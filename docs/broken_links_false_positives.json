@@ -5,4 +5,6 @@
 {"uri": "https://huggingface.co/docs/transformers/en/chat_templating_writing"}
 {"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM"}
 {"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForImageTextToText"}
+{"uri": "https://huggingface.co/docs/peft"}
+{"uri": "https://mn.cs.tsinghua.edu.cn/avqa"}
 {"uri": "https://opentelemetry.io/"}

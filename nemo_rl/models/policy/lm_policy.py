@@ -38,6 +38,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.generation.megatron.validation import (
+    validate_megatron_generation_backend_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -48,6 +51,7 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
+    has_custom_pp_layout_or_interleaved_vpp,
     resolve_policy_worker_cls,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -124,6 +128,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        if megatron_enable:
+            validate_megatron_generation_backend_config(config)
         if reserved_http_server_port is not None and not megatron_enable:
             raise ValueError(
                 "reserved_http_server_port is only supported by the Megatron "
@@ -214,6 +220,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
         actual_world_size = cluster.world_size()
+        dp_size = actual_world_size // model_parallel_size
 
         if (
             not bool(os.environ.get("NRL_IGNORE_TP_ACCURACY_CHECK"))
@@ -250,6 +257,56 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"Current DP would be {actual_world_size}/{model_parallel_size} = {dp_size_float:.6f}, which is not an integer. "
                 f"Please adjust your cluster size or parallelism parameters."
             )
+
+        if megatron_enable:
+            megatron_cfg = config["megatron_cfg"]
+            if (
+                has_custom_pp_layout_or_interleaved_vpp(megatron_cfg)
+                and not config["sequence_packing"]["enabled"]
+            ):
+
+                def validate_fixed_microbatch_count(
+                    *,
+                    batch_size_key: str,
+                    micro_batch_size_key: str,
+                    label: str,
+                ) -> None:
+                    global_batch_size = config[batch_size_key]
+                    micro_batch_size = config[micro_batch_size_key]
+                    assert global_batch_size % dp_size == 0, (
+                        "Virtual pipeline parallelism requires "
+                        f"{batch_size_key} ({global_batch_size}) to be divisible "
+                        f"by data_parallel_size ({dp_size}) for {label}."
+                    )
+                    per_dp_batch_size = global_batch_size // dp_size
+                    assert per_dp_batch_size % micro_batch_size == 0, (
+                        "Virtual pipeline parallelism requires the per-DP-rank "
+                        f"{label} batch size ({batch_size_key} / dp = "
+                        f"{global_batch_size} / {dp_size} = {per_dp_batch_size}) "
+                        f"to be divisible by {micro_batch_size_key} "
+                        f"({micro_batch_size})."
+                    )
+                    num_microbatches = per_dp_batch_size // micro_batch_size
+                    assert num_microbatches % pp_size == 0, (
+                        "Virtual pipeline parallelism requires the number of "
+                        f"{label} microbatches per data-parallel rank "
+                        f"({batch_size_key} / dp / {micro_batch_size_key} = "
+                        f"{global_batch_size} / {dp_size} / {micro_batch_size} = "
+                        f"{num_microbatches}) to be divisible by "
+                        f"pipeline_model_parallel_size ({pp_size})."
+                    )
+
+                validate_fixed_microbatch_count(
+                    batch_size_key="train_global_batch_size",
+                    micro_batch_size_key="train_micro_batch_size",
+                    label="training",
+                )
+                if config.get("logprob_batch_size") is not None:
+                    validate_fixed_microbatch_count(
+                        batch_size_key="train_global_batch_size",
+                        micro_batch_size_key="logprob_batch_size",
+                        label="logprob",
+                    )
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
@@ -367,6 +424,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             microbatch_order = config["sequence_packing"].get("microbatch_order")
             if microbatch_order is not None:
                 self.sequence_packing_args["microbatch_order"] = microbatch_order
+            if config["megatron_cfg"]["enabled"]:
+                # Custom PP layouts and interleaved VPP require the number of
+                # microbatches to be divisible by pp_size, so pass the matching
+                # min_bin_count and bin_count_multiple.
+                dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+                make_num_microbatch_divisible_by = None
+                if has_custom_pp_layout_or_interleaved_vpp(config["megatron_cfg"]):
+                    make_num_microbatch_divisible_by = dp_size * pp_size
+                    self.sequence_packing_args["min_bin_count"] = (
+                        make_num_microbatch_divisible_by
+                    )
+                    self.sequence_packing_args["bin_count_multiple"] = (
+                        make_num_microbatch_divisible_by
+                    )
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )

@@ -72,6 +72,8 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.megatron.common import chunk_prefixed_key
+from nemo_rl.models.megatron.vpp_utils import model_chunks, primary_model
 
 _HF_CONFIG_PATCHED = False
 
@@ -900,6 +902,15 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
+    model_cfg.virtual_pipeline_model_parallel_size = config["megatron_cfg"].get(
+        "virtual_pipeline_model_parallel_size", None
+    )
+    model_cfg.pipeline_model_parallel_layout = config["megatron_cfg"].get(
+        "pipeline_model_parallel_layout", None
+    )
+    model_cfg.microbatch_group_size_per_vp_stage = config["megatron_cfg"][
+        "pipeline_model_parallel_size"
+    ]
 
     if model_cfg.context_parallel_size > 1:
         # Either NeMo-RL does the packing+CP-sharding itself (classic mcore
@@ -2088,9 +2099,6 @@ def setup_model_and_optimizer(
         if len(model) == 1:
             param_sync_func = param_sync_func[0]
 
-    # Get the first model from the list
-    model = model[0]
-
     return ModelAndOptimizerState(
         state,
         model,
@@ -2298,18 +2306,20 @@ def setup_reference_model_state(
         reference_state_dict = {}
 
         if should_load_checkpoint or use_peft:
-            reference_model = reference_model[0]
-            reference_model.eval()
-            # Store reference state dict on CPU
-            for name, item in reference_model.state_dict().items():
-                if isinstance(item, torch.Tensor):
-                    cpu_item = item.detach().to(
-                        device="cpu", non_blocking=True, copy=True
-                    )
-                    del item
-                else:
-                    cpu_item = item
-                reference_state_dict[name] = cpu_item
+            for chunk_idx, chunk in enumerate(reference_model):
+                chunk.eval()
+                # Store reference state dict on CPU
+                for name, item in chunk.state_dict().items():
+                    if isinstance(item, torch.Tensor):
+                        cpu_item = item.detach().to(
+                            device="cpu", non_blocking=True, copy=True
+                        )
+                        del item
+                    else:
+                        cpu_item = item
+                    # Prefix with chunk index to avoid key collisions when multiple VPP
+                    # chunks share identical local layer indices (e.g. decoder.layers.0).
+                    reference_state_dict[chunk_prefixed_key(chunk_idx, name)] = cpu_item
             print("Reference model loaded")
         else:
             print("Reference model not loaded")
@@ -2332,9 +2342,10 @@ def finalize_megatron_setup(
     Returns:
         Tuple of (megatron_tokenizer, megatron_bridge, should_disable_forward_pre_hook, dp_size)
     """
+    chunks = model_chunks(model)
     _update_model_config_funcs(
-        [model],
-        get_model_config(model),
+        chunks,
+        get_model_config(primary_model(chunks)),
         megatron_cfg.ddp,
         optimizer,
         align_grad_reduce=megatron_cfg.dist.align_grad_reduce,

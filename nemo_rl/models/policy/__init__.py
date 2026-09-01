@@ -349,6 +349,8 @@ class MegatronConfig(TypedDict):
     pipeline_model_parallel_size: int
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
+    virtual_pipeline_model_parallel_size: int | None
+    pipeline_model_parallel_layout: Union[str, list] | None
     context_parallel_size: int
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.

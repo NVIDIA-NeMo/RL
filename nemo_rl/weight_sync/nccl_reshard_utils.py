@@ -37,6 +37,8 @@ import torch
 from torch.distributed._tensor import Shard
 from torch.distributed.tensor.placement_types import Replicate
 
+from nemo_rl.models.policy.utils import has_custom_pp_layout, has_interleaved_vpp
+
 # =========================================================================
 # MeshInfo — lightweight mesh wrapper type
 # =========================================================================
@@ -653,12 +655,12 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             )
 
         # PP-layout knobs that _build_layer_to_pp_stage doesn't yet handle.
-        if megatron_cfg.get("pipeline_model_parallel_layout") is not None:
+        if has_custom_pp_layout(megatron_cfg):
             violations.append(
                 "policy.megatron_cfg.pipeline_model_parallel_layout must be unset."
             )
         vpp = megatron_cfg.get("virtual_pipeline_model_parallel_size")
-        if vpp not in (None, 1):
+        if has_interleaved_vpp(megatron_cfg):
             violations.append(
                 "policy.megatron_cfg.virtual_pipeline_model_parallel_size must be "
                 f"None or 1 (got {vpp})."

@@ -33,6 +33,9 @@ from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
 )
+from nemo_rl.models.generation.megatron.validation import (
+    validate_megatron_generation_backend_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -217,12 +220,10 @@ class MegatronGeneration(GenerationInterface):
             skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
             reserved_http_server_port: Driver-reserved OpenAI server port for non-colocated.
         """
-        # Import here to avoid circular imports
-        from nemo_rl.models.policy.lm_policy import Policy
-
         assert (cluster is None) != (policy is None), (
             "Provide exactly one of `cluster` or `policy`."
         )
+        validate_megatron_generation_backend_config(config)
         assert not (skip_weight_load and policy is not None), (
             "skip_weight_load only applies to the dedicated inference policy."
         )
@@ -230,6 +231,9 @@ class MegatronGeneration(GenerationInterface):
             "reserved_http_server_port only applies to the dedicated inference "
             "policy; when colocated, pass it to the training policy instead."
         )
+
+        # Import here to avoid circular imports
+        from nemo_rl.models.policy.lm_policy import Policy
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
         # `self._policy_config` keeps a reference to the full PolicyConfig.

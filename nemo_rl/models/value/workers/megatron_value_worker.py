@@ -79,6 +79,13 @@ from nemo_rl.models.megatron.train import (
     megatron_forward_backward,
     suspend_activation_offload_for_forward_only,
 )
+from nemo_rl.models.megatron.vpp_utils import (
+    map_model_chunks,
+    model_chunks,
+    primary_model,
+    set_models_train_mode,
+    zero_grad_buffer,
+)
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
@@ -468,13 +475,32 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
 
+    def _model_chunks(self) -> list[Any]:
+        return model_chunks(self.model)
+
+    def _primary_model(self) -> Any:
+        return primary_model(self.model)
+
+    def _set_models_train_mode(self, training: bool) -> None:
+        set_models_train_mode(self.model, training)
+
+    def _zero_grad_buffer(self) -> None:
+        zero_grad_buffer(self.model)
+
+    def _clear_inference_params(self) -> None:
+        for model in self._model_chunks():
+            if hasattr(model, "inference_params"):
+                model.inference_params = None
+
     def enable_forward_pre_hook(self):
-        if isinstance(self.model, DistributedDataParallel):
-            self.model.enable_forward_pre_hook()
+        for model in self._model_chunks():
+            if isinstance(model, DistributedDataParallel):
+                model.enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
-        if isinstance(self.model, DistributedDataParallel):
-            self.model.disable_forward_pre_hook(param_sync=param_sync)
+        for model in self._model_chunks():
+            if isinstance(model, DistributedDataParallel):
+                model.disable_forward_pre_hook(param_sync=param_sync)
 
     @wrap_with_nvtx_name("megatron_value_worker/train")
     def train(
@@ -498,9 +524,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         Returns:
             Dictionary with training metrics (global_loss, grad_norm, etc.)
         """
-        self.model.zero_grad_buffer()
-        if hasattr(self.model, "inference_params"):
-            self.model.inference_params = None
+        self._zero_grad_buffer()
+        self._clear_inference_params()
 
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -517,10 +542,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
-            self.model.eval()
+            self._set_models_train_mode(False)
         else:
             ctx = nullcontext()
-            self.model.train()
+            self._set_models_train_mode(True)
 
         with ctx:
             all_mb_metrics = []
@@ -556,7 +581,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Zero gradients
-                    self.model.zero_grad_buffer()
+                    self._zero_grad_buffer()
                     self.optimizer.zero_grad()
 
                     # Reuse the policy LossPostProcessor; prepare_fn does the
@@ -590,7 +615,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         self.optimizer.step()
                     )
 
-                    pg_collection = get_pg_collection(self.model)
+                    pg_collection = get_pg_collection(self._primary_model())
                     update_successful = logical_and_across_model_parallel_group(
                         update_successful, mp_group=pg_collection.mp
                     )
@@ -678,7 +703,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         # Collect MoE aux metrics if applicable
         # Use getattr-by-string so "config" stays out of co_names; torch 2.11
         # cloudpickle otherwise matches torch.distributed.config (non-pickleable).
-        model_config = getattr(self.model, "config", None)
+        model_config = getattr(self._primary_model(), "config", None)
         num_moe_experts = getattr(model_config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
             moe_loss_scale = 1.0 / max(1, total_num_microbatches)
@@ -722,7 +747,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             else self.cfg.get("logprob_batch_size", self.cfg["train_micro_batch_size"])
         )
 
-        self.model.eval()
+        self._set_models_train_mode(False)
 
         pp_grp = get_pipeline_model_parallel_group()
 
@@ -830,7 +855,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
         )
-        self.model.train()
+        self._set_models_train_mode(True)
 
         if (
             hasattr(self, "optimizer")
@@ -845,7 +870,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
     def prepare_for_inference(self):
         """Prepare model for value inference."""
         self.model = self.move_model(self.model, "cuda", move_grads=False)
-        self.model.eval()
+        self._set_models_train_mode(False)
 
         # Offload gradients
         self.model = self.move_model(
@@ -858,51 +883,60 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
     @torch.no_grad()
     def move_model(
         self,
-        model: torch.nn.Module,
+        model: torch.nn.Module | list[torch.nn.Module],
         device: str,
         move_params: bool = True,
         move_grads: bool = True,
-    ) -> torch.nn.Module:
+    ) -> torch.nn.Module | list[torch.nn.Module]:
         """Move model parameters and gradient buffers to the specified device."""
-        if isinstance(model, DistributedDataParallel):
-            for buffers in [model.buffers, model.expert_parallel_buffers]:
-                for buffer_idx in range(len(buffers)):
-                    if device == "cpu":
-                        buffers[buffer_idx].offload_to_cpu(
-                            move_params=move_params, move_grads=move_grads
-                        )
-                    elif device == "cuda":
-                        buffers[buffer_idx].reload_from_cpu(
-                            move_params=move_params, move_grads=move_grads
-                        )
-                    else:
-                        raise ValueError(
-                            f"Invalid device: {device}. Only 'cpu' and 'cuda' are supported."
-                        )
-        elif isinstance(
-            model, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
-        ):
-            if device == "cpu":
-                model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)
-            elif device == "cuda":
-                model.param_and_grad_buffer.reload_from_cpu(
-                    move_params=move_params, move_grads=move_grads
-                )
+
+        def move_one_model(single_model: torch.nn.Module) -> torch.nn.Module:
+            if isinstance(single_model, DistributedDataParallel):
+                for buffers in [
+                    single_model.buffers,
+                    single_model.expert_parallel_buffers,
+                ]:
+                    for buffer_idx in range(len(buffers)):
+                        if device == "cpu":
+                            buffers[buffer_idx].offload_to_cpu(
+                                move_params=move_params, move_grads=move_grads
+                            )
+                        elif device == "cuda":
+                            buffers[buffer_idx].reload_from_cpu(
+                                move_params=move_params, move_grads=move_grads
+                            )
+                        else:
+                            raise ValueError(
+                                f"Invalid device: {device}. Only 'cpu' and 'cuda' are supported."
+                            )
+            elif isinstance(
+                single_model, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+            ):
+                if device == "cpu":
+                    single_model.param_and_grad_buffer.offload_to_cpu(
+                        move_params, move_grads
+                    )
+                elif device == "cuda":
+                    single_model.param_and_grad_buffer.reload_from_cpu(
+                        move_params=move_params, move_grads=move_grads
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid device: {device}. Only 'cpu' and 'cuda' are supported."
+                    )
             else:
-                raise ValueError(
-                    f"Invalid device: {device}. Only 'cpu' and 'cuda' are supported."
-                )
-        else:
-            if move_params:
-                new_state_dict = {}
-                for name, item in model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        item = item.detach().to(
-                            device=device, non_blocking=True, copy=True
-                        )
-                    new_state_dict[name] = item
-                model.load_state_dict(new_state_dict)
-        return model
+                if move_params:
+                    new_state_dict = {}
+                    for name, item in single_model.state_dict().items():
+                        if isinstance(item, torch.Tensor):
+                            item = item.detach().to(
+                                device=device, non_blocking=True, copy=True
+                            )
+                        new_state_dict[name] = item
+                    single_model.load_state_dict(new_state_dict)
+            return single_model
+
+        return map_model_chunks(model, move_one_model)
 
     def move_optimizer(self, device: str):
         """Move optimizer state to the specified device."""
@@ -959,7 +993,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             # Save Megatron backbone checkpoint
             save_checkpoint(
                 state=self.mcore_state,
-                model=[self.model],
+                model=self._model_chunks(),
                 optimizer=optimizer_to_save,
                 opt_param_scheduler=scheduler_to_save,
                 num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
@@ -1005,7 +1039,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )
-        self.model.eval()
+        self._set_models_train_mode(False)
 
         if (
             hasattr(self, "optimizer")

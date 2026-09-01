@@ -15,6 +15,7 @@
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
+from itertools import tee
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -426,6 +427,15 @@ def megatron_forward_backward(
         router_replay_train=router_replay_train,
     )
     forward_backward_func = get_forward_backward_func()
+    # The interleaved pipeline schedule (VPP) requires data_iterator to be a list with
+    # one independent iterator per model chunk.  Each chunk processes ALL num_microbatches
+    # in sequence, so every iterator must be able to yield num_microbatches items
+    # independently.  We materialise the microbatches once and hand each chunk its own
+    # iterator over the same data.  The non-interleaved schedule accepts a length-1 list
+    # and unwraps it itself.
+    num_model_chunks = len(model) if isinstance(model, list) else 1
+    if num_model_chunks > 1:
+        data_iterator = list(tee(data_iterator, num_model_chunks))
     if use_router_replay:
         clear_router_replay(model)
     with suspend_activation_offload_for_forward_only(model, forward_only):

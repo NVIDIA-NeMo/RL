@@ -40,8 +40,8 @@ single `ValueError` listing every violation. The current requirements are:
   quantize each received BF16 shard before installing it. Blockwise-FP8 train →
   MXFP8 gen is not supported.
 * vLLM expert parallelism is supported with the NeMo RL convention
-  `expert_parallel_size == tensor_parallel_size`. 
-* Generation-side, PP > 1 is not supported. 
+  `expert_parallel_size == tensor_parallel_size`.
+* Generation-side, PP > 1 is not supported.
 * **No ModelOpt real quantization** — `policy.generation.real_quant=false`. Real-quant
   rollouts refit through vLLM's layerwise-reload weight loaders, which the bulk
   `xferdtensor` writes bypass.

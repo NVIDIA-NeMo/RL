@@ -46,6 +46,7 @@ The bugs these catch:
 from __future__ import annotations
 
 import logging
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -78,6 +79,7 @@ def _make_mock_model():
     ``modules()`` that yields nothing (so the inference-cache reset loop
     is a no-op)."""
     model = MagicMock()
+    model.module = None
     model.config = MagicMock()
     model.config.grad_sync_func = "ORIGINAL_GRAD_SYNC_FUNC"  # sentinel
     # Set explicitly rather than letting MagicMock auto-create it: the finish
@@ -111,7 +113,7 @@ def _make_worker(loss_type):
     )
 
     w = object.__new__(MegatronPolicyWorkerImpl)
-    w.model = _make_mock_model()
+    w.model = [_make_mock_model()]
     w.optimizer = MagicMock()
     # MegatronOptimizer.step returns (success, grad_norm, num_zeros)
     w.optimizer.step.return_value = (True, 0.5, 0)
@@ -159,6 +161,11 @@ def _make_worker(loss_type):
     # Stash a loss_fn with the requested loss_type for tests that need one.
     w._test_loss_fn = MagicMock(loss_type=loss_type)
     return w
+
+
+def _primary_mock_model(worker: Any) -> Any:
+    """Return the single mocked model chunk used by these CPU state tests."""
+    return worker.model[0]
 
 
 @pytest.fixture
@@ -283,9 +290,10 @@ class TestBegin:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.begin_train_step(loss_fn=w._test_loss_fn)
-        w.model.zero_grad_buffer.assert_called_once()
+        model = _primary_mock_model(w)
+        model.zero_grad_buffer.assert_called_once()
         w.optimizer.zero_grad.assert_called_once()
-        w.model.train.assert_called_once()
+        model.train.assert_called_once()
 
     def test_saves_and_nulls_grad_sync_func(self, mock_module_symbols):
         """The PP scheduler's direct reduce dispatch must be suppressed
@@ -294,9 +302,10 @@ class TestBegin:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+        model = _primary_mock_model(w)
+        assert model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
         w.begin_train_step(loss_fn=w._test_loss_fn)
-        assert w.model.config.grad_sync_func is None
+        assert model.config.grad_sync_func is None
         assert w._train_step_state["saved_grad_sync_func"] == "ORIGINAL_GRAD_SYNC_FUNC"
 
     def test_double_begin_raises(self, mock_module_symbols):
@@ -357,7 +366,7 @@ class TestTrainMicrobatch:
         w.train_microbatch(_fake_batch())
         # no_sync() must have been ENTERED (called as a context manager).
         # MagicMock with __enter__/__exit__ records the __enter__ call.
-        ctx = w.model.no_sync.return_value
+        ctx = _primary_mock_model(w).no_sync.return_value
         ctx.__enter__.assert_called()
         ctx.__exit__.assert_called()
 
@@ -445,9 +454,10 @@ class TestFinish:
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
         w.finish_train_step()
+        model = _primary_mock_model(w)
         # scale_gradients should have been called with some 1/N scalar < 1
-        w.model.scale_gradients.assert_called_once()
-        arg = w.model.scale_gradients.call_args.args[0]
+        model.scale_gradients.assert_called_once()
+        arg = model.scale_gradients.call_args.args[0]
         assert 0 < arg <= 1.0
 
     @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
@@ -470,11 +480,12 @@ class TestFinish:
         w.cfg["megatron_cfg"]["distributed_data_parallel_config"][
             "overlap_grad_reduce"
         ] = overlap_grad_reduce
+        model = _primary_mock_model(w)
         # Record call order via a shared list
         order: list[str] = []
-        w.model.scale_gradients.side_effect = lambda s: order.append("scale")
-        w.model.start_grad_sync.side_effect = lambda: order.append("start_sync")
-        w.model.finish_grad_sync.side_effect = lambda: order.append("finish_sync")
+        model.scale_gradients.side_effect = lambda s: order.append("scale")
+        model.start_grad_sync.side_effect = lambda: order.append("start_sync")
+        model.finish_grad_sync.side_effect = lambda: order.append("finish_sync")
         w._train_step_state["saved_finalize_model_grads_func"] = (
             lambda models, num_tokens: order.append("finalize")
         )
@@ -508,8 +519,8 @@ class TestFinish:
         w._train_step_state["saved_finalize_model_grads_func"] = None
         with pytest.raises(AssertionError, match="finalize_model_grads_func was None"):
             w.finish_train_step()
-        w.model.start_grad_sync.assert_not_called()
-        w.model.finish_grad_sync.assert_not_called()
+        w.model[0].start_grad_sync.assert_not_called()
+        w.model[0].finish_grad_sync.assert_not_called()
         w.optimizer.step.assert_not_called()
 
     def test_picks_global_valid_toks_for_token_level_loss(self, mock_module_symbols):
@@ -520,7 +531,7 @@ class TestFinish:
         w.finish_train_step()
         # local_valid_toks accumulated = 2048; with mocked all_reduce as no-op,
         # global_valid_toks == 2048 → inv_n = 1/2048
-        arg = w.model.scale_gradients.call_args.args[0]
+        arg = _primary_mock_model(w).scale_gradients.call_args.args[0]
         assert arg == pytest.approx(1.0 / 2048.0, rel=1e-4)
 
     def test_picks_global_valid_seqs_for_sequence_level_loss(self, mock_module_symbols):
@@ -529,7 +540,7 @@ class TestFinish:
         w = self._setup_open_step(mock_module_symbols, LossType.SEQUENCE_LEVEL)
         w.finish_train_step()
         # local_valid_seqs = 8 → inv_n = 1/8
-        arg = w.model.scale_gradients.call_args.args[0]
+        arg = _primary_mock_model(w).scale_gradients.call_args.args[0]
         assert arg == pytest.approx(1.0 / 8.0, rel=1e-4)
 
     def test_restores_grad_sync_func(self, mock_module_symbols):
@@ -537,7 +548,7 @@ class TestFinish:
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
         w.finish_train_step()
-        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+        assert _primary_mock_model(w).config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
 
     @pytest.mark.parametrize("update_successful", [True, False])
     def test_reenables_forward_pre_hook_after_a_successful_step(
@@ -553,13 +564,14 @@ class TestFinish:
         w._first_train_step_param_sync_func = "ORIGINAL_PARAM_SYNC_FUNC"
         w.enable_forward_pre_hook = MagicMock()
         w.optimizer.step.return_value = (update_successful, 0.5, 0)
+        model = _primary_mock_model(w)
 
-        with patch(f"{WORKER_MOD}.get_model_config", return_value=w.model.config):
+        with patch(f"{WORKER_MOD}.get_model_config", return_value=model.config):
             w.finish_train_step()
 
         if update_successful:
             w.enable_forward_pre_hook.assert_called_once_with()
-            assert w.model.config.param_sync_func == "ORIGINAL_PARAM_SYNC_FUNC"
+            assert model.config.param_sync_func == "ORIGINAL_PARAM_SYNC_FUNC"
             assert w._first_train_step_forward_pre_hook_disabled is False
             assert w._first_train_step_param_sync_func is None
         else:
@@ -600,7 +612,7 @@ class TestFinish:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
-        w.model.config.num_moe_experts = None
+        _primary_mock_model(w).config.num_moe_experts = None
         metrics = w.finish_train_step()
         assert "moe_metrics" not in metrics
 
@@ -612,7 +624,7 @@ class TestFinish:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.model.config.num_moe_experts = 4
+        _primary_mock_model(w).config.num_moe_experts = 4
         # Have get_moe_metrics return non-empty so the branch fires
         mock_module_symbols["moe"].return_value = {"aux_loss": 0.1}
         w.begin_train_step(loss_fn=w._test_loss_fn)
@@ -724,17 +736,18 @@ class TestAbort:
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.abort_train_step()
-        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+        assert _primary_mock_model(w).config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
 
     def test_zero_grad_buffer_and_zero_grad_called(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.begin_train_step(loss_fn=w._test_loss_fn)
-        w.model.zero_grad_buffer.reset_mock()
+        model = _primary_mock_model(w)
+        model.zero_grad_buffer.reset_mock()
         w.optimizer.zero_grad.reset_mock()
         w.abort_train_step()
-        w.model.zero_grad_buffer.assert_called_once()
+        model.zero_grad_buffer.assert_called_once()
         w.optimizer.zero_grad.assert_called_once()
 
     def test_does_not_call_optimizer_step(self, mock_module_symbols):
@@ -785,23 +798,25 @@ class TestGradSyncFuncLifecycle:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         sentinel = "MY_CUSTOM_GRAD_SYNC"
-        w.model.config.grad_sync_func = sentinel
+        model = _primary_mock_model(w)
+        model.config.grad_sync_func = sentinel
         w.begin_train_step(loss_fn=w._test_loss_fn)
-        assert w.model.config.grad_sync_func is None
+        assert model.config.grad_sync_func is None
         w.train_microbatch(_fake_batch())
         w.finish_train_step()
-        assert w.model.config.grad_sync_func == sentinel
+        assert model.config.grad_sync_func == sentinel
 
     def test_begin_abort_round_trip(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         sentinel = "MY_CUSTOM_GRAD_SYNC"
-        w.model.config.grad_sync_func = sentinel
+        model = _primary_mock_model(w)
+        model.config.grad_sync_func = sentinel
         w.begin_train_step(loss_fn=w._test_loss_fn)
-        assert w.model.config.grad_sync_func is None
+        assert model.config.grad_sync_func is None
         w.abort_train_step()
-        assert w.model.config.grad_sync_func == sentinel
+        assert model.config.grad_sync_func == sentinel
 
     def test_handles_originally_none_grad_sync_func(self, mock_module_symbols):
         """When PP=1 (or align_grad_reduce=False), grad_sync_func is None
@@ -809,12 +824,13 @@ class TestGradSyncFuncLifecycle:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.model.config.grad_sync_func = None
+        model = _primary_mock_model(w)
+        model.config.grad_sync_func = None
         w.begin_train_step(loss_fn=w._test_loss_fn)
-        assert w.model.config.grad_sync_func is None
+        assert model.config.grad_sync_func is None
         w.train_microbatch(_fake_batch())
         w.finish_train_step()
-        assert w.model.config.grad_sync_func is None
+        assert model.config.grad_sync_func is None
 
 
 # ── finalize_model_grads_func: once per STEP, not per chunk ──────────────
@@ -833,9 +849,9 @@ class TestFinalizeModelGradsOncePerStep:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        sentinel = w.model.config.finalize_model_grads_func
+        sentinel = w.model[0].config.finalize_model_grads_func
         w.begin_train_step(loss_fn=w._test_loss_fn)
-        assert w.model.config.finalize_model_grads_func is None
+        assert w.model[0].config.finalize_model_grads_func is None
         assert w._train_step_state["saved_finalize_model_grads_func"] is sentinel
 
     def test_hook_stays_nulled_across_every_chunk(self, mock_module_symbols):
@@ -844,11 +860,11 @@ class TestFinalizeModelGradsOncePerStep:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        sentinel = w.model.config.finalize_model_grads_func
+        sentinel = w.model[0].config.finalize_model_grads_func
         w.begin_train_step(loss_fn=w._test_loss_fn)
         for _ in range(4):
             w.train_microbatch(_fake_batch())
-            assert w.model.config.finalize_model_grads_func is None
+            assert w.model[0].config.finalize_model_grads_func is None
         sentinel.assert_not_called()
 
     @pytest.mark.parametrize("num_chunks", [1, 2, 5])
@@ -860,7 +876,7 @@ class TestFinalizeModelGradsOncePerStep:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        sentinel = w.model.config.finalize_model_grads_func
+        sentinel = w.model[0].config.finalize_model_grads_func
         w.begin_train_step(loss_fn=w._test_loss_fn)
         for _ in range(num_chunks):
             w.train_microbatch(_fake_batch())
@@ -874,12 +890,12 @@ class TestFinalizeModelGradsOncePerStep:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        sentinel = w.model.config.finalize_model_grads_func
+        sentinel = w.model[0].config.finalize_model_grads_func
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         w.finish_train_step()
         args, kwargs = sentinel.call_args
-        assert args[0] == [w.model]
+        assert args[0] == w.model
         assert args[1] is None
         # No keywords at all, which is what keeps Megatron-Bridge's
         # ``partial(finalize_model_grads, pg_collection=...)`` binding intact —
@@ -897,7 +913,7 @@ class TestFinalizeModelGradsOncePerStep:
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         w.finish_train_step()
-        w.model.finish_grad_sync.assert_not_called()
+        w.model[0].finish_grad_sync.assert_not_called()
 
     def test_runs_after_rescale_and_before_optimizer_step(self, mock_module_symbols):
         """The 1/N rescale must land on the local buffer before the reduce, and
@@ -906,8 +922,8 @@ class TestFinalizeModelGradsOncePerStep:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         order: list[str] = []
-        w.model.scale_gradients.side_effect = lambda s: order.append("scale")
-        w.model.config.finalize_model_grads_func = MagicMock(
+        w.model[0].scale_gradients.side_effect = lambda s: order.append("scale")
+        w.model[0].config.finalize_model_grads_func = MagicMock(
             side_effect=lambda models, num_tokens: order.append("finalize")
         )
         w.optimizer.step.side_effect = lambda: (
@@ -922,11 +938,11 @@ class TestFinalizeModelGradsOncePerStep:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        sentinel = w.model.config.finalize_model_grads_func
+        sentinel = w.model[0].config.finalize_model_grads_func
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         w.finish_train_step()
-        assert w.model.config.finalize_model_grads_func is sentinel
+        assert w.model[0].config.finalize_model_grads_func is sentinel
 
     def test_abort_restores_the_hook(self, mock_module_symbols):
         """Otherwise a subsequent sync train() would run with no finalize at
@@ -934,11 +950,11 @@ class TestFinalizeModelGradsOncePerStep:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        sentinel = w.model.config.finalize_model_grads_func
+        sentinel = w.model[0].config.finalize_model_grads_func
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         w.abort_train_step()
-        assert w.model.config.finalize_model_grads_func is sentinel
+        assert w.model[0].config.finalize_model_grads_func is sentinel
 
     def test_abort_does_not_call_the_hook(self, mock_module_symbols):
         """An aborted step throws its gradients away; reducing them would leak
@@ -946,7 +962,7 @@ class TestFinalizeModelGradsOncePerStep:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        sentinel = w.model.config.finalize_model_grads_func
+        sentinel = w.model[0].config.finalize_model_grads_func
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         w.abort_train_step()
@@ -960,14 +976,14 @@ class TestFinalizeModelGradsOncePerStep:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.model.config.finalize_model_grads_func = None
+        w.model[0].config.finalize_model_grads_func = None
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         with pytest.raises(AssertionError, match="finalize_model_grads_func was None"):
             w.finish_train_step()
-        w.model.finish_grad_sync.assert_not_called()
-        assert w.model.config.finalize_model_grads_func is None
-        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+        w.model[0].finish_grad_sync.assert_not_called()
+        assert w.model[0].config.finalize_model_grads_func is None
+        assert w.model[0].config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
 
     def test_two_consecutive_steps_each_finalize_once(self, mock_module_symbols):
         """Restore-then-null across step boundaries must not lose the hook or
@@ -975,14 +991,14 @@ class TestFinalizeModelGradsOncePerStep:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        sentinel = w.model.config.finalize_model_grads_func
+        sentinel = w.model[0].config.finalize_model_grads_func
         for _ in range(2):
             w.begin_train_step(loss_fn=w._test_loss_fn)
             w.train_microbatch(_fake_batch())
             w.train_microbatch(_fake_batch())
             w.finish_train_step()
         assert sentinel.call_count == 2
-        assert w.model.config.finalize_model_grads_func is sentinel
+        assert w.model[0].config.finalize_model_grads_func is sentinel
 
 
 # ── num_chunks ───────────────────────────────────────────────────────────
@@ -1172,14 +1188,14 @@ class TestPrepareForLpInference:
         first = w.move_model.call_args_list[0]
         assert first.args[1] == "cuda"
         assert first.kwargs == {"move_grads": False}
-        w.model.eval.assert_called_once()
+        _primary_mock_model(w).train.assert_called_once_with(False)
 
     def test_keeps_buffers_across_an_open_step(self, mock_module_symbols):
         """The sequence the streaming pump actually produces: open a step, run a
         chunk, take the logprob detour, run another chunk, finish. The finalize
         must still fire exactly once and the grads must never be offloaded."""
         w = self._worker()
-        sentinel = w.model.config.finalize_model_grads_func
+        sentinel = w.model[0].config.finalize_model_grads_func
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         with patch("torch.randn"):

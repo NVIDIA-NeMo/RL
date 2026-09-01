@@ -16,6 +16,7 @@ import gc
 import os
 import traceback
 import warnings
+from collections.abc import Mapping
 from datetime import timedelta
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional, cast
@@ -127,6 +128,23 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     if config.get("quant_cfg") is None:
         return default_cls
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+
+
+def has_custom_pp_layout(megatron_cfg: Mapping[str, object]) -> bool:
+    """Return whether an input Megatron config sets a custom PP layer layout."""
+    return megatron_cfg.get("pipeline_model_parallel_layout") is not None
+
+
+def has_interleaved_vpp(megatron_cfg: Mapping[str, object]) -> bool:
+    """Return whether an input Megatron config enables interleaved virtual PP."""
+    return megatron_cfg.get("virtual_pipeline_model_parallel_size") not in (None, 1)
+
+
+def has_custom_pp_layout_or_interleaved_vpp(
+    megatron_cfg: Mapping[str, object],
+) -> bool:
+    """Return whether an input Megatron config uses custom PP layout or VPP."""
+    return has_custom_pp_layout(megatron_cfg) or has_interleaved_vpp(megatron_cfg)
 
 
 def resolve_model_class(model_name: str) -> Any:

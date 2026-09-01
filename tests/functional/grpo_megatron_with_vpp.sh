@@ -17,8 +17,6 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
-# Megatron generation with non-default sampling (temperature / top-p / top-k), exercising
-# the SamplingParams path (the megatron analog of grpo_topp_topk.sh).
 # Using Qwen2.5-0.5B instead of Qwen3-0.6B because the latter is not supported by Megatron yet
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
@@ -30,11 +28,9 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.train_global_batch_size=4 \
     policy.logprob_batch_size=4 \
     policy.train_micro_batch_size=1 \
-    policy.generation.backend=megatron \
-    policy.generation.temperature=0.8 \
-    policy.generation.top_p=0.9 \
-    policy.generation.top_k=50 \
     cluster.gpus_per_node=2 \
+    policy.megatron_cfg.pipeline_model_parallel_size=2 \
+    policy.megatron_cfg.virtual_pipeline_model_parallel_size=6 \
     grpo.max_num_steps=2 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
@@ -46,7 +42,9 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Non-default top-p/top-k sampling has slightly higher processed-logprob drift
-# than the default Megatron-generation smoke.
 uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/token_mult_prob_error"]) < 1.1'
+    'max(data["train/token_mult_prob_error"]) < 1.05' \
+    'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
+    'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
+    'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
+    'max(data["train/probs_ratio_clamped_max"]) < 1.21'

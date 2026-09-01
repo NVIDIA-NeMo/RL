@@ -68,6 +68,7 @@ from nemo_rl.models.megatron.memory_saver import (
     pause_inference_weights,
     resume_inference_weights,
 )
+from nemo_rl.models.megatron.vpp_utils import iter_model_modules, model_chunks
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -94,9 +95,14 @@ class MegatronGenerationMixin:
         """The model the inference engine wraps.
 
         Returns the dedicated inference-layout model when one exists (colocated
-        reshard), otherwise the shared training model.
+        reshard), otherwise the shared training model. Under virtual pipeline
+        parallelism the training model is a list of chunks; inference uses the
+        first chunk (VPP requires PP > 1, which mcore inference rejects anyway,
+        but keep the access well-defined).
         """
-        return self.inference_model if self.inference_model is not None else self.model
+        if self.inference_model is not None:
+            return self.inference_model
+        return self.model[0] if isinstance(self.model, list) else self.model
 
     def _init_inference_engine_state(self) -> None:
         """Reset all inference-engine attributes to their uninitialized state."""
@@ -141,26 +147,32 @@ class MegatronGenerationMixin:
                 "'transformer_engine' and 'full_iteration' are training-only capture modes."
             )
 
-        lang_module = unwrap_model(self.model)
+        lang_modules = [unwrap_model(chunk) for chunk in model_chunks(self.model)]
         # A model built with graphs enabled already owns managers.
         if not any(
-            hasattr(module, "cudagraph_manager") for module in lang_module.modules()
+            hasattr(module, "cudagraph_manager")
+            for module in iter_model_modules(lang_modules)
         ):
             scope = normalize_inference_cuda_graph_scope(
                 mcore_generation_config.get("inference_cuda_graph_scope"),
                 cuda_graph_impl,
             )
             # Need the correct configs.
-            set_model_config_attribute(lang_module, "cuda_graph_impl", cuda_graph_impl)
-            set_model_config_attribute(lang_module, "inference_cuda_graph_scope", scope)
-            set_model_config_attribute(lang_module, "cuda_graph_modules", [])
+            for lang_module in lang_modules:
+                set_model_config_attribute(
+                    lang_module, "cuda_graph_impl", cuda_graph_impl
+                )
+                set_model_config_attribute(
+                    lang_module, "inference_cuda_graph_scope", scope
+                )
+                set_model_config_attribute(lang_module, "cuda_graph_modules", [])
 
             # Need to recurse the configs' effects down into modules.
             # Megatron-LM has no API for attaching inference CUDA-graph managers to
             # an already-built model (reported upstream), so this mirrors its
             # construction-time setup.
             # TODO: switch to the upstream API once it exists.
-            for module in lang_module.modules():
+            for module in iter_model_modules(lang_modules):
                 if not isinstance(module, GraphableMegatronModule):
                     continue
                 if hasattr(module, "create_mcore_cudagraph_manager"):
@@ -170,17 +182,19 @@ class MegatronGenerationMixin:
 
             # Handle MTP as well.
             # TODO: this path only becomes testable once #3331 merges.
-            if getattr(lang_module, "mtp_process", False):
-                if hasattr(lang_module, "_setup_mtp_cuda_graphs") and not hasattr(
-                    lang_module, "_mtp_cudagraph_manager"
-                ):
-                    lang_module._setup_mtp_cuda_graphs()
-                assert hasattr(lang_module, "_mtp_cudagraph_manager"), (
-                    f"cuda_graph_impl='{cuda_graph_impl}', but no MTP graph manager was created."
-                )
+            for lang_module in lang_modules:
+                if getattr(lang_module, "mtp_process", False):
+                    if hasattr(lang_module, "_setup_mtp_cuda_graphs") and not hasattr(
+                        lang_module, "_mtp_cudagraph_manager"
+                    ):
+                        lang_module._setup_mtp_cuda_graphs()
+                    assert hasattr(lang_module, "_mtp_cudagraph_manager"), (
+                        f"cuda_graph_impl='{cuda_graph_impl}', but no MTP graph manager was created."
+                    )
 
             assert any(
-                hasattr(module, "cudagraph_manager") for module in lang_module.modules()
+                hasattr(module, "cudagraph_manager")
+                for module in iter_model_modules(lang_modules)
             ), (
                 f"cuda_graph_impl='{cuda_graph_impl}' is set for colocated Megatron "
                 "generation, but no CUDA-graph manager could be created for this model."
@@ -188,16 +202,18 @@ class MegatronGenerationMixin:
 
             # When the model-level manager owns block-scope graphs,
             # construction deletes the decoder's fallback manager.
-            decoder = getattr(lang_module, "decoder", None)
-            if (
-                hasattr(lang_module, "cudagraph_manager")
-                and decoder is not None
-                and hasattr(decoder, "cudagraph_manager")
-            ):
-                del decoder.cudagraph_manager
+            for lang_module in lang_modules:
+                decoder = getattr(lang_module, "decoder", None)
+                if (
+                    hasattr(lang_module, "cudagraph_manager")
+                    and decoder is not None
+                    and hasattr(decoder, "cudagraph_manager")
+                ):
+                    del decoder.cudagraph_manager
 
         # Detach for training; this caches the managers built above.
-        toggle_cuda_graphs(lang_module, set_to="none")
+        for lang_module in lang_modules:
+            toggle_cuda_graphs(lang_module, set_to="none")
 
     def get_inference_cuda_graph_capture_count(self) -> int:
         """Inference CUDA graphs captured in this worker process (0 = eager decode)."""
@@ -568,7 +584,7 @@ class MegatronGenerationMixin:
                 and self._forward_pre_hook_enabled()
             ):
                 self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
-            gen_model = self.model
+            gen_model = self._gen_model()
 
         # Colocated reshard (hosts without a dedicated inference model skip it).
         if self.inference_model is not None:

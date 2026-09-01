@@ -15,10 +15,12 @@ import ast
 import os
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -208,11 +210,15 @@ class _FakeTrainableModel:
         self.train_called = False
         self.eval_called = False
 
-    def train(self):
-        self.train_called = True
+    def train(self, mode: bool = True):
+        self.train_called = mode
+        self.eval_called = not mode
+        return self
 
     def eval(self):
+        self.train_called = False
         self.eval_called = True
+        return self
 
 
 class _ModelWithNonSerializableExtraState(torch.nn.Module):
@@ -327,13 +333,13 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = _FakeTrainableModel()
     worker.cfg = (
         {"generation": {"backend": generation_backend}} if generation_backend else {}
     )
     worker.is_generation_colocated = colocated
     worker.inference_model = object() if has_inference_model else None
     worker._colocated_reshard_plan = None
+    worker.model = [_FakeTrainableModel()]
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
     worker.move_model = lambda model, device, **kwargs: (
         events.append("move_model") or move_kwargs.append(kwargs) or model
@@ -504,7 +510,7 @@ def test_megatron_prepare_for_training_restores_optimizer():
     model = _FakeTrainableModel()
     restored_devices = []
 
-    worker.model = model
+    worker.model = [model]
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
     worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
@@ -669,6 +675,7 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
 
     worker = namespace["_Worker"]()
     worker.model = FakeDDP()
+    worker._model_chunks = lambda: [worker.model]
     worker._forward_pre_hook_enabled = lambda: True
     disable_calls = []
     worker.disable_forward_pre_hook = lambda param_sync=True: disable_calls.append(
@@ -726,10 +733,91 @@ def test_prepare_for_generation_disables_param_gather_hook_before_wake(
     assert model.config.flash_decode is False
 
 
+def test_setup_colocated_cuda_graph_managers_handles_vpp_model_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    class FakeGraphableModule:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.config = SimpleNamespace(name=name)
+            self.decoder = SimpleNamespace(cudagraph_manager="decoder-manager")
+
+        def modules(self) -> Iterator[object]:
+            yield self
+
+    chunks = [FakeGraphableModule("chunk0"), FakeGraphableModule("chunk1")]
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": {
+                "cuda_graph_impl": "local",
+                "inference_cuda_graph_scope": None,
+            },
+        }
+    }
+    worker.model = chunks
+    worker.is_generation_colocated = True
+    worker._colocated_reshard_plan = None
+
+    unwrap_calls = []
+    set_attr_calls = []
+    toggle_calls = []
+
+    def fake_unwrap(model: FakeGraphableModule) -> FakeGraphableModule:
+        unwrap_calls.append(model.name)
+        return model
+
+    def fake_set_model_config_attribute(
+        module: FakeGraphableModule, attr: str, value: object
+    ) -> None:
+        set_attr_calls.append((module.name, attr, value))
+
+    def fake_toggle_cuda_graphs(module: FakeGraphableModule, set_to: str) -> None:
+        toggle_calls.append((module.name, set_to))
+
+    monkeypatch.setattr(megatron_worker, "GraphableMegatronModule", FakeGraphableModule)
+    monkeypatch.setattr(
+        megatron_worker,
+        "CudaGraphManager",
+        lambda config: f"manager-{config.name}",
+    )
+    monkeypatch.setattr(megatron_worker, "unwrap_model", fake_unwrap)
+    monkeypatch.setattr(
+        megatron_worker,
+        "normalize_inference_cuda_graph_scope",
+        lambda scope, impl: "normalized-scope",
+    )
+    monkeypatch.setattr(
+        megatron_worker, "set_model_config_attribute", fake_set_model_config_attribute
+    )
+    monkeypatch.setattr(megatron_worker, "toggle_cuda_graphs", fake_toggle_cuda_graphs)
+
+    worker._setup_colocated_cuda_graph_managers()
+
+    assert unwrap_calls == ["chunk0", "chunk1"]
+    assert chunks[0].cudagraph_manager == "manager-chunk0"
+    assert chunks[1].cudagraph_manager == "manager-chunk1"
+    assert not hasattr(chunks[0].decoder, "cudagraph_manager")
+    assert not hasattr(chunks[1].decoder, "cudagraph_manager")
+    assert set_attr_calls == [
+        ("chunk0", "cuda_graph_impl", "local"),
+        ("chunk0", "inference_cuda_graph_scope", "normalized-scope"),
+        ("chunk0", "cuda_graph_modules", []),
+        ("chunk1", "cuda_graph_impl", "local"),
+        ("chunk1", "inference_cuda_graph_scope", "normalized-scope"),
+        ("chunk1", "cuda_graph_modules", []),
+    ]
+    assert toggle_calls == [("chunk0", "none"), ("chunk1", "none")]
+
+
 def create_megatron_test_config(
     model_name: str,
     tp: int = 1,
     pp: int = 1,
+    vpp: Optional[int] = None,
     precision: str = "float32",
     activation_checkpointing: bool = False,
     generation_backend: str = "megatron",
@@ -803,6 +891,8 @@ def create_megatron_test_config(
             "pipeline_model_parallel_size": pp,
             "num_layers_in_first_pipeline_stage": None,
             "num_layers_in_last_pipeline_stage": None,
+            "virtual_pipeline_model_parallel_size": vpp,
+            "pipeline_model_parallel_layout": None,
             "context_parallel_size": 1,
             "pipeline_dtype": precision,
             "sequence_parallel": sequence_parallel,
@@ -1004,6 +1094,10 @@ def training_setup(request):
                 config["megatron_cfg"]["attention_backend"] = config_updates[
                     "attention_backend"
                 ]
+            if "virtual_pipeline_model_parallel_size" in config_updates:
+                config["megatron_cfg"]["virtual_pipeline_model_parallel_size"] = (
+                    config_updates["virtual_pipeline_model_parallel_size"]
+                )
 
         tokenizer = get_tokenizer(config["tokenizer"])
         config["generation"] = configure_generation_config(
@@ -1074,6 +1168,13 @@ def training_setup(request):
             "tiny_llama_model_path",
             {"attention_backend": "flash", "precision": "bfloat16"},
         ),
+        (
+            2,
+            1,
+            2,
+            "tiny_llama_4layer_model_path",
+            {"virtual_pipeline_model_parallel_size": 2},
+        ),
     ],
     indirect=True,
     ids=[
@@ -1086,6 +1187,7 @@ def training_setup(request):
         "2gpu_tp2_llama_sp",
         "2gpu_tp2_llama_fp8",
         "2gpu_dp2_llama_attention_backend_flash",
+        "2gpu_pp2_vpp2_llama",
     ],
 )
 def test_megatron_policy_training(training_setup):
@@ -1304,6 +1406,7 @@ def logprob_setup(request):
     """Setup and teardown specifically for logprob tests."""
     # Parse parameters: (num_gpus, tp, pp, model_fixture_name)
     if hasattr(request, "param") and request.param is not None:
+        param = request.param
         (
             num_gpus,
             tp,
@@ -1311,7 +1414,8 @@ def logprob_setup(request):
             logprob_chunk_size,
             defer_fp32_logits,
             model_fixture_name,
-        ) = request.param
+        ) = param[:6]
+        vpp = param[6] if len(param) > 6 else None
     else:
         (
             num_gpus,
@@ -1320,7 +1424,8 @@ def logprob_setup(request):
             logprob_chunk_size,
             defer_fp32_logits,
             model_fixture_name,
-        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
+            vpp,
+        ) = (2, 1, 1, None, None, "tiny_llama_model_path", None)
 
     # Get the actual model path from the requested fixture
     model_name = request.getfixturevalue(model_fixture_name)
@@ -1331,8 +1436,10 @@ def logprob_setup(request):
 
     try:
         cluster_name = f"test-megatron-logprob-{num_gpus}gpu-tp{tp}-pp{pp}"
+        if vpp is not None:
+            cluster_name += f"-vpp{vpp}"
         print(
-            f"Creating logprob cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+            f"Creating logprob cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp}, VPP={vpp})"
         )
 
         cluster = RayVirtualCluster(
@@ -1348,6 +1455,7 @@ def logprob_setup(request):
             model_name=model_name,
             tp=tp,
             pp=pp,
+            vpp=vpp,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )
@@ -1398,7 +1506,7 @@ def logprob_setup(request):
 @pytest.mark.parametrize(
     "logprob_setup",
     [
-        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name[, vpp])
         (2, 1, 1, None, None, "tiny_llama_model_path"),
         (2, 2, 1, None, None, "tiny_llama_model_path"),
         (2, 1, 1, None, None, "tiny_qwen2_model_path"),
@@ -1411,6 +1519,8 @@ def logprob_setup(request):
         (2, 2, 1, 16, True, "tiny_llama_model_path"),
         (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
         (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
+        # VPP: pp=2, vpp=2 requires a 4-layer model (pp*vpp=4 layers)
+        (2, 1, 2, None, None, "tiny_llama_4layer_model_path", 2),
     ],
     indirect=True,
     ids=[
@@ -1426,6 +1536,7 @@ def logprob_setup(request):
         "2gpu_tp2_chunked_deferfp32_llama",
         "2gpu_dp2_chunked_deferfp32_qwen2",
         "2gpu_tp2_chunked_deferfp32_qwen2",
+        "2gpu_pp2_vpp2_llama",
     ],
 )
 def test_megatron_policy_logprobs(logprob_setup):
@@ -1778,22 +1889,29 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
 @pytest.mark.timeout(400)
 @pytest.mark.hf_gated
 @pytest.mark.parametrize(
-    "num_gpus,tp,pp,save_optimizer",
+    "num_gpus,tp,pp,save_optimizer,vpp,model_fixture_name",
     [
-        (2, 1, 1, False),  # Data parallel
-        (2, 1, 2, True),  # Pipeline parallel
-        (2, 2, 1, True),  # Tensor parallel
+        (2, 1, 1, False, None, "tiny_llama_model_path"),  # Data parallel
+        (2, 1, 2, True, None, "tiny_llama_model_path"),  # Pipeline parallel
+        (2, 2, 1, True, None, "tiny_llama_model_path"),  # Tensor parallel
+        # VPP: pp=2, vpp=2 requires a 4-layer model (pp*vpp=4 layers)
+        (2, 1, 2, True, 2, "tiny_llama_4layer_model_path"),  # Virtual pipeline parallel
     ],
-    ids=["2gpu_dp2_save_restore", "2gpu_pp2_save_restore", "2gpu_tp2_save_restore"],
+    ids=[
+        "2gpu_dp2_save_restore",
+        "2gpu_pp2_save_restore",
+        "2gpu_tp2_save_restore",
+        "2gpu_pp2_vpp2_save_restore",
+    ],
 )
 def test_megatron_checkpoint_save_kill_and_restore(
-    num_gpus, tp, pp, tiny_llama_model_path, save_optimizer
+    num_gpus, tp, pp, save_optimizer, vpp, model_fixture_name, request
 ):
     """Test full checkpoint save/restore cycle: save -> kill worker -> restart -> verify restore."""
     from copy import deepcopy
 
     # Use tiny model for faster testing
-    model_name = tiny_llama_model_path
+    model_name = request.getfixturevalue(model_fixture_name)
     tokenizer = get_tokenizer({"name": model_name})
 
     with tempfile.TemporaryDirectory(prefix="megatron_save_restore_") as temp_dir:
@@ -1808,9 +1926,16 @@ def test_megatron_checkpoint_save_kill_and_restore(
             else None
         )
 
-        # Create initial config
+        # This test exercises VPP policy save/restore, not Megatron generation.
+        # Use a supported generation backend for the VPP case so the explicit
+        # Megatron-generation VPP guard does not reject the policy-only setup.
         initial_config = create_megatron_test_config(
-            model_name=model_name, tp=tp, pp=pp, precision="float32"
+            model_name=model_name,
+            tp=tp,
+            pp=pp,
+            vpp=vpp,
+            precision="float32",
+            generation_backend="vllm" if vpp else "megatron",
         )
 
         # Step 1: Create first policy and train
@@ -2154,6 +2279,7 @@ def topk_setup(request):
     """Setup and teardown specifically for top-k logits tests."""
     # Parse parameters: (num_gpus, tp, pp, logprob_chunk_size, defer_fp32_logits, model_fixture_name)
     if hasattr(request, "param") and request.param is not None:
+        param = request.param
         (
             num_gpus,
             tp,
@@ -2161,7 +2287,8 @@ def topk_setup(request):
             logprob_chunk_size,
             defer_fp32_logits,
             model_fixture_name,
-        ) = request.param
+        ) = param[:6]
+        vpp = param[6] if len(param) > 6 else None
     else:
         (
             num_gpus,
@@ -2170,7 +2297,8 @@ def topk_setup(request):
             logprob_chunk_size,
             defer_fp32_logits,
             model_fixture_name,
-        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
+            vpp,
+        ) = (2, 1, 1, None, None, "tiny_llama_model_path", None)
 
     # Get the actual model path from the requested fixture
     model_name = request.getfixturevalue(model_fixture_name)
@@ -2181,8 +2309,10 @@ def topk_setup(request):
 
     try:
         cluster_name = f"test-megatron-topk-{num_gpus}gpu-tp{tp}-pp{pp}"
+        if vpp is not None:
+            cluster_name += f"-vpp{vpp}"
         print(
-            f"Creating topk cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+            f"Creating topk cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp}, VPP={vpp})"
         )
 
         cluster = RayVirtualCluster(
@@ -2198,6 +2328,7 @@ def topk_setup(request):
             model_name=model_name,
             tp=tp,
             pp=pp,
+            vpp=vpp,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )
@@ -2248,7 +2379,7 @@ def topk_setup(request):
 @pytest.mark.parametrize(
     "topk_setup",
     [
-        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name[, vpp])
         (2, 1, 1, None, None, "tiny_llama_model_path"),
         (2, 2, 1, None, None, "tiny_llama_model_path"),
         (2, 1, 1, None, None, "tiny_qwen2_model_path"),
@@ -2261,6 +2392,8 @@ def topk_setup(request):
         (2, 2, 1, 16, True, "tiny_llama_model_path"),
         (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
         (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
+        # VPP: pp=2, vpp=2 requires a 4-layer model (pp*vpp=4 layers)
+        (2, 1, 2, None, None, "tiny_llama_4layer_model_path", 2),
     ],
     indirect=True,
     ids=[
@@ -2276,6 +2409,7 @@ def topk_setup(request):
         "2gpu_tp2_chunked_deferfp32_llama",
         "2gpu_dp2_chunked_deferfp32_qwen2",
         "2gpu_tp2_chunked_deferfp32_qwen2",
+        "2gpu_pp2_vpp2_llama",
     ],
 )
 def test_megatron_policy_topk_logits(topk_setup):
@@ -3615,3 +3749,356 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+def _new_worker_impl():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    return MegatronPolicyWorkerImpl.__new__(MegatronPolicyWorkerImpl)
+
+
+def test_policy_sequence_packing_vpp_sets_microbatch_bin_constraints(monkeypatch):
+    """Policy init should request microbatch counts divisible by DP * PP for VPP."""
+    import nemo_rl.models.policy.lm_policy as lm_policy_module
+
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "9.0")
+    cluster = SimpleNamespace(
+        world_size=lambda: 4,
+        _sorted_bundle_indices=None,
+        num_gpus_per_node=4,
+    )
+    config = create_megatron_test_config(
+        "dummy-model", pp=2, vpp=2, generation_backend="vllm"
+    )
+    config["sequence_packing"] = {
+        "enabled": True,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+    config["dynamic_batching"]["enabled"] = False
+
+    with (
+        patch.object(lm_policy_module, "RayQueue", return_value=object()),
+        patch.object(lm_policy_module, "RayWorkerBuilder"),
+        patch.object(lm_policy_module, "RayWorkerGroup"),
+        patch.object(lm_policy_module, "get_hf_config", return_value={}),
+        patch.object(
+            lm_policy_module.FLOPTracker,
+            "from_config",
+            side_effect=ValueError("unsupported model"),
+        ),
+    ):
+        policy = Policy(cluster=cluster, config=config, tokenizer=MagicMock())
+
+    assert policy.use_sequence_packing is True
+    assert policy.sequence_packing_args["min_bin_count"] == 4
+    assert policy.sequence_packing_args["bin_count_multiple"] == 4
+
+
+def test_worker_forward_pre_hooks_apply_to_all_model_chunks(monkeypatch):
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    class FakeDDP:
+        def __init__(self):
+            self.remove_forward_pre_hook_handles = {}
+            self.enable_forward_pre_hook = MagicMock(
+                side_effect=lambda: self.remove_forward_pre_hook_handles.update(
+                    {"hook": object()}
+                )
+            )
+            self.disable_forward_pre_hook = MagicMock(
+                side_effect=lambda param_sync=True: (
+                    self.remove_forward_pre_hook_handles.clear()
+                )
+            )
+
+    monkeypatch.setattr(worker_module, "DistributedDataParallel", FakeDDP)
+    worker = _new_worker_impl()
+    worker.model = [FakeDDP(), FakeDDP()]
+
+    worker.enable_forward_pre_hook()
+    worker.disable_forward_pre_hook(param_sync=False)
+
+    for chunk in worker.model:
+        chunk.enable_forward_pre_hook.assert_called_once_with()
+        chunk.disable_forward_pre_hook.assert_called_once_with(param_sync=False)
+
+
+def test_worker_train_step_helpers_apply_to_all_model_chunks():
+    worker = _new_worker_impl()
+    chunks = [MagicMock(), MagicMock()]
+    entered = []
+    exited = []
+
+    @contextmanager
+    def no_sync_context(chunk_idx: int):
+        entered.append(chunk_idx)
+        try:
+            yield
+        finally:
+            exited.append(chunk_idx)
+
+    for chunk_idx, chunk in enumerate(chunks):
+        chunk.no_sync.return_value = no_sync_context(chunk_idx)
+    worker.model = chunks
+
+    worker._set_models_train_mode(True)
+    worker._zero_grad_buffer()
+    with worker._model_no_sync():
+        pass
+
+    for chunk in chunks:
+        chunk.train.assert_called_once_with(True)
+        chunk.zero_grad_buffer.assert_called_once_with()
+        chunk.no_sync.assert_called_once_with()
+    assert entered == [0, 1]
+    assert exited == [1, 0]
+
+
+def test_worker_set_param_sync_func_broadcasts_and_accepts_per_chunk_list():
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = _new_worker_impl()
+    worker.model = [
+        SimpleNamespace(config=SimpleNamespace()),
+        SimpleNamespace(config=SimpleNamespace()),
+    ]
+
+    with patch.object(
+        worker_module,
+        "get_model_config",
+        side_effect=lambda model: model.config,
+    ):
+        broadcast_fn = MagicMock()
+        worker._set_param_sync_func(broadcast_fn)
+        for chunk in worker.model:
+            assert chunk.config.param_sync_func is broadcast_fn
+
+        fn0, fn1 = MagicMock(), MagicMock()
+        worker._set_param_sync_func([fn0, fn1])
+        assert worker.model[0].config.param_sync_func is fn0
+        assert worker.model[1].config.param_sync_func is fn1
+
+        with pytest.raises(ValueError):
+            worker._set_param_sync_func([fn0])
+
+
+def test_worker_apply_state_dict_updates_all_model_chunks():
+    class Chunk0(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer0 = torch.nn.Linear(1, 1, bias=False)
+
+    class Chunk1(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer1 = torch.nn.Linear(1, 1, bias=False)
+
+    worker = _new_worker_impl()
+    worker.model = [Chunk0(), Chunk1()]
+    source_state_dict = {
+        "0/layer0.weight": torch.tensor([[3.0]]),
+        "1/layer1.weight": torch.tensor([[7.0]]),
+    }
+
+    worker._apply_state_dict_to_model(source_state_dict, raise_if_key_missing=True)
+
+    torch.testing.assert_close(worker.model[0].layer0.weight, torch.tensor([[3.0]]))
+    torch.testing.assert_close(worker.model[1].layer1.weight, torch.tensor([[7.0]]))
+
+
+def test_worker_apply_extra_state_uses_current_model_chunk():
+    class ExtraStateModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.extra_state = None
+
+        def get_extra_state(self):
+            return torch.zeros(1)
+
+        def set_extra_state(self, state):
+            self.extra_state = state
+
+    class Chunk(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = ExtraStateModule()
+
+    worker = _new_worker_impl()
+    worker.model = [Chunk()]
+    extra_state = torch.tensor([1.0, 2.0])
+
+    worker._apply_state_dict_to_model({"0/block._extra_state": extra_state})
+
+    assert worker.model[0].block.extra_state is extra_state
+
+
+def test_worker_apply_extra_state_skips_default_set_extra_state():
+    class ExtraStateWithoutSetter(torch.nn.Module):
+        def get_extra_state(self):
+            return torch.zeros(1)
+
+    class Chunk(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = ExtraStateWithoutSetter()
+
+    worker = _new_worker_impl()
+    worker.model = [Chunk()]
+
+    worker._apply_state_dict_to_model({"0/block._extra_state": torch.ones(2)})
+
+
+def test_worker_use_reference_model_restores_all_model_chunks():
+    class Chunk0(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer0 = torch.nn.Linear(1, 1, bias=False)
+
+    class Chunk1(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer1 = torch.nn.Linear(1, 1, bias=False)
+
+    worker = _new_worker_impl()
+    worker.model = [Chunk0(), Chunk1()]
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.should_disable_forward_pre_hook = False
+    worker.sampling_params = None
+    with torch.no_grad():
+        worker.model[0].layer0.weight.fill_(1.0)
+        worker.model[1].layer1.weight.fill_(2.0)
+    worker.reference_state_dict = {
+        "0/layer0.weight": torch.tensor([[10.0]]),
+        "1/layer1.weight": torch.tensor([[20.0]]),
+    }
+
+    with worker.use_reference_model():
+        torch.testing.assert_close(
+            worker.model[0].layer0.weight, torch.tensor([[10.0]])
+        )
+        torch.testing.assert_close(
+            worker.model[1].layer1.weight, torch.tensor([[20.0]])
+        )
+
+    torch.testing.assert_close(worker.model[0].layer0.weight, torch.tensor([[1.0]]))
+    torch.testing.assert_close(worker.model[1].layer1.weight, torch.tensor([[2.0]]))
+
+
+def test_worker_use_reference_model_restores_vpp_chunks_with_colliding_keys():
+    """VPP chunks share identical local layer names; all chunks must be restored correctly."""
+
+    class VppChunk(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # Both chunks intentionally have a parameter named "layer.weight",
+            # mimicking VPP where every chunk has decoder.layers.0, decoder.layers.1, ...
+            self.layer = torch.nn.Linear(1, 1, bias=False)
+
+    worker = _new_worker_impl()
+    worker.model = [VppChunk(), VppChunk()]
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.should_disable_forward_pre_hook = False
+    worker.sampling_params = None
+    with torch.no_grad():
+        worker.model[0].layer.weight.fill_(1.0)
+        worker.model[1].layer.weight.fill_(2.0)
+    # reference_state_dict uses chunk-indexed keys
+    worker.reference_state_dict = {
+        "0/layer.weight": torch.tensor([[10.0]]),
+        "1/layer.weight": torch.tensor([[20.0]]),
+    }
+
+    with worker.use_reference_model():
+        torch.testing.assert_close(worker.model[0].layer.weight, torch.tensor([[10.0]]))
+        torch.testing.assert_close(worker.model[1].layer.weight, torch.tensor([[20.0]]))
+
+    # Both chunks must be restored to their own original weights, not the last chunk's.
+    torch.testing.assert_close(worker.model[0].layer.weight, torch.tensor([[1.0]]))
+    torch.testing.assert_close(worker.model[1].layer.weight, torch.tensor([[2.0]]))
+
+
+def test_worker_prepare_for_training_moves_and_trains_each_model_chunk():
+    worker = _new_worker_impl()
+    worker.model = [MagicMock(), MagicMock()]
+    worker.move_model = MagicMock(side_effect=lambda model, *args, **kwargs: model)
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_logprob = False
+    worker.is_generation_colocated = False
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+
+    worker.prepare_for_training()
+
+    assert worker.move_model.call_count == 2
+    for chunk in worker.model:
+        chunk.train.assert_called_once_with()
+
+
+def test_worker_move_model_recurses_over_model_chunks():
+    worker = _new_worker_impl()
+    model_chunks = [torch.nn.Linear(1, 1), torch.nn.Linear(1, 1)]
+
+    moved_chunks = worker.move_model(model_chunks, "cpu")
+
+    assert moved_chunks == model_chunks
+
+
+def test_worker_check_tensor_parallel_attributes_reads_all_chunks():
+    worker = _new_worker_impl()
+    tp_chunk = torch.nn.Linear(2, 2, bias=False)
+    tp_chunk.weight.tensor_model_parallel = True
+    tp_chunk.weight.partition_dim = 0
+    tp_chunk.weight.partition_stride = 1
+    non_tp_chunk = torch.nn.Linear(2, 1, bias=False)
+    worker.model = [tp_chunk, non_tp_chunk]
+    worker.megatron_cfg = SimpleNamespace(
+        model=SimpleNamespace(tensor_model_parallel_size=2)
+    )
+
+    result = worker.check_tensor_parallel_attributes()
+
+    assert result["total_params"] == 2
+    assert result["tp_size"] == 2
+    assert len(result["tp_params"]) == 1
+    assert len(result["non_tp_params"]) == 1
+
+
+def test_worker_refit_conversion_tasks_use_model_chunk_list():
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = _new_worker_impl()
+    worker.model = [MagicMock(), MagicMock()]
+    worker.dtype = torch.float32
+    worker.fp8_cfg = None
+    mapping = SimpleNamespace(tp_size=2, ep_size=1, is_expert=False)
+    task = SimpleNamespace(
+        param_name="layer.weight",
+        param_weight=torch.ones(4, dtype=torch.float32),
+        mapping=mapping,
+    )
+    worker.megatron_bridge = MagicMock()
+    worker.megatron_bridge.get_conversion_tasks.return_value = [task]
+
+    with patch.object(
+        worker_module, "broadcast_obj_from_pp_rank", side_effect=lambda value: value
+    ):
+        result = worker._calculate_refit_param_info()
+
+    worker.megatron_bridge.get_conversion_tasks.assert_called_once_with(worker.model)
+    assert result == [("layer.weight", 32)]
+
+
+def test_worker_get_gpu_info_uses_first_model_chunk():
+    worker = _new_worker_impl()
+    worker.model = [MagicMock(), MagicMock()]
+
+    with patch(
+        "nemo_rl.models.policy.utils.get_gpu_info",
+        return_value={"name": "test-gpu"},
+    ) as mock_get_gpu_info:
+        result = worker.get_gpu_info()
+
+    mock_get_gpu_info.assert_called_once_with(worker.model[0])
+    assert result == {"name": "test-gpu"}

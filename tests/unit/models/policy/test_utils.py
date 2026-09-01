@@ -30,9 +30,61 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
+    has_custom_pp_layout,
+    has_custom_pp_layout_or_interleaved_vpp,
+    has_interleaved_vpp,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
 )
+
+
+def test_pipeline_layout_helpers_accept_input_config_mappings() -> None:
+    cases: list[tuple[dict[str, object], bool, bool, bool]] = [
+        ({}, False, False, False),
+        (
+            {
+                "pipeline_model_parallel_layout": None,
+                "virtual_pipeline_model_parallel_size": None,
+            },
+            False,
+            False,
+            False,
+        ),
+        (
+            {
+                "pipeline_model_parallel_layout": None,
+                "virtual_pipeline_model_parallel_size": 1,
+            },
+            False,
+            False,
+            False,
+        ),
+        (
+            {
+                "pipeline_model_parallel_layout": "E(tt|)*13tL",
+                "virtual_pipeline_model_parallel_size": None,
+            },
+            True,
+            False,
+            True,
+        ),
+        (
+            {
+                "pipeline_model_parallel_layout": None,
+                "virtual_pipeline_model_parallel_size": 2,
+            },
+            False,
+            True,
+            True,
+        ),
+    ]
+
+    for megatron_cfg, expected_layout, expected_vpp, expected_combined in cases:
+        assert has_custom_pp_layout(megatron_cfg) is expected_layout
+        assert has_interleaved_vpp(megatron_cfg) is expected_vpp
+        assert (
+            has_custom_pp_layout_or_interleaved_vpp(megatron_cfg) is expected_combined
+        )
 
 
 class TestGetMegatronCheckpointDir:
