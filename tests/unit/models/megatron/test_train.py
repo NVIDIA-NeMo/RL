@@ -759,6 +759,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
             cu_seqlens_padded=packed_seq_params.cu_seqlens_q_padded,
+            original_seq_length=3,
         )
         post_processor = LogprobsPostProcessor(
             cfg={"sequence_packing": {"enabled": True}}
