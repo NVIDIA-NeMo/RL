@@ -35,14 +35,24 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
+from nemo_rl.algorithms.grpo import (
+    _REWARD_PENALTY_FLAGS,
+    GRPOConfig,
+    GRPOLoggerConfig,
+    RewardPenaltyConfig,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+)
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -284,14 +294,48 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # nothing dispatches on this value, so accepting "round_robin" would silently give
     # the caller least_outstanding anyway.
     selection: Literal["least_outstanding"] = "least_outstanding"
-    # What to do once a shard is quarantined. Recovery modes arrive with the
-    # communicator rebuild.
+    # What to do once a shard is quarantined, for the case that cannot be recovered from.
+    #
+    # "Recovery modes arrive with the communicator rebuild" used to sit here as a forward
+    # reference. The rebuild has since landed, and recovery is not selected through this
+    # field at all: the reconcile rebuilds over the survivors whenever a shard becomes
+    # absent, whatever this says. A Literal of one for the same reason as selection above
+    # -- nothing dispatches on the value, so a second option would be a lie.
     on_dead_shard: Literal["fail_fast"] = "fail_fast"
     # Attempts to bring a shard back before retiring it permanently, counted across the
     # whole run rather than per incident.
     max_restart_attempts_per_shard: PositiveInt = 5
     # Serving shards below which the run cannot usefully continue.
     min_healthy_shards: PositiveInt = 1
+    # Deadline for one refit collective, after which each participating worker aborts its
+    # own communicator.
+    #
+    # With enabled=True the controller then rebuilds over the survivors and retries once.
+    # With enabled=False there is nothing to rebuild against, so the abort ends the run
+    # with RefitAborted -- still far better than hanging forever inside NCCL, but choose
+    # the deadline knowing there is no second chance.
+    #
+    # None disarms it: no watchdog thread is started and the refit path is byte-identical
+    # to before. Set it well above a healthy refit, because the cost of firing early is
+    # aborting a run that was merely slow, while the cost of firing late is only that a
+    # wedge lasts longer before it is broken.
+    #
+    # DEFAULTED, not None, because the deadline is what makes reactive recovery possible
+    # at all rather than a nicety on top of it. A Ray actor runs one task at a time
+    # (nothing here raises max_concurrency) and this group is a raw StatelessProcessGroup
+    # with no torch process-group watchdog behind it, so a shard dying mid-collective
+    # leaves every trainer blocked inside NCCL. The driver sees RayActorError and calls
+    # _recover_from_failed_refit, whose init_collective then queues behind the still-blocked
+    # task and never runs: the recovery itself wedges and the run ends on stall_timeout_s.
+    # Only the abort releases those ranks. With None as the default, a config that turned
+    # fleet health on got detection and quarantine but no refit recovery, silently.
+    #
+    # 300s is ~150x a healthy refit for a 1.5B model on GB200 (~1.9s measured), so it
+    # cannot fire on a merely-slow one at that scale. It is bandwidth-bound and roughly
+    # linear in parameter count, though: ~90s at 70B and ~500s at 405B on the same
+    # measurement, so a frontier-scale model needs this raised or it will abort a healthy
+    # refit. Set it explicitly there; set it to None to disarm the watchdog entirely.
+    refit_timeout_s: Optional[PositiveFloat] = 300.0
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "FleetHealthConfig":
@@ -552,6 +596,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
@@ -731,6 +776,16 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """
     algo_cfg = algo_config(master_config)
 
+    # None means no epoch bound. SC has no -1 convention though: the rollout pump
+    # gates on _current_epoch < max_num_epochs, so <= 0 trains nothing and exits 0.
+    if algo_cfg.max_num_epochs is not None and algo_cfg.max_num_epochs <= 0:
+        raise ValueError(
+            f"max_num_epochs={algo_cfg.max_num_epochs} trains zero steps on the "
+            "SingleController path, which does not use the -1 convention that v1 "
+            "async PPO requires. Set a positive max_num_epochs and bound the run "
+            "with max_num_steps."
+        )
+
     # SC reads none of these on either path, so an enabled one describes shaping
     # this run does not do. Async GRPO rejects three of them the same way.
     unsupported = [
@@ -889,6 +944,15 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 
+    reward_penalties_enabled = any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    )
+    if reward_penalties_enabled and not master_config.env.get("should_use_nemo_gym"):
+        raise ValueError(
+            "reward_penalties require the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true) on SingleController"
+        )
+
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(
             f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) "
@@ -980,6 +1044,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # configs can omit it. Only apply rollout-path validation when it is present.
     env_config = getattr(master_config, "env", None)
 
+    penalties_enabled = (
+        algo_cfg.invalid_tool_call_advantage is not None
+        or algo_cfg.malformed_thinking_advantage is not None
+    )
+    if penalties_enabled and not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "invalid_tool_call_advantage and malformed_thinking_advantage on the "
+            "active algorithm block require the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true) on SingleController."
+        )
+
     opd_enabled = opd_module.is_opd_enabled(master_config)
     if opd_enabled and is_ppo_run(master_config):
         raise ValueError(
@@ -1066,6 +1141,8 @@ class AdvantageConfig:
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
+    invalid_tool_call_mask_field: str = INVALID_TOOL_CALL_MASK
+    malformed_thinking_mask_field: str = MALFORMED_THINKING_MASK
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
     generation_logprobs_field: str = "generation_logprobs"

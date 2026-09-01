@@ -14,7 +14,7 @@
 
 import pytest
 
-from nemo_rl.utils.flops_tracker import FLOPTracker, get_default_hf_config
+from nemo_rl.utils.flops_tracker import FLOPTracker, get_hf_config
 
 
 @pytest.mark.parametrize(
@@ -33,7 +33,7 @@ from nemo_rl.utils.flops_tracker import FLOPTracker, get_default_hf_config
     ],
 )
 def test_flops_counter(model_name, gbs, seqlen, expected_flops):
-    model_config = get_default_hf_config(model_name)
+    model_config = get_hf_config(model_name)
     flops_tracker = FLOPTracker.from_config(model_name, model_config)
     flops_tracker.track(gbs, seqlen)
 

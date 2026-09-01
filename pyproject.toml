@@ -52,9 +52,9 @@ dependencies = [
   "torchvision==0.26.0",
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
-  # Keep the base range broad enough while allowing backend extras to tighten as needed.
-  # Floor raised to 5.5.0 for Gemma 4 support.
-  "transformers>=5.5.0,<5.13.0",
+  # Keep the base range compatible with backend-specific pins while selecting 5.12.1
+  # for the base and compatible backend environments in uv.lock.
+  "transformers>=5.5.0,<=5.12.1",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -70,15 +70,22 @@ dependencies = [
   "pybase64",                                                                                                 # for sglang refit
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
   "zstandard",                                                                                                # for sparse refit body compression
-  "fastokens-b10>=0.1.1",                                                                                     # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                   # for transformer-engine no build isolation
-  # tilelang — replacement Triton kernel mamba-ssm requires when
-  # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
-  # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
-  # crash at first gated-chunk backward with a RuntimeError pointing
-  # at this exact pip install. Linux x86_64 only — mamba-ssm itself
-  # is gated to that pair.
-  "tilelang>=0.1.9,<0.1.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "fastokens>=0.2.0",                                                                                         # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
+  # OpenTelemetry instrumentation. Base (not extra) so it reaches every worker
+  # venv; `telemetry.enabled` in the config is the on/off switch. Sourced from
+  # git in [tool.uv.sources] — see the note there; the floor is above the
+  # newest PyPI release so a dropped pin fails to resolve instead of silently
+  # falling back to 0.1.0.
+  "nemo-lens[sdk]>=0.2.0",
+  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'", # for transformer-engine no build isolation
+  # tilelang — required by fused DSA TileLang kernels on Blackwell and by the
+  # replacement Triton kernel mamba-ssm requires when Triton >= 3.4.0 on Hopper;
+  # see https://github.com/state-spaces/mamba/issues/640.
+  # Without it, qwen3.5 / nano-v3 / moonlight Megatron recipes crash at first
+  # gated-chunk backward with a RuntimeError pointing at this exact pip install.
+  # Keep the base range broad for both supported Linux architectures; backend
+  # extras tighten the version as required.
+  "tilelang>=0.1.9,<0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
   # automatically include them. Removes the need for a `[data-plane]`
@@ -109,9 +116,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Keep non-SGLang backends on their pre-SGLang-upgrade Transformers versions.
-# FSDP retains the shared range because it can be combined with other backend extras.
 fsdp = [
+  "transformers==5.12.1",
   # +cu13 wheels from GitHub match torch cu130; PyPI often resolves to +cu12 (libcudart.so.12).
   # https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.1
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
@@ -119,19 +125,21 @@ fsdp = [
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "mamba-ssm",
   "causal-conv1d",
-  "transformers>=5.5.0,<5.9.0",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 automodel = [
   "nemo-automodel[moe]",
+  # Automodel's FLA kernels require this TileLang version on Hopper.
+  # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
+  "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "transformers==5.5.0",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
+  "transformers==5.12.1",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
@@ -141,7 +149,7 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
 ]
 vllm = [
-  "transformers==5.8.1",
+  "transformers==5.12.1",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "cuda-python",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
@@ -194,8 +202,8 @@ mcore = [
   # dependency megatron-core[dev,mlm] and its [tool.uv.sources] path mapping, so Megatron-LM
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
-  "transformers==5.8.1",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "transformers==5.12.1",
+  "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -213,6 +221,8 @@ mcore = [
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
+  "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -287,6 +297,11 @@ nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = t
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
 nemo_gym = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
+# Must stay on the rev megatron-core pins for its dev/otel extras: the workspace
+# resolves a single nemo-lens, and PyPI's newest release (0.1.0) is older than
+# that rev, so declaring this dependency without the pin downgrades lens for
+# megatron-core too.
+nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b85578fc2b736a1804705e537001b5f45e9c715d" }
 sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "3003d70f680d41c59d1b7acbf65cb47795dfd19e", subdirectory = "python" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -304,6 +319,9 @@ triton = [
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
+# FlashMLA derives its version from the Git revision in setup.py. Keep this pin
+# synchronized with the static dependency metadata below.
+flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
 flashinfer-cubin = { index = "flashinfer", extra = "sglang" }
@@ -356,6 +374,7 @@ no-build-isolation-package = [
   "fast-hadamard-transform",
   "deep_gemm",
   "deep_ep",
+  "flash_mla",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "tensorrt-llm",             # custom PEP 517 backend calls build-custom-trtllm.sh; needs torch/CUDA from main venv
 ]
@@ -379,7 +398,7 @@ override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.23.0",
+  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
@@ -387,6 +406,7 @@ override-dependencies = [
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
+  "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
   # Floor only: trtllm (<1.4.0) and vllm (>=1.7.0) are incompatible, and the
@@ -403,11 +423,10 @@ override-dependencies = [
   # xgrammar.normalize_tool_choice (vLLM requires xgrammar>=0.2.1,<1.0.0; the
   # override would otherwise force an incompatible downgrade).
   "xgrammar>=0.2.1,<1.0.0",
-  # tensorrt-llm 1.3.0rc21 pins apache-tvm-ffi==0.1.6, but the xgrammar the
-  # line above selects needs >=0.1.9, and the xgrammar releases that would
-  # accept 0.1.6 ship no cp313 wheels. Take the newer one, as with llguidance
-  # above; without this the trtllm extra is unsatisfiable on vLLM 0.25.1.
-  "apache-tvm-ffi>=0.1.9",
+  # tensorrt-llm 1.3.0rc21 pins apache-tvm-ffi==0.1.6, while xgrammar needs
+  # >=0.1.9. TileLang 0.1.11's bundled compiler additionally requires the
+  # 0.1.11 ABI, so keep the shared override on that compatible release.
+  "apache-tvm-ffi==0.1.11",
   # Override dependencies to address CVEs
   "mlflow>=3.13.0",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
@@ -439,6 +458,10 @@ constraint-dependencies = [
   # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
   "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0",
   "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
+  # Same story for megatron-fsdp, which nemo-automodel (r0.6.0) resolves from a
+  # Megatron-LM fork via its own [tool.uv.sources] instead of PyPI. Keep this URL/rev
+  # in sync with 3rdparty/Automodel-workspace/Automodel/pyproject.toml.
+  "megatron-fsdp @ git+https://github.com/yuhezhang-ai/Megatron-LM.git@455389c480af6b3acdca74c7830c68b3274eb083#subdirectory=megatron/core/distributed/fsdp/src",
   # megatron-energon pulls s3fs; without a floor uv picks the 2020-era s3fs 0.4.2
   # (which needs only plain botocore) instead of a modern aiobotocore-based release.
   "s3fs>=2024.6.0",
@@ -538,6 +561,22 @@ conflicts = [
     { extra = "trtllm" },
     { extra = "mcore" },
   ],
+  [
+    { extra = "trtllm" },
+    { extra = "fsdp" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "modelopt" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "nvrx" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "nemo_gym" },
+  ],
 ]
 
 
@@ -553,11 +592,22 @@ mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
+flash_mla = [{ requirement = "torch", match-runtime = true }]
+
+# torch-memory-saver's build backend reads TMS_CUDA_MAJOR at build time. Keep this in
+# sync with docker/Dockerfile's BASE_IMAGE CUDA major version (currently cuda13.x).
+[tool.uv.extra-build-variables]
+torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-mla"
+version = "1.0.0+b7643bd"
+requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "causal-conv1d"
