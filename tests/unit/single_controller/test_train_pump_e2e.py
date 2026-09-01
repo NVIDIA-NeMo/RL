@@ -279,6 +279,7 @@ def test_train_pump_drives_mcore_training_step(
             dp_client,
             partition_id=_PARTITION_ID,
             pad_value_dict={"input_ids": int(tokenizer.pad_token_id or 0)},
+            include_message_violation_fields=False,
         )
         for step in range(train_steps):
             for g in range(num_prompts):

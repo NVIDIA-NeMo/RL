@@ -45,6 +45,7 @@ from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
+    _startup_pipeline_ready,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
 )
@@ -1245,23 +1246,21 @@ class TestReplayBuffer:
 
         ray.kill(buffer2)
 
-    def test_resume_deadlock_precondition_detectable(self):
-        """Regression: restored buffer can expose an async resume deadlock.
+    def test_restore_preserves_complete_current_target_without_lookahead(self):
+        """A restored buffer preserves target N while target N+1 remains absent.
 
-        After PR #2651 introduced replay-buffer checkpointing, resuming from a
-        checkpoint where target N is complete but target N+1 is absent can
-        deadlock Async GRPO or Async PPO:
+        This is the precondition for the async resume deadlock that PR #2651's
+        replay-buffer checkpointing exposed in Async GRPO or Async PPO:
 
           1. Startup wait sees has_complete_batch(N) == True and breaks immediately.
           2. Training consumes all target-N trajectories and triggers a refit.
           3. Collector's post-refit target window becomes [N+2, ...] (skipping N+1).
           4. Training waits for target N+1, which nobody generates — stall forever.
 
-        The fix is a startup pipeline barrier: before breaking, also require
-        has_complete_batch(N+1) to be True (or N+1 >= max_steps).  This test
-        constructs the exact precondition state — current step complete, lookahead
-        absent — to ensure it remains detectable and to document the expected
-        buffer readiness values that the barrier logic branches on.
+        The startup pipeline barrier requires target N+1 to be complete *or*
+        actively claimed by the collector before training may begin.  This test
+        constructs the precondition state — current step complete, lookahead
+        absent — and documents the buffer readiness values the barrier branches on.
         """
         num_prompts = 8
         resume_step = 30
@@ -1301,12 +1300,11 @@ class TestReplayBuffer:
             buffer2.has_complete_batch.remote(resume_step, num_prompts, max_age)
         ), "target step must be complete after restore"
 
-        # Step 31 is absent — this is the deadlock precondition.
-        # The startup pipeline barrier must detect this and continue waiting
-        # instead of breaking, giving the collector time to generate step 31.
+        # Step 31 is absent — startup may proceed only after collector status
+        # reports that this target has been claimed.
         assert not ray.get(
             buffer2.has_complete_batch.remote(resume_step + 1, num_prompts, max_age)
-        ), "lookahead step must be absent; barrier should block here"
+        ), "lookahead step must be absent from the restored buffer"
 
         ray.kill(buffer2)
 
@@ -2843,6 +2841,70 @@ class TestAsyncTrajectoryCollector:
         collector._release_target(target_weight)
 
         assert target_weight not in collector._generating_targets
+
+    def test_startup_barrier_clears_when_collector_reserves_lookahead(self):
+        """A real lookahead reservation opens the resume startup barrier."""
+        num_prompts = 2
+        resume_step = 30
+        max_age = 2
+
+        buffer1 = ReplayBuffer.remote(
+            max_size=20, drop_incomplete_targets_on_restore=False
+        )
+        buffer2 = None
+        try:
+            for _ in range(num_prompts):
+                ray.get(
+                    buffer1.add.remote(
+                        {"batch": {"data": "x"}, "rollout_metrics": {}},
+                        weight_version=resume_step - 1,
+                        target_weight_version=resume_step,
+                    )
+                )
+            state = ray.get(buffer1.state_dict.remote())
+            ray.kill(buffer1)
+            buffer1 = None
+
+            buffer2 = ReplayBuffer.remote(
+                max_size=20, drop_incomplete_targets_on_restore=False
+            )
+            ray.get(
+                buffer2.load_state_dict.remote(
+                    state,
+                    num_prompts_per_step=num_prompts,
+                    current_training_step=resume_step,
+                    max_age_steps=max_age,
+                )
+            )
+
+            collector = self.create_local_collector(replay_buffer=buffer2)
+            collector.initial_weight_version = resume_step
+            collector.current_weight_version = resume_step
+
+            def barrier_open() -> bool:
+                return _startup_pipeline_ready(
+                    buffer2,
+                    collector.get_status(),
+                    current_step_ready=True,
+                    step=resume_step,
+                    num_prompts_per_step=num_prompts,
+                    max_trajectory_age_steps=max_age,
+                    max_num_steps=resume_step + 100,
+                )
+
+            assert not barrier_open()
+            reserved = collector._get_next_target_for_generation(resume_step)
+            assert reserved == resume_step + 1
+            assert collector.get_status()["generating_targets"] == [resume_step + 1]
+            assert barrier_open()
+
+            collector._release_target(reserved)
+            assert not barrier_open()
+        finally:
+            if buffer1 is not None:
+                ray.kill(buffer1)
+            if buffer2 is not None:
+                ray.kill(buffer2)
 
     def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
         """Test start failures do not leave a target reserved forever."""
