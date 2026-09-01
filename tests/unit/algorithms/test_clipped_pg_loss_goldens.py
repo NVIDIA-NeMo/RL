@@ -25,7 +25,6 @@ from nemo_rl.algorithms.loss.loss_functions import (
     ClippedPGLossFn,
 )
 
-
 GOLDEN_PATH = Path(__file__).parent / "data" / "clipped_pg_loss_goldens.json"
 GOLDENS = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
 GOLDEN_CASES = {case["name"]: case for case in GOLDENS["cases"]}
