@@ -241,15 +241,18 @@ def make_empty_cache_best_effort_under_expandable_segments() -> None:
     if getattr(original_empty_cache, "_nrl_best_effort", False):
         return
 
-    def _best_effort_empty_cache() -> None:
-        try:
-            original_empty_cache()
-        except RuntimeError as e:
-            warnings.warn(
-                f"torch.cuda.empty_cache() failed under expandable_segments; "
-                f"skipping cache flush: {e}"
-            )
-
+def _best_effort_empty_cache() -> None:
+    try:
+        original_empty_cache()
+    except RuntimeError as e:
+        msg = str(e)
+        if "wrong index for variant" not in msg:
+            raise
+        warnings.warn(
+            "torch.cuda.empty_cache() failed under expandable_segments; "
+            f"skipping cache flush: {msg}",
+            stacklevel=2,
+        )
     _best_effort_empty_cache._nrl_best_effort = True  # type: ignore[attr-defined]
     torch.cuda.empty_cache = _best_effort_empty_cache
 
