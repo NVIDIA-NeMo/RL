@@ -18,7 +18,6 @@ from typing import Any
 
 import torch
 
-
 BASE_INPUTS: dict[str, Any] = {
     "input_ids": [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]],
     "token_mask": [[0.0, 1.0, 1.0, 1.0, 0.0], [0.0, 1.0, 1.0, 0.0, 0.0]],
