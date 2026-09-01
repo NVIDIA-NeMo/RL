@@ -1267,3 +1267,116 @@ def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypat
     ext._maybe_process_mtp_drafter_after_loading()
 
     process_weights.assert_not_called()
+
+
+class _FakeRefitZmqSocket:
+    """Replays a scripted IPC payload sequence and records the replies."""
+
+    def __init__(self, payloads):
+        self._payloads = list(payloads)
+        self.byte_acks = []
+        self.pyobj_acks = []
+
+    def recv_pyobj(self):
+        return self._payloads.pop(0)
+
+    def send(self, data):
+        self.byte_acks.append(data)
+
+    def send_pyobj(self, obj):
+        self.pyobj_acks.append(obj)
+
+
+def _make_ipc_update_extension(backend, state_dict_info, payloads):
+    ext = backend.VllmInternalWorkerExtension.__new__(
+        backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = state_dict_info
+    ext.device = SimpleNamespace(index=0)
+    ext.zmq_socket = _FakeRefitZmqSocket(payloads)
+    ext.maybe_init_zmq = lambda: None
+    ext.loaded_weights = []
+    ext._load_weights = ext.loaded_weights.extend
+    ext._synchronize_before_ipc_data_ack = lambda: None
+    ext._weight_update_errors_are_fatal = lambda: True
+
+    @contextlib.contextmanager
+    def _lifecycle(_transport):
+        yield lambda: None
+
+    ext._weight_update_lifecycle = _lifecycle
+    return ext
+
+
+def _pack_ipc_group(params):
+    """Stage tensors into one 512-byte-aligned buffer, sender-style."""
+    from nemo_rl.models.policy.utils import calculate_aligned_size
+
+    total = sum(calculate_aligned_size(t.nbytes) for _, t in params)
+    buffer = torch.zeros(total, dtype=torch.uint8)
+    offset = 0
+    for _, tensor in params:
+        raw = tensor.reshape(-1).view(torch.uint8)
+        buffer[offset : offset + tensor.nbytes] = raw
+        offset += calculate_aligned_size(tensor.nbytes)
+    return buffer, offset
+
+
+@pytest.mark.vllm
+def test_ipc_update_returns_received_digests_with_final_ack(monkeypatch):
+    """With verify on, the COMPLETE ACK is a pyobj carrying per-param digests."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol
+    from nemo_rl.weight_sync.digest import digests_to_ints, tensor_digest
+
+    params = [
+        ("a.weight", torch.arange(4, dtype=torch.float32)),
+        ("b.weight", torch.arange(6, dtype=torch.float32).reshape(2, 3)),
+    ]
+    buffer, used_bytes = _pack_ipc_group(params)
+    state_dict_info = {name: (t.shape, t.dtype) for name, t in params}
+
+    ext = _make_ipc_update_extension(
+        vllm_backend,
+        state_dict_info,
+        payloads=[
+            (buffer, [name for name, _ in params], used_bytes),
+            IPCProtocol.COMPLETE,
+        ],
+    )
+    monkeypatch.setattr(
+        vllm_backend, "rebuild_cuda_tensor_from_ipc", lambda handle, _index: handle
+    )
+
+    assert ext.update_weights_via_ipc_zmq(verify_digests=True) is True
+
+    assert [name for name, _ in ext.loaded_weights] == ["a.weight", "b.weight"]
+    # Data batches keep the plain byte ACK; only COMPLETE is answered as pyobj.
+    assert len(ext.zmq_socket.byte_acks) == 1
+    assert len(ext.zmq_socket.pyobj_acks) == 1
+    ack = ext.zmq_socket.pyobj_acks[0]
+    expected = digests_to_ints({name: tensor_digest(tensor) for name, tensor in params})
+    assert ack["digests"] == expected
+
+
+@pytest.mark.vllm
+def test_ipc_update_default_keeps_plain_byte_acks(monkeypatch):
+    """verify off must keep the wire format byte-for-byte as before."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol
+
+    params = [("a.weight", torch.arange(4, dtype=torch.float32))]
+    buffer, used_bytes = _pack_ipc_group(params)
+
+    ext = _make_ipc_update_extension(
+        vllm_backend,
+        {name: (t.shape, t.dtype) for name, t in params},
+        payloads=[(buffer, ["a.weight"], used_bytes), IPCProtocol.COMPLETE],
+    )
+    monkeypatch.setattr(
+        vllm_backend, "rebuild_cuda_tensor_from_ipc", lambda handle, _index: handle
+    )
+
+    assert ext.update_weights_via_ipc_zmq() is True
+    assert len(ext.zmq_socket.byte_acks) == 2
+    assert ext.zmq_socket.pyobj_acks == []

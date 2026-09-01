@@ -50,6 +50,10 @@ class IPCWeightSynchronizer(WeightSynchronizer):
             (concretely a VllmGeneration instance).
         refit_buffer_size_gb: Fixed buffer size in GB for weight staging.
             If None, buffer size is computed dynamically from free GPU memory.
+        verify_mode: Byte-level transfer verification mode ("off", "log",
+            or "enforce"), resolved from
+            ``policy.generation.refit_cfg.verify.mode``. Passed through to
+            both the sending policy workers and the receiving vLLM workers.
     """
 
     def __init__(
@@ -57,10 +61,12 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         policy: Any,
         generation: Any,
         refit_buffer_size_gb: Optional[float | int] = None,
+        verify_mode: str = "off",
     ):
         self._policy = policy
         self._generation = generation
         self._refit_buffer_size_gb = refit_buffer_size_gb
+        self._verify_mode = verify_mode
         self._stale = True
 
     def sync_weights(
@@ -85,8 +91,11 @@ class IPCWeightSynchronizer(WeightSynchronizer):
                 futures_train = self._policy.stream_weights_via_ipc_zmq(
                     buffer_size_bytes=buffer_size_bytes,
                     kv_scales=kv_scales,
+                    verify_mode=self._verify_mode,
                 )
-                futures_inference = self._generation.update_weights_via_ipc_zmq()
+                futures_inference = self._generation.update_weights_via_ipc_zmq(
+                    verify_digests=self._verify_mode != "off"
+                )
 
                 ray.get(futures_train)
                 results = ray.get(futures_inference)

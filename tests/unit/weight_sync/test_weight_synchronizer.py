@@ -150,6 +150,37 @@ class TestIPCWeightSynchronizer:
         assert call_kwargs.kwargs["kv_scales"] == kv_scales
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+    def test_sync_weights_threads_verify_mode_to_both_sides(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="enforce")
+
+        sync.sync_weights()
+
+        assert (
+            policy.stream_weights_via_ipc_zmq.call_args.kwargs["verify_mode"]
+            == "enforce"
+        )
+        assert gen.update_weights_via_ipc_zmq.call_args.kwargs["verify_digests"] is True
+
+    @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+    def test_sync_weights_default_leaves_verification_off(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = IPCWeightSynchronizer(policy, gen)
+
+        sync.sync_weights()
+
+        assert (
+            policy.stream_weights_via_ipc_zmq.call_args.kwargs["verify_mode"] == "off"
+        )
+        assert (
+            gen.update_weights_via_ipc_zmq.call_args.kwargs["verify_digests"] is False
+        )
+
+    @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_sync_weights_raises_on_failure(self, mock_ray):
         mock_ray.get.side_effect = [
             None,  # futures_train

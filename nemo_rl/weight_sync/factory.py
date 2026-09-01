@@ -192,8 +192,17 @@ def create_weight_synchronizer(
         IPCWeightSynchronizer,
     )
 
+    verify_mode = "off"
+    if generation_backend == VLLM_BACKEND:
+        from nemo_rl.models.generation.vllm.config import (
+            resolve_refit_verify_config,
+        )
+
+        verify_mode = resolve_refit_verify_config(generation.cfg).mode
+
     return IPCWeightSynchronizer(
         policy=policy,
         generation=generation,
         refit_buffer_size_gb=refit_buffer_size_gb,
+        verify_mode=verify_mode,
     )

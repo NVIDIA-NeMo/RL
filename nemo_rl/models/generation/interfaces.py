@@ -493,7 +493,9 @@ class GenerationInterface(ABC):
         """Prepare the info for refit."""
         raise NotImplementedError
 
-    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+    def update_weights_via_ipc_zmq(
+        self, verify_digests: bool = False
+    ) -> list[ray.ObjectRef]:
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
 

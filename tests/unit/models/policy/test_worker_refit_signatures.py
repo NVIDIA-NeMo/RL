@@ -57,6 +57,15 @@ FANOUT_METHODS = [
             "interfaces.py",
         ],
     ),
+    (
+        "stream_weights_via_ipc_zmq",
+        [
+            "workers/dtensor_policy_worker.py",
+            "workers/dtensor_policy_worker_v2.py",
+            "workers/megatron_policy_worker.py",
+            "interfaces.py",
+        ],
+    ),
 ]
 
 # The same contract on the generation side, and worse there: VllmGeneration picks the
@@ -85,7 +94,17 @@ GEN_FANOUT = [
     ),
     ("nccl_reshard_refit", "vllm_worker.py", "nccl_reshard_refit"),
     ("nccl_reshard_refit", "vllm_worker_async.py", "nccl_reshard_refit_async"),
+    ("update_weights_via_ipc_zmq", "vllm_worker.py", "update_weights_via_ipc_zmq"),
+    (
+        "update_weights_via_ipc_zmq",
+        "vllm_worker_async.py",
+        "update_weights_via_ipc_zmq_async",
+    ),
 ]
+
+# Worker-group control kwargs consumed by run_all_workers_*() itself, never
+# forwarded to the worker method.
+WORKER_GROUP_CONTROL_KWARGS = {"run_rank_0_only_axes"}
 
 # One level up again: CollectiveWeightSynchronizer holds a GenerationInterface and calls
 # update_weights_from_collective on it, so EVERY backend has to take what it sends --
@@ -172,13 +191,22 @@ def _forwarded_by_vllm_generation(method: str) -> set[str]:
         ):
             continue
         for call in ast.walk(node):
-            if (
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "remote"
+            if not (
+                isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
             ):
+                continue
+            if call.func.attr == "remote":
                 return {kw.arg for kw in call.keywords if kw.arg is not None}
-    raise AssertionError(f"VllmGeneration.{method}() has no .remote() fan-out")
+            # Same contract when the fan-out goes through the worker group:
+            # every kwarg except the group's own control kwargs reaches the
+            # worker method picked by config.
+            if call.func.attr.startswith("run_all_workers"):
+                return {
+                    kw.arg
+                    for kw in call.keywords
+                    if kw.arg is not None and kw.arg not in WORKER_GROUP_CONTROL_KWARGS
+                }
+    raise AssertionError(f"VllmGeneration.{method}() has no worker fan-out")
 
 
 @pytest.mark.parametrize(

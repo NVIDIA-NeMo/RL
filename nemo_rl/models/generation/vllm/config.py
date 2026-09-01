@@ -165,9 +165,24 @@ class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
     release_after_refit: bool = False
 
 
+class VllmRefitVerifyConfig(BaseModel, extra="allow"):
+    """Byte-level verification of refit weight transfers.
+
+    mode:
+        - "off": no verification (default; zero overhead).
+        - "log": hash sent and received bytes per parameter, print a warning
+          listing mismatched parameters.
+        - "enforce": like "log", but raise instead of warning so a corrupted
+          transfer fails the refit rather than silently skewing rollouts.
+    """
+
+    mode: Literal["off", "log", "enforce"] = "off"
+
+
 class VllmRefitConfig(BaseModel, extra="allow"):
     sparse: VllmSparseRefitConfig = Field(default_factory=VllmSparseRefitConfig)
     nixl: VllmNixlRefitConfig = Field(default_factory=VllmNixlRefitConfig)
+    verify: VllmRefitVerifyConfig = Field(default_factory=VllmRefitVerifyConfig)
 
 
 class VllmConfig(GenerationConfig):
@@ -257,6 +272,21 @@ def materialize_vllm_video_config(
     # VideoMediaIO otherwise defaults to 32 independently of the policy-side
     # frame count. Materializing the value here makes a mismatch impossible.
     video_media_io_kwargs["num_frames"] = video_config.num_frames
+
+
+def resolve_refit_verify_config(config: VllmConfig) -> VllmRefitVerifyConfig:
+    """Resolve the refit verification scope regardless of transport.
+
+    ``normalize_vllm_refit_config`` returns early for the default transports
+    (null -> IPC/collective, "nccl_reshard") without validating ``refit_cfg``,
+    but verification is orthogonal to transport selection, so it is resolved
+    here independently.
+    """
+    refit_cfg = config.get("refit_cfg")
+    if isinstance(refit_cfg, VllmRefitConfig):
+        return refit_cfg.verify
+    raw_verify = (refit_cfg or {}).get("verify") or {}
+    return VllmRefitVerifyConfig.model_validate(raw_verify)
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
