@@ -79,7 +79,6 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
-from nemo_rl.models.automodel.draft.integration import finalize_draft_ratio_metrics
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
@@ -88,6 +87,25 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
+
+
+def _finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
+    """Lazily defer to automodel's draft integration; no-op if it isn't installed.
+
+    Called unconditionally every step regardless of ``policy.draft.enabled`` or
+    backend, so importing ``nemo_rl.models.automodel.draft`` (which eagerly
+    imports ``nemo_automodel`` at package-init time) can't be a module-level
+    import here -- that would force every sync-GRPO run, including
+    Megatron-only runs, to have ``nemo_automodel`` importable in the driver's
+    venv. Deferred: only paid for when draft co-training is actually used.
+    """
+    try:
+        from nemo_rl.models.automodel.draft.integration import (
+            finalize_draft_ratio_metrics,
+        )
+    except ImportError:
+        return
+    finalize_draft_ratio_metrics(metrics)
 
 
 def _raise_if_message_level_advantage_penalties_enabled(
@@ -1108,7 +1126,7 @@ def grpo_train_sync(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
-                finalize_draft_ratio_metrics(metrics)
+                _finalize_draft_ratio_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
