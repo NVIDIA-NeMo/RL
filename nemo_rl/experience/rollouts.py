@@ -56,6 +56,7 @@ from nemo_rl.environments.interfaces import (
 )
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
+    assign_nemo_gym_generation_replica_indices,
     get_pad_dynamic_image_shapes,
 )
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
@@ -2341,6 +2342,9 @@ async def run_async_nemo_gym_rollout(
     sampling_params: Optional[GenerationSamplingParams] = None,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    generation_only: bool = False,
+    generation_policy_version: str | None = None,
+    identity_group_size: int | None = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2379,6 +2383,12 @@ async def run_async_nemo_gym_rollout(
             remote Gym return and restore the exact original payload locally.
         debug_payload_metrics: Emit logical, physical, and serialized media
             payload metrics at the Gym Ray boundary.
+        generation_only: Preserve compacted trace evidence without admitting it
+            to training (used by validation and generation qualification).
+        generation_policy_version: Synchronized policy identity required by
+            exact-trace training contracts.
+        identity_group_size: Number of rollout replicas sharing one logical
+            comparison-group identity. Defaults to ``num_generations``.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2439,6 +2449,12 @@ async def run_async_nemo_gym_rollout(
     )
     if num_generations <= 0:
         raise ValueError("num_generations must be greater than zero")
+    if identity_group_size is None:
+        identity_group_size = num_generations
+    if identity_group_size <= 0 or len(nemo_gym_rows) % identity_group_size:
+        raise ValueError(
+            "NeMo-Gym rollout batch size must be divisible by identity_group_size"
+        )
     if not nemo_gym_rows:
         raise ValueError("NeMo-Gym rollout batch must not be empty")
     if len(nemo_gym_rows) % num_generations != 0:
@@ -2464,6 +2480,10 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
+        assign_nemo_gym_generation_replica_indices(
+            input_batch,
+            num_generations_per_prompt=identity_group_size,
+        )
         _prepare_nemo_gym_rows(nemo_gym_rows, generation_config, sampling_params)
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
@@ -2488,7 +2508,12 @@ async def run_async_nemo_gym_rollout(
             )
             rollout_gen = nemo_gym_environment.run_rollouts.options(
                 num_returns="streaming"
-            ).remote(*ray_arguments)
+            ).remote(
+                *ray_arguments,
+                generation_only=generation_only,
+                generation_policy_version=generation_policy_version,
+                num_generations_per_prompt=identity_group_size,
+            )
         rollout_iterator = rollout_gen.__aiter__()
 
     while True:
@@ -2583,6 +2608,9 @@ def run_nemo_gym_rollout_sync(
     mask_env_flagged_samples: bool = True,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    generation_only: bool = False,
+    generation_policy_version: str | None = None,
+    identity_group_size: int | None = None,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2648,6 +2676,9 @@ def run_nemo_gym_rollout_sync(
             sampling_params=sampling_params,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
             debug_payload_metrics=debug_payload_metrics,
+            generation_only=generation_only,
+            generation_policy_version=generation_policy_version,
+            identity_group_size=identity_group_size,
         ):
             pass
         if rollout_result is None:
@@ -2709,8 +2740,12 @@ def _postprocess_single_nemo_gym_group(
                 ),
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                "hit_max_tokens": (
+                    bool(r["truncated"])
+                    if r.get("truncated") is not None
+                    else sum(len(m["token_ids"]) for m in r["message_log"])
+                    == max_total_tokens_per_sample
+                ),
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (
@@ -2830,6 +2865,11 @@ def _postprocess_single_nemo_gym_group(
         {
             "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
+            "rollout_id": [r["rollout_id"] for r in results],
+            "group_id": [r["group_id"] for r in results],
+            "generation_policy_version": [
+                r["generation_policy_version"] for r in results
+            ],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
@@ -2848,6 +2888,13 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
+    if any(len(r["physical_message_logs"]) > 1 for r in results):
+        # Only split optimizer batches carry physical training rows. Identity
+        # batches remain byte-for-byte on the ordinary GRPO path.
+        final_batch["physical_message_logs"] = [
+            r["physical_message_logs"] for r in results
+        ]
+        final_batch["physical_trace_ids"] = [r["physical_trace_ids"] for r in results]
     # Env/agent mask flag: flagged samples are dropped from the loss but still
     # count for advantages. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:

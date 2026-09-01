@@ -591,9 +591,10 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
             self._mark_collection_failed(e)
         finally:
-            self.running = False
             if dataloader_exhausted:
                 self.data_exhausted = True
+            self.running = False
+            if dataloader_exhausted:
                 print(
                     "❌ Trajectory collection stopped: dataloader exhausted "
                     "(max_num_epochs reached). No more data available for generation. "
@@ -1500,6 +1501,7 @@ class AsyncTrajectoryCollector:
     async def _iter_rollout_groups(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
+        generation_weight_version: int,
         num_generations: int,
         use_nemo_gym: bool,
         task_index_to_group_index: dict[int, int],
@@ -1546,6 +1548,9 @@ class AsyncTrajectoryCollector:
                 ),
                 deduplicate_multimodal_data=self._deduplicate_multimodal_data,
                 debug_payload_metrics=self._debug_payload_metrics,
+                generation_policy_version=(
+                    f"async-policy-weight-{generation_weight_version:08d}"
+                ),
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
@@ -1749,7 +1754,7 @@ class AsyncTrajectoryCollector:
         backoff_delay = 0.01
         backoff_started_at: float | None = None
         try:
-            while self.running:
+            while self.running or self.data_exhausted:
                 # Every retry is a distinct Ray submission of the full payload.
                 print_multimodal_payload_metrics(
                     collect_multimodal_payload_metrics(
@@ -1853,6 +1858,7 @@ class AsyncTrajectoryCollector:
             try:
                 async for rollout_result in self._iter_rollout_groups(
                     repeated_batch=repeated_batch,
+                    generation_weight_version=generation_weight_version,
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,

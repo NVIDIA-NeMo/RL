@@ -781,6 +781,7 @@ class MegatronPolicyWorkerImpl(
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        scheduler_step_increment: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
@@ -811,6 +812,10 @@ class MegatronPolicyWorkerImpl(
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
+        if scheduler_step_increment is None:
+            scheduler_step_increment = gbs
+        if scheduler_step_increment <= 0:
+            raise ValueError("scheduler_step_increment must be positive")
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
         torch.distributed.all_reduce(
@@ -1077,10 +1082,10 @@ class MegatronPolicyWorkerImpl(
         if not eval_mode:
             # Step LR scheduler once per train() call, not per global batch.
             # Megatron's OptimizerParamScheduler.step takes an `increment` in
-            # samples: NeMo init scales lr_warmup_steps by gbs internally, so
-            # passing increment=gbs cancels that scaling and one tick == one
-            # train() call regardless of batch size.
-            self.scheduler.step(increment=gbs)
+            # samples. Ordinary callers use gbs. Trace-expanded callers use the
+            # logical-rollout count so physical row multiplication does not
+            # accelerate the scheduler.
+            self.scheduler.step(increment=scheduler_step_increment)
 
         # Aggregate metrics across all microbatches
         mb_metrics, global_loss = aggregate_training_statistics(

@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest.mock as mock
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -67,6 +68,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     _warn_unsupported_in_flight_refit_pause_once,
 )
+from tests.unit.trace_test_utils import trace_bundle
 
 
 @ray.remote(num_cpus=0)
@@ -141,6 +143,63 @@ class TestReplayBufferImplCheckpointing:
     Ray actor execution is not reliably attributed to source coverage, so these
     tests cover the checkpoint/restore helpers on the local implementation class.
     """
+
+    @staticmethod
+    def _trace_trajectory() -> dict:
+        bundle = trace_bundle(compacted=True)
+        rollout_id = bundle["rollout_id"]
+        return {
+            "batch": BatchedDataDict(
+                {
+                    "rollout_id": [rollout_id],
+                    "group_id": [bundle["group_id"]],
+                    "generation_policy_version": [bundle["generation_policy_version"]],
+                    "physical_trace_ids": [
+                        [trace["trace_id"] for trace in bundle["physical_traces"]]
+                    ],
+                    "physical_message_logs": [
+                        [
+                            [
+                                {
+                                    "role": "assistant",
+                                    "token_ids": torch.tensor([1]),
+                                    "token_loss_mask": torch.tensor([1]),
+                                    "generation_logprobs": torch.tensor([-0.1]),
+                                }
+                            ]
+                        ]
+                    ],
+                    "total_reward": torch.tensor([1.0]),
+                    "loss_multiplier": torch.tensor([1.0]),
+                    "mask_sample": torch.tensor([False]),
+                    "truncated": torch.tensor([False]),
+                }
+            ),
+            "rollout_metrics": {},
+        }
+
+    def test_local_add_is_idempotent_for_identical_trace_retry(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        trajectory = self._trace_trajectory()
+
+        assert buffer.add(trajectory, 0, 1) == "success"
+        assert buffer.add(deepcopy(trajectory), 0, 1) == "success"
+
+        assert buffer.size() == 1
+        assert buffer.trajectory_versions == [0]
+        assert buffer.target_weight_versions == [1]
+
+    def test_local_add_rejects_conflicting_trace_identity(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        trajectory = self._trace_trajectory()
+        conflicting = self._trace_trajectory()
+        conflicting["batch"]["total_reward"][0] = 0.0
+
+        assert buffer.add(trajectory, 0, 1) == "success"
+        with pytest.raises(ValueError, match="conflicting content"):
+            buffer.add(conflicting, 0, 1)
+
+        assert buffer.size() == 1
 
     def _state(
         self,
@@ -2923,6 +2982,9 @@ class TestAsyncTrajectoryCollector:
         class FakeBatch:
             size = 1
 
+            def get(self, key, default=None):
+                return default
+
             def slice(self, start, end):
                 return self
 
@@ -2974,6 +3036,18 @@ class TestAsyncTrajectoryCollector:
             def __init__(self):
                 # Batch has 2 prompts, but only 1 more trajectory is needed.
                 self.get_trajectories_needed = RemoteMethod(1)
+
+        class FakeBatch:
+            size = 2
+
+            def get(self, key, default=None):
+                return default
+
+            def slice(self, start, end):
+                return self
+
+            def repeat_interleave(self, repeats):
+                return self
 
         started = []
 
@@ -3409,6 +3483,147 @@ class TestAsyncTrajectoryCollector:
         collector = self.create_local_collector(next_nemo_gym_task_index=123)
 
         assert collector.get_rollouts_state() == {"next_ng_task_index": 123}
+
+    def test_process_batch_defers_nemo_gym_identity_to_rollout_adapter(
+        self, monkeypatch
+    ):
+        """The rollout adapter owns replica identity after batch replication."""
+
+        class RemoteMethod:
+            def remote(self, *args, **kwargs):
+                return 1
+
+        class FakeReplayBuffer:
+            get_trajectories_needed = RemoteMethod()
+
+        started = []
+
+        class RecordingThread:
+            def __init__(self, *args, **kwargs):
+                self._target = kwargs["target"]
+
+            def start(self):
+                self._target()
+
+            def is_alive(self):
+                return False
+
+        async def record_rollout_batch(**kwargs):
+            started.append(kwargs["repeated_batch"])
+
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector._run_rollout_batch_worker = record_rollout_batch
+        collector.running = True
+        target_weight = 7
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        collector._get_next_target_for_generation = reserve_target
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+        batch = BatchedDataDict(
+            {
+                "message_log": [[{"role": "user", "content": "test"}]],
+                "extra_env_info": [
+                    {
+                        "context_compaction_rollout_index": 7,
+                    }
+                ],
+                "loss_multiplier": torch.ones(1),
+            }
+        )
+
+        collector._process_batch(batch)
+
+        assert len(started) == 1
+        repeated_batch = started[0]
+        assert [
+            row["context_compaction_rollout_index"]
+            for row in repeated_batch["extra_env_info"]
+        ] == [7, 7, 7]
+
+    @pytest.mark.parametrize(
+        ("running", "data_exhausted"),
+        [
+            pytest.param(True, False, id="collector-running"),
+            pytest.param(False, True, id="natural-exhaustion-drains-inflight"),
+        ],
+    )
+    def test_prompt_group_worker_records_async_policy_provenance(
+        self, monkeypatch, running, data_exhausted
+    ):
+        """Gym and replay receive provenance, including during exhaustion drain."""
+        add_calls = []
+
+        class RemoteAdd:
+            async def remote(self, *args):
+                add_calls.append(args)
+                return "success"
+
+        class FakeReplayBuffer:
+            add = RemoteAdd()
+
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.master_config.policy["generation"] = {
+            "temperature": 1.0,
+            "top_p": 1.0,
+        }
+        collector.master_config.logger = {"wandb_enabled": False, "wandb": {}}
+        collector.master_config.env = {}
+        collector.master_config.reward_penalties = None
+        collector.running = running
+        collector.data_exhausted = data_exhausted
+
+        final_batch = BatchedDataDict(
+            {
+                "message_log": [[{"role": "user", "content": "test"}]],
+                "loss_multiplier": torch.ones(1),
+            }
+        )
+        observed_rollout_kwargs = {}
+
+        async def fake_rollout(**kwargs):
+            observed_rollout_kwargs.update(kwargs)
+            result = mock.MagicMock()
+            result.final_batch = final_batch
+            result.rollout_metrics = {"turns_per_sample/mean": 1.0}
+            result.task_index = 17
+            yield result
+
+        monkeypatch.setattr(
+            "nemo_rl.experience.rollouts.run_async_nemo_gym_rollout",
+            fake_rollout,
+        )
+        repeated_batch = BatchedDataDict(
+            {
+                "message_log": [[{"role": "user", "content": "test"}]],
+                "extra_env_info": [{"_ng_task_index": 17}],
+                "loss_multiplier": torch.ones(1),
+            }
+        )
+
+        asyncio.run(
+            collector._collect_rollout_batch(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=4,
+                num_generations=1,
+                use_nemo_gym=True,
+            )
+        )
+
+        assert (
+            observed_rollout_kwargs["generation_policy_version"]
+            == "async-policy-weight-00000003"
+        )
+        assert len(add_calls) == 1
+        _, generation_weight, target_weight = add_calls[0]
+        assert generation_weight == 3
+        assert target_weight == 4
 
     def test_dataloader_state_retrieval(self):
         """Test getting dataloader state for checkpointing."""

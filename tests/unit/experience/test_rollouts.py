@@ -1846,9 +1846,16 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             rows,
             timer_prefix,
             deduplicate_multimodal_data,
+            *,
+            generation_only,
+            generation_policy_version,
+            num_generations_per_prompt,
         ):
-            del rows, timer_prefix
+            assert generation_only is False
+            assert generation_policy_version is None
+            assert num_generations_per_prompt == 2
             assert deduplicate_multimodal_data is True
+            del rows, timer_prefix
             # Both groups complete out of order internally and group 1 completes first.
             completion_order = [3, 1, 2, 0]
             values = []
@@ -2082,9 +2089,29 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                         "generation_logprobs": torch.tensor([-0.1]),
                     },
                 ],
+                "physical_message_logs": [
+                    [
+                        input_message,
+                        {
+                            "role": "assistant",
+                            "content": "answer",
+                            "token_ids": torch.tensor([2]),
+                            "generation_logprobs": torch.tensor([-0.1]),
+                        },
+                    ]
+                ],
+                "rollout_id": f"rollout-{reward}",
+                "group_id": "group-1",
+                "generation_policy_version": "sync-policy-step-00000000",
+                "physical_trace_ids": [f"rollout-{reward}:trace-0"],
                 "full_result": {"reward": reward},
             }
         )
+
+    results[1]["physical_message_logs"].append(
+        deepcopy(results[1]["physical_message_logs"][0])
+    )
+    results[1]["physical_trace_ids"].append("rollout-2.0:trace-1")
 
     rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
         nemo_gym_rows=rows,
@@ -2103,6 +2130,11 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
 
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert len(rollout_result.final_batch["physical_message_logs"]) == 2
+    assert rollout_result.final_batch["physical_trace_ids"][1] == [
+        "rollout-2.0:trace-0",
+        "rollout-2.0:trace-1",
+    ]
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
@@ -2197,7 +2229,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
+        def remote(self, inputs, timer_prefix, *, num_generations_per_prompt):
+            assert num_generations_per_prompt == 2
             del inputs, timer_prefix
             return _Stream()
 
@@ -2210,6 +2243,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._num_generations_per_prompt = 2
     manager._results_to_completions = lambda results: (
         [result["value"] for result in results],
         {},
@@ -2275,7 +2309,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
+        def remote(self, inputs, timer_prefix, *, num_generations_per_prompt):
+            assert num_generations_per_prompt == 2
             del inputs, timer_prefix
             return _DuplicateStream()
 
@@ -2287,6 +2322,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
+    manager._num_generations_per_prompt = 2
 
     with pytest.raises(ValueError, match="duplicate row index 0"):
         asyncio.run(
@@ -2348,6 +2384,8 @@ def test_run_async_nemo_gym_rollout(
         assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
+    assert "physical_message_logs" not in actual_result["final_batch"]
+    assert "physical_trace_ids" not in actual_result["final_batch"]
 
     expected_result = {
         "final_batch": {
@@ -2451,6 +2489,11 @@ def test_run_async_nemo_gym_rollout(
     def _standardize(d: dict) -> dict:
         final_batch = d["final_batch"].copy()
         final_batch.pop("message_log", None)
+        final_batch.pop("physical_message_logs", None)
+        final_batch.pop("physical_trace_ids", None)
+        final_batch.pop("rollout_id", None)
+        final_batch.pop("group_id", None)
+        final_batch.pop("generation_policy_version", None)
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()

@@ -61,6 +61,77 @@ def create_mock_tokenizer():
     return tokenizer
 
 
+def _policy_with_mock_worker():
+    policy = object.__new__(Policy)
+    policy.cfg = {
+        "train_global_batch_size": 2,
+        "train_micro_batch_size": 1,
+    }
+    policy.debug_payload_metrics = False
+    policy.flops_tracker = None
+    policy._shard_for_train = MagicMock(return_value=["physical-shard"])
+    policy.worker_group = MagicMock()
+    policy.worker_group.run_all_workers_sharded_data.return_value = ["future"]
+    policy.worker_group.get_all_worker_results.return_value = [
+        {
+            "global_loss": 0.5,
+            "grad_norm": 1.0,
+            "all_mb_metrics": {},
+        }
+    ]
+    return policy
+
+
+def test_policy_train_forwards_logical_scheduler_increment():
+    policy = _policy_with_mock_worker()
+    loss_fn = MagicMock()
+
+    policy.train(
+        MagicMock(),
+        loss_fn,
+        gbs=12,
+        mbs=2,
+        scheduler_step_increment=4,
+    )
+
+    common_kwargs = policy.worker_group.run_all_workers_sharded_data.call_args.kwargs[
+        "common_kwargs"
+    ]
+    assert common_kwargs == {
+        "loss_fn": loss_fn,
+        "eval_mode": False,
+        "gbs": 12,
+        "mbs": 2,
+        "check_dim_skip_keys": None,
+        "scheduler_step_increment": 4,
+    }
+
+
+def test_policy_train_preserves_worker_scheduler_default_when_not_overridden():
+    policy = _policy_with_mock_worker()
+
+    policy.train(MagicMock(), MagicMock())
+
+    common_kwargs = policy.worker_group.run_all_workers_sharded_data.call_args.kwargs[
+        "common_kwargs"
+    ]
+    assert "scheduler_step_increment" not in common_kwargs
+
+
+@pytest.mark.parametrize("scheduler_step_increment", [0, -1])
+def test_policy_train_rejects_nonpositive_scheduler_increment(
+    scheduler_step_increment,
+):
+    policy = _policy_with_mock_worker()
+
+    with pytest.raises(ValueError, match="must be positive"):
+        policy.train(
+            MagicMock(),
+            MagicMock(),
+            scheduler_step_increment=scheduler_step_increment,
+        )
+
+
 def create_dtensor_config(
     model_name: str, tp: int, pp: int = 1, cp: int = 1
 ) -> PolicyConfig:
