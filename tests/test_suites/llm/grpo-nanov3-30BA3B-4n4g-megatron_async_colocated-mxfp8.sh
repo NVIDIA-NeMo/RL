@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
+# GB200 nightly coverage for Megatron generation with MXFP8 training.
+
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
 GPUS_PER_NODE=4
@@ -19,6 +21,10 @@ cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
+    policy.megatron_cfg.fp8_cfg.enabled=true \
+    policy.megatron_cfg.fp8_cfg.fp8=e4m3 \
+    policy.megatron_cfg.fp8_cfg.fp8_recipe=mxfp8 \
+    policy.megatron_cfg.fp8_cfg.fp8_param=false \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
