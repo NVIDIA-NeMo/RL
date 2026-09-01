@@ -865,21 +865,19 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    if algo_cfg.ppo_epochs < 1:
-        raise ValueError("ppo.ppo_epochs must be at least 1")
-
-    # Without it the critic steps once per chunk and the policy once per step,
-    # which is two effective learning rates from one config, and no error.
+    # Each PPO epoch must consume the complete RL batch. Without this guard, every
+    # chunk would independently run the configured actor and critic optimizer steps.
     if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
         raise ValueError(
             "PPO on the SingleController path requires "
             "async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train}) == "
             f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
-            "step is assembled from a single chunk: the critic steps its "
-            "optimizer once per chunk and the policy once per step. Streaming "
-            "PPO needs a split train API on the value workers, which they do "
-            "not have yet (#2625)."
+            "step is assembled from a single chunk. Otherwise each chunk would "
+            "run ppo.critic_ppo_epochs critic optimizer steps and ppo.ppo_epochs "
+            "policy optimizer steps on only part of the RL batch. Streaming PPO "
+            "needs a split train API on the value workers, which they do not have "
+            "yet (#2625)."
         )
 
     failure_config = async_config.rollout_failure
@@ -932,8 +930,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         raise ValueError(
             "num_prompts_per_step * num_generations_per_prompt "
             f"({rl_step_samples}) must equal value.train_global_batch_size "
-            f"({value_global_batch_size}) so that one RL step maps to exactly one "
-            "critic optimizer.step."
+            f"({value_global_batch_size}) so that each critic epoch consumes one "
+            "complete RL batch."
         )
 
 
@@ -1038,6 +1036,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "computing them on the SingleController path. Set "
             "skip_reference_policy_logprobs_calculation=false, or set "
             "loss_fn.reference_policy_kl_penalty=0."
+        )
+
+    if (
+        master_config.loss_fn.use_kl_in_reward
+        and reference_policy_kl_penalty > 0
+        and master_config.loss_fn.force_on_policy_ratio
+        and algo_cfg.seq_logprob_error_threshold is None
+    ):
+        raise ValueError(
+            "loss_fn.use_kl_in_reward=true with a nonzero "
+            "loss_fn.reference_policy_kl_penalty requires policy logprobs, but "
+            "loss_fn.force_on_policy_ratio=true without "
+            "seq_logprob_error_threshold skips them. Set "
+            "loss_fn.force_on_policy_ratio=false or configure "
+            "seq_logprob_error_threshold."
         )
 
     # ``env`` is required in production configs, but model_construct-based unit
