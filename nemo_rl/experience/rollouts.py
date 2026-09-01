@@ -1648,7 +1648,6 @@ def resolve_reward_penalty_config(
         "penalize_empty_final_answer",
         "penalize_unwanted_tokens",
         "penalize_malformed_think_tag",
-        "penalize_invalid_tool_call",
     ):
         value = _get_reward_penalty_config_value(reward_penalty_config, flag)
         if value is not None:
@@ -1757,17 +1756,12 @@ def apply_reward_penalties(
             item: open-tag count must be 0 (always in prompt, never generated),
             close-tag count must be 0 or 1.
          Data: message_log pairs for token IDs, full_result output items for strings.
-
-      5. penalize_invalid_tool_call (Gym message flag)
-         Zeroes the rollout reward when Gym identifies an invalid textual call or
-         a structured function call rejected by runtime schema validation.
     """
     counts = {
         "duplicated_reasoning": 0,
         "empty_final_answer": 0,
         "unwanted_token": 0,
         "malformed_think_tag": 0,
-        "invalid_tool_call": 0,
     }
     if not reward_penalty_config or not results:
         return counts
@@ -1781,7 +1775,6 @@ def apply_reward_penalties(
             "penalize_empty_final_answer",
             "penalize_unwanted_tokens",
             "penalize_malformed_think_tag",
-            "penalize_invalid_tool_call",
         )
     )
     if any_penalty_enabled:
@@ -1955,19 +1948,6 @@ def apply_reward_penalties(
                 result["full_result"]["reward"] = 0.0
 
                 counts["malformed_think_tag"] += 1
-
-    # --- Penalty 5: Invalid tool calls (Gym-side parsing/schema validation) ---
-    if _get_reward_penalty_config_value(
-        reward_penalty_config, "penalize_invalid_tool_call"
-    ):
-        for result in results:
-            if any(
-                message.get("role") == "assistant"
-                and message.get("is_invalid_tool_call", False)
-                for message in result["message_log"]
-            ):
-                result["full_result"]["reward"] = 0.0
-                counts["invalid_tool_call"] += 1
 
     return counts
 
@@ -2983,10 +2963,6 @@ def _postprocess_single_nemo_gym_group(
         "malformed_think_tag": (
             "penalize_malformed_think_tag",
             "malformed_think_tag_rate",
-        ),
-        "invalid_tool_call": (
-            "penalize_invalid_tool_call",
-            "invalid_tool_call_penalty_rate",
         ),
     }
     if resolved_reward_penalty_config and results:

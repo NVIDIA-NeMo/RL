@@ -43,7 +43,6 @@ from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 from nemo_rl.experience.rollouts import (
     _calculate_refine_metrics,
     _extract_mask_sample_flags,
-    apply_reward_penalties,
     generate_responses_async,
     _tool_call_metrics,
     run_async_multi_turn_rollout,
@@ -72,27 +71,6 @@ from tests.unit.test_envs import (
 )
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-
-
-def test_apply_reward_penalties_zeroes_invalid_tool_call_reward():
-    result = {
-        "message_log": [
-            {"role": "user", "token_ids": torch.tensor([1])},
-            {
-                "role": "assistant",
-                "token_ids": torch.tensor([2]),
-                "is_invalid_tool_call": True,
-            },
-        ],
-        "full_result": {"reward": 1.0, "response": {"output": []}},
-    }
-
-    counts = apply_reward_penalties(
-        [result], {"penalize_invalid_tool_call": True}
-    )
-
-    assert result["full_result"]["reward"] == 0.0
-    assert counts["invalid_tool_call"] == 1
 
 
 class TestCalculateSingleMetric:

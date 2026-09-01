@@ -252,7 +252,6 @@ class RewardPenaltyConfig(BaseModel, extra="allow"):
     penalize_empty_final_answer: bool = False
     penalize_unwanted_tokens: bool = False
     penalize_malformed_think_tag: bool = False
-    penalize_invalid_tool_call: bool = False
     # Optional token IDs. token_ids.unwanted is required when
     # penalize_unwanted_tokens is true;
     # think-tag IDs are inferred from configured tag strings when possible.
@@ -275,7 +274,6 @@ _REWARD_PENALTY_FLAGS = (
     "penalize_empty_final_answer",
     "penalize_unwanted_tokens",
     "penalize_malformed_think_tag",
-    "penalize_invalid_tool_call",
 )
 
 

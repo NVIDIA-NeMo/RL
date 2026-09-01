@@ -33,9 +33,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     RawRewardAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
-    RewardPenaltyConfig,
     RewardScalingConfig,
-    _raise_if_reward_penalties_enabled_without_nemo_gym,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
     aggregate_rollout_metrics,
@@ -79,7 +77,6 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollouts import (
-    get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
@@ -375,7 +372,6 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: PPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
-    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
 
 
 # ===============================================================================
@@ -1015,11 +1011,7 @@ def setup(
         )
 
     nemo_gym_actor = None
-    enable_nemo_gym = _should_use_nemo_gym(master_config)
-    _raise_if_reward_penalties_enabled_without_nemo_gym(
-        master_config, enable_nemo_gym=enable_nemo_gym
-    )
-    if enable_nemo_gym:
+    if _should_use_nemo_gym(master_config):
         assert backend == "vllm", (
             f"NeMo-Gym requires the vLLM generation backend; got {backend!r}."
         )
@@ -1707,8 +1699,6 @@ def ppo_train(
                             ),
                             max_rollout_turns=None,
                             greedy=False,
-                            reward_penalty_config=master_config.reward_penalties,
-                            thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -3614,8 +3604,6 @@ def validate(
                     ),
                     max_rollout_turns=None,
                     greedy=False,
-                    reward_penalty_config=master_config.reward_penalties,
-                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
