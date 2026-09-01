@@ -24,12 +24,16 @@ import torch
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _pooled_opd_metrics,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
@@ -42,6 +46,18 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 class FakeWeightSynchronizer:
     pass
+
+
+class _InitBuffer:
+    """Minimal non-optional TQ buffer contract for actor-init tests."""
+
+    def __init__(self) -> None:
+        self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
 
 
 def _checkpointing_config(tmp_path) -> dict:
@@ -82,6 +98,7 @@ def _grpo_master_config(tmp_path) -> MasterConfig:
 
 def _actor_args_for_init(**overrides) -> SimpleNamespace:
     """Minimal actor args for a controller built through the real __init__."""
+    tq_buffer = _InitBuffer()
     args = dict(
         partition_id="rollout_data",
         dp_client=None,
@@ -91,8 +108,8 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         weight_synchronizer=FakeWeightSynchronizer(),
         advantage_estimator=None,
         loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        tq_buffer=tq_buffer,
+        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -100,6 +117,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        data_plane_checkpoint_metadata=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -129,6 +147,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         logger={},
         env={},
     )
+    tq_buffer = _InitBuffer()
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
         dp_client=None,
@@ -138,8 +157,8 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         weight_synchronizer=None,
         advantage_estimator=None,
         loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        tq_buffer=tq_buffer,
+        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -188,25 +207,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         # __init__ builds a CheckpointManager + TimeoutChecker from this block.
         checkpointing=_checkpointing_config(tmp_path),
     )
-    actor_args = SimpleNamespace(
-        partition_id="rollout_data",
-        dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
-        dataloader=None,
-        weight_synchronizer=FakeWeightSynchronizer(),
-        advantage_estimator=None,
-        loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
-        env_handles={},
-        fleet_monitor=None,
-        generation_router=None,
-        train_cluster=None,
-        inference_cluster=None,
-        save_state=_initial_grpo_save_state(),
-        last_checkpoint_path=None,
-    )
+    actor_args = _actor_args_for_init()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
     controller_cls(
@@ -317,26 +318,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
     setup_metrics = SetupTimingMetrics(
         generation_init_time_s=1.5, policy_init_time_s=2.5
     )
-    actor_args = SimpleNamespace(
-        partition_id="rollout_data",
-        dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
-        dataloader=None,
-        weight_synchronizer=FakeWeightSynchronizer(),
-        advantage_estimator=None,
-        loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
-        train_cluster=None,
-        inference_cluster=None,
-        # A real field of SingleControllerActorArgs. Read directly rather than via a
-        # getattr default, so omitting it breaks here instead of silently degrading
-        # watchdog.gym_subprocess_check into a no-op at runtime.
-        env_handles={},
-        save_state=_initial_grpo_save_state(),
-        last_checkpoint_path=None,
-    )
+    actor_args = _actor_args_for_init()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
     controller_cls(
@@ -464,12 +446,16 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    # No fleet health: _sync_weights reconciles refit membership first, and with no
+    # monitor there is nothing to reconcile.
+    ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=False,
     )
     ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(env={})
@@ -487,6 +473,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._async_cfg = AsyncRLConfig()
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    # No fleet health: _sync_weights reconciles refit membership first, and with no
+    # monitor there is nothing to reconcile.
+    ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
@@ -496,6 +485,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
         calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}})
     )
     ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(env={})
@@ -561,6 +551,12 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
             "sample_mask": torch.ones(batch_size),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
+            # The filtered row is also flagged. Its penalty must not overwrite
+            # the sequence-error mask and leak back into streaming training.
+            "invalid_tool_call_mask": torch.tensor(
+                [[False] * sequence_length] * 2 + [[True] * sequence_length] * 2
+            ),
+            "malformed_thinking_mask": torch.zeros(batch_size, sequence_length),
         },
         batch_size=[batch_size],
     )
@@ -574,11 +570,17 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=2.0,
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=None,
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = True
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -598,8 +600,17 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     assert has_valid_training_tokens
     assert data_plane.selected_fields is not None
     assert "prev_logprobs" in data_plane.selected_fields
+    assert "invalid_tool_call_mask" in data_plane.selected_fields
     assert "generation_logprobs" in data_plane.selected_fields
     assert data_plane.written_fields is not None
+    # The estimator's value remains, but the penalty did not overwrite it with
+    # -5; sample_mask below is what excludes this row from streaming training.
+    torch.testing.assert_close(
+        data_plane.written_fields["advantages"][2], torch.ones(5)
+    )
+    torch.testing.assert_close(
+        data_plane.written_fields["advantages"][3], torch.full((5,), -5.0)
+    )
     assert torch.equal(
         data_plane.written_fields["sample_mask"],
         torch.tensor([1.0, 1.0, 0.0, 1.0]),
@@ -642,11 +653,13 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -704,11 +717,13 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -759,11 +774,13 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -791,6 +808,112 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
         torch.zeros(batch_size, sequence_length),
     )
     assert "advantages" in (result_meta.fields or [])
+
+
+def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
+    """SC passes the TQ teacher column under OPD's estimator contract."""
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    captured_kwargs = {}
+
+    class FakeEstimator:
+        def compute_advantage(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return kwargs["teacher_logprobs"] - kwargs["prev_logprobs"]
+
+    class FakeDataPlane:
+        def __init__(self):
+            self.put_fields = None
+
+        def get_samples(self, sample_ids, partition_id, select_fields):
+            del sample_ids, partition_id
+            assert "teacher_reference_logprobs" in select_fields
+            assert "generation_logprobs" in select_fields
+            return TensorDict(
+                {
+                    "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
+                    "total_reward": torch.zeros(2),
+                    "token_mask": torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
+                    "sample_mask": torch.ones(2),
+                    "generation_logprobs": torch.full((2, 3), 0.5),
+                    "prev_logprobs": torch.full((2, 3), 0.5),
+                    "teacher_reference_logprobs": torch.full((2, 3), 0.75),
+                },
+                batch_size=(2,),
+            )
+
+        def put_samples(self, sample_ids, partition_id, fields):
+            del sample_ids, partition_id
+            self.put_fields = fields
+
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = FakeEstimator()
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = True
+    ctrl._is_ppo = False
+    ctrl._dp_client = FakeDataPlane()
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a", "b"],
+        fields=[],
+        sequence_lengths=[3, 3],
+    )
+
+    enriched, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert has_valid_training_tokens
+    assert set(captured_kwargs) >= {
+        "teacher_logprobs",
+        "prev_logprobs",
+        "prompt_ids",
+        "rewards",
+        "mask",
+        "repeated_batch",
+    }
+    assert "logprobs_policy" not in captured_kwargs
+    assert torch.allclose(
+        captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"],
+        torch.full((2, 3), 0.25),
+    )
+    assert "advantages" in (enriched.fields or [])
+    assert ctrl._opd_stat_sum == pytest.approx(1.0)
+    assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
+    assert ctrl._opd_stat_count == 4
+
+
+def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
+    """A small streaming chunk cannot receive the same weight as a large one."""
+    # Chunk 1 has values [0, 2]; chunk 2 has [4]. Averaging chunk means
+    # would incorrectly produce 2.5. Exact pooling produces mean=2, std=2.
+    metrics = _pooled_opd_metrics(
+        stat_sum=6.0,
+        stat_sumsq=20.0,
+        count=3,
+    )
+
+    assert metrics == pytest.approx(
+        {
+            "on_policy_distillation/teacher_student_logprob_gap_mean": 2.0,
+            "on_policy_distillation/adv_mean": 2.0,
+            "on_policy_distillation/adv_std": 2.0,
+        }
+    )
 
 
 class _EmptySampler:
@@ -959,6 +1082,7 @@ def _train_pump_controller(*, sampler) -> object:
         checkpointing={"enabled": False, "save_period": 10},
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
@@ -974,6 +1098,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
@@ -993,6 +1118,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
@@ -1000,7 +1126,12 @@ def _train_pump_controller(*, sampler) -> object:
         "rewards": [],
         "masked_advantages": [],
         "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
     }
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
+    ctrl._teacher_coordinator = None
     return ctrl
 
 
@@ -1368,6 +1499,7 @@ def _ppo_train_pump_controller(
         seq_logprob_error_threshold=None,
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     return ctrl, value
@@ -1631,11 +1763,13 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
         ppo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],

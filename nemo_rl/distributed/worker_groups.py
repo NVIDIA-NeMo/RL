@@ -550,6 +550,10 @@ class RayWorkerGroup:
                         "NODE_RANK": str(pg_idx),
                         "AVAILABLE_ADDR_LIST": str(available_addresses),
                         "AVAILABLE_PORT_LIST": str(available_ports),
+                        # RANK is group-local, so it alone cannot tell a policy
+                        # worker from a generation worker. Observability consumers
+                        # need the group to disambiguate them.
+                        "NRL_WORKER_GROUP": self.name_prefix,
                     }
                 )
                 # Remove Ray-specific environment variables, let the worker itself set them.

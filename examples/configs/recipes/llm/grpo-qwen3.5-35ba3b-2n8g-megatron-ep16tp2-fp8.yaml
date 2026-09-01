@@ -36,8 +36,6 @@ policy:
       - linear_attn.in_proj_a
       - linear_attn.in_proj_b
       - visual
-      env_vars:
-        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: '0'
 logger:
   wandb:
     name: grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8

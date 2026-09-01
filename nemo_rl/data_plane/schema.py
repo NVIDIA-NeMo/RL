@@ -30,6 +30,10 @@ INPUT_LENGTHS = "input_lengths"
 SAMPLE_MASK = "sample_mask"
 META_IDX = "meta_idx"
 
+# Token-aligned message-violation fields consumed by SingleController advantages.
+INVALID_TOOL_CALL_MASK = "invalid_tool_call_mask"
+MALFORMED_THINKING_MASK = "malformed_thinking_mask"
+
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
 # reference_policy_logprobs (workers) and advantages (driver).
@@ -44,6 +48,22 @@ DP_TRAIN_FIELDS = (
     "sample_mask",
 )
 
+# Full known tensor schema for SingleController's long-lived rollout partition.
+# The initial rollout put writes the first seven payload fields; later stages add
+# student/reference logprobs, advantages, PPO critic columns, and the MOPD teacher
+# column. Registering their names once before concurrent producers start avoids
+# TransferQueue's lazy field-name registration race.
+SC_ROLLOUT_SCHEMA_FIELDS = (
+    *DP_TRAIN_FIELDS,
+    "prompt_ids_for_adv",
+    "total_reward",
+    "values",
+    "returns",
+    "teacher_reference_logprobs",
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+)
+
 # Subset fetched by logprob / ref-logprob workers.
 LP_SEED_FIELDS = (
     "input_ids",
@@ -51,6 +71,9 @@ LP_SEED_FIELDS = (
     "token_mask",
     "sample_mask",
 )
+
+# Text-only inputs fetched by frozen MOPD teachers for logprob inference.
+TEACHER_LP_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
 
 # Kept out of DP_TRAIN_FIELDS: a GRPO run writes neither, and a worker fetching
 # a column nobody wrote errors out rather than reading zeros.
