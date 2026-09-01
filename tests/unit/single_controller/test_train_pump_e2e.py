@@ -297,12 +297,15 @@ def test_train_pump_drives_mcore_training_step(
             sync_weights=lambda *, kv_scales=None: None,
         )
         adv_est = _FakeAdvEstimator()
-        # Rollout manager stub — SC.__init__ only touches ._tq_buffer.
+        # Rollout manager stub — SC.__init__ only touches ._tq_buffer; the pump
+        # additionally publishes versions and resumes request-deadline clocks.
         rollout_manager = SimpleNamespace(
             _tq_buffer=None,
             set_weight_version=lambda v: ray.get(
                 log.record.remote("set_weight_version", {"version": int(v)})
             ),
+            suspend_request_deadlines=lambda: None,
+            resume_request_deadlines=lambda: None,
         )
 
         master_config = MasterConfig.model_construct(
