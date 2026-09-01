@@ -39,12 +39,16 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
     PY_EXECUTABLES,
+    RAY_CLUSTER_EXTERNAL,
+    RAY_CLUSTER_REUSED_LOCAL,
+    RAY_CLUSTER_STARTED_LOCAL,
     RayVirtualCluster,
     ResourceInsufficientError,
     _bind_socket_in_range,
     _get_free_consecutive_ports_local,
     _get_free_port_local,
     _get_node_ip_and_free_port,
+    _init_ray,
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
@@ -235,6 +239,39 @@ def test_ray_uses_same_cluster_for_permuted_cuda_devices():
         assert mock_ray_init.call_count == 1
         assert mock_ray_init.call_args_list[0][1]["address"] == "auto"
         assert mock_ray_shutdown.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "cluster_res, expected",
+    [
+        # A cluster NeMo-RL started earlier, whose CVD tag still matches.
+        ({"GPU": 1, "nrl_tag_0": 1}, RAY_CLUSTER_REUSED_LOCAL),
+        # Somebody else's cluster (ray.sub, KubeRay): no nrl_tag_ resource.
+        ({"GPU": 8}, RAY_CLUSTER_EXTERNAL),
+    ],
+)
+def test_init_ray_reports_how_it_got_its_cluster(cluster_res, expected):
+    """Recorded on rl.setup.ray_init: attaching and booting differ by minutes,
+    and that difference is the usual reason two identical runs disagree on
+    time-to-first-step.
+    """
+    with (
+        patch("ray.init"),
+        patch("ray.shutdown"),
+        patch("ray.cluster_resources", return_value=cluster_res),
+        patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True),
+    ):
+        assert _init_ray() == expected
+
+
+def test_init_ray_reports_a_freshly_booted_cluster():
+    with (
+        patch("ray.init", side_effect=[ConnectionError("no cluster"), None]),
+        patch("ray.shutdown"),
+        patch("ray.cluster_resources", return_value={"GPU": 1}),
+        patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True),
+    ):
+        assert _init_ray() == RAY_CLUSTER_STARTED_LOCAL
 
 
 def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():

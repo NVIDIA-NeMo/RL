@@ -9,7 +9,14 @@ Every algorithm instrumentation import should go through
 `rl.bucket` tagging applied to leaf spans:
 
 ```python
-from nemo_rl.telemetry.instrumentation import Bucket, bucket_scope, managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import (
+    Bucket,
+    bucket_scope,
+    managed_span,
+    trace_fn,
+    umbrella_span,
+    umbrella_trace_fn,
+)
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 ```
@@ -25,6 +32,37 @@ ends up with no bucket and invisible to the goodput rollup.
 …) are **not** tagged. Apps do **not** emit rolled-up ``rl.goodput`` /
 ``rl.bucket.*`` metrics — the offline monitor SUMs tagged phase / span
 durations by bucket.
+
+### Umbrella spans say so at the call site
+
+Whether a span carries a bucket is decided by its group, which used to make the
+two cases indistinguishable where it matters most: `GENERATION` and `ROLLOUT`
+are both plausible for a generation span, and only one of them enters the
+rollup. So umbrella spans are opened through their own helper, with the group
+spelled using its `U_` alias:
+
+```python
+from nemo_rl.telemetry.instrumentation import umbrella_span, umbrella_trace_fn
+
+with umbrella_span(RLSpanGroup.U_ROLLOUT, "rl.sc.generate_and_push", tracer=tracer):
+    ...
+```
+
+The `U_` names are aliases — `RLSpanGroup.U_ROLLOUT == RLSpanGroup.ROLLOUT ==
+"rollout"` — so presets, the `span_groups` spec and every config are unchanged.
+The six are `U_JOB`, `U_STEP`, `U_ROLLOUT`, `U_MODEL_INIT`, `U_EVALUATE` and
+`U_SETUP`.
+
+Reach for an umbrella whenever a span can overlap **another instance of
+itself**: concurrent spans sum past the wall clock they happened in, so a bucket
+on them multiplies rather than measures. The work is still counted by the leaf
+spans nested inside.
+
+Neither mistake raises — telemetry does not end a training run. Passing a leaf
+group to `umbrella_span` warns once and emits the span as a leaf, so the phase
+keeps the bucket it actually has; the reverse, `managed_span` on an umbrella
+group, is already correct output. Both are rejected by a drift test, which
+catches them at review time rather than partway through a run.
 
 To override classification for one site, pass the attribute explicitly:
 
@@ -77,9 +115,9 @@ enclosing group is disabled. See
 
 ## Adding a span
 
-### Decorator — `trace_fn`
+### Decorator — `trace_fn` / `umbrella_trace_fn`
 
-For a whole function (this is how `rl.vllm.generate` and the `rl.<algo>.job` spans are done):
+For a whole function. `rl.vllm.generate` is a leaf:
 
 ```python
 @trace_fn(RLSpanGroup.GENERATION, "rl.vllm.generate")
@@ -87,19 +125,27 @@ def generate(self, ...):
     ...
 ```
 
-### Group-gated block — `managed_span`
+The `rl.<algo>.job` spans are umbrellas, so they take the other one:
+
+```python
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
+def grpo_train(...):
+    ...
+```
+
+### Group-gated block — `managed_span` / `umbrella_span`
 
 For a hot path where you want minimal cost when the group is disabled:
 
 ```python
-with managed_span(RLSpanGroup.ROLLOUT, "rl.grpo.generation",
-                  **{"rl.iteration": iteration}) as span:
+with umbrella_span(RLSpanGroup.U_ROLLOUT, "rl.grpo.generation",
+                   **{"rl.iteration": iteration}) as span:
     result = collect()
     if span is not None:
         span.set_attribute("rl.num_generations_per_prompt", n)
 ```
 
-`managed_span` yields `None` when the group is disabled; the body still runs, so guard attribute-setting with `if span is not None`.
+Both yield `None` when the group is disabled; the body still runs, so guard attribute-setting with `if span is not None`.
 
 ### Always-on block — `span_cm`
 
@@ -127,18 +173,33 @@ Metric names use the **application scope** (`rl.*`) — never `dl.*`. Attribute 
 
 Pick from `RLSpanGroup` before inventing a new one:
 
-- Once per run (setup/whole-job)? → `job`
+- Before the first step (Ray init, worker builds, dataloaders)? → `setup`, via `startup_span` / `setup_span`
+- Once per run, covering the training loop? → `job`
 - Once per training step? → `step`
 - Rollout collection? → `rollout`; generation? → `generation`
 - Log-probs? → `logprob` (or `reference_policy` for the reference model)
 - Reward / advantage / policy update? → `reward` / `advantage` / `policy_update`
 - Checkpoint / eval? → `checkpoint` / `evaluate`
+- Transfer-queue op? → `data_plane`
+
+One question cuts across all of those: **how many of these spans will a run
+emit?** If the answer scales with the prompt or sample count rather than with
+the step count, the span belongs in `per_prompt` regardless of which phase it
+measures, so that a user picking `per_step` does not get dataset-sized volume
+they did not ask for. `per_prompt` is an umbrella, so such spans carry no
+`rl.bucket` — which is usually right anyway, since per-prompt work on the async
+paths overlaps itself.
+
+If the span is opened somewhere that cannot see whether its caller is
+per-prompt — as `MetricsDataPlaneClient` cannot — wrap the caller's region in
+`per_prompt_scope()` and consult `in_per_prompt_scope()` at the span site,
+rather than threading a flag through the signatures.
 
 ## Adding a new span group
 
 If nothing fits, add a group to `RLSpanGroup` in `nemo_rl/telemetry/span_groups.py`:
 
-1. Add the constant, add it to `ALL_GROUPS`, and slot it into the right preset(s) in `_PRESETS`. Decide per preset: `default` is coarse (rarely add here); `per_step` for per-step spans; `all` always includes it.
+1. Add the constant, add it to `ALL_GROUPS`, and slot it into the right preset(s) in `_PRESETS`. Decide per preset: `default` is coarse (rarely add here); `per_step` for per-step spans; `all` always includes it. A group whose span count scales with dataset size rather than step count belongs in `all` only — see `per_prompt`, and add it to `PER_PROMPT_GROUPS` rather than `EMITTED_GROUPS` in the test below.
 2. **Leave the fallback stub alone.** The stub `SpanGroup` in that file mirrors only lens's *base* groups and presets, for when nemo-lens is absent; `RLSpanGroup` overrides both `ALL_GROUPS` and `_PRESETS`, so an RL group belongs there and nowhere else. Touch the stub only when lens's own base contract changes.
 3. Document the new group in [Span Groups](span-groups.md), and add it to `EMITTED_GROUPS` in `tests/unit/telemetry/test_span_groups.py` so the preset-reachability test covers it.
 
@@ -146,12 +207,23 @@ Keep the base-class contract — shared with lens and its other consumers — co
 
 ## Adding a metric
 
-NeMo-RL records its `rl.*` metrics from the driver rather than scattering record calls through the algorithm code (see [Metrics](metrics.md)). Two cases:
+NeMo-RL records its `rl.*` metrics from the driver rather than scattering record calls through the algorithm code (see [Metrics](metrics.md)). NeMo-RL owns every `rl.*` metric name: they are declared with lens's metric registry, so adding one needs no lens change.
 
-- **You need a brand-new instrument** (a new counter/gauge/histogram, or a value that doesn't go through the Logger). Add it to `nemo.lens.instruments.rl` following the per-Meter `WeakKeyDictionary` caching pattern, then record it from the driver via `telemetry.meter`. The `new-instrument` lens skill covers this.
-- **The series is keyed by a NeMo-RL-specific label set** rather than a fixed field — e.g. one value per efficiency category. Lens's `record_rl_metrics` takes fixed keyword fields, so a growing label set doesn't fit it. Define the instrument in `nemo_rl/telemetry/metrics.py` instead (same per-Meter caching pattern) and emit **one dimensioned instrument** with the label as an attribute, not one instrument per label. `rl.efficiency.seconds` is the worked example. This also avoids gating the feature on a lens release.
+**If the value already flows through `Logger.log_metrics`** — the common case — you only add a row. Append a `_TeedMetric` to `_TRAIN_SCALARS` (or `_VLLM_STEP_METRICS`) in `nemo_rl/telemetry/metrics.py`, giving the logger key, the registry key, the OTel name and the kind:
 
-A training scalar that already flows through `Logger.log_metrics` is a third case with no home yet: mapping NeMo-RL's logger keys onto lens's `record_rl_metrics` fields is still being settled with the lens owners, so the only tee on that hook today is the efficiency one.
+```python
+_TeedMetric(
+    "my_logger_key", "my_metric", "rl.my.metric", kind="gauge", description="..."
+)
+```
+
+The row is both the declaration and the mapping, which is deliberate: an earlier design kept a separate key-to-field map, three of its entries pointed at keys nothing emitted, and those gauges reported a flat line instead of an error. Keep them in one row and `tests/unit/telemetry/test_source_drift.py` fails the build when a logger key stops being emitted.
+
+**If the series is keyed by a growing label set** — e.g. one value per efficiency category — declare **one dimensioned series** and pass the label through `attributes`, rather than one series per label. `rl.efficiency.seconds` is the worked example; `rl.setup.duration` is the same shape for a label set that is not even knowable at declaration time, since `SetupTimingMetrics.extras` is filled in at runtime.
+
+**If the dict arrives under a prefix other than `train`**, add the dispatch in `_tee_rl_metrics_to_otel`. Prefixes are matched rather than merged so neither family is scanned for the other's keys: `timing/setup` arrives once at step 0 and shares no key with the per-step dicts.
+
+**If the value does not go through the Logger at all**, declare it in the same table and call `record_metrics(meter, RL_METRIC_GROUP, {...})` from wherever it is produced.
 
 Prefer an attribute over a name whenever the label set can grow: `rl.efficiency.seconds{rl.efficiency.category="idle/refit_bubble"}` stays stable as categories come and go, while `rl.efficiency.idle_refit_bubble_seconds` forces an instrument change per category. Keep attribute cardinality bounded — a per-step or per-request value belongs on a span, not a metric label.
 

@@ -44,6 +44,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
+    compute_engine_step_metrics,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
@@ -618,7 +619,11 @@ class VllmGeneration(GenerationInterface):
         self._step_metrics_snapshot = self._get_raw_spec_counters()
 
     def get_step_metrics(self) -> dict[str, float]:
-        """Get speculative decoding metrics delta since snapshot_step_metrics().
+        """Get the vLLM engine metrics delta since snapshot_step_metrics().
+
+        Covers the speculative-decoding family plus the engine's token,
+        sequence-length and request-outcome series, all derived from the same
+        pair of snapshots so the wider coverage costs no extra RPC.
 
         Returns:
             Dictionary of delta metrics with 'vllm/' prefix.
@@ -635,13 +640,25 @@ class VllmGeneration(GenerationInterface):
             )
             return {}
 
-        counters_end = self._get_raw_spec_counters()
-        step_metrics = compute_spec_decode_metrics(
-            self._step_metrics_snapshot, counters_end
-        )
-
-        # Reset snapshot for next step
+        counters_start = self._step_metrics_snapshot
+        # Reset before the work, not after: on failure a stale snapshot would
+        # make the next snapshot_step_metrics() warn about a double snapshot.
         self._step_metrics_snapshot = None
+
+        # The callers merge this straight into the step's metrics dict with no
+        # guard of their own, so an exception here would end the run. These are
+        # derived from the engine's Prometheus snapshot, whose series names and
+        # shapes move between vLLM releases -- exactly the input that should
+        # cost observability rather than training.
+        try:
+            counters_end = self._get_raw_spec_counters()
+            step_metrics = compute_spec_decode_metrics(counters_start, counters_end)
+            step_metrics.update(
+                compute_engine_step_metrics(counters_start, counters_end)
+            )
+        except Exception:
+            warn_once("vllm_step_metrics", "failed to collect vLLM step metrics")
+            return {}
 
         return step_metrics
 

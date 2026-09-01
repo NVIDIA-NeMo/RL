@@ -94,4 +94,10 @@ class TelemetryConfig(BaseModel, extra="allow"):
     vllm_native_tracing: bool = False
     """Enable vLLM's own OTLP tracing inside generation workers (opt-in). vLLM's
     exporter is gRPC-only, so this needs a gRPC OTLP endpoint / collector — it
-    does not ride an ``http/protobuf`` OTLP endpoint used by lens."""
+    does not ride an ``http/protobuf`` OTLP endpoint used by lens.
+
+    vLLM traces per **request**, so this emits one span per rollout -- thousands
+    per step, against ~20 for the rest of the run -- and vLLM offers no sampling
+    knob. Switch it on to debug a few steps, not for a training run. For engine
+    behaviour in aggregate the ``vllm/*`` metrics are on by default and cost one
+    RPC per step."""

@@ -13,7 +13,7 @@ nemo_rl/telemetry/
 ├── config.py       — TelemetryConfig: the telemetry: config block
 ├── setup.py        — init_telemetry_driver / init_telemetry_worker / get_telemetry_handle / shutdown_telemetry
 ├── span_groups.py  — RLSpanGroup: RL-specific span groups + presets
-├── instrumentation.py — managed_span/trace_fn wrappers + phase/group → rl.bucket map (monitor derives goodput)
+├── instrumentation.py — managed_span/trace_fn (+ umbrella_* counterparts), bucket_scope/per_prompt_scope, phase/group → rl.bucket map (monitor derives goodput)
 ├── metrics.py      — tees Logger.log_metrics scalars into the rl.* instruments
 └── __init__.py
 ```
@@ -35,7 +35,12 @@ Not yet wired:
 | Gap | Effect |
 |---|---|
 | SGLang, TRT-LLM and Megatron generation workers | no `init_telemetry_worker`, no generation spans — only vLLM is instrumented |
-| `grpo_sync.py`, `single_controller.py` | no spans at all; `examples/run_grpo_single_controller.py` never calls `init_telemetry_driver`, so that entrypoint emits no telemetry |
+| `grpo_sync.py` | no spans at all |
+| `rl.startup` outside GRPO | `init_ray()` opens `rl.setup.ray_init` for every launcher, but only `run_grpo.py` and `run_grpo_single_controller.py` open the umbrella around it, so elsewhere the startup phases are root spans rather than one waterfall |
+| Startup sub-phases inside `setup()` | `rl.setup.workers` is one block on the driver: its phases run concurrently in worker threads, which OTel context does not reach. Each worker's own load is a span (`rl.policy.load_model` / `rl.value.load_model` / `rl.vllm.load_model`) in a separate trace; the driver-side per-phase breakdown is in the `rl.setup.duration` metric |
+| Driver-side startup phases as metrics | `rl_init_timer`'s outer phases (`config`, `ray_connect`, `tokenizer`, `data`, `setup`) are printed by the launcher but never logged, so `rl.setup.duration` carries only the phases from inside `setup()`. Summing the metric does not reconstruct `rl.startup` |
+| `rl.init.total` on async PPO | the `init/total` timer is recorded, but `async_ppo_train` is otherwise uninstrumented, so no span is emitted for the initial buffer fill there |
+| SingleController's generation / trainer workers | the actor's phases and the transfer queue are instrumented, but no trace context reaches `TQPolicy` / `TQValue` / generation workers, so their spans form separate traces correlated by `run_id` |
 | `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | no `init_telemetry_driver`, so a `telemetry:` block in those configs parses and the run succeeds while emitting nothing, driver *and* worker |
 | `VllmGeneration.generate_async` | no `rl.vllm.generate` span, so async rollouts and async validation show `rl.grpo.generation` / `rl.grpo.evaluate` with no generate breakdown inside |
 | `SyncRolloutActor` | the sync data-plane counterpart of the collector; no `init_telemetry_worker`, no rollout spans |

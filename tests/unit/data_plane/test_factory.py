@@ -63,3 +63,91 @@ def test_factory_disabled_error_message_helpful():
     assert "grpo" in msg.lower() or "legacy" in msg.lower(), (
         f"factory rejection should reference the legacy trainer; got: {msg}"
     )
+
+
+@pytest.fixture
+def stub_tq_adapter(monkeypatch):
+    """Stand in for the TQ adapter, which needs mooncake and a live cluster."""
+    import sys
+    from types import ModuleType
+
+    from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+
+    module = ModuleType("nemo_rl.data_plane.adapters.transfer_queue")
+
+    class _StubClient(NoOpDataPlaneClient):
+        def __init__(self, cfg, bootstrap=True):
+            super().__init__()
+
+    module.TQDataPlaneClient = _StubClient
+    monkeypatch.setitem(
+        sys.modules, "nemo_rl.data_plane.adapters.transfer_queue", module
+    )
+    return _StubClient
+
+
+def _is_wrapped(client) -> bool:
+    from nemo_rl.data_plane.observability import MetricsDataPlaneClient
+
+    return isinstance(client, MetricsDataPlaneClient)
+
+
+def _logs_events(client) -> bool:
+    """Whether the wrapper's event sink is the logger rather than a no-op."""
+    from nemo_rl.data_plane.observability import log_event
+
+    return client._on_event is log_event
+
+
+def test_telemetry_alone_installs_the_metrics_wrapper(monkeypatch, stub_tq_adapter):
+    """Transfer-queue spans must not depend on data-plane event logging.
+
+    The wrapper carries both, and requiring users to enable an unrelated
+    logging feature to get spans is how the queue stayed absent from traces.
+    """
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: True)
+
+    client = build_data_plane_client(
+        {"enabled": True, "impl": "transfer_queue"}, bootstrap=False
+    )
+    assert _is_wrapped(client)
+    # Event logging stays off: only spans were asked for, and attaching the
+    # log sink would add a per-op log line nobody enabled.
+    assert not _logs_events(client)
+    client.close()
+
+
+def test_observability_alone_still_installs_the_event_callback(
+    monkeypatch, stub_tq_adapter
+):
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: False)
+
+    client = build_data_plane_client(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "observability": {"enabled": True},
+        },
+        bootstrap=False,
+    )
+    assert _is_wrapped(client)
+    assert _logs_events(client)
+    client.close()
+
+
+def test_no_wrapper_when_neither_telemetry_nor_observability_is_on(
+    monkeypatch, stub_tq_adapter
+):
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: False)
+
+    client = build_data_plane_client(
+        {"enabled": True, "impl": "transfer_queue"}, bootstrap=False
+    )
+    assert not _is_wrapped(client)
+    client.close()

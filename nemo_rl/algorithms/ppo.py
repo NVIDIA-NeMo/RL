@@ -101,7 +101,8 @@ from nemo_rl.telemetry.instrumentation import (
     Bucket,
     bucket_scope,
     managed_span,
-    trace_fn,
+    umbrella_span,
+    umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -1233,7 +1234,7 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
 # ===============================================================================
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.ppo.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.ppo.job")
 def ppo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -1358,8 +1359,8 @@ def ppo_train(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.ppo.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
@@ -1443,8 +1444,8 @@ def ppo_train(
 
                 with (
                     timer.time("generation"),
-                    managed_span(
-                        RLSpanGroup.ROLLOUT,
+                    umbrella_span(
+                        RLSpanGroup.U_ROLLOUT,
                         "rl.ppo.generation",
                         tracer=_tracer,
                     ),
@@ -3163,8 +3164,8 @@ def validate(
     _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
+        umbrella_span(
+            RLSpanGroup.U_EVALUATE,
             "rl.ppo.evaluate",
             tracer=_tracer,
         ),

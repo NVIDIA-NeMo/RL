@@ -14,7 +14,7 @@ telemetry:
   span_groups: default        # start coarse; raise to per_step / all as needed
   metrics_enabled: true
   logs_enabled: true
-  vllm_native_tracing: false  # gRPC-only; leave off on an http/protobuf path
+  vllm_native_tracing: false  # gRPC-only, one span per request; leave off outside debugging
 ```
 
 Where you send it goes in the environment, since it describes the machine rather than the run. These are the standard OTel SDK variables, read by the SDK directly:

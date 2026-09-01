@@ -8,15 +8,27 @@ For the general span-group mechanism — how gating works, why a disabled group 
 
 | Preset | Groups included | Relative cost |
 |---|---|---|
-| `default` | `job`, `checkpoint`, `evaluate` | Lowest — safe for production |
-| `per_step` | `step`, `checkpoint`, `evaluate`, `model_init`, `rollout`, `generation`, `logprob`, `reward`, `advantage`, `policy_update`, `reference_policy`, `data_processing`, `efficiency` | Moderate |
-| `all` | every group (`job` included) | Highest — dev/debug |
+| `default` | `job`, `checkpoint`, `evaluate`, `setup`, `model_init` | Lowest — safe for production |
+| `per_step` | `step`, `checkpoint`, `evaluate`, `setup`, `model_init`, `rollout`, `generation`, `logprob`, `reward`, `advantage`, `policy_update`, `reference_policy`, `data_processing`, `data_plane`, `efficiency` | Moderate |
+| `all` | every group (`job` and `per_prompt` included) | Highest — dev/debug |
+
+### `per_step` deliberately omits `per_prompt`
+
+Every group in `per_step` emits a bounded number of spans per training step, so the preset's cost scales with steps. `per_prompt` is the exception: its spans are emitted once per prompt, so a 10k-prompt rollout produces roughly 20k spans where the phase groups produce a fixed handful. Folding it in would make `per_step` scale with dataset size instead, which is not what someone asking for step detail is asking for.
+
+Ask for it explicitly when debugging an individual rollout:
+
+```yaml
+span_groups: per_step,per_prompt
+```
+
+or take `all`. See [Per-prompt spans](#per-prompt-spans) for what you get.
 
 ### `per_step` deliberately omits `job`
 
 `per_step` **excludes** the `job` group on purpose. `job` is the whole-run root span; if it were enabled alongside `step`, every training step would nest under one giant, ever-growing trace. Omitting `job` makes **each training step its own root trace** — bounded in size and easy to search one step at a time.
 
-`job` lives in `default` (coarse: job + checkpoint + evaluate) and in `all` (one whole-run trace, useful for a short run). Choose `per_step` when you want to inspect individual steps; choose `default`/`all` when you want one trace spanning the run.
+`job` lives in `default` (coarse: startup + job + checkpoint + evaluate) and in `all` (one whole-run trace, useful for a short run). Choose `per_step` when you want to inspect individual steps; choose `default`/`all` when you want one trace spanning the run.
 
 ## `RLSpanGroup`
 
@@ -25,9 +37,10 @@ Defined in `nemo_rl/telemetry/span_groups.py`. Extends lens's base `SpanGroup` w
 | Group | Origin | Controls |
 |---|---|---|
 | `job` | base | the whole-run root span (`rl.<algo>.job`) |
+| `setup` | RL | startup, before the first step: `rl.startup` and the `rl.setup.*` phases under it |
 | `checkpoint` | base | `rl.<algo>.save_checkpoint` |
 | `evaluate` | base | `rl.<algo>.evaluate` |
-| `model_init` | base | `rl.vllm.load_model` (emitted in the generation worker) |
+| `model_init` | base | `rl.vllm.load_model` (generation worker), `rl.policy.load_model` / `rl.value.load_model` (training workers) |
 | `load_checkpoint` | base | *reserved — bucketed, but no site emits it yet* |
 | `step` | base | `rl.<algo>.step` (one per training step) |
 | `forward_backward` | base | *reserved — bucketed, but no site emits it yet* |
@@ -40,6 +53,8 @@ Defined in `nemo_rl/telemetry/span_groups.py`. Extends lens's base `SpanGroup` w
 | `policy_update` | RL | `rl.<algo>.policy_update` (and `value_update` for PPO) |
 | `reference_policy` | RL | *reserved — bucketed, but no site emits it yet* |
 | `data_processing` | RL | `rl.<algo>.data_processing` |
+| `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation (`put`, `get`, `claim_meta`, `clear`, …) from a batch-shaped caller |
+| `per_prompt` | RL | spans emitted once per prompt: `rl.sc.generate_and_push` and the rollout path's `rl.data_plane.put`. A cardinality axis rather than a phase — see [Per-prompt spans](#per-prompt-spans) |
 | `efficiency` | RL | idle phases on async GRPO — driver-side `rl.idle.buffer_starvation`, `rl.idle.refit_bubble`, and collector-side `rl.idle.refit_event_wait`, `rl.idle.generation_limit_pause` |
 
 ## Examples
@@ -71,6 +86,7 @@ The controlling group is shown for each; a span is only emitted when its group i
 
 | Algorithm | Spans |
 |---|---|
+| **Startup** (all algorithms) | `rl.startup` and, under it, `rl.setup.ray_init`, `rl.setup.tokenizer`, `rl.setup.data`, `rl.setup.nemo_gym_config`, `rl.setup.workers` — `setup` group; see [Startup](#startup-what-happens-before-the-first-step) |
 | **GRPO** (sync + async) | `rl.grpo.job`, `rl.grpo.step`, `rl.grpo.data_processing`, `rl.grpo.generation`, `rl.grpo.reward_calculation`, `rl.grpo.policy_and_reference_logprobs`, `rl.grpo.advantage_calculation`, `rl.grpo.policy_training`, `rl.grpo.checkpointing`, `rl.grpo.evaluate` |
 | **GRPO** (async only) | `rl.idle.buffer_starvation`, `rl.idle.refit_bubble` (driver) and `rl.idle.refit_event_wait`, `rl.idle.generation_limit_pause` (collector actor) — `efficiency` group; named after the `Timer` category, not the algorithm |
 | **GRPO** (async only) | `rl.grpo.generation` — `rollout` group, emitted by the collector actor, one span per rollout batch |
@@ -79,10 +95,14 @@ The controlling group is shown for each; a span is only emitted when its group i
 | **DPO** | `rl.dpo.job`, `rl.dpo.step`, `rl.dpo.policy_training`, `rl.dpo.checkpointing`, `rl.dpo.evaluate` |
 | **RM** | `rl.rm.job`, `rl.rm.step`, `rl.rm.checkpointing`, `rl.rm.evaluate` |
 | **Distillation** | `rl.distillation.job`, `rl.distillation.step`, `rl.distillation.data_processing`, `rl.distillation.generation`, `rl.distillation.teacher_logprob_inference`, `rl.distillation.policy_training`, `rl.distillation.checkpointing`, `rl.distillation.evaluate` |
+| **SingleController** | `rl.sc.job`, `rl.sc.step`, `rl.sc.logprob_inference_prep`, `rl.sc.policy_and_reference_logprobs`, `rl.sc.value_inference_prep`, `rl.sc.value_inference`, `rl.sc.advantage_calculation`, `rl.sc.training_prep`, `rl.sc.policy_training`, `rl.sc.policy_optimizer_step`, `rl.sc.value_training`, `rl.sc.checkpointing` — opened inside the `SingleControllerActor`, which is where the run actually lives |
+| **SingleController** (rollout) | `rl.sc.generate_and_push` — `per_prompt` group (umbrella, so unbucketed), one span per dispatch attempt; and `idle/buffer_starvation` / `idle/refit_bubble` reusing async GRPO's `efficiency` category names |
+| **Transfer queue** | `rl.data_plane.<op>` — `data_plane` group, or `per_prompt` when the caller is a rollout; emitted wherever a data-plane client is built (SC actor, `TQPolicy` / `TQValue` workers) |
 | **vLLM** (driver-side) | `rl.vllm.generate`, `rl.vllm.generate_text` — `generation` group; nested under the active rollout span |
 | **vLLM** (worker-side) | `rl.vllm.load_model` — `model_init` group; a root span in the generation worker's process, since Ray carries no trace context into `__init__` |
+| **Policy / value** (worker-side) | `rl.policy.load_model`, `rl.value.load_model` — `model_init` group, `rl.backend` attribute; opened by `traced_worker_init` on the worker's `__init__`, and root spans for the same reason |
 
-`rl.<algo>.job` is a function-level span (via `trace_fn`) wrapping the whole run. Under `per_step` it is suppressed, so each `rl.<algo>.step` becomes a root trace.
+`rl.<algo>.job` is a function-level span (via `umbrella_trace_fn`) wrapping the whole run. Under `per_step` it is suppressed, so each `rl.<algo>.step` becomes a root trace.
 
 ## Span tags (categorical attributes)
 
@@ -91,24 +111,34 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 | Tag | Meaning |
 |---|---|
 | `rl.iteration` | training iteration index |
-| `rl.epoch` | epoch index |
+| `rl.epoch` | epoch index (omitted on `rl.sc.step` — see below) |
 | `rl.step` | step index |
 | `rl.num_generations_per_prompt` | GRPO group size |
 | `rl.weight_version` / `rl.target_weight_version` | async rollout batch: the weights it generated from, and the training step it targets |
 | `rl.num_prompt_groups` | async rollout batch width, so a gap-filling batch is not read as an unexplained speed-up |
+| `rl.rollout.attempt` | SingleController dispatch attempt: `0` is a first try, `> 0` a substitution after a skipped group, whose tokens were discarded |
 | `rl.bucket` | goodput bucket: `productive` / `overhead` / `idle` / `wasted` (omit on umbrellas) |
+
+`rl.sc.step` carries `rl.iteration` and `rl.weight_version` but no `rl.epoch`.
+In the SingleController the rollout pump advances the epoch on its own clock, so
+the epoch counter at the time a train step runs describes how far *generation*
+has read into the dataset — not the epoch this step's batch came from. Use the
+rollout-side spans for that.
 
 ### Span group → `rl.bucket`
 
 Leaf groups are tagged automatically when using
 `nemo_rl.telemetry.instrumentation.managed_span` / `trace_fn`. Umbrellas are
-timed but **not** tagged so monitors can exclude them from goodput.
+timed but **not** tagged so monitors can exclude them from goodput, and they are
+opened through `umbrella_span` / `umbrella_trace_fn` with the group's `U_` alias
+so the call site shows which of the two it is — see
+[Extending](extending.md#umbrella-spans-say-so-at-the-call-site).
 
 | Group | `rl.bucket` |
 |---|---|
-| `job`, `step`, `rollout`, `model_init`, `evaluate` | *(none — umbrella)* |
+| `job`, `step`, `rollout`, `model_init`, `evaluate`, `setup`, `per_prompt` (aliased `U_JOB`, `U_STEP`, …) | *(none — umbrella)* |
 | `generation`, `reward`, `policy_update`, `forward_backward`, `optimizer` | `productive` |
-| `data_processing`, `checkpoint`, `load_checkpoint`, `logprob`, `advantage`, `reference_policy` | `overhead` |
+| `data_processing`, `data_plane`, `checkpoint`, `load_checkpoint`, `logprob`, `advantage`, `reference_policy` | `overhead` |
 | `efficiency` | `idle` for the two driver-side phases; *none* for the two collector-side ones (see below) |
 
 Rolled-up `rl.goodput` is **monitor-derived**, not emitted by NeMo-RL.
@@ -201,7 +231,8 @@ honest wall-clock durations — but the collector's wall clock runs *concurrentl
 with the driver's, so summing them against a driver-side denominator would
 overcount. Omitting the attribute keeps them out of a bucket rollup by
 construction instead of by convention. The membership list is
-`COLLECTOR_LOOP_CATEGORIES` in `nemo_rl/telemetry/instrumentation.py`.
+`COLLECTOR_LOOP_CATEGORIES` in `nemo_rl/telemetry/instrumentation.py`, which
+`UNBUCKETED_SPAN_CATEGORIES` extends with `init/total`.
 
 They still carry `rl.efficiency.category`, so they remain identifiable in a
 trace and continue to be reported as `efficiency/*` scalars. As metrics they are
@@ -218,11 +249,74 @@ several workers accumulate at once and the total can exceed the wall time it
 happened in. `idle/buffer_full_backoff` also has no clean block to wrap: it is
 recorded as a precomputed duration spanning a retry loop. `wasted/failed_trajectory`
 covers the same window as the enclosing `rl.grpo.generation` span, so a span
-there would duplicate an existing interval. `init/total` is likewise still
-`Timer`-only — it runs before the per-step loop, so it fills no step-level gap.
+there would duplicate an existing interval.
 
 So goodput on async runs covers driver idle, but not collector-side idle or
 wasted work — use the `efficiency/*` metrics for those.
+
+## Startup: what happens before the first step
+
+The `setup` group covers everything between process start and the first training
+step. It is in **both** shipped presets: startup is a fixed handful of spans
+emitted once per run, so it costs nothing at steady state, and "why was the first
+step so late" is a question a coarse preset needs to answer. `model_init` is in
+both presets for the same reason and travels with it — without it the worker
+build shows as one opaque block with `rl.vllm.load_model`, usually its largest
+part, missing from inside.
+
+```
+rl.startup                                    (launcher)
+├── rl.setup.ray_init                          rl.ray.cluster_source=started_local
+├── rl.setup.tokenizer
+├── rl.setup.data                              (run_grpo.py)
+├── rl.setup.nemo_gym_config                   (single controller, if gym is on)
+└── rl.setup.workers
+    ├── rl.vllm.load_model                    (generation worker, separate trace)
+    ├── rl.policy.load_model                  (training worker,   separate trace)
+    └── rl.value.load_model                   (PPO critic,        separate trace)
+```
+
+The three worker-side loads carry `rl.backend` — `megatron`, `dtensor` or
+`dtensor_v2` for the trainer, so one query compares the same phase across
+backends — and each is emitted once per worker process, so a slow rank shows up
+as one long span among its peers rather than an average.
+
+`rl.startup` exists because `init_ray()` and the algorithm's `setup()` are
+separate top-level calls in the launcher; without a span across them their
+phases arrive as unrelated root traces. It closes before training, so the run's
+`job` and `step` spans stay separate traces.
+
+`rl.setup.ray_init` is emitted by `init_ray()` itself, so every launcher gets it
+without opting in. It carries `rl.ray.cluster_source`:
+`attached_external` (a cluster ray.sub or KubeRay already had running),
+`reused_local` (one an earlier NeMo-RL run left behind), or `started_local` (paid
+to boot a new one). Attaching and booting differ by tens of seconds, which is the
+usual reason two otherwise identical runs disagree on time-to-first-step.
+
+### No bucket on any startup span
+
+Unlike the other leaf groups, `setup` spans carry no `rl.bucket` at all. The
+phases nest (`rl.startup` over `rl.setup.workers` over `rl.vllm.load_model`) and
+the worker builds run *concurrently* under parallel init, so a rollup adding
+them by bucket would multiply startup rather than measure it. The flat number
+lives in the `rl.setup.duration` metric at `phase=total_setup` — see
+[Metrics — startup phases](metrics.md#startup-phases). These spans are for shape.
+
+### The initial buffer fill
+
+On async GRPO the driver blocks before its first step until the replay buffer
+holds a full batch. That wait is `rl.init.total` (category `init/total`), a child
+of no step — it happens before the loop.
+
+It carries **no** `rl.bucket`, for the same reason as the collector's loop waits:
+the generation fleet is busy for that entire window and its
+`rl.grpo.generation` spans join the same trace, so bucketing the wait would
+charge one stretch of wall clock to two buckets. The `init/total` *metric* keeps
+its `overhead` bucket, because it is read as a single per-run number rather than
+summed beside sibling spans. The membership list for this rule is
+`UNBUCKETED_SPAN_CATEGORIES` in `nemo_rl/telemetry/instrumentation.py`.
+
+Async PPO records the same `init/total` timer but emits no span for it yet.
 
 ### Async rollout spans come from the collector actor
 
@@ -250,6 +344,20 @@ covers a fraction of a full one, so without it a short span looks like an
 unexplained speed-up. It is in the `rollout` group, so it is an
 umbrella and carries **no** `rl.bucket`: several batch workers run at once, so
 their durations sum past wall time and cannot enter a bucket rollup.
+
+`rl.sc.generate_and_push` is an umbrella for the same reason, though it sits in
+`per_prompt` rather than `rollout` (see [Per-prompt spans](#per-prompt-spans)).
+The SingleController dispatches one asyncio task per prompt group, bounded by
+`async_rl.max_inflight_prompts` — `num_prompts_per_step` in most recipes and
+`1280` in one — so that many spans can be open at once. Tagged `productive` they
+would sum to a large multiple of the wall clock they happened in. On both paths
+the productive generation term comes from the worker-side `rl.vllm.generate`
+spans, not from these driver-side dispatch spans.
+
+It also carries `rl.rollout.attempt`, because the span is opened inside the
+dispatch retry loop: a skipped group is substituted in place and the loop opens
+another span. `attempt > 0` is generation whose tokens were discarded — the same
+thing async GRPO reports as `wasted/failed_trajectory`.
 
 #### Getting the collector into one waterfall
 
@@ -307,6 +415,54 @@ Two consequences worth internalizing before reading an async trace:
   productive generation term; do not read it as "generation contributed
   nothing."
 
+## Per-prompt spans
+
+Two spans on the SingleController path are emitted once per prompt rather than
+once per step or per batch:
+
+| Span | Emitted | Bucket |
+|---|---|---|
+| `rl.sc.generate_and_push` | one per dispatch attempt, in the SC actor | none (umbrella) |
+| `rl.data_plane.put` | one per group commit, nested inside the above | none (umbrella) |
+
+They share the `per_prompt` group, which is a **cardinality axis** rather than a
+phase — the one group in `RLSpanGroup` that does not name a stage of work. What
+governs whether you want these is not that one is a rollout span and the other a
+transfer-queue span; it is that their count scales with the prompt count. A
+10k-prompt rollout emits roughly 20k of them, against a fixed handful per step
+from every phase group. That is why they are reachable only from `all` or an
+explicit `per_step,per_prompt`.
+
+If 20k per rollout is more than you want but you still need the rollout view,
+enable `per_prompt` and drop `data_plane`: transfer-queue time inside a rollout
+also shows up as a gap between the `rl.sc.*` phase spans.
+
+### Why the group has to come from the caller
+
+`rl.data_plane.put` is emitted by `MetricsDataPlaneClient`, and there is **one
+client per process**, shared by callers with wildly different cardinality:
+
+```
+SC actor process, one client from build_data_plane_client()
+  ├─ RolloutManager → TQReplayBuffer.commit → put_samples()   once per prompt
+  └─ _advantage_stage(meta)                → put_samples()    once per batch
+```
+
+Same op, same client, counts orders of magnitude apart. So neither the op name
+nor a constructor argument can distinguish them, and the client cannot see its
+caller. The rollout path therefore marks its region with
+`instrumentation.per_prompt_scope()`, a `ContextVar` the client consults — the
+same mechanism [`bucket_scope`](#overriding-the-bucket-for-a-region-bucket_scope)
+uses for the same reason. Entering the scope also means the put is gated *with*
+the rollout span: turn `per_prompt` off and both disappear.
+
+A rollout's put is unbucketed where a batch stage's put is `overhead`. That is
+deliberate: rollouts overlap each other and training, so summing their durations
+into `overhead` would push that bucket past the wall clock it happened in, by up
+to `max_inflight_prompts`. The scope propagates to nested calls and to
+coroutines started inside it, but not to raw threads — a data-plane call handed
+to a thread pool would read as batch-shaped.
+
 ## Coverage gaps
 
 A group being enabled does not guarantee spans: something has to emit them. Known
@@ -319,7 +475,11 @@ blanks today, so an empty trace is not read as a broken exporter:
 | `SyncRolloutActor` | the sync data-plane counterpart of the async collector — uninstrumented, so its rollouts produce no spans |
 | Worker flush outside async GRPO | only `async_grpo_train` calls `policy.shutdown()` / `policy_generation.shutdown()`, so on other trainers a worker's last spans depend on the periodic export rather than a flush |
 | `load_checkpoint`, `forward_backward`, `optimizer`, `reference_policy` | the groups are defined and bucketed, but no site emits them, so enabling them adds no spans |
-| `grpo_sync.py`, `single_controller.py` | no spans; `examples/run_grpo_single_controller.py` also never initialises telemetry, so that entrypoint emits nothing at all |
+| `grpo_sync.py` | no spans |
+| Startup phases inside `setup()` | `rl.setup.workers` is one block; its sub-phases run concurrently in worker threads, which OTel context does not reach, so they would detach into their own traces. Read the `rl.setup.duration` metric for the breakdown |
+| `rl.startup` outside GRPO | only `run_grpo.py` and `run_grpo_single_controller.py` open the umbrella, so on other launchers `rl.setup.ray_init` is a root span rather than part of a startup waterfall |
+| `rl.init.total` on async PPO | the timer is recorded, but `async_ppo_train` is otherwise uninstrumented, so the span is not emitted there |
+| SingleController generation / trainer workers | the actor's own phases are instrumented, but `TQPolicy` / `TQValue` / generation workers get no trace context from it, so their spans are separate traces correlated by `run_id` |
 | `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | these call the instrumented loops but never `init_telemetry_driver`, so a `telemetry:` block in their configs parses, the run succeeds, and nothing is emitted — driver or worker |
 | Ranked worker spans | separate traces, correlated by `run_id` — only the async collector's context is propagated |
 

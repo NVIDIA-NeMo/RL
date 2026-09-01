@@ -42,6 +42,8 @@ from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.telemetry.instrumentation import setup_span, startup_span
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -122,29 +124,52 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
-    # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
-    maybe_configure_data_plane_env(config.data_plane)
-    init_ray()
+    # Must precede init_ray() so the resolved NEMO_RL_OTEL_* env is snapshotted
+    # into the Ray runtime_env and inherited by every worker -- including the
+    # SingleControllerActor, which is where this path's spans are opened. No-op
+    # unless telemetry is enabled.
+    init_telemetry_driver(config, algorithm="ppo" if is_ppo_run(config) else "grpo")
 
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
-    assert config.policy["generation"] is not None, (
-        "A generation config is required for SC-driven async GRPO"
-    )
-    has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
-    megatron_cfg = config.policy.get("megatron_cfg") or {}
-    trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
-    config.policy["generation"] = configure_generation_config(
-        config.policy["generation"],
-        tokenizer,
-        has_refit_draft_weights=has_refit_draft_weights,
-        trains_mtp=trains_mtp,
-    )
+    # One trace over the whole startup, so init_ray() and setup_single_controller()
+    # -- separate top-level calls -- read as a waterfall rather than as unrelated
+    # roots. Closed before the actor is launched, so the run's own job and step
+    # spans (opened inside SingleControllerActor) stay separate traces.
+    with startup_span():
+        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+        maybe_configure_data_plane_env(config.data_plane)
+        # Opens rl.setup.ray_init itself, so no span here.
+        init_ray()
 
-    # NeMo-Gym specific config setup.
-    if bool(config.env.get("should_use_nemo_gym")):
-        setup_nemo_gym_config(config, tokenizer)
+        with setup_span("tokenizer"):
+            tokenizer = get_tokenizer(config.policy["tokenizer"])
+            assert config.policy["generation"] is not None, (
+                "A generation config is required for SC-driven async GRPO"
+            )
+            has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
+            megatron_cfg = config.policy.get("megatron_cfg") or {}
+            trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
+            config.policy["generation"] = configure_generation_config(
+                config.policy["generation"],
+                tokenizer,
+                has_refit_draft_weights=has_refit_draft_weights,
+                trains_mtp=trains_mtp,
+            )
 
-    actor_args, setup_timing_metrics = setup_single_controller(config, tokenizer)
+        # NeMo-Gym specific config setup. Its own phase rather than part of the
+        # tokenizer block: it resolves and can launch gym resource servers, so it
+        # is one of the phases most likely to be the slow one.
+        if bool(config.env.get("should_use_nemo_gym")):
+            with setup_span("nemo_gym_config"):
+                setup_nemo_gym_config(config, tokenizer)
+
+        # No child spans inside: its phases run concurrently under parallel init,
+        # and OTel context does not cross into worker threads, so spans opened
+        # there would detach into their own traces. The breakdown comes from the
+        # rl.setup.duration metric, which is measured inside each phase.
+        with setup_span("workers"):
+            actor_args, setup_timing_metrics = setup_single_controller(
+                config, tokenizer
+            )
 
     print("🚀 Launching SingleControllerActor")
     sc = SingleControllerActor.remote(
@@ -185,6 +210,12 @@ def main() -> None:
                 resource.shutdown()
             except Exception as e:
                 print(f"{resource_name} shutdown failed: {e}")
+
+        # Last, and before cluster teardown: the OTel SDK's own atexit hook is
+        # registered ahead of Ray's and so would otherwise run after it. The
+        # actor flushes its own spans -- this covers the driver's side. No-op
+        # when telemetry is inactive.
+        shutdown_telemetry()
 
 
 def _run_with_controller_liveness_watch(

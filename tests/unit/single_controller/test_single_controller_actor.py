@@ -134,6 +134,15 @@ def _init_controller(master_config, actor_args):
     )
 
 
+def test_tracer_is_declared_on_the_class() -> None:
+    """Every pump opens spans with ``self._tracer``, including on instances that
+    never ran ``__init__``. ``None`` makes ``managed_span`` fall back to the
+    process-global handle, so those paths emit nothing instead of raising
+    ``AttributeError`` out of the training loop.
+    """
+    assert single_controller.SingleControllerActor._tracer is None
+
+
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
     master_config = MasterConfig.model_construct(

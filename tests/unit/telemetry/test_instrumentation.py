@@ -14,6 +14,8 @@ Two layers:
   requires nemo-lens.
 """
 
+import logging
+
 import pytest
 
 from nemo_rl.telemetry.instrumentation import (
@@ -28,7 +30,9 @@ from nemo_rl.telemetry.instrumentation import (
     current_trace_carrier,
     efficiency_span,
     goodput_span_attributes,
+    in_per_prompt_scope,
     managed_span,
+    per_prompt_scope,
     remote_trace_context,
     trace_fn,
 )
@@ -221,6 +225,191 @@ def test_collector_efficiency_spans_are_trace_only():
         assert span.attributes[RL_EFFICIENCY_CATEGORY_ATTR].startswith("idle/")
 
 
+def test_setting_attributes_on_a_disabled_span_is_a_noop():
+    """A disabled group yields None, and lens's helper dereferences the span.
+
+    So the raw helper turns "telemetry is off" -- the default for every run --
+    into an AttributeError inside production code. Absorbed in nemo_rl's
+    wrapper, since a missing guard is invisible until it reaches a real run.
+    """
+    from nemo_rl.telemetry.instrumentation import safe_set_span_attributes
+
+    safe_set_span_attributes(None, {"rl.anything": "value"})
+
+
+@requires_lens
+def test_a_disabled_setup_span_yields_none_rather_than_a_stub():
+    """Pins the premise of the test above at the helper the launchers call."""
+    from nemo_rl.telemetry.instrumentation import safe_set_span_attributes, setup_span
+
+    handle, _ = _setup("rollout")
+    with setup_span("ray_init", tracer=handle.tracer) as span:
+        assert span is None
+        safe_set_span_attributes(span, {"rl.ray.cluster_source": "started_local"})
+    handle.shutdown()
+
+
+@requires_lens
+def test_the_initial_buffer_fill_span_is_trace_only():
+    """The driver waits, but the generation fleet is busy for the same window.
+
+    Both sides land in one trace, so bucketing the wait would charge that wall
+    clock twice. The ``init/total`` *metric* keeps its bucket.
+    """
+    from nemo_rl.telemetry.instrumentation import bucket_for_efficiency_category
+
+    handle, exporter = _setup("all")
+    with efficiency_span("init/total", tracer=handle.tracer):
+        pass
+    handle.shutdown()
+
+    (emitted,) = exporter.get_finished_spans()
+    assert emitted.name == "rl.init.total"
+    assert RL_BUCKET_ATTR not in emitted.attributes
+    assert emitted.attributes[RL_EFFICIENCY_CATEGORY_ATTR] == "init/total"
+    assert bucket_for_efficiency_category("init/total") is Bucket.OVERHEAD
+
+
+@requires_lens
+def test_the_u_aliases_are_the_same_groups_under_another_name():
+    """Aliases, so no config, preset or ``span_groups`` spec has to change."""
+    assert RLSpanGroup.U_ROLLOUT == RLSpanGroup.ROLLOUT == "rollout"
+    assert RLSpanGroup.U_SETUP == RLSpanGroup.SETUP == "setup"
+    assert {
+        RLSpanGroup.U_JOB,
+        RLSpanGroup.U_STEP,
+        RLSpanGroup.U_MODEL_INIT,
+        RLSpanGroup.U_EVALUATE,
+        RLSpanGroup.U_ROLLOUT,
+        RLSpanGroup.U_SETUP,
+        RLSpanGroup.U_PER_PROMPT,
+    } == UMBRELLA_GROUPS
+
+
+def test_an_umbrella_span_is_the_same_span_minus_the_bucket():
+    from nemo_rl.telemetry.instrumentation import umbrella_span
+
+    handle, exporter = _setup("all")
+    with umbrella_span(RLSpanGroup.U_ROLLOUT, "rl.test.rollout", tracer=handle.tracer):
+        pass
+    handle.shutdown()
+
+    (span,) = exporter.get_finished_spans()
+    assert span.name == "rl.test.rollout"
+    assert RL_BUCKET_ATTR not in span.attributes
+
+
+def test_a_leaf_group_at_an_umbrella_call_warns_and_keeps_its_bucket(caplog):
+    """Degrade, do not raise: telemetry must not end a training run.
+
+    Falling back to leaf semantics keeps the bucket the phase actually has.
+    Emitting it unbucketed would be the worse failure, because it is
+    indistinguishable downstream from a phase that is legitimately uncounted.
+    """
+    from nemo_rl.telemetry import instrumentation
+    from nemo_rl.telemetry.instrumentation import umbrella_span
+
+    instrumentation._LEAF_GROUP_AT_UMBRELLA_CALL.clear()
+    handle, exporter = _setup("all")
+    with caplog.at_level(logging.WARNING, logger=instrumentation.__name__):
+        with umbrella_span(
+            RLSpanGroup.GENERATION, "rl.test.generate", tracer=handle.tracer
+        ):
+            pass
+    handle.shutdown()
+
+    (span,) = exporter.get_finished_spans()
+    assert span.attributes[RL_BUCKET_ATTR] == Bucket.PRODUCTIVE.value
+    assert "is a leaf" in caplog.text
+
+
+def test_the_leaf_group_warning_is_not_repeated_every_step(caplog):
+    from nemo_rl.telemetry import instrumentation
+    from nemo_rl.telemetry.instrumentation import umbrella_span
+
+    instrumentation._LEAF_GROUP_AT_UMBRELLA_CALL.clear()
+    with caplog.at_level(logging.WARNING, logger=instrumentation.__name__):
+        for _ in range(3):
+            with umbrella_span(RLSpanGroup.GENERATION, "rl.test.generate"):
+                pass
+
+    assert caplog.text.count("is a leaf") == 1
+
+
+def test_a_leaf_group_at_an_umbrella_call_still_runs_the_body():
+    """The body is the training work; a bad group must not skip it."""
+    from nemo_rl.telemetry import instrumentation
+    from nemo_rl.telemetry.instrumentation import umbrella_trace_fn
+
+    instrumentation._LEAF_GROUP_AT_UMBRELLA_CALL.clear()
+
+    @umbrella_trace_fn(RLSpanGroup.POLICY_UPDATE, "rl.test.train")
+    def train() -> str:
+        return "done"
+
+    assert train() == "done"
+
+
+def test_umbrella_trace_fn_returns_what_it_wraps():
+    from nemo_rl.telemetry.instrumentation import umbrella_trace_fn
+
+    handle, exporter = _setup("all")
+
+    @umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.test.job", tracer=handle.tracer)
+    def job(value: int) -> int:
+        return value * 2
+
+    assert job(21) == 42
+    handle.shutdown()
+
+    (span,) = exporter.get_finished_spans()
+    assert span.name == "rl.test.job"
+    assert RL_BUCKET_ATTR not in span.attributes
+
+
+def test_startup_spans_nest_without_a_bucket():
+    """Startup phases nest and overlap, so none of them may carry a bucket."""
+    from nemo_rl.telemetry.instrumentation import setup_span, startup_span
+
+    handle, exporter = _setup("all")
+    with startup_span(tracer=handle.tracer):
+        with setup_span("ray_init", tracer=handle.tracer):
+            pass
+        with setup_span("workers", tracer=handle.tracer):
+            with setup_span("policy", tracer=handle.tracer):
+                pass
+    handle.shutdown()
+
+    by_name = {span.name: span for span in exporter.get_finished_spans()}
+    assert set(by_name) == {
+        "rl.startup",
+        "rl.setup.ray_init",
+        "rl.setup.workers",
+        "rl.setup.policy",
+    }
+    for span in by_name.values():
+        assert RL_BUCKET_ATTR not in span.attributes
+    # One trace, so a UI shows the phases as a waterfall rather than as roots.
+    trace_ids = {span.context.trace_id for span in by_name.values()}
+    assert len(trace_ids) == 1
+    assert by_name["rl.setup.policy"].parent.span_id == (
+        by_name["rl.setup.workers"].context.span_id
+    )
+
+
+@requires_lens
+def test_startup_spans_are_gated_by_span_group():
+    from nemo_rl.telemetry.instrumentation import setup_span, startup_span
+
+    handle, exporter = _setup("rollout")
+    with startup_span(tracer=handle.tracer):
+        with setup_span("ray_init", tracer=handle.tracer):
+            pass
+    handle.shutdown()
+
+    assert exporter.get_finished_spans() == ()
+
+
 @requires_lens
 def test_efficiency_span_is_gated_by_span_group():
     # The efficiency group is absent from the coarse "default" preset, so idle
@@ -260,6 +449,50 @@ def test_bucket_scope_leaves_umbrellas_unbucketed():
     """
     with bucket_scope(Bucket.OVERHEAD):
         assert goodput_span_attributes(RLSpanGroup.EVALUATE) == {}
+
+
+def test_per_prompt_scope_is_off_unless_entered():
+    assert not in_per_prompt_scope()
+    with per_prompt_scope():
+        assert in_per_prompt_scope()
+    assert not in_per_prompt_scope()
+
+
+def test_per_prompt_scope_nests_without_leaking():
+    """Nested rollouts must not switch it off on the inner exit."""
+    with per_prompt_scope():
+        with per_prompt_scope():
+            assert in_per_prompt_scope()
+        assert in_per_prompt_scope()
+    assert not in_per_prompt_scope()
+
+
+def test_per_prompt_scope_survives_an_exception():
+    with pytest.raises(RuntimeError):
+        with per_prompt_scope():
+            raise RuntimeError("rollout failed")
+    assert not in_per_prompt_scope()
+
+
+def test_per_prompt_spans_carry_no_bucket():
+    """Rollout-shaped work overlaps itself, so no bucket can hold it.
+
+    Up to ``max_inflight_prompts`` rollouts are in flight at once, so any
+    bucket on these would sum to a multiple of the wall clock.
+    """
+    assert RLSpanGroup.U_PER_PROMPT in UMBRELLA_GROUPS
+    assert bucket_for_span_group(RLSpanGroup.PER_PROMPT) is None
+    assert goodput_span_attributes(RLSpanGroup.PER_PROMPT) == {}
+
+
+def test_a_bucket_scope_cannot_bucket_per_prompt_work():
+    """The rollout path runs inside no scope today, but must stay safe if it does."""
+    with bucket_scope(Bucket.PRODUCTIVE):
+        assert goodput_span_attributes(RLSpanGroup.PER_PROMPT) == {}
+
+
+def test_the_u_alias_for_per_prompt_is_the_same_group():
+    assert RLSpanGroup.U_PER_PROMPT == RLSpanGroup.PER_PROMPT
 
 
 def test_every_rl_span_group_is_classified():

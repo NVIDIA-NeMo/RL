@@ -21,6 +21,8 @@ built-in sinks.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 from tensordict import TensorDict
@@ -29,6 +31,20 @@ from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 
 from ._rollout_shapes import make_rollout_batch
+
+try:
+    from nemo.lens import NemoLensConfig, setup_telemetry
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    _HAS_LENS = True
+except ImportError:
+    _HAS_LENS = False
+
+requires_lens = pytest.mark.skipif(
+    not _HAS_LENS, reason="nemo-lens (+ opentelemetry sdk) not installed"
+)
 
 
 @pytest.fixture
@@ -233,3 +249,259 @@ def test_observability_records_realistic_rollout_put() -> None:
     min_expected = n * 64 * 8  # input_ids alone
     assert put_events[0]["n_bytes"] >= min_expected
     client.close()
+
+
+# --------------------------------------------------------------------------- #
+# OTel spans for data-plane operations                                        #
+# --------------------------------------------------------------------------- #
+@contextmanager
+def _exporting(span_groups: str):
+    """Exporting telemetry with *span_groups* enabled.
+
+    Yields a callable rather than the exporter because the span processor
+    batches: without a force-flush the exporter is still empty at the point a
+    test looks at it.
+    """
+    import nemo_rl.telemetry.setup as setup_mod
+    from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+    exporter = InMemorySpanExporter()
+    cfg = NemoLensConfig(
+        enabled=True, span_groups=span_groups, _span_group_cls=RLSpanGroup
+    )
+    handle = setup_telemetry(cfg, rank=0, world_size=1, span_exporter=exporter)
+    setup_mod._TELEMETRY_HANDLE = handle
+
+    def _spans():
+        from opentelemetry import trace
+
+        trace.get_tracer_provider().force_flush()
+        return exporter.get_finished_spans()
+
+    try:
+        yield _spans
+    finally:
+        handle.shutdown()
+        setup_mod._TELEMETRY_HANDLE = None
+        _reset_otel_globals()
+
+
+@pytest.fixture
+def finished_spans():
+    """Only ``data_plane`` on: the batch-stage case."""
+    with _exporting("data_plane") as spans:
+        yield spans
+
+
+@pytest.fixture
+def finished_spans_with_per_prompt():
+    """Both groups on, so a test can see which one a rollout op picks."""
+    with _exporting("data_plane,per_prompt") as spans:
+        yield spans
+
+
+def _reset_otel_globals() -> None:
+    """Drop the process-global providers this fixture installed.
+
+    The OTel API only lets a provider be set once per process, so leaving ours
+    in place would silently disable telemetry for every later test in the run.
+    """
+    import nemo.lens.handle as handle_mod
+    import opentelemetry.metrics._internal as metrics_mod
+    import opentelemetry.trace as trace_mod
+    from nemo.lens.state import set_enabled_span_groups
+    from opentelemetry.util._once import Once
+
+    trace_mod._TRACER_PROVIDER = None
+    trace_mod._TRACER_PROVIDER_SET_ONCE = Once()
+    metrics_mod._METER_PROVIDER = None
+    metrics_mod._METER_PROVIDER_SET_ONCE = Once()
+    handle_mod._INITIALIZED = False
+    set_enabled_span_groups(frozenset())
+
+
+def _put_one(client) -> None:
+    client.register_partition(
+        partition_id="train", fields=["x"], num_samples=2, consumer_tasks=["read"]
+    )
+    client.put_samples(
+        sample_ids=["a", "b"],
+        partition_id="train",
+        fields=TensorDict({"x": torch.zeros(2, dtype=torch.float32)}, batch_size=[2]),
+    )
+
+
+@requires_lens
+def test_each_data_plane_op_emits_a_span(finished_spans):
+    """Transfer-queue time was invisible in the waterfall before this.
+
+    A step that stalls on a ``get`` looked like a gap between phases, with
+    nothing to say whether the queue or the producer was responsible.
+    """
+    from nemo_rl.telemetry.instrumentation import RL_BUCKET_ATTR
+
+    inner = NoOpDataPlaneClient()
+    client = MetricsDataPlaneClient(inner, on_event=None)
+    _put_one(client)
+    client.close()
+    inner.close()
+
+    spans = finished_spans()
+    names = [s.name for s in spans]
+    assert "rl.data_plane.put" in names
+
+    put = next(s for s in spans if s.name == "rl.data_plane.put")
+    assert put.attributes["rl.data_plane.op"] == "put"
+    assert put.attributes["rl.data_plane.partition"] == "train"
+    assert put.attributes["rl.data_plane.keys"] == 2
+    assert put.attributes["rl.data_plane.bytes"] > 0
+    assert put.attributes["rl.data_plane.status"] == "ok"
+    # Moving bytes between fleets is plumbing, not training progress, so it
+    # must not be credited to goodput.
+    assert put.attributes[RL_BUCKET_ATTR] == "overhead"
+
+
+@requires_lens
+def test_a_rollout_put_is_gated_apart_from_a_batch_put(finished_spans):
+    """The same op, from the per-prompt path, is not a ``data_plane`` span.
+
+    One client serves both paths, so with only ``data_plane`` on, the rollout's
+    put has to disappear while the batch stages' puts keep coming -- that is
+    the whole point of the split, since it is the per-prompt one whose count
+    scales with the dataset.
+    """
+    from nemo_rl.telemetry.instrumentation import per_prompt_scope
+
+    inner = NoOpDataPlaneClient()
+    client = MetricsDataPlaneClient(inner, on_event=None)
+    client.register_partition(
+        partition_id="train", fields=["x"], num_samples=2, consumer_tasks=["read"]
+    )
+    with per_prompt_scope():
+        client.put_samples(
+            sample_ids=["a"],
+            partition_id="train",
+            fields=TensorDict(
+                {"x": torch.zeros(1, dtype=torch.float32)}, batch_size=[1]
+            ),
+        )
+    client.close()
+    inner.close()
+
+    names = [s.name for s in finished_spans()]
+    assert "rl.data_plane.put" not in names
+    # The batch-shaped ops around it are unaffected.
+    assert "rl.data_plane.register" in names
+
+
+@requires_lens
+def test_a_rollout_put_carries_no_bucket(finished_spans_with_per_prompt):
+    """A rollout's put overlaps training and every other in-flight rollout.
+
+    Bucketing it ``overhead`` the way a batch put is would sum past the wall
+    clock it happened in, by up to ``max_inflight_prompts``.
+    """
+    from nemo_rl.telemetry.instrumentation import RL_BUCKET_ATTR, per_prompt_scope
+
+    inner = NoOpDataPlaneClient()
+    client = MetricsDataPlaneClient(inner, on_event=None)
+    client.register_partition(
+        partition_id="train", fields=["x"], num_samples=1, consumer_tasks=["read"]
+    )
+    with per_prompt_scope():
+        client.put_samples(
+            sample_ids=["a"],
+            partition_id="train",
+            fields=TensorDict(
+                {"x": torch.zeros(1, dtype=torch.float32)}, batch_size=[1]
+            ),
+        )
+    client.close()
+    inner.close()
+
+    spans = finished_spans_with_per_prompt()
+    put = next(s for s in spans if s.name == "rl.data_plane.put")
+    assert RL_BUCKET_ATTR not in put.attributes
+    # The op attributes are still recorded; only the bucket differs.
+    assert put.attributes["rl.data_plane.op"] == "put"
+    # A batch-stage op in the same run keeps its bucket.
+    register = next(s for s in spans if s.name == "rl.data_plane.register")
+    assert register.attributes[RL_BUCKET_ATTR] == "overhead"
+
+
+@requires_lens
+def test_leaving_the_scope_restores_the_batch_grouping(finished_spans):
+    """The scope is a region, not a mode: a later batch put must not inherit it."""
+    from nemo_rl.telemetry.instrumentation import per_prompt_scope
+
+    inner = NoOpDataPlaneClient()
+    client = MetricsDataPlaneClient(inner, on_event=None)
+    with per_prompt_scope():
+        client.register_partition(
+            partition_id="rollout", fields=["x"], num_samples=1, consumer_tasks=["r"]
+        )
+    client.register_partition(
+        partition_id="batch", fields=["x"], num_samples=1, consumer_tasks=["r"]
+    )
+    client.close()
+    inner.close()
+
+    partitions = [
+        s.attributes["rl.data_plane.partition"]
+        for s in finished_spans()
+        if s.name == "rl.data_plane.register"
+    ]
+    assert partitions == ["batch"]
+
+
+@requires_lens
+def test_a_failed_op_is_recorded_rather_than_left_open(finished_spans):
+    """An op that raises is exactly the one worth finding in a trace."""
+
+    class _Boom(NoOpDataPlaneClient):
+        def put_samples(self, *args, **kwargs):
+            raise RuntimeError("rdma write failed")
+
+    inner = _Boom()
+    client = MetricsDataPlaneClient(inner, on_event=None)
+    client.register_partition(
+        partition_id="train", fields=["x"], num_samples=2, consumer_tasks=["read"]
+    )
+    with pytest.raises(RuntimeError):
+        client.put_samples(
+            sample_ids=["a"],
+            partition_id="train",
+            fields=TensorDict(
+                {"x": torch.zeros(1, dtype=torch.float32)}, batch_size=[1]
+            ),
+        )
+    inner.close()
+
+    put = next(s for s in finished_spans() if s.name == "rl.data_plane.put")
+    assert put.attributes["rl.data_plane.status"] == "error"
+
+
+@requires_lens
+def test_spans_are_emitted_without_the_event_callback(finished_spans):
+    """Spans and the event log are independently switchable.
+
+    The factory installs this wrapper for telemetry alone, leaving ``on_event``
+    unset, so span emission must not be routed through the event path.
+    """
+    inner = NoOpDataPlaneClient()
+    client = MetricsDataPlaneClient(inner, on_event=None)
+    _put_one(client)
+    client.close()
+    inner.close()
+
+    assert finished_spans()
+
+
+def test_spans_cost_nothing_when_telemetry_is_off():
+    """The wrapper is installed on every data-plane client, so the disabled
+    path is the one that actually runs in production today."""
+    inner = NoOpDataPlaneClient()
+    client = MetricsDataPlaneClient(inner, on_event=None)
+    _put_one(client)
+    client.close()
+    inner.close()

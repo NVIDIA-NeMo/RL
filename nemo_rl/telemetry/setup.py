@@ -39,15 +39,18 @@ the import path of modules that never emit anything.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import uuid
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
 
 if TYPE_CHECKING:
     from nemo.lens import NemoLensConfig, TelemetryHandle
 
 logger = logging.getLogger(__name__)
+
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 # Process-global handle. One per process (driver or Ray actor); ``None`` when
 # lens is absent or telemetry is disabled.
@@ -452,6 +455,48 @@ def init_telemetry_worker(
     else:
         _TELEMETRY_HANDLE = handle
         return handle
+
+
+def traced_worker_init(span_name: str, **attributes: Any) -> Callable[[_F], _F]:
+    """Decorate a worker ``__init__`` so its model load lands in a span.
+
+    Training workers build and shard the model inside ``__init__``, which on a
+    large checkpoint is the longest single phase of a run's startup. Without
+    this the time is real but unattributed: the driver's ``rl.setup.workers``
+    span covers it as one block, and nothing says what the worker was doing.
+
+    Initialises worker telemetry before the body runs. A worker normally calls
+    :func:`init_telemetry_worker` itself a few lines into ``__init__``, but a
+    span cannot open before its provider exists, so the decorator hoists that
+    call ahead of the constructor; the body's own call then returns the handle
+    already made, being idempotent per process.
+
+    A ``None`` handle -- telemetry off, or its setup failed -- runs the
+    constructor untouched. That is also what keeps this safe when ``nemo.lens``
+    is absent: the span imports below are reached only once a handle exists,
+    which cannot happen without lens, so an install without it neither imports
+    nor pays for any of this.
+
+    The span belongs to the ``model_init`` umbrella and so carries no
+    ``rl.bucket``: it is startup rather than a phase of a training step, and
+    the goodput rollup measures steps.
+    """
+
+    def decorate(fn: _F) -> _F:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if init_telemetry_worker() is None:
+                return fn(*args, **kwargs)
+
+            from nemo_rl.telemetry.instrumentation import umbrella_span
+            from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+            with umbrella_span(RLSpanGroup.U_MODEL_INIT, span_name, **attributes):
+                return fn(*args, **kwargs)
+
+        return cast(_F, wrapper)
+
+    return decorate
 
 
 def get_telemetry_handle() -> Optional["TelemetryHandle"]:

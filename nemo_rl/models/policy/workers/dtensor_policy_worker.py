@@ -93,7 +93,10 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
-from nemo_rl.telemetry.setup import init_telemetry_worker
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    traced_worker_init,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -210,6 +213,7 @@ class DTensorPolicyWorkerImpl(
             "context_parallel": self.device_mesh["cp"].get_local_rank(),
         }
 
+    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "dtensor"})
     def __init__(
         self,
         config: PolicyConfig,

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneConfig
+from nemo_rl.telemetry.setup import telemetry_enabled_in_env
 
 
 def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
@@ -93,13 +94,19 @@ def build_data_plane_client(
         raise ValueError(f"unknown data_plane impl: {impl!r}")
 
     obs = cfg.get("observability") or {}
-    if obs.get("enabled", False):
+    obs_enabled = obs.get("enabled", False)
+    # The wrapper carries the trace spans as well as the event callback, so
+    # telemetry alone is reason enough to install it -- otherwise transfer-queue
+    # traffic would be missing from every trace unless a user happened to also
+    # switch on data-plane event logging. With observability off the callback is
+    # a no-op, so this costs one span per op and nothing else.
+    if obs_enabled or telemetry_enabled_in_env():
         from nemo_rl.data_plane.observability import (
             MetricsDataPlaneClient,
             log_event,
         )
 
-        on_event = obs.get("callback") or log_event
+        on_event = (obs.get("callback") or log_event) if obs_enabled else None
         # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
         client = MetricsDataPlaneClient(client, on_event=on_event)  # type: ignore[bad-argument-type]
     return client

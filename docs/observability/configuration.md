@@ -21,7 +21,7 @@ telemetry:
   metrics_enabled: true       # emit the rl.* metric instruments
   logs_enabled: false         # bridge Python logging to OTel logs (trace-correlated)
   exporter: otlp              # otlp | console
-  vllm_native_tracing: false  # opt in to vLLM's own OTLP tracing (gRPC-only — see vllm-tracing.md)
+  vllm_native_tracing: false  # opt in to vLLM's own OTLP tracing (gRPC-only, one span per request — see vllm-tracing.md)
 ```
 
 The defaults above are the field defaults of `TelemetryConfig` (`nemo_rl/telemetry/config.py`). The endpoint, headers, and protocol are **not** in this block — they come from the standard `OTEL_EXPORTER_OTLP_*` env vars (see below).

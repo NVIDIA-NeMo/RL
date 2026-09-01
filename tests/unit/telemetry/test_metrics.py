@@ -133,6 +133,14 @@ def _start_exporting_telemetry():
     import nemo_rl.telemetry.setup as setup_mod
     from nemo_rl.telemetry.span_groups import RLSpanGroup
 
+    # Every rl.* series is declared through lens's consumer-driven metric
+    # registry, so nothing is emitted at all on a lens that predates it.
+    # Skipping keeps these assertions meaningful instead of failing for a
+    # reason that has nothing to do with what they cover.
+    instruments = pytest.importorskip("nemo.lens.instruments")
+    if not hasattr(instruments, "register_metric_group"):
+        pytest.skip("installed nemo-lens has no metric registry (lens PR #46)")
+
     reader = InMemoryMetricReader()
     cfg = NemoLensConfig(enabled=True, _span_group_cls=RLSpanGroup)
     setup_mod._TELEMETRY_HANDLE = setup_telemetry(
@@ -434,6 +442,251 @@ def test_tee_never_raises_into_the_training_step(monkeypatch, caplog):
         tee_rl_metrics_to_otel({"reward": 1.0}, "train")
 
     assert [r.levelno for r in caplog.records] == [logging.WARNING]
+
+
+def test_map_teed_scalars_reads_training_and_vllm_keys():
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+
+    values = map_teed_scalars(
+        {
+            "reward": 0.75,
+            "kl_penalty": 0.01,
+            "loss": 1.5,
+            "critic/loss": 2.5,
+            "approx_entropy": 3.0,
+            "mean_gen_tokens_per_sample": 128.0,
+            "grad_norm": 0.9,
+            "lr": 1e-6,
+            "vllm/prompt_tokens": 400.0,
+            "vllm/generations_failed": 2.0,
+            "not_a_declared_key": 1.0,
+        }
+    )
+
+    assert values == {
+        "reward_mean": 0.75,
+        "kl_divergence": 0.01,
+        "policy_loss": 1.5,
+        "value_loss": 2.5,
+        "entropy": 3.0,
+        "response_length_mean": 128.0,
+        "grad_norm": 0.9,
+        "learning_rate": 1e-6,
+        "vllm_prompt_tokens": 400.0,
+        "vllm_generations_failed": 2.0,
+    }
+
+
+def test_map_teed_scalars_skips_bool_and_non_numeric():
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+
+    assert map_teed_scalars({"reward": True, "loss": "nan", "lr": None}) == {}
+
+
+def test_every_declared_scalar_has_a_unique_key_and_name():
+    """A duplicate key would make one declaration silently shadow another."""
+    from nemo_rl.telemetry.metrics import _TEED_SCALARS
+
+    keys = [teed.key for teed in _TEED_SCALARS]
+    names = [teed.name for teed in _TEED_SCALARS]
+
+    assert len(set(keys)) == len(keys)
+    assert len(set(names)) == len(names)
+    # The registry key is what a caller records under, so it has to be a valid
+    # Python identifier -- lens rejects anything else at construction.
+    assert all(key.isidentifier() for key in keys)
+
+
+def test_tee_emits_the_training_scalars(monkeypatch):
+    """The scalars were previously absent from OTel entirely.
+
+    Mapping NeMo-RL's logger keys onto lens's fixed instrument fields was never
+    settled; owning the names removes the need to.
+    """
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "efficiency_measurements", lambda: _MEASUREMENTS)
+
+    tee_rl_metrics_to_otel({"reward": 0.75, "lr": 1e-6}, "train")
+
+    data = reader.get_metrics_data()
+    assert [p.value for p in _gauge_points(data, "rl.reward.mean")] == [0.75]
+    assert [p.value for p in _gauge_points(data, "rl.learning_rate")] == [1e-6]
+
+
+def test_tee_emits_the_vllm_engine_metrics(monkeypatch):
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "efficiency_measurements", lambda: _MEASUREMENTS)
+
+    tee_rl_metrics_to_otel(
+        {"vllm/generation_length_mean": 150.0, "vllm/generations_failed": 2.0},
+        "train",
+    )
+
+    data = reader.get_metrics_data()
+    assert [p.value for p in _gauge_points(data, "rl.vllm.generation_length.mean")] == [
+        150.0
+    ]
+
+
+def test_a_missing_metric_registry_disables_the_tee_without_raising(
+    monkeypatch, caplog
+):
+    """A lens without the registry must cost the run its metrics, not its step."""
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    monkeypatch.setattr(metrics_mod, "_REGISTERED", False)
+    monkeypatch.setattr(metrics_mod, "_WARNED", set())
+    monkeypatch.setattr(
+        metrics_mod,
+        "_metric_specs",
+        lambda: (_ for _ in ()).throw(ImportError("no registry")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=metrics_mod.__name__):
+        tee_rl_metrics_to_otel({"reward": 1.0}, "train")
+
+    assert not metrics_mod.ensure_metric_group_registered()
+
+
+def test_setup_phase_strips_the_duration_suffixes():
+    from nemo_rl.telemetry.metrics import setup_phase
+
+    assert setup_phase("generation_init_time_s") == "generation_init"
+    assert setup_phase("parallel_wall_time_s") == "parallel_wall"
+    # An extras key the declared fields know nothing about still maps.
+    assert setup_phase("vllm_nccl_sparse_init_time_s") == "vllm_nccl_sparse_init"
+
+
+def test_setup_phase_rejects_keys_that_are_not_durations():
+    """The suffix requirement is the filter, so a flag must not become a phase."""
+    from nemo_rl.telemetry.metrics import setup_phase
+
+    assert setup_phase("parallel_init_enabled") is None
+    assert setup_phase("_s") is None
+
+
+def test_map_setup_seconds_reads_every_phase_including_extras():
+    from nemo_rl.telemetry.metrics import map_setup_seconds
+
+    assert map_setup_seconds(
+        {
+            "generation_init_time_s": 300.0,
+            "total_setup_time_s": 420,
+            "vllm_nccl_sparse_init_time_s": 5.0,
+            "parallel_init_enabled": 1.0,
+            "parallel_init_notes": "ignored",
+        }
+    ) == {
+        "generation_init": 300.0,
+        "total_setup": 420.0,
+        "vllm_nccl_sparse_init": 5.0,
+    }
+
+
+def test_tee_emits_the_setup_phases_under_their_own_prefix():
+    from nemo_rl.telemetry.metrics import (
+        RL_SETUP_DURATION_METRIC,
+        RL_SETUP_PHASE_ATTR,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+
+    tee_rl_metrics_to_otel(
+        {"generation_init_time_s": 300.0, "total_setup_time_s": 420.0},
+        "timing/setup",
+    )
+
+    points = _gauge_points(reader.get_metrics_data(), RL_SETUP_DURATION_METRIC)
+    assert {p.attributes[RL_SETUP_PHASE_ATTR]: p.value for p in points} == {
+        "generation_init": 300.0,
+        "total_setup": 420.0,
+    }
+
+
+def test_setup_phases_carry_no_bucket():
+    """They overlap each other, so anything summing them by bucket would lie."""
+    from nemo_rl.telemetry.metrics import (
+        RL_BUCKET_ATTR,
+        RL_SETUP_DURATION_METRIC,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+
+    tee_rl_metrics_to_otel({"total_setup_time_s": 420.0}, "timing/setup")
+
+    points = _gauge_points(reader.get_metrics_data(), RL_SETUP_DURATION_METRIC)
+    assert points
+    assert all(RL_BUCKET_ATTR not in p.attributes for p in points)
+
+
+def test_a_train_dict_does_not_reach_the_setup_tee():
+    """The two prefixes share no key, so neither may be scanned for the other."""
+    from nemo_rl.telemetry.metrics import (
+        RL_SETUP_DURATION_METRIC,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+
+    # Ends in _s and would parse as a phase, but arrives under "train".
+    tee_rl_metrics_to_otel({"total_step_time_s": 12.0}, "train")
+
+    assert not _gauge_points(reader.get_metrics_data(), RL_SETUP_DURATION_METRIC)
+
+
+def test_a_broken_setup_tee_does_not_raise(monkeypatch, caplog):
+    """setup() logs this dict unguarded, so a failure must not abort startup."""
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "_WARNED", set())
+    monkeypatch.setattr(
+        metrics_mod,
+        "map_setup_seconds",
+        lambda _: (_ for _ in ()).throw(RuntimeError("setup tee is wedged")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=metrics_mod.__name__):
+        tee_rl_metrics_to_otel({"total_setup_time_s": 1.0}, "timing/setup")
+
+    assert any("setup" in r.message for r in caplog.records)
+
+
+def test_a_broken_scalar_tee_does_not_silence_the_efficiency_tee(monkeypatch, caplog):
+    """Each family has its own handler, so one failure cannot cost the others."""
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import (
+        RL_EFFICIENCY_SECONDS_METRIC,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "efficiency_measurements", lambda: _MEASUREMENTS)
+    monkeypatch.setattr(metrics_mod, "_WARNED", set())
+    monkeypatch.setattr(
+        metrics_mod,
+        "map_teed_scalars",
+        lambda _: (_ for _ in ()).throw(RuntimeError("scalars are wedged")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=metrics_mod.__name__):
+        tee_rl_metrics_to_otel(
+            {"efficiency/idle/refit_bubble_s": 12.0, "reward": 1.0}, "train"
+        )
+
+    points = _gauge_points(reader.get_metrics_data(), RL_EFFICIENCY_SECONDS_METRIC)
+    assert [p.value for p in points] == [12.0]
+    assert any("scalars" in r.message for r in caplog.records)
 
 
 def test_a_broken_tee_warns_once_not_once_per_step(monkeypatch, caplog):

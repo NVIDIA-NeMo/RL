@@ -20,6 +20,7 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     shutdown_telemetry,
     telemetry_enabled_in_env,
+    traced_worker_init,
     vllm_native_tracing_requested,
 )
 
@@ -512,3 +513,61 @@ def test_shutdown_swallows_a_failing_flush():
     shutdown_telemetry()
 
     assert get_telemetry_handle() is None
+
+
+def test_a_traced_worker_init_runs_the_constructor_with_telemetry_off(monkeypatch):
+    """Telemetry off is the common case, and must be transparent.
+
+    A worker constructor builds the model; wrapping it must not change what it
+    does, what it returns, or -- since ``nemo.lens`` may be absent -- reach the
+    span imports at all.
+    """
+    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "0")
+    calls = []
+
+    class Worker:
+        @traced_worker_init("rl.policy.load_model", **{"rl.backend": "megatron"})
+        def __init__(self, name):
+            calls.append(name)
+            self.name = name
+
+    worker = Worker("policy")
+
+    assert worker.name == "policy"
+    assert calls == ["policy"]
+
+
+def test_a_traced_worker_init_initialises_telemetry_before_the_body(monkeypatch):
+    """The span cannot open before the provider exists.
+
+    A worker calls init_telemetry_worker() a few lines into __init__, which is
+    too late for a decorator to have opened a span, so the decorator hoists it.
+    """
+    order = []
+
+    def _fake_init():
+        order.append("telemetry")
+        return None  # disabled: the body still has to run
+
+    monkeypatch.setattr("nemo_rl.telemetry.setup.init_telemetry_worker", _fake_init)
+
+    class Worker:
+        @traced_worker_init("rl.value.load_model")
+        def __init__(self):
+            order.append("body")
+
+    Worker()
+
+    assert order == ["telemetry", "body"]
+
+
+def test_a_traced_worker_init_preserves_the_wrapped_signature():
+    class Worker:
+        @traced_worker_init("rl.policy.load_model")
+        def __init__(self, a, b=2):
+            """Build the model."""
+            self.total = a + b
+
+    assert Worker.__init__.__doc__ == "Build the model."
+    assert Worker(1).total == 3
+    assert Worker(1, b=5).total == 6

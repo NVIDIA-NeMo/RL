@@ -66,8 +66,8 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.telemetry.instrumentation import (
     efficiency_span,
-    managed_span,
     remote_trace_context,
+    umbrella_span,
 )
 from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -937,8 +937,8 @@ class AsyncTrajectoryCollector:
                 # version. Deliberately one span per batch, not per sample:
                 # generate_async is dispatched one coroutine per sample, which
                 # would be thousands of overlapping spans per step.
-                with managed_span(
-                    RLSpanGroup.ROLLOUT,
+                with umbrella_span(
+                    RLSpanGroup.U_ROLLOUT,
                     "rl.grpo.generation",
                     tracer=self._tracer,
                     **{

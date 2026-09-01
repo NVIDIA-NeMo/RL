@@ -54,7 +54,7 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317   # your OTLP backend /
 uv run examples/run_grpo.py --config examples/configs/grpo_math_1B.yaml
 ```
 
-With `default` span groups, NeMo-RL emits a handful of coarse spans (job, checkpoint, evaluate) plus whatever `rl.*` metrics the driver's logger produces. Switch to `per_step` for per-step traces (rollout/generation/reward/...), or `all` for everything.
+With `default` span groups, NeMo-RL emits a handful of coarse spans (startup, job, checkpoint, evaluate, model load) plus whatever `rl.*` metrics the driver's logger produces. Switch to `per_step` for per-step traces (rollout/generation/reward/...), or `all` for everything.
 
 Keeping the settings in the config file is what makes a run's telemetry reproducible from the file alone. The endpoint is the exception: `OTEL_EXPORTER_OTLP_*` are the standard OpenTelemetry variables, and they belong in the environment because they describe where you are running, not what you are measuring. See [Configuration](configuration.md).
 
@@ -70,7 +70,10 @@ Each algorithm's `examples/run_<algo>.py` calls `init_telemetry_driver(config, a
 | DPO | `examples/run_dpo.py` | `rl.dpo.step`, `rl.dpo.policy_training` |
 | RM | `examples/run_rm.py` | `rl.rm.step` |
 | Distillation | `examples/run_distillation.py` | `rl.distillation.step`, `rl.distillation.generation`, `rl.distillation.teacher_logprob_inference`, `rl.distillation.policy_training` |
+| SingleController (GRPO + PPO) | `examples/run_grpo_single_controller.py` | `rl.sc.step`, `rl.sc.generate_and_push`, `rl.sc.policy_and_reference_logprobs`, `rl.sc.advantage_calculation`, `rl.sc.policy_training`, `rl.data_plane.*` |
 | vLLM generation | `nemo_rl/models/generation/vllm/vllm_generation.py` | `rl.vllm.generate`, `rl.vllm.generate_text` |
+
+The SingleController path differs in where the spans come from. Its driver only builds resources and launches `SingleControllerActor`, so the actor opens the job and step spans and flushes its own telemetry; the entrypoint still calls `init_telemetry_driver` before `init_ray()`, because that is what puts the resolved settings in the environment the actor inherits.
 
 Each span belongs to a **span group** that controls whether it is emitted at runtime. See [Span Groups](span-groups.md) for the full per-algorithm span table.
 

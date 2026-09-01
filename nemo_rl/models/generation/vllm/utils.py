@@ -434,13 +434,71 @@ def model_dump_chat_response_with_dynamic_message_fields(
     return response_dict
 
 
+# --- vLLM engine counters -------------------------------------------------
+#
+# Workers hand the driver a flat ``{str: float | list[float]}`` dict, which is
+# all the aggregation below needs (it only ever sums). vLLM's reader, though,
+# reports labelled series as several objects sharing one ``name``, and
+# histograms as a ``count``/``sum``/``buckets`` triple with no scalar at all.
+# Both are folded into that flat shape by encoding the extra dimension in the
+# key, so a plain sum across workers still gives the right fleet total.
+COUNTER_KEY_SEP = "|"
+HISTOGRAM_SUM_PART = "sum"
+HISTOGRAM_COUNT_PART = "count"
+
+# Engine series surfaced per step, beyond the spec-decode family. vLLM has
+# renamed several of these across releases (compare the alias lists in
+# nemo_rl/models/generation/dynamo/metrics.py), so each entry lists the
+# candidates in preference order and a missing one is simply skipped.
+PROMPT_TOKEN_COUNTERS = ("vllm:prompt_tokens", "vllm:prompt_tokens_total")
+GENERATION_TOKEN_COUNTERS = ("vllm:generation_tokens", "vllm:generation_tokens_total")
+PROMPT_LENGTH_HISTOGRAMS = ("vllm:request_prompt_tokens",)
+GENERATION_LENGTH_HISTOGRAMS = ("vllm:request_generation_tokens",)
+REQUEST_SUCCESS_COUNTERS = ("vllm:request_success", "vllm:request_success_total")
+
+# vLLM's FinishReason vocabulary: stop, length, abort, error, repetition. Only
+# the first two leave a usable sample behind -- ``length`` is a normal outcome in
+# RL, where a rollout routinely runs to max_tokens. Everything else is counted as
+# failed rather than dropped, so ok + failed stays equal to the engine's total
+# even if a future vLLM adds a reason we have never heard of.
+OK_FINISH_REASONS = frozenset({"stop", "length"})
+FINISHED_REASON_LABEL = "finished_reason"
+
+# Metric names kept from a worker's snapshot. The snapshot carries every series
+# vLLM exposes (~40), and forwarding all of them would put unbounded,
+# version-dependent cardinality on the step metrics.
+#
+# Matched exactly, not by prefix: vLLM ships close siblings of these names
+# (``vllm:prompt_tokens_by_source``, ``vllm:prompt_tokens_cached``) that a
+# prefix test would pull in as extra per-step payload nothing here reads.
+_KEPT_COUNTER_NAMES: tuple[str, ...] = (
+    PROMPT_TOKEN_COUNTERS
+    + GENERATION_TOKEN_COUNTERS
+    + PROMPT_LENGTH_HISTOGRAMS
+    + GENERATION_LENGTH_HISTOGRAMS
+    + REQUEST_SUCCESS_COUNTERS
+)
+
+
+def encode_counter_key(name: str, part: str) -> str:
+    """Encode a histogram component or a label into a flat counter key."""
+    return f"{name}{COUNTER_KEY_SEP}{part}"
+
+
+def _is_kept(metric_name: str) -> bool:
+    """Whether a snapshot key belongs to a family the driver consumes."""
+    base = metric_name.split(COUNTER_KEY_SEP, 1)[0]
+    return "spec_decode" in base or base in _KEPT_COUNTER_NAMES
+
+
 def aggregate_spec_decode_counters(
     worker_metrics: list[dict[str, float | list[float]]],
 ) -> dict[str | tuple[str, int], float]:
-    """Aggregate speculative decoding counters from multiple workers.
+    """Aggregate vLLM engine counters from multiple workers.
 
-    Combines spec decode metrics collected from DP leader workers into
-    a single aggregated counter dictionary.
+    Combines the metrics collected from DP leader workers into a single
+    aggregated counter dictionary. Retains the spec-decode family and the engine
+    series listed above; everything else in the snapshot is dropped.
 
     Args:
         worker_metrics: List of metric dictionaries from each worker.
@@ -461,15 +519,106 @@ def aggregate_spec_decode_counters(
 
     for report in worker_metrics:
         for metric_name, value in report.items():
-            if "spec_decode" in metric_name:
-                if isinstance(value, list):
-                    # Per-position metrics (e.g., acceptance counts at each draft position)
-                    for position, pos_value in enumerate(value, 1):
-                        counters[metric_name, position] += pos_value
-                else:
-                    counters[metric_name] += value
+            if not _is_kept(metric_name):
+                continue
+            if isinstance(value, list):
+                # Per-position metrics (e.g., acceptance counts at each draft position)
+                for position, pos_value in enumerate(value, 1):
+                    counters[metric_name, position] += pos_value
+            else:
+                counters[metric_name] += value
 
     return dict(counters)
+
+
+def _first_delta(
+    delta: dict[str | tuple[str, int], float],
+    candidates: tuple[str, ...],
+    part: Optional[str] = None,
+) -> Optional[float]:
+    """Return the delta for the first candidate name present, else ``None``."""
+    for name in candidates:
+        key = encode_counter_key(name, part) if part is not None else name
+        if key in delta:
+            return delta[key]
+    return None
+
+
+def _mean_from_histogram(
+    delta: dict[str | tuple[str, int], float], candidates: tuple[str, ...]
+) -> Optional[float]:
+    """Mean of a histogram over the step, from its ``sum``/``count`` delta.
+
+    Exact rather than bucket-interpolated: vLLM tracks both, so the mean needs no
+    approximation. ``None`` when the engine served no request in the step, which
+    is a real state (a step spent entirely in training) and not a zero-length
+    sequence.
+    """
+    total = _first_delta(delta, candidates, HISTOGRAM_SUM_PART)
+    count = _first_delta(delta, candidates, HISTOGRAM_COUNT_PART)
+    if total is None or count is None or count <= 0:
+        return None
+    return total / count
+
+
+def compute_engine_step_metrics(
+    start_counters: dict[str | tuple[str, int], float],
+    end_counters: dict[str | tuple[str, int], float],
+) -> dict[str, float]:
+    """Compute per-step vLLM engine token, sequence-length and outcome metrics.
+
+    These are the engine's own accounting, which is why they are worth carrying
+    even though the driver already derives token counts from the tensors a
+    ``generate()`` call returns: sequence-length distributions and aborted
+    requests leave no trace in the returned tensors at all.
+
+    Args:
+        start_counters: Counter snapshot taken before generation.
+        end_counters: Counter snapshot taken after generation.
+
+    Returns:
+        Metrics for logging, keyed with a ``vllm/`` prefix. Absent series are
+        omitted rather than reported as zero, so a vLLM release that renames one
+        leaves a gap in the dashboard instead of a plausible-looking zero.
+    """
+    keys = set(start_counters) | set(end_counters)
+    delta = {k: end_counters.get(k, 0.0) - start_counters.get(k, 0.0) for k in keys}
+
+    metrics: dict[str, float] = {}
+
+    prompt_tokens = _first_delta(delta, PROMPT_TOKEN_COUNTERS)
+    if prompt_tokens is not None:
+        metrics["vllm/prompt_tokens"] = prompt_tokens
+    generation_tokens = _first_delta(delta, GENERATION_TOKEN_COUNTERS)
+    if generation_tokens is not None:
+        metrics["vllm/generation_tokens"] = generation_tokens
+
+    prompt_length = _mean_from_histogram(delta, PROMPT_LENGTH_HISTOGRAMS)
+    if prompt_length is not None:
+        metrics["vllm/prompt_length_mean"] = prompt_length
+    generation_length = _mean_from_histogram(delta, GENERATION_LENGTH_HISTOGRAMS)
+    if generation_length is not None:
+        metrics["vllm/generation_length_mean"] = generation_length
+
+    ok, failed, saw_any = 0.0, 0.0, False
+    for name in REQUEST_SUCCESS_COUNTERS:
+        prefix = encode_counter_key(name, f"{FINISHED_REASON_LABEL}=")
+        for key, value in delta.items():
+            if not isinstance(key, str) or not key.startswith(prefix):
+                continue
+            saw_any = True
+            reason = key[len(prefix) :]
+            if reason in OK_FINISH_REASONS:
+                ok += value
+            else:
+                failed += value
+        if saw_any:
+            break
+    if saw_any:
+        metrics["vllm/generations_ok"] = ok
+        metrics["vllm/generations_failed"] = failed
+
+    return metrics
 
 
 def compute_spec_decode_metrics(
