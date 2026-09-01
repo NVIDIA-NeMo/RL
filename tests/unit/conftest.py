@@ -14,6 +14,7 @@
 import json
 import os
 import random
+import tempfile
 import time
 import unittest.mock
 from datetime import datetime
@@ -406,9 +407,14 @@ def init_ray_cluster():
 
     This fixture doesn't need to be called directly.
     """
-    init_ray()
-    yield
-    ray.shutdown()
+    # Ray appends a long session/sockets suffix. Keep the root short enough for
+    # Linux's 107-byte AF_UNIX socket path limit.
+    with tempfile.TemporaryDirectory(prefix="nrl-ray-", dir="/tmp") as ray_temp_dir:
+        init_ray(log_dir=ray_temp_dir, force_new=True)
+        try:
+            yield
+        finally:
+            ray.shutdown()
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 import ray
 import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 # Set up Ray temp directory before any Ray operations
 # Try multiple approaches to ensure Ray uses a writable directory
@@ -1449,6 +1450,17 @@ class TestAsyncTrajectoryCollector:
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
 
+    def test_resume_after_refit_skips_duplicate_cache_invalidation(self):
+        """The driver resets cache while vLLM is paused, before collector admission."""
+        collector = self.create_local_collector()
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.recompute_kv_cache_after_weight_updates = True
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+
+        collector.resume_after_refit(cache_already_invalidated=True)
+
+        collector.policy_generation.invalidate_kv_cache.assert_not_called()
+
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""
         buffer = ReplayBuffer.remote(max_size=10)
@@ -1734,6 +1746,259 @@ class TestAsyncTrajectoryCollector:
             ["Test prompt 2", "Test prompt 3"],
         ]
 
+    def test_overfit361_batch16_reserve1_has_zero_prompt_loss(self, monkeypatch):
+        """One epoch admits every OSWorld prompt when capacity opens one slot at a time."""
+
+        class ReserveOne:
+            def remote(self, *args, **kwargs):
+                return 1
+
+        class Release:
+            def remote(self, *args, **kwargs):
+                return None
+
+        class FakeReplayBuffer:
+            reserve = ReserveOne()
+            release_reserved = Release()
+
+        class SynchronousThread:
+            def __init__(self, *, target, daemon):
+                assert daemon
+                self.target = target
+
+            def start(self):
+                self.target()
+
+            def is_alive(self):
+                return False
+
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+        admitted_prompt_ids = []
+
+        async def capture_batch(**kwargs):
+            repeated_batch = kwargs["repeated_batch"]
+            admitted_prompt_ids.extend(
+                int(messages[0]["content"])
+                for messages in repeated_batch["message_log"][::3]
+            )
+
+        collector._run_rollout_batch_worker = capture_batch
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: False)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", SynchronousThread
+        )
+
+        for start in range(0, 361, 16):
+            end = min(start + 16, 361)
+            prompt_ids = list(range(start, end))
+            collector._process_batch(
+                BatchedDataDict[DatumSpec](
+                    {
+                        "task_name": ["test"] * len(prompt_ids),
+                        "message_log": [
+                            [{"role": "user", "content": str(prompt_id)}]
+                            for prompt_id in prompt_ids
+                        ],
+                        "extra_env_info": [{} for _ in prompt_ids],
+                        "loss_multiplier": torch.ones(len(prompt_ids)),
+                    }
+                )
+            )
+
+        assert admitted_prompt_ids == list(range(361))
+        assert len(set(admitted_prompt_ids)) == 361
+
+    def test_real_dataloader_cycles_two_complete_361_prompt_epochs(self):
+        """The collector recreates the iterator and retains the nine-row tail."""
+
+        def collate(prompt_ids):
+            return BatchedDataDict[DatumSpec](
+                {
+                    "task_name": ["test"] * len(prompt_ids),
+                    "message_log": [
+                        [{"role": "user", "content": str(prompt_id)}]
+                        for prompt_id in prompt_ids
+                    ],
+                    "extra_env_info": [{} for _ in prompt_ids],
+                    "loss_multiplier": torch.ones(len(prompt_ids)),
+                }
+            )
+
+        dataloader = StatefulDataLoader(
+            list(range(361)),
+            batch_size=16,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate,
+            num_workers=0,
+        )
+        collector = self.create_local_collector()
+        collector.master_config.grpo.max_num_epochs = 2
+        collector.dataloader = dataloader
+        collector.running = True
+        admitted_prompt_ids = []
+
+        def capture_batch(batch, retry_count=0):
+            del retry_count
+            admitted_prompt_ids.extend(
+                int(messages[0]["content"]) for messages in batch["message_log"]
+            )
+
+        collector._process_batch = capture_batch
+        collector._collection_loop()
+
+        assert collector.data_exhausted
+        assert collector._completed_epochs == 2
+        assert admitted_prompt_ids == list(range(361)) * 2
+
+    def test_startup_refit_finishes_before_collection_admission(self, monkeypatch):
+        events = []
+
+        class RemoteMethod:
+            def __init__(self, event):
+                self.event = event
+
+            def remote(self, *args):
+                events.append(
+                    f"{self.event}:{args[0]}" if args and self.event == "set" else self.event
+                )
+                return None
+
+        collector = SimpleNamespace(
+            set_weight_version=RemoteMethod("set"),
+            start_collection=RemoteMethod("start"),
+        )
+        generation = SimpleNamespace(
+            prepare_for_generation=lambda: events.append("prepare")
+        )
+        monkeypatch.setattr(grpo_mod.ray, "get", lambda value, **_: value)
+        monkeypatch.setattr(
+            grpo_mod,
+            "refit_policy_generation",
+            lambda *args, **kwargs: events.append("refit"),
+        )
+
+        stale = grpo_mod._prepare_async_generation_and_start_collection(
+            object(),
+            generation,
+            collector,
+            object(),
+            need_refit=True,
+            generation_stale=True,
+            colocated_inference=False,
+            weight_version=7,
+        )
+
+        assert stale is False
+        assert events == ["refit", "set:7", "start"]
+
+    def test_native_vllm_refit_orders_both_scheduling_barriers(self, monkeypatch):
+        events = []
+
+        class RemoteMethod:
+            def __init__(self, event):
+                self.event = event
+
+            def remote(self, *args):
+                events.append(
+                    f"{self.event}:{args[0]}" if args and self.event == "set" else self.event
+                )
+                return None
+
+        class FakeVllmGeneration:
+            def pause_generation_for_refit(self):
+                events.append("vllm_pause")
+
+            def invalidate_kv_cache(self):
+                events.append("cache_reset")
+                return True
+
+            def resume_generation_after_refit(self):
+                events.append("vllm_resume")
+
+        collector = SimpleNamespace(
+            prepare_for_refit=RemoteMethod("collector_pause"),
+            set_weight_version=RemoteMethod("set"),
+            resume_after_refit=RemoteMethod("collector_resume"),
+        )
+        generation = FakeVllmGeneration()
+        monkeypatch.setattr(grpo_mod, "VllmGeneration", FakeVllmGeneration)
+        monkeypatch.setattr(grpo_mod.ray, "get", lambda value, **_: value)
+        monkeypatch.setattr(
+            grpo_mod,
+            "refit_policy_generation",
+            lambda *args, **kwargs: events.append("refit") or {"ok": 1.0},
+        )
+
+        metrics, version = grpo_mod._refit_async_generation_safely(
+            object(),
+            generation,
+            collector,
+            colocated_inference=False,
+            weight_version=3,
+        )
+
+        assert metrics == {"ok": 1.0}
+        assert version == 4
+        assert events == [
+            "collector_pause",
+            "vllm_pause",
+            "refit",
+            "cache_reset",
+            "set:4",
+            "vllm_resume",
+            "collector_resume",
+        ]
+
+    def test_checkpoint_captures_pending_and_unresolved_inflight_inputs(
+        self, monkeypatch
+    ):
+        class RemoteMethod:
+            def remote(self):
+                return {"trajectories": [], "trajectory_versions": []}
+
+        replay_buffer = SimpleNamespace(state_dict=RemoteMethod())
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.dataloader = SimpleNamespace(state_dict=lambda: {"cursor": 12})
+        collector._completed_epochs = 4
+        collector._next_nemo_gym_task_index = 20
+        collector._queue_pending_input(
+            BatchedDataDict(
+                {
+                    "extra_env_info": [{"_ng_task_index": 9}],
+                    "loss_multiplier": torch.ones(1),
+                }
+            ),
+            retry_count=1,
+        )
+        collector._inflight_inputs["active"] = {
+            "batch": BatchedDataDict(
+                {
+                    "extra_env_info": [
+                        {"_ng_task_index": 10},
+                        {"_ng_task_index": 11},
+                    ],
+                    "loss_multiplier": torch.ones(2),
+                }
+            ),
+            "retry_count": 0,
+            "unresolved_group_indices": {1},
+        }
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+
+        state = collector.get_checkpoint_state()
+        pending_ids = [
+            item["batch"]["extra_env_info"][0]["_ng_task_index"]
+            for item in state["rollouts"]["pending_inputs"]
+        ]
+
+        assert state["dataloader"] == {"cursor": 12}
+        assert state["rollouts"]["completed_epochs"] == 4
+        assert state["rollouts"]["next_ng_task_index"] == 20
+        assert pending_ids == [9, 11]
+
     def test_process_batch_non_gym_uses_one_batched_worker(self, monkeypatch):
         """Native collection repeats all prompts into one batch worker."""
 
@@ -1915,6 +2180,39 @@ class TestAsyncTrajectoryCollector:
         assert exc.value.__cause__ is not None
         assert "unexpected add status" in str(exc.value.__cause__)
 
+    def test_irrecoverable_prompt_attempt_does_not_stop_collector(self, monkeypatch):
+        """A repeatedly malformed rollout is skipped without killing training."""
+        collector = self.create_local_collector()
+        collector.running = True
+        admission_id = "malformed-trace-attempt"
+        batch = self.create_mock_batch(size=1)
+        collector._inflight_inputs[admission_id] = {
+            "batch": batch,
+            "retry_count": trajectory_collector_mod._MAX_FAILED_GROUP_REQUEUES,
+            "unresolved_group_indices": {0},
+        }
+
+        async def fail_collection(**kwargs):
+            raise ValueError("invalid compaction boundary")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail_collection)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=batch.repeat_interleave(3),
+                generation_weight_version=5,
+                target_weight_version=None,
+                num_generations=3,
+                use_nemo_gym=True,
+                admission_id=admission_id,
+            )
+        )
+
+        assert collector.running is True
+        assert collector.collection_failed is False
+        assert admission_id not in collector._inflight_inputs
+        assert not collector._pending_inputs
+
     def test_nemo_gym_batch_retry_does_not_duplicate_buffered_groups(self, monkeypatch):
         """A partial stream retry only enqueues prompt groups not already buffered."""
 
@@ -1932,7 +2230,7 @@ class TestAsyncTrajectoryCollector:
             def __init__(self):
                 self.task_indices = []
 
-            def remote(self, trajectory_group, *args):
+            def remote(self, trajectory_group, *args, **kwargs):
                 self.task_indices.append(trajectory_group["_ng_task_index"])
                 return _ReadyResult("success")
 

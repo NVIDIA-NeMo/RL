@@ -46,14 +46,11 @@ def _patch_transformers_tokenizer_class_set():
     # upper bound below 5.9 today, which forces us onto a transformers version
     # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
     # its transformers upper bound to >=5.12, we can drop this workaround.
-    # TODO: remove this patch (and the assert below) once MBridge relaxes its
+    # TODO: remove this patch once MBridge relaxes its
     # transformers upper bound past the deepseek_v3 fix (~transformers 5.12).
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.12.0"), (
-        f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was written for <5.12. "
-        "Check if the upstream fix now applies and remove this patch if so."
-    )
+    if PkgVersion(transformers.__version__) >= PkgVersion("5.12.0"):
+        return
 
     from transformers import AutoTokenizer
     from transformers.models.auto.tokenization_auto import (

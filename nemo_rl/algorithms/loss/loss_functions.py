@@ -150,8 +150,9 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- On-policy ---
     # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
     use_on_policy_kl_approximation: bool = False
-    # If True, force the ratio to 1.0 for truly on-policy behavior,
-    # eliminating any importance sampling effects.
+    # If True, force PPO's old-policy ratio to 1.0. When actor/rollout IS
+    # correction is enabled, it remains active with the detached training
+    # forward as numerator and generation logprobs as behavior denominator.
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
@@ -173,106 +174,7 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
-    # Optional [B] identity shared by every physical trace row from one
-    # logical rollout. When present, seq-mask-tis gates all such rows jointly.
-    logical_rollout_ids: NotRequired[torch.Tensor]
-    # Optional [B] gate precomputed over the complete optimizer-step batch.
-    # This is required when one logical rollout spans multiple microbatches.
-    logical_rollout_is_keep: NotRequired[torch.Tensor]
     __extra__: Any
-
-
-def logical_rollout_geometric_is_gate(
-    is_log_ratio: torch.Tensor,
-    token_mask: torch.Tensor,
-    sample_mask: torch.Tensor,
-    logical_rollout_ids: torch.Tensor,
-    *,
-    ratio_min: float,
-    ratio_max: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute a geometric IS gate over all traces in each logical rollout.
-
-    The geometric ratio for logical rollout ``g`` is
-    ``exp(sum(valid log ratios) / number of valid tokens)``. The returned row
-    gate has shape ``[B]`` and therefore rejects or retains every physical row
-    in a logical rollout together. Empty logical rollouts are rejected.
-
-    Returns:
-        row_kept: Boolean gate for physical rows, shape ``[B]``.
-        logical_ratios: One geometric ratio per active logical rollout.
-        logical_kept: Boolean gate aligned with ``logical_ratios``.
-    """
-    if is_log_ratio.shape != token_mask.shape:
-        raise ValueError(
-            "is_log_ratio and token_mask must have identical [B, T] shapes"
-        )
-    if sample_mask.ndim != 1 or sample_mask.shape[0] != is_log_ratio.shape[0]:
-        raise ValueError("sample_mask must have shape [B]")
-    if (
-        logical_rollout_ids.ndim != 1
-        or logical_rollout_ids.shape[0] != is_log_ratio.shape[0]
-    ):
-        raise ValueError("logical_rollout_ids must have shape [B]")
-    if ratio_min > ratio_max:
-        raise ValueError("ratio_min must be <= ratio_max")
-
-    active_rows = sample_mask.bool()
-    row_kept = torch.zeros_like(active_rows)
-    if not torch.any(active_rows):
-        empty_ratios = is_log_ratio.new_empty((0,))
-        return row_kept, empty_ratios, torch.empty(
-            0, dtype=torch.bool, device=is_log_ratio.device
-        )
-
-    active_ids = logical_rollout_ids.to(device=is_log_ratio.device)[active_rows]
-    _, active_row_groups = torch.unique(
-        active_ids, sorted=False, return_inverse=True
-    )
-    num_groups = int(active_row_groups.max().item()) + 1
-
-    row_groups = torch.full(
-        (is_log_ratio.shape[0],),
-        -1,
-        dtype=torch.long,
-        device=is_log_ratio.device,
-    )
-    row_groups[active_rows] = active_row_groups
-    valid_tokens = token_mask.bool() & active_rows.unsqueeze(-1)
-
-    # Match Molt's bounded handling: nonfinite valid-token differences cannot
-    # create NaN/Inf gates, while masked garbage contributes nothing.
-    bounded_log_ratio = torch.nan_to_num(
-        is_log_ratio.float(), nan=0.0, posinf=30.0, neginf=-30.0
-    ).clamp(min=-30.0, max=30.0)
-    group_indices = row_groups.unsqueeze(-1).expand_as(is_log_ratio)
-    flat_valid = valid_tokens.reshape(-1)
-    flat_groups = group_indices.reshape(-1)[flat_valid]
-
-    group_sums = bounded_log_ratio.new_zeros(num_groups)
-    group_counts = bounded_log_ratio.new_zeros(num_groups)
-    if torch.any(flat_valid):
-        group_sums.scatter_add_(
-            0, flat_groups, bounded_log_ratio.reshape(-1)[flat_valid]
-        )
-        group_counts.scatter_add_(
-            0, flat_groups, torch.ones_like(flat_groups, dtype=group_counts.dtype)
-        )
-
-    nonempty = group_counts > 0
-    group_means = torch.where(
-        nonempty,
-        group_sums / group_counts.clamp_min(1.0),
-        torch.zeros_like(group_sums),
-    )
-    logical_ratios = torch.exp(group_means).detach()
-    logical_kept = (
-        nonempty
-        & (logical_ratios >= ratio_min)
-        & (logical_ratios <= ratio_max)
-    )
-    row_kept[active_rows] = logical_kept[active_row_groups]
-    return row_kept, logical_ratios, logical_kept
 
 
 class ClippedPGLossFn(LossFunction):
@@ -481,11 +383,9 @@ class ClippedPGLossFn(LossFunction):
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
-        # PPO's old-policy ratio and behavior-policy IS correction are
-        # independent. force_on_policy_ratio only forces the former to one.
         stored_prev_logprobs = data.get("prev_logprobs")
         prev_logprobs = (
-            None
+            curr_logprobs.detach()
             if self.force_on_policy_ratio
             else stored_prev_logprobs[:, 1:]
         )
@@ -498,16 +398,10 @@ class ClippedPGLossFn(LossFunction):
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        # For truly on-policy training, use curr_logprobs as prev_logprobs
-        # This avoids computing prev_logprobs upstream
-        if self.force_on_policy_ratio:
-            prev_logprobs = curr_logprobs.detach()
-        behavior_logprobs = (
-            stored_prev_logprobs[:, 1:]
-            if self.use_importance_sampling_correction
-            and stored_prev_logprobs is not None
-            else prev_logprobs
-        )
+        # Match Molt's force-on-policy path: the training forward supplies both
+        # PPO's detached old-policy value and the IS numerator. Generation
+        # logprobs remain the rollout behavior denominator.
+        behavior_logprobs = prev_logprobs
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -745,72 +639,38 @@ class ClippedPGLossFn(LossFunction):
                     torch.zeros_like(actor_importance_weights_expanded),
                 )
             elif self.truncated_importance_sampling_type == "seq-mask-tis":
-                # geo_mean_i = exp( mean_t( log(π_behavior / π_gen) ) )
+                # Compute one geometric gate per physical trace/segment row.
+                # Logical rollout IDs still own rewards/advantages, but must not
+                # couple independent segment validity decisions.
                 log_is_ratio = torch.nan_to_num(
                     behavior_logprobs - generation_logprobs,
                     nan=0.0,
                     posinf=30.0,
                     neginf=-30.0,
                 ).clamp(min=-30.0, max=30.0)
-                precomputed_logical_gate = data.get("logical_rollout_is_keep")
-                if precomputed_logical_gate is not None:
-                    if precomputed_logical_gate.shape != sample_mask.shape:
-                        raise ValueError(
-                            "logical_rollout_is_keep must have shape [B]"
-                        )
-                    seq_kept_mask = precomputed_logical_gate.float()
-                    _is_filter_metrics = {
-                        "is_oob_ratio": masked_mean(
-                            1.0 - seq_kept_mask,
-                            sample_mask,
-                            global_normalization_factor=global_valid_seqs,
-                        ).item(),
-                    }
-                elif (logical_rollout_ids := data.get("logical_rollout_ids")) is not None:
+                seq_log_is_ratio_mean = masked_mean(
+                    log_is_ratio, token_mask, dim=-1
+                )  # [B]
+                seq_geomean_is_ratio = torch.exp(
+                    seq_log_is_ratio_mean
+                ).detach()  # [B]
+                seq_kept_mask = (
                     (
-                        seq_kept_mask,
-                        logical_geomean_is_ratio,
-                        logical_kept_mask,
-                    ) = logical_rollout_geometric_is_gate(
-                        log_is_ratio,
-                        token_mask,
-                        sample_mask,
-                        logical_rollout_ids,
-                        ratio_min=self.truncated_importance_sampling_ratio_min,
-                        ratio_max=self.truncated_importance_sampling_ratio,
+                        seq_geomean_is_ratio
+                        >= self.truncated_importance_sampling_ratio_min
                     )
-                    seq_kept_mask = seq_kept_mask.float()
-                    _is_filter_metrics = {
-                        "is_oob_ratio": (
-                            (~logical_kept_mask).float().mean().item()
-                            if logical_geomean_is_ratio.numel() > 0
-                            else 0.0
-                        ),
-                    }
-                else:
-                    seq_log_is_ratio_mean = masked_mean(
-                        log_is_ratio, token_mask, dim=-1
-                    )  # [B]
-                    seq_geomean_is_ratio = torch.exp(
-                        seq_log_is_ratio_mean
-                    ).detach()  # [B]
-                    seq_kept_mask = (
-                        (
-                            seq_geomean_is_ratio
-                            >= self.truncated_importance_sampling_ratio_min
-                        )
-                        & (
-                            seq_geomean_is_ratio
-                            <= self.truncated_importance_sampling_ratio
-                        )
-                    ).float()  # [B]
-                    _is_filter_metrics = {
-                        "is_oob_ratio": masked_mean(
-                            1.0 - seq_kept_mask,
-                            sample_mask,
-                            global_normalization_factor=global_valid_seqs,
-                        ).item(),
-                    }
+                    & (
+                        seq_geomean_is_ratio
+                        <= self.truncated_importance_sampling_ratio
+                    )
+                ).float()  # [B]
+                _is_filter_metrics = {
+                    "is_oob_ratio": masked_mean(
+                        1.0 - seq_kept_mask,
+                        sample_mask,
+                        global_normalization_factor=global_valid_seqs,
+                    ).item(),
+                }
                 actor_importance_weights_expanded = (
                     actor_importance_weights_expanded * seq_kept_mask.unsqueeze(-1)
                 )

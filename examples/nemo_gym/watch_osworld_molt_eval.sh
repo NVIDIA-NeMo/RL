@@ -21,9 +21,33 @@ fi
 
 EVAL_EVERY="${EVAL_EVERY:-25}"
 EVAL_POLL_SECONDS="${EVAL_POLL_SECONDS:-60}"
+EVAL_AT_START="${EVAL_AT_START:-true}"
 EVAL_STATE_DIR="${EVAL_STATE_DIR:-${RUNTIME_ROOT}/results/osworld-cc-eval/.submitted/${MOLT_RUN_NAME}}"
+EVAL_SNAPSHOT_DIR="${EVAL_SNAPSHOT_DIR:-${RUNTIME_ROOT}/results/osworld-cc-eval/.checkpoint-snapshots/${MOLT_RUN_NAME}}"
 SUBMIT="${ROOT}/examples/nemo_gym/submit_osworld_cc_eval_jianh_parity.sh"
-mkdir -p "${EVAL_STATE_DIR}"
+mkdir -p "${EVAL_STATE_DIR}" "${EVAL_SNAPSHOT_DIR}"
+
+snapshot_weights() {
+  local step="$1"
+  local source_weights="$2"
+  local snapshot_step="${EVAL_SNAPSHOT_DIR}/step_${step}"
+  local snapshot_weights="${snapshot_step}/weights"
+  [[ -f "${snapshot_weights}/latest_checkpointed_iteration.txt" ]] && {
+    printf '%s\n' "${snapshot_weights}"
+    return 0
+  }
+
+  local tmp_step="${snapshot_step}.tmp.$$"
+  rm -rf "${tmp_step}"
+  mkdir -p "${tmp_step}/weights"
+  # Checkpoint files are immutable after finalization. Hard links protect the
+  # model weights from keep_top_k pruning without duplicating their data blocks;
+  # optimizer state is deliberately excluded from eval snapshots.
+  cp -al "${source_weights}/." "${tmp_step}/weights/"
+  rm -rf "${snapshot_step}"
+  mv "${tmp_step}" "${snapshot_step}"
+  printf '%s\n' "${snapshot_weights}"
+}
 
 submit_once() {
   local step="$1"
@@ -34,6 +58,7 @@ submit_once() {
   local eval_name="${MOLT_RUN_NAME}-step${step}"
   local job_id
   if [[ -n "${checkpoint_path}" ]]; then
+    checkpoint_path="$(snapshot_weights "${step}" "${checkpoint_path}")"
     job_id="$(
       EVAL_NAME="${eval_name}" \
       EVAL_CHECKPOINT_PATH="${checkpoint_path}" \
@@ -46,8 +71,11 @@ submit_once() {
   echo "Submitted OSWorld eval step=${step} job=${job_id}"
 }
 
-# Step 0 evaluates the RFC0037 SFT checkpoint directly.
-submit_once 0
+# Step 0 evaluates the RFC0037 SFT checkpoint directly. Runs sharing that
+# identical base model may reuse one Eval0 instead of submitting duplicates.
+if [[ "${EVAL_AT_START}" == "true" ]]; then
+  submit_once 0
+fi
 
 while true; do
   for step_dir in "${MOLT_CHECKPOINT_DIR}"/step_*; do

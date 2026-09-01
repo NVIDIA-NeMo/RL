@@ -989,7 +989,13 @@ class VllmGeneration(GenerationInterface):
             "pause_generation_for_refit_async",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        results = ray.get(futures)
+        timeout_s = float(os.environ.get("MOLT_REFIT_RPC_TIMEOUT_S", "600"))
+        try:
+            results = ray.get(futures, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RuntimeError(
+                f"vLLM pause before refit exceeded {timeout_s:.0f}s"
+            ) from exc
         if not results or not all(result for result in results if result is not None):
             raise RuntimeError("Failed to pause vLLM generation before refit")
 
@@ -1001,7 +1007,13 @@ class VllmGeneration(GenerationInterface):
             "resume_generation_after_refit_async",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        results = ray.get(futures)
+        timeout_s = float(os.environ.get("MOLT_REFIT_RPC_TIMEOUT_S", "600"))
+        try:
+            results = ray.get(futures, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RuntimeError(
+                f"vLLM resume after refit exceeded {timeout_s:.0f}s"
+            ) from exc
         if not results or not all(result for result in results if result is not None):
             raise RuntimeError("Failed to resume vLLM generation after refit")
 
@@ -1175,7 +1187,15 @@ class VllmGeneration(GenerationInterface):
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
-            results = ray.get(futures)
+            timeout_s = float(os.environ.get("MOLT_REFIT_RPC_TIMEOUT_S", "600"))
+            try:
+                results = ray.get(futures, timeout=timeout_s)
+            except ray.exceptions.GetTimeoutError as exc:
+                for ref in futures:
+                    ray.cancel(ref, force=False)
+                raise RuntimeError(
+                    f"vLLM cache reset after refit exceeded {timeout_s:.0f}s"
+                ) from exc
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")

@@ -6,6 +6,11 @@
 
 defaults: grpo_nemotron_omni_30ba3b_osworld_cc.yaml
 
+data:
+  # Match Jianh's epoch-wise randomized OSWorld sampling while retaining every
+  # one of the 361 prompts (the async dataloader uses drop_last=False).
+  shuffle: true
+
 policy:
   # Keep padding configurable across Megatron topology profiles.
   make_sequence_length_divisible_by: ${oc.decode:${oc.env:MOLT_SEQUENCE_LENGTH_DIVISOR,32}}
@@ -32,6 +37,10 @@ policy:
     optimizer:
       # Keep the 48K multimodal activation budget on GPU by moving optimizer
       # state to host memory for this long-context recipe.
+      # Match Jianh's executed Molt recipe rather than inheriting NeMo-RL's
+      # Adam beta2=0.999 default.
+      adam_beta1: ${oc.decode:${oc.env:MOLT_ADAM_BETA1,0.9}}
+      adam_beta2: ${oc.decode:${oc.env:MOLT_ADAM_BETA2,0.99}}
       optimizer_cpu_offload: ${oc.decode:${oc.env:MOLT_OPTIMIZER_CPU_OFFLOAD,false}}
       optimizer_offload_fraction: ${oc.decode:${oc.env:MOLT_OPTIMIZER_OFFLOAD_FRACTION,1.0}}
   generation:
@@ -45,6 +54,9 @@ policy:
         num_nodes: ${oc.decode:${oc.env:MOLT_INFERENCE_NODES,1}}
 
 grpo:
+  # Jianh clamps the scalar OSWorld grader reward before computing advantages.
+  reward_clip_low: 0.0
+  reward_clip_high: 1.0
   adv_estimator:
     # Molt's Omni recipe uses an ordinary prompt-group mean baseline followed
     # by whitening over every eligible action token in the optimizer window.

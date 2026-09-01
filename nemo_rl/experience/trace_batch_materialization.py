@@ -36,6 +36,7 @@ class TraceBatchMaterialization(TypedDict):
     plan_id: str
     train_data: BatchedDataDict[Any]
     materialized_message_logs: list[list[dict[str, Any]]]
+    materialized_message_logs_are_compact: bool
     parent_indices: torch.Tensor
     row_rewards: torch.Tensor
     row_rollout_ids: list[str | None]
@@ -248,6 +249,28 @@ def _normalize_routed_expert_rows(
             )
 
 
+def _compact_message_logs_for_metrics(
+    message_logs: Sequence[Sequence[Mapping[str, Any]]],
+) -> list[list[dict[str, str]]]:
+    """Retain only the text consumed by GRPO metrics after tensorization.
+
+    Message logs can own raw images, routed-expert tensors, token tensors, and
+    arbitrary environment payloads. Keeping those dictionaries in the returned
+    materialization duplicates ownership with ``train_data`` for the lifetime
+    of policy/reference scoring.
+    """
+    return [
+        [
+            {
+                "content": "".join(
+                    str(message.get("content", "")) for message in message_log
+                )
+            }
+        ]
+        for message_log in message_logs
+    ]
+
+
 def materialize_trace_batch_plan(
     plan: Mapping[str, Any],
     *,
@@ -374,10 +397,7 @@ def materialize_trace_batch_plan(
     )
     train_data.update(flat.get_multimodal_dict(as_tensors=False))
     train_data["image_cache_keys"] = PackedTensor(
-        [
-            _vision_cache_key_tensor(row["ordered_media_ids"])
-            for row in plan["rows"]
-        ],
+        [_vision_cache_key_tensor(row["ordered_media_ids"]) for row in plan["rows"]],
         dim_to_pack=0,
     )
     if "routed_experts" in flat:
@@ -387,6 +407,7 @@ def materialize_trace_batch_plan(
         "plan_id": str(plan["plan_id"]),
         "train_data": train_data,
         "materialized_message_logs": message_logs,
+        "materialized_message_logs_are_compact": False,
         "parent_indices": parent_indices,
         "row_rewards": torch.tensor(
             [row["reward"] for row in plan["rows"]],
@@ -403,6 +424,12 @@ def materialize_trace_batch_plan(
         pad_token_id=pad_token_id,
         packed_specs=packed_specs,
     )
+    # Validation above is the last consumer that needs the tensor-bearing
+    # message dictionaries. GRPO only joins their content for metrics.
+    materialization["materialized_message_logs"] = _compact_message_logs_for_metrics(
+        message_logs
+    )
+    materialization["materialized_message_logs_are_compact"] = True
     return materialization
 
 
@@ -457,11 +484,13 @@ def validate_trace_batch_materialization(
         raise TypeError("Materialized core worker fields must be tensors")
     batch_size = plan["total_row_count"]
     if ordered_media_ids != [
-        [str(media_id) for media_id in row["ordered_media_ids"]]
-        for row in plan["rows"]
+        [str(media_id) for media_id in row["ordered_media_ids"]] for row in plan["rows"]
     ]:
         raise ValueError("Materialized ordered media IDs are corrupted")
-    if not isinstance(image_cache_keys, PackedTensor) or len(image_cache_keys) != batch_size:
+    if (
+        not isinstance(image_cache_keys, PackedTensor)
+        or len(image_cache_keys) != batch_size
+    ):
         raise ValueError("Materialized image cache keys lost row ownership")
     for row_index, row in enumerate(plan["rows"]):
         expected_cache_keys = _vision_cache_key_tensor(row["ordered_media_ids"])
@@ -592,6 +621,18 @@ def validate_trace_batch_materialization(
     message_logs = materialization.get("materialized_message_logs")
     if not isinstance(message_logs, list) or len(message_logs) != batch_size:
         raise ValueError("Materialized message-log rows are incomplete")
+    compact_message_logs = bool(
+        materialization.get("materialized_message_logs_are_compact", False)
+    )
+    if compact_message_logs:
+        if any(
+            not isinstance(message_log, list)
+            or len(message_log) != 1
+            or set(message_log[0]) != {"content"}
+            or not isinstance(message_log[0]["content"], str)
+            for message_log in message_logs
+        ):
+            raise ValueError("Compact materialized message logs contain heavy fields")
     specs = dict(packed_specs or _packed_tensor_specs(message_logs))
     for key, (dim_to_pack, pad_to_max_shape) in specs.items():
         packed = train_data.get(key)
@@ -631,7 +672,7 @@ def validate_trace_batch_materialization(
         or routed_experts.shape[:2] != input_ids.shape
     ):
         raise ValueError("Materialized routed_experts is misaligned")
-    if isinstance(routed_experts, torch.Tensor):
+    if isinstance(routed_experts, torch.Tensor) and not compact_message_logs:
         for row_index, (row, message_log) in enumerate(zip(plan["rows"], message_logs)):
             if row["row_kind"] == "padding":
                 expected_padding_routes = message_log[0]["routed_experts"]

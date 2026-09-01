@@ -157,9 +157,10 @@ def test_logical_grpo_advantages_are_fixed_before_physical_expansion():
 
 def test_one_compacted_rollout_expands_after_its_scalar_advantage_is_fixed():
     bundle = _fixture("k2_compaction.json")
+    rollout_batch = _rollout_batch([bundle])
 
     prepared = prepare_trace_batch_for_scoring(
-        _rollout_batch([bundle]),
+        rollout_batch,
         prompt_ids=torch.tensor([[101, 102]]),
         advantage_estimator=_estimator(),
         expected_rollouts_per_group=1,
@@ -181,6 +182,43 @@ def test_one_compacted_rollout_expands_after_its_scalar_advantage_is_fixed():
         1.0,
         0.0,
     ]
+    assert "physical_message_logs" not in rollout_batch
+    assert prepared["materialization"]["materialized_message_logs_are_compact"]
+
+
+def test_64_logical_multisegment_rollouts_release_source_message_graphs():
+    template = _fixture("k2_compaction.json")
+    bundles = [
+        _rekey_rollout(
+            template,
+            rollout_id=f"rollout-{index:03d}",
+            group_id=f"group-{index:03d}",
+            source_row_index=index,
+            reward=float(index % 5),
+        )
+        for index in range(64)
+    ]
+    rollout_batch = _rollout_batch(bundles)
+
+    prepared = prepare_trace_batch_for_scoring(
+        rollout_batch,
+        prompt_ids=torch.arange(64, dtype=torch.int64).unsqueeze(-1),
+        advantage_estimator=_estimator(),
+        expected_rollouts_per_group=1,
+        batch_quantum=8,
+        optimizer_step_id="step-64-multisegment-memory",
+        pad_token_id=999,
+    )
+
+    assert prepared["plan"]["logical_rollout_count"] == 64
+    assert prepared["plan"]["physical_trace_count"] == 64 * 3
+    assert prepared["materialization"]["train_data"]["input_ids"].shape[0] == 64 * 3
+    assert "physical_message_logs" not in rollout_batch
+    assert all(
+        set(message) == {"content"}
+        for message_log in prepared["materialization"]["materialized_message_logs"]
+        for message in message_log
+    )
 
 
 def test_reinforce_baseline_is_invariant_when_one_rollout_splits_into_traces():

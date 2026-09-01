@@ -200,6 +200,38 @@ def test_materialization_does_not_mutate_source_message_logs():
     )
 
 
+def test_returned_message_logs_retain_only_metric_text_without_tensor_aliases():
+    bundle = _fixture("k2_compaction.json")
+    source_logs = _message_logs(
+        bundle,
+        visual_trace_indices={0},
+        routed_experts=True,
+    )
+
+    _, materialization = _materialize(
+        [bundle],
+        batch_quantum=4,
+        logs={bundle["rollout_id"]: source_logs},
+    )
+
+    assert materialization["materialized_message_logs_are_compact"] is True
+    retained_logs = materialization["materialized_message_logs"]
+    assert [row[0]["content"] for row in retained_logs[:3]] == [
+        "".join(str(message["content"]) for message in trace_log)
+        for trace_log in source_logs
+    ]
+    assert retained_logs[3] == [{"content": ""}]
+    assert all(
+        set(message) == {"content"}
+        and not any(
+            isinstance(value, (torch.Tensor, PackedTensor))
+            for value in message.values()
+        )
+        for message_log in retained_logs
+        for message in message_log
+    )
+
+
 def test_text_first_batch_preserves_later_visual_row_ownership():
     compacted = _fixture("k2_compaction.json")
     identity = _fixture("without_compaction.json")

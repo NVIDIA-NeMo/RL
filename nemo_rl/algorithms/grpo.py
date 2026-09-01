@@ -49,9 +49,6 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import (
-    logical_rollout_geometric_is_gate,
-)
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -74,6 +71,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -143,6 +141,52 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
+
+
+def _detach_checkpoint_tensor_storage(value: Any) -> Any:
+    """Clone tensor leaves before torch.save sees Ray zero-copy storage aliases."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, PackedTensor):
+        return PackedTensor(
+            [
+                None
+                if tensor is None
+                else _detach_checkpoint_tensor_storage(tensor)
+                for tensor in value.tensors
+            ],
+            value.dim_to_pack,
+            pad_to_max_shape=value.pad_to_max_shape,
+        )
+    if isinstance(value, BatchedDataDict):
+        cloned = BatchedDataDict(
+            {
+                key: _detach_checkpoint_tensor_storage(item)
+                for key, item in value.items()
+            }
+        )
+        for attribute in (
+            "micro_batch_indices",
+            "micro_batch_lengths",
+            "elem_counts_per_gb",
+        ):
+            setattr(
+                cloned,
+                attribute,
+                _detach_checkpoint_tensor_storage(getattr(value, attribute)),
+            )
+        return cloned
+    if isinstance(value, dict):
+        return {
+            key: _detach_checkpoint_tensor_storage(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_detach_checkpoint_tensor_storage(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_checkpoint_tensor_storage(item) for item in value)
+    return value
+
 
 # ===============================================================================
 # Configuration
@@ -259,6 +303,7 @@ _REWARD_PENALTY_FLAGS = (
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
+    num_val_generations_per_prompt: int = 1
     max_num_epochs: int = 1
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
@@ -300,6 +345,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     batch_multiplier: float = 1.0
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
+    reward_clip_low: float | None = None
+    reward_clip_high: float | None = None
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: bool = False
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
@@ -507,7 +554,10 @@ def setup(
             batch_size=dataloader_batch_size,
             shuffle=data_config["shuffle"],
             collate_fn=rl_collate_fn,
-            drop_last=True,
+            # OSWorld has 361 prompts, which is not divisible by the persistent
+            # rollout pool size. Every epoch must retain its tail rather than
+            # permanently omitting the same tasks.
+            drop_last=False,
             num_workers=data_config["num_workers"],
         )
         if last_checkpoint_path is not None:
@@ -1776,6 +1826,23 @@ def scale_rewards(
     return repeated_batch
 
 
+def clip_total_rewards(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    *,
+    low: float | None,
+    high: float | None,
+) -> BatchedDataDict[DatumSpec]:
+    """Clamp scalar rollout rewards before advantage estimation."""
+    if low is None and high is None:
+        return repeated_batch
+    if low is not None and high is not None and low > high:
+        raise ValueError(f"reward_clip_low ({low}) must not exceed reward_clip_high ({high})")
+    repeated_batch["total_reward"] = repeated_batch["total_reward"].clamp(
+        min=low, max=high
+    )
+    return repeated_batch
+
+
 def extract_initial_prompt_messages(
     message_logs: list,
     original_prompt_lengths: torch.Tensor,
@@ -2527,15 +2594,24 @@ def _ray_actor_call_with_transient_retry(
     max_attempts: int = 6,
     retry_delay_s: float = 5.0,
 ) -> Any:
-    """Retry an idempotent actor RPC after transient Ray keepalive failures."""
+    """Retry a bounded idempotent actor RPC after transient Ray failures."""
+    timeout_s = float(os.environ.get("MOLT_CONTROL_RPC_TIMEOUT_S", "120"))
     for attempt in range(1, max_attempts + 1):
+        ref = call()
         try:
-            return ray.get(call())
-        except ray.exceptions.ActorUnavailableError:
+            return ray.get(ref, timeout=timeout_s)
+        except (ray.exceptions.ActorUnavailableError, ray.exceptions.GetTimeoutError) as exc:
+            try:
+                ray.cancel(ref, force=False)
+            except Exception:
+                pass
             if attempt == max_attempts:
-                raise
+                raise RuntimeError(
+                    f"{operation_name} failed after {max_attempts} bounded attempts"
+                ) from exc
             print(
-                f"⚠️ {operation_name} actor temporarily unavailable; "
+                f"⚠️ {operation_name} actor unavailable or exceeded "
+                f"{timeout_s:.0f}s; "
                 f"retrying in {retry_delay_s:.1f}s "
                 f"({attempt}/{max_attempts})",
                 flush=True,
@@ -2673,6 +2749,22 @@ def refit_policy_generation(
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
+    refit_timeout_s = float(os.environ.get("MOLT_REFIT_RPC_TIMEOUT_S", "600"))
+    refit_deadline = time.monotonic() + refit_timeout_s
+
+    def _get_refit_refs(refs: Any, phase: str) -> Any:
+        remaining_s = max(0.0, refit_deadline - time.monotonic())
+        try:
+            return ray.get(refs, timeout=remaining_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            refs_to_cancel = refs if isinstance(refs, (list, tuple)) else [refs]
+            for ref in refs_to_cancel:
+                ray.cancel(ref, force=False)
+            raise RuntimeError(
+                f"Policy generation refit exceeded {refit_timeout_s:.0f}s "
+                f"during {phase}"
+            ) from exc
+
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.suspend_for_refit()
@@ -2697,7 +2789,7 @@ def refit_policy_generation(
     ):
         futures_train = policy.preinit_nvshmem()
         futures_inference = policy_generation.preinit_nvshmem_collective()
-        ray.get(futures_train + futures_inference)
+        _get_refit_refs(futures_train + futures_inference, "megatron reshard")
 
     # Create a context manager that does nothing when timer is None
     timer_context = (
@@ -2727,7 +2819,7 @@ def refit_policy_generation(
                     buffer_size_bytes=buffer_size_bytes,
                 )
                 # Wait for all workers to complete
-                ray.get(futures_train)
+                _get_refit_refs(futures_train, "SGLang HTTP weight stream")
                 update_success = True
             else:
                 # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
@@ -2740,8 +2832,10 @@ def refit_policy_generation(
                 )
                 futures_inference = policy_generation.update_weights_via_ipc_zmq()
                 # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
+                _get_refit_refs(futures_train, "CUDA IPC sender")
+                results = _get_refit_refs(
+                    futures_inference, "CUDA IPC inference receiver"
+                )
                 update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl (vLLM) or megatron reshard
@@ -2758,8 +2852,8 @@ def refit_policy_generation(
                 )
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
+            _get_refit_refs(futures_train, "NCCL sender")
+            results = _get_refit_refs(futures_inference, "NCCL inference receiver")
             update_success = all(result for result in results if result is not None)
 
         # check if update is successful
@@ -2783,6 +2877,95 @@ def refit_policy_generation(
         policy_generation.resume_after_refit()
 
     return {}
+
+
+def _prepare_async_generation_and_start_collection(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    trajectory_collector: Any,
+    dataloader: StatefulDataLoader,
+    *,
+    need_refit: bool,
+    generation_stale: bool,
+    colocated_inference: bool,
+    weight_version: int,
+) -> bool:
+    """Establish the startup barrier before the collector can reserve work."""
+    if need_refit and generation_stale:
+        refit_policy_generation(policy, policy_generation, colocated_inference)
+        generation_stale = False
+    else:
+        policy_generation.prepare_for_generation()
+
+    # Waiting is intentional: collection must not become runnable until
+    # generation is ready and the version visible to admitted work is published.
+    _ray_actor_call_with_transient_retry(
+        lambda: trajectory_collector.set_weight_version.remote(weight_version),
+        operation_name="initial_set_weight_version",
+    )
+    _ray_actor_call_with_transient_retry(
+        lambda: trajectory_collector.start_collection.remote(dataloader),
+        operation_name="start_collection",
+    )
+    return generation_stale
+
+
+def _refit_async_generation_safely(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    trajectory_collector: Any,
+    *,
+    colocated_inference: bool,
+    weight_version: int,
+) -> tuple[dict[str, float], int]:
+    """Refit behind collector and native-vLLM scheduling barriers."""
+    _ray_actor_call_with_transient_retry(
+        trajectory_collector.prepare_for_refit.remote,
+        operation_name="prepare_for_refit",
+    )
+    native_vllm_pause_attempted = False
+    cache_invalidated_before_resume = False
+    try:
+        if isinstance(policy_generation, VllmGeneration):
+            native_vllm_pause_attempted = True
+            policy_generation.pause_generation_for_refit()
+
+        refit_metrics = refit_policy_generation(
+            policy,
+            policy_generation,
+            colocated_inference,
+        )
+        if isinstance(policy_generation, VllmGeneration):
+            # Match Molt's refit ordering exactly: requests remain paused while
+            # reusable prefix/KV state from the old policy is invalidated.
+            # In-flight requests are preserved by pause(mode="keep") and resume
+            # after the new weights and cache state are both visible.
+            cache_invalidated_before_resume = policy_generation.invalidate_kv_cache()
+            if not cache_invalidated_before_resume:
+                print(
+                    "⚠️ vLLM refused to fully invalidate prefix/KV cache after "
+                    "refit; continuing with the backend warning visible.",
+                    flush=True,
+                )
+        weight_version += 1
+        _ray_actor_call_with_transient_retry(
+            lambda: trajectory_collector.set_weight_version.remote(weight_version),
+            operation_name="set_weight_version",
+        )
+        return refit_metrics, weight_version
+    finally:
+        try:
+            if native_vllm_pause_attempted:
+                # Also attempted when pause raised after partially reaching workers.
+                policy_generation.resume_generation_after_refit()
+        finally:
+            # Admission is the last gate reopened.
+            _ray_actor_call_with_transient_retry(
+                lambda: trajectory_collector.resume_after_refit.remote(
+                    cache_invalidated_before_resume
+                ),
+                operation_name="resume_after_refit",
+            )
 
 
 def _initial_policy_generation_stale(
@@ -2871,47 +3054,10 @@ def _resolve_logprob_skip_flags(
             "Computing prev_logprobs anyway for seq-level error masking."
         )
     skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
-    if (
-        master_config.loss_fn.force_on_policy_ratio
-        and master_config.loss_fn.use_importance_sampling_correction
-    ):
-        # Molt keeps PPO's optimization ratio at one while independently
-        # correcting actor/rollout mismatch. NeMo-RL therefore still needs the
-        # pre-update actor logprobs for behavior-policy IS.
-        skip_prev_logprobs = False
     return (
         skip_prev_logprobs,
         master_config.grpo.skip_reference_policy_logprobs_calculation,
     )
-
-
-def _precompute_logical_rollout_is_gate(
-    train_data: BatchedDataDict,
-    loss_config: ClippedPGLossConfig,
-) -> None:
-    """Attach a Molt geometric IS gate computed over the full trace batch."""
-    if (
-        loss_config.truncated_importance_sampling_type != "seq-mask-tis"
-        or "logical_rollout_ids" not in train_data
-    ):
-        return
-    if not loss_config.use_importance_sampling_correction:
-        raise ValueError("logical-rollout IS gating requires IS correction")
-    ratio_min = loss_config.truncated_importance_sampling_ratio_min
-    ratio_max = loss_config.truncated_importance_sampling_ratio
-    if ratio_min is None or ratio_max is None:
-        raise ValueError("logical-rollout IS gating requires both ratio bounds")
-
-    row_kept, _, _ = logical_rollout_geometric_is_gate(
-        train_data["prev_logprobs"][:, 1:]
-        - train_data["generation_logprobs"][:, 1:],
-        train_data["token_mask"][:, 1:],
-        train_data["sample_mask"],
-        train_data["logical_rollout_ids"],
-        ratio_min=ratio_min,
-        ratio_max=ratio_max,
-    )
-    train_data["logical_rollout_is_keep"] = row_kept
 
 
 def compute_and_apply_seq_logprob_error_masking(
@@ -3406,6 +3552,11 @@ def grpo_train(
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, master_config.grpo.reward_shaping
                     )
+                repeated_batch = clip_total_rewards(
+                    repeated_batch,
+                    low=master_config.grpo.reward_clip_low,
+                    high=master_config.grpo.reward_clip_high,
+                )
 
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
@@ -3707,10 +3858,6 @@ def grpo_train(
 
                         del logprob_data
                         del extra_multimodal_data
-
-                _precompute_logical_rollout_is_gate(
-                    train_data, master_config.loss_fn
-                )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
@@ -4357,6 +4504,15 @@ def validate(
                 break
 
             additional_metrics_to_report = dict()
+            num_val_generations = (
+                master_config.grpo.num_val_generations_per_prompt
+            )
+            if num_val_generations > 1:
+                val_batch = val_batch.repeat_interleave(num_val_generations)
+                _assign_context_compaction_generation_replica_indices(
+                    val_batch,
+                    num_generations_per_prompt=num_val_generations,
+                )
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
@@ -4433,9 +4589,8 @@ def validate(
             ):
                 pass_at_k = (
                     rewards_t.reshape(-1, num_val_generations)
-                    .gt(0)
-                    .any(dim=1)
-                    .float()
+                    .max(dim=1)
+                    .values
                     .mean()
                     .item()
                 )
@@ -4696,9 +4851,22 @@ def async_grpo_train(
     num_prompts_per_step = master_config.grpo.num_prompts_per_step
     async_queue_size = master_config.grpo.async_grpo.async_queue_size
     optimal_buffer_size = num_prompts_per_step * async_queue_size
+    inflight_generation_capacity = _resolve_async_generation_batch_size(
+        master_config.grpo,
+        num_prompts_per_step=num_prompts_per_step,
+    )
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
+        max_size=optimal_buffer_size,
+        max_reserved_slots=inflight_generation_capacity,
+    )
+    print(
+        "   - replay_buffer_finished_capacity: "
+        f"{optimal_buffer_size} prompt groups"
+    )
+    print(
+        "   - rollout_inflight_capacity: "
+        f"{inflight_generation_capacity} prompt groups"
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
@@ -4772,49 +4940,27 @@ def async_grpo_train(
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
         next_nemo_gym_task_index=next_nemo_gym_task_index,
+        pending_inputs=list((rollouts_state or {}).get("pending_inputs", [])),
+        completed_epochs=int((rollouts_state or {}).get("completed_epochs", 0)),
     )
-
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
 
     print("⏳ Preparing policy generation for training...", flush=True)
-    if NEED_REFIT and POLICY_GENERATION_STALE:
-        print("🔄 Refitting policy generation with actual model weights...", flush=True)
-        try:
-            refit_policy_generation(
-                policy,
-                policy_generation,
-                colocated_inference,
-            )
-            print("✅ Policy generation refit completed successfully", flush=True)
-            POLICY_GENERATION_STALE = False
-        except Exception as e:
-            print(f"❌ Policy generation refit failed: {e}")
-            import traceback
+    POLICY_GENERATION_STALE = _prepare_async_generation_and_start_collection(
+        policy,
+        policy_generation,
+        trajectory_collector,
+        dataloader,
+        need_refit=NEED_REFIT,
+        generation_stale=POLICY_GENERATION_STALE,
+        colocated_inference=colocated_inference,
+        weight_version=weight_version,
+    )
 
-            traceback.print_exc()
-            raise
-    else:
-        print("🔄 Preparing policy generation for inference...")
-        try:
-            policy_generation.prepare_for_generation()
-            print("✅ Policy generation preparation completed successfully")
-        except Exception as e:
-            print(f"❌ Policy generation preparation failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            raise
-
+    print("📦 Started continuous background trajectory collection")
     print("✅ Policy generation setup complete, proceeding to validation...")
 
     # Run validation at start if configured
@@ -4926,6 +5072,10 @@ def async_grpo_train(
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
+    # The first async buffer fill can take over an hour for OSWorld. Do not use
+    # initialization time as the predicted duration of every optimizer step,
+    # or TimeoutChecker will stop a fresh resume after its first checkpoint.
+    timeout.start_iterations()
 
     # Main training loop
     try:
@@ -5147,6 +5297,11 @@ def async_grpo_train(
                     del initial_prompt_message_logs
                     del prompt_batched_flat
 
+                    repeated_batch = clip_total_rewards(
+                        repeated_batch,
+                        low=master_config.grpo.reward_clip_low,
+                        high=master_config.grpo.reward_clip_high,
+                    )
                     rewards = repeated_batch["total_reward"]
 
                     print(
@@ -5321,10 +5476,6 @@ def async_grpo_train(
                                 train_data["prev_logprobs"]
                             )
 
-                _precompute_logical_rollout_is_gate(
-                    train_data, master_config.loss_fn
-                )
-
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
@@ -5469,13 +5620,7 @@ def async_grpo_train(
                 if NEED_REFIT:
                     timer.start("idle/refit_bubble")
 
-                    # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
-                    with timer.time("exposed_generation"):
-                        _ray_actor_call_with_transient_retry(
-                            trajectory_collector.prepare_for_refit.remote,
-                            operation_name="prepare_for_refit",
-                        )
 
                     # Collect generation logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each worker
@@ -5487,25 +5632,16 @@ def async_grpo_train(
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
-                        refit_metrics = refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                        refit_metrics, weight_version = (
+                            _refit_async_generation_safely(
+                                policy,
+                                policy_generation,
+                                trajectory_collector,
+                                colocated_inference=colocated_inference,
+                                weight_version=weight_version,
+                            )
                         )
                         POLICY_GENERATION_STALE = False
-
-                        # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
-                        weight_version += 1
-                        _ray_actor_call_with_transient_retry(
-                            lambda: trajectory_collector.set_weight_version.remote(
-                                weight_version
-                            ),
-                            operation_name="set_weight_version",
-                        )
-                        _ray_actor_call_with_transient_retry(
-                            trajectory_collector.resume_after_refit.remote,
-                            operation_name="resume_after_refit",
-                        )
 
                     timer.stop("idle/refit_bubble")
 
@@ -5743,15 +5879,16 @@ def async_grpo_train(
                         # restart rather than blocking every checkpoint.
                         ray.get(trajectory_collector.pause.remote())
                         try:
-                            actual_dataloader_state = ray.get(
-                                trajectory_collector.get_dataloader_state.remote()
+                            collector_checkpoint_state = ray.get(
+                                trajectory_collector.get_checkpoint_state.remote()
                             )
-                            replay_buffer_state = ray.get(
-                                replay_buffer.state_dict.remote()
-                            )
-                            rollouts_state = ray.get(
-                                trajectory_collector.get_rollouts_state.remote()
-                            )
+                            actual_dataloader_state = collector_checkpoint_state[
+                                "dataloader"
+                            ]
+                            replay_buffer_state = collector_checkpoint_state[
+                                "replay_buffer"
+                            ]
+                            rollouts_state = collector_checkpoint_state["rollouts"]
                         finally:
                             ray.get(trajectory_collector.resume.remote())
 
@@ -5769,7 +5906,7 @@ def async_grpo_train(
                             f"{len(replay_buffer_state['trajectories'])} trajectories"
                         )
                         torch.save(
-                            rollouts_state,
+                            _detach_checkpoint_tensor_storage(rollouts_state),
                             os.path.join(checkpoint_path, "rollouts.pt"),
                         )
 

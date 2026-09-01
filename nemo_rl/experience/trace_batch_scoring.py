@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Protocol, TypedDict
+from typing import Any, Mapping, MutableMapping, Protocol, TypedDict
 
 import torch
 
@@ -131,8 +131,7 @@ def _validate_prompt_group_partition(
 
 
 def _compute_rollout_advantages(
-    advantage_estimator: GRPOAdvantageEstimator
-    | ReinforceBaselineAdvantageEstimator,
+    advantage_estimator: GRPOAdvantageEstimator | ReinforceBaselineAdvantageEstimator,
     *,
     bundles: list[Mapping[str, Any]],
     prompt_ids: torch.Tensor,
@@ -254,8 +253,7 @@ def prepare_trace_batch_for_scoring(
     rollout_batch: Mapping[str, Any],
     *,
     prompt_ids: torch.Tensor,
-    advantage_estimator: GRPOAdvantageEstimator
-    | ReinforceBaselineAdvantageEstimator,
+    advantage_estimator: GRPOAdvantageEstimator | ReinforceBaselineAdvantageEstimator,
     expected_rollouts_per_group: int,
     batch_quantum: int,
     optimizer_step_id: str,
@@ -328,6 +326,14 @@ def prepare_trace_batch_for_scoring(
         pad_token_id=pad_token_id,
         make_sequence_length_divisible_by=make_sequence_length_divisible_by,
     )
+    # This is an ownership-transfer boundary: train_data now owns the packed
+    # multimodal inputs needed by workers, while materialization retained only
+    # compact text for metrics. Drop the rollout-side graph promptly so raw
+    # images and per-message tensors are not kept alive by both representations.
+    if isinstance(rollout_batch, MutableMapping):
+        rollout_batch.pop("physical_message_logs", None)
+    del physical_message_logs_by_rollout
+    del physical_message_logs
     return {
         "rollout_advantages": rollout_advantages,
         "plan": plan,

@@ -450,6 +450,21 @@ def _run_frozen_projected_image_cache_contract(rank: int, world_size: int) -> No
             imgs_sizes=image_sizes,
             image_cache_keys=cache_keys,
         )
+        cached_call_count = uncached_calls
+        cached_host_entries = [
+            (value.device.type, value.dtype)
+            for value in core_model._vision_embedding_cache.values()
+        ]
+        core_model._vision_embedding_cache.clear()
+        os.environ["NEMOTRON_OMNI_VISION_CACHE_MAX_ENTRIES"] = "0"
+        zero_cache_output = model(
+            input_ids=processed.input_ids_cp_sharded,
+            attention_mask=processed.attention_mask,
+            packed_seq_params=processed.packed_seq_params,
+            pixel_values=images,
+            imgs_sizes=image_sizes,
+            image_cache_keys=cache_keys,
+        )
 
     torch.testing.assert_close(projected_output, raw_output, rtol=0, atol=0)
     # The production model projects in BF16, making this bit-identical. This
@@ -458,12 +473,11 @@ def _run_frozen_projected_image_cache_contract(rank: int, world_size: int) -> No
     torch.testing.assert_close(first_cached_output, raw_output, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(second_cached_output, raw_output, rtol=1e-2, atol=1e-2)
     assert first_pass_calls == 2
-    assert uncached_calls == first_pass_calls
-    assert len(core_model._vision_embedding_cache) == 2
-    assert all(
-        value.device.type == "cpu" and value.dtype == torch.bfloat16
-        for value in core_model._vision_embedding_cache.values()
-    )
+    assert cached_call_count == first_pass_calls
+    assert cached_host_entries == [("cpu", torch.bfloat16)] * 2
+    torch.testing.assert_close(zero_cache_output, raw_output, rtol=0, atol=0)
+    assert uncached_calls == cached_call_count + 1
+    assert len(core_model._vision_embedding_cache) == 0
     with pytest.raises(ValueError, match="mutually exclusive"):
         model(
             input_ids=processed.input_ids_cp_sharded,
@@ -474,7 +488,7 @@ def _run_frozen_projected_image_cache_contract(rank: int, world_size: int) -> No
             imgs_sizes=image_sizes,
         )
 
-    del model, raw_output, projected_output, first_cached_output
+    del model, raw_output, projected_output, first_cached_output, zero_cache_output
     del second_cached_output, projected
     gc.collect()
     torch.cuda.empty_cache()

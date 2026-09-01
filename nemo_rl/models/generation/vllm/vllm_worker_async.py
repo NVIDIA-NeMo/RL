@@ -1467,6 +1467,8 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""
+        import inspect
+
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
@@ -1476,9 +1478,26 @@ class VllmAsyncGenerationWorkerImpl(
                 "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
             )
 
-        await self.llm.reset_prefix_cache()
+        # Molt pauses with mode="keep", so a plain prefix-cache reset can leave
+        # running requests holding old-policy KV blocks. Use the newer vLLM
+        # reset controls when available, while remaining compatible with older
+        # versions that expose no keyword arguments.
+        supported = inspect.signature(self.llm.reset_prefix_cache).parameters
+        kwargs = {
+            name: True
+            for name in ("reset_running_requests", "reset_connector")
+            if name in supported
+        }
+        reset = await self.llm.reset_prefix_cache(**kwargs)
+        if reset is False:
+            print(
+                "[refit] WARNING: vLLM refused to reset the prefix cache; "
+                "rollout may reuse stale KV",
+                flush=True,
+            )
         gc.collect()
         torch.cuda.empty_cache()
+        return reset is not False
 
     async def sleep_async(self):
         """Async version of sleep."""

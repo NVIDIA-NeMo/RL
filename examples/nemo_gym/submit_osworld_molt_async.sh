@@ -45,9 +45,14 @@ export BASE_LOG_DIR="${BASE_LOG_DIR:-${RUNTIME_ROOT}/slurm-logs}"
 
 mkdir -p "${OSWORLD_RESULTS_DIR}" "${CHECKPOINT_DIR}" "${BASE_LOG_DIR}"
 
-JOB_NAME="molt-${MOLT_RUN_NAME}"
-active="$(squeue -h -u "${USER}" -n "${JOB_NAME}" -o '%i %j %T')"
-if [[ -n "${active}" ]]; then
+JOB_NAME="${MOLT_JOB_NAME:-molt-${MOLT_RUN_NAME}}"
+# COMPLETING jobs no longer own usable training state and can linger while Ray
+# tears down its workers. Only refuse a duplicate that can still start or run.
+active="$(
+  squeue -h -u "${USER}" -n "molt-${MOLT_RUN_NAME}" \
+    --states=PENDING,RUNNING,CONFIGURING -o '%i %j %T'
+)"
+if [[ -n "${active}" && "${MOLT_ALLOW_DUPLICATE_SUBMISSION:-false}" != "true" ]]; then
   echo "Refusing duplicate submission; active job:" >&2
   echo "${active}" >&2
   exit 3
@@ -123,12 +128,14 @@ export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 export UV_HTTP_RETRIES="${UV_HTTP_RETRIES:-10}"
 export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-true}"
 export NRL_IGNORE_VERSION_MISMATCH="${NRL_IGNORE_VERSION_MISMATCH:-1}"
-export SETUP_COMMAND="${SETUP_COMMAND:-/opt/nemo_rl_venv/bin/pip install --quiet --no-input tensordict pyvers wandb==0.21.0}"
+export SETUP_COMMAND="${SETUP_COMMAND:-/opt/nemo_rl_venv/bin/pip install --quiet --no-input tensordict pyvers gprof2dot wandb==0.21.0}"
 
 CONFIG="${ROOT}/examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_cc_molt_async.yaml"
 PARSER="${ROOT}/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py"
 export COMMAND="cd ${ROOT} && uv run --locked examples/nemo_gym/run_grpo_nemo_gym.py --config ${CONFIG} policy.generation.vllm_cfg.reasoning_parser_plugin=${PARSER}"
 SBATCH_SCRIPT="${SBATCH_SCRIPT:-${ROOT}/ray.sub}"
+DEFAULT_REAPER_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"other","description":"Async Omni3 OSWorld RL: actor and rollout GPUs alternate during train/rollout overlap"},"IdleGpuReaper":{"exemptIdleTimeMins":"240","reason":"other","description":"Async Omni3 OSWorld RL: actor and rollout GPUs alternate during train/rollout overlap"}}'
+export SBATCH_COMMENT="${SBATCH_COMMENT:-${DEFAULT_REAPER_COMMENT}}"
 
 sbatch --parsable \
   --chdir="${RUNTIME_ROOT}" \
@@ -138,6 +145,8 @@ sbatch --parsable \
   --partition="${SBATCH_PARTITION:-batch}" \
   --job-name="${JOB_NAME}" \
   --time="${SBATCH_TIME:-04:00:00}" \
+  --comment="${SBATCH_COMMENT}" \
   --output="${BASE_LOG_DIR}/slurm-%j.out" \
   --export=ALL \
+  --requeue \
   "${SBATCH_SCRIPT}"

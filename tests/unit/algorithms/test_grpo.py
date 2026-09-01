@@ -53,6 +53,7 @@ from nemo_rl.algorithms.grpo import (
     _validate_context_compaction_training_config,
     aggregate_rollout_metrics,
     async_grpo_train,
+    clip_total_rewards,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
     grpo_train,
@@ -451,6 +452,16 @@ def test_grpo_save_state_checkpoint_round_trip():
 
 def test_grpo_config_dynamic_sampling_default_matches_exemplar():
     assert GRPOConfig().dynamic_sampling_max_gen_batches == 10
+
+
+def test_clip_total_rewards_matches_molt_osworld_range():
+    batch = {"total_reward": torch.tensor([-0.5, 0.25, 1.5])}
+
+    clipped = clip_total_rewards(batch, low=0.0, high=1.0)
+
+    torch.testing.assert_close(
+        clipped["total_reward"], torch.tensor([0.0, 0.25, 1.0])
+    )
 
 
 def test_grpo_config_nested_defaults_are_populated():
@@ -2202,7 +2213,7 @@ def mock_async_grpo_infrastructure(
     )
 
     # Patch ray.get to return values from our stubs (not remote refs)
-    def mock_ray_get(ref):
+    def mock_ray_get(ref, *args, **kwargs):
         # If it's already a plain value (from our stubs), return it
         if isinstance(ref, (int, str, dict, list)):
             return ref
@@ -3762,15 +3773,10 @@ def test_clip_grpo_advantages_respects_config_bounds():
 def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     mock_grpo_components, train_func
 ):
-    """Regression test for PR #2177.
-
-    When ``loss_fn.force_on_policy_ratio=True``, both ``grpo_train`` and
-    ``async_grpo_train`` MUST NOT call ``policy.get_logprobs`` to compute
-    ``prev_logprobs`` -- the importance-sampling ratio is forced to 1.0 so
-    the prev-policy forward pass would be wasted compute.
-    """
+    """Forced PPO plus IS obtains its numerator from the training forward."""
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.force_on_policy_ratio = True
+    master_config.loss_fn.use_importance_sampling_correction = True
     master_config.grpo.seq_logprob_error_threshold = None
     master_config.grpo.max_num_steps = 1
     master_config.grpo.max_num_epochs = 1
@@ -5420,11 +5426,18 @@ class TestAggregateRolloutMetrics:
 
 
 def _cfg(
-    *, force=False, threshold=None, skip_ref=None, kl_reward=False, kl_penalty=0.01
+    *,
+    force=False,
+    is_correction=False,
+    threshold=None,
+    skip_ref=None,
+    kl_reward=False,
+    kl_penalty=0.01,
 ):
     return MasterConfig.model_construct(
         loss_fn=ClippedPGLossConfig(
             force_on_policy_ratio=force,
+            use_importance_sampling_correction=is_correction,
             use_kl_in_reward=kl_reward,
             reference_policy_kl_penalty=kl_penalty,
         ),
@@ -5440,10 +5453,17 @@ def _cfg(
     [
         ({}, (False, None)),
         ({"force": True}, (True, None)),
+        ({"force": True, "is_correction": True}, (True, None)),
         ({"force": True, "threshold": 1.5}, (False, None)),  # threshold overrides skip
         ({"skip_ref": True}, (False, True)),
     ],
-    ids=["default", "force_on_policy", "force_plus_threshold", "skip_ref"],
+    ids=[
+        "default",
+        "force_on_policy",
+        "force_on_policy_plus_is",
+        "force_plus_threshold",
+        "skip_ref",
+    ],
 )
 def test_resolve_logprob_skip_flags(kw, expected):
     if kw.get("force") and kw.get("threshold") is not None:

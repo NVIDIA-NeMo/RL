@@ -44,9 +44,9 @@ if len(full_rows) != 361 or len(full_by_id) != 361:
     )
 
 used = set()
-expected_counts = [46, 45, 45, 45, 45, 45, 45, 45]
+expected_counts = [91, 90, 90, 90]
 for index, expected_count in enumerate(expected_counts, start=1):
-    shard = f"{index:02d}of8"
+    shard = f"{index:02d}"
     reference_path = reference_dir / f"validation_nogdrive_361_q{shard}.jsonl"
     reference_rows = [
         json.loads(line)
@@ -77,13 +77,13 @@ if used != set(full_by_id):
     raise SystemExit(
         f"Jianh parity shards do not cover the full NeMo-Gym set: covered={len(used)} full={len(full_by_id)}"
     )
-print("Prepared Jianh parity shards: 46 + 7x45 = 361 tasks", file=sys.stderr)
+print("Prepared Jianh parity shards: 91 + 3x90 = 361 tasks", file=sys.stderr)
 PY
 
 job_ids=()
-PARITY_SHARDS="${PARITY_SHARDS:-01of8 02of8 03of8 04of8 05of8 06of8 07of8 08of8}"
+PARITY_SHARDS="${PARITY_SHARDS:-01 02 03 04}"
 for shard in ${PARITY_SHARDS}; do
-  [[ "${shard}" =~ ^0[1-8]of8$ ]] || {
+  [[ "${shard}" =~ ^0[1-4]$ ]] || {
     echo "Invalid parity shard: ${shard}" >&2
     exit 2
   }
@@ -95,6 +95,7 @@ for shard in ${PARITY_SHARDS}; do
     EVAL_NUM_GENERATIONS=4 \
     EVAL_TEMPERATURE=0.6 \
     EVAL_TOP_P=1.0 \
+    EVAL_MAX_STEPS=100 \
     EVAL_VAL_BATCH_SIZE="${shard_count}" \
     EVAL_NUM_WORKERS=32 \
     NUM_NODES=1 \
