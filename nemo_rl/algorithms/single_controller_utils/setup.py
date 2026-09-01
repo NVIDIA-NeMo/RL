@@ -712,23 +712,33 @@ def _clamp_max_num_steps(
 def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     """Set train_iters from max_num_steps after its dataloader clamp."""
     algo_cfg = algo_config(master_config)
-    is_ppo = is_ppo_run(master_config)
-    # train_iters is a scheduler-tick budget, and each PPO epoch steps both
-    # optimizers once, so the configured warmup/decay horizon has to be scaled.
-    ppo_epochs = algo_cfg.ppo_epochs if is_ppo else 1
-    train_iters = algo_cfg.max_num_steps * ppo_epochs
+    ppo_config = master_config.ppo if is_ppo_run(master_config) else None
+    # train_iters is a scheduler-tick budget. Policy and value need separate
+    # budgets when their epoch counts or training start steps differ.
+    policy_epochs = ppo_config.ppo_epochs if ppo_config is not None else 1
+    policy_training_steps = algo_cfg.max_num_steps
+    if ppo_config is not None:
+        policy_training_steps = max(
+            policy_training_steps - ppo_config.policy_training_start_step,
+            0,
+        )
+    # Megatron-Bridge requires a positive scheduler horizon at setup. A PPO
+    # policy scheduler is never advanced when critic warmup spans the whole run.
+    policy_train_iters = max(policy_training_steps * policy_epochs, 1)
 
     # policy
     policy_config = master_config.policy
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = train_iters
+        policy_config["megatron_cfg"]["train_iters"] = policy_train_iters
 
     # value
-    if not is_ppo:
+    if ppo_config is None:
         return
     value_config = master_config.value
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = train_iters  # type: ignore[index]
+        value_config["megatron_cfg"]["train_iters"] = (  # type: ignore[index]
+            algo_cfg.max_num_steps * ppo_config.critic_ppo_epochs
+        )
 
 
 def _maybe_attach_fleet_health(
