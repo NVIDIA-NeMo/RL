@@ -680,6 +680,12 @@ def _validate_failure_settings(
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    if getattr(master_config.grpo, "seq_logprob_error_force_on_policy", False):
+        raise NotImplementedError(
+            "grpo.seq_logprob_error_force_on_policy=true is not yet supported "
+            "by the SingleController/data-plane trainer."
+        )
+
     validate_router_replay_transport_path(
         master_config.policy,
         data_plane_enabled=bool((master_config.data_plane or {}).get("enabled", False)),

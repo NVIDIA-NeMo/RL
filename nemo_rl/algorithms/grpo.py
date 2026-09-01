@@ -48,6 +48,21 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import (
+    LOSS_METRIC_MAX_REDUCTION_NAMES,
+    LOSS_METRIC_MIN_REDUCTION_NAMES,
+    SEQ_LOGPROB_ERROR_ACCUM_METRICS,
+    SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC,
+)
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
     print_setup_timing_summary,
@@ -363,6 +378,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None = None
+    # Compute seq-level logprob errors from the policy forward used for training,
+    # and apply the threshold only to loss terms. This skips the separate
+    # prev-logprobs pass and therefore requires force_on_policy_ratio=True.
+    seq_logprob_error_force_on_policy: bool = False
     # Advantage value to assign to invalid tool call tokens. When set (e.g. -5.0), overwrites the
     # computed advantage for those tokens to penalize them; absent/None disables the penalty.
     invalid_tool_call_advantage: float | None = None
@@ -569,6 +588,7 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
+    _validate_loss_side_seq_logprob_error_config(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
     validate_router_replay_transport_path(
         policy_config,
@@ -775,7 +795,13 @@ def setup(
         )
 
     loss_fn = ClippedPGLossFn(
-        loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
+        loss_config,
+        use_fused_linear_logprobs=use_fused_linear_logprobs,
+        seq_logprob_error_threshold=(
+            grpo_config.seq_logprob_error_threshold
+            if _use_loss_side_seq_logprob_error(master_config)
+            else None
+        ),
     )
 
     # Validate force_on_policy_ratio
@@ -2591,10 +2617,141 @@ def _placeholder_seq_logprob_error_metrics() -> dict[str, float]:
     }
 
 
+def _use_loss_side_seq_logprob_error(master_config: MasterConfig) -> bool:
+    """Whether seq-level error masking is computed in the train loss forward."""
+    return bool(
+        getattr(master_config.grpo, "seq_logprob_error_force_on_policy", False)
+        and master_config.grpo.seq_logprob_error_threshold is not None
+    )
+
+
+def _validate_loss_side_seq_logprob_error_config(
+    master_config: MasterConfig,
+) -> None:
+    """Validate the opt-in, no-recompute sequence-error masking path."""
+    enabled = bool(
+        getattr(master_config.grpo, "seq_logprob_error_force_on_policy", False)
+    )
+    if not enabled:
+        return
+    if master_config.grpo.seq_logprob_error_threshold is None:
+        raise ValueError(
+            "grpo.seq_logprob_error_force_on_policy=true requires "
+            "grpo.seq_logprob_error_threshold to be set."
+        )
+    if not master_config.loss_fn.force_on_policy_ratio:
+        raise ValueError(
+            "grpo.seq_logprob_error_force_on_policy=true requires "
+            "loss_fn.force_on_policy_ratio=true."
+        )
+    if (master_config.data_plane or {}).get("enabled", False):
+        raise NotImplementedError(
+            "grpo.seq_logprob_error_force_on_policy=true is currently supported "
+            "only by the legacy GRPO trainer with data_plane.enabled=false."
+        )
+
+
+def _finalize_seq_logprob_error_metrics(metrics: dict[str, Any]) -> None:
+    """Replace mergeable loss statistics with public sequence-error metrics."""
+    present = SEQ_LOGPROB_ERROR_ACCUM_METRICS.intersection(metrics)
+    if not present:
+        metrics.update(_placeholder_seq_logprob_error_metrics())
+        metrics.update(
+            {
+                "logprob_error_masked_seq_fraction": 0.0,
+                "logprob_error_masked_correct_pct": 0.0,
+                "num_valid_seqs_before_logprob_error": 0.0,
+                "num_valid_seqs_after_logprob_error": 0.0,
+            }
+        )
+        return
+
+    missing = SEQ_LOGPROB_ERROR_ACCUM_METRICS.difference(metrics)
+    if missing:
+        raise ValueError(
+            "Missing loss-side sequence logprob error metrics: "
+            + ", ".join(sorted(missing))
+        )
+
+    sum_before = float(metrics.pop(SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC))
+    count_before = float(metrics.pop(SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC))
+    min_before = float(metrics.pop(SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC))
+    max_before = float(metrics.pop(SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC))
+    sum_after = float(metrics.pop(SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC))
+    count_after = float(metrics.pop(SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC))
+    min_after = float(metrics.pop(SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC))
+    max_after = float(metrics.pop(SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC))
+    masked_count = float(metrics.pop(SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC))
+    masked_correct_count = float(
+        metrics.pop(SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC)
+    )
+    masked_correct_pct = masked_correct_count / masked_count if masked_count else 0.0
+
+    metrics.update(
+        {
+            "max_seq_mult_prob_error": max_before if count_before else 0.0,
+            "mean_seq_mult_prob_error": (
+                sum_before / count_before if count_before else 0.0
+            ),
+            "min_seq_mult_prob_error": min_before if count_before else 0.0,
+            "max_seq_mult_prob_error_after_mask": (max_after if count_after else 0.0),
+            "mean_seq_mult_prob_error_after_mask": (
+                sum_after / count_after if count_after else 0.0
+            ),
+            "min_seq_mult_prob_error_after_mask": (min_after if count_after else 0.0),
+            "num_masked_seqs_by_logprob_error": masked_count,
+            "masked_correct_pct": masked_correct_pct,
+            "logprob_error_masked_seq_fraction": (
+                masked_count / count_before if count_before else 0.0
+            ),
+            "logprob_error_masked_correct_pct": masked_correct_pct,
+            "num_valid_seqs_before_logprob_error": count_before,
+            "num_valid_seqs_after_logprob_error": count_after,
+        }
+    )
+
+
+def _newly_masked_sequence_count(
+    before_mask: torch.Tensor, after_mask: torch.Tensor
+) -> float:
+    """Count eligible sequences that became masked between two stages."""
+    before = before_mask.detach().reshape(-1).bool().cpu()
+    after = after_mask.detach().reshape(-1).bool().cpu()
+    if before.shape != after.shape:
+        raise ValueError(
+            "Expected sequence masks to have the same shape, got "
+            f"{tuple(before.shape)} and {tuple(after.shape)}."
+        )
+    reenabled = after & ~before
+    if reenabled.any():
+        raise ValueError(
+            "Sequence masking stages must not re-enable an initially masked row."
+        )
+    return float((before & ~after).sum().item())
+
+
+def _sequence_mask_stage_metrics(
+    *,
+    initial_mask: torch.Tensor,
+    pre_train_mask: torch.Tensor,
+    post_train_masked_count: float,
+) -> dict[str, float]:
+    """Report disjoint pre-train, loss-side, and union sequence-mask counts."""
+    pre_train_count = _newly_masked_sequence_count(initial_mask, pre_train_mask)
+    post_train_count = float(post_train_masked_count)
+    if post_train_count < 0:
+        raise ValueError("post_train_masked_count must be non-negative.")
+    return {
+        "num_masked_seqs_pre_train_step": pre_train_count,
+        "num_masked_seqs_post_train_step": post_train_count,
+        "num_masked_seqs_total": pre_train_count + post_train_count,
+    }
+
+
 def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
     """Reject ``use_kl_in_reward`` when the KL term would read zero placeholder logprobs.
 
-    ``force_on_policy_ratio`` (without ``seq_logprob_error_threshold``) skips
+    The no-recompute force-on-policy paths skip
     the prev_logprobs forward and passes a zero placeholder to the advantage
     estimator; ``use_kl_in_reward`` then applies
     ``kl_coef * calculate_kl(zeros, ref)`` which corrupts the advantage.
@@ -2605,8 +2762,8 @@ def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
     if loss_config.use_kl_in_reward and loss_config.reference_policy_kl_penalty != 0:
         assert not opd_module._skip_prev_logprobs(master_config), (
             "loss_fn.use_kl_in_reward with nonzero loss_fn.reference_policy_kl_penalty "
-            "requires real prev_logprobs, but force_on_policy_ratio (without "
-            "grpo.seq_logprob_error_threshold) zeros them — KL would be computed "
+            "requires real prev_logprobs, but the configured force-on-policy "
+            "path zeros them — KL would be computed "
             "against a zero placeholder."
         )
 
@@ -2616,8 +2773,9 @@ def _resolve_logprob_skip_flags(
 ) -> tuple[bool, bool | None]:
     """Return (skip_prev_logprobs, skip_reference_logprobs); warn on incompatible combos.
 
-    Skip prev_logprobs when force_on_policy_ratio=True unless
-    seq_logprob_error_threshold is set (which requires prev_logprobs).
+    Skip prev_logprobs when force_on_policy_ratio=True unless the legacy
+    driver-side seq-error path needs them. The opt-in loss-side path computes
+    the error from the training forward and therefore still skips them.
     Skip reference_policy_logprobs when
     ``grpo.skip_reference_policy_logprobs_calculation`` is set.
     """
@@ -2625,6 +2783,7 @@ def _resolve_logprob_skip_flags(
     if (
         master_config.loss_fn.force_on_policy_ratio
         and master_config.grpo.seq_logprob_error_threshold is not None
+        and not _use_loss_side_seq_logprob_error(master_config)
     ):
         warnings.warn(
             "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
@@ -2862,6 +3021,7 @@ def grpo_train(
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+    loss_side_seq_logprob_error = _use_loss_side_seq_logprob_error(master_config)
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -3259,6 +3419,9 @@ def grpo_train(
                     del baseline
                     del std
 
+                initial_sequence_mask = (
+                    repeated_batch["loss_multiplier"].detach().clone()
+                )
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config.grpo.overlong_filtering
                     if use_overlong_filtering:
@@ -3394,8 +3557,13 @@ def grpo_train(
                     del logprob_data
                     del extra_multimodal_data
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                # The legacy driver path needs real prev_logprobs; the opt-in
+                # loss-side path emits these metrics from policy.train().
+                if loss_side_seq_logprob_error:
+                    # The training forward emits the metrics and applies a
+                    # loss-only mask, so there is no driver-side mask yet.
+                    seq_logprob_error_metrics = {}
+                elif skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
@@ -3409,6 +3577,10 @@ def grpo_train(
                         seq_logprob_error_metrics[
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
+
+                pre_train_sequence_mask = train_data["sample_mask"].detach().clone()
+                if loss_side_seq_logprob_error:
+                    train_data["rewards"] = rewards.detach().cpu()
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -3594,12 +3766,12 @@ def grpo_train(
                 metrics.update(gen_step_metrics)
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if k in LOSS_METRIC_MIN_REDUCTION_NAMES:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.min(valid_values).item() if valid_values else -1.0
                         )
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in LOSS_METRIC_MAX_REDUCTION_NAMES:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.max(valid_values).item() if valid_values else -1.0
@@ -3623,8 +3795,22 @@ def grpo_train(
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
-                # Always log sequence-level error metrics (useful for deciding threshold)
-                metrics.update(seq_logprob_error_metrics)
+                # Always log sequence-level error metrics (useful for deciding threshold).
+                if loss_side_seq_logprob_error:
+                    _finalize_seq_logprob_error_metrics(metrics)
+                else:
+                    metrics.update(seq_logprob_error_metrics)
+                metrics.update(
+                    _sequence_mask_stage_metrics(
+                        initial_mask=initial_sequence_mask,
+                        pre_train_mask=pre_train_sequence_mask,
+                        post_train_masked_count=(
+                            metrics["num_masked_seqs_by_logprob_error"]
+                            if loss_side_seq_logprob_error
+                            else 0.0
+                        ),
+                    )
+                )
 
                 ## Checkpointing
                 consumed_samples += master_config.grpo.num_prompts_per_step
@@ -4287,9 +4473,7 @@ def async_grpo_train(
     log_nemo_gym_training_samples = should_log_nemo_gym_training_samples(
         master_config.env
     )
-    log_local_train_data_artifacts = not _should_log_nemo_gym_responses(
-        master_config
-    )
+    log_local_train_data_artifacts = not _should_log_nemo_gym_responses(master_config)
     if log_nemo_gym_training_samples and not master_config.env.get(
         "should_use_nemo_gym", False
     ):
@@ -4341,6 +4525,7 @@ def async_grpo_train(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+    loss_side_seq_logprob_error = _use_loss_side_seq_logprob_error(master_config)
 
     assert (not colocated_inference) or (
         isinstance(policy_generation, MegatronGeneration)
@@ -5003,6 +5188,9 @@ def async_grpo_train(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
                     )
 
+                initial_sequence_mask = (
+                    repeated_batch["loss_multiplier"].detach().clone()
+                )
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
@@ -5114,8 +5302,13 @@ def async_grpo_train(
                             train_data["prev_logprobs"]
                         )
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                # The legacy driver path needs real prev_logprobs; the opt-in
+                # loss-side path emits these metrics from policy.train().
+                if loss_side_seq_logprob_error:
+                    # The training forward emits the metrics and applies a
+                    # loss-only mask, so there is no driver-side mask yet.
+                    seq_logprob_error_metrics = {}
+                elif skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
@@ -5129,6 +5322,10 @@ def async_grpo_train(
                         seq_logprob_error_metrics[
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
+
+                pre_train_sequence_mask = train_data["sample_mask"].detach().clone()
+                if loss_side_seq_logprob_error:
+                    train_data["rewards"] = rewards.detach().cpu()
 
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
@@ -5432,12 +5629,12 @@ def async_grpo_train(
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if k in LOSS_METRIC_MIN_REDUCTION_NAMES:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.min(valid_values).item() if valid_values else -1.0
                         )
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in LOSS_METRIC_MAX_REDUCTION_NAMES:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.max(valid_values).item() if valid_values else -1.0
@@ -5458,8 +5655,22 @@ def async_grpo_train(
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
-                # Always log sequence-level error metrics (useful for deciding threshold)
-                metrics.update(seq_logprob_error_metrics)
+                # Always log sequence-level error metrics (useful for deciding threshold).
+                if loss_side_seq_logprob_error:
+                    _finalize_seq_logprob_error_metrics(metrics)
+                else:
+                    metrics.update(seq_logprob_error_metrics)
+                metrics.update(
+                    _sequence_mask_stage_metrics(
+                        initial_mask=initial_sequence_mask,
+                        pre_train_mask=pre_train_sequence_mask,
+                        post_train_masked_count=(
+                            metrics["num_masked_seqs_by_logprob_error"]
+                            if loss_side_seq_logprob_error
+                            else 0.0
+                        ),
+                    )
+                )
 
                 # Speculative-decoding (MTP) acceptance metrics for this step.
                 if hasattr(policy_generation, "get_step_metrics"):
