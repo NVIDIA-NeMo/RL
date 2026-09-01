@@ -838,13 +838,13 @@ on_policy_distillation:
     default_teacher_cfg:
       tensor_model_parallel_size: 8
       pipeline_model_parallel_size: 1
-      expert_tensor_parallel_size: 1
       expert_model_parallel_size: 16
       context_parallel_size: 2
       num_nodes: 4
       segment_size: 4
       gpus_per_node: 4
-      precision: bfloat16
+      precision: bf16
       micro_batch_size: 1
       megatron_cfg_overrides:
         moe_token_dispatcher_type: alltoall
+        moe_flex_dispatcher_backend: deepep

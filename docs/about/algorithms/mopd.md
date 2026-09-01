@@ -267,8 +267,10 @@ indices and normalized log-probabilities are stored with the trajectory and
 reused by the trainer.
 
 This remains a smoke-test configuration. Measure throughput, peak memory, and
-loss/reward convergence against full-vocabulary MOPD before using it as a
-performance or quality baseline.
+reward convergence against sampled-token MOPD before using it as a performance
+or quality baseline. Monitor `opd_topk_head_loss` for the exact-support
+contribution; raw loss scales are not directly comparable between the two
+estimators.
 
 ## References
 

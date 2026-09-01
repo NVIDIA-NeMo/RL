@@ -71,7 +71,7 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     expert_model_parallel_size: int = 1
     num_nodes: int = 1
     gpus_per_node: int = 8
-    segment_size: Optional[int] = Field(default=None, ge=1)
+    segment_size: Annotated[Optional[int], Field(ge=1)] = None
     precision: TeacherPrecision = "bfloat16"
     micro_batch_size: int = 4
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
@@ -93,7 +93,7 @@ class TeacherResourceOverrideConfig(BaseModel, extra="allow"):
     expert_model_parallel_size: Optional[int] = None
     num_nodes: Optional[int] = None
     gpus_per_node: Optional[int] = None
-    segment_size: Optional[int] = Field(default=None, ge=1)
+    segment_size: Annotated[Optional[int], Field(ge=1)] = None
     precision: Optional[TeacherPrecision] = None
     micro_batch_size: Optional[int] = None
     megatron_cfg_overrides: Optional[dict[str, Any]] = None
@@ -115,8 +115,8 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
     enabled: bool = False
-    student_topk: Optional[int] = Field(default=None, ge=1)
-    teacher_topk: Optional[int] = Field(default=None, ge=1)
+    student_topk: Annotated[Optional[int], Field(ge=1)] = None
+    teacher_topk: Annotated[Optional[int], Field(ge=1)] = None
     teacher_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
     default_teacher_alias: Optional[str] = None
     strict_agent_name_match: bool = False
@@ -233,14 +233,14 @@ def topk_reverse_kl_loss(
     Note:
         The tail term is a score-function estimator evaluated with the current
         student's log-probability at the sampled target token. It is unbiased
-        only when that token is sampled from the current student policy. Under
-        async replay, the token comes from a stale policy and no importance
-        ratio corrects the sampling-distribution mismatch. The estimator thus
-        inherits async GRPO's off-policy bias and relies on on-policy training
-        or a sufficiently small policy lag, for example one bounded via
-        ICE-POP. Requiring ``disable_ppo_ratio=True`` avoids applying a policy
-        gradient ratio to this reverse-KL loss, but does not compensate for
-        replay staleness.
+        only when that token is sampled from the current student policy. Top-k
+        OPD currently requires async GRPO and rejects truncated importance
+        sampling, so no importance ratio corrects the stale-policy sampling
+        mismatch. Keep ``grpo.async_grpo.max_trajectory_age_steps`` at 1 to
+        minimize the supported replay lag and treat the residual bias as an
+        async-training trade-off. Requiring ``disable_ppo_ratio=True`` avoids
+        applying a policy-gradient ratio to this reverse-KL loss, but does not
+        compensate for replay staleness.
     """
     if student_support_logprobs.shape != teacher_support_logprobs.shape:
         raise ValueError(

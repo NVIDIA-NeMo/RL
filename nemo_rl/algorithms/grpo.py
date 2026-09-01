@@ -4033,10 +4033,7 @@ def grpo_train(
                 reduction_op="sum"
             )  # type: ignore
             # track example with high token mult prob error above 1.05
-            if (
-                "token_mult_prob_error" in metrics
-                and metrics["token_mult_prob_error"] > 1.05
-            ):
+            if metrics["token_mult_prob_error"] > 1.05:
                 logger.log_plot_token_mult_prob_error(
                     {
                         "prompt_lengths": repeated_batch["length"],
@@ -4069,8 +4066,7 @@ def grpo_train(
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
-            if "gen_kl_error" in metrics:
-                print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             if master_config.grpo.use_dynamic_sampling:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
@@ -6030,8 +6026,7 @@ def async_grpo_train(
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
-            if "gen_kl_error" in metrics:
-                print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
