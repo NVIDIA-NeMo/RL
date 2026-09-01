@@ -540,6 +540,9 @@ nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "61874f9842bd084cc5e9e348de4b3b6a8f46cdc8", SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM = "0.25.1", SETUPTOOLS_SCM_PRETEND_VERSION = "0.25.1" }
 flashinfer-python = { FLASHINFER_CUDA_ARCH_LIST = "10.0a" }
 flashinfer-cubin = { FLASHINFER_CUDA_ARCH_LIST = "10.0a" }
+# torch-memory-saver's build backend reads TMS_CUDA_MAJOR at build time. Keep this in
+# sync with docker/Dockerfile's BASE_IMAGE CUDA major version (currently cuda13.x).
+torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
