@@ -103,5 +103,19 @@ def configure_generation_config(
 
     elif config["backend"] == "trtllm":
         config = cast(TrtllmConfig, config)
+        # Same contract as vLLM above: the engine comes up on dummy weights
+        # and the initial refit installs the real ones before the collector
+        # is allowed to issue a request, so reading the checkpoint at startup
+        # would only be thrown away. Evaluation has no refit and must load.
+        #
+        # precision="fp8" is dummy either way — the engine is built with the
+        # quantized layout that the BF16 refit populates, so there is nothing
+        # on disk to load (see quantization.fp8.configure_fp8_llm_kwargs,
+        # which rejects any other load_format).
+        trtllm_cfg = config["trtllm_cfg"]
+        if trtllm_cfg.get("precision") == "fp8":
+            trtllm_cfg["load_format"] = "dummy"
+        else:
+            trtllm_cfg["load_format"] = "auto" if is_eval else "dummy"
 
     return config

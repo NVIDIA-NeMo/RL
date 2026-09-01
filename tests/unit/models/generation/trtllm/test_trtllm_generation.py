@@ -336,3 +336,32 @@ def test_ipc_refit_and_missing_worker_group():
     broken.worker_group.workers = []
     with pytest.raises(RuntimeError, match="Worker group not initialised"):
         broken.update_weights_via_ipc_zmq()
+
+
+class _LoadFormatTokenizer:
+    pad_token_id = 0
+    eos_token_id = 1
+
+
+def test_configure_generation_config_selects_trtllm_load_format() -> None:
+    """Training starts on dummy weights; the initial refit supplies the real ones."""
+    from nemo_rl.models.generation import configure_generation_config
+
+    training = configure_generation_config(_config(), _LoadFormatTokenizer())
+    assert training["trtllm_cfg"]["load_format"] == "dummy"
+
+    evaluation = configure_generation_config(
+        _config(), _LoadFormatTokenizer(), is_eval=True
+    )
+    assert evaluation["trtllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_forces_dummy_for_fp8() -> None:
+    """An FP8 engine has no loadable checkpoint: the BF16 refit builds its weights."""
+    from nemo_rl.models.generation import configure_generation_config
+
+    for is_eval in (False, True):
+        configured = configure_generation_config(
+            _config(precision="fp8"), _LoadFormatTokenizer(), is_eval=is_eval
+        )
+        assert configured["trtllm_cfg"]["load_format"] == "dummy"
