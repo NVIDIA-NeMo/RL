@@ -38,7 +38,11 @@ from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
@@ -52,6 +56,15 @@ reference_configs_dir = Path(os.path.join(absolute_dir, "reference_configs"))
 reference_config_files = glob.glob(
     str(reference_configs_dir / "*.yaml"), recursive=True
 )
+
+
+def test_ppo_recipe_critic_epochs_follow_actor_override():
+    config = load_config(real_configs_dir / "ppo_math_1B.yaml")
+    config = parse_hydra_overrides(config, ["ppo.ppo_epochs=7"])
+
+    resolved = OmegaConf.to_container(config, resolve=True)
+    assert resolved["ppo"]["ppo_epochs"] == 7
+    assert resolved["ppo"]["critic_ppo_epochs"] == 7
 
 
 def _collect_mismatched_keys(real: dict, reference: dict, path: str = ""):
