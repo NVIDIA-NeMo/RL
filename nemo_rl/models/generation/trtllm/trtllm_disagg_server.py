@@ -24,6 +24,7 @@ only hands it the two address pools and the router policies.
 
 import logging
 import threading
+import time
 from typing import Any, Optional
 
 import ray
@@ -46,6 +47,8 @@ def build_config(
     node_id: int,
     ctx_router: str,
     gen_router: str,
+    gen_tokids_ctxbytes: bool = False,
+    gen_strip_message_history: bool = False,
 ) -> Any:
     """Assemble the ``DisaggServerConfig`` for one replica.
 
@@ -75,12 +78,18 @@ def build_config(
         for host, port in gen_addrs
     ]
 
-    return DisaggServerConfig(
+    config = DisaggServerConfig(
         server_configs=server_configs,
         ctx_router_config=RouterConfig(type=ctx_router),
         gen_router_config=RouterConfig(type=gen_router),
         node_id=node_id,
     )
+    # Post-construction assignment, same as TRT-LLM's own YAML parser
+    # (llmapi/disagg_utils.py extract_disagg_cfg): thins the gen leg so the
+    # relay stops re-serializing a 30k-int id array and the full history.
+    config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
+    config.gen_strip_message_history = gen_strip_message_history
+    return config
 
 
 # Request fields NeMo-Gym sends for vLLM that TRT-LLM's ChatCompletionRequest
@@ -105,13 +114,18 @@ class _DropGymOnlyRequestFields:
     actually reads.
     """
 
-    def __init__(self, app: Any) -> None:
+    def __init__(self, app: Any, tokenize_fn: Any = None) -> None:
         self.app = app
+        # Phase-2 frontend tokenize: async callable(payload) -> b64 ids or
+        # None. Runs here because this middleware already pays the
+        # loads/dumps round trip for every body.
+        self._tokenize_fn = tokenize_fn
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") != "http" or scope.get("path") not in _ADAPTED_PATHS:
             await self.app(scope, receive, send)
             return
+
 
         import json
 
@@ -129,21 +143,49 @@ class _DropGymOnlyRequestFields:
             payload = json.loads(body)
         except ValueError:
             payload = None
+
+        mutated = False
         if isinstance(payload, dict) and any(
             field in payload for field in _GYM_ONLY_REQUEST_FIELDS
         ):
             for field in _GYM_ONLY_REQUEST_FIELDS:
                 payload.pop(field, None)
+            mutated = True
+        if (
+            self._tokenize_fn is not None
+            and isinstance(payload, dict)
+            and payload.get("messages")
+            and "prompt_token_ids_b64" not in payload
+            and "prompt_token_ids" not in payload
+            and payload.get("disaggregated_params") is None
+        ):
+            # Inbound gym request (the engine-facing legs carry
+            # disaggregated_params and never traverse this app). Attach the
+            # rendered+spliced prompt ids so the ctx adapter skips its
+            # chat-template work entirely; prompt_token_ids_b64 is a declared
+            # request field end-to-end.
+            try:
+                b64 = await self._tokenize_fn(payload)
+            except Exception:  # noqa: BLE001 - fall back to adapter-side tokenize
+                logger.exception(
+                    "frontend tokenize failed; falling back to adapter-side"
+                )
+                b64 = None
+            if b64 is not None:
+                payload["prompt_token_ids_b64"] = b64
+                mutated = True
+        if mutated:
             body = json.dumps(payload).encode()
-            # Content-Length must follow the body; a stale value makes any proxy
-            # in front of this server truncate or hang.
-            headers = [
-                (name, value)
-                for name, value in scope["headers"]
-                if name.lower() != b"content-length"
-            ]
+        # Content-Length must follow the body when it changed; a stale value
+        # makes any proxy in front of this server truncate or hang.
+        headers = [
+            (name, value)
+            for name, value in scope["headers"]
+            if name.lower() != b"content-length" or not mutated
+        ]
+        if mutated:
             headers.append((b"content-length", str(len(body)).encode()))
-            scope = {**scope, "headers": headers}
+        scope = {**scope, "headers": headers}
 
         delivered = False
 
@@ -188,6 +230,7 @@ def _build_adaptor_class() -> type:
         """
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._tokenize_fn = kwargs.pop("tokenize_fn", None)
             super().__init__(*args, **kwargs)
             self._uvicorn: Any = None
             self._install_request_adaptor()
@@ -221,7 +264,9 @@ def _build_adaptor_class() -> type:
             # validation and every request still fails with extra_forbidden.
             # Wrapping receive at the ASGI layer is what actually replaces the
             # body the route sees.
-            self.app.add_middleware(_DropGymOnlyRequestFields)
+            self.app.add_middleware(
+                _DropGymOnlyRequestFields, tokenize_fn=self._tokenize_fn
+            )
 
         # -------------------------------------------------------------- #
         #  Errors
@@ -263,7 +308,7 @@ def _build_adaptor_class() -> type:
                 response = await inner(req, raw_req)
                 if req.stream or not isinstance(response, JSONResponse):
                     return response
-                return self._attach_rollout_fields(response)
+                return self._attach_rollout_fields(response, raw_req)
 
             return wrapper
 
@@ -288,19 +333,26 @@ def _build_adaptor_class() -> type:
                 ids.append(int(token[len(_TOKEN_ID_PREFIX) :]))
             return ids or None
 
-        def _attach_rollout_fields(self, response: JSONResponse) -> JSONResponse:
+        def _attach_rollout_fields(
+            self, response: JSONResponse, raw_req: "Request | None" = None
+        ) -> JSONResponse:
             """Re-attach the fields NeMo-Gym reads off ``choices[].message``."""
             import json
 
             payload = json.loads(response.body)
+
             choices = payload.get("choices") or []
             if not choices:
-                return response
+                return JSONResponse(
+                    content=payload, status_code=response.status_code
+                )
 
             choice = choices[0]
             message = choice.get("message")
             if not isinstance(message, dict):
-                return response
+                return JSONResponse(
+                    content=payload, status_code=response.status_code
+                )
 
             if payload.get("prompt_token_ids") is not None:
                 message["prompt_token_ids"] = payload["prompt_token_ids"]
@@ -320,11 +372,65 @@ def _build_adaptor_class() -> type:
     return OpenAIDisaggServerAdaptor
 
 
+def _build_frontend_tokenizer(
+    model_name: str, server_template_kwargs: dict[str, Any]
+) -> Any:
+    """Async ``payload -> b64 prompt ids`` using the adapters' exact pipeline.
+
+    Loads the tokenizer and HF config the same way the engine adapters do
+    (``AutoTokenizer/AutoConfig.from_pretrained(model_name,
+    trust_remote_code=True)``) and renders through the shared
+    ``build_spliced_prompt_ids`` -- the ids must be bit-identical to what the
+    ctx adapter would compute, since a divergence silently trains on
+    off-policy tokens (the adapter shadow-validates a sample under
+    NRL_TRTLLM_TOKENIZE_SHADOW_RATE).
+    """
+    import base64
+
+    import numpy as np
+    from transformers import AutoConfig, AutoTokenizer
+
+    from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+        build_spliced_prompt_ids,
+    )
+
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+    async def _tokenize(payload: dict[str, Any]) -> str:
+        # Normalize through the SAME pydantic model and dump flags the disagg
+        # client uses toward the engines (model_dump(mode="json",
+        # exclude_unset=True), openai_client.py). The ctx adapter renders the
+        # POST-VALIDATION dicts -- pydantic inserts defaults and fixes key
+        # order (e.g., tools entries become {"type": "function", "function":
+        # ...}), and the chat template serializes them verbatim, so rendering
+        # the raw gym payload instead diverges at the tools JSON on turn-1
+        # prompts (caught by shadow validation).
+        norm = ChatCompletionRequest(**payload).model_dump(
+            mode="json", exclude_unset=True
+        )
+        per_request = norm.get("chat_template_kwargs") or {}
+        effective = {**server_template_kwargs, **per_request}
+        ids = await build_spliced_prompt_ids(
+            norm.get("messages") or [],
+            norm.get("tools"),
+            tokenizer,
+            model_config,
+            effective,
+        )
+        return base64.b64encode(np.asarray(ids, dtype=np.int32).tobytes()).decode()
+
+    return _tokenize
+
+
 def start_server(
     config: Any,
     host: str = "0.0.0.0",
     port: int = 0,
     req_timeout_secs: int = 1800,
+    tokenize_fn: Any = None,
 ) -> "tuple[threading.Thread, str, Any]":
     """Start the disagg server in a daemon thread and return (thread, base_url, server)."""
     import asyncio
@@ -357,11 +463,28 @@ def start_server(
         config,
         req_timeout_secs=req_timeout_secs,
         coordinator_url=None,
+        tokenize_fn=tokenize_fn,
     )
 
     def _run() -> None:
         # OpenAIDisaggServer.__call__ is a coroutine that runs uvicorn, so the
-        # thread needs its own event loop.
+        # thread needs its own event loop. Frontend-saturation mitigations
+        # mirror TRT-LLM's own serve entrypoint: uvloop when available, and
+        # optionally GC off (tekit measured negligible growth over 200k
+        # requests; the periodic gen-2 collections otherwise stall the whole
+        # relay loop).
+        import os
+
+        try:
+            import uvloop
+
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        except ImportError:
+            pass
+        if os.environ.get("TRTLLM_DISAGG_SERVER_DISABLE_GC", "0") == "1":
+            import gc
+
+            gc.disable()
         asyncio.run(server(host, port))
 
     thread = threading.Thread(target=_run, daemon=True)
@@ -385,36 +508,96 @@ class DisaggServerActorImpl:
     so it can be exercised without Ray.
     """
 
-    def __init__(self, replica_idx: int) -> None:
+    def __init__(
+        self,
+        replica_idx: int,
+        frontend_idx: int = 0,
+        num_frontends: int = 1,
+        port: int = 0,
+        serve_args: Optional[dict[str, Any]] = None,
+    ) -> None:
         self._replica_idx = replica_idx
+        self._frontend_idx = frontend_idx
+        self._num_frontends = num_frontends
+        self._port = port
         self._thread = None
         self._server = None
         self._base_url: Optional[str] = None
+        # Serving from the constructor is what makes crash recovery work: Ray
+        # re-runs __init__ on actor restart but never replays method calls, so
+        # with a hard node pin and a deterministic port the restarted frontend
+        # comes back at the SAME URL and Gym's sticky clients recover after
+        # their 5xx retries. The empty router trie is a one-time cache-miss.
+        if serve_args is not None:
+            self._start_serving(**serve_args)
 
-    def start(
+    def _start_serving(
         self,
         ctx_addrs: list[tuple[str, int]],
         gen_addrs: list[tuple[str, int]],
         *,
         ctx_router: str,
         gen_router: str,
-    ) -> str:
-        """Serve this replica and return the URL NeMo-Gym will talk to."""
-        if self._base_url is not None:
-            return self._base_url
-
+        gen_tokids_ctxbytes: bool = False,
+        gen_strip_message_history: bool = False,
+        frontend_tokenize: bool = False,
+        model_name: Optional[str] = None,
+        default_chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        # node_id keys the snowflake request-id mint (process_id is hardwired
+        # to 0 without a coordinator, and time.monotonic() shares an origin
+        # across processes on one node) -- distinct node_id per frontend is
+        # what keeps ctx_request_ids disjoint. It also namespaces the router's
+        # implicit conversation-id counter.
         config = build_config(
             ctx_addrs,
             gen_addrs,
-            node_id=self._replica_idx,
+            node_id=self._replica_idx * self._num_frontends + self._frontend_idx,
             ctx_router=ctx_router,
             gen_router=gen_router,
+            gen_tokids_ctxbytes=gen_tokids_ctxbytes,
+            gen_strip_message_history=gen_strip_message_history,
         )
-        self._thread, self._base_url, self._server = start_server(config)
+        tokenize_fn = None
+        if frontend_tokenize:
+            assert model_name, "frontend_tokenize requires the model name"
+            tokenize_fn = _build_frontend_tokenizer(
+                model_name, default_chat_template_kwargs or {}
+            )
+        self._thread, self._base_url, self._server = start_server(
+            config, port=self._port, tokenize_fn=tokenize_fn
+        )
+
+    def start(
+        self,
+        ctx_addrs: Optional[list[tuple[str, int]]] = None,
+        gen_addrs: Optional[list[tuple[str, int]]] = None,
+        *,
+        ctx_router: str = "conversation",
+        gen_router: str = "load_balancing",
+        gen_tokids_ctxbytes: bool = False,
+        gen_strip_message_history: bool = False,
+    ) -> str:
+        """Ensure the server is up and return the URL NeMo-Gym will talk to."""
+        if self._base_url is None:
+            assert ctx_addrs is not None and gen_addrs is not None, (
+                "start() needs the address pools unless they were passed to "
+                "the constructor via serve_args"
+            )
+            self._start_serving(
+                ctx_addrs,
+                gen_addrs,
+                ctx_router=ctx_router,
+                gen_router=gen_router,
+                gen_tokids_ctxbytes=gen_tokids_ctxbytes,
+                gen_strip_message_history=gen_strip_message_history,
+            )
         wait_ready(self._base_url)
 
         logger.info(
-            "disagg server for replica %d ready at %s",
+            "disagg frontend %d/%d for replica %d ready at %s",
+            self._frontend_idx,
+            self._num_frontends,
             self._replica_idx,
             self._base_url,
         )

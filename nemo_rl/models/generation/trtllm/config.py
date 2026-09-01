@@ -51,6 +51,30 @@ class TrtllmDisaggArgs(TypedDict):
     ctx_router: str  # conversation | kv_cache_aware
     gen_router: str  # round_robin | load_balancing
 
+    # Frontend (disagg server) workers per replica. Each is its own
+    # DisaggServerActor with a distinct URL; NeMo-Gym's per-session client
+    # selection shards conversations across them, so one frontend's CPU stops
+    # being the replica's turn-throughput ceiling. 1 = single-frontend
+    # behavior. replicas * workers must be <= 256 (snowflake node_id space).
+    num_frontend_workers: NotRequired[int]
+    # Relay ctx->gen prompt token ids as one base64 int32 string instead of a
+    # 30k-int JSON array (TRT-LLM DisaggServerConfig.gen_tokids_ctxbytes).
+    gen_tokids_ctxbytes: NotRequired[bool]
+    # Strip the conversation history from the generation leg; the relayed
+    # token ids carry the full prefix, so the generation adapter never needs
+    # the messages (DisaggServerConfig.gen_strip_message_history).
+    gen_strip_message_history: NotRequired[bool]
+    # Frontends render the chat template and tokenize (via the adapters'
+    # exact shared pipeline) and attach prompt_token_ids_b64 to the ctx leg,
+    # so the single ctx adapter process does no template work. Guarded by
+    # ctx-side shadow validation (NRL_TRTLLM_TOKENIZE_SHADOW_RATE).
+    frontend_tokenize: NotRequired[bool]
+    # Base port for the frontend workers' deterministic ports
+    # (base + frontend_idx on the pinned node). Deterministic so a restarted
+    # frontend actor re-binds the SAME port and its URL stays valid; keep the
+    # range outside virtual_cluster's random master-port window (1400-1999).
+    frontend_base_port: NotRequired[int]
+
     # Mapped onto TRT-LLM's CacheTransceiverConfig.
     # DEFAULT | UCX | NIXL | MOONCAKE | MPI
     cache_transceiver_backend: str
