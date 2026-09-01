@@ -340,6 +340,36 @@ async def _gather_cancelling_siblings(coros: list[Any]) -> list[Any]:
         raise
 
 
+class RequestDeadlineRegistry:
+    """Live request deadlines, pausable while a colocated engine has switched to training."""
+
+    def __init__(self) -> None:
+        self._live: set["_Deadline"] = set()
+        self.suspended = False
+
+    def add(self, deadline: "_Deadline") -> None:
+        self._live.add(deadline)
+        if self.suspended:
+            deadline.suspend()
+
+    def discard(self, deadline: "_Deadline") -> None:
+        self._live.discard(deadline)
+
+    def suspend(self) -> None:
+        if self.suspended:
+            return
+        self.suspended = True
+        for deadline in self._live:
+            deadline.suspend()
+
+    def resume(self) -> None:
+        if not self.suspended:
+            return
+        self.suspended = False
+        for deadline in self._live:
+            deadline.resume()
+
+
 class _Deadline:
     """``asyncio.timeout`` that reports expiry as a typed :class:`RolloutTimeout`.
 
@@ -349,20 +379,33 @@ class _Deadline:
     else propagates untouched.
 
     ``seconds=None`` disables the deadline, matching ``asyncio.timeout`` semantics.
+    ``registry`` puts the deadline clock in units of inference clock-time, not wall clock-time:
+    When a colocated engine is suspended for training, inference deadlines should not tick down.
     """
 
-    def __init__(self, seconds: Optional[float], description: str) -> None:
+    def __init__(
+        self,
+        seconds: Optional[float],
+        description: str,
+        registry: Optional[RequestDeadlineRegistry] = None,
+    ) -> None:
         self._seconds = seconds
         self._description = description
         self._timeout: Optional[asyncio.Timeout] = None
+        self._registry = registry
+        self._remaining: Optional[float] = None
 
     async def __aenter__(self) -> "_Deadline":
         self._timeout = asyncio.timeout(self._seconds)
         await self._timeout.__aenter__()
+        if self._registry is not None:
+            self._registry.add(self)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> Optional[bool]:
         assert self._timeout is not None
+        if self._registry is not None:
+            self._registry.discard(self)
         try:
             return await self._timeout.__aexit__(exc_type, exc, tb)
         except TimeoutError as timeout_error:
@@ -371,6 +414,23 @@ class _Deadline:
             raise RolloutTimeout(
                 f"{self._description} exceeded {self._seconds}s"
             ) from timeout_error
+
+    def suspend(self) -> None:
+        """Disarm the clock, banking whatever budget is left."""
+        if self._timeout is None or self._remaining is not None:
+            return
+        when = self._timeout.when()
+        if when is None:
+            return
+        self._remaining = max(0.0, when - asyncio.get_running_loop().time())
+        self._timeout.reschedule(None)
+
+    def resume(self) -> None:
+        """Re-arm the clock with the banked budget."""
+        if self._timeout is None or self._remaining is None:
+            return
+        self._timeout.reschedule(asyncio.get_running_loop().time() + self._remaining)
+        self._remaining = None
 
 
 class AsyncRolloutImpl:
@@ -389,6 +449,7 @@ class AsyncRolloutImpl:
         max_rollout_turns: int,
         policy_generation: GenerationInterface,
         timeouts: RolloutTimeouts = RolloutTimeouts(),
+        deadline_registry: Optional[RequestDeadlineRegistry] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -398,6 +459,7 @@ class AsyncRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._policy_generation = policy_generation
         self._timeouts = timeouts
+        self._deadline_registry = deadline_registry
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -630,7 +692,11 @@ class AsyncRolloutImpl:
         # Generate response
         # TODO: update generate_async to return a single item directly
         output = None
-        async with _Deadline(self._timeouts.generation_s, "generation turn"):
+        async with _Deadline(
+            self._timeouts.generation_s,
+            "generation turn",
+            registry=self._deadline_registry,
+        ):
             async for _idx, output in self._policy_generation.generate_async(
                 generation_input_data
             ):
@@ -771,6 +837,7 @@ class AsyncNemoGymRolloutImpl:
         # Optional so direct construction does not have to carry the resiliency wiring;
         # RolloutManager always passes both explicitly.
         timeouts: Optional[RolloutTimeouts] = None,
+        deadline_registry: Optional[RequestDeadlineRegistry] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
         # Shared with the owning RolloutManager so row-level re-dispatches are visible
         # in the same counters as everything else. None when constructed directly.
@@ -788,6 +855,7 @@ class AsyncNemoGymRolloutImpl:
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
+        self._deadline_registry = deadline_registry
         self._max_gym_row_attempts = (
             retry_policy
             if retry_policy is not None
@@ -968,7 +1036,11 @@ class AsyncNemoGymRolloutImpl:
             # below, and a wider annotation makes the `raise ... from last_error` at the
             # end unverifiable.
             last_error: Optional[Exception] = None
-            async with _Deadline(self._timeouts.rollout_s, "NeMo-Gym prompt group"):
+            async with _Deadline(
+                self._timeouts.rollout_s,
+                "NeMo-Gym prompt group",
+                registry=self._deadline_registry,
+            ):
                 for attempt in range(1, self._max_gym_row_attempts + 1):
                     pending = [row for row in inputs if results[row["_rowidx"]] is None]
                     if not pending:
@@ -1200,6 +1272,9 @@ class RolloutManager:
             else RolloutRetryPolicy.single_attempt()
         )
         self._stats = RolloutStats()
+        # Shared with the impl's request deadlines so the controller can pause their clocks
+        # while a colocated engine is in training mode.
+        self._request_deadlines = RequestDeadlineRegistry()
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -1226,6 +1301,7 @@ class RolloutManager:
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.
             timeouts=timeouts if timeouts is not None else RolloutTimeouts(),
+            deadline_registry=self._request_deadlines,
             # Only the NeMo-Gym impl reads these; the native impl absorbs them via kwargs.
             retry_policy=self._retry_policy,
             stats=self._stats,
@@ -1248,6 +1324,14 @@ class RolloutManager:
     def stats(self) -> RolloutStats:
         """Counters describing retry/skip activity so far."""
         return self._stats
+
+    def suspend_request_deadlines(self) -> None:
+        """Pause live request-deadline clocks while a colocated engine is in training mode."""
+        self._request_deadlines.suspend()
+
+    def resume_request_deadlines(self) -> None:
+        """Resume live request-deadline clocks when a colocated engine exits training mode."""
+        self._request_deadlines.resume()
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:

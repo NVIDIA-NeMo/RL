@@ -1813,6 +1813,12 @@ class SingleControllerActor:
                     if self._gen.blocks_training():
                         self._rollout_permitted.clear()
                         await asyncio.to_thread(self._gen.finish_generation)
+                        # Deadline clocks are meant to be in terms of the inference clock-time.
+                        # However, naively, we measure them against wall clock-time.
+                        # This is incorrect in colocated. Every time we switch to training,
+                        # we unfairly penalize the deadline clocks.
+                        # Instead, freeze the deadline clocks while we are training.
+                        self._rollout_manager.suspend_request_deadlines()
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
@@ -2162,6 +2168,7 @@ class SingleControllerActor:
                                     self._gen.prepare_for_generation
                                 )
                                 self._rollout_permitted.set()
+                                self._rollout_manager.resume_request_deadlines()
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -3165,6 +3172,7 @@ class SingleControllerActor:
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_permitted.set()
+        self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
 
     async def _value_stage(self, meta: KVBatchMeta) -> KVBatchMeta:

@@ -412,13 +412,22 @@ class _RefitRecordingTrainer(_FakeTrainer):
 
 
 class _FakeRolloutManager:
-    def __init__(self) -> None:
+    def __init__(self, events: Optional[list[str]] = None) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
         self.recovery_ledger = RolloutRecoveryLedger()
+        self._events = events
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def suspend_request_deadlines(self) -> None:
+        if self._events is not None:
+            self._events.append("suspend_deadlines")
+
+    def resume_request_deadlines(self) -> None:
+        if self._events is not None:
+            self._events.append("resume_deadlines")
 
 
 class _FakeTQBuffer:
@@ -588,6 +597,7 @@ def _make_actor_args(
     trainer: Optional[_FakeTrainer] = None,
     gen: Optional[Any] = None,
     weight_synchronizer: Optional[_FakeWeightSynchronizer] = None,
+    rollout_manager: Optional[Any] = None,
     save_state: Optional[GRPOSaveState] = None,
     dataloader: Optional[_FakeDataloader] = None,
     tq_buffer: Optional[_FakeTQBuffer] = None,
@@ -610,7 +620,9 @@ def _make_actor_args(
         ),
         advantage_estimator=None,
         loss_fn=object(),  # type: ignore[arg-type]
-        rollout_manager=_FakeRolloutManager(),  # type: ignore[arg-type]
+        rollout_manager=(  # type: ignore[arg-type]
+            rollout_manager if rollout_manager is not None else _FakeRolloutManager()
+        ),
         tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),  # type: ignore[arg-type]
         partition_id=_PARTITION_ID,
         save_state=(
@@ -929,20 +941,30 @@ class TestSaveTrigger:
                 4,
                 {"step_2", "step_4"},
                 [
-                    # step 1: stand down, then the plain wake inside _sync_weights.
+                    # step 1: stand down (request clocks suspended with the
+                    # engine), then the plain wake inside _sync_weights, whose
+                    # tail resumes the clocks.
                     "finish_generation",
+                    "suspend_deadlines",
                     "sync",
+                    "resume_deadlines",
                     # step 2: save-bound — no sync; the wake is deferred past the save.
                     "finish_generation",
+                    "suspend_deadlines",
                     "offload_before_refit",
                     "save",
                     "offload_after_refit",
                     "wake",
+                    "resume_deadlines",
                     # step 3: back to the plain shape.
                     "finish_generation",
+                    "suspend_deadlines",
                     "sync",
-                    # step 4: save on the last step — no wake at all.
+                    "resume_deadlines",
+                    # step 4: save on the last step — no wake; the clocks stay
+                    # suspended into teardown.
                     "finish_generation",
+                    "suspend_deadlines",
                     "offload_before_refit",
                     "save",
                 ],
@@ -957,7 +979,12 @@ class TestSaveTrigger:
                 1,
                 {"step_1"},
                 # The timeout latch fires on step 1: stood-down save, no wake.
-                ["finish_generation", "offload_before_refit", "save"],
+                [
+                    "finish_generation",
+                    "suspend_deadlines",
+                    "offload_before_refit",
+                    "save",
+                ],
                 id="timeout_save_exits",
             ),
         ],
@@ -989,7 +1016,10 @@ class TestSaveTrigger:
         actor = _run_train_pump(
             mc,
             _make_actor_args(
-                trainer=trainer, gen=gen, weight_synchronizer=synchronizer
+                trainer=trainer,
+                gen=gen,
+                weight_synchronizer=synchronizer,
+                rollout_manager=_FakeRolloutManager(events),
             ),
             seed=lambda actor: trainer.set_gate_probe(actor._rollout_permitted.is_set),
         )

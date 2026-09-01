@@ -464,6 +464,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=False,
@@ -491,6 +492,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=True,
@@ -1187,7 +1189,11 @@ def _train_pump_controller(*, sampler) -> object:
         requires_kv_scale_sync=False,
         blocks_training=lambda: False,
     )
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=MagicMock(),
+        suspend_request_deadlines=MagicMock(),
+        resume_request_deadlines=MagicMock(),
+    )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
@@ -1580,11 +1586,14 @@ def test_train_pump_chunked_step_by_engine_regime(
         assert trainer.keep_train_buffers_calls == [False]
         assert not ctrl._rollout_permitted.is_set()
         assert sampler.select_bounds == [(2, 2)]
+        # Frozen requests' deadline clocks pause with the engine.
+        ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
     else:
         assert calls == chunk * 2
         assert trainer.keep_train_buffers_calls == [False, True]
         assert ctrl._rollout_permitted.is_set()
         assert sampler.select_bounds[0] == (1, 2)
+        ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
 
 
@@ -1853,9 +1862,11 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
         # Stood down once per step (not per epoch), with the gate already
         # closed; the sync (mocked -- the real one reopens the gate) is the wake.
         assert stand_downs == [False]
+        ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
         ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     else:
         ctrl._sync_weights.assert_not_awaited()
+        ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
     # The step still closed and published the new version, so staleness
     # accounting keeps working through the warmup.
     assert ctrl._train_steps == 1

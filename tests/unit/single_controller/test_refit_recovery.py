@@ -148,7 +148,11 @@ def _make_controller(
             ],
         ),
     )
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=MagicMock(),
+        suspend_request_deadlines=MagicMock(),
+        resume_request_deadlines=MagicMock(),
+    )
     ctrl._trainer_version = 7
     # _sync_weights now asks _should_use_nemo_gym before aborting stale in-flight
     # rollouts (upstream #3263). An empty env dict selects the native path, and an
