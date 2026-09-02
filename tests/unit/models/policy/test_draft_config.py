@@ -115,3 +115,43 @@ def test_omitted_draft_config_does_not_request_refit() -> None:
     from nemo_rl.models.policy.draft_config import draft_refit_enabled
 
     assert draft_refit_enabled(None) is False
+
+
+def test_coerce_draft_config_accepts_a_raw_mapping() -> None:
+    """PolicyConfig is a TypedDict, so hand-built configs arrive as dicts.
+
+    Every downstream reader accesses the draft config by attribute, so the
+    mapping input has to survive as a validated model rather than a dict.
+    """
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    coerced = coerce_draft_config({"enabled": True, "model_name": "draft"})
+
+    assert isinstance(coerced, Eagle3DraftConfig)
+    assert coerced.enabled is True
+    assert coerced.model_name == "draft"
+
+
+def test_coerce_draft_config_validates_a_nested_optimizer_mapping() -> None:
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    coerced = coerce_draft_config({"enabled": True, "optimizer": {"lr": 1.0e-5}})
+
+    assert coerced is not None
+    assert coerced.optimizer == DraftOptimizerConfig(lr=1.0e-5)
+
+
+def test_coerce_draft_config_passes_through_models_and_none() -> None:
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    already = Eagle3DraftConfig(enabled=True)
+
+    assert coerce_draft_config(already) is already
+    assert coerce_draft_config(None) is None
+
+
+def test_raw_mapping_draft_config_requests_refit_when_enabled() -> None:
+    from nemo_rl.models.policy.draft_config import draft_refit_enabled
+
+    assert draft_refit_enabled({"enabled": True}) is True
+    assert draft_refit_enabled({"enabled": False}) is False
