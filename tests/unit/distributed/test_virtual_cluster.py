@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import re
 import socket
 import subprocess
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
@@ -21,8 +23,11 @@ import pytest
 import ray
 
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_PORT_RANGE_LOW,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
     DEFAULT_MASTER_PORT_RANGE_HIGH,
@@ -43,6 +48,27 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
+
+
+def _ray_sub_default(name: str) -> int:
+    ray_sub = (Path(__file__).resolve().parents[3] / "ray.sub").read_text()
+    match = re.search(
+        rf'^{re.escape(name)}="?\$\{{[A-Z0-9_]+:-(\d+)\}}"?',
+        ray_sub,
+        re.MULTILINE,
+    )
+    assert match is not None, f"{name} default not found in ray.sub"
+    return int(match.group(1))
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    (("SANDBOX_PORT", 6000), ("SANDBOX_BASE_PORT", 6001)),
+)
+def test_ray_sub_default_handles_quoted_and_aliased_variables(
+    name: str, expected: int
+) -> None:
+    assert _ray_sub_default(name) == expected
 
 
 def test_get_node_ip_and_free_port_does_not_start_with_zero():
@@ -209,6 +235,72 @@ def test_ray_uses_same_cluster_for_permuted_cuda_devices():
         assert mock_ray_init.call_count == 1
         assert mock_ray_init.call_args_list[0][1]["address"] == "auto"
         assert mock_ray_shutdown.call_count == 0
+
+
+def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
+    """This is the pattern every data-plane-enabled launcher uses --
+    maybe_configure_data_plane_env(config.data_plane) immediately before
+    init_ray() -- because init_ray's env_vars snapshot is the only point a
+    backend engine knob becomes cluster-wide (see both functions'
+    docstrings). init_ray itself has no data-plane awareness; the ordering
+    at the call site is what makes this work, so exercise the two calls
+    together rather than mocking either one out.
+
+    The fabric probe and the already-imported guard ARE mocked: both read
+    process/host state (sysfs, sys.modules) that would otherwise make this
+    test's outcome depend on the machine it runs on and on whether another
+    test already imported the transfer_queue adapter.
+    """
+    from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    env_mod = "nemo_rl.data_plane.adapters.transfer_queue_env"
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+        patch(f"{env_mod}.fabric_is_roce_only", return_value=True),
+        patch(f"{env_mod}._engine_already_imported", return_value=None),
+    ):
+        # Matching tag -> init_ray takes the "reuse existing cluster" path
+        # and returns after exactly one ray.init call, the one whose
+        # runtime_env we need to inspect.
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {"CUDA_VISIBLE_DEVICES": "0"}
+        with patch.dict(os.environ, env, clear=True):
+            maybe_configure_data_plane_env(
+                {
+                    "enabled": True,
+                    "impl": "transfer_queue",
+                    "backend": "mooncake_cpu",
+                    "claim_meta_poll_interval_s": 0.5,
+                }
+            )
+            init_ray()
+
+        assert mock_ray_init.call_count == 1
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert env_vars["MC_STORE_MEMCPY"] == "0"
+        assert env_vars["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
+
+
+def test_init_ray_alone_has_no_data_plane_awareness():
+    """Every non-data-plane launcher's call (bare init_ray(), no preceding
+    maybe_configure_data_plane_env) must not touch mooncake env vars --
+    init_ray does not know the data plane exists."""
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {"CUDA_VISIBLE_DEVICES": "0"}
+        with patch.dict(os.environ, env, clear=True):
+            from nemo_rl.distributed.virtual_cluster import init_ray
+
+            init_ray()
+
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert "MC_STORE_MEMCPY" not in env_vars
+        assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in env_vars
 
 
 def test_mcore_py_executable():
@@ -568,9 +660,46 @@ class TestVllmPortAssignment:
         assert "VLLM_PORT" not in env_vars
 
 
+def test_router_band_does_not_collide_with_ray_sub_ports():
+    reserved = {
+        _ray_sub_default("PORT"),
+        _ray_sub_default("RAY_CLIENT_SERVER_PORT"),
+        _ray_sub_default("DASHBOARD_PORT"),
+    }
+    # ray.sub gives the head node these ports + 1; workers get the odd values.
+    for name in (
+        "NODE_MANAGER_PORT",
+        "OBJECT_MANAGER_PORT",
+        "RUNTIME_ENV_AGENT_PORT",
+        "DASHBOARD_AGENT_GRPC_PORT",
+        "METRICS_EXPORT_PORT",
+        "DASHBOARD_AGENT_LISTEN_PORT",
+    ):
+        reserved |= {_ray_sub_default(name), _ray_sub_default(name) + 1}
+    reserved |= set(
+        range(
+            _ray_sub_default("MIN_WORKER_PORT"),
+            _ray_sub_default("MAX_WORKER_PORT") + 1,
+        )
+    )
+
+    router_band = set(
+        range(
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+        )
+    )
+    assert not router_band & reserved, sorted(router_band & reserved)
+
+
 def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     # Lowest observed ephemeral floor on some GB200 nodes; stock Linux is 32768.
     EPHEMERAL_FLOOR = 9000
+    assert (
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        < DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+        <= DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW
+    )
     assert DEFAULT_MASTER_PORT_RANGE_LOW < DEFAULT_MASTER_PORT_RANGE_HIGH
     assert DEFAULT_GENERATION_PORT_RANGE_LOW < DEFAULT_GENERATION_PORT_RANGE_HIGH
     assert DEFAULT_GYM_PORT_RANGE_LOW < DEFAULT_GYM_PORT_RANGE_HIGH
@@ -585,12 +714,12 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     )
     # SGLang router / Prometheus carve-outs live inside the vLLM band (only one
     # rollout backend runs at a time), stay above the 8-engine vLLM high-water
-    # mark and the Ray dashboard (8265), and sit below the ephemeral floor.
+    # mark and the Ray dashboard, and sit below the ephemeral floor.
     assert (
         DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
         < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
     )
-    assert 8265 < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    assert _ray_sub_default("DASHBOARD_PORT") < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
     assert DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW < DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH
     assert (
         DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
@@ -601,4 +730,5 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     )
     assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
     # Avoid privileged ports (<1024).
+    assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
