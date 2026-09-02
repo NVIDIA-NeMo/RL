@@ -38,6 +38,7 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    spinup_nemo_gym_actor,
 )
 
 
@@ -1096,9 +1097,7 @@ def test_task_source_is_validated_before_gym_resolves_agent_ref():
         }
     ]
 
-    nemo_gym_mod.validate_dataset_agent_coverage(
-        shard_set, {"train": dataset}
-    )
+    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
 
 
 def test_an_unsharded_job_is_not_scanned_at_all():
