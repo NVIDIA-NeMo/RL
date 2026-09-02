@@ -165,7 +165,7 @@ class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
     release_after_refit: bool = False
 
 
-class VllmRefitVerifyConfig(BaseModel, extra="allow"):
+class VllmRefitVerifyConfig(BaseModel, extra="forbid"):
     """Tensor byte and metadata verification for refit weight transfers.
 
     mode:
@@ -285,8 +285,37 @@ def resolve_refit_verify_config(config: VllmConfig) -> VllmRefitVerifyConfig:
     refit_cfg = config.get("refit_cfg")
     if isinstance(refit_cfg, VllmRefitConfig):
         return refit_cfg.verify
-    raw_verify = (refit_cfg or {}).get("verify") or {}
+    if refit_cfg is None:
+        return VllmRefitVerifyConfig()
+    raw_verify = refit_cfg.get("verify")
+    if raw_verify is None:
+        return VllmRefitVerifyConfig()
+    # Anything explicitly provided (including invalid scalars like ``false``
+    # and unknown keys like ``mdoe``) must fail loudly in Pydantic rather
+    # than silently degrade to the "off" default.
     return VllmRefitVerifyConfig.model_validate(raw_verify)
+
+
+def enforce_refit_verify_supported(config: VllmConfig) -> None:
+    """Setup-boundary check shared by every vLLM deployment path.
+
+    Refit digest verification is implemented only for the colocated CUDA-IPC
+    transport. Synchronizers for other topologies/transports are sometimes
+    constructed directly (bypassing the weight-sync factory), so this is
+    validated where every algorithm must pass: VllmGeneration construction.
+    """
+    if resolve_refit_verify_config(config).mode == "off":
+        return
+    colocated = config["colocated"]["enabled"]
+    transport = config.get("refit_transport")
+    if not colocated or transport is not None:
+        raise NotImplementedError(
+            "policy.generation.refit_cfg.verify is currently supported only "
+            "for colocated CUDA-IPC weight synchronization "
+            "(policy.generation.colocated.enabled=true and "
+            "refit_transport=null). Set verify.mode='off' or switch to the "
+            "supported topology."
+        )
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:

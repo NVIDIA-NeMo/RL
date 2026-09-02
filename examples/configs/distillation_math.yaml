@@ -223,6 +223,11 @@ policy: &POLICY_BASE
         val_top_k: ${.top_k}
         stop_token_ids: null
         stop_strings: null
+        refit_cfg:
+          # Byte-level digest verification of IPC refit transfers.
+          # Quote "off": bare off is YAML for boolean false.
+          verify:
+            mode: "off"
         vllm_cfg:
             async_engine: false
             precision: ${...precision}

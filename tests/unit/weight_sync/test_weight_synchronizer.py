@@ -1014,3 +1014,61 @@ class TestFactory:
                 colocated=True,
                 refit_buffer_size_gb=0,
             )
+
+
+# ---------------------------------------------------------------------------
+# Refit verify config: fail loud, not silently off
+# ---------------------------------------------------------------------------
+
+
+class TestRefitVerifyConfigValidation:
+    def test_misspelled_mode_key_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        with pytest.raises(Exception, match="mdoe"):
+            resolve_refit_verify_config({"refit_cfg": {"verify": {"mdoe": "enforce"}}})
+
+    def test_non_mapping_verify_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        with pytest.raises(Exception):
+            resolve_refit_verify_config({"refit_cfg": {"verify": False}})
+
+    def test_absent_verify_defaults_off(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        assert resolve_refit_verify_config({}).mode == "off"
+        assert resolve_refit_verify_config({"refit_cfg": None}).mode == "off"
+        assert resolve_refit_verify_config({"refit_cfg": {}}).mode == "off"
+
+    def test_enforce_rejected_on_non_colocated_topology(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        config = {
+            "refit_cfg": {"verify": {"mode": "enforce"}},
+            "colocated": {"enabled": False},
+        }
+        with pytest.raises(NotImplementedError, match="colocated"):
+            enforce_refit_verify_supported(config)
+
+    def test_enforce_rejected_on_non_default_transport(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        config = {
+            "refit_cfg": {"verify": {"mode": "enforce"}},
+            "colocated": {"enabled": True},
+            "refit_transport": "vllm_zmq_sparse",
+        }
+        with pytest.raises(NotImplementedError, match="colocated"):
+            enforce_refit_verify_supported(config)
+
+    def test_off_is_supported_everywhere(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        enforce_refit_verify_supported({"colocated": {"enabled": False}})

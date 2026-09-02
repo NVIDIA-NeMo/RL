@@ -42,6 +42,21 @@ def test_digest_rejects_paired_high_bit_flips():
     assert _value(original) != _value(corrupted)
 
 
+def test_digest_rejects_salted_lane_permutation():
+    """Closed-form permutation attack on a single commutative channel.
+
+    With lanes [0, 0] and a linear position salt S, the salted lanes are
+    [S, 2S]; corrupted lanes [S, -S] (as signed int64) salt to [2S, S] -- a
+    permutation that any single per-lane-bijection + commutative-sum digest
+    cannot see. The dual-channel digest must reject it.
+    """
+    original = torch.zeros(2, dtype=torch.int64)
+    corrupted = torch.tensor(
+        [-7046029254386353131, 7046029254386353131], dtype=torch.int64
+    )
+    assert _value(original) != _value(corrupted)
+
+
 def test_digest_is_position_sensitive():
     t = torch.tensor([1, 2], dtype=torch.int64)
     swapped = torch.tensor([2, 1], dtype=torch.int64)
@@ -92,7 +107,9 @@ def test_digests_to_ints_roundtrip_and_empty():
     tensors = {"a": torch.ones(3), "b": torch.zeros(5)}
     ints = digests_to_ints({k: tensor_digest(v) for k, v in tensors.items()})
     assert set(ints) == {"a", "b"}
-    assert all(0 <= v < (1 << 64) for v in ints.values())
+    assert all(
+        isinstance(v, str) and len(v) == 32 and int(v, 16) >= 0 for v in ints.values()
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

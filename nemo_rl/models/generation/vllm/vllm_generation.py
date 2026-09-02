@@ -150,6 +150,14 @@ class VllmGeneration(GenerationInterface):
             defer_model_load: If True, defer model loading for overlapped init
         """
         # Store config
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        # Fail at construction (every algorithm and transport passes here)
+        # rather than let unsupported topologies silently skip verification.
+        enforce_refit_verify_supported(config)
+
         self.cfg = config
         self._defer_model_load = defer_model_load
         self.weight_synchronizer: WeightSynchronizer | None = None
