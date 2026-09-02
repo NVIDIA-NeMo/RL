@@ -48,6 +48,8 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     DEFAULT_NVFP4_IGNORE,
     NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
     NvFp4PerTokenRolloutConfig,
+    boundary_layer_indices,
+    module_layer_index,
 )
 from nemo_rl.models.generation.vllm.quantization.utils import (
     resolve_module_from_param_name,
@@ -200,6 +202,9 @@ class NvFp4PerTokenQuantizer:
         self._build_inventory()
 
     def _build_inventory(self) -> None:
+        quantized_layers: dict[int, str] = {}
+        excluded_layers: dict[int, str] = {}
+        boundary_patterns: list[str] | None = None
         for module_name, module in self._model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if isinstance(module, RoutedExperts):
@@ -212,13 +217,22 @@ class NvFp4PerTokenQuantizer:
                         f"{num_fused_shared_experts} shared experts into RoutedExperts; "
                         "shared-expert NVFP4 is not supported."
                     )
+                layer_index = module_layer_index(module_name)
                 if isinstance(quant_method, ModelOptNvFp4PerTokenFusedMoE):
                     target = _build_expert_target(module_name, module)
                     self._targets[id(module)] = target
                     self._all_target_suffixes.update(
                         spec.checkpoint_suffix for spec in target.specs
                     )
-                elif not isinstance(quant_method, UnquantizedFusedMoEMethod):
+                    quantized_layers[layer_index] = module_name
+                    if boundary_patterns is None:
+                        boundary_patterns = list(
+                            getattr(quant_method.quant_config, "exclude_modules", ())
+                            or ()
+                        )
+                elif isinstance(quant_method, UnquantizedFusedMoEMethod):
+                    excluded_layers[layer_index] = module_name
+                else:
                     raise RuntimeError(
                         f"[nvfp4_pertoken] {module_name} has unexpected routed "
                         f"expert quant method {type(quant_method).__name__}."
@@ -231,11 +245,47 @@ class NvFp4PerTokenQuantizer:
                     f"{type(quant_method).__name__}, expected UnquantizedLinearMethod."
                 )
 
+        self._verify_boundary(boundary_patterns, quantized_layers, excluded_layers)
+
         print(
             f"[nvfp4_pertoken] inventory: selected {len(self._targets)} "
             "RoutedExperts containers; ordinary linears remain BF16",
             flush=True,
         )
+
+    @staticmethod
+    def _verify_boundary(
+        boundary_patterns: list[str] | None,
+        quantized_layers: Mapping[int, str],
+        excluded_layers: Mapping[int, str],
+    ) -> None:
+        """Fail closed when the BF16 boundary did not land where it was derived.
+
+        The ignore patterns are module-name globs, so a model family whose
+        routed experts are not named ``mlp.experts`` matches nothing and every
+        boundary layer would silently be quantized while the trainer keeps it
+        BF16. Compare the decisions this worker actually made against the layer
+        indices the patterns encode, restricted to the layers this pipeline
+        stage owns.
+        """
+        if boundary_patterns is None:
+            # No local NVFP4 target: a pipeline stage may legitimately own only
+            # boundary layers. The global zero-target check covers the rest.
+            return
+        expected = boundary_layer_indices(boundary_patterns)
+        local = set(quantized_layers) | set(excluded_layers)
+        should_exclude = expected & local
+        wrongly_quantized = sorted(should_exclude & set(quantized_layers))
+        wrongly_excluded = sorted(set(excluded_layers) - expected)
+        if wrongly_quantized or wrongly_excluded:
+            raise RuntimeError(
+                "[nvfp4_pertoken] BF16 boundary did not match the routed-expert "
+                "module names, so rollout precision disagrees with training. "
+                f"patterns={boundary_patterns}; layers quantized but expected "
+                f"BF16={[quantized_layers[i] for i in wrongly_quantized]}; "
+                f"layers excluded but expected NVFP4="
+                f"{[excluded_layers[i] for i in wrongly_excluded]}"
+            )
 
     def _resolve_module(self, name: str) -> torch.nn.Module | None:
         resolution = resolve_module_from_param_name(self._model, name)
