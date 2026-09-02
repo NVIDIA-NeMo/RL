@@ -96,6 +96,7 @@ def reduce_advantage_pump_metrics(
     sequence_lengths: list[int],
     *,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    num_mask_sample_filtered: list[int] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
     num_assistant_messages: list[int] | None = None,
@@ -108,13 +109,16 @@ def reduce_advantage_pump_metrics(
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
+        num_mask_sample_filtered: Environment-flagged sample counts, one per
+            streaming chunk.
         num_invalid_tool_calls: Per-sample invalid tool-call counts.
         num_malformed_thinking: Per-sample malformed-thinking counts.
         num_assistant_messages: Per-sample assistant message counts (rate denominator).
 
     Returns:
         Step-level reward, advantage, token-count, optional sequence
-        log-probability error metrics, and per-sample violation counts.
+        log-probability error metrics, the num_mask_sample_filtered count, and
+        per-sample violation counts.
 
     """
     out: dict[str, float] = {}
@@ -132,6 +136,8 @@ def reduce_advantage_pump_metrics(
             out["advantages/min"] = 0.0
     if sequence_lengths:
         out["total_num_tokens"] = float(sum(sequence_lengths))
+    if num_mask_sample_filtered is not None:
+        out["num_mask_sample_filtered"] = float(sum(num_mask_sample_filtered))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     n_asst = sum(num_assistant_messages or [])

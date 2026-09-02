@@ -15,6 +15,9 @@
 import copy
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, TypeVar, cast
 from urllib.parse import unquote, urlparse
@@ -28,9 +31,19 @@ from nemo_rl.data.multimodal_utils import (
     IMAGE_CONTENT_TYPES,
     VIDEO_CONTENT_TYPES,
     PackedTensor,
+    extract_input_media_sources_from_responses_messages,
     extract_multimodal_model_inputs,
     get_dim_to_pack_along,
+    get_responses_content_part_url,
+    image_to_data_url,
+    media_sources_equal,
     resolve_to_image,
+    video_path_to_data_url,
+)
+from nemo_rl.environments.nemo_gym_request import (
+    _chat_template_kwargs_for_processor,
+    _deep_merge_dict,
+    _json_mapping,
 )
 from nemo_rl.environments.nemotron_utils import (
     NEMOTRON_VIDEO_PROCESSOR_NAMES,
@@ -42,6 +55,265 @@ from nemo_rl.models.generation.vllm.video_utils import (
     build_cached_video_frame_metadata,
     load_video_frames_with_metadata,
 )
+
+_NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
+
+
+def _encode_single_image_source(source: str) -> str:
+    """Resolve, encode, and close one local image source."""
+    # `closing` (not a bare `with`): PIL's Image.__exit__ is a no-op, so only an
+    # explicit close() releases the buffer.
+    with closing(resolve_to_image(source)) as image:
+        return image_to_data_url(image)
+
+
+def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
+    """Replace local media paths in NeMo Gym examples with data URLs."""
+    local_image_sources: dict[str, None] = {}
+    local_video_sources: dict[str, None] = {}
+    pending_mutations: list[
+        tuple[dict, tuple[str, str, str], str, str, bool, Any, str]
+    ] = []
+    for example in nemo_gym_examples:
+        input_items = example.get("responses_create_params", {}).get("input", [])
+        if not isinstance(input_items, list):
+            continue
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type in IMAGE_CONTENT_TYPES:
+                    source_keys = ("image_url", "image", "url")
+                    canonical_type = "input_image"
+                    canonical_key = "image_url"
+                    is_image = True
+                elif part_type in VIDEO_CONTENT_TYPES:
+                    source_keys = ("video_url", "video", "url")
+                    canonical_type = "input_video"
+                    canonical_key = "video_url"
+                    is_image = False
+                else:
+                    continue
+
+                present_keys = [key for key in source_keys if key in part]
+                if (
+                    not present_keys
+                    and part_type == "input_image"
+                    and "file_id" in part
+                ):
+                    continue
+                if len(present_keys) != 1:
+                    raise ValueError(
+                        f"{part_type} requires exactly one of {source_keys}"
+                    )
+
+                source = part[present_keys[0]]
+                nested_detail = (
+                    source.get("detail") if isinstance(source, dict) else None
+                )
+                url = (
+                    source.get("url") or source.get("path", "")
+                    if isinstance(source, dict)
+                    else source
+                )
+                if not isinstance(url, str) or not url:
+                    raise ValueError(f"{part_type} requires a non-empty media URL")
+                if not url.startswith(("http://", "https://", "data:")):
+                    if is_image:
+                        local_image_sources.setdefault(url, None)
+                    else:
+                        local_video_sources.setdefault(url, None)
+
+                pending_mutations.append(
+                    (
+                        part,
+                        source_keys,
+                        canonical_type,
+                        canonical_key,
+                        is_image,
+                        nested_detail,
+                        url,
+                    )
+                )
+
+    sources = list(local_image_sources)
+    encoded_by_source: dict[str, str] = {}
+    if sources:
+        with ThreadPoolExecutor(
+            max_workers=_NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
+        ) as executor:
+            encoded_by_source = dict(
+                zip(
+                    sources,
+                    executor.map(_encode_single_image_source, sources),
+                    strict=True,
+                )
+            )
+
+    # Encode each unique video once. A video shared by G generations then points
+    # every part at the same string, instead of G separate base64 copies of the
+    # same file. Kept sequential: these payloads are large enough that encoding
+    # several at once would spike driver memory.
+    encoded_video_by_source: dict[str, str] = {
+        source: video_path_to_data_url(source) for source in local_video_sources
+    }
+
+    # Apply mutations only after every local source was encoded successfully.
+    for (
+        part,
+        source_keys,
+        canonical_type,
+        canonical_key,
+        is_image,
+        nested_detail,
+        url,
+    ) in pending_mutations:
+        for key in source_keys:
+            if key != canonical_key:
+                part.pop(key, None)
+        part["type"] = canonical_type
+        encoded = encoded_by_source if is_image else encoded_video_by_source
+        part[canonical_key] = encoded.get(url, url)
+        if is_image and nested_detail is not None:
+            part.setdefault("detail", nested_detail)
+    return nemo_gym_examples
+
+
+# WARNING: A function-call output beginning with HTTP(S) is accepted here and
+# passed to ``resolve_to_image``, which performs an outbound request during
+# postprocessing even when the tool result is not actually an image.
+_IMAGE_SRC_PREFIXES = ("data:image/", "http://", "https://", "file://")
+
+
+def _looks_like_image_src(src: str) -> bool:
+    """True when ``src`` plausibly points at an image the loader can open.
+
+    Guards against tool responses (e.g. ``{"x": 0.65, "y": 0.83}`` from a
+    click tool) that are strings but not image URLs. Without this, the
+    indexer forwards the JSON payload to ``resolve_to_image`` → PIL.open,
+    which treats it as a filesystem path and raises ``FileNotFoundError``.
+    """
+    return src.startswith(_IMAGE_SRC_PREFIXES)
+
+
+def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
+    """Pull PIL images out of a non-assistant Responses-API item.
+
+    Handles both content-list items (user / tool messages carrying
+    ``input_image``/``image``/``image_url`` parts) and ``function_call_output``
+    items whose ``output`` field is an image data URL. Tool outputs that are
+    non-image strings (e.g. structured JSON returned by tools like
+    ``click(x, y)``) contribute zero images to the bucket.
+    """
+    images: list[Image.Image] = []
+    if item.get("type") == "function_call_output":
+        src = item.get("output")
+        if isinstance(src, str) and _looks_like_image_src(src):
+            images.append(resolve_to_image(src))
+        return images
+    content = item.get("content") or []
+    if not isinstance(content, list):
+        return images
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") not in ("input_image", "image", "image_url"):
+            continue
+        src = part.get("image") or part.get("image_url") or part.get("url")
+        if isinstance(src, dict):
+            src = src.get("url")
+        if src is not None:
+            images.append(resolve_to_image(src))
+    return images
+
+
+def _is_trainable_output_item(item: dict) -> bool:
+    """Report whether an output item becomes a trainable assistant turn.
+
+    The postprocess loop skips items whose ``generation_token_ids`` is missing
+    *or* empty, so per-turn image binning has to use the same predicate or the
+    two walks disagree and every later turn gets the wrong images.
+    """
+    return bool(item.get("generation_token_ids"))
+
+
+def _index_per_turn_images(
+    output: list[dict],
+    input_messages: list[dict] | None = None,
+) -> list[list[Image.Image]]:
+    """Bin server-returned images by the trainable turn that saw them.
+
+    Walks the Responses-API items in order and flushes ``pending`` into a
+    per-turn bucket each time it hits an item carrying truthy
+    ``generation_token_ids`` — matching the exact gate that
+    ``_postprocess_nemo_gym_to_nemo_rl_result`` uses to decide which items
+    become trainable turns. Every other item (user turns, tool messages,
+    ``function_call_output``, non-trainable reasoning) contributes its images
+    to ``pending`` for the next trainable turn. This ensures the returned list
+    has one entry per trainable turn, aligned with the postprocess loop's
+    ``turn_idx`` even when the trainable item's role is not ``assistant``
+    (e.g. a reasoning-only response, or a ``function_call``).
+
+    ``input_messages`` is the initial ``responses_create_params.input`` list —
+    images there (e.g. a single-shot user prompt for tool-based envs like
+    circle-click) are consumed by the first trainable turn's tokenized prompt
+    and must land in the first bucket. Agents like ``gym_v_agent`` that keep
+    ``input`` empty and inject observations as ``function_call_output`` items
+    are unaffected — the seed is a no-op when ``input_messages`` is empty.
+    """
+    per_turn: list[list[Image.Image]] = []
+    pending: list[Image.Image] = []
+    for item in input_messages or ():
+        if isinstance(item, dict) and item.get("role") != "assistant":
+            pending.extend(_extract_input_images_from_message(item))
+    for item in output:
+        if _is_trainable_output_item(item):
+            per_turn.append(pending)
+            pending = []
+        elif item.get("role") != "assistant":
+            pending.extend(_extract_input_images_from_message(item))
+    return per_turn
+
+
+def _without_initial_media_sources(
+    messages: Any, initial_sources: list[Any]
+) -> tuple[Any, bool]:
+    """Copy Responses messages and remove one ordered copy of initial images and videos."""
+    if not isinstance(messages, list):
+        return messages, False
+
+    filtered = deepcopy(messages)
+    remaining_sources = list(initial_sources)
+    for message in filtered:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        filtered_content = []
+        for part in content:
+            part_sources = extract_input_media_sources_from_responses_messages(
+                [{"content": [part]}]
+            )
+            if (
+                remaining_sources
+                and len(part_sources) == 1
+                and media_sources_equal(part_sources[0], remaining_sources[0])
+            ):
+                remaining_sources.pop(0)
+                continue
+            filtered_content.append(part)
+        message["content"] = filtered_content
+
+    return filtered, not remaining_sources
+
 
 _VideoConfigValue = TypeVar("_VideoConfigValue")
 _LOCAL_VIDEO_METADATA_KEYS = frozenset(
@@ -64,17 +336,6 @@ def _require_video_config_value(
     return value
 
 
-def _get_content_part_url(part: dict[str, Any], *keys: str) -> str:
-    """Return a string media source from a Responses/Chat content part."""
-    for key in keys:
-        value = part.get(key)
-        if isinstance(value, dict):
-            value = value.get("url") or value.get("path")
-        if isinstance(value, str) and value:
-            return value
-    return ""
-
-
 def _resolve_local_video_path(source: str) -> str:
     """Resolve a local video source and reject unsupported remote schemes."""
     parsed = urlparse(source)
@@ -94,41 +355,6 @@ def _resolve_local_video_path(source: str) -> str:
     if not os.access(path, os.R_OK):
         raise PermissionError(f"Gym video file is not readable: {path}")
     return str(path.resolve())
-
-
-def normalize_video_urls_in_examples(examples: list[dict[str, Any]]) -> None:
-    """Convert bare local video paths to file URLs before Gym dispatch."""
-    for example in examples:
-        input_items = example.get("responses_create_params", {}).get("input", [])
-        if not isinstance(input_items, list):
-            continue
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if (
-                    not isinstance(part, dict)
-                    or part.get("type") not in VIDEO_CONTENT_TYPES
-                ):
-                    continue
-                media_key = next(
-                    (key for key in ("video_url", "video", "url") if key in part),
-                    None,
-                )
-                if media_key is None:
-                    continue
-                source = _get_content_part_url(part, media_key)
-                if not source or urlparse(source).scheme:
-                    continue
-                normalized = Path(_resolve_local_video_path(source)).as_uri()
-                original = part[media_key]
-                if isinstance(original, dict):
-                    original["url"] = normalized
-                else:
-                    part[media_key] = normalized
 
 
 def _extract_static_video_messages(
@@ -168,7 +394,9 @@ def _extract_static_video_messages(
             if part_type == "input_text":
                 hf_content.append({"type": "text", "text": part["text"]})
             elif part_type in VIDEO_CONTENT_TYPES:
-                source = _get_content_part_url(part, "video_url", "video", "url")
+                source = get_responses_content_part_url(
+                    part, "video_url", "video", "url"
+                )
                 if not source:
                     raise ValueError(f"{part_type} requires a non-empty video URL")
                 video_sources.append(source)
@@ -177,7 +405,9 @@ def _extract_static_video_messages(
                 if not part.get("_is_video_frame"):
                     has_still_images = True
                     continue
-                source = _get_content_part_url(part, "image_url", "image", "url")
+                source = get_responses_content_part_url(
+                    part, "image_url", "image", "url"
+                )
                 if not source:
                     raise ValueError(
                         "Cached Gym video frames require a non-empty image URL."
@@ -249,80 +479,6 @@ def _extract_static_video_messages(
     return hf_messages, _resolve_local_video_path(video_sources[0])
 
 
-def _json_mapping(value: Any, *, field_name: str) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return copy.deepcopy(value)
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a JSON object string or a dict")
-    if not value.strip():
-        raise ValueError(f"{field_name} must not be empty")
-    try:
-        decoded = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{field_name} must contain valid JSON") from exc
-    if not isinstance(decoded, dict):
-        raise TypeError(f"{field_name} JSON must decode to an object")
-    return decoded
-
-
-def _metadata_extra_body(nemo_gym_example: dict[str, Any]) -> dict[str, Any]:
-    params = nemo_gym_example.get("responses_create_params", {})
-    if not isinstance(params, dict):
-        raise TypeError("responses_create_params must be a dict")
-    metadata = params.get("metadata", {})
-    if not isinstance(metadata, dict):
-        raise TypeError("responses_create_params.metadata must be a dict")
-    if "extra_body" not in metadata:
-        return {}
-    return _json_mapping(
-        metadata["extra_body"],
-        field_name="responses_create_params.metadata.extra_body",
-    )
-
-
-def _chat_template_kwargs_for_processor(
-    nemo_gym_example: dict[str, Any],
-) -> dict[str, Any]:
-    params = nemo_gym_example.get("responses_create_params", {})
-    if not isinstance(params, dict):
-        raise TypeError("responses_create_params must be a dict")
-    metadata = params.get("metadata", {})
-    if not isinstance(metadata, dict):
-        raise TypeError("responses_create_params.metadata must be a dict")
-
-    extra_body = _metadata_extra_body(nemo_gym_example)
-    processor_kwargs: dict[str, Any] = {}
-    raw_chat_template_kwargs = metadata.get(
-        "chat_template_kwargs", extra_body.get("chat_template_kwargs")
-    )
-    chat_template_kwargs = (
-        _json_mapping(
-            raw_chat_template_kwargs,
-            field_name="responses_create_params.metadata.chat_template_kwargs",
-        )
-        if raw_chat_template_kwargs is not None
-        else {}
-    )
-    if chat_template_kwargs:
-        processor_kwargs["chat_template_kwargs"] = chat_template_kwargs
-    enable_thinking = chat_template_kwargs.get(
-        "enable_thinking", extra_body.get("enable_thinking")
-    )
-    if enable_thinking is not None:
-        processor_kwargs["enable_thinking"] = enable_thinking
-    return processor_kwargs
-
-
-def _deep_merge_dict(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
-    merged = copy.deepcopy(base)
-    for key, value in update.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dict(merged[key], value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
-
-
 def _inject_vllm_mm_processor_kwargs(
     nemo_gym_example: dict[str, Any],
     mm_processor_kwargs: dict[str, Any],
@@ -387,7 +543,9 @@ def _replace_cached_video_frames_with_native_video(
         for part in content:
             if not isinstance(part, dict) or not part.get("_is_video_frame"):
                 continue
-            frame_path = _get_content_part_url(part, "image_url", "image", "url")
+            frame_path = get_responses_content_part_url(
+                part, "image_url", "image", "url"
+            )
             if not frame_path:
                 raise ValueError(
                     "Cached Gym video frames require a non-empty image URL."

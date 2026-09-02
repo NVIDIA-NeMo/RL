@@ -41,7 +41,7 @@ import torch
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -140,6 +140,18 @@ def _canonical_manifest_value(value: Any, *, path: str) -> Any:
     )
 
 
+def _canonical_manifest_extra_info(value: Any, *, path: str) -> Any:
+    """Canonicalize identity metadata without hashing advisory rollout metrics.
+
+    Rollout metrics may contain logger payloads that are not JSON-compatible.
+    They remain in the serialized ``KVBatchMeta`` for post-restore logging, but
+    do not identify the replay rows bound to the native TQ checkpoint.
+    """
+    if isinstance(value, Mapping):
+        value = {key: item for key, item in value.items() if key != ROLLOUT_METRICS}
+    return _canonical_manifest_value(value, path=path)
+
+
 def replay_manifest_digest(groups: list[TQReplayGroupMetadata]) -> str:
     """Return a stable digest binding replay metadata to a TQ checkpoint."""
     digest_input = [
@@ -166,7 +178,7 @@ def replay_manifest_digest(groups: list[TQReplayGroupMetadata]) -> str:
                     group["meta"].tags,
                     path=f"groups[{group_index}].meta.tags",
                 ),
-                "extra_info": _canonical_manifest_value(
+                "extra_info": _canonical_manifest_extra_info(
                     group["meta"].extra_info,
                     path=f"groups[{group_index}].meta.extra_info",
                 ),
@@ -1130,6 +1142,7 @@ class TQReplayBuffer:
                     sample_ids=list(sample_ids),
                     fields=list(fields.keys()),
                     sequence_lengths=[int(s) for s in lengths.tolist()],
+                    extra_info={ROLLOUT_METRICS: [dict(record.rollout_metrics)]},
                     tags=[dict(t) for t in tags],
                 )
 

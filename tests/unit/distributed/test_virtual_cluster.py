@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import re
 import socket
 import subprocess
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
@@ -21,8 +23,11 @@ import pytest
 import ray
 
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_PORT_RANGE_LOW,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
     DEFAULT_MASTER_PORT_RANGE_HIGH,
@@ -43,6 +48,27 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
+
+
+def _ray_sub_default(name: str) -> int:
+    ray_sub = (Path(__file__).resolve().parents[3] / "ray.sub").read_text()
+    match = re.search(
+        rf'^{re.escape(name)}="?\$\{{[A-Z0-9_]+:-(\d+)\}}"?',
+        ray_sub,
+        re.MULTILINE,
+    )
+    assert match is not None, f"{name} default not found in ray.sub"
+    return int(match.group(1))
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    (("SANDBOX_PORT", 6000), ("SANDBOX_BASE_PORT", 6001)),
+)
+def test_ray_sub_default_handles_quoted_and_aliased_variables(
+    name: str, expected: int
+) -> None:
+    assert _ray_sub_default(name) == expected
 
 
 def test_get_node_ip_and_free_port_does_not_start_with_zero():
@@ -634,9 +660,46 @@ class TestVllmPortAssignment:
         assert "VLLM_PORT" not in env_vars
 
 
+def test_router_band_does_not_collide_with_ray_sub_ports():
+    reserved = {
+        _ray_sub_default("PORT"),
+        _ray_sub_default("RAY_CLIENT_SERVER_PORT"),
+        _ray_sub_default("DASHBOARD_PORT"),
+    }
+    # ray.sub gives the head node these ports + 1; workers get the odd values.
+    for name in (
+        "NODE_MANAGER_PORT",
+        "OBJECT_MANAGER_PORT",
+        "RUNTIME_ENV_AGENT_PORT",
+        "DASHBOARD_AGENT_GRPC_PORT",
+        "METRICS_EXPORT_PORT",
+        "DASHBOARD_AGENT_LISTEN_PORT",
+    ):
+        reserved |= {_ray_sub_default(name), _ray_sub_default(name) + 1}
+    reserved |= set(
+        range(
+            _ray_sub_default("MIN_WORKER_PORT"),
+            _ray_sub_default("MAX_WORKER_PORT") + 1,
+        )
+    )
+
+    router_band = set(
+        range(
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+        )
+    )
+    assert not router_band & reserved, sorted(router_band & reserved)
+
+
 def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     # Lowest observed ephemeral floor on some GB200 nodes; stock Linux is 32768.
     EPHEMERAL_FLOOR = 9000
+    assert (
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        < DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+        <= DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW
+    )
     assert DEFAULT_MASTER_PORT_RANGE_LOW < DEFAULT_MASTER_PORT_RANGE_HIGH
     assert DEFAULT_GENERATION_PORT_RANGE_LOW < DEFAULT_GENERATION_PORT_RANGE_HIGH
     assert DEFAULT_GYM_PORT_RANGE_LOW < DEFAULT_GYM_PORT_RANGE_HIGH
@@ -651,12 +714,12 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     )
     # SGLang router / Prometheus carve-outs live inside the vLLM band (only one
     # rollout backend runs at a time), stay above the 8-engine vLLM high-water
-    # mark and the Ray dashboard (8265), and sit below the ephemeral floor.
+    # mark and the Ray dashboard, and sit below the ephemeral floor.
     assert (
         DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
         < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
     )
-    assert 8265 < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    assert _ray_sub_default("DASHBOARD_PORT") < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
     assert DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW < DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH
     assert (
         DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
@@ -667,4 +730,5 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     )
     assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
     # Avoid privileged ports (<1024).
+    assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
