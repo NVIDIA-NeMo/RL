@@ -87,20 +87,23 @@ class PY_EXECUTABLES:
 #
 # Python port-range bounds below are half-open: [low, high).
 #
+#   [1202, 1300) SingleController gen. router    (driver-local allocation)
 #   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
 #   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
 #     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
 #     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
-#   6000-6099    SingleController gen. router    (async_rl.generation_router.port_range_low/high;
-#                                                 one fixed port per run — NeMo-Gym holds the
-#                                                 URL for the whole run and never re-resolves)
+#   6000         NeMo-Skills sandbox Nginx       (NEMO_SKILLS_SANDBOX_PORT; ray.sub starts one
+#                                                 sidecar per allocated node, driver included)
+#   6001-6999    NeMo-Skills sandbox uWSGI       (SANDBOX_BASE_PORT)
 #   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
 #   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
 #                                                 carved out of the vLLM band — only one rollout
 #                                                 backend runs at a time)
 #   8800-8999    SGLang Prometheus metrics       (DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_*, hard-coded)
+DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW = 1202
+DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH = 1300
 DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
 DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW = 1313

@@ -348,11 +348,19 @@ class _FakeGeneration:
     list it plays the colocated engine: blocks training, records the
     stand-down/wake choreography, and its wake carries the weight update."""
 
+    requires_kv_scale_sync = False
+
     def __init__(self, events: Optional[list[str]] = None) -> None:
         self._events = events
 
     def blocks_training(self) -> bool:
         return self._events is not None
+
+    def snapshot_step_metrics(self) -> None:
+        pass
+
+    def get_step_metrics(self) -> dict[str, float]:
+        return {}
 
     def wake_carries_weight_updates(self) -> bool:
         return True

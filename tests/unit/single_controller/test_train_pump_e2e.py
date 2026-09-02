@@ -58,6 +58,8 @@ _REGISTERED_FIELDS = [
     "advantages",
     "token_mask",
     "sample_mask",
+    "mask_sample",
+    "truncated",
     "total_reward",
     "prompt_ids_for_adv",
 ]
@@ -94,6 +96,8 @@ def _populate_group(
             "input_lengths": torch.tensor([seq_len] * group_size).long(),
             "token_mask": torch.ones(group_size, seq_len, dtype=torch.long),
             "sample_mask": torch.ones(group_size, dtype=torch.long),
+            "mask_sample": torch.zeros(group_size, dtype=torch.bool),
+            "truncated": torch.zeros(group_size, dtype=torch.bool),
             "generation_logprobs": torch.zeros(
                 group_size, seq_len, dtype=torch.float32
             ),
@@ -354,7 +358,11 @@ def test_train_pump_drives_mcore_training_step(
         actor_args = SingleControllerActorArgs(
             # Continuous-serving stub: the pump asks blocks_training() before
             # every step's trainer GPU work.
-            gen_handle=SimpleNamespace(blocks_training=lambda: False),  # type: ignore[arg-type]
+            gen_handle=SimpleNamespace(
+                blocks_training=lambda: False,
+                snapshot_step_metrics=lambda: None,
+                get_step_metrics=lambda: {},
+            ),  # type: ignore[arg-type]
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,  # type: ignore[arg-type]
