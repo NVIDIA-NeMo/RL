@@ -192,6 +192,52 @@ def test_build_router_replay_tensors_maps_global_moe_layer_order():
 
 
 @pytest.mark.mcore
+def test_build_router_replay_tensors_uses_hybrid_moe_layer_pattern():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import build_router_replay_tensors
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # The main decoder has six layers, with MoE at one-based layers 2
+            # and 5.  Neither the PP separator nor the MTP suffix belongs to
+            # the routed-experts payload's layer axis.
+            self.config = SimpleNamespace(
+                num_layers=6,
+                hybrid_layer_pattern="MEM|*E-/MM/MM",
+            )
+            self.router_2 = DummyRouter(RouterReplay(), layer_number=2)
+            self.router_5 = DummyRouter(RouterReplay(), layer_number=5)
+
+    try:
+        model = DummyModel()
+        routed_experts = torch.tensor(
+            [
+                [[20, 21], [50, 51]],
+                [[22, 23], [52, 53]],
+            ],
+            dtype=torch.int32,
+        )
+
+        replay_tensors = build_router_replay_tensors(model, routed_experts)
+
+        assert len(replay_tensors) == 2
+        assert torch.equal(replay_tensors[0], routed_experts[:, 0, :].to(torch.long))
+        assert torch.equal(replay_tensors[1], routed_experts[:, 1, :].to(torch.long))
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
 def test_build_router_replay_tensors_maps_full_layer_payload_to_moe_layers():
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
