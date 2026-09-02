@@ -276,6 +276,13 @@ class DraftLossWrapper:
         self.student_logits = student_logits
         if cu_seqlens_q is not None and student_logits is None:
             raise ValueError("student_logits must be passed explicitly in packed mode.")
+        if cu_seqlens_q is not None and defer_normalization:
+            # The packed path normalizes inside _packed_draft_loss and emits no
+            # step payload, so a deferred caller would silently keep the policy
+            # denominator on the draft gradients. Fail loudly instead.
+            raise ValueError(
+                "deferred draft normalization is not supported in packed mode."
+            )
         if cu_seqlens_q is None and prepare_fn is None:
             raise ValueError("prepare_fn is required in unpacked mode.")
         self.draft_loss_fn = DraftCrossEntropyLossFn(

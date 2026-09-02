@@ -336,3 +336,26 @@ def test_packed_draft_loss_matches_unpacked(draft_vocab_size, d2t):
         reference_metrics["draft_loss"], rel=1e-5
     )
     assert packed_metrics["draft_loss"] > 0.0
+
+
+def test_packed_mode_rejects_deferred_normalization():
+    """The packed path emits no step payload, so deferral cannot be honored.
+
+    Accepting the flag would leave the draft grads on the policy denominator
+    with no runtime symptom, so the combination fails at construction.
+    """
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    batch = _build_draft_batch(11, None)
+
+    with pytest.raises(ValueError, match="deferred draft normalization"):
+        DraftLossWrapper(
+            loss_fn=_zero_policy_loss,
+            prepare_fn=None,
+            data_dict=batch["data"],
+            cu_seqlens_q=batch["cu_seqlens"],
+            cu_seqlens_q_padded=batch["cu_seqlens_padded"],
+            d2t=None,
+            student_logits=batch["packed_student"],
+            defer_normalization=True,
+        )

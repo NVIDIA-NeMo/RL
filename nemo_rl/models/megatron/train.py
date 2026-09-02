@@ -592,6 +592,7 @@ class LossPostProcessor:
                     cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                     d2t=self.d2t,
                     student_logits=student_logits,
+                    defer_normalization=self.defer_draft_normalization,
                 )
         else:
             loss_fn_wrapped = partial(
