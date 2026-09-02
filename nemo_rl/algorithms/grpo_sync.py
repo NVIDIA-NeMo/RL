@@ -261,6 +261,8 @@ def validate_sync(
         return {}, {}
 
     timer = Timer()
+    # >= 1 is validated in setup().
+    val_num_generations_per_prompt = master_config.grpo.val_num_generations_per_prompt
     total_rewards: list[float] = []
     total_lengths: list[float] = []
     all_message_logs: list[list[dict[str, str]]] = []
@@ -275,8 +277,10 @@ def validate_sync(
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
-            n_prompts = int(val_batch.size)
-            policy.prepare_val_partition(n_prompts, partition_id=partition_id)
+            if val_num_generations_per_prompt > 1:
+                val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
+            n_rollouts = int(val_batch.size)
+            policy.prepare_val_partition(n_rollouts, partition_id=partition_id)
             meta, driver_carry, rollout_metrics, _ = ray.get(
                 rollout_actor.rollout_to_tq.remote(
                     val_batch,
@@ -293,7 +297,7 @@ def validate_sync(
             total_lengths.append(rollout_metrics["mean_gen_tokens_per_sample"])
             all_message_logs.extend(
                 [{"role": r, "content": c} for r, c in zip(roles[i], contents[i])]
-                for i in range(n_prompts)
+                for i in range(n_rollouts)
             )
             if capture_extras:
                 additional_metrics = rollout_metrics
@@ -304,12 +308,35 @@ def validate_sync(
             if total_rewards
             else 0.0
         )
+        # Grouped validation (val_num_generations_per_prompt > 1) additionally
+        # reports pass@k over each prompt's k rollouts, mirroring
+        # nemo_rl.algorithms.grpo.validate.
+        pass_k = None
+        if total_rewards and val_num_generations_per_prompt > 1:
+            assert len(total_rewards) % val_num_generations_per_prompt == 0, (
+                "Validation rewards must be divisible by "
+                "grpo.val_num_generations_per_prompt"
+            )
+            pass_k = (
+                (
+                    torch.tensor(total_rewards, dtype=torch.float32).view(
+                        -1, val_num_generations_per_prompt
+                    )
+                    > 0
+                )
+                .any(dim=1)
+                .float()
+                .mean()
+                .item()
+            )
         avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0.0
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
             **additional_metrics,
         }
+        if pass_k is not None:
+            val_metrics["pass_k"] = pass_k
         try:
             print_message_log_samples(
                 all_message_logs,
