@@ -24,7 +24,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
-    get_data_parallel_rank,
 )
 from megatron.core.utils import StragglerDetector
 
@@ -36,11 +35,7 @@ from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
-from nemo_rl.utils.routed_experts_ref import (
-    ROUTED_EXPERTS_REF_TRANSPORT,
-    materialize_routed_experts_refs,
-    materialize_routed_experts_refs_once_per_dp,
-)
+from nemo_rl.utils.routed_experts_ref import materialize_routed_experts_refs
 
 
 @dataclass
@@ -136,34 +131,11 @@ def make_processed_microbatch_iterator(
                     "Ray-reference routed_experts requires input_lengths for "
                     "microbatch-local materialization."
                 )
-            router_replay = cfg.get("router_replay") or {}
-            materialize_once_per_dp = router_replay.get(
-                "transport", "inline"
-            ) == ROUTED_EXPERTS_REF_TRANSPORT and router_replay.get(
-                "materialize_once_per_dp", True
+            data_dict["routed_experts"] = materialize_routed_experts_refs(
+                routed_experts,
+                input_ids=data_dict["input_ids"],
+                input_lengths=data_dict["input_lengths"],
             )
-            if materialize_once_per_dp:
-                run_instance_id = router_replay.get("_store_run_instance_id")
-                if not isinstance(run_instance_id, str) or not run_instance_id:
-                    raise RuntimeError(
-                        "router_replay.transport=ray is missing its store run "
-                        "instance id for shared materialization"
-                    )
-                data_dict["routed_experts"] = (
-                    materialize_routed_experts_refs_once_per_dp(
-                        routed_experts,
-                        input_ids=data_dict["input_ids"],
-                        input_lengths=data_dict["input_lengths"],
-                        run_instance_id=run_instance_id,
-                        dp_rank=get_data_parallel_rank(),
-                    )
-                )
-            else:
-                data_dict["routed_experts"] = materialize_routed_experts_refs(
-                    routed_experts,
-                    input_ids=data_dict["input_ids"],
-                    input_lengths=data_dict["input_lengths"],
-                )
 
         # Move to GPU
         data_dict = data_dict.to("cuda")

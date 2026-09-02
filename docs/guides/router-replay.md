@@ -29,14 +29,12 @@ policy:
   batch. When `data_plane.enabled=true`, this is the existing TransferQueue
   implementation; there is no separate TQ selector.
 - `ray` carries only an opaque tag through Gym and the RL replay buffer. A
-  source-local actor on the generation node owns each full routed-expert array
-  and returns only the logical ranges selected by the Megatron policy
-  microbatch. This prevents cumulative multi-turn prompts from making policy
-  reads quadratic in the number of turns. By default, one Ray actor per
-  data-parallel shard assembles each composite microbatch once and places that
-  final immutable CPU result in Ray for its TP/CP/PP siblings to reuse. Set
-  `materialize_once_per_dp: false` only as a rollback to the legacy per-worker
-  assembly path. This path currently requires async GRPO,
+  source-local actor on the generation node owns a Ray reference to each full
+  routed-expert array. Policy workers retrieve that immutable whole object
+  directly for unsliced single-turn samples. For sliced multi-turn samples,
+  the source actor returns only the logical ranges selected by the policy
+  microbatch, preventing cumulative prompts from making reads quadratic in the
+  number of turns. This path currently requires async GRPO,
   `env.should_use_nemo_gym=true`, vLLM's async engine, and
   `data_plane.enabled=false`.
 
