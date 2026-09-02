@@ -13,6 +13,7 @@
 # limitations under the License.
 import datetime
 import logging
+import os
 import sys
 import threading
 import time
@@ -416,25 +417,66 @@ def convert_to_seconds(time_string: str) -> int:
     return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
+def get_slurm_job_start_time() -> Optional[float]:
+    """Epoch seconds of the SLURM allocation start, or None outside SLURM.
+
+    Reads ``SLURM_JOB_START_TIME`` (exported by Slurm >= 23.02). An unset,
+    empty, or malformed value returns None so callers fall back to construction
+    time; a malformed value additionally warns rather than crashing.
+    """
+    raw = os.environ.get("SLURM_JOB_START_TIME")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            f"Could not parse SLURM_JOB_START_TIME={raw!r}; anchoring the "
+            "checkpoint timeout at construction time instead."
+        )
+        return None
+
+
 class TimeoutChecker:
     def __init__(
-        self, timeout: Optional[str] = "00:03:45:00", fit_last_save_time: bool = False
+        self,
+        timeout: Optional[str] = "00:03:45:00",
+        fit_last_save_time: bool = False,
+        start_time: Optional[float] = None,
     ):
         """Initializes the TimeoutChecker.
 
         Args:
             timeout (str or None): Timeout in format 'DD:HH:MM:SS'. If None, timeout is considered infinite.
             fit_last_save_time (bool): If True, considers average iteration time when checking timeout.
+            start_time (float or None): Epoch seconds to anchor the timeout budget at.
+                Defaults to the SLURM allocation start (``SLURM_JOB_START_TIME``) when
+                available, otherwise the current time. Anchoring at the allocation start
+                makes ``checkpoint_must_save_by`` budget from allocation start, so the
+                setup time before this checker is constructed is not silently excluded.
         """
         super().__init__()
         self.last_save_time = (
             float("inf") if timeout is None else convert_to_seconds(timeout)
         )
-        self.start_time = time.time()
+        if start_time is None:
+            start_time = get_slurm_job_start_time()
+        if start_time is None:
+            self.start_time = time.time()
+            anchor = "construction time"
+        else:
+            self.start_time = start_time
+            anchor = "SLURM_JOB_START_TIME"
         self.last_saved = False
         self.iteration_times = []
         self.previous_iteration_time: Optional[float] = None
         self.fit_last_save_time = fit_last_save_time
+
+        if self.last_save_time != float("inf"):
+            remaining = self.last_save_time - (time.time() - self.start_time)
+            budget = datetime.timedelta(seconds=round(abs(remaining)))
+            status = "remaining budget" if remaining >= 0 else "budget already exceeded by"
+            logger.info(f"TimeoutChecker anchored at {anchor}; effective {status} {budget}.")
 
     def check_save(self):
         # Flush

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 import threading
 import time
 from unittest.mock import patch
@@ -651,3 +652,33 @@ class TestTimeoutChecker:
         checker.mark_iteration()
         assert len(checker.iteration_times) == 1
         assert checker.iteration_times[0] > 0
+
+    def test_defaults_to_construction_time_without_slurm(self):
+        # No SLURM env -> anchored at construction time (pre-existing behavior).
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SLURM_JOB_START_TIME", None)
+            checker = TimeoutChecker(timeout="00:00:01:00")
+        assert checker.check_save() is False
+
+    def test_slurm_job_start_time_budgets_from_allocation(self):
+        # A 60s budget with the allocation started 120s ago is already spent, so
+        # the first check must fire a save. Construction-time anchoring would
+        # instead wait the full 60s -- the bug this fix addresses.
+        started = time.time() - 120
+        with patch.dict(os.environ, {"SLURM_JOB_START_TIME": str(started)}):
+            checker = TimeoutChecker(timeout="00:00:01:00")
+        assert checker.check_save() is True
+
+    def test_malformed_slurm_job_start_time_falls_back(self, caplog):
+        with patch.dict(os.environ, {"SLURM_JOB_START_TIME": "not-a-number"}):
+            with caplog.at_level(logging.WARNING):
+                checker = TimeoutChecker(timeout="00:00:01:00")
+        # Falls back to construction time (budget intact) and warns loudly.
+        assert checker.check_save() is False
+        assert "SLURM_JOB_START_TIME" in caplog.text
+
+    def test_explicit_start_time_overrides_slurm(self):
+        # An explicit start_time wins over the environment.
+        with patch.dict(os.environ, {"SLURM_JOB_START_TIME": str(time.time() - 120)}):
+            checker = TimeoutChecker(timeout="00:00:01:00", start_time=time.time())
+        assert checker.check_save() is False
