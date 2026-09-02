@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import socket
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -57,6 +58,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.held_port import receive_held_socket
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -107,7 +109,13 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    broadcast_hf_buckets_via_distributed_impl,
+    connect_rollout_engines_from_distributed,
+    disconnect_rollout_engines_from_distributed,
+    get_runtime_env_for_policy_worker,
+    send_hf_buckets_via_ipc_actor_impl,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     MegatronCheckpointEngineSendMixin,
@@ -115,6 +123,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.telemetry.setup import init_telemetry_worker
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -430,6 +439,7 @@ class MegatronPolicyWorkerImpl(
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
+        reserved_http_server_port: Optional[int] = None,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -457,6 +467,10 @@ class MegatronPolicyWorkerImpl(
         # set by configure_worker), so it can't identify this worker's GPU.
         bind_to_gpu_numa(local_rank)
 
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
+
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
@@ -465,8 +479,17 @@ class MegatronPolicyWorkerImpl(
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
+        # Adopt the driver-reserved OpenAI server socket before any heavy init.
+        # The port holder has kept it bound and listening since reservation, so
+        # there was no window in which the pre-published URL could be stolen.
+        self._reserved_http_server_socket: Optional[socket.socket] = None
+        if reserved_http_server_port is not None and self.rank == 0:
+            self._reserved_http_server_socket = receive_held_socket(
+                reserved_http_server_port
+            )
+
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(config)
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -485,16 +508,19 @@ class MegatronPolicyWorkerImpl(
         # worker) may set ``_model_import_post_wrap_hook`` and
         # layer-spec hooks on ``self`` before calling
         # super().__init__() to inject quantization hooks into HF->Megatron
-        # import.
-        handle_model_import(
-            config,
-            hf_model_name,
-            pretrained_path,
-            pt_checkpoint_exists,
-            model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
-            transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
-            mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
-        )
+        # import. Refit-fed inference-only policies (skip_weight_load) skip the import entirely.
+        if not skip_weight_load:
+            handle_model_import(
+                config,
+                hf_model_name,
+                pretrained_path,
+                pt_checkpoint_exists,
+                model_post_wrap_hook=getattr(
+                    self, "_model_import_post_wrap_hook", None
+                ),
+                transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
+                mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
+            )
         log_gpu_memory_diagnostics(
             label="after_hf_import", worker_type="MegatronPolicyWorker"
         )
@@ -512,6 +538,7 @@ class MegatronPolicyWorkerImpl(
             pretrained_path,
             weights_path,
             optimizer_path,
+            skip_weight_load=skip_weight_load,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
@@ -671,6 +698,7 @@ class MegatronPolicyWorkerImpl(
         self._held_gather_buffer = None
 
         self._init_inference_engine_state()
+        self._setup_colocated_cuda_graph_managers()
 
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
@@ -1690,6 +1718,16 @@ class MegatronPolicyWorkerImpl(
             draft_grad_norm, mp_group=pg_collection.mp
         )
 
+        # Mirrors train(): without re-enabling the pre-hook __init__ removed, the
+        # param all-gather never runs and each forward sees only its own shard.
+        if self._first_train_step_forward_pre_hook_disabled and update_successful:
+            self.enable_forward_pre_hook()
+            get_model_config(
+                self.model
+            ).param_sync_func = self._first_train_step_param_sync_func
+            self._first_train_step_param_sync_func = None
+            self._first_train_step_forward_pre_hook_disabled = False
+
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
 
@@ -2314,15 +2352,19 @@ class MegatronPolicyWorkerImpl(
         emits a *pair* of tasks per FP8 weight (the FP8 data and a ``*_scale_inv``
         scale tensor).
         """
-        if self._is_fp8_export():
-            return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
-                self.megatron_bridge.hf_pretrained, [self.model]
-            )
-        return [
-            task
-            for task in self.megatron_bridge.get_conversion_tasks([self.model])
-            if task is not None
-        ]
+        # Deferred import to avoid circular import issues.
+        from nemo_rl.models.megatron.draft import draft_model_detached
+
+        with draft_model_detached([self.model]):
+            if self._is_fp8_export():
+                return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
+                    self.megatron_bridge.hf_pretrained, [self.model]
+                )
+            return [
+                task
+                for task in self.megatron_bridge.get_conversion_tasks([self.model])
+                if task is not None
+            ]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -2373,6 +2415,7 @@ class MegatronPolicyWorkerImpl(
         self,
         kv_scales: Optional[dict[str, float]] = None,
         conversion_tasks=None,
+        include_draft: bool = True,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -2382,6 +2425,10 @@ class MegatronPolicyWorkerImpl(
         ``conversion_tasks`` (optional) overrides ``self.refit_conversion_tasks``
         — used by the nccl_reshard_refit misc-refit path to pass a filtered subset so
         Bridge only does TP/EP all-gather for those tasks instead of the full model.
+
+        ``include_draft`` controls the ``draft.*`` EAGLE weights. SGLang refit
+        sets it False: the engine keeps draft weights via
+        ``enable_draft_weights_cpu_backup`` rather than receiving them.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             get_vllm_qkv_scale_names,
@@ -2401,7 +2448,7 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in base_iter:
             yield name, tensor
 
-        if self.draft_model is not None:
+        if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
 
             draft_weights = export_eagle_weights_to_hf(
@@ -2515,6 +2562,169 @@ class MegatronPolicyWorkerImpl(
             if not isinstance(hf_param, dict) and is_nccl_reshard_param(str(hf_param)):
                 yield str(hf_param), local_tensor
 
+    # ------------------------------------------------------------------
+    # SGLang weight update (colocate IPC + disaggregate broadcast)
+    # ------------------------------------------------------------------
+    def _iter_sglang_hf_weight_buckets(
+        self,
+        *,
+        target_precision: str,
+        sglang_quantization_cfg: Optional[dict] = None,
+        buffer_size_bytes: int,
+    ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        """Yield HF tensor buckets for SGLang refit.
+
+        Reuses the same two pieces as every other transport: the
+        ``export_hf_weights`` walk in ``_iter_params_with_optional_kv_scales``
+        (without vLLM KV/Q scales or draft weights — SGLang keeps drafts
+        engine-side via ``enable_draft_weights_cpu_backup``) and the shared
+        ``iter_named_tensor_buckets`` packing.
+        """
+        from nemo_rl.models.policy.utils import iter_named_tensor_buckets
+
+        if sglang_quantization_cfg is None:
+            raise ValueError("SGLang refit requires an explicit quantization config.")
+        configured_precision = sglang_quantization_cfg["scheme"]
+        if target_precision != configured_precision:
+            raise ValueError(
+                "SGLang refit target precision does not match its quantization "
+                f"config: target={target_precision!r}, "
+                f"configured={configured_precision!r}."
+            )
+        if target_precision != "bf16":
+            raise ValueError(f"Unsupported SGLang target precision: {target_precision}")
+
+        if self.refit_conversion_tasks is None:
+            self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
+                [self.model]
+            )
+
+        return iter_named_tensor_buckets(
+            self._iter_params_with_optional_kv_scales(include_draft=False),
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_colocated")
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict] = None,
+    ) -> None:
+        """Send finalized HF tensor buckets to colocated SGLang engines.
+
+        Synchronous: each chunk is awaited via ``ray.get`` inside
+        :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk
+        is sent, so trainer-side IPC tensors stay alive until the engine
+        has copied them and per-chunk engine failures surface immediately.
+        Raises ``RuntimeError`` on any chunk failure.
+        """
+        bucket_iter = self._iter_sglang_hf_weight_buckets(
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+        state = self._refit_transport_state("sglang_ipc")
+        state["weight_version"] = state.get("weight_version", 0) + 1
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            worker_state=state,
+            weight_version=state["weight_version"],
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name(
+        "megatron_policy_worker/connect_sglang_rollout_engines_distributed"
+    )
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list,
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit.
+
+        Only trainer rank 0 broadcasts to SGLang, so only rank 0 owns the
+        torch process group. Other ranks return immediately. Calling this
+        again after engines recover destroys the stale group first.
+        """
+        if self.rank != 0:
+            return
+
+        state = self._refit_transport_state("sglang_dist")
+        if group_name is not None:
+            state["group_name"] = group_name
+        state.setdefault("group_name", "nemo_rl_sglang")
+
+        if state.get("group") is not None:
+            disconnect_rollout_engines_from_distributed(
+                group_name=state["group_name"],
+                model_update_group=state["group"],
+                rollout_engines=state.get("engines", []),
+            )
+            state["group"] = None
+            state["engines"] = []
+
+        state["group"] = connect_rollout_engines_from_distributed(
+            group_name=state["group_name"],
+            rollout_engines=list(rollout_engines),
+            engine_gpu_counts=list(engine_gpu_counts),
+        )
+        state["engines"] = list(rollout_engines)
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_distributed")
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list,
+        rollout_engine_lock,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict] = None,
+    ) -> None:
+        """Broadcast finalized HF tensors to SGLang engines from trainer rank 0.
+
+        Non-rank-0 trainers still walk the AutoBridge iterator (Megatron
+        gather + AutoBridge restoration is a collective), but they do not
+        participate in the NCCL broadcast. This matches the design's "trainer
+        rank 0 as the only source" decision.
+        """
+        bucket_iter = self._iter_sglang_hf_weight_buckets(
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+        if self.rank != 0:
+            # Drain the iterator so AutoBridge collectives complete on every
+            # rank, but do not broadcast.
+            for _ in bucket_iter:
+                pass
+            return
+
+        state = self._refit_transport_state("sglang_dist")
+        if state.get("group") is None:
+            raise RuntimeError(
+                "connect_sglang_rollout_engines_distributed must be called "
+                "before update_weights_to_sglang_distributed."
+            )
+        state["weight_version"] = state.get("weight_version", 0) + 1
+
+        broadcast_hf_buckets_via_distributed_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            rollout_engine_lock=rollout_engine_lock,
+            group_name=state["group_name"],
+            model_update_group=state["group"],
+            weight_version=state["weight_version"],
+        )
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
@@ -2540,11 +2750,45 @@ class MegatronPolicyWorkerImpl(
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
     ) -> None:
-        """Broadcast the weights for collective communication."""
+        """Broadcast the weights for collective communication.
+
+        A generation rank that dies mid-broadcast leaves this call blocked in NCCL with no
+        timeout and no error -- observed as both policy workers stuck in
+        ``packed_broadcast_producer -> cuda stream synchronize`` while the run sat wedged.
+        The watchdog is the only way out, because the controller cannot reach this actor
+        while its event loop is inside the collective. Disarmed unless refit_timeout_s is
+        set, so the default path is unchanged.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            self._broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                buffer_size_bytes=buffer_size_bytes,
+                num_buffers=num_buffers,
+            )
+        if guard.fired:
+            # The aborted collective returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit broadcast exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+    ) -> None:
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
@@ -2875,22 +3119,77 @@ class MegatronPolicyWorkerImpl(
                     mapping[name] = LocalParamSpec(base=param_map.get(name))
         return HFToLocalParamMap(specs=mapping)
 
-    @torch.no_grad()
-    def nccl_reshard_refit(self, kv_scales=None):
-        """Transfer weights to generation workers via xferdtensor.
+    async def nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):
+        """Run the refit off this actor's event loop; see _nccl_reshard_refit_guarded.
 
-        Uses TP-local shards directly from Megatron parameters, bypassing
-        the Bridge's PP broadcast + TP gather.  The modified xferdtensor
-        reconstructs the full tensor from per-rank shards internally.
+        Async purely so the blocking transfer does not occupy the loop. While it runs,
+        this actor can still service the recovery's ``init_collective`` -- which is the
+        whole reason the rebuild can happen at all when a generation rank goes silent.
+
+        THE DEVICE IS CARRIED ACROSS EXPLICITLY. CUDA's current device is thread-local, so
+        a fresh thread starts on device 0 rather than this worker's, and NCCL on the wrong
+        device fails with ``UnhandledCudaError`` -- job 6510914 died that way on its first
+        healthy refit, before any fault was injected. ``torch.cuda.current_stream()``
+        inside the transfer reads the same thread-local state, so setting the device also
+        puts the transfer back on the intended stream.
+        """
+        from nemo_rl.distributed.refit_watchdog import await_off_loop
+
+        # Read on the loop thread, where it is correct, and applied on the worker thread.
+        device = torch.cuda.current_device()
+
+        def _on_this_workers_device():
+            torch.cuda.set_device(device)
+            return self._nccl_reshard_refit_guarded(
+                kv_scales=kv_scales, refit_timeout_s=refit_timeout_s
+            )
+
+        return await await_off_loop(_on_this_workers_device)
+
+    @torch.no_grad()
+    def _nccl_reshard_refit_guarded(self, kv_scales=None, refit_timeout_s=None):
+        """Transfer weights to generation workers via xferdtensor, under a deadline.
+
+        Guarded exactly like the collective producer, and for the same reason: a
+        generation rank that dies mid-refit leaves this blocked inside NCCL with no
+        error and no progress, and the controller cannot reach this actor to break it
+        because its event loop is inside the transfer.
+
+        BOTH communicator families are handed to the watchdog. This transport moves the
+        bulk over the per-PP-stage ``pp_comm_group`` and then broadcasts the remainder
+        over the shared ``model_update_group``, so the hang can be in either and nothing
+        here can tell which. Aborting both is safe -- abort() is idempotent -- and the
+        recovery rebuilds both anyway.
+
+        Disarmed unless refit_timeout_s is set, so the default path is unchanged.
 
         ``kv_scales`` (FP8 KV cache): the per-layer k/v(/q) scales ride the misc
         packed-broadcast as plain scale tensors (the is_nccl_reshard_param whitelist
         excludes ``.k_scale``/``.v_scale``/``.q_scale`` -> misc); the gen side finalizes
         them via ``_maybe_process_fp8_kv_cache``.  No out-of-band channel needed.
         """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        groups = [self.pp_comm_group, self.model_update_group]
+        with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
+            self._nccl_reshard_refit(
+                kv_scales=kv_scales, refit_timeout_s=refit_timeout_s
+            )
+        if guard.fired:
+            # The aborted transfer returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit nccl_reshard exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):
         # hf_to_local_param_map is built once in prepare_nccl_reshard_refit_info;
         # weight values change but the name → spec mapping is stable across
         # refits.
+        from nemo_rl.distributed.refit_watchdog import sync_stream_within
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         # spec.pre (grouped-MoE expert stacking) and spec.post enqueue on this
@@ -2939,14 +3238,18 @@ class MegatronPolicyWorkerImpl(
                 # memory returns to the caching allocator
                 del ctx, src_tensor
 
-        torch.cuda.synchronize()
+        sync_stream_within(
+            nccl_reshard_stream, refit_timeout_s, "the bulk parameter transfer"
+        )
         torch.cuda.empty_cache()
 
         import time
 
         misc_t0 = time.perf_counter()
         self._broadcast_misc_params_packed(kv_scales=kv_scales)
-        torch.cuda.synchronize()
+        sync_stream_within(
+            torch.cuda.current_stream(), refit_timeout_s, "the misc broadcast"
+        )
         if torch.distributed.get_rank() == 0:
             print(
                 f"[nccl_reshard_refit] misc broadcast (train side): "
@@ -3082,10 +3385,13 @@ class MegatronPolicyWorkerImpl(
 
     def finish_inference(self) -> None:
         """Offload model params to CPU after inference. Only used in PPO."""
+        # MambaMixer.eval() recomputes and caches a state transition decay,
+        # -torch.exp(self.A_log.float()). Set the model in inference mode
+        # before offloading the model parameters (including self.A_log).
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
-        self.model.eval()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -3222,8 +3528,22 @@ class MegatronPolicyWorkerImpl(
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model = self.move_model(self.model, "cpu")
+        # Non-reshard colocated serves both models from the same param buffers.
+        generation_cfg = self.cfg.get("generation")
+        keep_params_for_generation = (
+            generation_cfg is not None
+            and generation_cfg.get("backend") == "megatron"
+            and self.is_generation_colocated
+            and self.inference_model is None
+            and self._colocated_reshard_plan is None
+        )
+        # MambaMixer.eval() recomputes and caches a state transition decay,
+        # -torch.exp(self.A_log.float()). Set the model in inference mode
+        # before offloading the model parameters (including self.A_log).
         self.model.eval()
+        self.model = self.move_model(
+            self.model, "cpu", move_params=not keep_params_for_generation
+        )
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 
