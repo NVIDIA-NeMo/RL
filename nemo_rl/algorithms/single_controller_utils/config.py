@@ -1160,6 +1160,19 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "active algorithm block require the NeMo-Gym rollout path "
             "(env.should_use_nemo_gym=true) on SingleController."
         )
+    if penalties_enabled and token_capture_config.enabled:
+        # TODO(token-capture): thread the per-message violation flags through
+        # capture receipts/staging so BlackboxFinalizer can emit
+        # invalid_tool_call_mask/malformed_thinking_mask; then drop this guard.
+        raise NotImplementedError(
+            "invalid_tool_call_advantage/malformed_thinking_advantage require "
+            "the invalid_tool_call_mask/malformed_thinking_mask train-batch "
+            "columns, which the token-capture finalizer does not emit — the "
+            "first streamed group would crash the train pump with a KeyError "
+            "at the advantage stage. Set grpo.invalid_tool_call_advantage=null "
+            "and grpo.malformed_thinking_advantage=null to run with token "
+            "capture; mask support on the capture path is a follow-up."
+        )
 
     opd_enabled = opd_module.is_opd_enabled(master_config)
     if opd_enabled and is_ppo_run(master_config):
