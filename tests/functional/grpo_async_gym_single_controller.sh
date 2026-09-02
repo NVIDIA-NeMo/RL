@@ -55,6 +55,10 @@ VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
 jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > $TRAIN_PATH
 jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
 
+# rollout_timeout_s is set here because this is the only test that takes the NeMo-Gym
+# rollout path, so it is the only place that deadline runs at all. 300s is orders above
+# a 512-token Qwen3-0.6B group on one tool, so it fires only on a wedge, and it stays
+# under the default watchdog.stall_timeout_s of 600s as that guard requires.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo_single_controller.py \
     --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
@@ -102,6 +106,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++async_rl.min_groups_for_streaming_train=4 \
     ++async_rl.max_inflight_prompts=4 \
     ++async_rl.max_buffered_rollouts=4 \
+    ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=300.0 \
     $@ \
     2>&1 | tee $RUN_LOG
 
