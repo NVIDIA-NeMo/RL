@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+from ray.exceptions import ActorDiedError
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
@@ -1222,14 +1223,20 @@ class _StepMetricRecordingTrainer(_NoOpTrainer):
 class _StepMetricRecordingGeneration:
     requires_kv_scale_sync = False
 
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], dies_in: str | None = None) -> None:
         self._events = events
+        self._dies_in = dies_in
+
+    def _record(self, method: str) -> None:
+        self._events.append(method)
+        if method == self._dies_in:
+            raise ActorDiedError()
 
     def snapshot_step_metrics(self) -> None:
-        self._events.append("snapshot_step_metrics")
+        self._record("snapshot_step_metrics")
 
     def get_step_metrics(self) -> dict[str, float]:
-        self._events.append("get_step_metrics")
+        self._record("get_step_metrics")
         return {"vllm/spec_acceptance_rate": 0.8}
 
 
@@ -1670,9 +1677,12 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
     assert "histogram/gen_tokens_length" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("dies_in", [None, "snapshot_step_metrics", "get_step_metrics"])
 def test_train_pump_collects_generation_metrics_at_step_boundaries(
-    monkeypatch,
+    monkeypatch, dies_in
 ) -> None:
+    """A shard killed mid-step (grpo_dp_single_controller_chaos) must not end the pump
+    from the metrics fan-out; the typed failure belongs to the probe/refit paths."""
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
@@ -1684,7 +1694,7 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
     events: list[str] = []
     ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
     ctrl._trainer = _StepMetricRecordingTrainer(events)
-    ctrl._gen = _StepMetricRecordingGeneration(events)
+    ctrl._gen = _StepMetricRecordingGeneration(events, dies_in=dies_in)
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
@@ -1700,7 +1710,10 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
         "get_step_metrics",
     ]
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
-    assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
+    if dies_in == "get_step_metrics":
+        assert "vllm/spec_acceptance_rate" not in train_metrics
+    else:
+        assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
 
 
 def test_train_pump_skips_generation_metrics_without_generation_handle(
