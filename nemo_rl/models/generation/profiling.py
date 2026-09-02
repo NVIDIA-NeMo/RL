@@ -87,8 +87,10 @@ def validate_rollout_profiler_topology(
         return
     if tensor_parallel_size < 1:
         raise ValueError("Rollout profiling requires tensor_parallel_size >= 1")
-    if pipeline_parallel_size != 1 or expert_parallel_size != 1:
+    if pipeline_parallel_size != 1:
+        raise ValueError("Rollout profiling requires pipeline_parallel_size=1")
+    if expert_parallel_size not in (1, tensor_parallel_size):
         raise ValueError(
-            "Rollout profiling currently requires pipeline_parallel_size=1 "
-            "and expert_parallel_size=1"
+            "Rollout profiling requires expert_parallel_size=1 or "
+            "expert_parallel_size=tensor_parallel_size"
         )
