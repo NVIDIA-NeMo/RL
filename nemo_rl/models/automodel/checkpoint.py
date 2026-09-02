@@ -216,7 +216,12 @@ class AutomodelCheckpointManager:
         base_cfg = AutomodelCheckpointingConfig(
             enabled=True,
             checkpoint_dir="",
+        config_updates.setdefault("save_consolidated", "false")
+        base_cfg = AutomodelCheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="",
             **config_updates,
+        )
         )
         self.checkpointer = base_cfg.build(
             dp_rank=self._get_dp_rank(),
