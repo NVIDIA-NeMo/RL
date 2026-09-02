@@ -53,6 +53,35 @@ def build_checkpoint_config(
     Component configs such as teachers and reward models do not necessarily
     inherit the policy exemplar. Preserve NeMo-RL's established defaults at
     this single integration boundary instead of inheriting Automodel's
+    ``save_consolidated="final"`` default accidentally. This is an
+    integration-boundary helper for the two DTensor v2 workers, not a
+    general-purpose config builder.
+
+    Args:
+        dtensor_cfg: The worker's ``policy.dtensor_cfg`` / ``value.dtensor_cfg``
+            mapping. Only ``model_save_format``, ``save_consolidated``,
+            ``single_rank_consolidation``, and ``consolidation_timeout_minutes``
+            are read from it; all other keys are ignored.
+        model_repo_id: Forwarded to Automodel's ``CheckpointingConfig.model_repo_id``.
+        dequantize_base_checkpoint: Forwarded to
+            ``CheckpointingConfig.dequantize_base_checkpoint``; only takes effect
+            on a base-checkpoint init load, not on a resume load.
+        is_peft: Forwarded to ``CheckpointingConfig.is_peft``.
+        is_async: Forwarded to ``CheckpointingConfig.is_async``.
+        skip_task_head_prefixes_for_base_model: Optional parameter-prefix list
+            forwarded to ``CheckpointingConfig.skip_task_head_prefixes_for_base_model``
+            (only set on the returned dict when not None); the value worker
+            passes ``["score."]`` to skip the reward head on base-model init loads.
+
+    Returns:
+        A dict of only the fields Automodel's ``CheckpointingConfig`` dataclass
+        accepts, meant to be splatted into
+        ``AutomodelCheckpointingConfig(enabled=True, checkpoint_dir="", **result)``.
+    """
+
+    Component configs such as teachers and reward models do not necessarily
+    inherit the policy exemplar. Preserve NeMo-RL's established defaults at
+    this single integration boundary instead of inheriting Automodel's
     ``save_consolidated="final"`` default accidentally.
     """
     if "model_save_format" in dtensor_cfg:
