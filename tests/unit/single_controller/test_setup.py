@@ -45,6 +45,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
+    RewardPenaltyConfig,
     _initial_grpo_save_state,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -427,13 +428,127 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
     )
 
 
+@pytest.mark.parametrize(
+    ("reference_policy_kl_penalty", "expected_init_reference_model"),
+    [(0.0, False), (0.01, True)],
+)
+def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
+    reference_policy_kl_penalty: float,
+    expected_init_reference_model: bool,
+) -> None:
+    master_config = _make_master_config(
+        loss_cfg=ClippedPGLossConfig(
+            reference_policy_kl_penalty=reference_policy_kl_penalty
+        )
+    )
+
+    with patch.object(sc_setup_mod, "TQPolicy") as mock_policy:
+        sc_setup_mod._build_trainer(
+            MagicMock(name="train_cluster"),
+            master_config,
+            MagicMock(name="tokenizer"),
+            None,
+            weights_path=None,
+            optimizer_path=None,
+        )
+
+    assert (
+        mock_policy.call_args.kwargs["init_reference_model"]
+        is expected_init_reference_model
+    )
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
+
+    def test_reward_penalties_are_typed(self):
+        assert isinstance(_make_master_config().reward_penalties, RewardPenaltyConfig)
+
+    def test_reward_penalties_require_gym_before_setup_factories(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.reward_penalties = RewardPenaltyConfig(penalize_empty_final_answer=True)
+
+        with pytest.raises(ValueError, match="reward_penalties require the NeMo-Gym"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_invalid_reward_penalty_config_fails_before_setup_factories(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.reward_penalties = RewardPenaltyConfig.model_construct(
+            penalize_unwanted_tokens=True
+        )
+
+        with pytest.raises(ValueError, match="reward_penalties.token_ids.unwanted"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_resolves_and_passes_reward_penalties(self, patched_factories):
+        mc = _make_master_config()
+        tokenizer = MagicMock(pad_token_id=0)
+        thinking_tags = ["<reason>", "</reason>"]
+        resolved = {"penalize_malformed_think_tag": True}
+
+        with (
+            patch.object(
+                sc_setup_mod, "get_nemo_gym_thinking_tags", return_value=thinking_tags
+            ) as get_tags,
+            patch.object(
+                sc_setup_mod, "resolve_reward_penalty_config", return_value=resolved
+            ) as resolve_config,
+            patch.object(sc_setup_mod, "RolloutManager") as rollout_manager,
+        ):
+            actor_args, _ = setup_single_controller(mc, tokenizer)
+
+        get_tags.assert_called_once_with(mc.env)
+        resolve_config.assert_called_once_with(
+            mc.reward_penalties,
+            tokenizer,
+            thinking_tags=thinking_tags,
+        )
+        assert rollout_manager.call_args.kwargs["reward_penalty_config"] is resolved
+        assert actor_args.rollout_manager is rollout_manager.return_value
 
     def test_raises_when_data_plane_disabled(self):
         mc = _make_master_config(dp_enabled=False)
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
             setup_single_controller(mc, MagicMock())
+
+    def test_nonzero_kl_rejects_skipping_reference_logprobs(self, patched_factories):
+        mc = _make_master_config(
+            loss_cfg=ClippedPGLossConfig(reference_policy_kl_penalty=0.01)
+        )
+        mc.grpo.skip_reference_policy_logprobs_calculation = True
+
+        with pytest.raises(ValueError, match="requires reference_policy_logprobs"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
+
+    def test_reward_kl_rejects_skipping_policy_logprobs(self, patched_factories):
+        mc = _make_master_config(
+            loss_cfg=ClippedPGLossConfig(
+                reference_policy_kl_penalty=0.01,
+                use_kl_in_reward=True,
+                force_on_policy_ratio=True,
+            )
+        )
+
+        with pytest.raises(ValueError, match="requires policy logprobs"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
 
     def test_rejects_mooncake_data_plane_checkpointing(self):
         mc = _make_master_config()

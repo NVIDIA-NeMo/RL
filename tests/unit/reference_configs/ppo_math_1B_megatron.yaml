@@ -8,7 +8,9 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  ppo_epochs: 4
+  ppo_epochs: 4  # actor passes over each rollout batch
+  # Critic passes over each rollout batch; follows ppo_epochs unless overridden.
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
   warm_start_value_checkpoint: null  # step_<n> dir of a critic-pretrain run whose value/ seeds the critic
   val_period: 20
@@ -56,6 +58,10 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
   seq_logprob_error_threshold: null
 
 loss_fn:
