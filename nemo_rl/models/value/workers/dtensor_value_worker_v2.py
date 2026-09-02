@@ -52,7 +52,6 @@ from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
 from nemo_rl.telemetry.setup import init_telemetry_worker
-from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -105,7 +104,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
         **kwargs: Any,
     ):
         """Initialize the DTensorValueWorkerV2.
@@ -183,7 +181,17 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self.cp_size = distributed_manager.cp_size
 
         # Initialize checkpoint manager
-        checkpoint_config = dict(checkpointing_cfg or {})
+        dtensor_cfg = config["dtensor_cfg"]
+        checkpoint_config = {
+            field: dtensor_cfg[field]
+            for field in (
+                "model_save_format",
+                "save_consolidated",
+                "single_rank_consolidation",
+                "consolidation_timeout_minutes",
+            )
+            if field in dtensor_cfg
+        }
         checkpoint_config.update(
             {
                 "model_repo_id": config["model_name"],
@@ -198,11 +206,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         )
         self._init_checkpoint_manager(
             config_updates=checkpoint_config,
-            checkpoint_root=(
-                str(checkpointing_cfg["checkpoint_dir"])
-                if checkpointing_cfg is not None
-                else None
-            ),
         )
 
         # Set up model and optimizer
@@ -620,7 +623,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
     def _init_checkpoint_manager(
         self,
         config_updates: Optional[dict[str, Any]] = None,
-        checkpoint_root: Optional[str] = None,
     ) -> None:
         """Initialize the AutomodelCheckpointManager for this worker."""
         if self.checkpoint_manager is None:
@@ -631,7 +633,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             )
             self.checkpoint_manager.init_checkpointer(
                 config_updates=config_updates,
-                checkpoint_root=checkpoint_root,
             )
 
 

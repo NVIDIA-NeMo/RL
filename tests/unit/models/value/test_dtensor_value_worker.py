@@ -139,6 +139,10 @@ def _create_value_test_config(
         "dtensor_cfg": {
             "enabled": True,
             "_v2": True,
+            "model_save_format": "safetensors",
+            "save_consolidated": "false",
+            "single_rank_consolidation": False,
+            "consolidation_timeout_minutes": 30,
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
             "sequence_parallel": False,
@@ -189,20 +193,6 @@ def test_value_worker_init_rejects_cp_scoring_before_setup(monkeypatch):
         )
 
     apply_transformer_engine_patch.assert_not_called()
-
-
-def _make_checkpointing_cfg(checkpoint_dir) -> dict:
-    """Build a minimal `CheckpointingConfig` for DTensor V2 worker setup."""
-    return {
-        "enabled": True,
-        "checkpoint_dir": str(checkpoint_dir),
-        "metric_name": None,
-        "higher_is_better": False,
-        "keep_top_k": 2,
-        "save_period": 30,
-        "checkpoint_must_save_by": None,
-        "save_optimizer": True,
-    }
 
 
 def _load_dcp_state(checkpoint_dir: Path, output_path: Path) -> dict[str, Any]:
@@ -302,7 +292,6 @@ def value_setup(request, tiny_qwen2_model_path, tmp_path):
             cluster=cluster,
             config=config,
             tokenizer=tokenizer,
-            checkpointing_cfg=_make_checkpointing_cfg(tmp_path / "value_ckpt_root"),
         )
 
         torch.manual_seed(42)
@@ -494,7 +483,6 @@ def test_value_worker_parallelism_equivalence(
             cluster=cluster,
             config=ref_config,
             tokenizer=tokenizer,
-            checkpointing_cfg=_make_checkpointing_cfg(tmp_path),
         )
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
@@ -623,7 +611,6 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         weights_path=resume_weights_path,
         optimizer_path=resume_optimizer_path,
         name_prefix="lm_value_resumed",
-        checkpointing_cfg=_make_checkpointing_cfg(tmp_path / "value_ckpt_resaved"),
     )
     try:
         workers_alive = ray.get(

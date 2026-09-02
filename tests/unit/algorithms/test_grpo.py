@@ -3165,9 +3165,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
         optimizer_path,
         init_optimizer,
         init_reference_model,
-        checkpointing_cfg,
     ):
-        assert checkpointing_cfg is master_config.checkpointing
         del (
             cluster,
             config,

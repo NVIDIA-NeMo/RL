@@ -157,7 +157,6 @@ def create_test_config(
     expert_parallel_size: int = 1,
     sequence_packing_enabled: bool = False,
     automodel_kwargs: AutomodelKwargs | None = None,
-    checkpointing: dict | None = None,
 ) -> PolicyConfig:
     config = {
         "model_name": model_name,
@@ -188,6 +187,16 @@ def create_test_config(
         "dtensor_cfg": {
             **({"_v2": dtensor_v2} if dtensor_v2 else {}),
             "enabled": True,
+            **(
+                {
+                    "model_save_format": "safetensors",
+                    "save_consolidated": "false",
+                    "single_rank_consolidation": False,
+                    "consolidation_timeout_minutes": 30,
+                }
+                if dtensor_v2
+                else {}
+            ),
             "cpu_offload": cpu_offload,
             "sequence_parallel": sp,
             "activation_checkpointing": activation_checkpointing,
@@ -227,8 +236,6 @@ def create_test_config(
     }
     if automodel_kwargs is not None:
         config["dtensor_cfg"]["automodel_kwargs"] = automodel_kwargs
-    if checkpointing is not None:
-        config["checkpointing"] = checkpointing
     return config
 
 
@@ -443,7 +450,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
             tp=2,
             cp=1,
             dtensor_v2=True,
-            checkpointing=checkpointing_config,
         )
 
         policy = Policy(
@@ -453,7 +459,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
             init_reference_model=False,
             cluster=two_gpu_virtual_cluster,
             name_prefix="lm_policy_checkpoint",
-            checkpointing_cfg=checkpointing_config,
         )
 
         try:
@@ -479,7 +484,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 tp=2,
                 cp=1,
                 dtensor_v2=True,
-                checkpointing=checkpointing_config,
             )
 
             # Shutdown original policy first to free GPU memory
@@ -502,7 +506,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 name_prefix="lm_policy_checkpoint_loaded",
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
-                checkpointing_cfg=checkpointing_config,
             )
 
             # Verify policy was loaded successfully
@@ -944,7 +947,7 @@ def _init_v2_worker_mocked(
         side_effect=lambda **kw: call_log.append("load_checkpoint")
     )
 
-    def fake_init_checkpoint_manager(self, config_updates=None, checkpoint_root=None):
+    def fake_init_checkpoint_manager(self, config_updates=None):
         self.checkpoint_manager = MagicMock()
         self.checkpoint_manager.load_checkpoint = load_checkpoint_mock
 

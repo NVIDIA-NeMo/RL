@@ -233,7 +233,6 @@ def create_dcp_checkpoint(
         config=config["policy"],
         tokenizer=tokenizer,
         init_reference_model=False,
-        checkpointing_cfg=config["checkpointing"],
     )
 
     # Save checkpoint without any training
@@ -486,7 +485,7 @@ def main():
         print("=" * 60)
         config_v2 = copy.deepcopy(config_v1)
         config_v2["policy"]["dtensor_cfg"]["_v2"] = True
-        config_v2["checkpointing"]["model_save_format"] = "torch_save"
+        config_v2["policy"]["dtensor_cfg"]["model_save_format"] = "torch_save"
         dcp_checkpoint_path_v2 = create_dcp_checkpoint(model_name, config_v2, temp_dir)
 
         # Step 4: Create Megatron checkpoint

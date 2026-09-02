@@ -231,7 +231,6 @@ def setup(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
-        checkpointing_cfg=checkpointing_config,
         processor=processor,
         weights_path=weights_path,
         optimizer_path=optimizer_path,

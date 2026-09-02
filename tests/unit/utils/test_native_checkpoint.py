@@ -126,7 +126,7 @@ def tokenizer():
 
 
 @pytest.fixture(scope="function")
-def policy(cluster, tokenizer, request, tmp_path):
+def policy(cluster, tokenizer, request):
     """Initialize the policy with dtensor v1/v2."""
     use_v2 = bool(getattr(request, "param", False))
     config = {
@@ -134,6 +134,7 @@ def policy(cluster, tokenizer, request, tmp_path):
         "dtensor_cfg": {
             **simple_policy_config["dtensor_cfg"],
             "_v2": use_v2,
+            **({"model_save_format": "torch_save"} if use_v2 else {}),
         },
     }
     policy = Policy(
@@ -142,15 +143,6 @@ def policy(cluster, tokenizer, request, tmp_path):
         config=config,
         init_optimizer=True,
         init_reference_model=False,
-        checkpointing_cfg=(
-            {
-                "enabled": True,
-                "checkpoint_dir": str(tmp_path),
-                "model_save_format": "torch_save",
-            }
-            if use_v2
-            else None
-        ),
     )
     yield policy
     policy.worker_group.shutdown()

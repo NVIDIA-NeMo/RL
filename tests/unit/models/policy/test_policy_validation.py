@@ -275,42 +275,30 @@ def test_world_size_validation_dtensor(
         mock_ray_worker_group.assert_not_called()
 
 
-@pytest.mark.parametrize("checkpointing_enabled", [True, False])
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_v1_model_save_format_guard_respects_checkpointing_enabled(
-    mock_ray_worker_group,
-    checkpointing_enabled,
-):
-    """A disabled checkpointer must not reject dormant DTensor v1 settings."""
+def test_v1_model_save_format_guard_runs_only_when_saving(mock_ray_worker_group):
+    """DTensor v1 construction succeeds; an unsupported actual save fails."""
     config = create_dtensor_config("test/model", tp=1)
     config["dtensor_cfg"]["_v2"] = False
-    checkpointing_cfg = {
-        "enabled": checkpointing_enabled,
-        "model_save_format": "safetensors",
-    }
+    config["dtensor_cfg"]["model_save_format"] = "safetensors"
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayQueue"),
         patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
         patch("nemo_rl.models.policy.lm_policy.FLOPTracker.from_config"),
     ):
-        if checkpointing_enabled:
-            with pytest.raises(ValueError, match="model_save_format must be None"):
-                Policy(
-                    cluster=create_mock_cluster(world_size=1),
-                    config=config,
-                    tokenizer=create_mock_tokenizer(),
-                    checkpointing_cfg=checkpointing_cfg,
-                )
-            mock_ray_worker_group.assert_not_called()
-        else:
-            Policy(
-                cluster=create_mock_cluster(world_size=1),
-                config=config,
-                tokenizer=create_mock_tokenizer(),
-                checkpointing_cfg=checkpointing_cfg,
-            )
-            mock_ray_worker_group.assert_called_once()
+        policy = Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    mock_ray_worker_group.assert_called_once()
+    with pytest.raises(ValueError, match="model_save_format must be None"):
+        policy.save_checkpoint(
+            weights_path="/tmp/test-checkpoint",
+            is_final_checkpoint=False,
+        )
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")

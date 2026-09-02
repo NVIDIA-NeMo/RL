@@ -412,7 +412,6 @@ def setup(
         cluster=cluster,
         config=policy_config,
         tokenizer=student_tokenizer,
-        checkpointing_cfg=master_config.checkpointing,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,

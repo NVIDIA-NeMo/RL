@@ -140,15 +140,6 @@ class CheckpointingConfig(TypedDict):
     ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
         When set, a checkpoint is saved every ft_save_period steps for crash recovery.
         Requires ft_keep_latest_k to control how many of these are retained.
-    model_save_format (str | None): Format for saving model (v2 allowed values: "torch_save" or "safetensors", v1 allowed values: None).
-    save_consolidated (str): When to save consolidated checkpoints for HF
-        compatibility. Allowed values are "false", "final", and "every".
-    single_rank_consolidation (bool): Whether only rank 0 consolidates the checkpoint.
-    consolidation_timeout_minutes (int): Timeout for the dedicated distributed
-        consolidation process group.
-    model_cache_dir (str): Directory for model cache (for safetensors format).
-    model_repo_id (str): Repository ID for the model (for safetensors format).
-    is_peft (bool): Whether the model uses PEFT.
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
     save_data_plane (bool): Whether SingleController checkpoints include the
         native TQ snapshot and replay-buffer metadata. Currently supported only
@@ -173,18 +164,6 @@ class CheckpointingConfig(TypedDict):
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
     load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
-    # New nemo-automodel integration fields
-    model_save_format: NotRequired[str | None]  # Default: "safetensors"
-    save_consolidated: NotRequired[
-        Literal["false", "final", "every"]
-    ]  # Default: "false"
-    single_rank_consolidation: NotRequired[bool]  # Default: False
-    consolidation_timeout_minutes: NotRequired[int]  # Default: 30
-    model_cache_dir: NotRequired[str]  # Default: ""
-    model_repo_id: NotRequired[str]  # Default: ""
-    is_peft: NotRequired[bool]  # Default: False
-    peft_config: NotRequired[Any]  # Default: None
-    is_async: NotRequired[bool]  # Default: False
 
 
 def should_save_as_final_checkpoint(

@@ -99,7 +99,6 @@ def _run_two_rank_consolidated_save(
                 "single_rank_consolidation": False,
                 "consolidation_timeout_minutes": 1,
             },
-            checkpoint_root=str(Path(weights_path).parent),
         )
 
         # Secondary structural assertion: the real multi-rank construction path
@@ -485,7 +484,6 @@ class TestAutomodelCheckpointManager:
 
             manager.init_checkpointer(
                 config_updates={"model_repo_id": "test-model"},
-                checkpoint_root="/path/to/checkpoints",
             )
 
             assert manager.checkpointer is mock_checkpointer
@@ -674,17 +672,13 @@ class TestSaveCheckpointFunctional:
             dp_mesh=mock_dp_mesh,
             tp_mesh=mock_tp_mesh,
         )
-        checkpointing_cfg = {
-            "enabled": True,
+        automodel_config = {
             "model_save_format": "safetensors",
             "save_consolidated": "every",
             "single_rank_consolidation": True,
             "consolidation_timeout_minutes": 7,
         }
-        manager.init_checkpointer(
-            config_updates=checkpointing_cfg,
-            checkpoint_root="/initial/checkpoint/root",
-        )
+        manager.init_checkpointer(config_updates=automodel_config)
         original_checkpointer = manager.checkpointer
 
         with TemporaryDirectory() as tmp_dir:
@@ -697,46 +691,9 @@ class TestSaveCheckpointFunctional:
 
         assert manager.checkpointer is original_checkpointer
         assert len(built_checkpointers) == 1
-        assert original_checkpointer.config.checkpoint_dir == "/initial/checkpoint/root"
-        assert (
-            original_checkpointer.lifecycle.config.checkpoint_dir
-            == "/initial/checkpoint/root"
-        )
+        assert original_checkpointer.config.checkpoint_dir == ""
+        assert original_checkpointer.lifecycle.config.checkpoint_dir == ""
         original_checkpointer.close.assert_not_called()
-
-    @patch("torch.distributed.get_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_save_rejects_local_cloud_storage_transition(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes, mock_model
-    ):
-        """A Checkpointer cannot change storage implementations after setup."""
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-        mock_checkpointer = MagicMock()
-
-        def build_checkpointer(*, config, **_kwargs):
-            mock_checkpointer.config = config
-            mock_checkpointer.lifecycle.config = config
-            return mock_checkpointer
-
-        mock_checkpointer_cls.side_effect = build_checkpointer
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-        manager.init_checkpointer(checkpoint_root="/local/checkpoints")
-
-        with pytest.raises(
-            ValueError,
-            match="cannot change between local and cloud paths",
-        ):
-            manager.save_checkpoint(
-                model=mock_model,
-                weights_path="msc://bucket/run/weights",
-                is_final_checkpoint=False,
-            )
-
-        mock_checkpointer.save_model.assert_not_called()
 
     @patch("torch.distributed.get_rank")
     @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")

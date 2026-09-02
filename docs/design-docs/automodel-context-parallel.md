@@ -93,11 +93,13 @@ model = model_class.from_pretrained(
   `_should_write_hf_metadata(config)`.
 - `save_consolidated` now uses the canonical `"false"`, `"final"`, and `"every"`
   modes ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL
-  delegates normalization to Automodel, explicitly marks terminal checkpoint saves,
-  and supports all three modes. Automodel still accepts legacy booleans, but NeMo RL
-  intentionally exposes only canonical strings: use quoted `"false"` instead of the
-  YAML boolean `false`, and use `"every"` instead of `true`. Timeout-triggered saves
-  remain resumable recovery checkpoints and are not marked as terminal saves.
+  exposes these Automodel-only settings under `policy.dtensor_cfg`, delegates
+  normalization to Automodel, explicitly marks terminal checkpoint saves, and
+  supports all three modes. Automodel still accepts legacy booleans, but NeMo RL
+  intentionally exposes only canonical strings: use quoted `"false"` instead of
+  the YAML boolean `false`, and use `"every"` instead of `true`.
+  Timeout-triggered saves remain resumable recovery checkpoints and are not marked
+  as terminal saves.
   NeMo RL retains ownership of async-save finalization, metric selection, and
   checkpoint retention, so overlapping or otherwise unsupported upstream settings
   are rejected instead of silently ignored. Automodel policy saves are asynchronous

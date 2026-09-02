@@ -23,9 +23,6 @@ checkpointing:
   save_period: 10
   checkpoint_must_save_by: null
   save_optimizer: true
-  save_consolidated: "false"
-  single_rank_consolidation: false
-  consolidation_timeout_minutes: 30
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B"
@@ -44,6 +41,10 @@ policy:
   dtensor_cfg:
     _v2: true
     enabled: true
+    model_save_format: "safetensors"
+    save_consolidated: "false"
+    single_rank_consolidation: false
+    consolidation_timeout_minutes: 30
     env_vars: {}
     cpu_offload: False
     sequence_parallel: false

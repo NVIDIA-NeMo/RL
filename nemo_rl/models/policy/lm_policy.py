@@ -50,7 +50,6 @@ from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
 )
-from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_hf_config,
@@ -103,7 +102,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
         reserved_http_server_port: Optional[int] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ):
         self.debug_payload_metrics = False
         if weights_path:
@@ -237,18 +235,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
-        if (
-            dtensor_enable
-            and not use_v2
-            and checkpointing_cfg is not None
-            and checkpointing_cfg["enabled"]
-            and checkpointing_cfg.get("model_save_format", None) is not None
-        ):
-            raise ValueError(
-                "model_save_format must be None or omitted if using "
-                "DTensorPolicyWorker (_v2=False)."
-            )
-
         # If a worker extension class is provided, use it instead of the default worker builder class
         if worker_extension_cls_fqn is not None:
             print(
@@ -330,7 +316,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
-            worker_kwargs["checkpointing_cfg"] = checkpointing_cfg
         else:
             worker_kwargs["tokenizer"] = tokenizer
             worker_kwargs["processor"] = processor
@@ -1330,6 +1315,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 is_final_checkpoint=is_final_checkpoint,
             )
         else:
+            if (
+                self.cfg.get("dtensor_cfg", {}).get("enabled", False)
+                and self.cfg["dtensor_cfg"].get("model_save_format", None) is not None
+            ):
+                raise ValueError(
+                    "policy.dtensor_cfg.model_save_format must be None or omitted "
+                    "when using DTensorPolicyWorker (_v2=False)."
+                )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,

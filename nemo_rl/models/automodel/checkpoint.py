@@ -29,7 +29,6 @@ from nemo_automodel.components.checkpoint import (
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
 )
-from nemo_automodel.components.checkpoint.utils import is_cloud_path
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
@@ -37,22 +36,6 @@ from transformers import AutoTokenizer
 from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
 
 logger = logging.getLogger(__name__)
-
-
-_AUTOMODEL_CONFIG_FIELDS = frozenset(
-    {
-        "consolidation_timeout_minutes",
-        "dequantize_base_checkpoint",
-        "is_async",
-        "is_peft",
-        "model_cache_dir",
-        "model_repo_id",
-        "model_save_format",
-        "save_consolidated",
-        "single_rank_consolidation",
-        "skip_task_head_prefixes_for_base_model",
-    }
-)
 
 
 def _patch_qwen_vl_vision_key_mapping() -> None:
@@ -156,7 +139,6 @@ class AutomodelCheckpointManager:
     def init_checkpointer(
         self,
         config_updates: Optional[dict[str, Any]] = None,
-        checkpoint_root: Optional[str] = None,
     ) -> None:
         """Initialize the Automodel Checkpointer if not already created.
 
@@ -164,8 +146,7 @@ class AutomodelCheckpointManager:
         If a checkpointer already exists, this method does nothing.
 
         Args:
-            config_updates: Dict of CheckpointingConfig fields to set during initialization.
-            checkpoint_root: Optional root directory for checkpoints.
+            config_updates: Automodel checkpoint fields to set during initialization.
         """
         if self.checkpointer is not None:
             return
@@ -173,18 +154,14 @@ class AutomodelCheckpointManager:
         if config_updates is None:
             config_updates = {}
 
-        # Let Automodel own defaults, validation, and normalization. All
-        # resource-owning settings must be present before build() creates async
-        # stagers and dedicated process groups on every rank.
-        automodel_config_updates = {
-            key: value
-            for key, value in config_updates.items()
-            if key in _AUTOMODEL_CONFIG_FIELDS
-        }
+        # Let Automodel own validation and normalization. All resource-owning
+        # settings are supplied before build() creates async stagers and process
+        # groups. NeMo-RL passes explicit paths to every save/load operation, so
+        # the configured root is intentionally unused.
         base_cfg = AutomodelCheckpointingConfig(
             enabled=True,
-            checkpoint_dir=checkpoint_root or "",
-            **automodel_config_updates,
+            checkpoint_dir="",
+            **config_updates,
         )
         self.checkpointer = base_cfg.build(
             dp_rank=self._get_dp_rank(),
@@ -251,15 +228,6 @@ class AutomodelCheckpointManager:
             "Checkpointer must be initialized before saving checkpoint. "
             "Call init_checkpointer() first."
         )
-
-        configured_root = self.checkpointer.config.checkpoint_dir
-        if is_cloud_path(configured_root) != is_cloud_path(weights_path):
-            raise ValueError(
-                "Automodel checkpoint storage cannot change between local and "
-                "cloud paths after initialization: "
-                f"{configured_root!s} -> {weights_path}. Initialize the "
-                "Checkpointer with the target checkpoint root."
-            )
 
         # Automodel keeps one future each for model and optimizer state. Finish
         # the previous save before those future handles can be replaced.

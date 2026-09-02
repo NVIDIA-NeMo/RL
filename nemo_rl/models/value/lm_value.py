@@ -32,7 +32,6 @@ from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
-from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -51,7 +50,6 @@ class Value(ValueInterface):
         init_optimizer: bool = True,
         weights_path: Optional[PathLike] = None,
         optimizer_path: Optional[PathLike] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ):
         """Initialize the Value model.
 
@@ -64,7 +62,6 @@ class Value(ValueInterface):
             init_optimizer: Whether to initialize the optimizer
             weights_path: Path to load model weights from
             optimizer_path: Path to load optimizer state from
-            checkpointing_cfg: Checkpoint settings used to initialize DTensor v2 workers.
         """
         if weights_path:
             weights_path = os.path.abspath(weights_path)
@@ -163,8 +160,6 @@ class Value(ValueInterface):
             "worker_sharding_annotations": self.sharding_annotations,
             "pre_init_communication_queue": pre_init_queue,
         }
-        if dtensor_enable:
-            worker_kwargs["checkpointing_cfg"] = checkpointing_cfg
         worker_builder = RayWorkerBuilder(
             worker_builder_cls,
             config,

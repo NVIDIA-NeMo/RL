@@ -129,10 +129,6 @@ checkpointing:
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
   save_data_plane: false
-  model_save_format: "safetensors"
-  save_consolidated: "false"
-  single_rank_consolidation: false
-  consolidation_timeout_minutes: 30
   save_optimizer: true
 
 policy:
@@ -155,6 +151,10 @@ policy:
   dtensor_cfg:
     _v2: true
     enabled: true
+    model_save_format: "safetensors"
+    save_consolidated: "false"
+    single_rank_consolidation: false
+    consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false

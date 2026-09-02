@@ -1241,8 +1241,6 @@ def setup(
             "(reference model is not loaded)."
         )
 
-    # Caller-supplied factories receive the same construction-time checkpoint
-    # configuration as Policy, so worker resources are fully defined at setup.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
     def init_policy(reserved_http_server_port: Optional[int] = None):
@@ -1261,7 +1259,6 @@ def setup(
             optimizer_path=optimizer_path,
             init_optimizer=True,
             init_reference_model=init_reference_model,
-            checkpointing_cfg=checkpointing_config,
             **extra_policy_kwargs,
         )
         p.debug_payload_metrics = grpo_config.debug_payload_metrics
