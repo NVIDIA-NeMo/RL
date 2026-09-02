@@ -2800,11 +2800,9 @@ class SingleControllerActor:
                         # PPO retains every selected row and training claim through
                         # all actor/critic epochs. Release them even when filtering
                         # or model training fails so teardown cannot deadlock.
-                        async with (
-                            self._data_plane_checkpoint_barrier.mutation(
-                                "sample_clears"
-                            ) as cut
-                        ):
+                        async with self._data_plane_checkpoint_barrier.mutation(
+                            "sample_clears"
+                        ) as cut:
                             await self._cleanup_consumed_metas_unlocked(
                                 cut, consumed_metas
                             )
