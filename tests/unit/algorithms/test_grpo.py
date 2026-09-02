@@ -1758,6 +1758,58 @@ def test_initial_refit_completes_before_async_collection_starts(
     assert events[:3] == ["refit", "set_weight_version", "start_collection"]
 
 
+def test_async_initial_buffer_wait_is_included_in_first_step_timing(
+    mock_grpo_components,
+) -> None:
+    """The startup rollout wait is part of step 1, not initialization."""
+    timing_sample_counts = []
+
+    class InspectingTimer(Timer):
+        def get_timing_metrics(self, reduction_op="mean"):
+            timing_sample_counts.append(
+                {label: len(samples) for label, samples in self._timers.items()}
+            )
+            return super().get_timing_metrics(reduction_op)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.env["should_log_nemo_gym_responses"] = True
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            {"mean_gen_tokens_per_sample": 2.0},
+        ),
+        patch("nemo_rl.algorithms.grpo.Timer", InspectingTimer),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    first_step_counts = timing_sample_counts[0]
+    # One startup-wait sample plus the regular optimizer-step context.
+    assert first_step_counts["total_step_time"] == 2
+    # Startup wait + replay sample coordination + pre-refit collector wait.
+    assert first_step_counts["exposed_generation"] == 3
+
+
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:
     master_config = mock_grpo_components["master_config"]
     master_config.policy["generation"]["backend"] = "dynamo"
@@ -3542,8 +3594,8 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
     policy_generation.finish_generation.side_effect = lambda *a, **k: events.append(
         ("finish_generation", k.get("release_gpu", True))
     )
-    policy_generation.prepare_for_generation.side_effect = (
-        lambda *a, **k: events.append("wake_engine")
+    policy_generation.prepare_for_generation.side_effect = lambda *a, **k: (
+        events.append("wake_engine")
     )
     policy.offload_before_refit.side_effect = lambda *a, **k: events.append(
         "offload_before_refit"
