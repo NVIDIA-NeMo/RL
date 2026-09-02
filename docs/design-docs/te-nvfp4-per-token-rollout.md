@@ -191,27 +191,31 @@ should still receive an end-to-end smoke before being listed as validated.
 
 The following comparison uses Qwen3-30B-A3B-Base with DAPO on 8 nodes with
 4 GB200 GPUs per node, a global batch size of 512, and a 20K response limit.
-Training uses TP=2, EP=8, and PP=1; each vLLM engine uses TP=1. The generation
-and step metrics are medians over the 502 logged steps shared by both runs
-between steps 200 and 800. These are representative runs rather than a
-controlled precision-only A/B; their configurations differ beyond numerical
-precision. The final NVFP4 refit value is the mean and median from the 90-step
-native `reload_weights` validation run; both are 18.42 seconds.
+Training uses TP=2, EP=8, and PP=1; each vLLM engine uses TP=1. Both runs enable
+router replay and are configured identically apart from rollout precision. All
+values are medians over the 900 logged steps shared by the two runs.
 
 | Metric | BF16 | NVFP4 W4A4 | Change |
 |---|---:|---:|---:|
-| Rollout generation throughput | 457.9 tokens/s/GPU | 799.4 tokens/s/GPU | 1.75x |
-| Generation time | 319.2 s | 144.7 s | 2.21x faster |
-| Observed step time | 390.9 s | 224.8 s | 42.5% lower |
-| Token-normalized end-to-end throughput | 376.1 tokens/s/GPU | 506.2 tokens/s/GPU | 1.35x |
-| Weight transfer and update | 1.76 s | 18.42 s | 16.66 s higher |
+| Rollout generation throughput | 472.9 tokens/s/GPU | 661.4 tokens/s/GPU | 1.40x |
+| Generation time | 220.5 s | 154.6 s | 1.43x faster |
+| Observed step time | 276.4 s | 237.2 s | 14.2% lower |
+| Token-normalized end-to-end throughput | 367.1 tokens/s/GPU | 421.1 tokens/s/GPU | 1.15x |
+| Policy training throughput | 3,196 tokens/s/GPU | 2,681 tokens/s/GPU | 0.84x |
+| Weight transfer and update | 1.8 s | 19.2 s | 17.4 s higher |
+| Median response length | 5,608 tokens | 5,612 tokens | 1.00x |
 
-The NVFP4 run generated shorter responses in this interval, so observed step
-time alone overstates the speedup: its median response length was approximately
-6,219 tokens, compared with 7,730 tokens for BF16. Generation throughput and
-token-normalized end-to-end throughput control for this difference. Policy
-training time is currently similar because the backward path remains
-dequantized; the main gain comes from W4A4 rollout.
+Response length is matched between the two runs, so observed step time is
+directly comparable and generation throughput is not inflated by longer
+sequences. The gain comes entirely from W4A4 rollout. Two costs offset it:
+policy training is slower because the backward path remains dequantized, and
+refit is substantially slower than a BF16 weight transfer.
+
+All three parts still have headroom. Refit is the largest and is profiled below.
+Policy training will improve once the backward path runs natively in NVFP4. The
+rollout numbers themselves were measured with conservative quantization-kernel
+settings, so generation has room to improve as well. The end-to-end figure
+therefore understates what this path can reach; see the roadmap.
 
 NVFP4 stores each quantized weight using an E2M1 value, one E4M3 scale per
 16-value block, and one FP32 global scale per tensor. Excluding the small
@@ -260,8 +264,21 @@ coordination with vLLM's streaming quantization-unit RFC
 [#53192](https://github.com/vllm-project/vllm/issues/53192).
 
 Refit remains a visible part of the step and an optimization target.
-Training-quality curves will be added after the ongoing long-run stability
-validation is complete.
+
+## Training Quality
+
+The two runs above, over their first 900 shared steps:
+
+![Qwen3-30B-A3B-Base GRPO, BF16 versus NVFP4 W4A4 per-token rollout: train/reward, validation/accuracy, train/mean_gen_tokens_per_sample, rollout generation throughput, train/token_mult_prob_error, train/gen_kl_error, train/approx_entropy, and policy training throughput](../assets/nvfp4-pertoken-bf16-vs-w4a4-900steps.png)
+
+Reward, response length, and validation accuracy track the BF16 baseline, and
+entropy does not collapse. The train-rollout logprob error stays near its ideal
+value of 1.0 for both runs. Generation KL error is higher under W4A4, which is
+the expected cost of a quantized rollout and is the metric to watch when
+extending this path to other models. The two throughput panels show the same
+tradeoff as the table: faster rollout, slower policy training.
+
+Longer stability validation is ongoing.
 
 ## Roadmap
 
