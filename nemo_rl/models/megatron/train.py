@@ -541,6 +541,17 @@ class LossPostProcessor:
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
+            fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
+            if fuse_loss:
+                # The fused path prepares loss via prepare_packed_loss_input and
+                # cannot honor a custom prepare_fn (e.g. the value model's); guard
+                # before reading packed metadata so misconfiguration fails clearly.
+                assert self.prepare_fn is None, (
+                    "sequence_packing.fuse_loss=true does not support a custom "
+                    "prepare_fn (e.g. the value model's value-specific prep). "
+                    "Disable fuse_loss for the value model."
+                )
+
             cu_seqlens_q = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
             padded_boundaries = (
                 packed_seq_params.cu_seqlens_q_padded
@@ -548,16 +559,7 @@ class LossPostProcessor:
                 else packed_seq_params.cu_seqlens_q
             )
             cu_seqlens_q_padded = to_cpu_int_tuple(padded_boundaries)
-            fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
             if fuse_loss:
-                # The fused path prepares loss via prepare_packed_loss_input and
-                # cannot honor a custom prepare_fn (e.g. the value model's); guard
-                # rather than silently bypass it.
-                assert self.prepare_fn is None, (
-                    "sequence_packing.fuse_loss=true does not support a custom "
-                    "prepare_fn (e.g. the value model's value-specific prep). "
-                    "Disable fuse_loss for the value model."
-                )
                 wrapper_cls = SequencePackingFusionLossWrapper
                 prepare_fn = partial(
                     prepare_packed_loss_input,
