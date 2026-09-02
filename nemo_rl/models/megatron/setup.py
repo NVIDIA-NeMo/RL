@@ -476,6 +476,44 @@ def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
     return os.path.join(path, iter_subdirs[-1])
 
 
+def validate_fp32_lm_head_config(config: PolicyConfig) -> None:
+    """Reject an fp32 LM head that is enabled on only one engine.
+
+    ``megatron_cfg.fp32_lm_head`` and vLLM's ``NRL_VLLM_FP32_LM_HEAD`` (set via
+    ``generation.vllm_cfg.env_vars``) must agree: with bf16 heads on both sides
+    the logits round to the same grid, so enabling fp32 on one side alone makes
+    train/token_mult_prob_error *worse* than leaving the feature off. The
+    fused linear+CE path bypasses ``output_layer`` entirely, so the trainer
+    head would silently stay bf16 there too.
+
+    Only checked when generation uses the vLLM backend; SFT/DPO have no
+    generation engine to disagree with.
+    """
+    megatron_cfg = config.get("megatron_cfg") or {}
+    trainer_fp32 = bool(megatron_cfg.get("fp32_lm_head"))
+    generation = config.get("generation") or {}
+    if generation.get("backend") != "vllm":
+        return
+    env_vars = (generation.get("vllm_cfg") or {}).get("env_vars") or {}
+    vllm_fp32 = str(env_vars.get("NRL_VLLM_FP32_LM_HEAD", "0")) == "1"
+    if trainer_fp32 != vllm_fp32:
+        raise ValueError(
+            "fp32 LM head must be enabled on both engines or neither: "
+            f"megatron_cfg.fp32_lm_head={megatron_cfg.get('fp32_lm_head')!r} but "
+            f"generation.vllm_cfg.env_vars.NRL_VLLM_FP32_LM_HEAD="
+            f"{env_vars.get('NRL_VLLM_FP32_LM_HEAD')!r}. A one-sided fp32 head "
+            "increases the generation/training logprob mismatch instead of "
+            "reducing it."
+        )
+    if trainer_fp32 and megatron_cfg.get("use_fused_linear_logprobs", False):
+        raise ValueError(
+            "megatron_cfg.fp32_lm_head has no effect with "
+            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
+            "output_layer), which would leave the trainer in bf16 while vLLM "
+            "runs fp32. Disable one of them."
+        )
+
+
 def _resolve_output_layer_owner(chunk: Any) -> Any:
     """Return the module that owns ``output_layer`` for a Megatron model chunk.
 
