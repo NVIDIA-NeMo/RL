@@ -27,15 +27,13 @@ The same reasoning covers the NeMo-Gym port-reservation wiring
 socket/plumbing contracts, pinned here without a GPU.
 """
 
+import asyncio
 import socket
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-    text_generation_server as mlm_text_gen_server,
-)
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import (
@@ -204,18 +202,26 @@ def test_http_server_port_reservation(monkeypatch):
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             pass
 
-        # Server start with the network and MLM server stubbed out.
-        started = {}
-        monkeypatch.setattr(
-            mlm_text_gen_server,
-            "start_text_gen_server",
-            lambda **kwargs: started.update(kwargs),
-        )
+        # Server start with the network stubbed out and the LLM handle faked;
+        # MegatronAsyncLLM.serve owns the sock/port pass-through to the MLM server.
+        class FakeServingLLM:
+            """Captures the ServeConfig handed to MegatronAsyncLLM.serve."""
+
+            def __init__(self) -> None:
+                self.serve_config = None
+                self.serve_blocking = None
+
+            async def serve(self, serve_config, *, blocking=True):
+                self.serve_config = serve_config
+                self.serve_blocking = blocking
+
+            def run_sync(self, coro):
+                return asyncio.run(coro)
+
         monkeypatch.setattr(
             "nemo_rl.distributed.virtual_cluster._get_free_port_local",
             lambda: 12345,
         )
-        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
         requests_mock = MagicMock()
         health_get = requests_mock.Session.return_value.__enter__.return_value.get
         health_get.return_value.status_code = 200
@@ -225,16 +231,18 @@ def test_http_server_port_reservation(monkeypatch):
         )
 
         for reserved_socket, expected_port in ((reserved, port), (None, 12345)):
+            llm = FakeServingLLM()
             worker = SimpleNamespace(
-                coordinator_addr="tcp://127.0.0.1:5555",
-                megatron_tokenizer=object(),
                 rank=0,
                 cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
                 _reserved_http_server_socket=reserved_socket,
+                llm=llm,
             )
             base_url = MegatronGenerationMixin._setup_openai_api_server(worker)
-            assert started["sock"] is reserved_socket
-            assert started["server_port"] == expected_port
+            assert llm.serve_config is not None
+            assert llm.serve_config.sock is reserved_socket
+            assert llm.serve_config.port == expected_port
+            assert llm.serve_blocking is False
             assert base_url == f"http://10.0.0.5:{expected_port}/v1"
     finally:
         reserved.close()

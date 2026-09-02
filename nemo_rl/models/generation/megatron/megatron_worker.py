@@ -14,7 +14,6 @@
 
 import asyncio
 import gc
-import os
 import threading
 import time
 import warnings
@@ -28,7 +27,6 @@ from megatron.core.inference.config import (
     MambaInferenceStateConfig,
     PrefixCachingCoordinatorPolicy,
 )
-from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
@@ -100,17 +98,12 @@ class MegatronGenerationMixin:
 
     def _init_inference_engine_state(self) -> None:
         """Reset all inference-engine attributes to their uninitialized state."""
-        self.dynamic_inference_engine = None
-        self.inference_client = None
-        self.inference_context = None
-        self.inference_wrapped_model = None
+        self.llm = None
         self.base_url = None
         self._inference_engine_initialized = False
         self._inference_engine_asleep = (
             True  # Start paused since we begin with training
         )
-        self._inference_loop = None
-        self._inference_thread = None
 
     def _setup_colocated_cuda_graph_managers(self) -> None:
         """Create inference CUDA-graph managers for shared-model colocated generation.
@@ -205,22 +198,10 @@ class MegatronGenerationMixin:
 
     def _initialize_inference_engine(self, mcore_generation_config: dict) -> None:
         """Initialize the persistent inference engine and client."""
-        # TODO: Switch to standardized Megatron API.
         if self._inference_engine_initialized:
             return
 
-        from megatron.core.inference.contexts.dynamic_context import (
-            DynamicInferenceContext,
-        )
-        from megatron.core.inference.engines.dynamic_engine import (
-            DynamicInferenceEngine,
-        )
-        from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-            GPTInferenceWrapper,
-        )
-        from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-            TextGenerationController,
-        )
+        from megatron.core.inference.apis import MegatronAsyncLLM
         from megatron.core.utils import get_attr_wrapped_model
 
         gen_model = self._gen_model()
@@ -310,107 +291,46 @@ class MegatronGenerationMixin:
                 mcore_generation_config["inference_cuda_graph_scope"]
             ]
 
-        self.inference_context = DynamicInferenceContext(
-            gen_model.config, inference_config
-        )
-        self.inference_wrapped_model = GPTInferenceWrapper(
-            gen_model, self.inference_context
-        )
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=self.inference_wrapped_model,
+        self.llm = MegatronAsyncLLM(
+            model=gen_model,
             tokenizer=self.megatron_tokenizer,
-        )
-        self.dynamic_inference_engine = DynamicInferenceEngine(
-            text_generation_controller, self.inference_context
+            inference_config=inference_config,
+            use_coordinator=True,
         )
 
         self._inference_engine_initialized = True
-        self._inference_engine_asleep = True
-        print(f"[Rank {self.rank}] Initialized persistent inference engine")
-
-    async def _start_inference_coordinator(self):
-        """Start the inference coordinator and engine loop."""
-        self.coordinator_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=None,
-            launch_inference_coordinator=True,
-        )
-        if torch.distributed.get_rank() == 0:
-            from megatron.core.inference.inference_client import InferenceClient
-
-            self.inference_client = InferenceClient(
-                inference_coordinator_address=self.coordinator_addr, deserialize=True
-            )
-            result = self.inference_client.start()
-            if result is not None:
-                await result
-
         self._inference_engine_asleep = False
+        print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
     def _sleep(self) -> None:
         """Pause + suspend the engine. No-op if already asleep."""
         if self._inference_engine_asleep:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._sleep_engine(), self._inference_loop
-        )
-        future.result()
+        self.llm.run_sync(self._sleep_engine())
         torch.distributed.barrier()
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] paused inference engine")
 
-    async def _sleep_engine(self):
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.pause_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
-
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.suspend_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
+    async def _sleep_engine(self) -> None:
+        await self.llm.pause()
+        await self.llm.suspend()
 
     def _wake(self) -> None:
         """Resume + unpause the engine. No-op if already awake."""
         if not self._inference_engine_asleep:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._wake_engine(), self._inference_loop
-        )
-        future.result()
+        self.llm.run_sync(self._wake_engine())
         torch.distributed.barrier()
         self._inference_engine_asleep = False
         print(f"[Rank {self.rank}] resumed inference engine")
 
-    async def _wake_engine(self):
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.resume_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
-
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.unpause_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
-
-    def _start_inference_loop_thread(self):
-        """Start a background thread with a persistent event loop for inference."""
-        # CUDA current_device is per-thread.
-        # The worker's __init__ thread called set_device(LOCAL_RANK), and this thread must match.
-        local_rank = int(os.environ["LOCAL_RANK"])
-
-        def run_loop():
-            torch.cuda.set_device(local_rank)
-            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-            self._inference_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._inference_loop)
-            self._inference_loop.run_forever()
-
-        self._inference_thread = threading.Thread(target=run_loop, daemon=True)
-        self._inference_thread.start()
-        while self._inference_loop is None:
-            time.sleep(0.001)
+    async def _wake_engine(self) -> None:
+        await self.llm.resume()
+        await self.llm.unpause()
 
     def _setup_openai_api_server(self) -> str:
         """Start the OpenAI-compatible HTTP server on this worker."""
-        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
-            start_text_gen_server,
-        )
+        from megatron.core.inference.apis import ServeConfig
 
         from nemo_rl.distributed.virtual_cluster import (
             _get_free_port_local,
@@ -424,15 +344,13 @@ class MegatronGenerationMixin:
         else:
             server_port = _get_free_port_local()
 
-        start_text_gen_server(
-            coordinator_addr=self.coordinator_addr,
-            tokenizer=self.megatron_tokenizer,
-            rank=torch.distributed.get_rank(),
-            server_port=server_port,
+        serve_config = ServeConfig(
+            port=server_port,
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
             sock=reserved_socket,
         )
+        self.llm.run_sync(self.llm.serve(serve_config, blocking=False))
 
         base_url = f"http://{ip}:{server_port}/v1"
         max_wait_time = 300
@@ -453,29 +371,31 @@ class MegatronGenerationMixin:
                 time.sleep(2)
         return base_url
 
-    def _run_async_coordinator_start(self):
-        """Start the coordinator and engine loop in the background thread."""
-        if self._inference_loop is None:
-            self._start_inference_loop_thread()
-
-        future = asyncio.run_coroutine_threadsafe(
-            self._start_inference_coordinator(), self._inference_loop
-        )
-        # _start_inference_coordinator awaits RUNNING, so future.result() only returns once
-        # this rank's engine is fully warmed up. Cross-rank sync is handled by Ray's actor
-        # group semantics (the caller waits for all workers' prepare_for_generation).
-        future.result()
-        print(f"[Rank {torch.distributed.get_rank()}] Coordinator started")
-
+    def _maybe_start_openai_api_server(self) -> None:
+        """Start the OpenAI HTTP server on rank 0 when configured to expose it."""
+        rank = torch.distributed.get_rank()
         if (
             self.cfg["generation"]["mcore_generation_config"]["expose_http_server"]
-            and torch.distributed.get_rank() == 0
+            and rank == 0
         ):
-            print(f"[Rank {torch.distributed.get_rank()}] Starting HTTP Server")
+            print(f"[Rank {rank}] Starting HTTP Server")
             self.base_url = self._setup_openai_api_server()
         else:
-            print(f"[Rank {torch.distributed.get_rank()}] HTTP Server not started")
+            print(f"[Rank {rank}] HTTP Server not started")
             self.base_url = None
+
+    def shutdown_inference_engine(self) -> None:
+        """Stop the engine and tear down the coordinator + HTTP server."""
+        if self.llm is None:
+            return
+        t = threading.Thread(
+            target=asyncio.run, args=(self.llm.shutdown(),), name="mcore-llm-shutdown"
+        )
+        t.start()
+        t.join()
+        self.llm = None
+        self._inference_engine_initialized = False
+        self._inference_engine_asleep = True
 
     def finish_generation(self, *, release_gpu: bool = True) -> None:
         """Wind down a generation cycle.
@@ -595,7 +515,7 @@ class MegatronGenerationMixin:
         if tags is None or "weights" not in tags:
             if not self._inference_engine_initialized:
                 self._initialize_inference_engine(mcore_generation_config)
-                self._run_async_coordinator_start()
+                self._maybe_start_openai_api_server()
             else:
                 self._wake()
 
@@ -757,19 +677,17 @@ class MegatronGenerationMixin:
         prompt_tokens_tensor, prompt_lengths_tensor, sampling_params = (
             self._prepare_data_for_generation(data, greedy)
         )
-        if self._inference_loop is None:
+        if self.llm is None:
             raise RuntimeError(
-                "Inference loop not initialized. Call prepare_for_generation() first."
+                "Inference engine not initialized. Call prepare_for_generation() first."
             )
-        future = asyncio.run_coroutine_threadsafe(
+        result = self.llm.run_sync(
             self._generate_with_persistent_engine(
                 prompt_tokens_tensor,
                 prompt_lengths_tensor,
                 sampling_params,
-            ),
-            self._inference_loop,
+            )
         )
-        result = future.result()
 
         return self._parse_result_to_batched_data_dict(data, result)
 
@@ -785,9 +703,9 @@ class MegatronGenerationMixin:
         Yields:
             Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
         """
-        if self._inference_loop is None:
+        if self.llm is None:
             raise RuntimeError(
-                "Inference loop not initialized. Call prepare_for_generation() first."
+                "Inference engine not initialized. Call prepare_for_generation() first."
             )
 
         async def _generate_single_item(
@@ -797,15 +715,11 @@ class MegatronGenerationMixin:
             prompt_tokens_tensor, prompt_lengths_tensor, sampling_params = (
                 self._prepare_data_for_generation(datum, greedy)
             )
-            future = asyncio.run_coroutine_threadsafe(
-                self._generate_with_persistent_engine(
-                    prompt_tokens_tensor,
-                    prompt_lengths_tensor,
-                    sampling_params,
-                ),
-                self._inference_loop,
+            result = await self._generate_with_persistent_engine(
+                prompt_tokens_tensor,
+                prompt_lengths_tensor,
+                sampling_params,
             )
-            result = await asyncio.wrap_future(future)
             output = self._parse_result_to_batched_data_dict(datum, result)
             return (index, output)
 
@@ -821,28 +735,24 @@ class MegatronGenerationMixin:
         prompt_lengths_tensor: torch.Tensor,
         sampling_params: list[SamplingParams],
     ) -> list:
-        """Submit requests through the persistent inference client (rank 0 only)."""
-        from megatron.core.inference.inference_request import DynamicInferenceRequest
-
+        """Submit one request per sample to the persistent MegatronAsyncLLM (rank 0 only)."""
         dist_rank = torch.distributed.get_rank()
         assert dist_rank == 0, (
-            "Only rank 0 creates a client to communicate with the coordinator"
+            "Only rank 0 submits requests to the inference coordinator"
         )
 
         print(
             f"[Rank {dist_rank}] Submitting {prompt_tokens_tensor.size(0)} requests to coordinator"
         )
 
-        futures = []
+        coros = []
         for prompt_tokens, prompt_len, request_sampling_params in zip(
             prompt_tokens_tensor, prompt_lengths_tensor, sampling_params, strict=True
         ):
             prompt = prompt_tokens[: prompt_len.item()].tolist()
-            futures.append(
-                self.inference_client.add_request(prompt, request_sampling_params)
-            )
+            coros.append(self.llm.generate(prompt, request_sampling_params))
 
-        results: list[DynamicInferenceRequest] = await asyncio.gather(*futures)
+        results = await asyncio.gather(*coros)
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
         return results
 
