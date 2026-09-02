@@ -580,7 +580,7 @@ class LossPostProcessor:
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=None,
                     data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    loss_weight=float(self.cfg["draft"].loss_weight),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
