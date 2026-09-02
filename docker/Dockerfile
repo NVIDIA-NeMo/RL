@@ -259,6 +259,9 @@ fi
 if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
     PREFETCH_NEGATIVE_FILTERS="$PREFETCH_NEGATIVE_FILTERS sglang"
 fi
+if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    PREFETCH_NEGATIVE_FILTERS="$PREFETCH_NEGATIVE_FILTERS trtllm"
+fi
 while IFS=$'\t' read -r venv_name stage extras; do
     if [[ -z "$venv_name" || "$venv_name" == \#* ]]; then
         continue
@@ -334,11 +337,12 @@ set +e
 # Build TRT-LLM into a throwaway venv instead of the main one:
 # the main venv is fully hardlinked from the dependency layer,
 # and churning it here would copy files up into this layer.
-# The throwaway venv is created and deleted within this RUN, so it leaves no bytes in the layer.
+# The throwaway venv must be symlink-mode: hardlinks to files in the dependency layer's uv
+# cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
-    uv sync --verbose --link-mode hardlink --locked --extra trtllm --no-install-project \
+    uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
     | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
 TRTLLM_SYNC_STATUS=$?
@@ -358,6 +362,8 @@ du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 # Worker-venv prefetch, phase 1 for the "trtllm"-stage manifest entries:
 # the dependency layer gave them a base-only warm; now that the tensorrt_llm wheel exists,
 # top off the venv with the full extra set so that the added files hardlink in-layer.
+# tensorrt_llm itself is new in this layer; trtllm-extra deps already present in the
+# dependency layer's cache (e.g. tilelang) get copied up here, a small accepted cost.
 while IFS=$'\t' read -r venv_name stage extras; do
     if [[ -z "$venv_name" || "$venv_name" == \#* || "$stage" != "trtllm" ]]; then
         continue
