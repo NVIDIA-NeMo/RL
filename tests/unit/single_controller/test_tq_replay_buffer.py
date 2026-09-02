@@ -33,6 +33,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     replay_manifest_digest,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
@@ -164,7 +165,11 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _make_record(*, prompt_idx: int = 0) -> PromptGroupRecord:
+def _make_record(
+    rollout_metrics: dict[str, Any] | None = None,
+    *,
+    prompt_idx: int = 0,
+) -> PromptGroupRecord:
     """Opaque PromptGroupRecord — converter is stubbed, so contents are unused."""
     return PromptGroupRecord(
         prompt_idx=prompt_idx,
@@ -172,7 +177,7 @@ def _make_record(*, prompt_idx: int = 0) -> PromptGroupRecord:
         extra_env_info=None,
         metadata={},
         completions=[],
-        rollout_metrics={},
+        rollout_metrics=dict(rollout_metrics or {}),
     )
 
 
@@ -200,6 +205,7 @@ def _add_group(
     weight: int,
     end_weight: int | None = None,
     target_step: int | None = None,
+    rollout_metrics: dict[str, Any] | None = None,
 ) -> KVBatchMeta:
     if end_weight is None:
         end_weight = weight
@@ -207,7 +213,7 @@ def _add_group(
     return _run(
         buf.commit(
             group_id,
-            _make_record(),
+            _make_record(rollout_metrics),
             start_weight_version=weight,
             end_weight_version=end_weight,
         )
@@ -381,6 +387,26 @@ class TestTQReplayBufferReserveCommit:
         assert dp.depth() == 0
         assert buf.ready_list == [False]
         assert buf.meta_list == [None]
+
+    def test_commit_retains_group_rollout_metrics(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        record = _make_record({"gen_tokens/min": 3, "total_turns": 2})
+        group_id = buf.reserve(weight_version=3)
+
+        meta = _run(
+            buf.commit(
+                group_id,
+                record,
+                start_weight_version=3,
+                end_weight_version=4,
+            )
+        )
+        record.rollout_metrics["gen_tokens/min"] = 99
+
+        assert meta.extra_info[ROLLOUT_METRICS] == [
+            {"gen_tokens/min": 3, "total_turns": 2}
+        ]
 
     def test_commit_clears_rows_when_put_raises_after_writing(self):
         dp = FailAfterPutDataPlaneClient()
@@ -886,6 +912,17 @@ class TestReplayManifestDigest:
 
         assert replay_manifest_digest([first]) == replay_manifest_digest([second])
 
+    def test_ignores_rollout_metrics_logging_sidecar(self):
+        first = _make_group_entry("group-1", weight=1)
+        second = _make_group_entry("group-1", weight=1)
+        first["meta"].extra_info = {
+            "packing": [1, 2],
+            ROLLOUT_METRICS: [{"per_worker_token_counts": {0: 7}}],
+        }
+        second["meta"].extra_info = {"packing": [1, 2]}
+
+        assert replay_manifest_digest([first]) == replay_manifest_digest([second])
+
 
 class TestTQReplayBufferStateDict:
     def test_metadata_state_dict_omits_tensors_and_data_plane_reads(self):
@@ -909,7 +946,18 @@ class TestTQReplayBufferStateDict:
     def test_native_tq_round_trip_restores_index_without_reputting_rows(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
-        metas = [_add_group(buf, weight=w) for w in (1, 2)]
+        metas = [
+            _add_group(
+                buf,
+                weight=1,
+                rollout_metrics={
+                    "gen_tokens/min": 3,
+                    "total_turns": 2,
+                    "per_worker_token_counts": {0: 7},
+                },
+            ),
+            _add_group(buf, weight=2),
+        ]
         state = buf.metadata_state_dict(saved_capacity=8)
 
         restored_dp = FakeDataPlaneClient()
@@ -925,6 +973,13 @@ class TestTQReplayBufferStateDict:
         assert restored_buf.ready_list == [True, True]
         assert [meta.sample_ids for meta in restored_buf.meta_list] == [
             list(meta.sample_ids) for meta in metas
+        ]
+        assert restored_buf.meta_list[0].extra_info[ROLLOUT_METRICS] == [
+            {
+                "gen_tokens/min": 3,
+                "total_turns": 2,
+                "per_worker_token_counts": {0: 7},
+            }
         ]
         assert restored_dp.put_calls == []
 

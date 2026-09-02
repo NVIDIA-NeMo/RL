@@ -634,3 +634,19 @@ class GenerationInterface(ABC):
             Dictionary of metrics. Format may vary by backend.
         """
         return {}
+
+    def snapshot_step_metrics(self) -> None:
+        """Begin a per-training-step generation metric window.
+
+        Backends without per-step generation metrics may use this default no-op.
+        """
+
+    def get_step_metrics(self) -> dict[str, float]:
+        """Finish the current metric window and return generation metrics.
+
+        Returns:
+            Metrics accumulated since the matching ``snapshot_step_metrics``
+            call, not running totals. Backends without per-step generation
+            metrics return an empty dictionary.
+        """
+        return {}

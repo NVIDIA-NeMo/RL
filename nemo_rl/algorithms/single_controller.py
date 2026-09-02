@@ -79,6 +79,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _write_latest_checkpoint_status,
+    aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -103,7 +104,11 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_CALIB_INPUT_FIELDS,
+    DP_TRAIN_FIELDS,
+    ROLLOUT_METRICS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -1722,6 +1727,7 @@ class SingleControllerActor:
             step_open = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
+            selected_rollout_metrics: list[dict[str, Any]] = []
             # One chunk per step on the PPO path, so these are the step's own
             # model updates -- the last epoch's, when there is more than one.
             policy_result: Optional[dict[str, Any]] = None
@@ -1804,6 +1810,13 @@ class SingleControllerActor:
                         # Release buffer capacity
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
+
+                        selected_rollout_metrics.extend(
+                            train_meta.extra_info.pop(ROLLOUT_METRICS, [])
+                        )
+
+                    if groups_dispatched == 0 and self._gen is not None:
+                        await asyncio.to_thread(self._gen.snapshot_step_metrics)
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
@@ -2006,6 +2019,19 @@ class SingleControllerActor:
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
+                per_group_rollout_metrics: dict[str, list[Any]] = {}
+                for group_metrics in selected_rollout_metrics:
+                    for metric_name, value in group_metrics.items():
+                        per_group_rollout_metrics.setdefault(metric_name, []).append(
+                            value
+                        )
+                step_metrics.update(
+                    aggregate_rollout_metrics(per_group_rollout_metrics)
+                )
+                if self._gen is not None:
+                    step_metrics.update(
+                        await asyncio.to_thread(self._gen.get_step_metrics)
+                    )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
@@ -2150,9 +2176,14 @@ class SingleControllerActor:
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             # TODO: per-step train_data jsonl dump, vllm metrics logger,
-            #   histogram log, rollout_metrics, pretty-print "Training Results"
-            #   block, print_performance_metrics.
-            print(f"step_metrics={step_metrics}", flush=True)
+            #   histogram log, pretty-print "Training Results" block,
+            #   print_performance_metrics.
+            printable_step_metrics = {
+                name: value
+                for name, value in step_metrics.items()
+                if not isinstance(value, list)
+            }
+            print(f"step_metrics={printable_step_metrics}", flush=True)
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )

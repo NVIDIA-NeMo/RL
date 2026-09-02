@@ -45,6 +45,7 @@ from nemo_rl.algorithms.loss import (
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -313,16 +314,35 @@ def forward_with_post_processing_fn(
         from megatron.core.transformer.multi_token_prediction import roll_tensor
 
         captured_states = capture.get_captured_states()
-        shifted_input_embeds = roll_tensor(
-            captured_states.inputs_embeds,
-            shifts=-1,
-            dims=0,
-            cp_group=get_context_parallel_group(),
-        )[0]
+        if packed_seq_params is not None:
+            # Packed layout: rolling the captured embeddings would leak the
+            # next segment's first token across every packing boundary, so
+            # shift the token ids per sequence before packing and re-embed
+            # them instead (one extra embedding lookup; also yields the
+            # correct sequence-parallel layout for free). no_grad matches the
+            # capture hooks, which hand the draft detached embeddings.
+            with torch.no_grad():
+                shifted_input_ids = _pack_input_ids(
+                    data_dict["input_ids"],
+                    packed_seq_params.cu_seqlens_q,
+                    packed_seq_params.cu_seqlens_q_padded,
+                    roll_shift=-1,
+                )
+                shifted_input_embeds = capture.model.embedding(
+                    input_ids=shifted_input_ids, position_ids=position_ids
+                )
+        else:
+            shifted_input_embeds = roll_tensor(
+                captured_states.inputs_embeds,
+                shifts=-1,
+                dims=0,
+                cp_group=get_context_parallel_group(),
+            )[0]
         data_dict["student_logits"] = draft_model(
             hidden_states=captured_states.hidden_states,
             input_embeds=shifted_input_embeds,
             attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
         )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -549,6 +569,26 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
+            if "student_logits" in data_dict:
+                # draft + use_fused_linear_logprobs is rejected at setup in
+                # lm_policy.py (the fused path never materializes the full
+                # next-token logits the teacher needs), so no check here.
+                # Keep the draft head's packed logits out of the policy-loss
+                # data so the per-sequence packing slicers never see them.
+                student_logits = data_dict.pop("student_logits")
+                loss_fn_wrapped = DraftLossWrapper(
+                    loss_fn=loss_fn_wrapped,
+                    prepare_fn=None,
+                    data_dict=data_dict,
+                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=get_context_parallel_group(),
+                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                    d2t=self.d2t,
+                    student_logits=student_logits,
+                )
         else:
             loss_fn_wrapped = partial(
                 wrap_loss_fn_with_input_preparation,

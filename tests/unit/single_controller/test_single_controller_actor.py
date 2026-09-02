@@ -40,6 +40,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -1109,6 +1110,39 @@ class _EpochRecordingTrainer(_OrderRecordingTrainer):
         return {}
 
 
+class _StepMetricRecordingTrainer(_NoOpTrainer):
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def begin_train_step(self, loss_fn) -> None:
+        del loss_fn
+        self._events.append("begin_train_step")
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
+        self._events.append("train_microbatches")
+
+    def finish_train_step(self) -> dict:
+        self._events.append("finish_train_step")
+        return {}
+
+
+class _StepMetricRecordingGeneration:
+    requires_kv_scale_sync = False
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def snapshot_step_metrics(self) -> None:
+        self._events.append("snapshot_step_metrics")
+
+    def get_step_metrics(self) -> dict[str, float]:
+        self._events.append("get_step_metrics")
+        return {"vllm/spec_acceptance_rate": 0.8}
+
+
 class _NoOpDataPlane:
     def clear_samples(self, **kwargs) -> None:
         del kwargs
@@ -1161,7 +1195,11 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
     ctrl._value_loss_fn = None
-    ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        snapshot_step_metrics=lambda: None,
+        get_step_metrics=lambda: {},
+    )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
@@ -1482,6 +1520,119 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
+
+
+def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
+    monkeypatch,
+    capsys,
+) -> None:
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{index}"],
+            fields=[],
+            sequence_lengths=[1],
+            extra_info={ROLLOUT_METRICS: [metrics]},
+            tags=[{"weight_version": 0}],
+        )
+        for index, metrics in enumerate(
+            [
+                {
+                    "gen_tokens/min": 7,
+                    "gen_tokens/max": 10,
+                    "total_turns": 2,
+                    "accuracy": 0.25,
+                    "trajectory_duration_s": 1.0,
+                    "histogram/gen_tokens_length": [7, 10],
+                },
+                {
+                    "gen_tokens/min": 3,
+                    "gen_tokens/max": 20,
+                    "total_turns": 5,
+                    "accuracy": 0.75,
+                    "trajectory_duration_s": 3.0,
+                    "histogram/gen_tokens_length": [3, 20],
+                },
+            ]
+        )
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_call = ctrl._logger.log_metrics.call_args_list[0]
+    train_metrics = train_call.args[0]
+    assert train_metrics["gen_tokens/min"] == 3
+    assert train_metrics["gen_tokens/max"] == 20
+    assert train_metrics["total_turns"] == 7
+    assert train_metrics["accuracy"] == pytest.approx(0.5)
+    assert train_metrics["trajectory_duration_s"] == pytest.approx(2.0)
+    assert train_metrics["trajectory_duration_s/max"] == 3.0
+    assert train_metrics["trajectory_duration_s/p95"] == 3.0
+    assert train_metrics["histogram/gen_tokens_length"] == [7, 10, 3, 20]
+    assert train_call.kwargs == {"step": 1, "prefix": "train"}
+    assert all(ROLLOUT_METRICS not in meta.extra_info for meta in metas)
+    assert "histogram/gen_tokens_length" not in capsys.readouterr().out
+
+
+def test_train_pump_collects_generation_metrics_at_step_boundaries(
+    monkeypatch,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    events: list[str] = []
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._trainer = _StepMetricRecordingTrainer(events)
+    ctrl._gen = _StepMetricRecordingGeneration(events)
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert events == [
+        "snapshot_step_metrics",
+        "begin_train_step",
+        "train_microbatches",
+        "train_microbatches",
+        "finish_train_step",
+        "get_step_metrics",
+    ]
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
+
+
+def test_train_pump_skips_generation_metrics_without_generation_handle(
+    monkeypatch,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._gen = None
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert "vllm/spec_acceptance_rate" not in train_metrics
 
 
 def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:

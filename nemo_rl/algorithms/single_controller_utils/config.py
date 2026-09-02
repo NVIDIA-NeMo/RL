@@ -51,7 +51,11 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
 )
-from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+    ClusterConfig,
+)
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.value import ValueConfig
@@ -364,11 +368,12 @@ class GenerationRouterConfig(BaseModel, extra="allow"):
 
     # When true, NeMo-Gym receives the router's URL instead of the raw backend URLs.
     enabled: bool = False
-    # Range the router reserves its fixed port from. Deliberately distinct from Gym
-    # (5000-5999) and vLLM (7000-8999). The port is fixed for the life of the run so the
-    # URL Gym holds never changes.
-    port_range_low: PositiveInt = 6000
-    port_range_high: PositiveInt = 6099
+    # Range the router reserves its fixed port from. It sits between Ray's client
+    # port (1201) and management ports (1301+) so it cannot collide with Gym,
+    # sandbox, or generation services. The port is fixed for the life of the run
+    # so the URL Gym holds never changes.
+    port_range_low: PositiveInt = DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+    port_range_high: PositiveInt = DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
     # Router -> backend deadline, covering the whole generation. This is the timeout
     # Gym's own client never sets.
     backend_timeout_s: PositiveFloat = 600.0
