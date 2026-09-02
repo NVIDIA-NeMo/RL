@@ -7,12 +7,10 @@ import os
 import sys
 
 
-REFERENCE_REPO = (
-    "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/"
-    "users/jianh/projects/OpenRLHF-main"
+REFERENCE_COMMIT = os.environ.get(
+    "MOLT_REFERENCE_COMMIT", "26f086ddabbb45a09e00c0b1f9962cdd2863159c"
 )
-REFERENCE_COMMIT = "26f086ddabbb45a09e00c0b1f9962cdd2863159c"
-BASE_MODEL = f"{REFERENCE_REPO}/ckpts/rfc0037-sft-step400"
+BASE_MODEL = os.environ.get("MOLT_REFERENCE_MODEL", "")
 
 PROFILES = {
     "b1k1": {
@@ -83,6 +81,10 @@ COMMON = {
 
 
 def main() -> int:
+    if not BASE_MODEL:
+        print("ABORT: MOLT_REFERENCE_MODEL must be set", file=sys.stderr)
+        return 2
+
     profile = os.environ.get("MOLT_ALIGNMENT_PROFILE", "")
     if profile not in PROFILES:
         print(f"ABORT: unknown MOLT_ALIGNMENT_PROFILE={profile!r}", file=sys.stderr)

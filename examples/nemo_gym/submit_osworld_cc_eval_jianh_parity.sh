@@ -11,8 +11,8 @@ RUNTIME_ROOT="${OSWORLD_RUNTIME_ROOT:-$(dirname "${ROOT}")/osworld-cc-runtime}"
 
 : "${OSWORLD_GRPO_VAL_DATA:?Set OSWORLD_GRPO_VAL_DATA to the full 361-task JSONL}"
 : "${EVAL_NAME:?Set EVAL_NAME}"
+: "${PARITY_SHARD_SOURCE_DIR:?Set PARITY_SHARD_SOURCE_DIR to the reference shard directory}"
 
-PARITY_SHARD_SOURCE_DIR="${PARITY_SHARD_SOURCE_DIR:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/jianh/data/osworld-eval}"
 PARITY_SHARD_DIR="${PARITY_SHARD_DIR:-${RUNTIME_ROOT}/data/eval-parity-shards}"
 SUBMIT="${EVAL_SUBMIT_SCRIPT:-${ROOT}/examples/nemo_gym/submit_osworld_cc_eval.sh}"
 mkdir -p "${PARITY_SHARD_DIR}"
@@ -75,9 +75,9 @@ for index, expected_count in enumerate(expected_counts, start=1):
 
 if used != set(full_by_id):
     raise SystemExit(
-        f"Jianh parity shards do not cover the full NeMo-Gym set: covered={len(used)} full={len(full_by_id)}"
+        f"Reference parity shards do not cover the full NeMo-Gym set: covered={len(used)} full={len(full_by_id)}"
     )
-print("Prepared Jianh parity shards: 91 + 3x90 = 361 tasks", file=sys.stderr)
+print("Prepared parity shards: 91 + 3x90 = 361 tasks", file=sys.stderr)
 PY
 
 job_ids=()
@@ -103,7 +103,7 @@ for shard in ${PARITY_SHARDS}; do
   )"
   job_id="${submit_output##* }"
   job_ids+=("${job_id}")
-  echo "Submitted Jianh-parity eval shard=${shard} tasks=${shard_count} job=${job_id}" >&2
+  echo "Submitted parity eval shard=${shard} tasks=${shard_count} job=${job_id}" >&2
 done
 
 printf '%s\n' "${job_ids[*]}"

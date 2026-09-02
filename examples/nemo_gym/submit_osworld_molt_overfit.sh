@@ -12,7 +12,8 @@ DATA_DIR="${OSWORLD_OVERFIT_DATA_DIR:-${RUNTIME_ROOT}/data/overfit361-cc-v2}"
 
 export OSWORLD_GRPO_TRAIN_DATA="${OSWORLD_GRPO_TRAIN_DATA:-${DATA_DIR}/train-5x.jsonl}"
 export OSWORLD_GRPO_VAL_DATA="${OSWORLD_GRPO_VAL_DATA:-${DATA_DIR}/validation-1x.jsonl}"
-export NANO_OMNI_MODEL_NAME="${NANO_OMNI_MODEL_NAME:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/jianh/projects/OpenRLHF-main/ckpts/rfc0037-sft-step400}"
+: "${NANO_OMNI_MODEL_NAME:?Set NANO_OMNI_MODEL_NAME to the SFT checkpoint}"
+export NANO_OMNI_MODEL_NAME
 
 # Molt Omni schedule: five dataset episodes, eight logical rollouts per prompt,
 # and one optimizer epoch per consumed prompt group. OSWorld uses one prompt

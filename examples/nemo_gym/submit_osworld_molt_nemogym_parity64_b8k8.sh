@@ -3,11 +3,12 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
-# Jianh Molt batch-parity experiment: B=8 prompt groups per optimizer step,
-# N=8 rollouts per prompt, and K=8 prompt groups concurrently in flight.
-export MOLT_RUN_NAME="${MOLT_RUN_NAME:-osworld361-molt-jianh-aligned-v1-b8k8}"
+# Validated Molt batch-parity experiment: B=8 prompt groups per optimizer
+# step, N=8 rollouts per prompt, and K=8 groups concurrently in flight.
+export MOLT_RUN_NAME="${MOLT_RUN_NAME:-osworld361-molt-aligned-v1-b8k8}"
 export MOLT_ALIGNMENT_PROFILE=b8k8
-export NANO_OMNI_MODEL_NAME=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/jianh/projects/OpenRLHF-main/ckpts/rfc0037-sft-step400
+: "${NANO_OMNI_MODEL_NAME:?Set NANO_OMNI_MODEL_NAME to the SFT checkpoint}"
+export MOLT_REFERENCE_MODEL="${MOLT_REFERENCE_MODEL:-${NANO_OMNI_MODEL_NAME}}"
 
 export MOLT_MAX_STEPS="${MOLT_MAX_STEPS:-300}"
 export OSWORLD_NUM_PROMPTS_PER_STEP=8
@@ -56,7 +57,7 @@ export OSWORLD_CC_ACTIONS_PER_CHUNK=100
 export OSWORLD_CC_MAX_TOTAL_TOKENS=49152
 export OSWORLD_CC_RESERVED_GENERATION_TOKENS=11152
 export OSWORLD_SLEEP_AFTER_EXECUTION=5
-# Jianh admits K=8 prompt groups but caps active desktop work at 32 rollouts.
+# Admit K=8 prompt groups while capping active desktop work at 32 rollouts.
 export OSWORLD_NEMO_GYM_NUM_WORKERS=32
 export OSWORLD_MAX_PARALLEL_ROLLOUTS=32
 

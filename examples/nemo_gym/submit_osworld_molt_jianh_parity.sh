@@ -10,11 +10,13 @@ fi
 RUNTIME_ROOT="${OSWORLD_RUNTIME_ROOT:-$(dirname "${ROOT}")/osworld-cc-runtime}"
 DATA_DIR="${OSWORLD_OVERFIT_DATA_DIR:-${RUNTIME_ROOT}/data/overfit361-cc-v2}"
 
-# Match the executed RFC0037 step-400 Molt recipe in Jianh's DFW checkout.
-export NANO_OMNI_MODEL_NAME="${NANO_OMNI_MODEL_NAME:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/jianh/projects/OpenRLHF-main/ckpts/rfc0037-sft-step400}"
+# Match the validated RFC0037 step-400 Molt recipe while keeping checkpoint
+# locations portable across clusters.
+: "${NANO_OMNI_MODEL_NAME:?Set NANO_OMNI_MODEL_NAME to the SFT checkpoint}"
+export NANO_OMNI_MODEL_NAME
 export OSWORLD_GRPO_TRAIN_DATA="${OSWORLD_GRPO_TRAIN_DATA:-${DATA_DIR}/validation-1x.jsonl}"
 export OSWORLD_GRPO_VAL_DATA="${OSWORLD_GRPO_VAL_DATA:-${DATA_DIR}/validation-1x.jsonl}"
-export MOLT_RUN_NAME="${MOLT_RUN_NAME:-osworld361-jianh-parity-s400-rbaseline-r3}"
+export MOLT_RUN_NAME="${MOLT_RUN_NAME:-osworld361-molt-aligned-s400-rbaseline-r3}"
 export MOLT_MAX_STEPS="${MOLT_MAX_STEPS:-300}"
 
 export OSWORLD_NUM_PROMPTS_PER_STEP="${OSWORLD_NUM_PROMPTS_PER_STEP:-8}"

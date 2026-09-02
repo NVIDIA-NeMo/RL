@@ -26,6 +26,8 @@ fi
 : "${OPENSANDBOX_API_KEY:?Set OPENSANDBOX_API_KEY or OSWORLD_PRIVATE_ENV}"
 : "${OSWORLD_GRPO_TRAIN_DATA:?Set OSWORLD_GRPO_TRAIN_DATA}"
 : "${OSWORLD_GRPO_VAL_DATA:?Set OSWORLD_GRPO_VAL_DATA}"
+: "${CONTAINER:?Set CONTAINER to the NeMo-RL container image}"
+: "${NANO_OMNI_MODEL_NAME:?Set NANO_OMNI_MODEL_NAME to the model checkpoint}"
 
 export NUM_NODES="${NUM_NODES:-3}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
@@ -58,9 +60,9 @@ if [[ -n "${active}" && "${MOLT_ALLOW_DUPLICATE_SUBMISSION:-false}" != "true" ]]
   exit 3
 fi
 
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/nemo_rl_ci/sqsh_files/rl-gym.65293387.sqsh}"
-export MOUNTS="${MOUNTS:-/lustre:/lustre}"
-export NANO_OMNI_MODEL_NAME="${NANO_OMNI_MODEL_NAME:-/lustre/fsw/portfolios/coreai/users/aroshanghias/checkpoints/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16}"
+export CONTAINER
+export MOUNTS="${MOUNTS:-}"
+export NANO_OMNI_MODEL_NAME
 GYM_ROOT="${ROOT}/3rdparty/Gym-workspace/Gym"
 # Gym config paths are repo-relative, while component server directories are
 # relative to the Gym checkout. Keep both roots, with the component root first.
