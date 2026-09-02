@@ -24,9 +24,12 @@ staging keys.
 Each staged row carries three jagged columns (``token_ids_delta``,
 ``token_mask_delta``, ``generation_logprobs_delta``), the complete receipt
 identity/lineage metadata, and all digest inputs so it round-trips to a
-complete ``StagedCallSnapshot``. Masks/logprobs are float32 on the wire,
-matching ``compute_staging_digest``'s float32-bit-pattern scheme, so the
-finalizer's digest recomputation over fetched values is byte-exact.
+normally validated ``StagedCallBaseSnapshot``. Masks/logprobs are float32 on
+the wire, matching ``compute_staging_digest``'s float32-bit-pattern scheme, so
+digest recomputation over fetched values is byte-exact. Route payloads never
+ride inside snapshots: the source returns them as separate ``RouteFragment``
+values keyed by staging key, digest-verified by the plan executor at point of
+use.
 """
 
 from __future__ import annotations
@@ -45,17 +48,21 @@ if TYPE_CHECKING:
     # uses import locally so this module (and the finalizer actor importing
     # it) stays importable without it.
     from nemo_gym.token_id_capture.staging.records import (
+        StagedCallBaseSnapshot,
         StagedCallRecord,
-        StagedCallSnapshot,
         StageResult,
     )
 
 from nemo_rl.data_plane.schema import (
+    ROUTE_ENCODING_ENVELOPE,
+    ROUTE_ENCODING_LIST,
+    ROUTE_ENCODING_NONE,
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
+from nemo_rl.experience.route_assembly import RouteFragment
 
 STAGING_FIELDS = [
     "token_ids_delta",
@@ -84,9 +91,6 @@ STAGING_FIELDS = [
     ROUTED_LEN_FIELD,
 ]
 
-_ROUTE_ENCODING_NONE = 0
-_ROUTE_ENCODING_ENVELOPE = 1
-_ROUTE_ENCODING_LIST = 2
 _MODE_TO_CODE = {"text": 0, "token_in": 1}
 _CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
 
@@ -107,11 +111,17 @@ def _optional_digest_fields(value: str | None) -> tuple[torch.Tensor, torch.Tens
 
 @dataclass(frozen=True)
 class FetchedStagedCall:
-    """One explicitly identified small-column finalization fetch result."""
+    """One explicitly identified small-column finalization fetch result.
+
+    ``fragment`` is populated only when the fetch requested route payloads
+    (direct mode); deferred finalization leaves route bytes in TQ and carries
+    only ``routed_len`` transport metadata.
+    """
 
     staging_key: str
-    snapshot: StagedCallSnapshot
+    snapshot: StagedCallBaseSnapshot
     routed_len: int
+    fragment: RouteFragment | None = None
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -213,7 +223,7 @@ class TQTokenSink:
                 ).encode("utf-8")
             )
             routed_len = 0
-            routed_encoding = _ROUTE_ENCODING_NONE
+            routed_encoding = ROUTE_ENCODING_NONE
             if routed is not None:
                 delta_len = len(record.token_ids_delta)
                 if isinstance(routed, str):
@@ -232,10 +242,10 @@ class TQTokenSink:
                             f"unsupported routed_experts dtype {dtype_name!r}"
                         )
                     experts = decode_routed_experts(routed, dtype)
-                    routed_encoding = _ROUTE_ENCODING_ENVELOPE
+                    routed_encoding = ROUTE_ENCODING_ENVELOPE
                 else:
                     experts = torch.tensor(routed, dtype=torch.int16)
-                    routed_encoding = _ROUTE_ENCODING_LIST
+                    routed_encoding = ROUTE_ENCODING_LIST
                 if experts.dim() != 3 or experts.shape[0] != delta_len:
                     raise ValueError(
                         "routed_experts must already be delta-aligned: "
@@ -314,56 +324,9 @@ class TQTokenSource:
         self._dp_client = dp_client
         self._staging_partition = staging_partition
 
-    def fetch(self, staging_keys: list[str]) -> list[StagedCallSnapshot]:
-        """Fetch Gym snapshots, retaining legacy optional route materialization."""
-        if not staging_keys:
-            return []
-        try:
-            # Extras are optional per row (feature-gated at the worker);
-            # try the extended selection first, fall back to the base
-            # schema so extras-free rows keep fetching.
-            try:
-                rows = _call_dp(
-                    self._dp_client,
-                    "get_samples",
-                    sample_ids=list(staging_keys),
-                    partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS + [ROUTED_EXPERTS_FIELD],
-                )
-            except Exception:  # noqa: BLE001 — field-not-present probe
-                rows = _call_dp(
-                    self._dp_client,
-                    "get_samples",
-                    sample_ids=list(staging_keys),
-                    partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS,
-                )
-        except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
-            raise KeyError(
-                f"staged rows for {len(staging_keys)} keys could not be "
-                f"fetched from {self._staging_partition!r}: {error}"
-            ) from error
-        # TQ's kv path only errors when *zero* keys resolve; a partial miss
-        # returns fewer rows with no error. Guard explicitly so a lost row
-        # rejects the rollout as missing_staging_row instead of surfacing
-        # later as a misleading digest mismatch from misaligned zipping.
-        n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
-        if n_rows != len(staging_keys):
-            raise KeyError(
-                f"staged rows missing: requested {len(staging_keys)} keys "
-                f"from {self._staging_partition!r}, got {n_rows} rows"
-            )
-        # Row order mirrors the requested key order; the finalizer's digest
-        # recomputation is the byte-exact backstop if that ever breaks.
-        snapshots: list[StagedCallSnapshot] = []
-        for index, key in enumerate(staging_keys):
-            snapshot = _row_to_snapshot(_select_row(rows, index), include_routes=True)
-            if snapshot.staging_key != key:
-                raise KeyError(
-                    f"staged row identity mismatch: requested {key!r}, got {snapshot.staging_key!r}"
-                )
-            snapshots.append(snapshot)
-        return snapshots
+    def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
+        """Gym ``StagingSource`` conformance: base snapshots only, in order."""
+        return [item.snapshot for item in self.fetch_for_finalization(staging_keys)]
 
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         """Bulk-fetch ordered delta chain and concatenate token_ids_delta into a prefix."""
@@ -397,36 +360,73 @@ class TQTokenSource:
         return result
 
     def fetch_for_finalization(
-        self, staging_keys: list[str]
+        self,
+        staging_keys: list[str],
+        *,
+        include_route_fragments: bool = False,
     ) -> list[FetchedStagedCall]:
-        """Fetch only digest-covered columns plus required route length metadata."""
+        """Fetch digest-covered base columns, plus route payloads when requested.
+
+        Deferred mode (the default) never selects ``routed_experts`` — route
+        bytes stay in TQ for the policy worker. Direct mode passes
+        ``include_route_fragments=True`` to pull the payloads in the same
+        batched read and receives them as ``RouteFragment`` values beside the
+        base snapshots, never inside them.
+        """
         if not staging_keys:
             return []
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("finalization staging request contains duplicate keys")
         try:
-            rows = _call_dp(
-                self._dp_client,
-                "get_samples",
-                sample_ids=list(staging_keys),
-                partition_id=self._staging_partition,
-                select_fields=STAGING_FIELDS,
-            )
+            if include_route_fragments:
+                # Route payloads are optional per run (feature-gated at the
+                # worker); fall back to the base schema so extras-free rows
+                # keep fetching.
+                try:
+                    rows = _call_dp(
+                        self._dp_client,
+                        "get_samples",
+                        sample_ids=list(staging_keys),
+                        partition_id=self._staging_partition,
+                        select_fields=STAGING_FIELDS + [ROUTED_EXPERTS_FIELD],
+                    )
+                except Exception:  # noqa: BLE001 — field-not-present probe
+                    rows = _call_dp(
+                        self._dp_client,
+                        "get_samples",
+                        sample_ids=list(staging_keys),
+                        partition_id=self._staging_partition,
+                        select_fields=STAGING_FIELDS,
+                    )
+            else:
+                rows = _call_dp(
+                    self._dp_client,
+                    "get_samples",
+                    sample_ids=list(staging_keys),
+                    partition_id=self._staging_partition,
+                    select_fields=STAGING_FIELDS,
+                )
         except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
             raise KeyError(
                 f"staged rows for {len(staging_keys)} keys could not be "
                 f"fetched from {self._staging_partition!r}: {error}"
             ) from error
+        # TQ's kv path only errors when *zero* keys resolve; a partial miss
+        # returns fewer rows with no error. Guard explicitly so a lost row
+        # rejects the rollout as missing_staging_row instead of surfacing
+        # later as a misleading digest mismatch from misaligned zipping.
         n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
         if n_rows != len(staging_keys):
             raise KeyError(
                 f"staged rows missing: requested {len(staging_keys)} keys "
                 f"from {self._staging_partition!r}, got {n_rows} rows"
             )
+        # Row order mirrors the requested key order; digest recomputation at
+        # snapshot validation is the byte-exact backstop if that ever breaks.
         fetched: list[FetchedStagedCall] = []
         for index, key in enumerate(staging_keys):
             row = _select_row(rows, index)
-            snapshot = _row_to_snapshot(row, include_routes=False)
+            snapshot = _row_to_base_snapshot(row)
             if snapshot.staging_key != key:
                 raise KeyError(
                     f"staged row identity mismatch: requested {key!r}, got {snapshot.staging_key!r}"
@@ -436,6 +436,9 @@ class TQTokenSource:
                     staging_key=key,
                     snapshot=snapshot,
                     routed_len=_row_scalar_int(row, ROUTED_LEN_FIELD),
+                    fragment=(
+                        _row_to_route_fragment(row) if include_route_fragments else None
+                    ),
                 )
             )
         return fetched
@@ -444,7 +447,7 @@ class TQTokenSource:
 def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
     """Slice one row out of a batched fetch, restoring single-row shapes.
 
-    ``_row_to_snapshot`` predates batching and expects each field with a
+    ``_row_to_base_snapshot`` predates batching and expects each field with a
     leading batch dim of 1 (the shape a single-key ``get_samples`` returns),
     so re-add it after indexing. Indexing a nested tensor yields that row's
     dense component, which is exactly the jagged-row payload.
@@ -455,97 +458,93 @@ def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
     return row
 
 
-def _row_to_snapshot(row: Any, *, include_routes: bool) -> StagedCallSnapshot:
+def _row_leaf(row: Any, name: str) -> torch.Tensor:
+    value = row[name]
+    tensor = value[0] if value.dim() > 1 or value.numel() > 1 else value
+    return tensor.reshape(-1)
+
+
+def _row_text(row: Any, name: str) -> str:
+    return bytes(int(value) for value in _row_leaf(row, name).tolist()).decode("utf-8")
+
+
+def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
+    """Rebuild one normally validated base snapshot; route bytes never enter it."""
     # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-    from nemo_gym.token_id_capture.staging.records import StagedCallSnapshot
-
-    def _leaf(name: str) -> torch.Tensor:
-        value = row[name]
-        tensor = value[0] if value.dim() > 1 or value.numel() > 1 else value
-        return tensor.reshape(-1)
-
-    def _text(name: str) -> str:
-        return bytes(int(value) for value in _leaf(name).tolist()).decode("utf-8")
+    from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
 
     def _digest(name: str) -> str:
-        value = bytes(int(item) for item in _leaf(name).tolist())
+        value = bytes(int(item) for item in _row_leaf(row, name).tolist())
         if len(value) != 32:
             raise ValueError(f"{name} must contain exactly 32 bytes")
         return value.hex()
 
     def _optional_digest(name: str, present_name: str) -> str | None:
-        return _digest(name) if bool(_leaf(present_name)[0].item()) else None
+        return _digest(name) if bool(_row_leaf(row, present_name)[0].item()) else None
 
     parent_call_id = (
-        _text("parent_call_id_utf8")
-        if bool(_leaf("parent_call_id_present")[0].item())
+        _row_text(row, "parent_call_id_utf8")
+        if bool(_row_leaf(row, "parent_call_id_present")[0].item())
         else None
     )
-    mode_code = int(_leaf("capture_mode")[0].item())
+    mode_code = int(_row_leaf(row, "capture_mode")[0].item())
     try:
         mode = _CODE_TO_MODE[mode_code]
     except KeyError as error:
         raise ValueError(f"unknown capture_mode code {mode_code}") from error
-    extras = json.loads(_text(ROUTED_EXTRAS_METADATA_FIELD))
-    routed_encoding = int(_leaf(ROUTED_EXPERTS_ENCODING_FIELD)[0].item())
-    if routed_encoding != _ROUTE_ENCODING_NONE and include_routes:
-        try:
-            routed = row[ROUTED_EXPERTS_FIELD]
-        except KeyError as error:
-            raise KeyError(
-                "staged row metadata names routed_experts but its field is absent"
-            ) from error
-        experts = routed[0] if routed.dim() > 3 or routed.shape[0] == 1 else routed
-        if extras is None:
-            extras = {}
-        if not isinstance(extras, dict):
-            raise TypeError("staged extras metadata must decode to an object or null")
-        if routed_encoding == _ROUTE_ENCODING_ENVELOPE:
-            from nemo_rl.utils.routed_experts_codec import encode_routed_experts
-
-            extras[ROUTED_EXPERTS_FIELD] = encode_routed_experts(experts)
-        elif routed_encoding == _ROUTE_ENCODING_LIST:
-            extras[ROUTED_EXPERTS_FIELD] = experts.tolist()
-        else:
-            raise ValueError(f"unknown routed_experts_encoding {routed_encoding}")
-    elif routed_encoding not in (
-        _ROUTE_ENCODING_NONE,
-        _ROUTE_ENCODING_ENVELOPE,
-        _ROUTE_ENCODING_LIST,
+    routed_encoding = int(_row_leaf(row, ROUTED_EXPERTS_ENCODING_FIELD)[0].item())
+    if routed_encoding not in (
+        ROUTE_ENCODING_NONE,
+        ROUTE_ENCODING_ENVELOPE,
+        ROUTE_ENCODING_LIST,
     ):
         raise ValueError(f"unknown routed_experts_encoding {routed_encoding}")
 
-    values = dict(
-        schema_version=int(_leaf("schema_version")[0].item()),
-        digest_version=int(_leaf("digest_version")[0].item()),
-        extras_digest_version=int(_leaf("extras_digest_version")[0].item()),
-        rollout_id=_text("rollout_id_utf8"),
-        model_call_id=_text("model_call_id_utf8"),
+    return StagedCallBaseSnapshot(
+        schema_version=int(_row_leaf(row, "schema_version")[0].item()),
+        digest_version=int(_row_leaf(row, "digest_version")[0].item()),
+        extras_digest_version=int(_row_leaf(row, "extras_digest_version")[0].item()),
+        rollout_id=_row_text(row, "rollout_id_utf8"),
+        model_call_id=_row_text(row, "model_call_id_utf8"),
         parent_call_id=parent_call_id,
         mode=mode,
-        prev_len=int(_leaf("prev_len")[0].item()),
-        delta_len=int(_leaf("delta_len")[0].item()),
-        cum_len=int(_leaf("cum_len")[0].item()),
-        weight_version=int(_leaf("weight_version")[0].item()),
+        prev_len=int(_row_leaf(row, "prev_len")[0].item()),
+        delta_len=int(_row_leaf(row, "delta_len")[0].item()),
+        cum_len=int(_row_leaf(row, "cum_len")[0].item()),
+        weight_version=int(_row_leaf(row, "weight_version")[0].item()),
         digest=_digest("digest_bytes"),
-        token_ids_delta=[int(t) for t in _leaf("token_ids_delta").tolist()],
-        token_mask_delta=[float(m) for m in _leaf("token_mask_delta").tolist()],
+        token_ids_delta=[int(t) for t in _row_leaf(row, "token_ids_delta").tolist()],
+        token_mask_delta=[float(m) for m in _row_leaf(row, "token_mask_delta").tolist()],
         generation_log_probs_delta=[
-            float(p) for p in _leaf("generation_logprobs_delta").tolist()
+            float(p) for p in _row_leaf(row, "generation_logprobs_delta").tolist()
         ],
-        extras=extras,
         extras_digest=_digest("extras_digest_bytes"),
         chain_hash=_optional_digest("chain_hash_bytes", "chain_hash_present"),
         cumulative_hash=_optional_digest(
             "cumulative_hash_bytes", "cumulative_hash_present"
         ),
     )
-    if include_routes or routed_encoding == _ROUTE_ENCODING_NONE:
-        return StagedCallSnapshot(**values)
-    # Metadata-only deferred finalization deliberately leaves the heavy route
-    # fragment in TQ. The finalizer verifies its digest binding before
-    # publishing a route assembly plan.
-    return StagedCallSnapshot.model_construct(**values)
+
+
+def _row_to_route_fragment(row: Any) -> RouteFragment | None:
+    """Extract one staged route payload beside (never inside) the snapshot."""
+    routed_encoding = int(_row_leaf(row, ROUTED_EXPERTS_ENCODING_FIELD)[0].item())
+    if routed_encoding == ROUTE_ENCODING_NONE:
+        return None
+    try:
+        routed = row[ROUTED_EXPERTS_FIELD]
+    except KeyError as error:
+        raise KeyError(
+            "staged row metadata names routed_experts but its field is absent"
+        ) from error
+    experts = routed[0] if routed.dim() > 3 or routed.shape[0] == 1 else routed
+    return RouteFragment(
+        routes=experts,
+        encoding=routed_encoding,
+        extras_metadata_json=_row_text(row, ROUTED_EXTRAS_METADATA_FIELD).encode(
+            "utf-8"
+        ),
+    )
 
 
 def _row_scalar_int(row: Any, field_name: str) -> int:

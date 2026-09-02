@@ -14,25 +14,26 @@
 """Blackbox finalization: token-free receipts + staged deltas -> canonical rows.
 
 Orchestration only:
-per rollout, fetch the staged rows the receipt manifest names through the
-``TokenSource``, re-verify them (digest recomputation over fetched values,
-shape/mask/finite-logprob checks, length chaining, weight-version tag
-equality), then delegate semantics to Gym's pure ``linearize``
-(``main_chain_only`` + ``terminal_hint``). Any rejection becomes a masked
-placeholder row — the group always publishes exactly N rows so GRPO group
-shape survives; validity folds into ``sample_mask`` (no new train field) and
-placeholders copy ``prompt_ids_for_adv`` from a valid sibling so per-prompt
-baselines stay well-formed.
+per rollout, apply the rollout-level receipt guards, fetch the staged base
+rows the receipt manifest names through the ``TokenSource`` (normally
+validated ``StagedCallBaseSnapshot`` values), and delegate all token, digest,
+lineage, and terminal-chain semantics to Gym's ``verify_and_linearize``. Any
+rejection becomes a masked placeholder row — the group always publishes
+exactly N rows so GRPO group shape survives; validity folds into
+``sample_mask`` (no new train field) and placeholders copy
+``prompt_ids_for_adv`` from a valid sibling so per-prompt baselines stay
+well-formed.
 
-In deferred-route mode the finalizer reads only small columns, publishes a
-strict route plan beside each canonical row, and leaves staged route fragments
-live until policy consumption completes. The direct-route rollback path keeps
-the prior finalizer-side materialization behavior.
+Router replay runs one unified flow: both modes construct the same
+``RouteAssemblyPlan`` from Gym's link spans and extras commitments. Deferred
+mode publishes the encoded plan beside the canonical row and leaves staged
+route fragments live until policy consumption; direct mode executes the plan
+eagerly with fragments fetched in the same batch — any executor failure is a
+pre-publication ``route_assembly:<reason>`` rejection.
 """
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -43,19 +44,19 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.route_assembly import (
+    ROUTE_MISSING_SENTINEL,
+    RouteFragment,
+    execute_route_plan,
+)
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
     RouteAssemblyPlan,
     RouteSpan,
-    classify_route_span,
     encode_route_plan,
     encoded_route_plan_size_bytes,
+    validate_route_plan,
 )
-
-# Keep the finalizer importable in its CPU-only actor without importing the
-# generation package (which eagerly loads backend dependencies). This value is
-# the shared router-replay missing-route wire sentinel.
-_ROUTED_EXPERTS_SENTINEL = -1
 
 
 @dataclass(frozen=True)
@@ -73,9 +74,9 @@ class FinalizedRollout:
     staging_keys: list[str]
     min_wv: Optional[int] = None
     max_wv: Optional[int] = None
-    # Router replay (R3): [len(token_ids)][num_moe_layers][topk] from the
-    # rebuilt chain; None when the rollout staged no extras.
-    routed_experts: Optional[list] = None
+    # Router replay (R3): [len(token_ids), num_moe_layers, topk] int16 from
+    # the executed route plan; None when the rollout staged no routes.
+    routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
 
 
@@ -93,112 +94,6 @@ class FinalizedGroup:
     dropped: bool = False
     # Which policy dropped the group, for the caller's log line.
     drop_reason: Optional[str] = None
-
-
-def _linearize_metadata_only(receipt: Any, snapshots: list[Any]) -> Any:
-    """Linearize a verified chain while leaving digest-bound route bytes in TQ."""
-    from nemo_gym.token_id_capture.staging.rebuild import (
-        LinearizedRow,
-        RebuildError,
-        WeightVersionSpan,
-    )
-
-    records = {record.model_call_id: record for record in receipt.manifest}
-    staged = {snapshot.model_call_id: snapshot for snapshot in snapshots}
-    for model_call_id, record in records.items():
-        if record.parent_call_id is not None:
-            parent = records.get(record.parent_call_id)
-            if parent is None:
-                raise RebuildError(
-                    "missing_parent",
-                    f"call {model_call_id} names absent parent {record.parent_call_id}",
-                )
-            if parent.cum_len != record.prev_len:
-                raise RebuildError(
-                    "parent_length_mismatch",
-                    f"call {model_call_id} starts at {record.prev_len}, parent ends at {parent.cum_len}",
-                )
-        visited: set[str] = set()
-        cursor = record
-        while cursor is not None:
-            if cursor.model_call_id in visited:
-                raise RebuildError(
-                    "lineage_cycle", f"cycle reaches call {cursor.model_call_id}"
-                )
-            visited.add(cursor.model_call_id)
-            cursor = (
-                records.get(cursor.parent_call_id)
-                if cursor.parent_call_id is not None
-                else None
-            )
-
-    terminal_id = receipt.terminal_model_call_id
-    if terminal_id is None or terminal_id not in records:
-        raise RebuildError(
-            "missing_terminal", "successful receipt has no terminal call"
-        )
-    chain = []
-    cursor = records[terminal_id]
-    while cursor is not None:
-        chain.append(cursor)
-        cursor = (
-            records.get(cursor.parent_call_id)
-            if cursor.parent_call_id is not None
-            else None
-        )
-    chain.reverse()
-
-    token_ids: list[int] = []
-    token_mask: list[float] = []
-    logprobs: list[float] = []
-    model_call_ids: list[str] = []
-    weight_versions: list[int] = []
-    weight_version_spans = []
-    link_spans: list[tuple[str, int, int]] = []
-    prompt_len = 0
-    for index, record in enumerate(chain):
-        snapshot = staged[record.model_call_id]
-        boundary = 0
-        for mask in snapshot.token_mask_delta:
-            if mask != 0.0:
-                break
-            boundary += 1
-        if boundary == len(snapshot.token_mask_delta) or any(
-            mask != 1.0 for mask in snapshot.token_mask_delta[boundary:]
-        ):
-            raise RebuildError(
-                "invalid_mask_order",
-                f"call {record.model_call_id} mask is not carry-then-generation",
-            )
-        start = len(token_ids)
-        token_ids.extend(snapshot.token_ids_delta)
-        token_mask.extend(snapshot.token_mask_delta)
-        logprobs.extend(snapshot.generation_log_probs_delta)
-        end = len(token_ids)
-        if index == 0:
-            prompt_len = boundary
-        model_call_ids.append(record.model_call_id)
-        weight_versions.append(record.weight_version)
-        weight_version_spans.append(
-            WeightVersionSpan(
-                model_call_id=record.model_call_id,
-                start=start,
-                end=end,
-                weight_version=record.weight_version,
-            )
-        )
-        link_spans.append((record.model_call_id, boundary, record.delta_len - boundary))
-    return LinearizedRow(
-        rollout_id=receipt.rollout_id,
-        token_ids=token_ids,
-        token_mask=token_mask,
-        logprobs=logprobs,
-        model_call_ids=model_call_ids,
-        prompt_len=prompt_len,
-        weight_versions=weight_versions,
-        weight_version_spans=weight_version_spans,
-        link_spans=link_spans,
-    )
 
 
 class BlackboxFinalizer:
@@ -249,7 +144,6 @@ class BlackboxFinalizer:
         substitutes a placeholder.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.digest import compute_staging_digest
         from nemo_gym.token_id_capture.staging.rebuild import (
             RebuildError,
             ReceiptVerificationError,
@@ -294,128 +188,39 @@ class BlackboxFinalizer:
         if len(records_by_call) != len(parsed.manifest):
             return rejected("duplicate_manifest_call_id", staging_keys)
 
+        fetch_fragments = (
+            self._router_replay_enabled and not self._defer_routed_experts_to_policy
+        )
         try:
-            fetched = (
-                self._source.fetch_for_finalization(staging_keys)
-                if self._defer_routed_experts_to_policy
-                else None
-            )
-            snapshots = (
-                [item.snapshot for item in fetched]
-                if fetched is not None
-                else self._source.fetch(staging_keys)
+            fetched = self._source.fetch_for_finalization(
+                staging_keys, include_route_fragments=fetch_fragments
             )
         except KeyError as error:
             return rejected(f"missing_staging_row:{error}", staging_keys)
         except (TypeError, ValueError) as error:
             return rejected(f"invalid_staging_row:{error}", staging_keys)
         fetched_by_call = {}
-        if fetched is not None:
-            for record, item in zip(parsed.manifest, fetched):
-                if item.staging_key != record.staging_key:
-                    return rejected(
-                        f"staging_key_mismatch:{record.model_call_id}", staging_keys
-                    )
-                if item.snapshot.model_call_id != record.model_call_id:
-                    return rejected(
-                        f"call_id_mismatch:{record.model_call_id}", staging_keys
-                    )
-                fetched_by_call[record.model_call_id] = item
-            if len(fetched_by_call) != len(fetched):
-                return rejected("duplicate_fetched_call_id", staging_keys)
+        for record, item in zip(parsed.manifest, fetched):
+            if item.staging_key != record.staging_key:
+                return rejected(
+                    f"staging_key_mismatch:{record.model_call_id}", staging_keys
+                )
+            if item.snapshot.model_call_id != record.model_call_id:
+                return rejected(
+                    f"call_id_mismatch:{record.model_call_id}", staging_keys
+                )
+            fetched_by_call[record.model_call_id] = item
+        if len(fetched_by_call) != len(fetched):
+            return rejected("duplicate_fetched_call_id", staging_keys)
 
-        for record, snapshot in zip(parsed.manifest, snapshots):
-            if not (
-                len(snapshot.token_ids_delta)
-                == len(snapshot.token_mask_delta)
-                == len(snapshot.generation_log_probs_delta)
-            ):
-                return rejected(
-                    f"misaligned_delta:{record.model_call_id}", staging_keys
-                )
-            if any(m not in (0.0, 1.0) for m in snapshot.token_mask_delta):
-                return rejected(
-                    f"invalid_token_mask:{record.model_call_id}", staging_keys
-                )
-            if any(not math.isfinite(p) for p in snapshot.generation_log_probs_delta):
-                return rejected(
-                    f"non_finite_logprob:{record.model_call_id}", staging_keys
-                )
-            if record.delta_len != len(snapshot.token_ids_delta) or (
-                snapshot.prev_len + record.delta_len != record.cum_len
-            ):
-                return rejected(f"length_mismatch:{record.model_call_id}", staging_keys)
-            compared_fields = (
-                "schema_version",
-                "digest_version",
-                "extras_digest_version",
-                "rollout_id",
-                "model_call_id",
-                "parent_call_id",
-                "mode",
-                "prev_len",
-                "delta_len",
-                "cum_len",
-                "weight_version",
-                "digest",
-                "extras_digest",
-                "chain_hash",
-                "cumulative_hash",
-            )
-            mismatch = next(
-                (
-                    field_name
-                    for field_name in compared_fields
-                    if getattr(snapshot, field_name)
-                    != (
-                        rollout_id
-                        if field_name == "rollout_id"
-                        else getattr(record, field_name)
-                    )
-                ),
-                None,
-            )
-            if mismatch is not None:
-                return rejected(
-                    f"{mismatch}_mismatch:{record.model_call_id}", staging_keys
-                )
-            try:
-                digest = compute_staging_digest(
-                    schema_version=snapshot.schema_version,
-                    digest_version=snapshot.digest_version,
-                    extras_digest_version=snapshot.extras_digest_version,
-                    rollout_id=rollout_id,
-                    model_call_id=record.model_call_id,
-                    parent_call_id=record.parent_call_id,
-                    mode=record.mode,
-                    prev_len=snapshot.prev_len,
-                    delta_len=snapshot.delta_len,
-                    cum_len=snapshot.cum_len,
-                    weight_version=snapshot.weight_version,
-                    token_ids_delta=snapshot.token_ids_delta,
-                    token_mask_delta=snapshot.token_mask_delta,
-                    generation_log_probs_delta=(snapshot.generation_log_probs_delta),
-                    extras_digest=snapshot.extras_digest,
-                    chain_hash=snapshot.chain_hash,
-                    cumulative_hash=snapshot.cumulative_hash,
-                )
-            except (TypeError, ValueError, OverflowError) as error:
-                return rejected(
-                    f"invalid_digest_input:{record.model_call_id}:{error}",
-                    staging_keys,
-                )
-            if digest != record.digest:
-                return rejected(f"digest_mismatch:{record.model_call_id}", staging_keys)
-
+        # All base token/digest/lineage/terminal semantics belong to Gym; the
+        # finalizer never re-verifies them.
         try:
-            row = (
-                _linearize_metadata_only(parsed, snapshots)
-                if self._defer_routed_experts_to_policy
-                else verify_and_linearize(parsed, snapshots)
-            )
+            row = verify_and_linearize(parsed, [item.snapshot for item in fetched])
         except (
             KeyError,
             ValueError,
+            TypeError,
             ReceiptVerificationError,
             RebuildError,
             NotImplementedError,
@@ -427,19 +232,26 @@ class BlackboxFinalizer:
             return rejected(f"mixed_weight_versions:{min_wv}..{max_wv}", staging_keys)
 
         route_plan = None
-        if self._router_replay_enabled and self._defer_routed_experts_to_policy:
-            link_spans = row.link_spans
-            if link_spans is None:
-                return rejected("missing_link_spans", staging_keys)
+        routed_experts: Optional[torch.Tensor] = None
+        if self._router_replay_enabled:
+            # One plan construction for both modes: join Gym's link spans and
+            # extras commitments with the fetch's staging keys and route
+            # lengths. Cleanup keys cover the whole manifest; off-chain rows
+            # stay cleanup-owned but produce no spans.
+            commitments_by_call = {
+                commitment.model_call_id: commitment
+                for commitment in row.extras_commitments
+            }
             route_spans: list[RouteSpan] = []
             seen_span_call_ids: set[str] = set()
-            for call_id, carry_len, generation_len in link_spans:
+            for call_id, carry_len, generation_len in row.link_spans:
                 if call_id in seen_span_call_ids:
                     return rejected(f"duplicate_route_span:{call_id}", staging_keys)
                 seen_span_call_ids.add(call_id)
                 record = records_by_call.get(call_id)
                 item = fetched_by_call.get(call_id)
-                if record is None or item is None:
+                commitment = commitments_by_call.get(call_id)
+                if record is None or item is None or commitment is None:
                     return rejected(f"route_span_identity:{call_id}", staging_keys)
                 if item.routed_len not in (0, record.delta_len):
                     return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
@@ -451,28 +263,39 @@ class BlackboxFinalizer:
                     return rejected(
                         f"route_carry_span_mismatch:{call_id}", staging_keys
                     )
-                span = RouteSpan(
-                    staging_key=record.staging_key,
-                    carry_len=int(carry_len),
-                    generation_len=int(generation_len),
-                    staged_route_len=item.routed_len,
-                    extras_digest_version=record.extras_digest_version,
-                    extras_digest=record.extras_digest,
+                route_spans.append(
+                    RouteSpan(
+                        staging_key=record.staging_key,
+                        carry_len=int(carry_len),
+                        generation_len=int(generation_len),
+                        staged_route_len=item.routed_len,
+                        extras_digest_version=commitment.extras_digest_version,
+                        extras_digest=commitment.extras_digest,
+                    )
                 )
-                classify_route_span(span)
-                route_spans.append(span)
             if sum(span.carry_len + span.generation_len for span in route_spans) != len(
                 row.token_ids
             ):
                 return rejected("route_span_length_mismatch", staging_keys)
-            route_plan = RouteAssemblyPlan(
+            plan = RouteAssemblyPlan(
                 schema_version=ROUTE_PLAN_SCHEMA_VERSION,
                 staging_partition=self._staging_partition,
                 spans=tuple(route_spans),
                 cleanup_staging_keys=tuple(staging_keys),
                 expected_token_length=len(row.token_ids),
             )
-            encode_route_plan(route_plan)
+            try:
+                validate_route_plan(plan)
+            except (TypeError, ValueError) as error:
+                return rejected(f"invalid_route_plan:{error}", staging_keys)
+            # Both modes carry the constructed plan on the rollout; only
+            # deferred mode publishes it (direct mode executes it eagerly and
+            # the published row carries the assembled tensor instead).
+            route_plan = plan
+            if not self._defer_routed_experts_to_policy:
+                routed_experts, failure = self._execute_direct_plan(plan, fetched)
+                if failure is not None:
+                    return rejected(f"route_assembly:{failure}", staging_keys)
 
         return FinalizedRollout(
             rollout_id=rollout_id,
@@ -486,14 +309,43 @@ class BlackboxFinalizer:
             staging_keys=staging_keys,
             min_wv=min_wv,
             max_wv=max_wv,
-            # getattr: pre-R3 Gym pins' LinearizedRow has no routed_experts;
-            # capture-R3 then degrades to the sentinel/group-drop path.
-            routed_experts=(
-                None
-                if self._defer_routed_experts_to_policy
-                else getattr(row, "routed_experts", None)
-            ),
+            routed_experts=routed_experts,
             route_plan=route_plan,
+        )
+
+    def _execute_direct_plan(
+        self,
+        plan: RouteAssemblyPlan,
+        fetched: list[Any],
+    ) -> tuple[Optional[torch.Tensor], Optional[str]]:
+        """Run the shared executor eagerly with locally fetched fragments.
+
+        Returns ``(None, None)`` when the rollout staged no routes at all —
+        the group tensor build fills those rows with sentinels, exactly like
+        a deferred row whose plan is all-sentinel.
+        """
+        fragments: dict[str, RouteFragment] = {
+            item.staging_key: item.fragment
+            for item in fetched
+            if item.fragment is not None
+        }
+        if not any(span.staged_route_len > 0 for span in plan.spans):
+            return None, None
+        if fragments:
+            # Direct mode has no policy model in-process; the fragments'
+            # own (num_moe_layers, topk) is the learned-dims heuristic, and
+            # the trainer's model-shape check remains authoritative.
+            first = next(iter(fragments.values())).routes
+            if first.dim() != 3:
+                return None, "fragment_rank"
+            self._routed_dims = (int(first.shape[1]), int(first.shape[2]))
+        if self._routed_dims is None:
+            return None, "missing_fragment"
+        return execute_route_plan(
+            plan,
+            fragments,
+            dims=self._routed_dims,
+            canonical_len=plan.expected_token_length,
         )
 
     # ── per group ───────────────────────────────────────────────────────────
@@ -660,7 +512,9 @@ class BlackboxFinalizer:
             "total_reward": rewards_t,
         }
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
-            has_routed_row = any(r.valid and r.routed_experts for r in rows)
+            has_routed_row = any(
+                r.valid and r.routed_experts is not None for r in rows
+            )
             if not has_routed_row and self._routed_dims is None and not valid_rows:
                 # Nothing to learn (L, K) from yet — e.g. an all-poisoned
                 # group before the first healthy rollout. Dropping loses no
@@ -783,9 +637,11 @@ class BlackboxFinalizer:
         of the run finalizes).
         """
         for row in rows:
-            if row.valid and row.routed_experts:
-                first = row.routed_experts[0]
-                self._routed_dims = (len(first), len(first[0]))
+            if row.valid and row.routed_experts is not None:
+                self._routed_dims = (
+                    int(row.routed_experts.shape[1]),
+                    int(row.routed_experts.shape[2]),
+                )
                 break
         if self._routed_dims is None:
             raise RuntimeError(
@@ -797,7 +653,7 @@ class BlackboxFinalizer:
         num_moe_layers, topk = self._routed_dims
         routed = torch.full(
             (len(rows), max_len, num_moe_layers, topk),
-            _ROUTED_EXPERTS_SENTINEL,
+            ROUTE_MISSING_SENTINEL,
             dtype=torch.int16,
         )
         rows_with_routes = 0
@@ -809,11 +665,11 @@ class BlackboxFinalizer:
                 continue
             valid_rows += 1
             covered_tokens += len(row.token_ids)
-            if not row.routed_experts:
+            if row.routed_experts is None:
                 sentinel_tokens += len(row.token_ids)
                 continue
             rows_with_routes += 1
-            row_routes = torch.tensor(row.routed_experts, dtype=torch.int16)
+            row_routes = row.routed_experts
             if row_routes.shape != (len(row.token_ids), num_moe_layers, topk):
                 raise RuntimeError(
                     "rebuilt routed_experts shape "
@@ -823,7 +679,7 @@ class BlackboxFinalizer:
                 )
             routed[i, : row_routes.shape[0]] = row_routes
             sentinel_tokens += int(
-                row_routes.eq(_ROUTED_EXPERTS_SENTINEL).all(-1).all(-1).sum().item()
+                row_routes.eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
             )
         if valid_rows:
             metrics["finalize/routed_experts_row_coverage"] = (

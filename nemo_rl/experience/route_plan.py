@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 ROUTE_PLAN_SCHEMA_VERSION = 2
 _EXTRAS_DIGEST_VERSION = 1
@@ -26,7 +26,12 @@ _SHA256_HEX_LENGTH = 64
 
 @dataclass(frozen=True)
 class RouteSpan:
-    """One root-first route contribution to a canonical rollout row."""
+    """One root-first route contribution to a canonical rollout row.
+
+    How a span contributes (full/tail/sentinel) is Gym's decision table —
+    ``nemo_gym.token_id_capture.staging.routes.classify_route_span`` — applied
+    by the shared plan executor; this module carries metadata only.
+    """
 
     staging_key: str
     carry_len: int
@@ -45,19 +50,6 @@ class RouteAssemblyPlan:
     spans: tuple[RouteSpan, ...]
     cleanup_staging_keys: tuple[str, ...]
     expected_token_length: int
-
-
-RouteSpanMode = Literal["full", "tail", "sentinel"]
-
-
-def classify_route_span(span: RouteSpan) -> RouteSpanMode:
-    """Apply Gym's route-linearization decision table using metadata only."""
-    expected = span.carry_len + span.generation_len
-    if span.staged_route_len > 0 and span.staged_route_len == expected:
-        return "full"
-    if span.staged_route_len > 0 and 0 < span.generation_len <= span.staged_route_len:
-        return "tail"
-    return "sentinel"
 
 
 def _require_exact_keys(
@@ -144,7 +136,6 @@ def _validate_plan(plan: RouteAssemblyPlan) -> None:
                 f"route_plan.spans[{index}] key {span.staging_key!r} is outside "
                 "cleanup_staging_keys"
             )
-        classify_route_span(span)
     if plan.spans:
         contribution = sum(span.carry_len + span.generation_len for span in plan.spans)
         if contribution != plan.expected_token_length:
@@ -152,6 +143,11 @@ def _validate_plan(plan: RouteAssemblyPlan) -> None:
                 f"route plan spans contribute {contribution} tokens, expected "
                 f"{plan.expected_token_length}"
             )
+
+
+def validate_route_plan(plan: RouteAssemblyPlan) -> None:
+    """Validate a plan without encoding it (direct mode never serializes)."""
+    _validate_plan(plan)
 
 
 def encode_route_plan(plan: RouteAssemblyPlan) -> dict[str, Any]:
