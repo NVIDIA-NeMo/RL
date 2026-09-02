@@ -212,6 +212,13 @@ Run async GRPO or PPO via the SingleController path: TransferQueue data plane, p
 Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable RL.
 :::
 
+:::{grid-item-card} {octicon}`shield-check` Generation Fault Tolerance
+:link: design-docs/single-controller-fault-tolerance
+:link-type: doc
+
+Keep training when a generation shard dies: which transports and backends support it, and what happens in each failure case.
+:::
+
 :::{grid-item-card} {octicon}`bug` Debugging
 :link: debugging
 :link-type: doc
@@ -384,6 +391,7 @@ design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/nccl-reshard-refit.md
+design-docs/single-controller-fault-tolerance.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
 ```
