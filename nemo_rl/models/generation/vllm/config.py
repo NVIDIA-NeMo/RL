@@ -210,7 +210,7 @@ class VllmConfig(GenerationConfig):
     refit_cfg: NotRequired[VllmRefitConfig | None]
     # LoRA policies use vLLM's factorized adapter runtime by default. Set to
     # ``merged`` to opt into materializing and refitting full ``W + BA`` weights.
-    lora_refit_mode: NotRequired[LoraRefitMode]
+    lora_refit_mode: LoraRefitMode
 
     # quantization config
     quant_cfg: NotRequired[str | None]
@@ -342,14 +342,15 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
 def configure_vllm_lora_refit(policy_config: Mapping[str, Any]) -> None:
     """Validate and materialize vLLM's LoRA refit representation.
 
-    When LoRA training is enabled, an omitted mode resolves to native refit;
-    merged full-weight materialization must be selected explicitly.
+    Exemplar configs select native refit for LoRA training; merged full-weight
+    materialization must be selected explicitly.
 
     Args:
         policy_config: Complete policy config containing training and generation
             backend settings.
 
     Raises:
+        KeyError: If LoRA is enabled but ``lora_refit_mode`` is missing.
         ValueError: If native refit is selected for an unsupported policy,
             transport, engine mode, precision, or vLLM LoRA configuration.
     """
@@ -376,7 +377,7 @@ def configure_vllm_lora_refit(policy_config: Mapping[str, Any]) -> None:
     if not dtensor_lora_enabled and not megatron_lora_enabled:
         return
 
-    mode = generation_config.setdefault("lora_refit_mode", "native")
+    mode = generation_config["lora_refit_mode"]
     if mode not in ("native", "merged"):
         raise ValueError(
             "LoRA training with vLLM requires "
