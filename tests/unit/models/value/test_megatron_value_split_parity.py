@@ -14,8 +14,6 @@
 
 """GPU A/B for a synchronous critic step vs two split-API chunks."""
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 import ray
@@ -39,7 +37,7 @@ NUM_GPUS = 2
 SEQ_LEN = 64
 
 
-def _make_value(model_name: str, cluster_name: str, **checkpoint_paths):
+def _make_value(model_name: str, cluster_name: str):
     cluster = RayVirtualCluster(
         name=cluster_name,
         bundle_ct_per_node_list=[NUM_GPUS],
@@ -53,7 +51,6 @@ def _make_value(model_name: str, cluster_name: str, **checkpoint_paths):
         cluster=cluster,
         config=config,
         tokenizer=tokenizer,
-        **checkpoint_paths,
     )
     return value, cluster, config
 
@@ -87,9 +84,9 @@ def _run_split(value: Value, data: BatchedDataDict, loss_fn, gbs: int, mbs: int)
     )
     for start in (0, gbs // 2):
         chunk = data.slice(start, start + gbs // 2)
-        sharded, _ = chunk.shard_by_batch_size(
+        sharded = chunk.shard_by_batch_size(
             value.sharding_annotations.get_axis_size("data_parallel"),
-            batch_size=None,
+            batch_size=gbs // 2,
         )
         wg.get_all_worker_results(
             wg.run_all_workers_sharded_data(
@@ -108,9 +105,7 @@ def _run_split(value: Value, data: BatchedDataDict, loss_fn, gbs: int, mbs: int)
                 ],
             )
         )
-    finished = ray.get(
-        wg.run_all_workers_single_data("finish_train_step_presharded")
-    )
+    finished = ray.get(wg.run_all_workers_single_data("finish_train_step_presharded"))
     value.finish_training()
     return _aggregate_train_results(
         [result for result in finished if result.get("is_replica_leader", True)]
@@ -129,9 +124,7 @@ def _reduce_metric(key: str, values: list) -> float:
 
 @pytest.mark.hf_gated
 @pytest.mark.timeout(600)
-def test_two_split_critic_chunks_match_one_sync_step(
-    tiny_qwen2_model_path, tmp_path
-):
+def test_two_split_critic_chunks_match_one_sync_step(tiny_qwen2_model_path):
     loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=0.5))
     sync_value, sync_cluster, config = _make_value(
         tiny_qwen2_model_path, "critic-parity-sync"
@@ -139,12 +132,7 @@ def test_two_split_critic_chunks_match_one_sync_step(
     gbs = config["train_global_batch_size"]
     mbs = config["train_micro_batch_size"]
     data = _make_batch(gbs)
-    weights_path = Path(tmp_path) / "initial" / "weights"
-    optimizer_path = Path(tmp_path) / "initial" / "optimizer"
     try:
-        sync_value.save_checkpoint(
-            weights_path=str(weights_path), optimizer_path=str(optimizer_path)
-        )
         sync_value.prepare_for_training()
         sync_result = sync_value.train(data, loss_fn)
         sync_value.finish_training()
@@ -152,11 +140,11 @@ def test_two_split_critic_chunks_match_one_sync_step(
         sync_value.shutdown()
         sync_cluster.shutdown()
 
+    # Fresh workers load the same tiny checkpoint and deterministic seed, so both
+    # paths start with identical model and optimizer state. Saving a distributed
+    # optimizer before its first step is unsupported by Megatron Core.
     split_value, split_cluster, _ = _make_value(
-        tiny_qwen2_model_path,
-        "critic-parity-split",
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
+        tiny_qwen2_model_path, "critic-parity-split"
     )
     try:
         split_result = _run_split(split_value, data, loss_fn, gbs, mbs)
@@ -173,9 +161,7 @@ def test_two_split_critic_chunks_match_one_sync_step(
         rtol=1e-3,
         atol=1e-5,
     )
-    assert set(split_result["all_mb_metrics"]) == set(
-        sync_result["all_mb_metrics"]
-    )
+    assert set(split_result["all_mb_metrics"]) == set(sync_result["all_mb_metrics"])
     for key in sorted(sync_result["all_mb_metrics"]):
         assert _reduce_metric(
             key, split_result["all_mb_metrics"][key]
