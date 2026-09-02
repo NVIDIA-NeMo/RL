@@ -927,17 +927,26 @@ def grpo_train_sync(
                     policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...", flush=True)
+                num_iterations = master_config.grpo.num_iterations
                 with timer.time("policy_training"):
-                    # Meta-driven train: workers fetch the union of
-                    # rollout + driver-written + worker-written columns
-                    # from TQ, train, return aggregated metrics via Ray.
-                    train_results = policy.train_from_meta(
-                        meta,
-                        loss_fn=loss_fn,
-                        timer=timer,
-                        train_fields=train_fields,
-                    )
+                    for iteration in range(num_iterations):
+                        print(
+                            f"▶ Training policy iteration {iteration + 1}/{num_iterations}...",
+                            flush=True,
+                        )
+                        # Meta-driven train: workers fetch the union of
+                        # rollout + driver-written + worker-written columns
+                        # from TQ, train, return aggregated metrics via Ray.
+                        train_results = policy.train_from_meta(
+                            meta,
+                            loss_fn=loss_fn,
+                            timer=timer,
+                            train_fields=train_fields,
+                        )
+                        print(
+                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}",
+                            flush=True,
+                        )
 
                 if sync_kv_scales:
                     with timer.time("recompute_kv_scales"):

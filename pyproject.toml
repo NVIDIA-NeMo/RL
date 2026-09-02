@@ -333,6 +333,7 @@ members = [
   # nemo-rl's uv.lock you'll see it's 1.X b/c megatron mandates 1.X in the optional dependencies, so
   # globally we must choose 1.X otherwise we run into pickle issues from ray.
   "research/template_project",
+  "research/gdpo",
 ]
 
 [[tool.uv.index]]
