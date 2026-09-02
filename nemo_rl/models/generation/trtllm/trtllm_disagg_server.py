@@ -237,6 +237,7 @@ def _build_adaptor_class() -> type:
             "nemo_ctx_queued_ts_us",
             "nemo_ctx_first_scheduled_ts_us",
             "nemo_ctx_done_ts_us",
+            "nemo_ctx_cached_tokens",
         )
 
         def on_ctx_resp(self, ctx_server: str, response: Any) -> None:
