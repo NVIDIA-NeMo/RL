@@ -442,9 +442,10 @@ class VllmInternalWorkerExtension:
         storage and no-op.
 
         Only called when the incoming draft weights actually contain an
-        lm_head update: head-less drafts WANT the sharing to persist — their
-        draft logits must track the target's live head. Embedding sharing is
-        likewise left intact.
+        lm_head update: head-less drafts (DFlash, official contract) WANT the
+        sharing to persist — their draft logits must track the target's live
+        head. Embedding sharing is likewise left intact (the mask row rides
+        the target's ``embed_tokens``).
         """
         target_model = getattr(self.model_runner, "model", None)
         if target_model is not None and hasattr(target_model, "get_language_model"):

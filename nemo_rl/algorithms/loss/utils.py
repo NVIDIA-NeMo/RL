@@ -288,6 +288,69 @@ def compute_draft_pass_valid_counts(
     return counts
 
 
+def block_draft_slot_mask(
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    anchors: torch.Tensor,
+    anchor_valid: torch.Tensor,
+    *,
+    gamma: int,
+) -> torch.Tensor:
+    """Validity mask ``[B, N, gamma]`` for DFlash block draft slots.
+
+    Slot ``j`` of a block anchored at ``p`` predicts ``x_{p + 1 + j}``; it is
+    valid when the block is real (``anchor_valid``), the label position is in
+    bounds, the label token is trained (``token_mask``), and the sample is
+    valid. Anchors near the sequence end keep their in-bounds slots instead of
+    being rejected outright (see the CP design note's packing issue ③).
+
+    Validity is PREFIX-CONTIGUOUS along the slot axis: once a slot is invalid
+    every later slot is too. A speculative block at serving time never spans a
+    user/tool/prefill hole, so an anchor whose labels cross such a hole must
+    not train the slots beyond it (multi-turn data would otherwise resurrect
+    slots on the far side of the hole).
+    """
+    batch_size, seq_len = token_mask.shape
+    num_anchors = anchors.shape[1]
+    label_pos = (
+        anchors.unsqueeze(-1)
+        + 1
+        + torch.arange(gamma, device=anchors.device).view(1, 1, -1)
+    )
+    in_bounds = label_pos < seq_len
+    label_pos_clamped = label_pos.clamp(max=seq_len - 1)
+    label_token_mask = torch.gather(
+        token_mask, 1, label_pos_clamped.reshape(batch_size, -1)
+    ).reshape(batch_size, num_anchors, gamma)
+    slot_mask = (
+        anchor_valid.unsqueeze(-1)
+        & in_bounds
+        & (label_token_mask > 0.5)
+        & (sample_mask.view(-1, 1, 1) > 0.5)
+    )
+    return torch.cumprod(slot_mask.to(torch.int32), dim=-1).bool()
+
+
+def compute_block_draft_slot_valid_counts(
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    anchors: torch.Tensor,
+    anchor_valid: torch.Tensor,
+    *,
+    gamma: int,
+) -> torch.Tensor:
+    """Local per-slot valid counts ``[gamma]`` for the block draft loss.
+
+    The block analogue of :func:`compute_draft_pass_valid_counts` (same
+    DP-only all-reduce contract and the same denominator/metric consumption
+    in the loss): entry ``j`` counts this rank's valid slot-``j`` CE targets.
+    """
+    slot_mask = block_draft_slot_mask(
+        token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
+    )
+    return slot_mask.float().sum(dim=(0, 1))
+
+
 def _pack_input_ids(
     input_ids: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
