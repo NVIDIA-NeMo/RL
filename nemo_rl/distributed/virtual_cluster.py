@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import random
 import socket
 import sys
 import time
@@ -187,13 +188,23 @@ def _bind_socket_in_range(
     port_range_high: int,
     max_retries: int | None = 50,
     excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
 ) -> int:
     """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
     When *max_retries* is ``None``, try every non-excluded port once. Otherwise,
     preserve the existing bounded random-retry behavior.
+
+    Args:
+        rng: Source of candidate ports. Defaults to the ``random`` module. That
+            module's state is process-wide and seeded per run, so every rank of a
+            job draws the same sequence; ranks sharing a node then contend for one
+            port, and whichever binds after the others have closed silently reuses
+            it. Pass a rank-seeded ``random.Random`` to decorrelate them.
+
+    Raises ``RuntimeError`` after *max_retries* failed attempts.
     """
-    import random
+    rng = rng if rng is not None else random
 
     excluded = excluded_ports or set()
     if max_retries is None:
@@ -202,7 +213,7 @@ def _bind_socket_in_range(
             for port in range(port_range_low, port_range_high)
             if port not in excluded
         ]
-        random.shuffle(candidates)
+        rng.shuffle(candidates)
         for port in candidates:
             try:
                 sock.bind(("", port))
@@ -212,7 +223,7 @@ def _bind_socket_in_range(
         retry_description = f"all {len(candidates)} available ports"
     else:
         for _ in range(max_retries):
-            port = random.randint(port_range_low, port_range_high - 1)
+            port = rng.randint(port_range_low, port_range_high - 1)
             if port in excluded:
                 continue
             try:
@@ -234,7 +245,15 @@ def _get_free_port_local(
     *,
     max_retries: int | None = 50,
     excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
 ) -> int:
+    """Find a free port, holding it only long enough to learn its number.
+
+    Args:
+        rng: Source of candidate ports; see :func:`_bind_socket_in_range`. Callers
+            that run on several ranks of one node should pass a rank-seeded
+            generator, or they will all be handed the same port.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         port = _bind_socket_in_range(
             s,
@@ -242,6 +261,7 @@ def _get_free_port_local(
             port_range_high,
             max_retries=max_retries,
             excluded_ports=excluded_ports,
+            rng=rng,
         )
         s.listen(1)
 
