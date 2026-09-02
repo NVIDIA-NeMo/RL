@@ -21,6 +21,12 @@ This module provides different advantage estimation strategies:
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
+
+Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts ``valid_mask``
+and must honor it: the SingleController always passes ``sample_mask`` as
+``valid_mask`` so token-capture placeholder rows (and sequence-logprob-error
+masked rows) do not vote in their siblings' baselines.
+
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
@@ -140,6 +146,7 @@ class GDPOAdvantageEstimator:
         rewards,
         mask,
         repeated_batch,
+        valid_mask=None,
         **kwargs,
     ):
         """Compute GDPO advantages.
@@ -149,6 +156,11 @@ class GDPOAdvantageEstimator:
             rewards: Unused; for interface consistency.
             repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward components should participate in the per-prompt baseline/std.
+                  Token-capture placeholder rows carry 0.0 (their sample_mask already
+                  excludes them from the loss; excluding them here keeps siblings'
+                  baselines unbiased). None keeps the legacy all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -173,7 +185,8 @@ class GDPOAdvantageEstimator:
                 "Provide exactly one weight per component, ordered alphabetically by "
                 "component name (matching the sorted reward/<name> keys)."
             )
-        valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
+        reference = repeated_batch[reward_component_keys[0]]
+        valid = torch.ones_like(reference) if valid_mask is None else valid_mask.float()
         leave_one_out = self.use_leave_one_out_baseline
         assert prompt_ids.shape[0] == valid.shape[0], (
             "prompt_ids must match reward batch size; "
@@ -235,6 +248,7 @@ class ReinforcePlusPlusAdvantageEstimator:
         *,
         logprobs_policy=None,
         logprobs_reference=None,
+        valid_mask=None,
         **kwargs,
     ):
         """Compute Reinforce++ advantages with optional KL penalty.
@@ -247,6 +261,11 @@ class ReinforcePlusPlusAdvantageEstimator:
                   that only considers valid tokens.
             logprobs_policy: Policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
             logprobs_reference: Reference policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward should participate in the per-prompt mean baseline. Token-capture
+                  placeholder rows carry 0.0 (their sample_mask already excludes them from
+                  the loss; excluding them here keeps siblings' baselines unbiased).
+                  None keeps the legacy all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -257,7 +276,7 @@ class ReinforcePlusPlusAdvantageEstimator:
             mean, _ = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 rewards,
-                torch.ones_like(rewards),
+                torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
                 leave_one_out_baseline=False,
             )
             adv = rewards - mean
