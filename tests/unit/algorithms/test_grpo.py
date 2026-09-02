@@ -3836,6 +3836,13 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
     policy.offload_after_refit.side_effect = lambda *a, **k: events.append(
         "offload_after_refit"
     )
+    post_save_refits = []
+
+    def record_refit(*args: Any, **kwargs: Any) -> dict[str, float]:
+        if ("save", 2) in events:
+            events.append("backend_refit")
+            post_save_refits.append((args, kwargs))
+        return {}
 
     def record_save(step, *args, **kwargs):
         events.append(("save", step))
@@ -3849,6 +3856,10 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
             mock_batch, mock_rollout_metrics, collector_events=events
         ),
         _patched_logprob_phase(policy),
+        patch(
+            "nemo_rl.algorithms.grpo.refit_policy_generation",
+            side_effect=record_refit,
+        ),
         patch("nemo_rl.algorithms.grpo.torch.save"),
     ):
         async_grpo_train(
@@ -3881,8 +3892,7 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
         "offload_before_refit",
         "set_weight_version",
         ("save", 2),
-        "offload_after_refit",
-        "wake_engine",
+        "backend_refit",
         "resume_after_refit",
         # Step 3 (last step saves): same deferral, but no wake — the loop exits.
         ("finish_generation", True),
@@ -3890,6 +3900,9 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
         "set_weight_version",
         ("save", 3),
     ]
+    assert post_save_refits == [((policy, policy_generation, True), {})]
+    policy.offload_after_refit.assert_not_called()
+    policy_generation.prepare_for_generation.assert_not_called()
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])

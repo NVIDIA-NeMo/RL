@@ -5780,10 +5780,15 @@ def async_grpo_train(
                         or should_save_by_timeout
                         or early_stop_message is not None
                     ):
-                        # The save onloaded model+optimizer;
-                        # generation windows must start from the offloaded state.
-                        policy.offload_after_refit()
-                        policy_generation.prepare_for_generation()
+                        # Preserve the backend's wake and offload semantics.
+                        assert (
+                            getattr(policy_generation, "weight_synchronizer", None)
+                            is not None
+                        ), "defer_wake_for_save requires a weight synchronizer"
+                        with timer.time("post_checkpoint_refit"):
+                            refit_policy_generation(
+                                policy, policy_generation, colocated_inference
+                            )
                         ray.get(trajectory_collector.resume_after_refit.remote())
 
             # Logging
