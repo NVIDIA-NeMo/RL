@@ -23,6 +23,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     BlockDraftLossFn,
     DraftCrossEntropyLossFn,
     DraftTTTCrossEntropyLossFn,
+    DSparkBlockLossFn,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -251,10 +252,13 @@ class DraftLossWrapper:
     ``ttt_steps > 1`` selects the multi-pass loss
     (:class:`DraftTTTCrossEntropyLossFn`), which returns per-pass metrics
     alongside the loss and needs ``global_draft_pass_counts``. Block drafts
-    are detected from ``data_dict["draft_block_logits"]`` (stashed by the
-    train loop) and use :class:`BlockDraftLossFn`. ``draft_loss_kwargs`` are
-    the selected LossFn's remaining ctor kwargs — ``slot_weights`` for block
-    drafts, ``pass_weights`` / ``seq_chunk_size`` for the multi-pass loss.
+    are detected from the tensors the train loop stashed:
+    ``data_dict["draft_block_logits"]`` selects :class:`BlockDraftLossFn`
+    (soft CE), plus ``data_dict["draft_confidence_pred"]`` selects
+    :class:`DSparkBlockLossFn` (the official hard-CE + TV + confidence
+    loss). ``draft_loss_kwargs`` are the selected LossFn's remaining ctor
+    kwargs — ``slot_weights`` (+ dspark alphas) for block drafts,
+    ``pass_weights`` / ``seq_chunk_size`` for the multi-pass loss.
     """
 
     def __init__(
@@ -301,8 +305,14 @@ class DraftLossWrapper:
                 "the unpacked [B, S] layout."
             )
         draft_loss_kwargs = draft_loss_kwargs or {}
-        if self.block_draft:
-            self.draft_loss_fn: Any = BlockDraftLossFn(
+        if self.block_draft and "draft_confidence_pred" in data_dict:
+            self.draft_loss_fn: Any = DSparkBlockLossFn(
+                vocab_parallel_group=vocab_parallel_group,
+                vocab_parallel_rank=vocab_parallel_rank,
+                **draft_loss_kwargs,
+            )
+        elif self.block_draft:
+            self.draft_loss_fn = BlockDraftLossFn(
                 vocab_parallel_group=vocab_parallel_group,
                 **draft_loss_kwargs,
             )

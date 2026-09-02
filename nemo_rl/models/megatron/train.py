@@ -226,11 +226,11 @@ def _run_block_draft_forward(
     captured_states: Any,
     data_dict: BatchedDataDict[Any],
 ) -> torch.Tensor:
-    """Run the DFlash block-draft forward for one microbatch.
+    """Run the DFlash/DSpark block-draft forward for one microbatch.
 
     Returns prediction-slot logits ``[B, N, gamma, V_local]`` aligned with
     labels ``x_{p+1} .. x_{p+gamma}`` per anchor ``p`` (DFlash's bonus anchor
-    slot is dropped).
+    slot is dropped; DSpark's teacher-forced Markov bias is added).
 
     Following the official DFlash contract the draft owns neither an LM head
     nor a mask embedding: logits are projected through the policy's LIVE head
@@ -254,6 +254,10 @@ def _run_block_draft_forward(
     data_dict["draft_anchor_positions"] = anchors
     data_dict["draft_anchor_valid"] = anchor_valid
 
+    method_kwargs = {}
+    if draft_model.speculator_type == "dspark":
+        # Teacher-forces the Markov/confidence heads inside the forward.
+        method_kwargs["input_ids"] = data_dict["input_ids"]
     draft_out = draft_model(
         taps=captured_states.hidden_states,
         input_embeds=captured_states.inputs_embeds,
@@ -263,11 +267,16 @@ def _run_block_draft_forward(
         mask_embedding=get_policy_embedding_row(
             model, draft_model.mask_token_id
         ).detach(),
+        **method_kwargs,
     )
     if draft_model.speculator_type == "dflash":
         # Slot 0 is the anchor bonus slot (condition only); the gamma mask
         # slots align with labels x_{p+1} .. x_{p+gamma}.
         return draft_out[:, :, 1:, :]
+    elif draft_model.speculator_type == "dspark":
+        block_logits, confidence_pred = draft_out
+        data_dict["draft_confidence_pred"] = confidence_pred
+        return block_logits
     raise ValueError(
         f"Unknown block-draft speculator_type '{draft_model.speculator_type}'."
     )
@@ -400,7 +409,10 @@ def forward_with_post_processing_fn(
             )
 
         captured_states = capture.get_captured_states()
-        if getattr(draft_model, "speculator_type", "eagle3") == "dflash":
+        if getattr(draft_model, "speculator_type", "eagle3") in (
+            "dflash",
+            "dspark",
+        ):
             data_dict["draft_block_logits"] = _run_block_draft_forward(
                 model=model,
                 draft_model=draft_model,
@@ -613,7 +625,7 @@ class LossPostProcessor:
         if eagle_module is not None:
             self.d2t = getattr(eagle_module, "d2t", None)
         else:
-            # Block drafts (DFlash) train full-vocab in v1 (no d2t).
+            # Block drafts (DFlash/DSpark) train full-vocab in v1 (no d2t).
             self.d2t = None
 
     def __call__(
@@ -767,6 +779,14 @@ class LossPostProcessor:
                             draft_cfg.get("loss_weighting"), int(draft_cfg["gamma"])
                         )
                     }
+                    if "draft_confidence_pred" in data_dict:
+                        for key in (
+                            "ce_loss_alpha",
+                            "tv_loss_alpha",
+                            "confidence_head_alpha",
+                        ):
+                            if draft_cfg.get(key) is not None:
+                                draft_loss_kwargs[key] = float(draft_cfg[key])
                 elif ttt_steps > 1:
                     draft_loss_kwargs = {
                         "pass_weights": draft_cfg.get("ttt_pass_weights")

@@ -517,19 +517,20 @@ class DraftConfig(TypedDict):
     # stock single-pass eagle3 loss keeps the unchunked path. Default in the
     # exemplar YAML: 4096.
     loss_seq_chunk_size: NotRequired[int | None]
-    # Speculator family: "eagle3" (default), or the block drafter "dflash"
-    # (vLLM >= 0.25 serving; anchor + mask-token blocks, bidirectional
-    # in-block attention, trunk truncated at the anchor; additionally
-    # requires PP == 1). Matches vLLM's speculative_config method naming.
+    # Speculator family: "eagle3" (default), or the block drafters "dflash"
+    # (vLLM >= 0.25 serving) / "dspark" (vLLM >= 0.26): anchor + mask-token
+    # blocks, bidirectional in-block attention, trunk truncated at the
+    # anchor; additionally require PP == 1. Matches vLLM's speculative_config
+    # method naming.
     speculator_type: NotRequired[str]
-    # ---- dflash only ----
+    # ---- dflash/dspark only ----
     # Speculated tokens per block (vLLM num_speculative_tokens).
     gamma: NotRequired[int]
     # Anchors sampled per sequence (static shape).
     anchors_per_seq: NotRequired[int]
     # Restrict anchors to generation segments (token_loss_mask == 1 labels).
     anchor_from_generation_only: NotRequired[bool]
-    # Reserved, unused-in-data token id (required for dflash). Mask
+    # Reserved, unused-in-data token id (required for dflash/dspark). Mask
     # slots embed via the target's FROZEN embedding row at this id (official
     # DFlash contract; never trained).
     mask_token_id: NotRequired[int | None]
@@ -538,6 +539,15 @@ class DraftConfig(TypedDict):
     # w_j = exp(-j / gamma_d), gamma_d tabulated by block size (b8 -> 4,
     # b10 -> 5, b16 -> 7; interpolated otherwise).
     loss_weighting: NotRequired[str | None]
+    # DSpark Markov-head rank. Null = the checkpoint config's markov_rank
+    # (64 for checkpoint-less builds); an explicit value must match the ckpt.
+    markov_rank: NotRequired[int | None]
+    # DSpark loss mix: ce * hard-label CE + tv * TV distillation
+    # + confidence * BCE(confidence head, TV acceptance rate).
+    # Defaults = official dspark_qwen3_8b (0.1 / 0.9 / 1.0).
+    ce_loss_alpha: NotRequired[float]
+    tv_loss_alpha: NotRequired[float]
+    confidence_head_alpha: NotRequired[float]
     # Trunk-attention bucketing granularity in tokens (correctness-neutral).
     trunk_chunk: NotRequired[int]
     # Per-head q/k RMSNorm in the draft attention (Qwen3 style).
