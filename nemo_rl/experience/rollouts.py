@@ -2790,14 +2790,23 @@ def _postprocess_single_nemo_gym_group(
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        for nemo_gym_row, result in zip(nemo_gym_rows, results):
+        agent_to_truncations: dict[str, list[bool]] = defaultdict(list)
+        for nemo_gym_row, result, sample_metrics in zip(
+            nemo_gym_rows, results, all_sample_metrics
+        ):
             agent_ref = nemo_gym_row["agent_ref"]
             agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
+            agent_to_truncations[agent_name].append(sample_metrics["hit_max_tokens"])
             result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
+            agent_truncations = agent_to_truncations[agent_name]
+            per_agent_metrics[f"{agent_name}/truncation_rate"] = sum(
+                agent_truncations
+            ) / len(agent_truncations)
+
             keys = agent_results[0].keys()
             for key in keys:
                 values = [

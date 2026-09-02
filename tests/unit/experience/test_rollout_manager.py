@@ -469,6 +469,23 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+def test_nemo_gym_rollout_metrics_include_per_agent_truncation_rate():
+    completions = [
+        Completion(
+            message_log=[{"role": "assistant", "token_ids": [1]}],
+            env_extras={"reward": reward},
+            truncated=truncated,
+            reward=reward,
+        )
+        for reward, truncated in ((0.0, False), (1.0, True))
+    ]
+
+    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+
+    assert metrics["truncation_rate"] == pytest.approx(0.5)
+    assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
+
+
 # ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------

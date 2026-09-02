@@ -5703,6 +5703,15 @@ class TestAggregateRolloutMetrics:
         assert result["mean_gen_tokens_per_sample"] == pytest.approx(200.0)
         assert result["reward/mean"] == pytest.approx(0.7)
 
+    def test_per_agent_truncation_rates_are_averaged(self):
+        metrics = {
+            "agent-a/truncation_rate": [0.0, 0.5, 1.0],
+            "agent-b/truncation_rate": [0.25, 0.75],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["agent-a/truncation_rate"] == pytest.approx(0.5)
+        assert result["agent-b/truncation_rate"] == pytest.approx(0.5)
+
     def test_non_numeric_passed_through(self):
         metrics = {"some_list_metric": [["a", "b"], ["c", "d"]]}
         result = aggregate_rollout_metrics(metrics)
