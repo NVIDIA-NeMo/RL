@@ -432,6 +432,18 @@ class MegatronConfig(TypedDict):
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
+    # Timeout (in minutes) passed to torch.distributed.init_process_group.
+    # Increase when initial weight conversion or checkpoint load can exceed
+    # the default NCCL timeout (e.g. very large models on slow storage).
+    # Omitted: use the torch.distributed default.
+    distributed_timeout_minutes: NotRequired[int]
+    # Verbosity forwarded to Megatron-LM's LoggerConfig.
+    # Omitted: 0 (quiet), the historical hard-coded value.
+    logging_level: NotRequired[int]
+    # Per-step NaN/Inf grad check in Megatron-LM's DDP. Useful for debugging
+    # numerical stability but adds overhead in steady-state training.
+    # Omitted: True, the historical hard-coded value.
+    check_for_nan_in_grad: NotRequired[bool]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
