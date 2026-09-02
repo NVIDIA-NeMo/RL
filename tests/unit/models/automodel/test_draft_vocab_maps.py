@@ -20,7 +20,16 @@ is a target-vocab boolean membership mask. The derived target->draft inverse
 must agree with ``t2d`` exactly.
 """
 
+import pytest
 import torch
+
+# Skip entire module if nemo_automodel is not available
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
+
+pytestmark = pytest.mark.automodel
 
 TARGET_VOCAB = 100
 DRAFT_VOCAB = 30

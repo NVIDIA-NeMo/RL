@@ -11,12 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pytest
 import torch
+
+# Skip entire module if nemo_automodel is not available
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
 
 from nemo_rl.models.automodel.draft.common import (
     build_anchor_candidate_mask,
     sample_anchor_positions,
 )
+
+pytestmark = pytest.mark.automodel
 
 
 def _rl_loss_mask(seq_len: int, response_start: int, response_len: int) -> torch.Tensor:

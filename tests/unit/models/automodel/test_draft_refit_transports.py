@@ -13,13 +13,22 @@
 # limitations under the License.
 """Draft weights ride every supported refit transport with preserved dtypes."""
 
+import pytest
 import torch
 from torch import nn
+
+# Skip entire module if nemo_automodel is not available
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
 
 import nemo_rl.models.policy.workers.dtensor_policy_worker_v2 as worker_mod
 from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
     DTensorPolicyWorkerV2Impl,
 )
+
+pytestmark = pytest.mark.automodel
 
 
 class _TinyDraft(nn.Module):

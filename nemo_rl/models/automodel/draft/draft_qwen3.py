@@ -26,6 +26,11 @@
 from typing import Callable, Optional
 
 import torch
+from nemo_automodel.components.attention.dflash_mask import (
+    create_dflash_block_mask,
+    create_dflash_sdpa_mask,
+)
+from nemo_automodel.components.speculative.dspark._sampling import sample_tokens
 from torch import nn
 from transformers.cache_utils import Cache
 from transformers.models.qwen3.modeling_qwen3 import (
@@ -41,11 +46,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
-from nemo_automodel.components.attention.dflash_mask import (
-    create_dflash_block_mask,
-    create_dflash_sdpa_mask,
-)
-from nemo_automodel.components.speculative.dspark._sampling import sample_tokens
 from nemo_rl.models.automodel.draft.common import (
     AcceptRatePredictor,
     DSparkForwardOutput,

@@ -18,7 +18,17 @@ small mean-reduction allowlist) — not the wrong value a pre-divided
 per-microbatch ratio would sum into.
 """
 
+import pytest
+
+# Skip entire module if nemo_automodel is not available
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
+
 from nemo_rl.models.automodel.draft.integration import finalize_draft_ratio_metrics
+
+pytestmark = pytest.mark.automodel
 
 
 def test_finalize_ratio_metrics_reproduces_token_weighted_global_ratio():

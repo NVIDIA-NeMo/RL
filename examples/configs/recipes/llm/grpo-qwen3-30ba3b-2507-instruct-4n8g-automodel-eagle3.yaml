@@ -98,7 +98,6 @@ policy:
   draft:
     enabled: true
     model_name: yuekai/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex
-    algo: "eagle3"
     loss_weight: 1.0
     eagle3:
       # Draft param-group lr; must far exceed the policy RL lr so the draft

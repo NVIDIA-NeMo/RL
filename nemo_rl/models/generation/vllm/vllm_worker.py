@@ -611,15 +611,7 @@ class BaseVllmGenerationWorker:
         # full-stream path; eagle3 is gated on _draft_full_refit because the
         # megatron eagle3 trainer streams a PARTIAL set (no embed_tokens) and
         # relies on the drafter sharing the target's embedding.
-        draft_full_refit = bool(self.cfg.get("_draft_full_refit"))
-        if (
-            load_format == "dummy"
-            and spec_cfg is not None
-            and (
-                spec_cfg.get("method") in ("dspark", "dflash")
-                or (spec_cfg.get("method") == "eagle3" and draft_full_refit)
-            )
-        ):
+        if _draft_module_sharing_disable_required(self.cfg):
             # Deferred import: vllm_backend imports vllm eagerly, which only
             # this vLLM-venv worker process should pay for.
             from nemo_rl.models.generation.vllm.vllm_backend import (

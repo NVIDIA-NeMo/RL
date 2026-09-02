@@ -13,9 +13,17 @@
 # limitations under the License.
 import pytest
 
+# Skip entire module if nemo_automodel is not available
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
+
 from nemo_rl.models.automodel.draft.integration import (
     validate_dspark_checkpoint_meta,
 )
+
+pytestmark = pytest.mark.automodel
 
 _TRAINING_META = {
     "model_name": "deepseek-ai/dspark_qwen3_8b_block7",

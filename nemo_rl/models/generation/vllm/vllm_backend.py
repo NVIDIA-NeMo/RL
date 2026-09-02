@@ -744,7 +744,7 @@ class VllmInternalWorkerExtension:
             return False
         try:
             return bool(get_pp_group().is_last_rank)
-        except Exception:
+        except AssertionError:
             # No initialized PP group (single-process layouts, unit tests).
             return True
 

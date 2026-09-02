@@ -31,7 +31,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-
 from nemo_automodel.components.speculative.dspark.common import (  # noqa: F401
     AcceptRatePredictor,
     context_doc_ids,
@@ -85,6 +84,19 @@ def build_anchor_candidate_mask(
     loss_mask: torch.Tensor,
     doc_remaining: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Mask of anchor positions whose first predicted token is supervised.
+
+    Args:
+        seq_len: source sequence length.
+        loss_mask: [batch_size, seq_len] per-token supervision mask.
+        doc_remaining: [batch_size, seq_len] tokens remaining in the current
+            packed document, or None when unpacked.
+
+    Returns:
+        [batch_size, seq_len - 1] boolean mask; True at anchor position p
+        when token p + 1 is supervised (and, when packing, stays inside the
+        anchor's document).
+    """
     num_candidates = max(seq_len - 1, 0)
     if num_candidates == 0:
         return loss_mask[:, :0].bool()
@@ -113,6 +125,22 @@ def sample_anchor_positions(
     doc_remaining: Optional[torch.Tensor] = None,
     generator: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample up to num_anchors valid anchor positions per sample.
+
+    Args:
+        seq_len: source sequence length.
+        loss_mask: [batch_size, seq_len] per-token supervision mask.
+        num_anchors: maximum anchors to sample per sample.
+        device: device to allocate outputs on.
+        doc_remaining: packed-document remaining-token counts, or None.
+        generator: optional RNG for a reproducible draw (must be seeded
+            identically across TP peers sharing the same draft replica).
+
+    Returns:
+        (anchors, keep_mask): anchors is [batch_size, num_anchors] sorted
+        anchor token positions (zero-padded past the valid count); keep_mask
+        marks which of those are real vs. padding.
+    """
     valid = build_anchor_candidate_mask(
         seq_len=seq_len,
         loss_mask=loss_mask,

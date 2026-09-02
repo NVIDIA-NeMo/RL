@@ -19,13 +19,16 @@
 # the prev-token embedding spans the FULL target vocab while the bias
 # projection outputs draft-vocab logits. Upstream heads assume one vocab for
 # both sides.
-from torch import nn
+from typing import Any
 
 from nemo_automodel.components.speculative.dspark.markov_head import (  # noqa: F401
     GatedMarkovHead,
     RNNHead,
+)
+from nemo_automodel.components.speculative.dspark.markov_head import (
     VanillaMarkov as _UpstreamVanillaMarkov,
 )
+from torch import nn
 
 
 class VanillaMarkov(_UpstreamVanillaMarkov):
@@ -37,7 +40,7 @@ class VanillaMarkov(_UpstreamVanillaMarkov):
         vocab_size: int,
         markov_rank: int,
         embed_vocab_size: int | None = None,
-    ):
+    ) -> None:
         super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
         # Reduced-draft-vocab checkpoints (draft_vocab_size < target vocab)
         # embed previous tokens over the FULL target vocab (token ids are
@@ -47,7 +50,22 @@ class VanillaMarkov(_UpstreamVanillaMarkov):
             self.markov_w1 = nn.Embedding(self.embed_vocab_size, self.markov_rank)
 
 
-def build_markov_head(config) -> nn.Module | None:
+def build_markov_head(config: Any) -> nn.Module | None:
+    """Build the draft model's markov head from its architecture config.
+
+    Args:
+        config: the draft checkpoint's config object (e.g. a HF
+            ``PretrainedConfig``); reads ``markov_rank``, ``markov_head_type``,
+            ``vocab_size``, and (optionally) ``draft_vocab_size``.
+
+    Returns:
+        The constructed head, or None when ``markov_rank == 0`` (no markov
+        head).
+
+    Raises:
+        ValueError: if ``markov_head_type`` doesn't support the checkpoint's
+            reduced draft vocabulary (only ``"vanilla"`` does).
+    """
     markov_rank = int(config.markov_rank)
     assert markov_rank >= 0, f"markov_rank must be >= 0, got {markov_rank}"
     if markov_rank == 0:

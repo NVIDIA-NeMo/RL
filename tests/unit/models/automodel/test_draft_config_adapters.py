@@ -20,12 +20,20 @@ Fixtures are trimmed copies of the real published checkpoint configs:
 
 import pytest
 
+# Skip entire module if nemo_automodel is not available
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
+
 from nemo_rl.models.automodel.draft.integration import (
     _adapt_speculators_dspark_config,
     _adapt_speculators_eagle3_config,
     default_eagle3_aux_layer_ids_vllm,
     validate_dspark_draft_config,
 )
+
+pytestmark = pytest.mark.automodel
 
 _QWEN3_8B_LAYER_FIELDS = {
     "head_dim": 128,

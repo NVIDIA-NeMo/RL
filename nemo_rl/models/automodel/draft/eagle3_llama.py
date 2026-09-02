@@ -48,13 +48,12 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-
 from nemo_automodel.components.speculative.eagle.draft_llama import (
     Eagle3LlamaDecoderLayer,
     LlamaEagle3DraftModel,
     _seq_lens_to_cu_seqlens,
 )
+from torch.utils.checkpoint import checkpoint
 
 _LOSS_REDUCTION_EPS = 1e-5
 _KL_CHUNK_TOKENS = 512
@@ -305,7 +304,9 @@ class Eagle3DraftModel(LlamaEagle3DraftModel):
                 seq_lens, seq_length=total_seq_len
             )
         else:
-            attn_mask = _build_attention_mask(document_ids, total_seq_len, dtype, device)
+            attn_mask = _build_attention_mask(
+                document_ids, total_seq_len, dtype, device
+            )
             cu_seqlens = None
             max_seqlen = None
 

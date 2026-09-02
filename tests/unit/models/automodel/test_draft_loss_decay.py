@@ -21,9 +21,18 @@ in both layouts so the first proposed token is never down-weighted.
 
 import math
 
+import pytest
 import torch
 
+# Skip entire module if nemo_automodel is not available
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
+
 from nemo_rl.models.automodel.draft.loss import _build_loss_weight_mask
+
+pytestmark = pytest.mark.automodel
 
 BLOCK_SIZE = 4
 GAMMA = 4.0

@@ -274,8 +274,7 @@ def _adapt_native_flat_eagle3_config(
     adapted.attn_implementation = "flash_attention_2"
     if not getattr(adapted, "draft_vocab_size", None):
         raise ValueError(
-            f"eagle3 draft checkpoint {model_name} config is missing "
-            "draft_vocab_size."
+            f"eagle3 draft checkpoint {model_name} config is missing draft_vocab_size."
         )
     aux_ids = config_dict.get("eagle_aux_hidden_state_layer_ids") or config_dict.get(
         "aux_hidden_state_layer_ids"
@@ -528,8 +527,6 @@ def _load_eagle3_weights(
     copy train independently thereafter, governed by ``train_embed_and_head``
     like the rest of the embedding/head.
     """
-    import os
-
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
 
@@ -1105,9 +1102,7 @@ class Eagle3Runtime(_DraftRuntimeBase):
         # of that fixed width -- see Eagle3DraftModel.forward's seq_lens
         # docstring for why that's safe despite the internal padding. Built
         # unconditionally; Eagle3DraftModel ignores it on the eager path.
-        seq_lens = torch.full(
-            (1, batch_size), seq_len, dtype=torch.long, device=device
-        )
+        seq_lens = torch.full((1, batch_size), seq_len, dtype=torch.long, device=device)
 
         # Called as self.draft_model(...) (nn.Module.__call__), not a bare
         # method: FSDP2's fully_shard unshard/reshard hooks fire on

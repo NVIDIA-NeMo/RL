@@ -22,6 +22,14 @@ neither does (while the rest of the drafter still trains).
 import pytest
 import torch
 
+# Skip entire module if nemo_automodel is not available
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
+
+pytestmark = pytest.mark.automodel
+
 
 def _tiny_eagle3_model(norm_before_residual: bool = True):
     from transformers.models.llama.configuration_llama import LlamaConfig
@@ -217,14 +225,18 @@ def test_chunked_lm_head_matches_unchunked_reference(monkeypatch):
     monkeypatch.setattr(m, "_KL_CHUNK_TOKENS", 1024)  # total=16 tokens: one chunk
     reference = _run_ttt_forward_backward(model)
     reference_grads = {
-        name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None
+        name: p.grad.clone()
+        for name, p in model.named_parameters()
+        if p.grad is not None
     }
 
     model.zero_grad(set_to_none=True)
     monkeypatch.setattr(m, "_KL_CHUNK_TOKENS", 3)  # force multi-chunk path
     chunked = _run_ttt_forward_backward(model)
     chunked_grads = {
-        name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None
+        name: p.grad.clone()
+        for name, p in model.named_parameters()
+        if p.grad is not None
     }
 
     for field in (
@@ -235,12 +247,16 @@ def test_chunked_lm_head_matches_unchunked_reference(monkeypatch):
         "cond_acc_nums",
         "cond_acc_dens",
     ):
-        for ref_val, chunked_val in zip(getattr(reference, field), getattr(chunked, field)):
+        for ref_val, chunked_val in zip(
+            getattr(reference, field), getattr(chunked, field)
+        ):
             assert torch.allclose(chunked_val, ref_val, atol=1e-5), field
 
     assert reference_grads.keys() == chunked_grads.keys()
     for name in reference_grads:
-        assert torch.allclose(chunked_grads[name], reference_grads[name], atol=1e-5), name
+        assert torch.allclose(chunked_grads[name], reference_grads[name], atol=1e-5), (
+            name
+        )
 
 
 def _has_flash_attn() -> bool:

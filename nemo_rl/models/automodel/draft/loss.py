@@ -342,7 +342,31 @@ def compute_dspark_loss(
     confidence_head_alpha: float,
     process_group: Optional[dist.ProcessGroup] = None,
     return_terms: bool = False,
-):
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the DSpark block-draft loss (CE + L1 + optional confidence).
+
+    The returned ``backward_loss`` is built from ``global_denominators``
+    (all-reduced across ``process_group``) so it is correct under FSDP's
+    gradient averaging; the per-rank scalars in ``terms`` (when
+    ``return_terms=True``) are local, detached diagnostics only and must not
+    be used for the backward pass.
+
+    Args:
+        outputs: forward-pass outputs from the DSpark draft model.
+        loss_decay_gamma: exponential per-block-position loss-decay factor,
+            or None to disable decay.
+        ce_loss_alpha: weight on the cross-entropy term.
+        l1_loss_alpha: weight on the L1 (confidence-target) term.
+        confidence_head_alpha: weight on the confidence-head term.
+        process_group: process group to all-reduce loss denominators over
+            (typically the DP group); None to skip the all-reduce.
+        return_terms: if True, also return a dict of detached diagnostic
+            terms (window-mean losses plus unreduced accept-rate/tau sums).
+
+    Returns:
+        ``backward_loss`` alone, or ``(backward_loss, terms)`` when
+        ``return_terms`` is True.
+    """
     loss_terms, has_confidence = _collect_local_terms(
         outputs=outputs,
         loss_decay_gamma=loss_decay_gamma,

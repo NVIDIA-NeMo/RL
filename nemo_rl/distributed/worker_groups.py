@@ -201,9 +201,10 @@ class RayWorkerBuilder:
                     bundle_indices=bundle_indices,
                     num_gpus_per_node=num_gpus_per_node,
                 )
-                if "config" in inspect.signature(
-                    worker_class.configure_worker
-                ).parameters:
+                if (
+                    "config"
+                    in inspect.signature(worker_class.configure_worker).parameters
+                ):
                     configure_worker_kwargs["config"] = (
                         self.init_args[0] if self.init_args else None
                     )
