@@ -19,7 +19,7 @@ fi
 
 EVAL_CHECKPOINT_PATH="${EVAL_CHECKPOINT_PATH:-}"
 NANO_OMNI_MODEL_NAME="${NANO_OMNI_MODEL_NAME:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/jianh/projects/OpenRLHF-main/ckpts/rfc0037-sft-step400}"
-CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/nemo_rl_ci/sqsh_files/rl.63363213.sqsh}"
+CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/nemo_rl_ci/sqsh_files/rl-gym.65293387.sqsh}"
 # Jianh's standalone 361-task scoring protocol uses 100 turns even though the
 # training rollout budget is 150.
 EVAL_MAX_STEPS="${EVAL_MAX_STEPS:-100}"
@@ -42,7 +42,7 @@ HF_MODULES_CACHE="${HF_MODULES_CACHE:-${RUNTIME_ROOT}/hf-modules-cache}"
 NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${HF_HOME}/nemo_rl}"
 UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-${RUNTIME_ROOT}/venvs/eval-${EVAL_NAME}/nemo-rl}"
 PYTHONPATH="${HF_MODULES_CACHE}:${GYM_ROOT}:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-SETUP_COMMAND="${SETUP_COMMAND:-/opt/nemo_rl_venv/bin/pip install --quiet --no-input tensordict pyvers gprof2dot wandb==0.21.0}"
+SETUP_COMMAND="${SETUP_COMMAND:-/opt/nemo_rl_venv/bin/pip install --quiet --no-input tensordict pyvers gprof2dot wandb==0.28.1}"
 mkdir -p "${BASE_LOG_DIR}" "${HF_HOME}" "${HF_MODULES_CACHE}" "${NRL_MEGATRON_CHECKPOINT_DIR}"
 
 PRETRAINED_OVERRIDES=""

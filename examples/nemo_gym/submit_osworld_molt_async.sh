@@ -58,7 +58,7 @@ if [[ -n "${active}" && "${MOLT_ALLOW_DUPLICATE_SUBMISSION:-false}" != "true" ]]
   exit 3
 fi
 
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/nemo_rl_ci/sqsh_files/rl.63363213.sqsh}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/nemo_rl_ci/sqsh_files/rl-gym.65293387.sqsh}"
 export MOUNTS="${MOUNTS:-/lustre:/lustre}"
 export NANO_OMNI_MODEL_NAME="${NANO_OMNI_MODEL_NAME:-/lustre/fsw/portfolios/coreai/users/aroshanghias/checkpoints/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16}"
 GYM_ROOT="${ROOT}/3rdparty/Gym-workspace/Gym"
@@ -128,7 +128,7 @@ export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 export UV_HTTP_RETRIES="${UV_HTTP_RETRIES:-10}"
 export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-true}"
 export NRL_IGNORE_VERSION_MISMATCH="${NRL_IGNORE_VERSION_MISMATCH:-1}"
-export SETUP_COMMAND="${SETUP_COMMAND:-/opt/nemo_rl_venv/bin/pip install --quiet --no-input tensordict pyvers gprof2dot wandb==0.21.0}"
+export SETUP_COMMAND="${SETUP_COMMAND:-/opt/nemo_rl_venv/bin/pip install --quiet --no-input tensordict pyvers gprof2dot wandb==0.28.1}"
 
 CONFIG="${ROOT}/examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_cc_molt_async.yaml"
 PARSER="${ROOT}/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py"

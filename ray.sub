@@ -24,18 +24,21 @@
 
 set -eoux pipefail
 
-# Load W&B credentials only for jobs that explicitly enable W&B. Disable
-# xtrace while sourcing so the API key is never copied into Slurm logs.
+# Match the proven OSWorld W&B authentication path: mount the submit user's
+# netrc read-only into every Ray container. Do not export WANDB_API_KEY because
+# it takes precedence over netrc and can silently override the valid credential.
 if [[ "${WANDB_ENABLED:-false}" == "true" ]]; then
-  wandb_env_file="${WANDB_PRIVATE_ENV:-${BASE_LOG_DIR:-}/../private/wandb.env}"
-  if [[ -f "${wandb_env_file}" ]]; then
-    set +x
-    set -a
-    source "${wandb_env_file}"
-    set +a
-    set -x
+  wandb_netrc_file="${WANDB_NETRC_FILE:-${HOME}/.netrc}"
+  if [[ -f "${wandb_netrc_file}" ]]; then
+    unset WANDB_API_KEY
+    export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.wandb.ai}"
+    if [[ -n "${MOUNTS:-}" ]]; then
+      MOUNTS+=",${wandb_netrc_file}:/root/.netrc:ro"
+    else
+      MOUNTS="${wandb_netrc_file}:/root/.netrc:ro"
+    fi
   else
-    echo "ERROR: WANDB_ENABLED=true but credential file is missing: ${wandb_env_file}" >&2
+    echo "ERROR: WANDB_ENABLED=true but credential file is missing: ${wandb_netrc_file}" >&2
     exit 1
   fi
 fi
