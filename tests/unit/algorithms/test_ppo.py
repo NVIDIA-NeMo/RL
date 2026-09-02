@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -33,6 +35,44 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_sync_ppo_writes_trace_when_training_raises(monkeypatch, tmp_path):
+    from nemo_rl.algorithms import ppo
+
+    output_path = tmp_path / "failed_sync_ppo.json"
+    master_config = SimpleNamespace(
+        logger={
+            "log_dir": str(tmp_path),
+            "perfetto": {"enable": True, "name": str(output_path)},
+        }
+    )
+    monkeypatch.setattr(
+        ppo,
+        "_ppo_train_impl",
+        MagicMock(side_effect=RuntimeError("training failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        ppo.ppo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            value_model=MagicMock(),
+            dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            value_loss_fn=MagicMock(),
+            task_to_env={},
+            val_task_to_env=None,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            ppo_save_state=ppo._default_ppo_save_state(),
+            master_config=master_config,
+        )
+
+    events = json.loads(output_path.read_text())
+    assert any(event.get("name") == "ppo_training_start" for event in events)
 
 
 def _make_loss_config(
@@ -765,6 +805,7 @@ def _run_mock_ppo_train(
     warmup_generation_lead_steps: int | None = None,
     overlong_filtering: bool = False,
     truncated_samples: tuple[bool, bool] = (False, False),
+    trace_events: list[dict[str, Any]] | None = None,
 ):
     """Run the real PPO loop with deterministic in-process collaborators."""
     from nemo_rl.algorithms import ppo as ppo_mod
@@ -921,6 +962,12 @@ def _run_mock_ppo_train(
     monkeypatch.setattr(ppo_mod, "run_multi_turn_rollout", fake_rollout)
     monkeypatch.setattr(ppo_mod, "refit_policy_generation", refit)
     monkeypatch.setattr(ppo_mod, "batched_message_log_to_flat_message", fake_flatten)
+    if trace_events is not None:
+        monkeypatch.setattr(
+            ppo_mod,
+            "save_trace",
+            lambda events, **_kwargs: trace_events.extend(events),
+        )
     monkeypatch.setattr(
         ppo_mod,
         "extract_initial_prompt_messages",
@@ -971,6 +1018,13 @@ def _run_mock_ppo_train(
             "checkpoint_must_save_by": None,
             "save_period": 100,
             "metric_name": None,
+        },
+        logger={
+            "log_dir": "logs",
+            "perfetto": {
+                "enable": trace_events is not None,
+                "name": "ppo_trace.json",
+            },
         },
         cluster={"num_nodes": 1, "gpus_per_node": 2},
     )
@@ -1149,6 +1203,37 @@ def test_ppo_train_runs_extra_critic_epochs_without_extra_actor_updates(
         "policy_train_prep",
         "policy_train",
         "policy_train",
+    ]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_trace_reports_independent_critic_and_policy_epochs(
+    monkeypatch, async_mode
+):
+    trace_events: list[dict[str, Any]] = []
+    _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=async_mode,
+        max_num_steps=1,
+        ppo_epochs=2,
+        critic_ppo_epochs=3,
+        seq_logprob_error_threshold=None,
+        trace_events=trace_events,
+    )
+
+    epoch_args = [
+        event["args"]
+        for event in trace_events
+        if event.get("name") == "ppo_epoch_start"
+    ]
+    assert [
+        (args["phase"], args["ppo_epoch"], args["ppo_epochs"]) for args in epoch_args
+    ] == [
+        ("critic", 1, 3),
+        ("critic", 2, 3),
+        ("critic", 3, 3),
+        ("policy", 1, 2),
+        ("policy", 2, 2),
     ]
 
 
@@ -2249,6 +2334,7 @@ def _make_async_ppo_config() -> SimpleNamespace:
         ),
         data={"use_multiple_dataloader": False},
         env={},
+        logger={"log_dir": "logs"},
         checkpointing={"checkpoint_must_save_by": None},
     )
 

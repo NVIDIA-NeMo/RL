@@ -17,11 +17,33 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Callable, Generator, Optional, Sequence, Union
+from typing import Any, Callable, Generator, Optional, Protocol, Sequence, Union
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+class _TraceSink(Protocol):
+    """Subset of the Perfetto tracer used by ``Timer``."""
+
+    def start_span(
+        self,
+        name: str,
+        *,
+        category: str = "driver",
+        args: Optional[dict[str, Any]] = None,
+    ) -> None: ...
+
+    def end_span(self) -> None: ...
+
+    def instant(
+        self,
+        name: str,
+        *,
+        category: str = "driver",
+        args: Optional[dict[str, Any]] = None,
+    ) -> None: ...
 
 
 class Timer:
@@ -73,7 +95,11 @@ class Timer:
         "count": len,
     }
 
-    def __init__(self, context: Optional[dict[str, object]] = None) -> None:
+    def __init__(
+        self,
+        context: Optional[dict[str, object]] = None,
+        trace: Optional[_TraceSink] = None,
+    ) -> None:
         """Initialize the timer.
 
         Args:
@@ -82,15 +108,29 @@ class Timer:
                      start/stop/record/mark call.
                      Typical keys: rank, worker, node, job_id.
                      Example: {"rank": 3, "worker": "collector", "node": "gpu-05"}
+            trace: Optional Perfetto trace sink. Each timer interval is mirrored
+                as a trace span when supplied.
         """
         self._timers: dict[str, list[float]] = {}
         self._start_times: dict[str, float] = {}
         self._markers: dict[str, list[tuple[float, Optional[dict]]]] = {}
         self._context = context or {}
+        self._trace = trace
         if "hostname" not in self._context:
             import socket
 
             self._context["hostname"] = socket.gethostname()
+
+    def __getstate__(self) -> dict[str, object]:
+        """Keep timers serializable when callers pass them through Ray.
+
+        The driver owns the trace collector and its thread lock. Remote copies
+        retain timing state but intentionally do not emit into the driver's
+        in-memory trace.
+        """
+        state = dict(self.__dict__)
+        state["_trace"] = None
+        return state
 
     def _fmt(self, label: str, event: str) -> str:
         """Build a log message string, prepending context prefix and appending UTC timestamp."""
@@ -107,11 +147,16 @@ class Timer:
         if label in self._start_times:
             raise ValueError(f"Timer '{label}' is already running")
         self._start_times[label] = time.perf_counter()
+        if self._trace is not None:
+            self._trace.start_span(label, category="driver", args=self._context)
         if should_log:
             logger.debug(self._fmt(label, "start"))
 
     def stop(self, label: str, should_log: bool = True) -> float:
         """Stop timing for the given label and return the elapsed time.
+
+        When Perfetto tracing is attached, nested timers must be stopped in
+        last-in, first-out order so the trace span stack remains well-formed.
 
         Args:
             label: The label to stop timing for
@@ -132,6 +177,8 @@ class Timer:
             self._timers[label] = []
         self._timers[label].append(elapsed)
         del self._start_times[label]
+        if self._trace is not None:
+            self._trace.end_span()
         if should_log:
             logger.debug(self._fmt(label, f"end elapsed={elapsed:.4f}s"))
         return elapsed
@@ -172,6 +219,8 @@ class Timer:
         if label not in self._markers:
             self._markers[label] = []
         self._markers[label].append((ts, metadata))
+        if self._trace is not None:
+            self._trace.instant(label, category="marker", args=metadata)
         event = f"mark meta={metadata}" if metadata else "mark"
         logger.debug(self._fmt(label, event))
         return ts
@@ -344,8 +393,12 @@ class ThreadSafeTimer(Timer):
     concurrent threads can safely record timings to the same instance.
     """
 
-    def __init__(self, context: Optional[dict[str, object]] = None) -> None:
-        super().__init__(context=context)
+    def __init__(
+        self,
+        context: Optional[dict[str, object]] = None,
+        trace: Optional[_TraceSink] = None,
+    ) -> None:
+        super().__init__(context=context, trace=trace)
         self._lock = threading.RLock()
 
     def start(self, label: str, should_log: bool = True) -> None:

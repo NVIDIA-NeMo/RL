@@ -434,6 +434,9 @@ env:
 logger:
   log_dir: "logs"
   num_val_samples_to_print: 0
+  perfetto:
+    enable: false
+    name: "ppo_perfetto.json"
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
