@@ -473,19 +473,18 @@ class DraftConfig(TypedDict):
     ttt_steps: NotRequired[int]
     # Per-pass loss weights alpha_d (len == ttt_steps); null = uniform 1.0.
     ttt_pass_weights: NotRequired[list[float] | None]
-    # Draft algorithm: "eagle3" (default), or the block drafter "dflash"
-    # (vLLM >= 0.25 serving; anchor + mask-token blocks, bidirectional
-    # in-block attention, trunk truncated at the anchor; additionally
-    # requires PP == 1).
+    # Draft algorithm: "eagle3" (default), or the vLLM >= 0.26 block drafters
+    # "dflash"/"dspark" (anchor + mask-token blocks, bidirectional in-block
+    # attention, trunk truncated at the anchor; additionally require PP == 1).
     method: NotRequired[str]
-    # ---- dflash only ----
+    # ---- dflash/dspark only ----
     # Speculated tokens per block (vLLM num_speculative_tokens).
     gamma: NotRequired[int]
     # Anchors sampled per sequence (static shape).
     anchors_per_seq: NotRequired[int]
     # Restrict anchors to generation segments (token_loss_mask == 1 labels).
     anchor_from_generation_only: NotRequired[bool]
-    # Reserved, unused-in-data token id (required for dflash). Mask
+    # Reserved, unused-in-data token id (required for dflash/dspark). Mask
     # slots embed via the target's FROZEN embedding row at this id (official
     # DFlash contract; never trained).
     mask_token_id: NotRequired[int | None]
@@ -494,6 +493,15 @@ class DraftConfig(TypedDict):
     # w_j = exp(-j / gamma_d), gamma_d tabulated by block size (b8 -> 4,
     # b10 -> 5, b16 -> 7; interpolated otherwise).
     loss_weighting: NotRequired[str | None]
+    # DSpark Markov-head rank. Null = the checkpoint config's markov_rank
+    # (64 for checkpoint-less builds); an explicit value must match the ckpt.
+    markov_rank: NotRequired[int | None]
+    # DSpark loss mix: ce * hard-label CE + tv * TV distillation
+    # + confidence * BCE(confidence head, TV acceptance rate).
+    # Defaults = official dspark_qwen3_8b (0.1 / 0.9 / 1.0).
+    ce_loss_alpha: NotRequired[float]
+    tv_loss_alpha: NotRequired[float]
+    confidence_head_alpha: NotRequired[float]
     # Trunk-attention bucketing granularity in tokens (correctness-neutral).
     trunk_chunk: NotRequired[int]
     # Per-head q/k RMSNorm in the draft attention (Qwen3 style).

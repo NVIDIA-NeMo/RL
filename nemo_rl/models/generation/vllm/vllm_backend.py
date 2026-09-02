@@ -423,8 +423,15 @@ class VllmInternalWorkerExtension:
         which vLLM keeps as a module separate from the main model. Typed ``Any``
         because these are dynamic vLLM model classes whose ``load_weights`` /
         ``mtp_start_layer_idx`` members are not visible through ``nn.Module``.
+
+        vLLM <= 0.20 (and 0.26's legacy ``gpu_model_runner``) exposes the
+        proposer as ``model_runner.drafter``; 0.26's V2 gpu model runner
+        renamed it to ``model_runner.speculator``. Both hold the draft model
+        at ``.model``.
         """
         draft_owner = getattr(self.model_runner, "drafter", None)
+        if draft_owner is None:
+            draft_owner = getattr(self.model_runner, "speculator", None)
         return getattr(draft_owner, "model", None) if draft_owner else None
 
     def _unshare_draft_lm_head(self, draft_model: torch.nn.Module) -> None:
@@ -442,10 +449,10 @@ class VllmInternalWorkerExtension:
         storage and no-op.
 
         Only called when the incoming draft weights actually contain an
-        lm_head update: head-less drafts (DFlash, official contract) WANT the
-        sharing to persist — their draft logits must track the target's live
-        head. Embedding sharing is likewise left intact (the mask row rides
-        the target's ``embed_tokens``).
+        lm_head update: head-less drafts (DFlash/DSpark, official contract)
+        WANT the sharing to persist — their draft logits must track the
+        target's live head. Embedding sharing is likewise left intact (the
+        trained mask row rides the target's ``embed_tokens``).
         """
         target_model = getattr(self.model_runner, "model", None)
         if target_model is not None and hasattr(target_model, "get_language_model"):
@@ -486,9 +493,9 @@ class VllmInternalWorkerExtension:
             # weights forever (observed: acceptance rate pinned at exactly 0
             # while draft_loss fell). Fail loudly instead.
             raise RuntimeError(
-                "[draft] Received draft weights but no vLLM drafter was found "
-                "on the model runner; the draft refit would be silently "
-                "dropped. Check the speculative_config and the vLLM "
+                "[draft] Received draft weights but no vLLM drafter/speculator "
+                "was found on the model runner; the draft refit would be "
+                "silently dropped. Check the speculative_config and the vLLM "
                 "model-runner version compatibility."
             )
         if any("lm_head" in name for name, _ in draft_weights):

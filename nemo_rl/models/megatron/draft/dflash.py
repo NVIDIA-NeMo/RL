@@ -31,7 +31,8 @@ This file matches the behavior of vLLM 0.26's
   current LM head, matching how serving shares those target-model weights.
 
 The decoder is a standard MCore ``TransformerBlock`` whose ``core_attention``
-modules are replaced by :class:`BlockDraftCoreAttention`.
+modules are replaced by :class:`BlockDraftCoreAttention`. The DSpark model in
+``draft/dspark.py`` subclasses :class:`DFlashDraftModel` and reuses this code.
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ if not (_fa_major == 2 and _fa_minor >= 7):
     )
 
 
-SUPPORTED_BLOCK_DRAFT_METHODS = ("dflash",)
+SUPPORTED_BLOCK_DRAFT_METHODS = ("dflash", "dspark")
 
 
 def sample_block_anchors(
@@ -840,11 +841,12 @@ class BlockDraftCoreAttention(torch.nn.Module):
 
 
 class DFlashDraftModel(MegatronModule):
-    """Block drafter with a context-only anchor slot.
+    """Training model shared by the DFlash and DSpark block drafters.
 
     A DFlash block has ``W = gamma + 1`` slots. Slot 0 contains the anchor and
     supplies context, but its logits are not trained. The remaining ``gamma``
-    slots predict new tokens.
+    slots predict new tokens. DSpark subclasses this model and changes
+    ``method`` and ``block_width`` for its serving and loss behavior.
     """
 
     method = "dflash"
@@ -874,7 +876,8 @@ class DFlashDraftModel(MegatronModule):
             )
         self.config = config
         self.gamma = int(gamma)
-        # DFlash adds one context-only anchor slot.
+        # DFlash adds one context-only anchor slot. DSpark overrides the width
+        # because its anchor slot also makes a prediction.
         self.block_width = int(block_width) if block_width is not None else gamma + 1
         self.mask_token_id = int(mask_token_id)
         self.num_aux_hidden_states = int(num_aux_hidden_states)

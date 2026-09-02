@@ -396,6 +396,220 @@ class ChunkedDistributedCrossEntropy(torch.autograd.Function):
         return grad_student, None, None, None, None
 
 
+class ChunkedDistributedLabelCEAndTV(torch.autograd.Function):
+    """Hard-label CE + TV distillation across TP-sharded vocab, chunked along dim 1.
+
+    The two DSpark loss terms: ``ce = -log softmax(student)[label]`` and
+    ``tv = sum_v |softmax(student)_v - softmax(teacher)_v|`` (2x the
+    total-variation distance). Same memory contract as
+    :class:`ChunkedDistributedCrossEntropy`: fp32 buffers exist per chunk
+    only, backward recomputes from the saved (bf16) logits references.
+    Labels are GLOBAL vocab ids (each rank contributes its
+    ``[vocab_start_index, vocab_end_index)`` shard); only ``student_logits``
+    gets a gradient. Returns fp32 ``(ce, tv)`` of shape ``[B, T]``.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int,
+        group: Optional[torch.distributed.ProcessGroup],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if student_logits.shape != teacher_logits.shape:
+            raise ValueError(
+                "student_logits and teacher_logits must have the same shape, "
+                f"got {student_logits.shape} and {teacher_logits.shape}."
+            )
+        if labels.shape != student_logits.shape[:-1]:
+            raise ValueError(
+                f"labels shape {labels.shape} does not match logits "
+                f"{student_logits.shape[:-1]}."
+            )
+
+        seq_size = int(student_logits.shape[1])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+        ce_chunks = []
+        tv_chunks = []
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+
+            chunk_labels = labels[:, chunk_start:chunk_end]
+            label_mask = (chunk_labels < vocab_start_index) | (
+                chunk_labels >= vocab_end_index
+            )
+            local_labels = (chunk_labels - vocab_start_index).masked_fill(label_mask, 0)
+
+            # copy=True: the chunk is mutated in place below; without it an
+            # already-fp32 input would alias (and corrupt) the saved logits.
+            student_fp32 = student_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32, copy=True
+            )
+            student_max = torch.amax(student_fp32, dim=-1, keepdim=True)
+            if group is not None:
+                torch.distributed.all_reduce(
+                    student_max,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=group,
+                )
+            shifted = student_fp32.sub_(student_max)
+            # Gather shifted[label] BEFORE the in-place exp (an exp->log
+            # round-trip would underflow for very unlikely labels).
+            picked_shifted = (
+                shifted.gather(-1, local_labels.unsqueeze(-1))
+                .squeeze(-1)
+                .masked_fill(label_mask, 0.0)
+            )
+            if group is not None:
+                torch.distributed.all_reduce(
+                    picked_shifted,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+            exp_student = shifted.exp_()
+            sum_exp = exp_student.sum(dim=-1, keepdim=True)
+            if group is not None:
+                torch.distributed.all_reduce(
+                    sum_exp,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+            ce_chunks.append(sum_exp.log().squeeze(-1) - picked_shifted)
+            student_probs = exp_student.div_(sum_exp)
+
+            teacher_fp32 = teacher_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32, copy=True
+            )
+            teacher_probs, _ = _shifted_softmax_with_log_norm(
+                teacher_fp32, group=group, in_place=True
+            )
+
+            tv_chunk = (student_probs - teacher_probs).abs().sum(dim=-1)
+            if group is not None:
+                torch.distributed.all_reduce(
+                    tv_chunk,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+            tv_chunks.append(tv_chunk)
+
+            del student_fp32, teacher_fp32, student_probs, teacher_probs
+
+        cross_entropy = torch.cat(ce_chunks, dim=1)
+        tv_distance = torch.cat(tv_chunks, dim=1)
+
+        # Only references are saved; no fp32 full-size buffers survive.
+        ctx.save_for_backward(student_logits, teacher_logits, labels)
+        ctx.chunk_size = chunk_size
+        ctx.group = group
+        ctx.vocab_start_index = vocab_start_index
+        ctx.vocab_end_index = vocab_end_index
+
+        return cross_entropy, tv_distance
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], ...]:
+        grad_ce, grad_tv = grad_outputs
+        student_logits, teacher_logits, labels = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        group = ctx.group
+        vocab_start_index = ctx.vocab_start_index
+        vocab_end_index = ctx.vocab_end_index
+
+        seq_size = int(student_logits.shape[1])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+        grad_student = torch.empty_like(student_logits)
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+
+            student_fp32 = student_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32, copy=True
+            )
+            student_probs, _ = _shifted_softmax_with_log_norm(
+                student_fp32, group=group, in_place=True
+            )
+            teacher_fp32 = teacher_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32, copy=True
+            )
+            teacher_probs, _ = _shifted_softmax_with_log_norm(
+                teacher_fp32, group=group, in_place=True
+            )
+
+            # d(tv)/dz_u = p_u * (sign_u - sum_v sign_v p_v); the row sum needs
+            # the full vocab, hence the all-reduce.
+            sign = (student_probs - teacher_probs).sign_()
+            sign_prob_row = (sign * student_probs).sum(dim=-1, keepdim=True)
+            if group is not None:
+                torch.distributed.all_reduce(
+                    sign_prob_row,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+            d_tv = grad_tv[:, chunk_start:chunk_end].unsqueeze(-1)
+            chunk_grad = sign.sub_(sign_prob_row).mul_(student_probs).mul_(d_tv)
+
+            # d(ce)/dz = p - onehot(label), local-shard one-hot.
+            d_ce = grad_ce[:, chunk_start:chunk_end]
+            chunk_grad.add_(student_probs.mul_(d_ce.unsqueeze(-1)))
+            chunk_labels = labels[:, chunk_start:chunk_end]
+            label_mask = (chunk_labels < vocab_start_index) | (
+                chunk_labels >= vocab_end_index
+            )
+            local_labels = (chunk_labels - vocab_start_index).masked_fill(label_mask, 0)
+            onehot_grad = (d_ce * (~label_mask).float()).neg_()
+            chunk_grad.scatter_add_(
+                -1, local_labels.unsqueeze(-1), onehot_grad.unsqueeze(-1)
+            )
+
+            grad_student[:, chunk_start:chunk_end, :].copy_(chunk_grad)
+            del student_fp32, teacher_fp32, student_probs, teacher_probs
+            del sign, chunk_grad
+
+        return grad_student, None, None, None, None, None, None
+
+
+def _shifted_softmax_with_log_norm(
+    logits_fp32: torch.Tensor,
+    group: Optional[torch.distributed.ProcessGroup],
+    in_place: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Full-vocab-stable softmax over a (possibly TP-sharded) fp32 chunk.
+
+    Returns ``(probs, log_norm)`` where ``log_norm = logsumexp - global_max``
+    is rank-identical. ``in_place=True`` reuses the input buffer for the
+    probs (the chunk copies in the callers above are throwaways).
+    """
+    logits_max = torch.amax(logits_fp32, dim=-1, keepdim=True)
+    if group is not None:
+        torch.distributed.all_reduce(
+            logits_max,
+            op=torch.distributed.ReduceOp.MAX,
+            group=group,
+        )
+    shifted = logits_fp32.sub_(logits_max) if in_place else logits_fp32 - logits_max
+    exp_logits = shifted.exp_() if in_place else shifted.exp()
+    sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+    if group is not None:
+        torch.distributed.all_reduce(
+            sum_exp,
+            op=torch.distributed.ReduceOp.SUM,
+            group=group,
+        )
+    probs = exp_logits.div_(sum_exp)
+    return probs, sum_exp.log()
+
+
 class ChunkedDistributedLogprob(torch.autograd.Function):
     """Custom autograd function for computing log probabilities in a distributed setting.
 
