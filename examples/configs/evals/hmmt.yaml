@@ -1,0 +1,9 @@
+# HMMT evaluation Configuration
+defaults: "eval.yaml"
+
+generation:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+
+data:
+  prompt_file: "examples/prompts/cot.txt"
+  dataset_name: "hmmt2025_feb"  # "hmmt2025_feb", "hmmt2025_nov", "hmmt2026_feb"
