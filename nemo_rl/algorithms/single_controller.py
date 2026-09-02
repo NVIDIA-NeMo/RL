@@ -393,9 +393,12 @@ class SingleControllerActor:
         # makes the native snapshot match the controller's metadata-only replay
         # index exactly. Generation may continue, but completed rollouts wait at
         # commit; _buffer_capacity bounds reservations and eventually stalls
-        # dispatch instead of allowing unbounded TQ growth.
-        # A future staging/finalizer path must join the same barrier before
-        # native restore can be authoritative.
+        # dispatch instead of allowing unbounded TQ growth. The finalizer commit,
+        # pre-publication cleanup, and post-train cleanup paths take the mutation
+        # side too. Authoritative (replay-index) snapshots are still rejected in
+        # token-capture mode by validate_single_controller_config: the capture
+        # dispatch path does not thread lineage group ids into the recovery
+        # ledger, so a resume could not reap it. Shadow snapshots still run.
         self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         self._buffer.set_data_plane_checkpoint_barrier(
             self._data_plane_checkpoint_barrier
@@ -1070,17 +1073,6 @@ class SingleControllerActor:
             return await result
         return result
 
-    async def _clear_data_plane_samples(self, sample_ids: list[str]) -> None:
-        """Clear consumed rows without overlapping a data-plane checkpoint."""
-        async with self._data_plane_checkpoint_barrier.mutation():
-            await call_data_plane(
-                self._dp_client,
-                "clear_samples",
-                offload_sync=True,
-                sample_ids=sample_ids,
-                partition_id=self._partition_id,
-            )
-
     async def _save_data_plane_checkpoint(
         self,
         checkpoint_path: PathLike,
@@ -1183,10 +1175,14 @@ class SingleControllerActor:
         errors: list[BaseException] = []
         # One shared mutation slot for both clears: they run outside the train
         # pump task, so a live data-plane checkpoint must not interleave them.
+        # Offloaded so the rollout pump's event loop keeps serving other
+        # dispatches and finalizer handoffs while the clears are in flight.
         async with self._data_plane_checkpoint_barrier.mutation():
             try:
-                await self._call_dp(
+                await call_data_plane(
+                    self._dp_client,
                     "clear_samples",
+                    offload_sync=True,
                     sample_ids=list(request.rollout_ids),
                     partition_id=self._partition_id,
                 )
@@ -1201,8 +1197,10 @@ class SingleControllerActor:
             staging_keys = self._request_staging_keys(request)
             if staging_keys:
                 try:
-                    await self._call_dp(
+                    await call_data_plane(
+                        self._dp_client,
                         "clear_samples",
+                        offload_sync=True,
                         sample_ids=staging_keys,
                         partition_id=self._master_config.token_capture.staging_partition,
                     )
@@ -1317,7 +1315,14 @@ class SingleControllerActor:
         return True
 
     async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
-        """Clear canonical rows and full-manifest staging keys after train success."""
+        """Clear canonical rows and full-manifest staging keys after train success.
+
+        Runs after ``finish_train_step`` because policy workers read the staged
+        capture deltas during training. One mutation cut spans both partitions
+        so a data-plane checkpoint sees either all of a step's rows or none, and
+        the clears are offloaded so the event loop keeps serving the rollout
+        pump and finalizer handoffs meanwhile.
+        """
         canonical_by_partition: dict[str, list[str]] = {}
         staging_by_partition: dict[str, list[str]] = {}
         for meta in metas:
@@ -1334,36 +1339,28 @@ class SingleControllerActor:
                 )
 
         errors: list[BaseException] = []
-        for partition_id, sample_ids in canonical_by_partition.items():
-            unique_ids = list(dict.fromkeys(sample_ids))
-            try:
-                await self._call_dp(
-                    "clear_samples",
-                    sample_ids=unique_ids,
-                    partition_id=partition_id,
-                )
-            except Exception as error:
-                cleanup_error = RuntimeError(
-                    "post-train canonical cleanup failed: "
-                    f"partition={partition_id!r}, sample_ids={unique_ids!r}"
-                )
-                cleanup_error.__cause__ = error
-                errors.append(cleanup_error)
-        for partition_id, staging_keys in staging_by_partition.items():
-            unique_keys = list(dict.fromkeys(staging_keys))
-            try:
-                await self._call_dp(
-                    "clear_samples",
-                    sample_ids=unique_keys,
-                    partition_id=partition_id,
-                )
-            except Exception as error:
-                cleanup_error = RuntimeError(
-                    "post-train staging cleanup failed: "
-                    f"partition={partition_id!r}, staging_keys={unique_keys!r}"
-                )
-                cleanup_error.__cause__ = error
-                errors.append(cleanup_error)
+        async with self._data_plane_checkpoint_barrier.mutation():
+            for label, by_partition in (
+                ("canonical", canonical_by_partition),
+                ("staging", staging_by_partition),
+            ):
+                for partition_id, ids in by_partition.items():
+                    unique_ids = list(dict.fromkeys(ids))
+                    try:
+                        await call_data_plane(
+                            self._dp_client,
+                            "clear_samples",
+                            offload_sync=True,
+                            sample_ids=unique_ids,
+                            partition_id=partition_id,
+                        )
+                    except Exception as error:
+                        cleanup_error = RuntimeError(
+                            f"post-train {label} cleanup failed: "
+                            f"partition={partition_id!r}, ids={unique_ids!r}"
+                        )
+                        cleanup_error.__cause__ = error
+                        errors.append(cleanup_error)
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
 
@@ -1992,9 +1989,13 @@ class SingleControllerActor:
                     respectively. Each policy optimizer step closes here rather
                     than in 5 -- a PPO step is one chunk, so there is nothing to
                     accumulate across chunks.
-            4. Clear the batch. dp_client.clear_samples on the consumed sample_ids.
+            4. Close the chunk. Refresh min_sample_version and the dispatch tally. The
+                consumed rows stay in TQ: staged capture deltas are read by the policy
+                workers during 3, so nothing is cleared until the step closes.
             5. Train the policy model (GRPO) -- finish_train_step all_reduces the
-                accumulated gradients, rescales, and runs optimizer.step.
+                accumulated gradients, rescales, and runs optimizer.step. Then
+                _cleanup_consumed_metas clears every consumed canonical row and its
+                staged capture deltas.
             6. Refit the model. Sync the new policy weights to generation.
 
         PPO critic warmup (ppo.policy_training_start_step > 0) changes which of those
@@ -2023,7 +2024,6 @@ class SingleControllerActor:
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
             consumed_metas: list[KVBatchMeta] = []
-            consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
 
             with self._timer.time("total_step_time"):
@@ -2099,7 +2099,12 @@ class SingleControllerActor:
                             continue
 
                         consumed_metas.append(train_meta)
-                        consumed_group_count += num_groups
+
+                        # Release buffer capacity. The rows stay in TQ until the
+                        # post-step clear, but every reservation uses a fresh
+                        # uuid group id, so nothing can collide with them.
+                        for _ in range(num_groups):
+                            self._buffer_capacity.release()
                         selected_group_ids = {
                             sample_id.rsplit("_g", 1)[0]
                             for sample_id in train_meta.sample_ids
@@ -2317,11 +2322,8 @@ class SingleControllerActor:
                         )
 
                 # Clear consumed canonical rows (and their staged capture deltas)
-                # now that the step's training dispatches are complete, then hand
-                # the freed buffer slots back to the rollout pump.
+                # now that the step's training dispatches are complete.
                 await self._cleanup_consumed_metas(consumed_metas)
-                for _ in range(consumed_group_count):
-                    self._buffer_capacity.release()
 
                 # Aggregate step metrics
                 step_metrics = {}

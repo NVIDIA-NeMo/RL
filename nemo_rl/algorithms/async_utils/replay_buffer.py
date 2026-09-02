@@ -1437,15 +1437,11 @@ class TQReplayBuffer:
         checkpoint barrier through this capture and the matching TQ save.
         Commits and destructive clears use shared mutation slots, so the replay
         index and native snapshot describe one exact set of training-ready groups.
-        Every operation that mutates the canonical rollout partition or its
-        controller-local replay membership must either participate in that
-        barrier across the complete publish/index or clear/remove transition,
-        or run in the same asyncio task as the checkpoint save. The advantage
-        stage relies on the latter: it and ``_save_checkpoint`` both live in
-        ``_train_pump``, so they cannot interleave. Any new writer outside
-        ``_train_pump`` -- including future finalizer paths -- must take a
-        mutation slot; canonical writes are not required to originate
-        specifically from :meth:`commit`.
+        Every operation that mutates the canonical or staging partitions or the
+        controller-local replay membership must hold a mutation cut across the
+        complete publish/index or clear/remove transition. No writer is exempt,
+        including post-train cleanup in ``_train_pump``; canonical writes are
+        not required to originate specifically from :meth:`commit`.
         In-flight reservations are intentionally omitted.
         """
         groups: list[TQReplayGroupMetadata] = []

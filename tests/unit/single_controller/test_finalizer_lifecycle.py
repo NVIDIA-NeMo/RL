@@ -17,12 +17,16 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+)
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
@@ -83,6 +87,7 @@ def _request() -> FinalizationRequest:
         ),
         rewards=(1.0,),
         fallback_weight_version=3,
+        prompt_idx=0,
     )
 
 
@@ -98,6 +103,7 @@ def _controller(actor: object) -> Any:
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(staging_partition="staging")
@@ -250,3 +256,36 @@ def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() 
             "partition_id": "staging",
         },
     ]
+
+
+class _SyncDataPlaneClient:
+    """Synchronous client like the production TQ adapter; records caller threads."""
+
+    def __init__(self) -> None:
+        self.clear_calls: list[dict[str, Any]] = []
+        self.clear_thread_ids: list[int] = []
+
+    def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        self.clear_thread_ids.append(threading.get_ident())
+        self.clear_calls.append(
+            {"sample_ids": list(sample_ids), "partition_id": partition_id}
+        )
+
+
+def test_known_outcome_cleanup_runs_sync_clears_off_the_event_loop() -> None:
+    ctrl = _controller(SimpleNamespace())
+    ctrl._dp_client = _SyncDataPlaneClient()
+
+    async def _main() -> int:
+        await ctrl._cleanup_known_finalization_request(_request())
+        return threading.get_ident()
+
+    loop_thread_id = asyncio.run(_main())
+
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    assert ctrl._dp_client.clear_thread_ids
+    assert all(tid != loop_thread_id for tid in ctrl._dp_client.clear_thread_ids)
+    ctrl._buffer.abort.assert_called_once_with("group")
