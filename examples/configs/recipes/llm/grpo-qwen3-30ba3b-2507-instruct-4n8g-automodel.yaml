@@ -1,10 +1,11 @@
-defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
+defaults: grpo-qwen3-8b-4n8g-automodel.yaml
 # Qwen3-30B-A3B-Instruct-2507 GRPO math baseline (NO speculative decoding),
 # automodel (DTensor v2) backend, 4 nodes x 8 GPUs, 10240-token context
 # (2048 prompt + 8192 response). MoE sibling of the Qwen3-8B baseline:
 # identical data / GRPO knobs / optimizer; model, chat template, and
 # parallelism differ, and context is trimmed from this repo's usual 20480
-# to 10240 to stay comparable to the eagle3-10k sibling at the same
+# to 10240 to stay comparable to the eagle3 sibling
+# (grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel-eagle3.yaml) at the same
 # sequence length (that recipe's drafter OOMs at 20480 on this layout).
 #
 # Parallelism:
@@ -22,7 +23,7 @@ defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
 grpo:
   val_period: 10
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-30ba3b-2507-instruct-math-baseline-4n8g-automodel-10k
+  checkpoint_dir: results/grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel
   save_period: 15
   keep_top_k: 5
   is_async: false
@@ -57,4 +58,4 @@ policy:
       tensor_parallel_size: 4
 logger:
   wandb:
-    name: grpo-qwen3-30ba3b-2507-instruct-math-baseline-4n8g-automodel-10k
+    name: grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel

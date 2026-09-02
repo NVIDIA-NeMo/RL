@@ -44,7 +44,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-qwen3-8b-math-baseline-4n8g-automodel
+  checkpoint_dir: results/grpo-qwen3-8b-4n8g-automodel
   keep_top_k: 3
   save_period: 5
 
@@ -122,7 +122,7 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl-dspark
-    name: grpo-qwen3-8b-math-baseline-4n8g-automodel
+    name: grpo-qwen3-8b-4n8g-automodel
 
 cluster:
   gpus_per_node: 8

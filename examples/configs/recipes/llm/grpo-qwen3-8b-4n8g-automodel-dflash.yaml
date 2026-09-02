@@ -1,7 +1,7 @@
-defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
+defaults: grpo-qwen3-8b-4n8g-automodel.yaml
 # Qwen3-8B GRPO math baseline with DFlash draft co-training (DTensor v2
 # backend), 4 nodes x 8 GPUs. DFlash sibling of
-# grpo-qwen3-8b-math-baseline-4n8g-automodel-dspark.yaml: policy-side
+# grpo-qwen3-8b-4n8g-automodel-dspark.yaml: policy-side
 # settings are inherited unchanged (including tp=2 and activation
 # checkpointing); the RedHatAI/Qwen3-8B-speculator.dflash block drafter
 # (markov-free, confidence-free, bonus-anchor supervision layout) trains
@@ -12,7 +12,7 @@ defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
 # training options are set here (confidence loss must be 0: dflash has no
 # confidence head).
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-8b-math-baseline-4n8g-automodel-dflash
+  checkpoint_dir: results/grpo-qwen3-8b-4n8g-automodel-dflash
 policy:
   draft:
     enabled: true
@@ -41,4 +41,4 @@ policy:
         draft_sample_method: "probabilistic"
 logger:
   wandb:
-    name: grpo-qwen3-8b-math-baseline-4n8g-automodel-dflash
+    name: grpo-qwen3-8b-4n8g-automodel-dflash

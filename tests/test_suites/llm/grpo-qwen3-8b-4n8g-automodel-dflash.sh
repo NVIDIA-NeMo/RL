@@ -29,23 +29,22 @@ uv run examples/run_grpo.py \
     2>&1 | tee $RUN_LOG
 
 if grep -q "Speculative decoding is enabled without draft refit sync" "$RUN_LOG"; then
-    echo "Unexpected startup-weight warning for refit-backed DSpark path"
+    echo "Unexpected startup-weight warning for refit-backed DFlash path"
     exit 1
 fi
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # Metric scales anchored to the math-baseline 4n8g run: draft_loss
-    # (CE+TV+conf, summed over microbatches) was 290-490 over the first 30
-    # steps; the confidence head is active for dspark (BCE term declining,
-    # unlike dflash where it is exactly 0); acceptance length was 3.3-4.7
-    # from step 1.
+    # Metric scales anchored to the 4n8g run: draft_loss
+    # (CE+TV, summed over microbatches) was 242-358 over the first 30 steps;
+    # confidence loss is exactly 0 for dflash; acceptance length was 2.4-3.9
+    # from step 1 and rose with co-training.
     uv run tests/check_metrics.py $JSON_METRICS \
         'min(data["train/draft_loss"]) > 0' \
-        'data["train/draft_loss"]["30"] < 500' \
-        'min(data["train/draft_conf_loss"]) > 0' \
-        'data["train/vllm/spec_acceptance_length"]["30"] > 3.0'
+        'data["train/draft_loss"]["30"] < 400' \
+        'max(data["train/draft_conf_loss"]) == 0' \
+        'data["train/vllm/spec_acceptance_length"]["30"] > 2.5'
 
     rm -rf "$CKPT_DIR"
 fi

@@ -1,7 +1,7 @@
-defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
+defaults: grpo-qwen3-8b-4n8g-automodel.yaml
 # Qwen3-8B GRPO math baseline with DSpark draft co-training (DTensor v2
 # backend), 4 nodes x 8 GPUs. Experimental arm for
-# grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml: policy-side settings are
+# grpo-qwen3-8b-4n8g-automodel.yaml: policy-side settings are
 # inherited unchanged (including tp=2 and activation checkpointing); the
 # deepseek-ai/dspark_qwen3_8b_block7 block drafter trains alongside the
 # policy on rollout data and is refit into vLLM (draft.* weight stream) for
@@ -9,7 +9,7 @@ defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
 # target_layer_ids, mask_token_id, markov/confidence heads) come from the
 # draft checkpoint's config.json; only training options are set here.
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-8b-math-baseline-4n8g-automodel-dspark
+  checkpoint_dir: results/grpo-qwen3-8b-4n8g-automodel-dspark
 policy:
   draft:
     enabled: true
@@ -37,4 +37,4 @@ policy:
         draft_sample_method: "probabilistic"
 logger:
   wandb:
-    name: grpo-qwen3-8b-math-baseline-4n8g-automodel-dspark
+    name: grpo-qwen3-8b-4n8g-automodel-dspark

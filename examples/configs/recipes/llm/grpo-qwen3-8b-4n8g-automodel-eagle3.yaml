@@ -1,7 +1,7 @@
-defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
+defaults: grpo-qwen3-8b-4n8g-automodel.yaml
 # Qwen3-8B GRPO math baseline with EAGLE3 draft co-training (DTensor v2
 # backend), 4 nodes x 8 GPUs. EAGLE3 sibling of
-# grpo-qwen3-8b-math-baseline-4n8g-automodel-dspark.yaml: policy-side
+# grpo-qwen3-8b-4n8g-automodel-dspark.yaml: policy-side
 # settings are inherited unchanged (including tp=2 and activation
 # checkpointing); the RedHatAI/Qwen3-8B-speculator.eagle3 drafter trains
 # alongside the policy with the speculators-style TTT unrolling
@@ -12,7 +12,7 @@ defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
 # d2t/t2d maps, norm_before_residual, layer family) come from the draft
 # checkpoint's config.json; only training options are set here.
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-8b-math-baseline-4n8g-automodel-eagle3
+  checkpoint_dir: results/grpo-qwen3-8b-4n8g-automodel-eagle3
 policy:
   draft:
     enabled: true
@@ -35,4 +35,4 @@ policy:
         num_speculative_tokens: 3
 logger:
   wandb:
-    name: grpo-qwen3-8b-math-baseline-4n8g-automodel-eagle3
+    name: grpo-qwen3-8b-4n8g-automodel-eagle3
