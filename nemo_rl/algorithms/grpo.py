@@ -557,6 +557,7 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
+    enable_nemo_gym = should_use_nemo_gym(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -599,6 +600,10 @@ def setup(
     #         Logger
     # ==========================
     logger = Logger(logger_config)
+    if enable_nemo_gym:
+        env_configs.setdefault("nemo_gym", {})["nemo_gym_log_dir"] = os.path.join(
+            logger.base_log_dir, "nemo_gym"
+        )
     logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
@@ -787,7 +792,6 @@ def setup(
 
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
-    enable_nemo_gym = should_use_nemo_gym(master_config)
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
