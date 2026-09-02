@@ -694,9 +694,12 @@ class TestPartialGymRedispatch:
         method = _PartialGymMethod(fail_after_rows=1, failures_before_success=99)
         impl = _make_gym_impl(method, num_generations=4, row_attempts=2)
 
-        with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError) as exc_info:
             asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
         assert method.attempts == 2, "the budget bounds the re-dispatches"
+        assert exc_info.value.__notes__ == [
+            "NeMo-Gym instance 'nemo_gym' failed during rollout collection"
+        ]
 
     def test_a_data_failure_is_not_re_dispatched(self):
         """Another dispatch cannot help a prompt NeMo-Gym is unable to serve."""

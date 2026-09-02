@@ -1002,18 +1002,16 @@ class AsyncNemoGymRolloutImpl:
                         )
                     except Exception as error:
                         last_error = error
-                        if isinstance(error, ValueError):
-                            raise
                         # Only transport-shaped failures are worth another dispatch; a
                         # prompt NeMo-Gym cannot serve fails the same way every time.
                         if (
                             classify_rollout_failure(error) is not FailureClass.INFRA
                             or attempt == self._max_gym_row_attempts
                         ):
-                            raise RuntimeError(
-                                f"NeMo-Gym instance '{instance_label}' failed during "
-                                f"rollout collection: {error}"
-                            ) from error
+                            error.add_note(
+                                f"NeMo-Gym instance '{instance_label}' failed during rollout collection"
+                            )
+                            raise
                     else:
                         if timing_metrics is not None:
                             env_timing_metrics = timing_metrics
