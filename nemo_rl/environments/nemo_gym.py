@@ -34,14 +34,16 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
-    count_image_placeholder_runs,
     encode_images_in_examples,
     extract_input_image_sources_from_responses_messages,
     image_size_from_source,
-    predicted_static_image_num_tokens,
     resolve_to_image,
-    supports_image_placeholder_run_parity,
     uses_image_placeholder,
+)
+from nemo_rl.environments.nemotron_utils import (
+    count_image_placeholder_runs,
+    predicted_static_image_num_tokens,
+    supports_image_placeholder_run_parity,
 )
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (

@@ -43,6 +43,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import (
+    ROLLOUT_MATCHED_MEDIA_KEY,
     NATIVE_MULTIMODAL_KEYS,
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
@@ -232,15 +233,16 @@ def attach_static_multimodal_payload(
             "turns than the source prompt."
         )
     for source, target in zip(source_users, target_users):
+        if target.pop(ROLLOUT_MATCHED_MEDIA_KEY, False):
+            # The Gym actor attached rollout-matched media for this turn (e.g.
+            # after vetoing dedup omission on a budget-bound row); never
+            # overwrite it with the statically-budgeted prompt copy. Key
+            # presence alone is not provenance: targets may carry placeholder
+            # or stale payloads that this copy is expected to replace.
+            continue
         for key, value in source.items():
-            if not (isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS):
-                continue
-            if key in target:
-                # The Gym actor attached rollout-matched media for this turn
-                # (e.g. after vetoing dedup omission on a budget-bound row);
-                # never overwrite it with the statically-budgeted prompt copy.
-                continue
-            target[key] = value
+            if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
+                target[key] = value
 
 
 def _add_r3_fallback_metrics(
