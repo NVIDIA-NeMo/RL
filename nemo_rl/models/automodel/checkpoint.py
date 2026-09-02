@@ -78,12 +78,6 @@ def build_checkpoint_config(
         accepts, meant to be splatted into
         ``AutomodelCheckpointingConfig(enabled=True, checkpoint_dir="", **result)``.
     """
-
-    Component configs such as teachers and reward models do not necessarily
-    inherit the policy exemplar. Preserve NeMo-RL's established defaults at
-    this single integration boundary instead of inheriting Automodel's
-    ``save_consolidated="final"`` default accidentally.
-    """
     if "model_save_format" in dtensor_cfg:
         model_save_format = dtensor_cfg["model_save_format"]
         if model_save_format not in ("torch_save", "safetensors"):
@@ -242,15 +236,11 @@ class AutomodelCheckpointManager:
         # settings are supplied before build() creates async stagers and process
         # groups. NeMo-RL passes explicit paths to every save/load operation, so
         # the configured root is intentionally unused.
-        base_cfg = AutomodelCheckpointingConfig(
-            enabled=True,
-            checkpoint_dir="",
         config_updates.setdefault("save_consolidated", "false")
         base_cfg = AutomodelCheckpointingConfig(
             enabled=True,
             checkpoint_dir="",
             **config_updates,
-        )
         )
         self.checkpointer = base_cfg.build(
             dp_rank=self._get_dp_rank(),

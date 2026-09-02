@@ -545,7 +545,7 @@ class TestAutomodelCheckpointManager:
             assert manager.checkpointer is mock_checkpointer
             mock_checkpointer_cls.assert_called_once()
             automodel_config = mock_checkpointer_cls.call_args.kwargs["config"]
-            assert automodel_config.save_consolidated == SaveConsolidatedMode.FINAL
+            assert automodel_config.save_consolidated == SaveConsolidatedMode.FALSE
 
     @patch("torch.distributed.get_rank")
     def test_init_checkpointer_does_nothing_if_exists(self, mock_get_rank, mock_meshes):
