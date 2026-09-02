@@ -62,7 +62,7 @@ Learn about DTensor and Megatron Core training backends, their capabilities, and
 :link: about/algorithms/index
 :link-type: doc
 
-Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy distillation, and multi-teacher on-policy distillation (MOPD) with detailed guides and examples.
+Discover supported algorithms including GRPO, PPO, SFT, DPO, OAPL, RM, on-policy distillation, and multi-teacher on-policy distillation (MOPD) with detailed guides and examples.
 :::
 
 :::{grid-item-card} {octicon}`graph` Evaluation
@@ -306,6 +306,7 @@ guides/sft-openmathinstruct2.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
+guides/oapl.md
 guides/dapo.md
 guides/lora.md
 guides/cispo.md

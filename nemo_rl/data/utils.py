@@ -23,12 +23,13 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
     extract_necessary_env_names,
+    load_oapl_dataset,
     load_preference_dataset,
     load_response_dataset,
     merge_datasets,
     update_single_dataset_config,
 )
-from nemo_rl.data.processors import preference_preprocessor
+from nemo_rl.data.processors import oapl_preprocessor, preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
 
@@ -383,6 +384,68 @@ def setup_preference_data(
             None,
             val_task_data_processors,
             task_data_preprocessors=val_task_data_preprocessors,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+        print(
+            f"  ✓ Validation dataset loaded with {len(val_dataset['default'])} samples."
+        )
+
+    return dataset, val_dataset
+
+
+# TODO: @yukih: unify to setup_data after dataset refactored
+def setup_oapl_data(
+    tokenizer: AutoTokenizer, data_config: DataConfig
+) -> tuple[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]]:
+    """Setup OAPL data.
+
+    This function is used to setup the OAPL data for the training and validation datasets.
+
+    Args:
+        tokenizer: Tokenizer.
+        data_config: Data config for OAPL dataset.
+
+    Returns:
+        A tuple of (train dataset, validation dataset).
+    """
+    assert "train" in data_config, (
+        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/oapl.md#datasets "
+        "to update the dataset config."
+    )
+
+    print("\n▶ Setting up data...")
+    # setup train dataset
+    if "default" in data_config:
+        update_single_dataset_config(data_config["train"], data_config["default"])
+    data = load_oapl_dataset(data_config["train"])
+    task_data_processors = {data.task_name: (data.task_spec, oapl_preprocessor)}
+
+    dataset = AllTaskProcessedDataset(
+        data.dataset,
+        tokenizer,
+        None,
+        task_data_processors,
+        max_seq_length=data_config["max_input_seq_length"],
+    )
+    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
+
+    # setup validation dataset
+    val_dataset: dict[str, AllTaskProcessedDataset] = {}
+    if "validation" in data_config and data_config["validation"] is not None:
+        if "default" in data_config:
+            update_single_dataset_config(
+                data_config["validation"], data_config["default"]
+            )
+        val_data = load_oapl_dataset(data_config["validation"])
+        val_task_data_processors = {
+            val_data.task_name: (val_data.task_spec, oapl_preprocessor)
+        }
+
+        val_dataset["default"] = AllTaskProcessedDataset(
+            val_data.dataset,
+            tokenizer,
+            None,
+            val_task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
         print(

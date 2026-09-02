@@ -52,6 +52,17 @@ class PreferenceDatumSpec(TypedDict):
     idx: int
 
 
+class OAPLDatumSpec(TypedDict):
+    message_log: LLMMessageLogType
+    length: int
+    reward: float  # r(x, y), the final reward for this trajectory
+    reference_policy_logprob: float  # log pi_ref(y|x), precomputed offline
+    log_z: float  # log Z(x) = log( (1/n) sum_i exp(r(x, y_i) / beta) ), precomputed over the group of generations for x
+    loss_multiplier: float
+    idx: int
+    task_name: NotRequired[str]
+
+
 @dataclass
 class TaskDataSpec:
     task_name: Optional[str] = None

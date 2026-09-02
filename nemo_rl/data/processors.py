@@ -24,6 +24,7 @@ from transformers import AutoProcessor, PreTrainedTokenizerBase
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
+    OAPLDatumSpec,
     PreferenceDatumSpec,
     TaskDataProcessFnCallable,
     TaskDataSpec,
@@ -304,6 +305,52 @@ def preference_preprocessor(
         "length_rejected": length_rejected,
         "loss_multiplier": loss_multiplier,
         "idx": idx,
+    }
+    return output
+
+
+def oapl_preprocessor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> OAPLDatumSpec:
+    """Process a datum dictionary for OAPL training.
+
+    Each datum is one (context, completion) pair already flattened from its
+    prompt group by ``OAPLDataset``, carrying the precomputed ``reward``,
+    ``reference_logprob``, and ``log_z`` fields.
+    """
+    message_log = get_formatted_message_log(
+        datum_dict["context"] + datum_dict["completion"], tokenizer, task_data_spec
+    )
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        logging.warning(
+            f"Sequence length {length} exceeds max_seq_length {max_seq_length}. Ignoring example."
+        )
+
+        # make smaller and mask out
+        for message in message_log:
+            message["token_ids"] = message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+        length = sum(len(m["token_ids"]) for m in message_log)
+
+    output: OAPLDatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "reward": datum_dict["reward"],
+        "reference_policy_logprob": datum_dict["reference_logprob"],
+        "log_z": datum_dict["log_z"],
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict.get("task_name"),
     }
     return output
 

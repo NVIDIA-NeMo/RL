@@ -24,6 +24,8 @@ from nemo_rl.algorithms.loss import (
     DPOLossConfig,
     DPOLossFn,
     NLLLossFn,
+    OAPLLossConfig,
+    OAPLLossFn,
     prepare_loss_input,
 )
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
@@ -208,6 +210,56 @@ def test_dpo_loss():
     assert torch.isclose(
         loss_sft.cpu(),
         0.5 * expected_sft_loss + expected_preference_loss,
+    )
+
+
+def test_oapl_loss():
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    vocab_size = 16
+    batch_size = 2
+    seq_len = 4
+    beta = 0.5
+
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.arange(vocab_size / 2)
+            .reshape(batch_size, seq_len)
+            .to(torch.int64)
+            .to("cuda"),
+            "token_mask": torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]]).to("cuda"),
+            "sample_mask": torch.tensor([1, 1]).to("cuda"),
+            "reference_policy_logprob": torch.zeros(batch_size).to("cuda"),
+            "log_z": torch.zeros(batch_size).to("cuda"),
+            "reward": torch.tensor([1.0, 2.0]).to("cuda"),
+        }
+    )
+    next_token_logits = torch.zeros((batch_size, seq_len, vocab_size)).to("cuda")
+
+    loss_fn = OAPLLossFn(cfg=OAPLLossConfig(beta=beta, average_log_probs=False))
+
+    loss_input, prepared_data = prepare_loss_input(next_token_logits, data, loss_fn)
+    loss, metrics = loss_fn(
+        data=prepared_data,
+        global_valid_seqs=torch.sum(prepared_data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            prepared_data["token_mask"] * prepared_data["sample_mask"].unsqueeze(-1)
+        ),
+        **loss_input,
+    )
+
+    ## uniform logits -> each unmasked token has logprob log(1/vocab_size);
+    ## 2 unmasked tokens per sample, reference_policy_logprob=0, log_z=0
+    per_token_logprob = -torch.log(torch.tensor(float(vocab_size)))
+    implicit_reward = beta * (2 * per_token_logprob)
+    expected_per_sample_loss = (implicit_reward - data["reward"].cpu()) ** 2
+    expected_loss = expected_per_sample_loss.mean()
+
+    torch.testing.assert_close(loss.cpu(), expected_loss)
+    assert metrics["num_valid_samples"] == batch_size
+    torch.testing.assert_close(
+        torch.tensor(metrics["implicit_reward_mean"]), implicit_reward
     )
 
 

@@ -16,8 +16,8 @@ from unittest.mock import MagicMock
 
 import torch
 
-from nemo_rl.data.collate_fn import preference_collate_fn
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.collate_fn import oapl_collate_fn, preference_collate_fn
+from nemo_rl.data.interfaces import DatumSpec, OAPLDatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -149,3 +149,68 @@ def test_preference_collate_fn():
     assert torch.equal(
         train_data["input_ids"][1][3:5], torch.tensor([8, 9])
     )  # assistant
+
+
+def test_oapl_collate_fn_masks_tool_turns_and_unmasks_all_assistant_turns():
+    """A multi-turn (x, y) trajectory with tool calls: only assistant tokens are unmasked."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.pad_token_id = 0
+
+    data_batch = [
+        OAPLDatumSpec(
+            message_log=[
+                {
+                    "role": "user",
+                    "content": "What's 17*24?",
+                    "token_ids": torch.tensor([1, 2, 3]),
+                },
+                {
+                    "role": "assistant",
+                    "content": "calling calculator",
+                    "token_ids": torch.tensor([4, 5]),
+                },
+                {
+                    "role": "tool",
+                    "content": "408",
+                    "token_ids": torch.tensor([6, 7, 8]),
+                },
+                {
+                    "role": "assistant",
+                    "content": "17*24 = 408.",
+                    "token_ids": torch.tensor([9, 10, 11, 12]),
+                },
+            ],
+            length=12,
+            reward=1.0,
+            reference_policy_logprob=-8.21,
+            log_z=0.5,
+            loss_multiplier=1.0,
+            idx=0,
+            task_name="test_task",
+        ),
+    ]
+
+    train_data = oapl_collate_fn(
+        data_batch,
+        mock_tokenizer,
+        make_sequence_length_divisible_by=16,
+        add_loss_mask=True,
+    )
+
+    assert isinstance(train_data, BatchedDataDict)
+    assert torch.equal(
+        train_data["reward"], torch.tensor([1.0], dtype=torch.float32)
+    )
+    assert torch.equal(
+        train_data["reference_policy_logprob"],
+        torch.tensor([-8.21], dtype=torch.float32),
+    )
+    assert torch.equal(train_data["log_z"], torch.tensor([0.5], dtype=torch.float32))
+
+    # user turn (0:3) and tool turn (5:8) must stay masked out; both
+    # assistant turns (3:5 and 8:12) must be unmasked.
+    token_mask = train_data["token_mask"][0]
+    assert torch.all(token_mask[0:3] == 0)  # user
+    assert torch.all(token_mask[3:5] == 1)  # assistant (tool-call turn)
+    assert torch.all(token_mask[5:8] == 0)  # tool result
+    assert torch.all(token_mask[8:12] == 1)  # assistant (final turn)

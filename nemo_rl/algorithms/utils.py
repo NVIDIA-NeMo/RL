@@ -523,6 +523,12 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
                     .repeat(min_padding, 1),
                 ]
             )
+        # Pad OAPL's per-sample scalar fields (reward, reference_policy_logprob, log_z)
+        for key in ("reward", "reference_policy_logprob", "log_z"):
+            if key in batch:
+                batch[key] = torch.cat(
+                    [batch[key], batch[key][-1].unsqueeze(0).repeat(min_padding)]
+                )
     return batch
 
 

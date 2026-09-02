@@ -122,7 +122,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
-- ✅ **Learning Algorithms** - GRPO/GSPO/DAPO, SFT(with LoRA), DPO, and On-policy distillation.
+- ✅ **Learning Algorithms** - GRPO/GSPO/DAPO, SFT(with LoRA), DPO, OAPL, and On-policy distillation.
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
 - ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training (through NeMo AutoModel).
 - ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP) (through NeMo Megatron Bridge). 
@@ -150,6 +150,7 @@ For detailed information on backend selection, configuration, and examples, see 
     |[X-Token Off-Policy Distillation](#x-token-off-policy-distillation)|[X-Token Off-Policy Distillation Single Node](#x-token-off-policy-distillation-single-node)|[X-Token Off-Policy Distillation Multi-node](#x-token-off-policy-distillation-multi-node)|
     |[SFT](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
+    |[OAPL](#oapl)|[OAPL Single Node](#oapl-single-node)|[OAPL Multi-node](#oapl-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
 
     <p></p>
@@ -627,6 +628,57 @@ For distributed DPO training across multiple nodes, modify the following script 
 NUM_ACTOR_NODES=2
 
 COMMAND="uv run ./examples/run_dpo.py --config examples/configs/dpo.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 dpo.val_global_batch_size=32 checkpointing.checkpoint_dir='results/dpo_llama81_2nodes' logger.wandb_enabled=True logger.wandb.name='dpo-llama1b'" \
+CONTAINER=YOUR_CONTAINER \
+MOUNTS="$PWD:$PWD" \
+sbatch \
+    --nodes=${NUM_ACTOR_NODES} \
+    --account=YOUR_ACCOUNT \
+    --job-name=YOUR_JOBNAME \
+    --partition=YOUR_PARTITION \
+    --time=4:0:0 \
+    --gres=gpu:8 \
+    ray.sub
+```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
+## OAPL
+
+OAPL (Offline Advantage-weighted Partition-function Loss) is an offline RL algorithm that trains on a fixed dataset of `(prompt, trajectory, reward, reference_logprob)` tuples, such as agent trajectories with tool calls and a final task reward, without requiring pairwise preference labels.
+
+### OAPL Single Node
+
+The default OAPL experiment is configured to run on a single GPU. Point `data.train.data_path` (and `data.validation.data_path`) in `examples/configs/oapl.yaml` at your own dataset, then launch the experiment:
+
+```sh
+uv run python examples/run_oapl.py
+```
+
+This trains `Llama3.2-1B-Instruct` on 1 GPU.
+
+Any of the OAPL parameters can be customized from the command line. For example:
+
+```sh
+uv run python examples/run_oapl.py \
+  oapl.beta=0.05 \
+  checkpointing.checkpoint_dir="results/llama_oapl" \
+  logger.wandb_enabled=True \
+  logger.wandb.name="llama-oapl"
+```
+
+Refer to `examples/configs/oapl.yaml` for a full list of parameters that can be overridden. For an in-depth explanation of the OAPL dataset format, refer to the [OAPL documentation](docs/guides/oapl.md).
+
+### OAPL Multi-node
+
+For distributed OAPL training across multiple nodes, modify the following script for your use case:
+
+```sh
+# Run from the root of NeMo RL repo
+## number of nodes to use for your job
+NUM_ACTOR_NODES=2
+
+COMMAND="uv run ./examples/run_oapl.py --config examples/configs/oapl.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 oapl.val_global_batch_size=32 checkpointing.checkpoint_dir='results/oapl_llama1b_2nodes' logger.wandb_enabled=True logger.wandb.name='oapl-llama1b'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \

@@ -1107,6 +1107,112 @@ class DPOLossFn(PreferenceLossFn):
         }
 
 
+class OAPLLossConfig(BaseModel, extra="allow"):
+    beta: float = 0.1
+    average_log_probs: bool = False
+
+
+class OAPLLossDataDict(TypedDict):
+    """Required keys for the OAPL loss function."""
+
+    input_ids: torch.Tensor
+    reward: torch.Tensor
+    reference_policy_logprob: torch.Tensor
+    log_z: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+
+
+class OAPLLossFn(LossFunction):
+    """Offline Advantage-weighted Partition-function Loss (OAPL).
+
+    Regresses the implicit reward of the policy, relative to a fixed
+    reference policy and a precomputed partition function, onto the observed
+    reward of each (prompt, trajectory) pair in an offline dataset:
+
+    L(theta) = (beta * (log pi_theta(y|x) - log pi_ref(y|x) + log Z(x)) - r(x, y))^2
+
+    where:
+    - beta is a fixed temperature (``cfg.beta``)
+    - log pi_ref(y|x) and log Z(x) are precomputed offline (part of the
+      dataset) and do not depend on the trainable policy
+    - Z(x) = (1/n) * sum_i exp(r(x, y_i) / beta) is the partition function
+      estimated from the n generations collected for prompt x
+
+    Because log pi_ref(y|x) and log Z(x) are supplied by the dataset, each
+    (x, y) example can be trained on independently -- no reference-model
+    forward pass or in-batch grouping is required at training time. These
+    values (and r(x, y)) are treated as fixed regression targets/offsets and
+    are detached before use, so no gradient flows through them.
+
+    Args:
+        cfg (OAPLLossConfig): Configuration dictionary containing:
+            - beta (float): Temperature used to scale the implicit reward (beta)
+            - average_log_probs (bool): Whether to average log pi_theta(y|x) over tokens instead of summing
+
+    Returns:
+        tuple[torch.Tensor, dict]: A tuple containing:
+            - The regression loss value
+            - A dictionary with metrics including:
+                - loss: Total loss value
+                - implicit_reward_mean: Mean implicit reward beta * (log pi_theta/pi_ref + log Z) over valid samples
+                - target_reward_mean: Mean target reward r(x, y) over valid samples
+    """
+
+    loss_type = LossType.SEQUENCE_LEVEL
+    input_type = LossInputType.LOGPROB
+
+    def __init__(self, cfg: OAPLLossConfig):
+        self.beta = cfg.beta
+        self.average_log_probs = cfg.average_log_probs
+
+    def __call__(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[OAPLLossDataDict],
+        global_valid_seqs: Tensor,
+        global_valid_toks: Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+
+        logprob = (next_token_logprobs * token_mask).sum(-1)
+        if self.average_log_probs:
+            logprob = logprob / token_mask.sum(-1).clamp(min=1)
+
+        # log pi_ref(y|x), log Z(x), and r(x, y) are precomputed constants from
+        # the dataset -- detach defensively so no gradient can flow through
+        # them even if a caller ever hands us non-leaf tensors here.
+        reference_policy_logprob = data["reference_policy_logprob"].detach()
+        log_z = data["log_z"].detach()
+        reward = data["reward"].detach()
+
+        implicit_reward = self.beta * (logprob - reference_policy_logprob + log_z)
+
+        per_sample_loss = (implicit_reward - reward) ** 2 * sample_mask
+
+        loss = masked_mean(
+            per_sample_loss,
+            sample_mask,
+            global_normalization_factor=global_valid_seqs,
+        )
+
+        return loss, {
+            "loss": loss.item(),
+            "implicit_reward_mean": masked_mean(
+                implicit_reward,
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            ).item(),
+            "target_reward_mean": masked_mean(
+                reward,
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            ).item(),
+            "num_valid_samples": sample_mask.sum().item(),
+        }
+
+
 class DistillationLossConfig(BaseModel, extra="allow"):
     kl_type: str = "mixed"
     mixed_kl_weight: float = 0.5
