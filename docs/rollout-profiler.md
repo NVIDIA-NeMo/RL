@@ -6,8 +6,9 @@ attempts. One profiled attempt includes every generation turn and
 and policy training are outside this lifecycle.
 
 The integration supports `tensor_parallel_size>=1`,
-`pipeline_parallel_size=1`, and `expert_parallel_size=1` with either synchronous
-or asynchronous vLLM engines. NeMo RL rejects a configured rollout profiler for
+`pipeline_parallel_size=1`, and either `expert_parallel_size=1` or
+`expert_parallel_size=tensor_parallel_size` with synchronous or asynchronous
+vLLM engines. NeMo RL rejects a configured rollout profiler for unsupported
 pipeline- or expert-parallel topologies before allocating generation workers.
 
 ## Plugin contract
