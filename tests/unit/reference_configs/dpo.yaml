@@ -2,6 +2,7 @@
 dpo:
   max_num_epochs: 1
   max_num_steps: 150
+  stop_after_step: null
   val_period: 25
   val_batches: 8
   val_global_batch_size: 8

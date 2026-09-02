@@ -57,6 +57,11 @@ class PreferenceDatasetConfig(TypedDict):
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    split_validation_size: NotRequired[float | int]
+    legacy_validation_split: NotRequired[bool]
+    seed: NotRequired[int]
+    max_samples: NotRequired[int | None]
+    cache_dir: NotRequired[str | None]
 
 
 class DataConfig(TypedDict):

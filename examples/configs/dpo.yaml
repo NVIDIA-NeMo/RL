@@ -2,6 +2,9 @@
 dpo:
   max_num_epochs: 1
   max_num_steps: 150
+  # Optional checkpoint boundary for time-sliced jobs. The final scheduler
+  # horizon remains max_num_steps across resumed segments.
+  stop_after_step: null
   val_period: 25
   val_batches: 8
   val_global_batch_size: 8

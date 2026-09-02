@@ -264,6 +264,25 @@ def test_maybe_pad_last_batch():
     assert "token_mask" not in result
     assert "reference_policy_logprobs" not in result
 
+    # Preference padding must append complete, uniquely identified pairs.
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(18).reshape(6, 3),
+            "input_lengths": torch.full((6,), 3),
+            "sample_mask": torch.ones(6),
+            "pair_index": torch.tensor([0, 0, 1, 1, 2, 2]),
+            "is_chosen": torch.tensor([True, False, True, False, True, False]),
+        }
+    )
+    result = maybe_pad_last_batch(batch, dp_size=2, mbs=2)
+    assert result.size == 8
+    assert torch.equal(result["pair_index"], torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]))
+    assert torch.equal(
+        result["is_chosen"],
+        torch.tensor([True, False, True, False, True, False, True, False]),
+    )
+    assert torch.equal(result["sample_mask"][-2:], torch.zeros(2))
+
 
 # Performance Metrics Tests
 
