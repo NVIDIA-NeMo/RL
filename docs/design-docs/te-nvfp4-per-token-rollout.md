@@ -159,9 +159,7 @@ end-to-end validation:
 
 The validation recipe is a long-running configuration with periodic synchronous
 checkpoints. Short smoke coverage remains available in
-`grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml`. The generic
-checkpoint-mapping path also has a Qwen3.5-35B-A3B 20-step smoke recipe at
-`grpo-qwen3.5-35ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml`.
+`grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml`.
 
 ## Current Limitations
 
