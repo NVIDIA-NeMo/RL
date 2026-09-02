@@ -259,6 +259,9 @@ class AutomodelCheckpointManager:
         """Save a checkpoint of the model.
 
         The optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
+        Any previous async save is completed before a new one starts.
+        When async saving is enabled, this method returns after model and optimizer
+        staging is complete; upload and consolidation may continue in the background.
 
         Args:
             model: The model to save.
@@ -290,6 +293,10 @@ class AutomodelCheckpointManager:
                 "Checkpointer with the target checkpoint root."
             )
 
+        # Automodel keeps one future each for model and optimizer state. Finish
+        # the previous save before those future handles can be replaced.
+        self.checkpointer.async_wait()
+
         self.checkpointer.save_model(
             model=model,
             weights_path=weights_path,
@@ -311,6 +318,11 @@ class AutomodelCheckpointManager:
             # ConsolidatedHFAddon (we pass tokenizer=None above), which is where
             # nemo_automodel applies its own rank-0 guard, so we must apply it here.
             save_tokenizer_on_rank0(tokenizer, tokenizer_path)
+
+        # Async DCP staging reads from the live model and optimizer state. Wait
+        # for those copies before callers can update or offload the source tensors;
+        # disk upload and deferred consolidation remain asynchronous.
+        self.checkpointer.maybe_wait_for_staging()
 
     def load_checkpoint(
         self,

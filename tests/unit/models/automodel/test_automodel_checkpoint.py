@@ -550,6 +550,7 @@ class TestSaveCheckpointFunctional:
         )
         manager.init_checkpointer()
         mock_checkpointer.config = mock_checkpointer_cls.call_args.kwargs["config"]
+        mock_checkpointer.reset_mock()
 
         with TemporaryDirectory() as tmp_dir:
             weights_path = os.path.join(tmp_dir, "weights")
@@ -566,6 +567,11 @@ class TestSaveCheckpointFunctional:
 
             # Verify save_optimizer was not called
             mock_checkpointer.save_optimizer.assert_not_called()
+            assert [call[0] for call in mock_checkpointer.method_calls] == [
+                "async_wait",
+                "save_model",
+                "maybe_wait_for_staging",
+            ]
 
     @patch("torch.distributed.get_rank")
     @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
@@ -712,6 +718,7 @@ class TestSaveCheckpointFunctional:
         )
         manager.init_checkpointer()
         mock_checkpointer.config = mock_checkpointer_cls.call_args.kwargs["config"]
+        mock_checkpointer.reset_mock()
 
         with TemporaryDirectory() as tmp_dir:
             weights_path = os.path.join(tmp_dir, "model", "weights")
@@ -729,6 +736,12 @@ class TestSaveCheckpointFunctional:
             # Verify both model and optimizer saving were called
             mock_checkpointer.save_model.assert_called_once()
             mock_checkpointer.save_optimizer.assert_called_once()
+            assert [call[0] for call in mock_checkpointer.method_calls] == [
+                "async_wait",
+                "save_model",
+                "save_optimizer",
+                "maybe_wait_for_staging",
+            ]
 
     @patch("torch.distributed.get_rank")
     @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
