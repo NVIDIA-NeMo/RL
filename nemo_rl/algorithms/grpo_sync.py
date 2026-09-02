@@ -55,6 +55,7 @@ from nemo_rl.algorithms.grpo import (
     _policy_dtype,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
+    _validate_loss_side_seq_logprob_error_config,
     _validation_early_stop_message,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
@@ -450,6 +451,7 @@ def grpo_train_sync(
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
+    _validate_loss_side_seq_logprob_error_config(master_config)
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
     # bootstraps the controller and attaches workers; ``policy.dp_cfg``
     # is the public marker. The explicit master_config check is the

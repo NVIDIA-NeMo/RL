@@ -48,7 +48,10 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import (
+    should_log_nemo_gym_training_samples,
+    should_use_nemo_gym,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -266,6 +269,11 @@ class AsyncTrajectoryCollector:
         step they can target. If all target versions are exhausted, this generation
         server will remain idle until the next weight update.
 
+        The current generation weight is included as the first candidate so a
+        partially filled current-step target can be repaired after an in-flight
+        worker releases it. In the normal case it is already consumed or full,
+        so the existing replay-buffer checks skip it without generating more.
+
         Example:
         generation_weight_version = 10
         generation_lead_steps = 4
@@ -274,19 +282,15 @@ class AsyncTrajectoryCollector:
         warmup can temporarily configure them independently.
 
         Returns:
-            [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
+            [10, 11, 12, 13, 14]  # Current-step gap fill, then the four lead targets
         """
         generation_lead = self._generation_lead_steps
-        if generation_weight_version == self.initial_weight_version:
-            return [
-                i
-                for i in range(
-                    self.initial_weight_version,
-                    self.initial_weight_version + generation_lead + 1,
-                )
-            ]
-
-        return [generation_weight_version + i for i in range(1, generation_lead + 1)]
+        return list(
+            range(
+                generation_weight_version,
+                generation_weight_version + generation_lead + 1,
+            )
+        )
 
     def _get_next_target_for_generation(
         self, generation_weight_version: int
@@ -1260,6 +1264,7 @@ class AsyncTrajectoryCollector:
         num_generations: int,
         use_nemo_gym: bool,
         task_index_to_group_index: dict[int, int],
+        target_weight_version: Optional[int] = None,
     ) -> AsyncGenerator[RolloutGroupResult, None]:
         """Yield prompt groups from either backend through one result type."""
         if use_nemo_gym:
@@ -1304,6 +1309,10 @@ class AsyncTrajectoryCollector:
                 ),
                 deduplicate_multimodal_data=self._deduplicate_multimodal_data,
                 debug_payload_metrics=self._debug_payload_metrics,
+                target_weight_version=target_weight_version,
+                log_training_samples=should_log_nemo_gym_training_samples(
+                    self.master_config.env
+                ),
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
@@ -1345,13 +1354,17 @@ class AsyncTrajectoryCollector:
         worker_start = time.perf_counter()
         wake_generation_limits_after_cleanup = False
         try:
-            await self._collect_rollout_batch(
+            batch_fully_buffered = await self._collect_rollout_batch(
                 repeated_batch=repeated_batch,
                 generation_weight_version=generation_weight_version,
                 target_weight_version=target_weight_version,
                 num_generations=num_generations,
                 use_nemo_gym=use_nemo_gym,
             )
+            if batch_fully_buffered is False:
+                # A partially successful Gym stream is useful work, but the
+                # released target still needs another batch to fill its gap.
+                wake_generation_limits_after_cleanup = True
             with self._failure_lock:
                 if self._fatal_error_message is None:
                     self._failure_count = 0
@@ -1572,8 +1585,8 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         num_generations: int,
         use_nemo_gym: bool,
-    ) -> None:
-        """Run one backend batch and enqueue every completed prompt group."""
+    ) -> bool:
+        """Enqueue completed prompt groups; return whether the batch was complete."""
         collection_started_at = time.perf_counter()
         if num_generations <= 0 or repeated_batch.size % num_generations != 0:
             raise ValueError(
@@ -1603,17 +1616,33 @@ class AsyncTrajectoryCollector:
         ]
         buffered_group_indices: set[int] = set()
         last_error: Exception | None = None
+        last_enqueue_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
+            pending_group_indices = expected_group_indices - buffered_group_indices
+            if len(pending_group_indices) == expected_prompt_groups:
+                attempt_batch = repeated_batch
+            else:
+                pending_row_indices = [
+                    row_index
+                    for group_index in sorted(pending_group_indices)
+                    for row_index in range(
+                        group_index * num_generations,
+                        (group_index + 1) * num_generations,
+                    )
+                ]
+                attempt_batch = repeated_batch.select_indices(pending_row_indices)
+
             push_tasks: list[asyncio.Task[None]] = []
             scheduled_group_indices: set[int] = set()
             stream_error: Exception | None = None
             try:
                 async for rollout_result in self._iter_rollout_groups(
-                    repeated_batch=repeated_batch,
+                    repeated_batch=attempt_batch,
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,
+                    target_weight_version=target_weight_version,
                 ):
                     group_index = rollout_result.group_index
                     if group_index not in expected_group_indices:
@@ -1651,9 +1680,11 @@ class AsyncTrajectoryCollector:
             push_errors = [
                 result for result in push_results if isinstance(result, Exception)
             ]
+            if push_errors:
+                last_enqueue_error = push_errors[0]
             pending_group_indices = expected_group_indices - buffered_group_indices
             if not pending_group_indices:
-                return
+                return True
 
             last_error = stream_error or (push_errors[0] if push_errors else None)
             if last_error is None:
@@ -1673,10 +1704,22 @@ class AsyncTrajectoryCollector:
             )
             await asyncio.sleep(retry_delay)
 
+        if use_nemo_gym and buffered_group_indices and last_enqueue_error is None:
+            pending_group_indices = expected_group_indices - buffered_group_indices
+            print(
+                "⚠️ NeMo-Gym batch exhausted retries after buffering "
+                f"{len(buffered_group_indices)}/{expected_prompt_groups} prompt "
+                f"groups; releasing {len(pending_group_indices)} unbuffered groups "
+                "for gap-fill",
+                flush=True,
+            )
+            return False
+
         batch_error = RuntimeError(
             "Rollout batch failed to buffer prompt groups "
             f"{sorted(expected_group_indices - buffered_group_indices)}"
         )
-        if last_error is not None:
-            raise batch_error from last_error
+        error_cause = last_enqueue_error or last_error
+        if error_cause is not None:
+            raise batch_error from error_cause
         raise batch_error

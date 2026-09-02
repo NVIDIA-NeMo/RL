@@ -14,6 +14,7 @@
 import gc
 import json
 import os
+import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -47,6 +48,21 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import (
+    LOSS_METRIC_MAX_REDUCTION_NAMES,
+    LOSS_METRIC_MIN_REDUCTION_NAMES,
+    SEQ_LOGPROB_ERROR_ACCUM_METRICS,
+    SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC,
+)
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
     print_setup_timing_summary,
@@ -74,6 +90,11 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.nemo_gym_sample_artifacts import (
+    NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY,
+    AsyncNemoGymTrainingSampleWriter,
+)
+from nemo_rl.data.train_data_artifacts import AsyncTrainDataArtifactWriter
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -86,7 +107,11 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    should_log_nemo_gym_training_samples,
+    should_use_nemo_gym,
+    spinup_nemo_gym_actor,
+)
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -127,6 +152,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
+    validate_router_replay_transport_path,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -146,6 +172,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.routed_experts_ref import retire_routed_experts_through
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -352,6 +379,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None = None
+    # Compute seq-level logprob errors from the policy forward used for training,
+    # and apply the threshold only to loss terms. This skips the separate
+    # prev-logprobs pass and therefore requires force_on_policy_ratio=True.
+    seq_logprob_error_force_on_policy: bool = False
     # Advantage value to assign to invalid tool call tokens. When set (e.g. -5.0), overwrites the
     # computed advantage for those tokens to penalize them; absent/None disables the penalty.
     invalid_tool_call_advantage: float | None = None
@@ -558,7 +589,16 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
+    _validate_loss_side_seq_logprob_error_config(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
+    validate_router_replay_transport_path(
+        policy_config,
+        data_plane_enabled=bool((master_config.data_plane or {}).get("enabled", False)),
+        async_grpo_enabled=bool(
+            grpo_config.async_grpo and grpo_config.async_grpo.enabled
+        ),
+        nemo_gym_enabled=enable_nemo_gym,
+    )
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -756,7 +796,13 @@ def setup(
         )
 
     loss_fn = ClippedPGLossFn(
-        loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
+        loss_config,
+        use_fused_linear_logprobs=use_fused_linear_logprobs,
+        seq_logprob_error_threshold=(
+            grpo_config.seq_logprob_error_threshold
+            if _use_loss_side_seq_logprob_error(master_config)
+            else None
+        ),
     )
 
     # Validate force_on_policy_ratio
@@ -2232,11 +2278,56 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+def _take_nemo_gym_training_samples_for_log(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    *,
+    enabled: bool,
+) -> Optional[list[dict[str, Any]]]:
+    """Detach the selected Gym response snapshots from the replay batch."""
+    has_samples = NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY in repeated_batch
+    if not enabled:
+        if has_samples:
+            raise RuntimeError(
+                "NeMo Gym training samples reached the trainer while "
+                "env.log_training_samples is disabled"
+            )
+        return None
+    if not has_samples:
+        warnings.warn(
+            "env.log_training_samples=true, but the sampled replay "
+            "batch contains no retained NeMo Gym responses; skipping sample "
+            "logging for this step",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+
+    raw_samples = repeated_batch[NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY]
+    del repeated_batch[NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY]
+    if not isinstance(raw_samples, list) or len(raw_samples) != repeated_batch.size:
+        actual_size = len(raw_samples) if isinstance(raw_samples, list) else None
+        raise ValueError(
+            "Retained NeMo Gym response count must match the selected training "
+            f"batch: got {actual_size}, expected {repeated_batch.size}"
+        )
+
+    samples: list[dict[str, Any]] = []
+    for index, raw_sample in enumerate(raw_samples):
+        if not isinstance(raw_sample, dict):
+            raise TypeError(
+                "Retained NeMo Gym training samples must be dictionaries, "
+                f"got {type(raw_sample).__name__} at row {index}"
+            )
+        samples.append(dict(raw_sample))
+    return samples
+
+
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
-    When **True**, skip the expensive per-step ``train_data_step*.jsonl`` dump.
-    When **False** (the default if unset), write the local JSONL file.
+    When **True**, skip the expensive local per-step train-data dump.  When
+    **False** (the default if unset), write the local train-data artifacts
+    (JSONL for synchronous GRPO; ``.pt`` plus safetensors for async GRPO).
 
     W&B full-result Tables are controlled independently by
     ``logger.wandb.log_nemo_gym_full_result_tables``.
@@ -2527,10 +2618,141 @@ def _placeholder_seq_logprob_error_metrics() -> dict[str, float]:
     }
 
 
+def _use_loss_side_seq_logprob_error(master_config: MasterConfig) -> bool:
+    """Whether seq-level error masking is computed in the train loss forward."""
+    return bool(
+        getattr(master_config.grpo, "seq_logprob_error_force_on_policy", False)
+        and master_config.grpo.seq_logprob_error_threshold is not None
+    )
+
+
+def _validate_loss_side_seq_logprob_error_config(
+    master_config: MasterConfig,
+) -> None:
+    """Validate the opt-in, no-recompute sequence-error masking path."""
+    enabled = bool(
+        getattr(master_config.grpo, "seq_logprob_error_force_on_policy", False)
+    )
+    if not enabled:
+        return
+    if master_config.grpo.seq_logprob_error_threshold is None:
+        raise ValueError(
+            "grpo.seq_logprob_error_force_on_policy=true requires "
+            "grpo.seq_logprob_error_threshold to be set."
+        )
+    if not master_config.loss_fn.force_on_policy_ratio:
+        raise ValueError(
+            "grpo.seq_logprob_error_force_on_policy=true requires "
+            "loss_fn.force_on_policy_ratio=true."
+        )
+    if (master_config.data_plane or {}).get("enabled", False):
+        raise NotImplementedError(
+            "grpo.seq_logprob_error_force_on_policy=true is currently supported "
+            "only by the legacy GRPO trainer with data_plane.enabled=false."
+        )
+
+
+def _finalize_seq_logprob_error_metrics(metrics: dict[str, Any]) -> None:
+    """Replace mergeable loss statistics with public sequence-error metrics."""
+    present = SEQ_LOGPROB_ERROR_ACCUM_METRICS.intersection(metrics)
+    if not present:
+        metrics.update(_placeholder_seq_logprob_error_metrics())
+        metrics.update(
+            {
+                "logprob_error_masked_seq_fraction": 0.0,
+                "logprob_error_masked_correct_pct": 0.0,
+                "num_valid_seqs_before_logprob_error": 0.0,
+                "num_valid_seqs_after_logprob_error": 0.0,
+            }
+        )
+        return
+
+    missing = SEQ_LOGPROB_ERROR_ACCUM_METRICS.difference(metrics)
+    if missing:
+        raise ValueError(
+            "Missing loss-side sequence logprob error metrics: "
+            + ", ".join(sorted(missing))
+        )
+
+    sum_before = float(metrics.pop(SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC))
+    count_before = float(metrics.pop(SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC))
+    min_before = float(metrics.pop(SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC))
+    max_before = float(metrics.pop(SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC))
+    sum_after = float(metrics.pop(SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC))
+    count_after = float(metrics.pop(SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC))
+    min_after = float(metrics.pop(SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC))
+    max_after = float(metrics.pop(SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC))
+    masked_count = float(metrics.pop(SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC))
+    masked_correct_count = float(
+        metrics.pop(SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC)
+    )
+    masked_correct_pct = masked_correct_count / masked_count if masked_count else 0.0
+
+    metrics.update(
+        {
+            "max_seq_mult_prob_error": max_before if count_before else 0.0,
+            "mean_seq_mult_prob_error": (
+                sum_before / count_before if count_before else 0.0
+            ),
+            "min_seq_mult_prob_error": min_before if count_before else 0.0,
+            "max_seq_mult_prob_error_after_mask": (max_after if count_after else 0.0),
+            "mean_seq_mult_prob_error_after_mask": (
+                sum_after / count_after if count_after else 0.0
+            ),
+            "min_seq_mult_prob_error_after_mask": (min_after if count_after else 0.0),
+            "num_masked_seqs_by_logprob_error": masked_count,
+            "masked_correct_pct": masked_correct_pct,
+            "logprob_error_masked_seq_fraction": (
+                masked_count / count_before if count_before else 0.0
+            ),
+            "logprob_error_masked_correct_pct": masked_correct_pct,
+            "num_valid_seqs_before_logprob_error": count_before,
+            "num_valid_seqs_after_logprob_error": count_after,
+        }
+    )
+
+
+def _newly_masked_sequence_count(
+    before_mask: torch.Tensor, after_mask: torch.Tensor
+) -> float:
+    """Count eligible sequences that became masked between two stages."""
+    before = before_mask.detach().reshape(-1).bool().cpu()
+    after = after_mask.detach().reshape(-1).bool().cpu()
+    if before.shape != after.shape:
+        raise ValueError(
+            "Expected sequence masks to have the same shape, got "
+            f"{tuple(before.shape)} and {tuple(after.shape)}."
+        )
+    reenabled = after & ~before
+    if reenabled.any():
+        raise ValueError(
+            "Sequence masking stages must not re-enable an initially masked row."
+        )
+    return float((before & ~after).sum().item())
+
+
+def _sequence_mask_stage_metrics(
+    *,
+    initial_mask: torch.Tensor,
+    pre_train_mask: torch.Tensor,
+    post_train_masked_count: float,
+) -> dict[str, float]:
+    """Report disjoint pre-train, loss-side, and union sequence-mask counts."""
+    pre_train_count = _newly_masked_sequence_count(initial_mask, pre_train_mask)
+    post_train_count = float(post_train_masked_count)
+    if post_train_count < 0:
+        raise ValueError("post_train_masked_count must be non-negative.")
+    return {
+        "num_masked_seqs_pre_train_step": pre_train_count,
+        "num_masked_seqs_post_train_step": post_train_count,
+        "num_masked_seqs_total": pre_train_count + post_train_count,
+    }
+
+
 def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
     """Reject ``use_kl_in_reward`` when the KL term would read zero placeholder logprobs.
 
-    ``force_on_policy_ratio`` (without ``seq_logprob_error_threshold``) skips
+    The no-recompute force-on-policy paths skip
     the prev_logprobs forward and passes a zero placeholder to the advantage
     estimator; ``use_kl_in_reward`` then applies
     ``kl_coef * calculate_kl(zeros, ref)`` which corrupts the advantage.
@@ -2541,8 +2763,8 @@ def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
     if loss_config.use_kl_in_reward and loss_config.reference_policy_kl_penalty != 0:
         assert not opd_module._skip_prev_logprobs(master_config), (
             "loss_fn.use_kl_in_reward with nonzero loss_fn.reference_policy_kl_penalty "
-            "requires real prev_logprobs, but force_on_policy_ratio (without "
-            "grpo.seq_logprob_error_threshold) zeros them — KL would be computed "
+            "requires real prev_logprobs, but the configured force-on-policy "
+            "path zeros them — KL would be computed "
             "against a zero placeholder."
         )
 
@@ -2552,8 +2774,9 @@ def _resolve_logprob_skip_flags(
 ) -> tuple[bool, bool | None]:
     """Return (skip_prev_logprobs, skip_reference_logprobs); warn on incompatible combos.
 
-    Skip prev_logprobs when force_on_policy_ratio=True unless
-    seq_logprob_error_threshold is set (which requires prev_logprobs).
+    Skip prev_logprobs when force_on_policy_ratio=True unless the legacy
+    driver-side seq-error path needs them. The opt-in loss-side path computes
+    the error from the training forward and therefore still skips them.
     Skip reference_policy_logprobs when
     ``grpo.skip_reference_policy_logprobs_calculation`` is set.
     """
@@ -2561,6 +2784,7 @@ def _resolve_logprob_skip_flags(
     if (
         master_config.loss_fn.force_on_policy_ratio
         and master_config.grpo.seq_logprob_error_threshold is not None
+        and not _use_loss_side_seq_logprob_error(master_config)
     ):
         warnings.warn(
             "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
@@ -2798,6 +3022,7 @@ def grpo_train(
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+    loss_side_seq_logprob_error = _use_loss_side_seq_logprob_error(master_config)
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -3190,6 +3415,9 @@ def grpo_train(
                     del baseline
                     del std
 
+                initial_sequence_mask = (
+                    repeated_batch["loss_multiplier"].detach().clone()
+                )
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config.grpo.overlong_filtering
                     if use_overlong_filtering:
@@ -3325,8 +3553,13 @@ def grpo_train(
                     del logprob_data
                     del extra_multimodal_data
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                # The legacy driver path needs real prev_logprobs; the opt-in
+                # loss-side path emits these metrics from policy.train().
+                if loss_side_seq_logprob_error:
+                    # The training forward emits the metrics and applies a
+                    # loss-only mask, so there is no driver-side mask yet.
+                    seq_logprob_error_metrics = {}
+                elif skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
@@ -3340,6 +3573,10 @@ def grpo_train(
                         seq_logprob_error_metrics[
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
+
+                pre_train_sequence_mask = train_data["sample_mask"].detach().clone()
+                if loss_side_seq_logprob_error:
+                    train_data["rewards"] = rewards.detach().cpu()
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -3525,12 +3762,12 @@ def grpo_train(
                 metrics.update(gen_step_metrics)
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if k in LOSS_METRIC_MIN_REDUCTION_NAMES:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.min(valid_values).item() if valid_values else -1.0
                         )
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in LOSS_METRIC_MAX_REDUCTION_NAMES:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.max(valid_values).item() if valid_values else -1.0
@@ -3554,8 +3791,22 @@ def grpo_train(
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
-                # Always log sequence-level error metrics (useful for deciding threshold)
-                metrics.update(seq_logprob_error_metrics)
+                # Always log sequence-level error metrics (useful for deciding threshold).
+                if loss_side_seq_logprob_error:
+                    _finalize_seq_logprob_error_metrics(metrics)
+                else:
+                    metrics.update(seq_logprob_error_metrics)
+                metrics.update(
+                    _sequence_mask_stage_metrics(
+                        initial_mask=initial_sequence_mask,
+                        pre_train_mask=pre_train_sequence_mask,
+                        post_train_masked_count=(
+                            metrics["num_masked_seqs_by_logprob_error"]
+                            if loss_side_seq_logprob_error
+                            else 0.0
+                        ),
+                    )
+                )
 
                 ## Checkpointing
                 consumed_samples += master_config.grpo.num_prompts_per_step
@@ -4216,6 +4467,16 @@ def async_grpo_train(
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
     max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
+    log_nemo_gym_training_samples = should_log_nemo_gym_training_samples(
+        master_config.env
+    )
+    log_local_train_data_artifacts = not _should_log_nemo_gym_responses(master_config)
+    if log_nemo_gym_training_samples and not master_config.env.get(
+        "should_use_nemo_gym", False
+    ):
+        raise ValueError(
+            "env.log_training_samples requires env.should_use_nemo_gym=true"
+        )
 
     if router_replay_enabled(master_config.policy) and (
         master_config.data_plane or {}
@@ -4261,6 +4522,7 @@ def async_grpo_train(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+    loss_side_seq_logprob_error = _use_loss_side_seq_logprob_error(master_config)
 
     assert (not colocated_inference) or (
         isinstance(policy_generation, MegatronGeneration)
@@ -4664,10 +4926,18 @@ def async_grpo_train(
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
+    train_data_writer = AsyncTrainDataArtifactWriter(logger.log_train_data_artifacts)
+    nemo_gym_sample_writer = AsyncNemoGymTrainingSampleWriter(
+        logger.log_nemo_gym_training_samples
+    )
 
     # Main training loop
     try:
         while step < master_config.grpo.max_num_steps:
+            # Surface a completed background-save failure before doing more work.
+            # A still-running save is allowed to overlap the optimizer step.
+            train_data_writer.finish(wait=False)
+            nemo_gym_sample_writer.finish(wait=False)
             ray.get(trajectory_collector.check_health.remote())
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
@@ -4843,6 +5113,14 @@ def async_grpo_train(
                     print(
                         f"❌ Unexpected training batch size: got {repeated_batch.size}, expected {expected_batch_size}. Skipping step and waiting for correct buffer content."
                     )
+                    del (
+                        per_prompt_batches,
+                        repeated_batch,
+                        sample_result,
+                        trajectories,
+                        trajectory_teacher_logprobs,
+                    )
+                    gc.collect()
                     time.sleep(0.5)
                     continue
 
@@ -4854,6 +5132,25 @@ def async_grpo_train(
                     )
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
+
+                with timer.time("save_nemo_gym_training_samples"):
+                    nemo_gym_training_samples = _take_nemo_gym_training_samples_for_log(
+                        repeated_batch,
+                        enabled=log_nemo_gym_training_samples,
+                    )
+                    if nemo_gym_training_samples is not None:
+                        nemo_gym_sample_writer.start(
+                            step=step + 1,
+                            samples=nemo_gym_training_samples,
+                        )
+                        del nemo_gym_training_samples
+
+                # ``repeated_batch`` now owns the selected combined batch and
+                # the optional sample writer owns its detached snapshots.  The
+                # replay-buffer result and per-prompt source batches are not
+                # used below; retaining them would keep a second object graph
+                # of message logs and Gym responses alive through training.
+                del per_prompt_batches, sample_result, trajectories
 
                 # Baseline spec-decode counters; the delta read at metrics time gives
                 # MTP acceptance over this step's generation window (async generation
@@ -4878,6 +5175,9 @@ def async_grpo_train(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
                     )
 
+                initial_sequence_mask = (
+                    repeated_batch["loss_multiplier"].detach().clone()
+                )
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
@@ -4930,6 +5230,17 @@ def async_grpo_train(
                     )
                     train_data.to("cpu")
 
+                    # Everything needed by policy inference/training now lives
+                    # in train_data.  Keep non-tensor content only when the
+                    # local train-data artifact writer will consume it.
+                    flat_token_mask = train_data["token_mask"]
+                    flat_messages_content = (
+                        flat_messages.get("content", [])
+                        if log_local_train_data_artifacts
+                        else []
+                    )
+                    del flat_messages
+
                 generation_logger_metrics = None
                 if policy_generation.blocks_training():
                     print("⏸️ Pausing colocated engine + collector for training...")
@@ -4978,8 +5289,13 @@ def async_grpo_train(
                             train_data["prev_logprobs"]
                         )
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                # The legacy driver path needs real prev_logprobs; the opt-in
+                # loss-side path emits these metrics from policy.train().
+                if loss_side_seq_logprob_error:
+                    # The training forward emits the metrics and applies a
+                    # loss-only mask, so there is no driver-side mask yet.
+                    seq_logprob_error_metrics = {}
+                elif skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
@@ -4993,6 +5309,10 @@ def async_grpo_train(
                         seq_logprob_error_metrics[
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
+
+                pre_train_sequence_mask = train_data["sample_mask"].detach().clone()
+                if loss_side_seq_logprob_error:
+                    train_data["rewards"] = rewards.detach().cpu()
 
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
@@ -5056,17 +5376,38 @@ def async_grpo_train(
                         train_data["advantages"], master_config.grpo
                     )
 
-                print("▶ Preparing for training...")
+                # The message log is only needed through advantage penalties.
+                # Drop the large Python object graph before Policy.train builds
+                # and serializes its DP shards.
+                with timer.time("driver_memory_cleanup"):
+                    del repeated_batch["message_log"]
+                    gc.collect()
+
+                print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...")
+                print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
                     train_results = policy.train(
                         train_data,
                         loss_fn,
                         timer=timer,
+                    )
+
+                # weight_version is the target version just consumed. The
+                # policy call has joined every worker, while all future
+                # buffered/in-flight rollouts target strictly newer versions.
+                with timer.time("router_replay_gc"):
+                    routed_experts_gc = retire_routed_experts_through(
+                        master_config.policy, weight_version
+                    )
+                if routed_experts_gc is not None:
+                    print(
+                        "🧹 Retired routed-experts Ray objects through target "
+                        f"{weight_version}: {routed_experts_gc}",
+                        flush=True,
                     )
 
                 is_last_step = step + 1 == master_config.grpo.max_num_steps
@@ -5090,7 +5431,10 @@ def async_grpo_train(
                     and policy_generation.wake_carries_weight_updates()
                 )
 
-                print("🔄 Synchronizing policy weights to trajectory collector…")
+                print(
+                    "🔄 Synchronizing policy weights to trajectory collector…",
+                    flush=True,
+                )
                 if defer_wake_for_save:
                     # Wake-deferral (checkpoint scheduling, which the backend
                     # cannot see): the engine is about to be saved, so leave it
@@ -5233,10 +5577,6 @@ def async_grpo_train(
                             trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
-                flat_token_mask = flat_messages["token_loss_mask"]
-                # Save content for logging before deleting flat_messages
-                flat_messages_content = flat_messages.get("content", [])
-                del flat_messages
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -5276,12 +5616,12 @@ def async_grpo_train(
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if k in LOSS_METRIC_MIN_REDUCTION_NAMES:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.min(valid_values).item() if valid_values else -1.0
                         )
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in LOSS_METRIC_MAX_REDUCTION_NAMES:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.max(valid_values).item() if valid_values else -1.0
@@ -5302,8 +5642,22 @@ def async_grpo_train(
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
-                # Always log sequence-level error metrics (useful for deciding threshold)
-                metrics.update(seq_logprob_error_metrics)
+                # Always log sequence-level error metrics (useful for deciding threshold).
+                if loss_side_seq_logprob_error:
+                    _finalize_seq_logprob_error_metrics(metrics)
+                else:
+                    metrics.update(seq_logprob_error_metrics)
+                metrics.update(
+                    _sequence_mask_stage_metrics(
+                        initial_mask=initial_sequence_mask,
+                        pre_train_mask=pre_train_sequence_mask,
+                        post_train_masked_count=(
+                            metrics["num_masked_seqs_by_logprob_error"]
+                            if loss_side_seq_logprob_error
+                            else 0.0
+                        ),
+                    )
+                )
 
                 # Speculative-decoding (MTP) acceptance metrics for this step.
                 if hasattr(policy_generation, "get_step_metrics"):
@@ -5451,33 +5805,45 @@ def async_grpo_train(
                         ray.get(trajectory_collector.resume_after_refit.remote())
 
             # Logging
+            # Stage the training data before releasing train_data, but do not
+            # start filesystem I/O until the step's W&B metrics have been sent.
+            pending_train_data_save: Optional[
+                tuple[dict[str, Any], dict[str, torch.Tensor], int]
+            ] = None
             # Log training data (match sync GRPO logging payload for parity).
             # NeMo Gym responses can be very large and expensive to log; when
-            # env.should_log_nemo_gym_responses is true, skip this jsonl (see
+            # env.should_log_nemo_gym_responses is true, skip these artifacts (see
             # _should_log_nemo_gym_responses).
-            if not _should_log_nemo_gym_responses(master_config):
-                log_data = {}
+            if log_local_train_data_artifacts:
+                non_tensor_log_data: dict[str, Any] = {}
                 if "agent_ref" in repeated_batch:
-                    log_data["agent_ref"] = repeated_batch["agent_ref"]
-                log_data["content"] = flat_messages_content
-                log_data["rewards"] = rewards.tolist()
+                    non_tensor_log_data["agent_ref"] = repeated_batch["agent_ref"]
+                non_tensor_log_data["content"] = flat_messages_content
+                tensor_log_data = {
+                    # JSONL historically added this field while iterating rows.
+                    "idx": torch.arange(len(flat_messages_content), dtype=torch.int64),
+                    "rewards": rewards.detach().cpu(),
+                    "input_lengths": input_lengths.detach().cpu(),
+                    "token_ids": train_data["input_ids"].detach().cpu(),
+                    "token_loss_mask": train_data["token_mask"].detach().cpu(),
+                    "sample_loss_mask": train_data["sample_mask"].detach().cpu(),
+                    "advantages": train_data["advantages"].detach().cpu(),
+                    "generation_logprobs": train_data["generation_logprobs"]
+                    .detach()
+                    .cpu(),
+                    "prev_logprobs": train_data["prev_logprobs"].detach().cpu(),
+                }
                 if master_config.grpo.use_dynamic_sampling:
                     # In dynamic sampling, `rewards` corresponds to filtered rewards
-                    log_data["filtered_rewards"] = rewards.tolist()
-                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
-                log_data["input_lengths"] = input_lengths.tolist()
-                log_data["token_ids"] = train_data["input_ids"].tolist()
-                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-                log_data["advantages"] = train_data["advantages"].tolist()
-                log_data["generation_logprobs"] = train_data[
-                    "generation_logprobs"
-                ].tolist()
-                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-                logger.log_batched_dict_as_jsonl(
-                    log_data, f"train_data_step{step + 1}.jsonl"
+                    tensor_log_data["filtered_rewards"] = rewards.detach().cpu()
+                    tensor_log_data["rewards"] = (
+                        repeated_batch["total_reward"].detach().cpu()
+                    )
+                pending_train_data_save = (
+                    non_tensor_log_data,
+                    tensor_log_data,
+                    len(flat_messages_content),
                 )
-                del log_data
             del train_data
             del flat_messages_content
 
@@ -5504,7 +5870,8 @@ def async_grpo_train(
                     logger,
                 )
 
-            print("\n📊 Training Results:")
+            print("\n📊 Training Results:", flush=True)
+            print(f"  • Step: {step + 1}")
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
@@ -5585,6 +5952,43 @@ def async_grpo_train(
                 step_finished=True,
             )
 
+            if pending_train_data_save is not None:
+                non_tensor_log_data, tensor_log_data, num_log_samples = (
+                    pending_train_data_save
+                )
+                train_data_writer.start(
+                    step=step + 1,
+                    num_samples=num_log_samples,
+                    non_tensor_data=non_tensor_log_data,
+                    tensors=tensor_log_data,
+                )
+                del (
+                    pending_train_data_save,
+                    non_tensor_log_data,
+                    tensor_log_data,
+                    num_log_samples,
+                )
+
+            # Release the completed step before assembling the next globally
+            # padded batch.  Several of these locals are aliases into tensors
+            # formerly owned by ``train_data``; deleting that container alone
+            # leaves the token mask, combined mask, and advantages reachable.
+            # The CPU allocator may retain their pages, but dropping all live
+            # references lets the next sharding pass reuse those allocations.
+            del (
+                advantages,
+                flat_advantages,
+                flat_token_mask,
+                mask,
+                repeated_batch,
+                response_advantages,
+                rewards,
+                sample_mask,
+                token_mask,
+                trajectory_teacher_logprobs,
+            )
+            gc.collect()
+
             timer.reset()
             step += 1
             if early_stop_message is not None:
@@ -5610,6 +6014,23 @@ def async_grpo_train(
         raise
 
     finally:
+        had_active_exception = sys.exc_info()[0] is not None
+        artifact_finalize_error: Optional[Exception] = None
+        try:
+            train_data_writer.finish(wait=True)
+        except Exception as e:
+            print(f"Error finalizing background train-data save: {e}", flush=True)
+            artifact_finalize_error = e
+        try:
+            nemo_gym_sample_writer.finish(wait=True)
+        except Exception as e:
+            print(
+                f"Error finalizing background NeMo Gym training-sample save: {e}",
+                flush=True,
+            )
+            if artifact_finalize_error is None:
+                artifact_finalize_error = e
+
         # Finalize any pending async checkpoint before tearing down workers.
         try:
             checkpointer.shutdown()
@@ -5644,3 +6065,7 @@ def async_grpo_train(
                 print(f"Error shutting down policy workers: {e}")
 
         print("Async GRPO training complete!")
+        # Preserve an already-active training exception.  Otherwise surface a
+        # persistence failure only after all workers and checkpoints are clean.
+        if artifact_finalize_error is not None and not had_active_exception:
+            raise artifact_finalize_error

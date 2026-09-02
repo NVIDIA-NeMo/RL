@@ -38,7 +38,12 @@ from nemo_rl.experience.failures import (
     RolloutTimeout,
     classify_rollout_failure,
 )
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+    Completion,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
@@ -374,11 +379,17 @@ class AsyncRolloutImpl:
         self._policy_generation = policy_generation
         self._timeouts = timeouts
 
-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+    async def run_rollout(
+        self,
+        input_sample: DatumSpec,
+        target_weight_version: Optional[int] = None,
+    ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
+            target_weight_version: Opaque async-RL target version. The native
+                rollout path does not forward it to a Gym model request.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -768,11 +779,17 @@ class AsyncNemoGymRolloutImpl:
 
         self._validate_init_params()
 
-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+    async def run_rollout(
+        self,
+        input_sample: DatumSpec,
+        target_weight_version: Optional[int] = None,
+    ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
+            target_weight_version: Opaque async-RL target version forwarded on
+                every NeMo-Gym model request. ``None`` omits the field.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -781,7 +798,10 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
 
-        rollout_inputs = self._build_inputs(input_sample)
+        rollout_inputs = self._build_inputs(
+            input_sample,
+            target_weight_version=target_weight_version,
+        )
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
         )
@@ -816,7 +836,11 @@ class AsyncNemoGymRolloutImpl:
             "Please set `max_rollout_turns` to 1."
         )
 
-    def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
+    def _build_inputs(
+        self,
+        input_sample: DatumSpec,
+        target_weight_version: Optional[int] = None,
+    ) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
@@ -837,10 +861,17 @@ class AsyncNemoGymRolloutImpl:
         )
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
+        # The Gym rollout index is a separate, Gym-visible per-task identity; it is
+        # conventionally [0, K) and happens to match the local row order here.
         rows = []
         for i in range(self._num_generations_per_prompt):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
+            row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
+            if target_weight_version is None:
+                row.pop(NEMO_GYM_TARGET_WEIGHT_VERSION_KEY, None)
+            else:
+                row[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] = target_weight_version
             rows.append(row)
         return rows
 
@@ -1194,8 +1225,15 @@ class RolloutManager:
         """
         self._weight_version = int(version)
 
-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
-        return await self._impl.run_rollout(input_sample)
+    async def run_rollout(
+        self,
+        input_sample: DatumSpec,
+        target_weight_version: Optional[int] = None,
+    ) -> PromptGroupRecord:
+        return await self._impl.run_rollout(
+            input_sample,
+            target_weight_version=target_weight_version,
+        )
 
     async def generate_and_push(
         self,
@@ -1266,7 +1304,10 @@ class RolloutManager:
                     inflight_registry[group_id] = (current_task, start_version)
                 # Unregister before commit so cancellation cannot interrupt it.
                 try:
-                    record = await self.run_rollout(input_sample)
+                    record = await self.run_rollout(
+                        input_sample,
+                        target_weight_version=target_step,
+                    )
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(group_id, None)

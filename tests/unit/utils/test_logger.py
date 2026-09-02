@@ -429,6 +429,16 @@ class TestWandbLogger:
         mock_run.log.assert_called_once_with(metrics, step=step)
 
     @patch("nemo_rl.utils.logger.wandb")
+    def test_log_histogram_is_disabled(self, mock_wandb):
+        """W&B histogram logging remains disabled for bounded payloads."""
+        logger = WandbLogger({})
+
+        logger.log_histogram([1.0, 2.0, 3.0], step=10, name="train/reward")
+
+        mock_wandb.Histogram.assert_not_called()
+        mock_wandb.init.return_value.log.assert_not_called()
+
+    @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix(self, mock_wandb):
         """Test logging metrics with a prefix to WandbLogger."""
         cfg = {}

@@ -39,6 +39,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _finalize_seq_logprob_error_metrics,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -48,8 +49,11 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
+    _sequence_mask_stage_metrics,
     _startup_pipeline_ready,
+    _take_nemo_gym_training_samples_for_log,
     _validate_multimodal_dedup_capability,
+    _validate_loss_side_seq_logprob_error_config,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -63,6 +67,18 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC,
+)
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -70,6 +86,9 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.nemo_gym_sample_artifacts import (
+    NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -258,6 +277,43 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+def test_take_nemo_gym_training_samples_detaches_selected_snapshots():
+    full_results = [{"reward": 1.0}, {"reward": 2.0}]
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 0.0]),
+            "mask_sample": torch.tensor([False, True]),
+            "total_reward": torch.tensor([1.0, 2.0]),
+            "truncated": torch.tensor([False, True]),
+            NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY: [
+                {"full_result": full_results[0], "_ng_rollout_index": 0},
+                {"full_result": full_results[1], "_ng_rollout_index": 1},
+            ],
+        }
+    )
+
+    samples = _take_nemo_gym_training_samples_for_log(repeated_batch, enabled=True)
+
+    assert NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY not in repeated_batch
+    assert samples is not None
+    assert samples == [
+        {"full_result": full_results[0], "_ng_rollout_index": 0},
+        {"full_result": full_results[1], "_ng_rollout_index": 1},
+    ]
+    assert all("training" not in sample for sample in samples)
+
+
+def test_take_nemo_gym_training_samples_warns_when_snapshots_are_missing():
+    repeated_batch = BatchedDataDict(
+        {"loss_multiplier": torch.tensor([1.0]), "total_reward": torch.tensor([1.0])}
+    )
+
+    with pytest.warns(RuntimeWarning, match="no retained NeMo Gym responses"):
+        samples = _take_nemo_gym_training_samples_for_log(repeated_batch, enabled=True)
+
+    assert samples is None
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -5734,7 +5790,14 @@ class TestAggregateRolloutMetrics:
 
 
 def _cfg(
-    *, force=False, threshold=None, skip_ref=None, kl_reward=False, kl_penalty=0.01
+    *,
+    force=False,
+    threshold=None,
+    loss_side=False,
+    skip_ref=None,
+    kl_reward=False,
+    kl_penalty=0.01,
+    data_plane=None,
 ):
     return MasterConfig.model_construct(
         loss_fn=ClippedPGLossConfig(
@@ -5744,8 +5807,10 @@ def _cfg(
         ),
         grpo=GRPOConfig.model_construct(
             seq_logprob_error_threshold=threshold,
+            seq_logprob_error_force_on_policy=loss_side,
             skip_reference_policy_logprobs_calculation=skip_ref,
         ),
+        data_plane=data_plane,
     )
 
 
@@ -5755,16 +5820,85 @@ def _cfg(
         ({}, (False, None)),
         ({"force": True}, (True, None)),
         ({"force": True, "threshold": 1.5}, (False, None)),  # threshold overrides skip
+        (
+            {"force": True, "threshold": 1.5, "loss_side": True},
+            (True, None),
+        ),
         ({"skip_ref": True}, (False, True)),
     ],
-    ids=["default", "force_on_policy", "force_plus_threshold", "skip_ref"],
+    ids=[
+        "default",
+        "force_on_policy",
+        "force_plus_legacy_threshold",
+        "force_plus_loss_side_threshold",
+        "skip_ref",
+    ],
 )
 def test_resolve_logprob_skip_flags(kw, expected):
-    if kw.get("force") and kw.get("threshold") is not None:
+    if kw.get("force") and kw.get("threshold") is not None and not kw.get("loss_side"):
         with pytest.warns(UserWarning, match="seq_logprob_error_threshold is set"):
             assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
     else:
         assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+
+
+def test_validate_loss_side_seq_logprob_error_config():
+    _validate_loss_side_seq_logprob_error_config(
+        _cfg(force=True, threshold=2.0, loss_side=True)
+    )
+
+    with pytest.raises(ValueError, match="seq_logprob_error_threshold"):
+        _validate_loss_side_seq_logprob_error_config(_cfg(force=True, loss_side=True))
+    with pytest.raises(ValueError, match="force_on_policy_ratio"):
+        _validate_loss_side_seq_logprob_error_config(
+            _cfg(threshold=2.0, loss_side=True)
+        )
+    with pytest.raises(NotImplementedError, match="data_plane.enabled=false"):
+        _validate_loss_side_seq_logprob_error_config(
+            _cfg(
+                force=True,
+                threshold=2.0,
+                loss_side=True,
+                data_plane={"enabled": True},
+            )
+        )
+
+
+def test_finalize_loss_side_seq_logprob_error_metrics():
+    metrics = {
+        SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC: 7.0,
+        SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC: 3.0,
+        SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC: 1.0,
+        SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC: 4.0,
+        SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC: 3.0,
+        SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC: 2.0,
+        SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC: 1.0,
+        SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC: 2.0,
+        SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC: 1.0,
+        SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC: 1.0,
+    }
+
+    _finalize_seq_logprob_error_metrics(metrics)
+
+    assert metrics["mean_seq_mult_prob_error"] == pytest.approx(7.0 / 3.0)
+    assert metrics["mean_seq_mult_prob_error_after_mask"] == pytest.approx(1.5)
+    assert metrics["num_masked_seqs_by_logprob_error"] == 1.0
+    assert metrics["masked_correct_pct"] == 1.0
+    assert metrics["logprob_error_masked_seq_fraction"] == pytest.approx(1.0 / 3.0)
+
+
+def test_sequence_mask_stage_metrics_are_disjoint_and_additive():
+    metrics = _sequence_mask_stage_metrics(
+        initial_mask=torch.tensor([1.0, 1.0, 1.0, 0.0]),
+        pre_train_mask=torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        post_train_masked_count=1.0,
+    )
+
+    assert metrics == {
+        "num_masked_seqs_pre_train_step": 1.0,
+        "num_masked_seqs_post_train_step": 1.0,
+        "num_masked_seqs_total": 2.0,
+    }
 
 
 def test_validate_use_kl_in_reward_rejects_force_on_policy_ratio():

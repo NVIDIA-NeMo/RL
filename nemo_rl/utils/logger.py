@@ -22,7 +22,8 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
+from pathlib import Path
+from typing import Any, Callable, Mapping, NotRequired, Optional, Sequence, TypedDict
 
 import mlflow
 import numpy as np
@@ -41,6 +42,11 @@ from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
 
 from nemo_rl.data.interfaces import LLMMessageLogType
+from nemo_rl.data.nemo_gym_sample_artifacts import save_nemo_gym_training_samples
+from nemo_rl.data.train_data_artifacts import (
+    TrainDataArtifactPaths,
+    save_train_data_artifacts,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
 
@@ -419,19 +425,8 @@ class WandbLogger(LoggerInterface):
             self.run = None
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
-        """Log histogram metrics to wandb.
-
-        Args:
-            histogram: List of histogram values
-            step: Global step value
-            name: Name of the metric
-        """
-        try:
-            self.run.log({name: wandb.Histogram(histogram)}, step=step)
-        except ValueError:
-            # When all values are identical, numpy cannot create finite-sized bins.
-            # Log the scalar value instead.
-            self.run.log({name: histogram[0] if len(histogram) > 0 else 0}, step=step)
+        """Skip histogram metrics for wandb to keep history payloads bounded."""
+        return None
 
 
 class SwanlabLogger(LoggerInterface):
@@ -1127,6 +1122,36 @@ class Logger(LoggerInterface):
                 f.write(json.dumps({**sample, "idx": i}, default=str) + "\n")
 
         print(f"Logged data to {filepath}")
+
+    def log_train_data_artifacts(
+        self,
+        *,
+        step: int,
+        num_samples: int,
+        non_tensor_data: Mapping[str, Any],
+        tensors: Mapping[str, torch.Tensor],
+    ) -> TrainDataArtifactPaths:
+        """Log one train-data step as ``.pt`` plus a safetensors sidecar."""
+        return save_train_data_artifacts(
+            base_dir=self.base_log_dir,
+            step=step,
+            num_samples=num_samples,
+            non_tensor_data=non_tensor_data,
+            tensors=tensors,
+        )
+
+    def log_nemo_gym_training_samples(
+        self,
+        *,
+        step: int,
+        samples: Sequence[Mapping[str, Any]],
+    ) -> Path:
+        """Log selected NeMo Gym responses as one tensor-free ``.pt`` file."""
+        return save_nemo_gym_training_samples(
+            base_dir=self.base_log_dir,
+            step=step,
+            samples=samples,
+        )
 
     def log_string_list_as_jsonl(self, to_log: list[str], filename: str) -> None:
         """Log a list of strings to a JSONL file.

@@ -19,7 +19,11 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    LOSS_METRIC_MAX_REDUCTION_NAMES,
+    LOSS_METRIC_MIN_REDUCTION_NAMES,
+    DraftCrossEntropyLossFn,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -144,9 +148,9 @@ class SequencePackingLossWrapper:
             loss_accum += loss
             for k, v in metrics.items():
                 if k not in metrics_accum:
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if k in LOSS_METRIC_MIN_REDUCTION_NAMES:
                         metrics_accum[k] = float("inf")
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in LOSS_METRIC_MAX_REDUCTION_NAMES:
                         metrics_accum[k] = float("-inf")
                     else:
                         metrics_accum[k] = 0
@@ -154,10 +158,10 @@ class SequencePackingLossWrapper:
                 val = v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v
 
                 # Skip inf/-inf sentinel values (from sequences with no valid tokens)
-                if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                if k in LOSS_METRIC_MIN_REDUCTION_NAMES:
                     if not math.isinf(val):
                         metrics_accum[k] = min(metrics_accum[k], val)
-                elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                elif k in LOSS_METRIC_MAX_REDUCTION_NAMES:
                     if not math.isinf(val):
                         metrics_accum[k] = max(metrics_accum[k], val)
                 else:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 from contextlib import contextmanager
 from functools import wraps
@@ -89,6 +90,230 @@ def _locked_file_patch(file_path: str):
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
+
+
+_ROUTED_EXPERTS_CAPTURER_SOURCE = (
+    "model_executor/layers/fused_moe/routed_experts_capturer.py"
+)
+# This blob is shared by the live image's b31cc131 build and uv.lock's
+# 6f11a9c5 source revision, despite other differences between those commits.
+_ROUTED_EXPERTS_CAPTURER_V0251_SHA256 = (
+    "e2e02d6322fd45edc143bdf2553a0fe6e2a010e1da3fbcea0df5887485a211c1"
+)
+_ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256 = (
+    "7aada566f750ae6c46d214b03f3b012757ea07f81ac3f0c2d6ce15956a4ad25b"
+)
+
+
+def _compact_routed_experts_capturer_source(content: str) -> str:
+    """Apply the pinned vLLM 0.25.1 compact-layer capturer source edit."""
+    replacements = (
+        (
+            "routed-layer resolver",
+            """        "or 'num_local_experts'."
+    )
+
+
+class RoutedExpertsCapturer:""",
+            '''        "or 'num_local_experts'."
+    )
+
+
+def get_routed_experts_layer_indices(hf_config) -> tuple[int, ...]:
+    """Return backbone layer IDs represented by the routing payload.
+
+    Hybrid Nemotron configs explicitly identify MoE blocks in
+    ``layers_block_type``. Compress those sparse global layer IDs into a dense
+    payload axis. Other model families retain the historical full-layer layout
+    unless they expose an equivalent explicit block list.
+
+    MTP block types intentionally live in ``mtp_layers_block_type`` and are not
+    included: rollout routes replay only backbone MoE layers.
+    """
+    layer_types = getattr(hf_config, "layers_block_type", None)
+    if isinstance(layer_types, (list, tuple)) and layer_types:
+        moe_layer_ids = tuple(
+            layer_id
+            for layer_id, layer_type in enumerate(layer_types)
+            if str(layer_type).lower() == "moe"
+        )
+        if moe_layer_ids:
+            return moe_layer_ids
+
+    num_hidden_layers = int(hf_config.num_hidden_layers)
+    return tuple(range(num_hidden_layers))
+
+
+class RoutedExpertsCapturer:''',
+        ),
+        (
+            "capturer allocation",
+            """        num_experts_per_tok = _get_num_experts_per_tok(hf_config)
+        num_layers = hf_config.num_hidden_layers
+        logger.info(
+            "RoutedExpertsCapturer: allocating buffer with "
+            "max_tokens=%d, num_layers=%d, num_experts_per_tok=%d "
+            "(hf_config.model_type=%s)",
+            max_num_batched_tokens,
+            num_layers,
+            num_experts_per_tok,
+            getattr(hf_config, "model_type", "unknown"),
+        )""",
+            """        num_experts_per_tok = _get_num_experts_per_tok(hf_config)
+        routed_layer_ids = get_routed_experts_layer_indices(hf_config)
+        num_layers = len(routed_layer_ids)
+        logger.info(
+            "RoutedExpertsCapturer: allocating buffer with "
+            "max_tokens=%d, routed_layers=%d, num_experts_per_tok=%d "
+            "(hf_config.model_type=%s, global_layer_ids=%s)",
+            max_num_batched_tokens,
+            num_layers,
+            num_experts_per_tok,
+            getattr(hf_config, "model_type", "unknown"),
+            routed_layer_ids,
+        )""",
+        ),
+        (
+            "global-to-compact layer map",
+            """        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+    def capture""",
+            """        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.layer_id_to_capture_index = {
+            layer_id: capture_index
+            for capture_index, layer_id in enumerate(routed_layer_ids)
+        }
+
+    def capture""",
+        ),
+        (
+            "capturer layer lookup",
+            """        # Defensive: model may expose more layers than the capture buffer
+        # was sized for (unusual, but guards against miss-config).
+        if layer_id >= self.device_buffer.shape[1]:
+            return
+
+        self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[""",
+            """        layer_id_to_capture_index = getattr(self, "layer_id_to_capture_index", None)
+        capture_index = (
+            layer_id
+            if layer_id_to_capture_index is None
+            else layer_id_to_capture_index.get(layer_id)
+        )
+        # Missing IDs include non-MoE backbone blocks and MTP routers.
+        if (
+            capture_index is None
+            or capture_index < 0
+            or capture_index >= self.device_buffer.shape[1]
+        ):
+            return
+
+        self.device_buffer[:token_num_per_dp, capture_index, :] = topk_ids[""",
+        ),
+        (
+            "manager routed-layer resolver",
+            """        num_experts = get_num_experts(hf_config)
+        num_experts_per_tok = _get_num_experts_per_tok(hf_config)
+        max_num_slots = kv_cache_config.num_blocks * self.block_size""",
+            """        num_experts = get_num_experts(hf_config)
+        num_experts_per_tok = _get_num_experts_per_tok(hf_config)
+        routed_layer_ids = get_routed_experts_layer_indices(hf_config)
+        max_num_slots = kv_cache_config.num_blocks * self.block_size""",
+        ),
+        (
+            "manager allocation",
+            """                max_num_slots,
+                hf_config.num_hidden_layers,
+                num_experts_per_tok,""",
+            """                max_num_slots,
+                len(routed_layer_ids),
+                num_experts_per_tok,""",
+        ),
+        (
+            "manager allocation log",
+            """            max_num_slots,
+            hf_config.num_hidden_layers,
+            hf_config.num_experts_per_tok,
+            self.routed_experts_by_slot.dtype.name,""",
+            """            max_num_slots,
+            len(routed_layer_ids),
+            num_experts_per_tok,
+            self.routed_experts_by_slot.dtype.name,""",
+        ),
+    )
+
+    for description, old_snippet, new_snippet in replacements:
+        occurrences = content.count(old_snippet)
+        if occurrences != 1:
+            raise ValueError(
+                f"expected exactly one {description} source anchor, found {occurrences}"
+            )
+        content = content.replace(old_snippet, new_snippet, 1)
+    return content
+
+
+def _patch_vllm_routed_experts_compact_layers(logger) -> bool:
+    """Compact vLLM's routed-experts buffers to backbone MoE layers only.
+
+    vLLM's engine processes import their own module state, so a normal Python
+    monkeypatch in the NeMo-RL actor does not propagate. Patch the installed
+    source before those processes start instead. The edit is pinned by source
+    hashes to the image's known vLLM 0.25.1 implementation and to the desired
+    result, keeping this independent of a mounted custom vLLM checkout while
+    refusing to rewrite an unknown implementation.
+
+    Returns whether the compact implementation is present after this call.
+    """
+    try:
+        file_to_patch = _get_vllm_file(_ROUTED_EXPERTS_CAPTURER_SOURCE)
+    except RuntimeError as error:
+        logger.error("Could not locate routed-experts capturer: %s", error)
+        return False
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        source_sha256 = hashlib.sha256(content.encode()).hexdigest()
+        if source_sha256 == _ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256:
+            logger.info("vLLM compact routed-experts capturer source already present.")
+            return True
+
+        if source_sha256 != _ROUTED_EXPERTS_CAPTURER_V0251_SHA256:
+            logger.error(
+                "Refusing to patch unknown vLLM routed-experts capturer at %s "
+                "(sha256=%s; expected stock=%s or compact=%s).",
+                file_to_patch,
+                source_sha256,
+                _ROUTED_EXPERTS_CAPTURER_V0251_SHA256,
+                _ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256,
+            )
+            return False
+
+        try:
+            patched_content = _compact_routed_experts_capturer_source(content)
+            compile(patched_content, file_to_patch, "exec")
+        except (SyntaxError, ValueError) as error:
+            logger.error("Could not build compact routed-experts source: %s", error)
+            return False
+
+        patched_sha256 = hashlib.sha256(patched_content.encode()).hexdigest()
+        if patched_sha256 != _ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256:
+            logger.error(
+                "Compact routed-experts source had unexpected sha256=%s "
+                "(expected %s); source was not modified.",
+                patched_sha256,
+                _ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256,
+            )
+            return False
+
+        write_back(patched_content)
+
+    logger.info(
+        "Applied compact routed-experts source patch to %s (sha256=%s).",
+        file_to_patch,
+        _ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256,
+    )
+    return True
 
 
 def _patch_vllm_init_workers_ray(
@@ -663,6 +888,8 @@ def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:
         write_back(content.replace(old_snippet, new_snippet, 1))
 
     logger.info("Applied NemotronH fp32 LM head source patch.")
+
+
 def _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch(
     logger: Any | None = None,
 ) -> None:
@@ -1162,6 +1389,7 @@ def _apply_vllm_patches(
     py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
+    require_compact_routed_experts: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
@@ -1211,4 +1439,13 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_nemotron_h_fp32_lm_head(patch_logger)
+    compact_routed_experts_ready = _patch_vllm_routed_experts_compact_layers(
+        patch_logger
+    )
+    if require_compact_routed_experts and not compact_routed_experts_ready:
+        raise RuntimeError(
+            "Router replay requires NeMo-RL's compact routed-experts vLLM "
+            "source patch, but it could not be applied. See the preceding "
+            "vllm_patch error for the installed source path and hash."
+        )
     _patch_vllm_flashinfer_trtllm_refit_buffers(patch_logger)

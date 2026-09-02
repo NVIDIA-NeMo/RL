@@ -569,6 +569,11 @@ class RouterReplayConfigDisabled(TypedDict):
 
 class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
+    # ``inline`` carries the dense tensor through Gym and the RL driver.
+    # ``ray`` carries small tags and resolves the tensor in policy workers.
+    transport: NotRequired[Literal["inline", "ray"]]
+    # Internal run-unique store identifier populated during setup.
+    _store_run_instance_id: NotRequired[str]
 
 
 class PolicyConfig(TypedDict):

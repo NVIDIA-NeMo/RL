@@ -27,7 +27,20 @@ from nemo_rl.algorithms.loss import (
     prepare_loss_input,
 )
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
-from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    SEQ_LOGPROB_ERROR_ACCUM_METRICS,
+    SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC,
+    CrossTokenizerDistillationLossFn,
+)
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
@@ -407,6 +420,68 @@ def _setup_clipped_pg_test_data(batch_size=1, seq_len=4, vocab_size=8, device="c
     )
     # Return seq_len and vocab_size needed by tests
     return data, batch_size, seq_len, vocab_size
+
+
+def test_clipped_pg_loss_side_seq_logprob_error_masking():
+    """The train forward supplies the mask and rejected rows have zero gradient."""
+    batch_size, seq_len = 2, 4
+    curr_logprobs = torch.full((batch_size, seq_len - 1), -1.0, requires_grad=True)
+    generation_logprobs = torch.full((batch_size, seq_len), -1.0)
+    generation_logprobs[:, 0] = 0.0
+    generation_logprobs[1, 1:] -= torch.log(torch.tensor(3.0))
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(batch_size, seq_len, dtype=torch.long),
+            "token_mask": torch.tensor([[0.0, 1.0, 1.0, 1.0], [0.0, 1.0, 1.0, 1.0]]),
+            "sample_mask": torch.ones(batch_size),
+            "advantages": torch.ones(batch_size, seq_len),
+            "prev_logprobs": torch.zeros(batch_size, seq_len),
+            "generation_logprobs": generation_logprobs,
+            "reference_policy_logprobs": torch.zeros(batch_size, seq_len),
+            "rewards": torch.tensor([0.0, 1.0]),
+        }
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            force_on_policy_ratio=True,
+            reference_policy_kl_penalty=0.0,
+        ),
+        seq_logprob_error_threshold=2.0,
+    )
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=curr_logprobs,
+        data=data,
+        global_valid_seqs=torch.tensor(2.0),
+        global_valid_toks=torch.tensor(6.0),
+    )
+    loss.backward()
+
+    assert loss.item() == pytest.approx(-0.5)
+    torch.testing.assert_close(
+        curr_logprobs.grad[0], torch.full((seq_len - 1,), -1.0 / 6.0)
+    )
+    torch.testing.assert_close(curr_logprobs.grad[1], torch.zeros(seq_len - 1))
+    # The loss-only mask must not mutate the batch mask used by advantages/MTP.
+    torch.testing.assert_close(data["sample_mask"], torch.ones(batch_size))
+    assert metrics[SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC] == pytest.approx(4.0)
+    assert metrics[SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC] == 2.0
+    assert metrics[SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC] == pytest.approx(1.0)
+    assert metrics[SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC] == pytest.approx(3.0)
+    assert metrics[SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC] == pytest.approx(1.0)
+    assert metrics[SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC] == 1.0
+    assert metrics[SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC] == pytest.approx(1.0)
+    assert metrics[SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC] == pytest.approx(1.0)
+    assert metrics[SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC] == 1.0
+    assert metrics[SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC] == 1.0
+
+
+def test_clipped_pg_loss_side_seq_logprob_error_requires_force_on_policy():
+    with pytest.raises(ValueError, match="force_on_policy_ratio"):
+        ClippedPGLossFn(
+            ClippedPGLossConfig(force_on_policy_ratio=False),
+            seq_logprob_error_threshold=2.0,
+        )
 
 
 # Helper to create logits that yield specific target log probs after log_softmax
@@ -2710,6 +2785,10 @@ class TestMetricNormalizationAdvertisement:
         assert norms["positive_nll_loss"] is MetricNormalizer.NONE
         assert norms["probs_ratio_min"] is MetricNormalizer.NONE
         assert norms["probs_ratio_max"] is MetricNormalizer.NONE
+        assert all(
+            norms[key] is MetricNormalizer.NONE
+            for key in SEQ_LOGPROB_ERROR_ACCUM_METRICS
+        )
         # no TIS configured → the metric is never emitted, so not advertised
         assert "is_oob_ratio" not in norms
 

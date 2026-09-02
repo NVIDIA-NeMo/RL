@@ -15,7 +15,9 @@
 import asyncio
 import copy
 import gc
+import importlib.util
 import logging
+import os
 import threading
 import time
 import uuid
@@ -26,6 +28,7 @@ import ray
 import torch
 import uvicorn
 from fastapi import FastAPI
+from pydantic import Field
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -35,6 +38,11 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -53,6 +61,10 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
+)
+from nemo_rl.utils.routed_experts_ref import (
+    ROUTED_EXPERTS_REF_TRANSPORT,
+    RoutedExpertsStoreWriter,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -84,6 +96,14 @@ def is_context_length_error(exc: BaseException) -> bool:
     Only the message is reliable across those paths.
     """
     return CONTEXT_LENGTH_ERROR_MARKER in str(exc)
+
+
+def _resolved_module_source(module_name: str) -> str:
+    """Return both the import origin and resolved path for startup diagnostics."""
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.origin is None:
+        return "<not found>"
+    return f"{spec.origin} -> {os.path.realpath(spec.origin)}"
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -127,6 +147,18 @@ class VllmAsyncGenerationWorkerImpl(
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._routed_experts_store_writer = None
+        self._routed_experts_store_writer_lock = threading.Lock()
+
+        LOGGER.info(
+            "vLLM runtime sources: package=%s; routed_experts_capturer=%s; "
+            "gpu_model_runner=%s",
+            _resolved_module_source("vllm"),
+            _resolved_module_source(
+                "vllm.model_executor.layers.fused_moe.routed_experts_capturer"
+            ),
+            _resolved_module_source("vllm.v1.worker.gpu_model_runner"),
+        )
 
         super().__init__(
             config,
@@ -156,6 +188,31 @@ class VllmAsyncGenerationWorkerImpl(
         return bool(
             self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
         )
+
+    def _routed_experts_ref_enabled(self) -> bool:
+        return (
+            self.cfg.get("vllm_cfg", {}).get("_routed_experts_transport")
+            == ROUTED_EXPERTS_REF_TRANSPORT
+        )
+
+    def _get_routed_experts_store_writer(self) -> RoutedExpertsStoreWriter:
+        writer = self._routed_experts_store_writer
+        if writer is not None:
+            return writer
+        with self._routed_experts_store_writer_lock:
+            writer = self._routed_experts_store_writer
+            if writer is None:
+                run_instance_id = self.cfg.get("vllm_cfg", {}).get(
+                    "_routed_experts_store_run_instance_id"
+                )
+                if not isinstance(run_instance_id, str) or not run_instance_id:
+                    raise RuntimeError(
+                        "router_replay.transport=ray is missing the vLLM "
+                        "store run instance id"
+                    )
+                writer = RoutedExpertsStoreWriter(run_instance_id)
+                self._routed_experts_store_writer = writer
+        return writer
 
     def _reserve_port(self) -> None:
         """Bind and listen on a TCP socket to reserve a free port from the OS.
@@ -610,6 +667,18 @@ class VllmAsyncGenerationWorkerImpl(
             NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
+            nemo_gym_task_index: Optional[int] = Field(
+                default=None,
+                alias=NEMO_GYM_TASK_INDEX_KEY,
+            )
+            nemo_gym_rollout_index: Optional[int] = Field(
+                default=None,
+                alias=NEMO_GYM_ROLLOUT_INDEX_KEY,
+            )
+            nemo_gym_target_weight_version: Optional[int] = Field(
+                default=None,
+                alias=NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+            )
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
@@ -667,12 +736,56 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 if worker_self._return_routed_experts_enabled():
+                    routed_experts_ref_factory = None
+                    routed_experts_dtype = worker_self.routed_experts_dtype
+                    if worker_self._routed_experts_ref_enabled():
+                        request_id = getattr(final_res, "request_id", None)
+                        task_index = request.nemo_gym_task_index
+                        rollout_index = request.nemo_gym_rollout_index
+                        target_weight_version = request.nemo_gym_target_weight_version
+                        missing_fields = [
+                            name
+                            for name, value in (
+                                ("request_id", request_id),
+                                (NEMO_GYM_TASK_INDEX_KEY, task_index),
+                                (NEMO_GYM_ROLLOUT_INDEX_KEY, rollout_index),
+                                (
+                                    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+                                    target_weight_version,
+                                ),
+                            )
+                            if value is None
+                        ]
+                        if missing_fields:
+                            raise RuntimeError(
+                                "Ray-reference router replay requires request "
+                                "identity metadata; missing "
+                                f"{missing_fields}."
+                            )
+                        writer = worker_self._get_routed_experts_store_writer()
+
+                        def routed_experts_ref_factory(
+                            routed_experts: torch.Tensor,
+                        ) -> dict[str, Any]:
+                            return writer.put(
+                                routed_experts,
+                                request_id=str(request_id),
+                                task_index=int(task_index),
+                                rollout_index=int(rollout_index),
+                                target_weight_version=int(target_weight_version),
+                            )
+
+                        # The reference format is intentionally fixed-width and
+                        # signed so -1 remains available as the missing-route
+                        # sentinel without a driver-side dtype scan.
+                        routed_experts_dtype = torch.int16
                     response = attach_routed_experts_to_chat_response_choices(
                         response,
                         final_res,
                         device=torch.device("cpu"),
                         logger=LOGGER,
-                        routed_experts_dtype=worker_self.routed_experts_dtype,
+                        routed_experts_dtype=routed_experts_dtype,
+                        routed_experts_ref_factory=routed_experts_ref_factory,
                     )
 
                 return response

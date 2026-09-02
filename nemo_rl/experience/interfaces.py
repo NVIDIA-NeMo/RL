@@ -18,6 +18,12 @@ from typing import Any, Optional
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
+# Gym-visible generation identity within a task, conventionally in [0, K).
+# This is distinct from RolloutManager's private _rowidx ordering key even
+# though both are assigned the same value when K rollout rows are expanded.
+NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# Opaque async-RL target version; None means the field is not forwarded.
+NEMO_GYM_TARGET_WEIGHT_VERSION_KEY = "_ng_target_weight_version"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.

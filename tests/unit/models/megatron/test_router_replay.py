@@ -56,6 +56,86 @@ def test_validate_router_replay_config_allows_prefix_cache_default():
 
 
 @pytest.mark.mcore
+def test_configure_vllm_for_ray_router_replay_sets_stable_internal_store_id():
+    from nemo_rl.models.megatron.router_replay import (
+        configure_vllm_for_router_replay,
+        validate_router_replay_config,
+    )
+
+    config = {
+        "router_replay": {"enabled": True, "transport": "ray"},
+        "generation": {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},
+            "vllm_kwargs": {},
+        },
+        "megatron_cfg": {"enabled": True},
+    }
+
+    configure_vllm_for_router_replay(config)
+    first_id = config["router_replay"]["_store_run_instance_id"]
+    configure_vllm_for_router_replay(config)
+
+    assert config["router_replay"]["_store_run_instance_id"] == first_id
+    assert config["generation"]["vllm_cfg"]["_routed_experts_transport"] == "ray"
+    assert (
+        config["generation"]["vllm_cfg"]["_routed_experts_store_run_instance_id"]
+        == first_id
+    )
+    validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_ray_router_replay_rejects_transfer_queue_path():
+    from nemo_rl.models.megatron.router_replay import (
+        validate_router_replay_transport_path,
+    )
+
+    config = {"router_replay": {"enabled": True, "transport": "ray"}}
+
+    with pytest.raises(NotImplementedError, match="data_plane.enabled=true"):
+        validate_router_replay_transport_path(
+            config,
+            data_plane_enabled=True,
+            async_grpo_enabled=True,
+            nemo_gym_enabled=True,
+        )
+
+    validate_router_replay_transport_path(
+        config,
+        data_plane_enabled=False,
+        async_grpo_enabled=True,
+        nemo_gym_enabled=True,
+    )
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("async_grpo_enabled", "nemo_gym_enabled", "message"),
+    [
+        (False, True, "requires async GRPO"),
+        (True, False, "env.should_use_nemo_gym=true"),
+    ],
+)
+def test_ray_router_replay_rejects_non_gym_or_sync_paths(
+    async_grpo_enabled, nemo_gym_enabled, message
+):
+    from nemo_rl.models.megatron.router_replay import (
+        validate_router_replay_transport_path,
+    )
+
+    config = {"router_replay": {"enabled": True, "transport": "ray"}}
+
+    with pytest.raises(NotImplementedError, match=message):
+        validate_router_replay_transport_path(
+            config,
+            data_plane_enabled=False,
+            async_grpo_enabled=async_grpo_enabled,
+            nemo_gym_enabled=nemo_gym_enabled,
+        )
+
+
+@pytest.mark.mcore
 def test_normalize_routed_experts_dense_batch_uses_seq_major_order():
     from nemo_rl.models.megatron.router_replay import (
         _normalize_routed_experts_for_mcore,
@@ -112,6 +192,52 @@ def test_build_router_replay_tensors_maps_global_moe_layer_order():
 
 
 @pytest.mark.mcore
+def test_build_router_replay_tensors_uses_hybrid_moe_layer_pattern():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import build_router_replay_tensors
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # The main decoder has six layers, with MoE at one-based layers 2
+            # and 5.  Neither the PP separator nor the MTP suffix belongs to
+            # the routed-experts payload's layer axis.
+            self.config = SimpleNamespace(
+                num_layers=6,
+                hybrid_layer_pattern="MEM|*E-/MM/MM",
+            )
+            self.router_2 = DummyRouter(RouterReplay(), layer_number=2)
+            self.router_5 = DummyRouter(RouterReplay(), layer_number=5)
+
+    try:
+        model = DummyModel()
+        routed_experts = torch.tensor(
+            [
+                [[20, 21], [50, 51]],
+                [[22, 23], [52, 53]],
+            ],
+            dtype=torch.int32,
+        )
+
+        replay_tensors = build_router_replay_tensors(model, routed_experts)
+
+        assert len(replay_tensors) == 2
+        assert torch.equal(replay_tensors[0], routed_experts[:, 0, :].to(torch.long))
+        assert torch.equal(replay_tensors[1], routed_experts[:, 1, :].to(torch.long))
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
 def test_build_router_replay_tensors_maps_full_layer_payload_to_moe_layers():
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
@@ -147,6 +273,175 @@ def test_build_router_replay_tensors_maps_full_layer_payload_to_moe_layers():
         assert len(replay_tensors) == 2
         assert torch.equal(replay_tensors[0], routed_experts[:, 1, :].to(torch.long))
         assert torch.equal(replay_tensors[1], routed_experts[:, 2, :].to(torch.long))
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_router_replay_excludes_mtp_subtrees_by_default(monkeypatch):
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    from nemo_rl.models.megatron.router_replay import (
+        build_router_replay_assignments,
+        clear_router_replay,
+        set_router_replay_backward,
+        set_router_replay_forward,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    monkeypatch.delenv("NRL_ROUTER_REPLAY_EXCLUDE_MTP", raising=False)
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyMTPStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.is_mtp_layer = True
+            self.nested = torch.nn.ModuleList(
+                [DummyRouter(RouterReplay(), layer_number=1)]
+            )
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.decoder_router = DummyRouter(RouterReplay(), layer_number=1)
+            self.mtp = DummyMTPStack()
+
+    try:
+        model = DummyModel()
+        mtp_router = model.mtp.nested[0]
+        routed_experts = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+
+        assignments = build_router_replay_assignments(model, routed_experts)
+
+        assert len(assignments) == 1
+
+        set_router_replay_forward(model, routed_experts)
+        assert (
+            model.decoder_router.router_replay.router_replay_action
+            == RouterReplayAction.REPLAY_FORWARD
+        )
+        assert mtp_router.router_replay.router_replay_action is None
+        assert mtp_router.router_replay.target_topk_idx is None
+
+        set_router_replay_backward(model)
+        assert (
+            model.decoder_router.router_replay.router_replay_action
+            == RouterReplayAction.REPLAY_BACKWARD
+        )
+        assert mtp_router.router_replay.router_replay_action is None
+
+        clear_router_replay(model)
+        assert model.decoder_router.router_replay.router_replay_action is None
+        assert mtp_router.router_replay.router_replay_action is None
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_router_replay_can_include_mtp_subtrees_when_env_disabled(monkeypatch):
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    from nemo_rl.models.megatron.router_replay import (
+        build_router_replay_assignments,
+        set_router_replay_forward,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    monkeypatch.setenv("NRL_ROUTER_REPLAY_EXCLUDE_MTP", "0")
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyMTPStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.is_mtp_layer = True
+            self.nested = torch.nn.ModuleList(
+                [DummyRouter(RouterReplay(), layer_number=1)]
+            )
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.decoder_router = DummyRouter(RouterReplay(), layer_number=1)
+            self.mtp = DummyMTPStack()
+
+    try:
+        model = DummyModel()
+        routed_experts = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+
+        assignments = build_router_replay_assignments(model, routed_experts)
+
+        assert len(assignments) == 2
+
+        set_router_replay_forward(model, routed_experts)
+        assert (
+            model.decoder_router.router_replay.router_replay_action
+            == RouterReplayAction.REPLAY_FORWARD
+        )
+        assert (
+            model.mtp.nested[0].router_replay.router_replay_action
+            == RouterReplayAction.REPLAY_FORWARD
+        )
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_router_replay_excluded_mtp_only_rank_noops(monkeypatch):
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        build_router_replay_assignments,
+        set_router_replay_forward,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    monkeypatch.delenv("NRL_ROUTER_REPLAY_EXCLUDE_MTP", raising=False)
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyMTPStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.is_mtp_layer = True
+            self.nested = torch.nn.ModuleList(
+                [DummyRouter(RouterReplay(), layer_number=1)]
+            )
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.mtp = DummyMTPStack()
+
+    try:
+        model = DummyModel()
+        routed_experts = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+
+        assert build_router_replay_assignments(model, routed_experts) == []
+        set_router_replay_forward(model, routed_experts)
+        assert model.mtp.nested[0].router_replay.router_replay_action is None
     finally:
         RouterReplay.clear_global_router_replay_instances()
 
@@ -962,6 +1257,142 @@ def test_router_replay_missing_route_sentinel_uses_megatron_topk():
 
         assert torch.equal(backward_indices, expected_mixed)
         assert replay.replay_backward_list == []
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_router_replay_setup_uses_no_missing_fast_path():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        clear_router_replay,
+        set_router_replay_forward,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.router = DummyRouter(RouterReplay(), layer_number=1)
+
+    try:
+        model = DummyModel()
+        replay = model.router.router_replay
+        target = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+        scores = torch.tensor(
+            [
+                [0.1, 0.9, 0.2, 0.3, 0.4],
+                [0.4, 0.2, 0.8, 0.7, 0.1],
+            ],
+            dtype=torch.float32,
+        )
+
+        set_router_replay_forward(model, target)
+
+        assert hasattr(replay, "_nrl_missing_route_fallback_mask")
+        assert replay._nrl_missing_route_fallback_mask is None
+
+        def unexpected_default_topk(*args, **kwargs):
+            raise AssertionError("no-missing replay must not compute native top-k")
+
+        probs, indices = replay.get_replay_topk(
+            scores,
+            2,
+            default_compute_topk=unexpected_default_topk,
+        )
+
+        expected_indices = target[:, 0].long()
+        assert torch.equal(indices, expected_indices)
+        assert torch.equal(probs, scores.gather(1, expected_indices))
+
+        clear_router_replay(model)
+        assert not hasattr(replay, "_nrl_missing_route_fallback_mask")
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_router_replay_setup_precomputes_missing_mask_for_forward_only():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        clear_router_replay,
+        set_router_replay_backward,
+        set_router_replay_forward,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.router = DummyRouter(RouterReplay(), layer_number=1)
+
+    default_topk_calls = 0
+
+    def default_compute_topk(scores, topk, num_groups=None, group_topk=None):
+        nonlocal default_topk_calls
+        default_topk_calls += 1
+        return torch.topk(scores, k=topk, dim=1)
+
+    try:
+        model = DummyModel()
+        replay = model.router.router_replay
+        target = torch.tensor([[[1, 2]], [[-1, -1]]], dtype=torch.int32)
+        scores = torch.tensor(
+            [
+                [0.1, 0.9, 0.2],
+                [0.4, 0.2, 0.8],
+            ],
+            dtype=torch.float32,
+        )
+        expected_default = torch.topk(scores, k=2, dim=1).indices
+        expected_mixed = torch.stack([target[0, 0].long(), expected_default[1]])
+
+        set_router_replay_forward(model, target)
+
+        assert torch.equal(
+            replay._nrl_missing_route_fallback_mask,
+            torch.tensor([False, True]),
+        )
+        _, forward_indices = replay.get_replay_topk(
+            scores,
+            2,
+            default_compute_topk=default_compute_topk,
+        )
+
+        assert default_topk_calls == 1
+        assert torch.equal(forward_indices, expected_mixed)
+        assert torch.equal(replay.replay_backward_list[0], expected_mixed)
+
+        set_router_replay_backward(model)
+        _, backward_indices = replay.get_replay_topk(
+            scores,
+            2,
+            default_compute_topk=default_compute_topk,
+        )
+
+        assert default_topk_calls == 1
+        assert torch.equal(backward_indices, expected_mixed)
+        assert replay.replay_backward_list == []
+
+        clear_router_replay(model)
     finally:
         RouterReplay.clear_global_router_replay_instances()
 

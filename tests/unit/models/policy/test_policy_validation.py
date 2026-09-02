@@ -20,12 +20,47 @@ the world_size compatibility validation that prevents confusing reshape errors
 when the cluster size is insufficient for the specified parallelism configuration.
 """
 
+import weakref
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+
+
+def test_train_releases_source_dp_shards_before_waiting_for_workers() -> None:
+    """The driver should not retain Python shards beside their Ray copies."""
+
+    class EphemeralShard:
+        pass
+
+    class WorkerGroup:
+        shard_ref: weakref.ReferenceType[EphemeralShard] | None = None
+
+        def run_all_workers_sharded_data(self, _method_name, *, data, **_kwargs):
+            self.shard_ref = weakref.ref(data[0])
+            return object()
+
+        def get_all_worker_results(self, _futures):
+            assert self.shard_ref is not None
+            assert self.shard_ref() is None
+            return [
+                {
+                    "global_loss": 0.0,
+                    "grad_norm": 0.0,
+                    "all_mb_metrics": {},
+                }
+            ]
+
+    policy = Policy.__new__(Policy)
+    policy.cfg = {"train_global_batch_size": 1, "train_micro_batch_size": 1}
+    policy.debug_payload_metrics = False
+    policy.flops_tracker = None
+    policy.worker_group = WorkerGroup()
+    policy._shard_for_train = lambda _data, _batch_size: [EphemeralShard()]
+
+    policy.train(data=object(), loss_fn=object())
 
 
 def test_shutdown_succeeds_before_worker_group_is_initialized(capsys) -> None:
