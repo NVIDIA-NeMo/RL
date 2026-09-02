@@ -14,6 +14,7 @@
 """Strict, vLLM-free configuration for per-token NVFP4 rollout."""
 
 import re
+from collections.abc import Iterable
 from typing import Annotated
 
 from pydantic import AfterValidator, BaseModel, Field
@@ -28,7 +29,36 @@ MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16 = 1
 # semantic BF16 decoder-layer boundaries belong in ModelOpt's ignore list.
 DEFAULT_NVFP4_IGNORE: list[str] = []
 
-_FULL_EXPERT_LAYER_IGNORE_RE = re.compile(r"^\*\.layers\.\d+\.mlp\.experts\*$")
+_FULL_EXPERT_LAYER_IGNORE_RE = re.compile(r"^\*\.layers\.(\d+)\.mlp\.experts\*$")
+# vLLM module prefixes for a decoder layer's routed experts always carry the
+# layer index as ``layers.<index>``; the container name below it differs per
+# model family (``mlp.experts``, ``block_sparse_moe.experts``, ...).
+_MODULE_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def boundary_layer_indices(patterns: Iterable[str]) -> set[int]:
+    """Recover the decoder-layer indices encoded in boundary ignore patterns."""
+    indices: set[int] = set()
+    for pattern in patterns:
+        match = _FULL_EXPERT_LAYER_IGNORE_RE.fullmatch(pattern)
+        if match is None:
+            raise ValueError(
+                "NVFP4 boundary verification requires complete expert-layer "
+                f"ignore patterns; cannot read a layer index from {pattern!r}"
+            )
+        indices.add(int(match.group(1)))
+    return indices
+
+
+def module_layer_index(module_name: str) -> int:
+    """Return the decoder-layer index for a routed-expert module path."""
+    match = _MODULE_LAYER_INDEX_RE.search(module_name)
+    if match is None:
+        raise ValueError(
+            "NVFP4 boundary verification requires a 'layers.<index>' segment in "
+            f"the routed-expert module path, got {module_name!r}"
+        )
+    return int(match.group(1))
 
 
 def _require_full_expert_layer_ignores(value: list[str]) -> list[str]:
@@ -52,13 +82,15 @@ def resolve_boundary_ignore_patterns(
     first_last_layers_bf16: bool,
     num_layers_at_start_in_bf16: int,
     num_layers_at_end_in_bf16: int,
-    legacy_additional_ignore: list[str] | None = None,
+    expected_additional_ignore: list[str] | None = None,
 ) -> list[str]:
     """Resolve semantic Megatron BF16 boundaries to rollout layer patterns.
 
-    ``additional_ignore`` is accepted for one-release migration only. When
-    present it must describe exactly the same complete decoder layers; it can
-    no longer establish an independent rollout precision boundary.
+    The Megatron boundary is the only source of truth for rollout precision.
+    When ``expected_additional_ignore`` is supplied it is cross-checked against
+    the derived set rather than establishing a boundary of its own, so a config
+    that never reached driver-side normalization fails here instead of running
+    with a rollout precision boundary the trainer does not share.
     """
     counts = (num_layers_at_start_in_bf16, num_layers_at_end_in_bf16)
     if any(
@@ -87,13 +119,15 @@ def resolve_boundary_ignore_patterns(
         )
     resolved = [f"*.layers.{index}.mlp.experts*" for index in sorted(indices)]
 
-    if legacy_additional_ignore is not None:
-        _require_full_expert_layer_ignores(legacy_additional_ignore)
-        if set(legacy_additional_ignore) != set(resolved):
+    if expected_additional_ignore is not None:
+        _require_full_expert_layer_ignores(expected_additional_ignore)
+        if set(expected_additional_ignore) != set(resolved):
             raise ValueError(
-                "generation.nvfp4_pertoken_rollout.additional_ignore must exactly "
-                "match the effective Megatron first/last BF16 layer boundary; "
-                f"expected {resolved}, got {legacy_additional_ignore}"
+                "generation.nvfp4_pertoken_rollout.additional_ignore does not "
+                "match the effective Megatron first/last BF16 layer boundary. "
+                f"Expected {resolved}, got {expected_additional_ignore}. An "
+                "empty value usually means normalize_nvfp4_pertoken_policy_config "
+                "did not run for this entry point."
             )
     return resolved
 
