@@ -713,6 +713,25 @@ class TestTQReplayBufferRemove:
         assert dp.depth() == 2 * _N_GENS
         assert dp.clear_calls == []
 
+    def test_remove_deletes_by_identity_when_a_slot_is_aborted_mid_clear(self):
+        class AbortDuringClearClient(FakeDataPlaneClient):
+            async def clear_samples(self, sample_ids, partition_id):
+                super().clear_samples(sample_ids, partition_id)
+                buf.abort(unready_id)  # renumbers slots above it while remove awaits
+
+        dp = AbortDuringClearClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0)  # index 0, ready
+        unready_id = buf.reserve(weight_version=0)  # index 1, unready
+        target = _add_group(buf, weight=0)  # index 2, ready; the eviction target
+
+        removed = _run(buf.remove([2], remove_in_dp=True))
+
+        assert removed == 1
+        assert buf._group_ids == [buf._group_ids[0]]
+        assert buf.meta_list[0] is not target
+        assert dp.clear_calls == [target.sample_ids]
+
 
 class TestTQReplayBufferSize:
     def test_size_and_len(self):

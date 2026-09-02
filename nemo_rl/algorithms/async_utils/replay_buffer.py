@@ -1385,9 +1385,15 @@ class TQReplayBuffer:
     async def _remove_unlocked(
         self, drop_idxs: list[int], *, clear_data_plane: bool
     ) -> int:
-        """Remove validated indices while the caller owns any required lock."""
+        """Remove validated indices while the caller owns any required lock.
+
+        Slots are deleted by group id, not position: the clears below yield the
+        event loop, and abort() or a concurrent remove() can renumber the
+        parallel lists while they are in flight.
+        """
         dropped_sample_ids: list[str] = []
         dropped_staging_keys: list[str] = []
+        drop_group_ids = [self._group_ids[i] for i in drop_idxs]
         for i in drop_idxs:
             meta = self.meta_list[i]
             if meta is not None:
@@ -1425,10 +1431,16 @@ class TQReplayBuffer:
                         "may already be cleared"
                     ) from error
 
-        for i in drop_idxs:
-            self._delete_slot(i)
+        removed = 0
+        for group_id in drop_group_ids:
+            try:
+                idx = self._group_ids.index(group_id)
+            except ValueError:
+                continue  # already dropped by a concurrent abort() or remove()
+            self._delete_slot(idx)
+            removed += 1
 
-        return len(drop_idxs)
+        return removed
 
     def metadata_state_dict(self, *, saved_capacity: int) -> TQReplayMetadataState:
         """Capture the controller index for ready groups without tensor payloads.
