@@ -15,6 +15,7 @@
 """Tests for vLLM generation log probabilities."""
 
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,7 +25,58 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 @pytest.mark.vllm
-def test_worker_generate_records_sampled_token_logprob(monkeypatch):
+@pytest.mark.parametrize("mode", ["native", "merged"])
+def test_native_lora_request_uses_stable_identity(mode):
+    from nemo_rl.models.generation.vllm.config import (
+        NATIVE_LORA_ADAPTER_ID,
+        NATIVE_LORA_ADAPTER_NAME,
+        NATIVE_LORA_ADAPTER_PATH,
+        NATIVE_LORA_CONFIG_KEY,
+    )
+    from nemo_rl.models.generation.vllm.vllm_worker import (
+        _make_native_lora_request,
+    )
+
+    request = _make_native_lora_request(
+        cast(
+            Any,
+            {
+                "lora_refit_mode": mode,
+                "vllm_kwargs": {
+                    "enable_lora": True,
+                    "additional_config": {
+                        NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}
+                    },
+                },
+            },
+        )
+    )
+
+    if mode == "merged":
+        assert request is None
+    else:
+        assert request.lora_int_id == NATIVE_LORA_ADAPTER_ID
+        assert request.lora_name == NATIVE_LORA_ADAPTER_NAME
+        assert request.lora_path == NATIVE_LORA_ADAPTER_PATH
+        assert request.lora_path
+
+
+@pytest.mark.vllm
+def test_native_default_without_lora_does_not_create_request():
+    from nemo_rl.models.generation.vllm.vllm_worker import (
+        _make_native_lora_request,
+    )
+
+    assert _make_native_lora_request(cast(Any, {"lora_refit_mode": "native"})) is None
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "native_lora_request", [None, pytest.param(object(), id="native")]
+)
+def test_worker_generate_records_sampled_token_logprob(
+    monkeypatch, native_lora_request
+):
     from nemo_rl.models.generation.vllm import vllm_worker
 
     sampled_token_id = 880
@@ -49,6 +101,7 @@ def test_worker_generate_records_sampled_token_logprob(monkeypatch):
         "vllm_kwargs": {},
     }
     worker.routed_experts_dtype = torch.int32
+    worker._native_lora_request = native_lora_request
     worker.llm = SimpleNamespace(
         generate=MagicMock(return_value=[raw_output]),
         llm_engine=SimpleNamespace(
@@ -86,6 +139,39 @@ def test_worker_generate_records_sampled_token_logprob(monkeypatch):
 
     assert result["output_ids"][0].tolist() == [101, 102, sampled_token_id, 0]
     assert result["logprobs"][0].tolist() == pytest.approx([0.0, 0.0, -2.30, 0.0])
+    assert worker.llm.generate.call_args.kwargs["lora_request"] is native_lora_request
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "native_lora_request", [None, pytest.param(object(), id="native")]
+)
+def test_worker_generate_text_passes_lora_request(native_lora_request):
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
+        vllm_worker.VllmGenerationWorkerImpl
+    )
+    worker.cfg = cast(
+        Any,
+        {
+            "vllm_cfg": {"async_engine": False, "use_tqdm": False},
+            "top_k": None,
+            "top_p": 1.0,
+            "temperature": 1.0,
+            "max_new_tokens": 8,
+            "stop_token_ids": [],
+        },
+    )
+    worker.SamplingParams = MagicMock(return_value=object())
+    worker._native_lora_request = native_lora_request
+    output = SimpleNamespace(outputs=[SimpleNamespace(text="response")])
+    worker.llm = SimpleNamespace(generate=MagicMock(return_value=[output]))
+
+    result = worker.generate_text(BatchedDataDict({"prompts": ["prompt"]}))
+
+    assert result["texts"] == ["response"]
+    assert worker.llm.generate.call_args.kwargs["lora_request"] is native_lora_request
 
 
 @pytest.mark.vllm
