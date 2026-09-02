@@ -287,13 +287,39 @@ def resolve_refit_verify_config(config: VllmConfig) -> VllmRefitVerifyConfig:
         return refit_cfg.verify
     if refit_cfg is None:
         return VllmRefitVerifyConfig()
-    raw_verify = refit_cfg.get("verify")
-    if raw_verify is None:
+    if "verify" not in refit_cfg:
         return VllmRefitVerifyConfig()
-    # Anything explicitly provided (including invalid scalars like ``false``
-    # and unknown keys like ``mdoe``) must fail loudly in Pydantic rather
-    # than silently degrade to the "off" default.
-    return VllmRefitVerifyConfig.model_validate(raw_verify)
+    # Only a truly absent field defaults. Anything explicitly provided --
+    # including ``verify: null``, ``verify: false``, and unknown inner keys
+    # like ``mdoe`` -- must fail loudly in Pydantic rather than silently
+    # degrade to the "off" default.
+    return VllmRefitVerifyConfig.model_validate(refit_cfg["verify"])
+
+
+_REFIT_CFG_KNOWN_KEYS = frozenset({"sparse", "nixl", "verify"})
+
+
+def _validate_refit_cfg_keys(config: VllmConfig) -> None:
+    """Reject unknown top-level refit_cfg keys (scoped to the transport).
+
+    ``VllmRefitConfig`` is ``extra="allow"`` so custom checkpoint-engine
+    plugins can scope their options under their own ``module:ClassName``
+    selector key; every other unknown key is a typo (e.g. ``verfiy``) that
+    would otherwise silently disable what the user thought they enabled.
+    """
+    refit_cfg = config.get("refit_cfg")
+    if refit_cfg is None or isinstance(refit_cfg, VllmRefitConfig):
+        return
+    allowed = set(_REFIT_CFG_KNOWN_KEYS)
+    transport = config.get("refit_transport")
+    if isinstance(transport, str) and ":" in transport:
+        allowed.add(transport)
+    unknown = set(refit_cfg) - allowed
+    if unknown:
+        raise ValueError(
+            f"Unknown policy.generation.refit_cfg keys: {sorted(unknown)}. "
+            f"Known keys: {sorted(allowed)}."
+        )
 
 
 def enforce_refit_verify_supported(config: VllmConfig) -> None:
@@ -304,6 +330,7 @@ def enforce_refit_verify_supported(config: VllmConfig) -> None:
     constructed directly (bypassing the weight-sync factory), so this is
     validated where every algorithm must pass: VllmGeneration construction.
     """
+    _validate_refit_cfg_keys(config)
     if resolve_refit_verify_config(config).mode == "off":
         return
     colocated = config["colocated"]["enabled"]

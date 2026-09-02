@@ -1072,3 +1072,33 @@ class TestRefitVerifyConfigValidation:
         )
 
         enforce_refit_verify_supported({"colocated": {"enabled": False}})
+
+    def test_explicit_null_verify_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        with pytest.raises(Exception):
+            resolve_refit_verify_config({"refit_cfg": {"verify": None}})
+
+    def test_misspelled_outer_verify_key_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        config = {
+            "refit_cfg": {"verfiy": {"mode": "enforce"}},
+            "colocated": {"enabled": True},
+        }
+        with pytest.raises(ValueError, match="verfiy"):
+            enforce_refit_verify_supported(config)
+
+    def test_plugin_selector_key_is_allowed(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        config = {
+            "refit_cfg": {"my.mod:Engine": {}},
+            "refit_transport": "my.mod:Engine",
+            "colocated": {"enabled": True},
+        }
+        enforce_refit_verify_supported(config)

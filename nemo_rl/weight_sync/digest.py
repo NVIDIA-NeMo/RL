@@ -14,17 +14,20 @@
 
 """Deterministic per-tensor digests for refit weight-transfer verification.
 
-Each int64 lane is bound to its position through a nonlinear mix and reduced
-with wraparound addition on two independently-parameterized 64-bit channels
-(128 bits of state total). Wraparound addition is associative and
-commutative, so the result is bit-identical regardless of reduction order,
-chunking, or device. A single such channel is not enough: for any bijective
-per-lane transform, a corruption that permutes the transformed lane values
-leaves a commutative sum unchanged and can be constructed in closed form.
-With two channels the same corrupted lanes must simultaneously preserve both
-nonlinearly-coupled sums, for which no closed-form construction exists. The
-tensor's dtype and shape seed both channels so equal-size metadata drift is
-also detected.
+Int64 lanes are folded through an ordered binary tree whose pairwise merge
+is non-commutative (left and right children enter through different odd
+multipliers before a nonlinear mix), on two independently-parameterized
+64-bit channels. Every reduction step is elementwise over disjoint pairs, so
+the fold parallelizes on GPU and is bit-identical across devices; a lane's
+position is bound to its path through the tree rather than to its value.
+
+Commutative reductions are structurally unsafe here no matter how many
+channels they use: k channels impose k multiset constraints while n lanes
+provide n degrees of freedom, so lane permutations satisfying all channels
+simultaneously exist and have been constructed for one- and two-channel
+variants of this module. An ordered tree has no such permutation freedom.
+The tensor's dtype and shape seed both channels so equal-size metadata
+drift is also detected.
 """
 
 import hashlib
@@ -35,15 +38,23 @@ _U64 = 1 << 64
 # SplitMix64 finalizer constants.
 _MIX_MULTIPLIER_1 = 0xBF58476D1CE4E5B9
 _MIX_MULTIPLIER_2 = 0x94D049BB133111EB
-# Independent per-channel position salts and the second channel's lane offset.
-# A *linear* position salt (lane + pos * salt) is absorbable: corrupted lanes
-# can soak up the salt difference between two positions and permute the salted
-# values, which a commutative sum cannot see. Positions are therefore injected
-# through the nonlinear mixer (lane ^ _mix64(pos * salt)).
-_CHANNEL_1_POSITION_SALT = 0x9E3779B97F4A7C15
-_CHANNEL_2_POSITION_SALT = 0xC2B2AE3D27D4EB4F
-_CHANNEL_2_LANE_OFFSET = 0x452821E638D01377
-# 1 Mi int64 lanes (8 MiB) hashed per chunk.
+# Per-channel (left tweak, right tweak, multiplier) of the tree merge.
+# Both children pass through the mixer (with distinct tweaks) before the
+# linear combination: a bare linear combination leaves a structural channel
+# open, because two odd multipliers sum to an even number and
+# 2^63 * even == 0 mod 2^64, so flipping the top bit of both children
+# cancels. Distinct tweaks keep the merge non-commutative and remove the
+# all-zero fixed point of the mixer.
+_CHANNEL_1_LEFT_TWEAK = 0x9E3779B97F4A7C15
+_CHANNEL_1_RIGHT_TWEAK = 0xC2B2AE3D27D4EB4F
+_CHANNEL_1_MULTIPLIER = 0xFF51AFD7ED558CCD
+_CHANNEL_2_LEFT_TWEAK = 0x452821E638D01377
+_CHANNEL_2_RIGHT_TWEAK = 0xD1B54A32D192ED03
+_CHANNEL_2_MULTIPLIER = 0xC4CEB9FE1A85EC53
+# Chunk-chain multiplier binding the order of per-chunk tree roots.
+_CHAIN_MULTIPLIER = 0x2545F4914F6CDD1D
+# Lanes folded per tree (an algorithm constant, not a tuning knob: changing
+# it changes chunk boundaries and therefore the digest).
 _CHUNK_LANES = 1 << 20
 
 
@@ -63,6 +74,26 @@ def _mix64(value: torch.Tensor) -> torch.Tensor:
     value = (value ^ _logical_right_shift(value, 30)) * _as_i64(_MIX_MULTIPLIER_1)
     value = (value ^ _logical_right_shift(value, 27)) * _as_i64(_MIX_MULTIPLIER_2)
     return value ^ _logical_right_shift(value, 31)
+
+
+def _tree_fold(
+    lanes: torch.Tensor, left_tweak: int, right_tweak: int, multiplier: int
+) -> torch.Tensor:
+    """Fold a power-of-two lane vector through an ordered binary tree.
+
+    Each level merges disjoint (left, right) pairs elementwise as
+    ``mix64(mix64(left ^ lt) + mix64(right ^ rt) * mult)``. Mixing both
+    children before the combination closes the linear cancellation channel;
+    distinct tweaks make the merge order-sensitive, so a lane's position is
+    encoded by its path through the tree. Returns a 0-dim int64 tensor.
+    """
+    value = lanes
+    lt = _as_i64(left_tweak)
+    rt = _as_i64(right_tweak)
+    mult = _as_i64(multiplier)
+    while value.numel() > 1:
+        value = _mix64(_mix64(value[0::2] ^ lt) + _mix64(value[1::2] ^ rt) * mult)
+    return value.reshape(())
 
 
 def _metadata_seeds(tensor: torch.Tensor) -> tuple[int, int]:
@@ -109,22 +140,23 @@ def tensor_digest(tensor: torch.Tensor) -> torch.Tensor:
     seed_1, seed_2 = _metadata_seeds(tensor)
     channel_1 = torch.full((), _as_i64(seed_1), dtype=torch.int64, device=lanes.device)
     channel_2 = torch.full((), _as_i64(seed_2), dtype=torch.int64, device=lanes.device)
-    lane_offset = 0
+    chain = _as_i64(_CHAIN_MULTIPLIER)
     for chunk in lanes.split(_CHUNK_LANES):
         lanes_in_chunk = chunk.numel()
-        positions = torch.arange(
-            lane_offset + 1,
-            lane_offset + lanes_in_chunk + 1,
-            dtype=torch.int64,
-            device=lanes.device,
+        tree_width = 1 << max(1, (lanes_in_chunk - 1).bit_length())
+        if tree_width != lanes_in_chunk:
+            padded_chunk = chunk.new_zeros(tree_width)
+            padded_chunk[:lanes_in_chunk] = chunk
+            chunk = padded_chunk
+        root_1 = _tree_fold(
+            chunk, _CHANNEL_1_LEFT_TWEAK, _CHANNEL_1_RIGHT_TWEAK, _CHANNEL_1_MULTIPLIER
         )
-        position_mix_1 = _mix64(positions * _as_i64(_CHANNEL_1_POSITION_SALT))
-        position_mix_2 = _mix64(positions * _as_i64(_CHANNEL_2_POSITION_SALT))
-        channel_1 = channel_1 + _mix64(chunk ^ position_mix_1).sum(dtype=torch.int64)
-        channel_2 = channel_2 + _mix64(
-            (chunk + _as_i64(_CHANNEL_2_LANE_OFFSET)) ^ position_mix_2
-        ).sum(dtype=torch.int64)
-        lane_offset += lanes_in_chunk
+        root_2 = _tree_fold(
+            chunk, _CHANNEL_2_LEFT_TWEAK, _CHANNEL_2_RIGHT_TWEAK, _CHANNEL_2_MULTIPLIER
+        )
+        # Chunk roots are chained in order, so chunk position is bound too.
+        channel_1 = _mix64(channel_1 * chain + root_1)
+        channel_2 = _mix64(channel_2 * chain + root_2)
     return torch.stack([_mix64(channel_1), _mix64(channel_2)])
 
 

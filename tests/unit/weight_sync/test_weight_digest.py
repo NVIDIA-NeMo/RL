@@ -48,13 +48,51 @@ def test_digest_rejects_salted_lane_permutation():
     With lanes [0, 0] and a linear position salt S, the salted lanes are
     [S, 2S]; corrupted lanes [S, -S] (as signed int64) salt to [2S, S] -- a
     permutation that any single per-lane-bijection + commutative-sum digest
-    cannot see. The dual-channel digest must reject it.
+    cannot see. Position must be structural (tree path), not an input.
     """
     original = torch.zeros(2, dtype=torch.int64)
     corrupted = torch.tensor(
         [-7046029254386353131, 7046029254386353131], dtype=torch.int64
     )
     assert _value(original) != _value(corrupted)
+
+
+_DUAL_CHANNEL_COLLISION_X = [
+    1463740549975506996,
+    7247435662023658159,
+    -6925967542218718874,
+    8546351873743446617,
+    -8135354941262485898,
+    -1523163779216173669,
+]
+_DUAL_CHANNEL_COLLISION_Y = [
+    -1671919555023232268,
+    -7491608144376453009,
+    -7861950440807229534,
+    4727800188207773341,
+    -9070301026299793230,
+    -2460484802935340705,
+]
+
+
+def test_digest_rejects_dual_channel_permutation_collision():
+    """The 6-lane pair that collided both commutative channels at once.
+
+    k commutative channels impose only k multiset constraints while n lanes
+    provide n degrees of freedom, so simultaneous permutations exist for any
+    fixed k; these lanes permuted channel 1 by (1,0,4,5,2,3) and channel 2 by
+    (2,3,1,0,5,4). An ordered tree fold has no permutation freedom to exploit.
+    """
+    x = torch.tensor(_DUAL_CHANNEL_COLLISION_X, dtype=torch.int64)
+    y = torch.tensor(_DUAL_CHANNEL_COLLISION_Y, dtype=torch.int64)
+    assert _value(x) != _value(y)
+
+
+def test_digest_rejects_dual_channel_collision_as_bf16():
+    """The same 48 bytes reinterpreted as bf16 must not collide either."""
+    x = torch.tensor(_DUAL_CHANNEL_COLLISION_X, dtype=torch.int64).view(torch.bfloat16)
+    y = torch.tensor(_DUAL_CHANNEL_COLLISION_Y, dtype=torch.int64).view(torch.bfloat16)
+    assert _value(x) != _value(y)
 
 
 def test_digest_is_position_sensitive():
@@ -95,11 +133,13 @@ def test_digest_handles_odd_storage_offset():
     assert _value(sliced) == _value(sliced.clone())
 
 
-def test_digest_is_chunking_invariant(monkeypatch):
-    t = torch.arange(999, dtype=torch.uint8)
-    reference = _value(t)
-    monkeypatch.setattr(digest_mod, "_CHUNK_LANES", 4)
-    assert _value(t) == reference
+def test_digest_is_stable_across_chunk_boundaries():
+    # _CHUNK_LANES is an algorithm constant (chunk boundaries are part of the
+    # tree structure), so the guarantee is determinism for inputs of any
+    # length relative to the chunk size -- including non-power-of-two tails.
+    for lanes in (1, 2, 3, digest_mod._CHUNK_LANES + 3):
+        t = torch.arange(lanes * 8, dtype=torch.uint8)
+        assert _value(t) == _value(t.clone())
 
 
 def test_digests_to_ints_roundtrip_and_empty():
