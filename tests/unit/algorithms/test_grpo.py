@@ -3407,7 +3407,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     synchronizer.sync_weights.side_effect = sync_weights
     nemo_gym_actor = object()
 
-    def spinup_nemo_gym_actor(**kwargs):
+    def spinup_nemo_gym_actor(_env_configs, **kwargs):
         assert kwargs["base_urls"] == [reserved_url]
         events.append("gym_started")
         gym_started.set()
