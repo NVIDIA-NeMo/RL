@@ -2320,7 +2320,19 @@ def _profile_sync_vllm_rollout(
         yield
         return
 
-    policy_generation.begin_rollout_profile(step_id=step_id)
+    try:
+        policy_generation.begin_rollout_profile(step_id=step_id)
+    except BaseException as rollout_error:
+        try:
+            policy_generation.abort_rollout_profile(
+                reason="grpo_rollout_begin_error"
+            )
+        except Exception as profiler_error:
+            rollout_error.add_note(
+                f"Rollout profiler abort also failed: {profiler_error!r}"
+            )
+        raise
+
     try:
         yield
     except BaseException as rollout_error:
@@ -2331,7 +2343,18 @@ def _profile_sync_vllm_rollout(
                 f"Rollout profiler abort also failed: {profiler_error!r}"
             )
         raise
-    policy_generation.finish_rollout_profile()
+    try:
+        policy_generation.finish_rollout_profile()
+    except BaseException as rollout_error:
+        try:
+            policy_generation.abort_rollout_profile(
+                reason="grpo_rollout_finish_error"
+            )
+        except Exception as profiler_error:
+            rollout_error.add_note(
+                f"Rollout profiler abort also failed: {profiler_error!r}"
+            )
+        raise
 
 
 def _preserve_router_replay_routed_experts(
