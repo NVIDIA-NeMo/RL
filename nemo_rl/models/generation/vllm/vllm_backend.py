@@ -147,14 +147,24 @@ def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
 
 def _local_shard_slices(param_info: dict[str, Any], rank: int) -> tuple[slice, ...]:
     """Return this destination rank's slices in an HF-global tensor."""
-    from nemo_rl.weight_sync.xferdtensor import get_local_shard_slices
+    from nemo_rl.weight_sync.xferdtensor_python import _compute_shard_slices
 
     dst_mesh = param_info["dst_mesh_info"]
-    return get_local_shard_slices(
-        param_info["global_shape"],
-        dst_mesh,
-        param_info["dst_placements"],
-        rank,
+    mesh_tensor = getattr(dst_mesh, "mesh", None)
+    if mesh_tensor is None:
+        mesh_tensor = getattr(dst_mesh, "_mesh", None)
+    if mesh_tensor is None:
+        raise ValueError("Destination DeviceMesh does not expose mesh ranks.")
+    coordinates = (mesh_tensor == rank).nonzero(as_tuple=False)
+    if coordinates.numel() == 0:
+        raise ValueError(f"Rank {rank} is absent from the destination mesh")
+    return tuple(
+        _compute_shard_slices(
+            param_info["global_shape"],
+            list(mesh_tensor.shape),
+            coordinates[0].tolist(),
+            param_info["dst_placements"],
+        )
     )
 
 
