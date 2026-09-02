@@ -303,7 +303,7 @@ def test_a_failing_shard_names_itself_rather_than_surfacing_a_bare_ray_error():
     drained = []
 
     async def drain_until_failure():
-        async for result in _merge_nemo_gym_shard_streams(
+        async for result in _merge_nemo_gym_instance_streams(
             buckets, timer_prefix="timing/rollout"
         ):
             drained.append(result)

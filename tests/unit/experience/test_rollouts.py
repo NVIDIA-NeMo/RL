@@ -2265,8 +2265,16 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     completions, prompt_message_log, metrics = asyncio.run(
         manager._run_rollouts(
             inputs=[
-                {"_rowidx": 0, "task_source": "workplace_assistant"},
-                {"_rowidx": 1, "task_source": "workplace_assistant"},
+                {
+                    "_rowidx": 0,
+                    "task_source": "workplace_assistant",
+                    "agent_ref": {"name": "agent"},
+                },
+                {
+                    "_rowidx": 1,
+                    "task_source": "workplace_assistant",
+                    "agent_ref": {"name": "agent"},
+                },
             ],
             timer=rollouts_mod.Timer(),
             timer_prefix="timing/test",
@@ -2443,12 +2451,13 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
     manager = object.__new__(AsyncNemoGymRolloutImpl)
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
+    manager._num_generations_per_prompt = 1
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
 
-    with pytest.raises(RuntimeError, match="instance 'nemo_gym' failed"):
+    with pytest.raises(RuntimeError, match="actor died") as exc_info:
         asyncio.run(
             manager._run_rollouts(
                 inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
@@ -2456,6 +2465,9 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
                 timer_prefix="timing/test",
             )
         )
+    assert exc_info.value.__notes__ == [
+        "NeMo-Gym instance 'nemo_gym' failed during rollout collection"
+    ]
 
 
 @pytest.mark.nemo_gym
