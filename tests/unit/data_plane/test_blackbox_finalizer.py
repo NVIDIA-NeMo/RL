@@ -606,7 +606,9 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
     fetched[0] = dataclass_replace(fetched[0], routed_len=bad_routed_len)
 
     class _InjectedSource:
-        def fetch_for_finalization(self, staging_keys, *, include_route_fragments=False):
+        def fetch_for_finalization(
+            self, staging_keys, *, include_route_fragments=False
+        ):
             del staging_keys, include_route_fragments
             return fetched
 
@@ -713,7 +715,9 @@ def test_direct_extras_corruption_rejects_before_publication(
     )
 
     class _InjectedSource:
-        def fetch_for_finalization(self, staging_keys, *, include_route_fragments=False):
+        def fetch_for_finalization(
+            self, staging_keys, *, include_route_fragments=False
+        ):
             del staging_keys, include_route_fragments
             return fetched
 

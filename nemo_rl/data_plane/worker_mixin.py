@@ -347,8 +347,7 @@ class TQWorkerMixin:
                 routes=route_column[index],
                 encoding=int(encoding_column[index].reshape(-1)[0].item()),
                 extras_metadata_json=bytes(
-                    int(value)
-                    for value in metadata_column[index].reshape(-1).tolist()
+                    int(value) for value in metadata_column[index].reshape(-1).tolist()
                 ),
             )
             for index, key in enumerate(keys)

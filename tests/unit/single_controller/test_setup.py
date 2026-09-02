@@ -1144,9 +1144,7 @@ class TestSetup:
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
-    def test_token_capture_always_creates_finalizer_actor_pool(
-        self, patched_factories
-    ):
+    def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
         mc = _make_master_config(backend="vllm")
         mc.policy["generation"].update(
             {

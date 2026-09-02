@@ -141,6 +141,10 @@ class TQTokenSink:
     the model call is acked) holds by construction. Failures are reported in
     the ``StageResult`` — the caller decides whether the rollout poisons or
     aborts (``token_capture.on_capture_failure``).
+
+    ``stage`` is thread-safe per the ``StagingSink`` contract: it holds no
+    per-call mutable state, so the capture host may run writes for unrelated
+    calls concurrently.
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
@@ -514,7 +518,9 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
         weight_version=int(_row_leaf(row, "weight_version")[0].item()),
         digest=_digest("digest_bytes"),
         token_ids_delta=[int(t) for t in _row_leaf(row, "token_ids_delta").tolist()],
-        token_mask_delta=[float(m) for m in _row_leaf(row, "token_mask_delta").tolist()],
+        token_mask_delta=[
+            float(m) for m in _row_leaf(row, "token_mask_delta").tolist()
+        ],
         generation_log_probs_delta=[
             float(p) for p in _row_leaf(row, "generation_logprobs_delta").tolist()
         ],

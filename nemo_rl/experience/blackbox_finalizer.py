@@ -512,9 +512,7 @@ class BlackboxFinalizer:
             "total_reward": rewards_t,
         }
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
-            has_routed_row = any(
-                r.valid and r.routed_experts is not None for r in rows
-            )
+            has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)
             if not has_routed_row and self._routed_dims is None and not valid_rows:
                 # Nothing to learn (L, K) from yet — e.g. an all-poisoned
                 # group before the first healthy rollout. Dropping loses no

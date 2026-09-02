@@ -240,6 +240,7 @@ class TQPolicy(TQDriverMixin, Policy):
             ),
             task_name=task_name,
         )
+
     def _logprob_dispatch(
         self,
         meta: KVBatchMeta,

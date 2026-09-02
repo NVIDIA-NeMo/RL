@@ -118,7 +118,6 @@ from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lo
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
-from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -128,6 +127,7 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
+from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -1513,7 +1513,9 @@ class SingleControllerActor:
                                 else:
                                     self._credit_shortfall(target_step)
                         else:
-                            replacement = self._take_replacement(target_step, replacements)
+                            replacement = self._take_replacement(
+                                target_step, replacements
+                            )
                         if replacement is None:
                             # Nothing was committed, so the train pump will never see this
                             # group and never release its permit on our behalf.
