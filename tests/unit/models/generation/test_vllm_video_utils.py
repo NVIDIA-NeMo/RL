@@ -158,7 +158,7 @@ def test_registered_loader_reads_cached_frame_manifest(monkeypatch, tmp_path):
         Image.fromarray(frame).save(frame_path)
         expected_frames.append(frame)
         frame_paths.append(str(frame_path))
-    payload = utils._CACHED_VIDEO_FRAME_MANIFEST_MAGIC + json.dumps(
+    payload = utils.CACHED_VIDEO_FRAME_MANIFEST_MAGIC + json.dumps(
         {
             "frame_paths": frame_paths,
             "metadata": {
@@ -189,7 +189,7 @@ def test_cached_video_data_url_requires_no_driver_decoder(monkeypatch, tmp_path)
 
     _, encoded = data_url.split(",", 1)
     payload = base64.b64decode(encoded)
-    manifest = json.loads(payload[len(utils._CACHED_VIDEO_FRAME_MANIFEST_MAGIC) :])
+    manifest = json.loads(payload[len(utils.CACHED_VIDEO_FRAME_MANIFEST_MAGIC) :])
     assert manifest["frame_paths"] == frame_paths
     assert manifest["metadata"]["frames_indices"] == [0, 1, 2, 3]
     assert manifest["metadata"]["fps"] == 1.0
@@ -201,7 +201,7 @@ def test_cached_video_manifest_does_not_import_torchcodec(monkeypatch, tmp_path)
     monkeypatch.setenv("NEMO_RL_VIDEO_MEDIA_ROOT", str(tmp_path))
     frame_path = tmp_path / "frame.png"
     Image.new("RGB", (2, 2)).save(frame_path)
-    payload = utils._CACHED_VIDEO_FRAME_MANIFEST_MAGIC + json.dumps(
+    payload = utils.CACHED_VIDEO_FRAME_MANIFEST_MAGIC + json.dumps(
         {
             "frame_paths": [str(frame_path)],
             "metadata": {
