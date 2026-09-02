@@ -160,7 +160,7 @@ def test_pack_rolled_draft_token_mask_clamps_inflated_last_segment():
 def _zero_policy_loss(
     next_token_logits, data, global_valid_seqs, global_valid_toks, **kwargs
 ):
-    return torch.zeros(()), {}
+    return torch.zeros(()), {"loss": 0.0}
 
 
 def _build_draft_batch(draft_vocab_size, d2t):
