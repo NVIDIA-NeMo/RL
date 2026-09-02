@@ -751,12 +751,16 @@ class VllmAsyncGenerationWorkerImpl(
             # caller that constructs a non-train GenerationSamplingParams. Multi-turn
             # agents issue their own requests, so this server-side check is the one
             # chokepoint they all pass.
-            # vLLM resolves an unset top_p from the model's generation_config.json
-            # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
-            # request omitting it would sample off-policy while passing this check.
+            # The engine is constructed with generation_config="vllm" (see
+            # BaseVllmGenerationWorker._load_model), so an unset top_p resolves to
+            # vLLM's neutral 1.0 rather than the model's generation_config.json.
+            # Still require it explicitly: a silently-resolved 1.0 would only match
+            # the on-policy check by coincidence, and an explicit value keeps this
+            # chokepoint independent of the engine-level setting (which
+            # generation.vllm_kwargs.generation_config can override).
             assert request.top_p is not None, (
-                "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
-                "resolved by vLLM from the model's generation_config.json and would "
+                "top_p must be set explicitly on NeMo-RL requests; an unset top_p "
+                "would be resolved by vLLM instead of the NeMo-RL config and would "
                 "bypass the on-policy sampling check."
             )
             request_top_p = request.top_p
