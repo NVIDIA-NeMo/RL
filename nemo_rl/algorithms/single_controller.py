@@ -3340,8 +3340,9 @@ class SingleControllerActor:
                 advantages,
                 self._master_config.grpo,
             )
+            response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["masked_advantages"].append(
-            torch.masked_select(advantages, mask.bool()).detach().cpu()
+            response_advantages.detach().cpu()
         )
 
         fields_to_put = {adv_cfg.output_field: advantages}
