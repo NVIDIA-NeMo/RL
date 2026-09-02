@@ -796,7 +796,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     unsupported = [
         name
         for name, enabled in (
-            ("overlong_filtering", algo_cfg.overlong_filtering),
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
             ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
@@ -1161,6 +1160,8 @@ class AdvantageConfig:
     sample_mask_field: str = "sample_mask"
     invalid_tool_call_mask_field: str = INVALID_TOOL_CALL_MASK
     malformed_thinking_mask_field: str = MALFORMED_THINKING_MASK
+    mask_sample_field: str = "mask_sample"
+    truncated_field: str = "truncated"
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
     generation_logprobs_field: str = "generation_logprobs"

@@ -439,6 +439,7 @@ class SingleControllerActor:
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "masked_advantages": [],
+            "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
@@ -1869,8 +1870,9 @@ class SingleControllerActor:
                     if self._is_ppo and not has_valid_training_tokens:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
-                            "filtering. Check ppo.seq_logprob_error_threshold to "
-                            "avoid an optimizer step with an empty batch."
+                            "filtering. Check seq_logprob_error_threshold, "
+                            "overlong_filtering, and environment mask_sample flags "
+                            "to avoid an optimizer step with an empty batch."
                         )
 
                     # ---- 3. Train the model -- train_microbatches_from_meta ----
@@ -2001,8 +2003,9 @@ class SingleControllerActor:
                     if not step_open:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
-                            "filtering. Check grpo.seq_logprob_error_threshold to "
-                            "avoid an optimizer step with an empty batch."
+                            "filtering. Check seq_logprob_error_threshold, "
+                            "overlong_filtering, and environment mask_sample flags "
+                            "to avoid an optimizer step with an empty batch."
                         )
 
                     with self._timer.time("policy_training"):
@@ -3234,6 +3237,18 @@ class SingleControllerActor:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
+        mask_sample = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.mask_sample_field)
+        ).bool()
+        truncated = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.truncated_field)
+        ).bool()
+
+        num_mask_sample_filtered = int(mask_sample.sum().item())
+        self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
+        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        if self._algo_cfg.overlong_filtering:
+            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
@@ -3243,7 +3258,7 @@ class SingleControllerActor:
             masking_data = BatchedDataDict(
                 {
                     "token_mask": token_mask,
-                    "sample_mask": sample_mask,
+                    "sample_mask": final_sample_mask,
                     "prev_logprobs": tensor_field(
                         data,
                         adv_cfg.policy_logprobs_field,
@@ -3255,7 +3270,7 @@ class SingleControllerActor:
                 }
             )
             num_valid_seqs_before = float(
-                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
                 .sum()
                 .item()
             )
@@ -3264,9 +3279,9 @@ class SingleControllerActor:
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
             )
-            sample_mask = masking_data["sample_mask"]
+            final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(
-                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
                 .sum()
                 .item()
             )
@@ -3277,7 +3292,7 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
-        mask = token_mask * sample_mask.unsqueeze(-1)
+        mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -3363,8 +3378,8 @@ class SingleControllerActor:
             self._opd_stat_count += int(valid.numel())
 
         fields_to_put = {adv_cfg.output_field: advantages}
-        if seq_logprob_error_threshold is not None:
-            fields_to_put[adv_cfg.sample_mask_field] = sample_mask
+        if not torch.equal(final_sample_mask, sample_mask):
+            fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
         new_fields = [adv_cfg.output_field]
         if returns is not None:
             fields_to_put[adv_cfg.returns_field] = returns
@@ -3391,6 +3406,8 @@ class SingleControllerActor:
             adv_cfg.token_mask_field,
             adv_cfg.sample_mask_field,
             *adv_cfg.repeated_batch_fields,
+            adv_cfg.mask_sample_field,
+            adv_cfg.truncated_field,
         ]
         if self._message_level_advantage_penalties_enabled:
             fields.extend(
