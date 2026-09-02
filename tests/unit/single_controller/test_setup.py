@@ -1441,7 +1441,7 @@ class TestSetup:
         endpoint_up = threading.Event()
         weight_sync.sync_weights.side_effect = lambda **_: endpoint_up.set()
 
-        def _spinup_gym(**_):
+        def _spinup_gym(_env_configs, **_):
             if not endpoint_up.wait(timeout=5):
                 raise TimeoutError("Gym was awaited before the initial refit")
             return fake_gym_actor
