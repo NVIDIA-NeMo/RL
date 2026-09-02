@@ -322,6 +322,14 @@ class MegatronCheckpointConfig(TypedDict, total=False):
     ckpt_fully_parallel_save_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+    # Use Megatron-Core's fully-parallel checkpoint save/load path. Setting
+    # either to False can simplify debugging at the cost of throughput.
+    # Omitted: True, the historical hard-coded values.
+    fully_parallel_save: bool
+    fully_parallel_load: bool
+    # Include RNG state in saved checkpoints and restore it on load — needed
+    # for bit-exact resume. Omitted: False, the historical hard-coded value.
+    load_rng: bool
 
 
 class MegatronConfig(TypedDict):
