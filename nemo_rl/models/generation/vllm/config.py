@@ -283,17 +283,16 @@ def resolve_refit_verify_config(config: VllmConfig) -> VllmRefitVerifyConfig:
     here independently.
     """
     refit_cfg = config.get("refit_cfg")
-    if isinstance(refit_cfg, VllmRefitConfig):
-        return refit_cfg.verify
     if refit_cfg is None:
         return VllmRefitVerifyConfig()
-    if "verify" not in refit_cfg:
-        return VllmRefitVerifyConfig()
-    # Only a truly absent field defaults. Anything explicitly provided --
-    # including ``verify: null``, ``verify: false``, and unknown inner keys
-    # like ``mdoe`` -- must fail loudly in Pydantic rather than silently
-    # degrade to the "off" default.
-    return VllmRefitVerifyConfig.model_validate(refit_cfg["verify"])
+    if not isinstance(refit_cfg, VllmRefitConfig):
+        # Any explicit non-null value -- including non-mappings like ``[]``
+        # or ``""``, ``verify: null``, and invalid inner keys -- goes to
+        # Pydantic as-is and fails loudly rather than silently degrading to
+        # the "off" default. Only a truly absent refit_cfg (or absent
+        # verify field, which Pydantic defaults) turns verification off.
+        refit_cfg = VllmRefitConfig.model_validate(refit_cfg)
+    return refit_cfg.verify
 
 
 _REFIT_CFG_KNOWN_KEYS = frozenset({"sparse", "nixl", "verify"})
@@ -308,17 +307,27 @@ def _validate_refit_cfg_keys(config: VllmConfig) -> None:
     would otherwise silently disable what the user thought they enabled.
     """
     refit_cfg = config.get("refit_cfg")
-    if refit_cfg is None or isinstance(refit_cfg, VllmRefitConfig):
+    if refit_cfg is None:
         return
-    allowed = set(_REFIT_CFG_KNOWN_KEYS)
+    if isinstance(refit_cfg, VllmRefitConfig):
+        # normalize_vllm_refit_config validates and writes the model back for
+        # non-default transports before VllmGeneration is constructed; a typo
+        # like "verfiy" then lives in model_extra and must still be caught.
+        present = set((refit_cfg.model_extra or {}).keys())
+    elif isinstance(refit_cfg, dict):
+        present = set(refit_cfg) - _REFIT_CFG_KNOWN_KEYS
+    else:
+        # Non-mapping values fail loudly in resolve_refit_verify_config.
+        return
     transport = config.get("refit_transport")
+    allowed = set()
     if isinstance(transport, str) and ":" in transport:
         allowed.add(transport)
-    unknown = set(refit_cfg) - allowed
+    unknown = present - allowed
     if unknown:
         raise ValueError(
             f"Unknown policy.generation.refit_cfg keys: {sorted(unknown)}. "
-            f"Known keys: {sorted(allowed)}."
+            f"Known keys: {sorted(_REFIT_CFG_KNOWN_KEYS | allowed)}."
         )
 
 
@@ -379,7 +388,12 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
             "embeddings would silently survive weight updates. Supported "
             "transports: null (collective/IPC) and 'nccl_reshard'."
         )
-    refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
+    raw_refit_cfg = config.get("refit_cfg")
+    # Explicit falsy non-mappings ([] / "" / false) must fail in Pydantic,
+    # not be coerced into an empty (and therefore default) config.
+    refit_config = VllmRefitConfig.model_validate(
+        {} if raw_refit_cfg is None else raw_refit_cfg
+    )
     if ":" in transport:
         plugin_config = (refit_config.model_extra or {}).get(transport)
         if plugin_config is None:

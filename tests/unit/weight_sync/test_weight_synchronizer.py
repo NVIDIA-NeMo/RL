@@ -1102,3 +1102,43 @@ class TestRefitVerifyConfigValidation:
             "colocated": {"enabled": True},
         }
         enforce_refit_verify_supported(config)
+
+    def test_non_mapping_refit_cfg_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        for bad in ([], "", False):
+            with pytest.raises(Exception):
+                resolve_refit_verify_config({"refit_cfg": bad})
+
+    def test_normalized_model_extra_typo_still_rejected(self):
+        """normalize -> VllmGeneration is the real GRPO order for non-default
+        transports; the typo lands in model_extra and must still be caught."""
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+            normalize_vllm_refit_config,
+        )
+
+        config = {
+            "refit_transport": "vllm_zmq_sparse",
+            "refit_cfg": {"verfiy": {"mode": "enforce"}},
+            "colocated": {"enabled": True},
+            "vllm_cfg": {},
+        }
+        normalize_vllm_refit_config(config)
+        with pytest.raises(ValueError, match="verfiy"):
+            enforce_refit_verify_supported(config)
+
+    def test_normalized_plugin_selector_still_allowed(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+            normalize_vllm_refit_config,
+        )
+
+        config = {
+            "refit_transport": "my.mod:Engine",
+            "refit_cfg": {"my.mod:Engine": {}},
+            "colocated": {"enabled": True},
+            "vllm_cfg": {},
+        }
+        normalize_vllm_refit_config(config)
+        enforce_refit_verify_supported(config)
