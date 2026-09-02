@@ -53,7 +53,6 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
-    model_save_format: "safetensors"
     save_consolidated: "false"
     single_rank_consolidation: false
     consolidation_timeout_minutes: 30

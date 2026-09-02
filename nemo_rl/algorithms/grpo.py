@@ -1241,6 +1241,9 @@ def setup(
             "(reference model is not loaded)."
         )
 
+    # Caller-supplied factory lets the sync trainer swap in a TQ-mediated
+    # Policy subclass without this shared setup needing to know the data
+    # plane exists. Default is the plain Policy class — legacy behavior.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
     def init_policy(reserved_http_server_port: Optional[int] = None):
@@ -1261,6 +1264,7 @@ def setup(
             init_reference_model=init_reference_model,
             **extra_policy_kwargs,
         )
+        # Keep custom policy_factory call signatures backward compatible.
         p.debug_payload_metrics = grpo_config.debug_payload_metrics
         if remote_transport is not None:
             assert remote_synchronizer_cls is not None
