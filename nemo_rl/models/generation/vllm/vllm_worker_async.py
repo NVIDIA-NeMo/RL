@@ -1708,14 +1708,18 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            profiler_error = None
             if self._sparse_refit_receiver is not None:
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
 
             if self.llm is not None:
                 if self._use_internal_rollout_profiler:
-                    await self.llm.collective_rpc(
-                        "close_rollout_profiler", args=tuple()
-                    )
+                    try:
+                        await self.llm.collective_rpc(
+                            "close_rollout_profiler", args=tuple()
+                        )
+                    except Exception as error:
+                        profiler_error = error
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())
                 try:
@@ -1744,6 +1748,8 @@ class VllmAsyncGenerationWorkerImpl(
                 self.http_server.should_exit = True
                 self.server_thread.join()
 
+            if profiler_error is not None:
+                raise profiler_error
             return True
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")

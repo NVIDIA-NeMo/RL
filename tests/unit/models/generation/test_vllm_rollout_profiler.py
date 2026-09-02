@@ -254,7 +254,7 @@ def test_generation_selects_engine_specific_profiler_rpc(async_engine, expected_
         "pipeline_parallel_size",
         "expert_parallel_size",
     ),
-    [(8, 2, 1), (8, 1, 2)],
+    [(8, 2, 1), (8, 1, 2), (8, 1, 16)],
 )
 def test_rollout_profiler_rejects_unsupported_topology_before_worker_start(
     tensor_parallel_size,
@@ -270,12 +270,13 @@ def test_rollout_profiler_rejects_unsupported_topology_before_worker_start(
         )
 
 
-def test_rollout_profiler_accepts_tp8_topology():
+@pytest.mark.parametrize("expert_parallel_size", [1, 8])
+def test_rollout_profiler_accepts_tp8_topology(expert_parallel_size):
     validate_rollout_profiler_topology(
         class_path="profiler.Plugin",
         tensor_parallel_size=8,
         pipeline_parallel_size=1,
-        expert_parallel_size=1,
+        expert_parallel_size=expert_parallel_size,
     )
 
 
@@ -325,3 +326,59 @@ def test_worker_shutdown_closes_internal_rollout_profilers():
         call("cleanup", args=tuple()),
     ]
     assert worker.llm is None
+
+
+def test_worker_shutdown_cleans_up_after_internal_profiler_close_failure(capsys):
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker._rollout_profiler = None
+    worker._use_internal_rollout_profiler = True
+    worker._sparse_refit_receiver = None
+    llm = MagicMock()
+    llm.collective_rpc.side_effect = [RuntimeError("close failed"), None]
+    worker.llm = llm
+    worker.tokenizer = object()
+
+    with (
+        patch("nemo_rl.models.generation.vllm.vllm_worker.gc.collect"),
+        patch("nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache"),
+        patch("nemo_rl.models.generation.vllm.vllm_worker.shutdown_telemetry"),
+    ):
+        assert worker.shutdown() is False
+
+    assert llm.collective_rpc.call_args_list == [
+        call("close_rollout_profiler", args=tuple()),
+        call("cleanup", args=tuple()),
+    ]
+    assert worker.llm is None
+    assert worker.tokenizer is None
+    assert "Error during vLLM shutdown: close failed" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_async_worker_shutdown_cleans_up_after_profiler_close_failure(capsys):
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._use_internal_rollout_profiler = True
+    worker._sparse_refit_receiver = None
+    llm = MagicMock()
+    llm.collective_rpc = AsyncMock(side_effect=[RuntimeError("close failed"), None])
+    worker.llm = llm
+    worker.tokenizer = object()
+    worker.server_thread = None
+
+    with (
+        patch("nemo_rl.models.generation.vllm.vllm_worker_async.gc.collect"),
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache"
+        ),
+        patch("nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry"),
+    ):
+        assert await worker.shutdown() is False
+
+    assert llm.collective_rpc.await_args_list == [
+        call("close_rollout_profiler", args=tuple()),
+        call("cleanup", args=tuple()),
+    ]
+    llm.shutdown.assert_called_once_with()
+    assert worker.llm is None
+    assert worker.tokenizer is None
+    assert "Error during vLLM shutdown: close failed" in capsys.readouterr().out
