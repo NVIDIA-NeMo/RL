@@ -386,6 +386,7 @@ design-docs/modelopt-real-quant-architecture.md
 design-docs/nccl-reshard-refit.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
+design-docs/policy-lifecycle.md
 ```
 
 ```{toctree}
