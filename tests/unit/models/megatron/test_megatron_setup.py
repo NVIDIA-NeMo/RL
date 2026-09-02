@@ -3611,3 +3611,93 @@ class TestForceSyncOptimizerFp32FromModel:
                 f"DistributedOptimizer no longer references {name!r}; "
                 "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
             )
+
+
+# ---------------------------------------------------------------------------
+# apply_fp32_lm_head: output_layer resolution through multimodal wrappers
+# ---------------------------------------------------------------------------
+
+
+class _FakeOutputLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.ones(4, 2, dtype=torch.bfloat16), requires_grad=False
+        )
+        self.seen_dtypes: list[tuple[torch.dtype, torch.dtype]] = []
+
+    def forward(self, input_, *args, weight=None, **kwargs):
+        w = weight if weight is not None else self.weight
+        self.seen_dtypes.append((input_.dtype, w.dtype))
+        return input_ @ w.t()
+
+
+def _assert_fp32_wrapped(output_layer: _FakeOutputLayer) -> None:
+    out = output_layer.forward(torch.ones(3, 2, dtype=torch.bfloat16))
+    assert out.dtype == torch.float32
+    assert output_layer.seen_dtypes == [(torch.float32, torch.float32)]
+
+
+def test_apply_fp32_lm_head_wraps_plain_last_stage_chunk():
+    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
+
+    # Float16Module/DDP-style `.module` nesting around a GPTModel-like chunk.
+    layer = _FakeOutputLayer()
+    chunk = SimpleNamespace(
+        module=SimpleNamespace(output_layer=layer, post_process=True)
+    )
+    apply_fp32_lm_head([chunk])
+    _assert_fp32_wrapped(layer)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        # NemotronVLModel with an LLaVA wrapper: .llava_model.language_model
+        lambda layer: SimpleNamespace(
+            post_process=True,
+            llava_model=SimpleNamespace(
+                language_model=SimpleNamespace(output_layer=layer, post_process=True)
+            ),
+        ),
+        # NemotronVLModel without LLaVA: .language_model
+        lambda layer: SimpleNamespace(
+            post_process=True,
+            llava_model=None,
+            language_model=SimpleNamespace(output_layer=layer, post_process=True),
+        ),
+        # NemotronOmniModel: .thinker.language_model
+        lambda layer: SimpleNamespace(
+            post_process=True,
+            thinker=SimpleNamespace(
+                language_model=SimpleNamespace(output_layer=layer, post_process=True)
+            ),
+        ),
+    ],
+    ids=["vl_llava", "vl_language_model", "omni_thinker"],
+)
+def test_apply_fp32_lm_head_resolves_nested_language_model(build):
+    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
+
+    layer = _FakeOutputLayer()
+    chunk = SimpleNamespace(module=build(layer))
+    apply_fp32_lm_head([chunk])
+    _assert_fp32_wrapped(layer)
+
+
+def test_apply_fp32_lm_head_raises_when_post_process_chunk_has_no_output_layer():
+    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
+
+    # A post_process chunk with no reachable output_layer must not be mistaken
+    # for a non-last pipeline stage: that leaves the trainer in bf16 while
+    # generation runs fp32.
+    chunk = SimpleNamespace(module=SimpleNamespace(post_process=True))
+    with pytest.raises(ValueError, match="no output_layer was found"):
+        apply_fp32_lm_head([chunk])
+
+
+def test_apply_fp32_lm_head_skips_non_last_pipeline_stage():
+    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
+
+    chunk = SimpleNamespace(module=SimpleNamespace(post_process=False))
+    apply_fp32_lm_head([chunk])  # no output_layer, not post_process: no-op

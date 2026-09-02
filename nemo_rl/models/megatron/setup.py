@@ -476,6 +476,33 @@ def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
     return os.path.join(path, iter_subdirs[-1])
 
 
+def _resolve_output_layer_owner(chunk: Any) -> Any:
+    """Return the module that owns ``output_layer`` for a Megatron model chunk.
+
+    Sheds the ``Float16Module`` / DDP ``.module`` wrappers, then the multimodal
+    wrappers that nest the language model instead of exposing ``output_layer``
+    themselves: ``NemotronOmniModel.thinker`` / ``.language_model`` and
+    ``NemotronVLModel.llava_model.language_model`` / ``.language_model``. The
+    descent stops as soon as a module exposes ``output_layer`` so plain
+    ``GPTModel`` / ``MambaModel`` chunks resolve to themselves. Mirrors the
+    unwrap chain in ``freeze_moe_router``.
+    """
+    module = chunk
+    while hasattr(module, "module"):
+        module = module.module
+    for _ in range(4):
+        if getattr(module, "output_layer", None) is not None:
+            break
+        for attr in ("thinker", "llava_model", "language_model"):
+            inner = getattr(module, attr, None)
+            if inner is not None:
+                module = inner
+                break
+        else:
+            break
+    return module
+
+
 def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
     """Run the LM output-layer GEMM in fp32 (MiniMax-M1-style, arXiv:2506.13585).
 
@@ -498,11 +525,25 @@ def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
     if not isinstance(model_chunks, (list, tuple)):
         model_chunks = [model_chunks]
     for chunk in model_chunks:
-        module = chunk
-        while hasattr(module, "module"):
-            module = module.module
+        module = _resolve_output_layer_owner(chunk)
         output_layer = getattr(module, "output_layer", None)
         if output_layer is None:
+            # Zero matches must not look like success: on the chunk that owns
+            # the head, silently wrapping nothing leaves the trainer in bf16
+            # while vLLM (NRL_VLLM_FP32_LM_HEAD) runs fp32, which is worse than
+            # disabling the feature on both sides. ``post_process`` is how
+            # Megatron marks that chunk (GPTModel, MambaModel/HybridModel,
+            # NemotronVLModel, NemotronOmniModel all carry it).
+            if getattr(module, "post_process", False) or getattr(
+                chunk, "post_process", False
+            ):
+                raise ValueError(
+                    "fp32_lm_head is enabled but no output_layer was found on a "
+                    f"post_process model chunk of type {type(module).__name__} "
+                    f"(chunk type {type(chunk).__name__}). The trainer would run "
+                    "the LM head in bf16 while generation runs fp32, which is "
+                    "worse than disabling both."
+                )
             continue  # not the last pipeline stage
         original_forward = output_layer.forward
 
