@@ -347,23 +347,23 @@ def setup(
     else:
         nemo_gym_num_nodes = 0
         ray_cur_node_id = None
-    segment_size = cluster_config.get("segment_size")
+    segment_size = cluster_config.segment_size
 
     if colocated_inference:
-        num_nodes = cluster_config["num_nodes"]
+        num_nodes = cluster_config.num_nodes
         node_resource_constraints, _, _ = prepare_segment_topology(
             segment_size, num_nodes
         )
         cluster = RayVirtualCluster(
             name="distillation_cluster",
-            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+            bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
             use_gpus=True,
-            num_gpus_per_node=cluster_config["gpus_per_node"],
+            num_gpus_per_node=cluster_config.gpus_per_node,
             max_colocated_worker_groups=1
             if generation_config["backend"] == "megatron"
             else 3,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -380,15 +380,15 @@ def setup(
         )
 
         # train resources will be updated through overall and inference resources below
-        train_gpus_per_node = cluster_config["gpus_per_node"]
-        train_nodes = cluster_config["num_nodes"]
+        train_gpus_per_node = cluster_config.gpus_per_node
+        train_nodes = cluster_config.num_nodes
 
         inference_resources = generation_config["colocated"]["resources"]
         inference_gpus_per_node = inference_resources["gpus_per_node"]
         inference_nodes = inference_resources["num_nodes"]
 
         # validate and configure resources
-        if cluster_config["num_nodes"] == 1:
+        if cluster_config.num_nodes == 1:
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
             ), (
@@ -411,11 +411,11 @@ def setup(
             )
             assert (
                 inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+                and inference_gpus_per_node == cluster_config.gpus_per_node
             ), (
                 "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config.gpus_per_node}."
             )
             train_nodes -= inference_nodes
 
@@ -428,8 +428,8 @@ def setup(
         )
         if node_resource_constraints is not None and inference_nodes > 0:
             nodes_per_instance = (
-                inference_gpus_per_node + cluster_config["gpus_per_node"] - 1
-            ) // cluster_config["gpus_per_node"]
+                inference_gpus_per_node + cluster_config.gpus_per_node - 1
+            ) // cluster_config.gpus_per_node
             if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
                 remaining_topology = {nid: topology[nid] for nid in remaining_node_ids}
                 inference_node_resource_constraints, _, _ = prepare_segment_topology(
@@ -447,8 +447,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=train_gpus_per_node,
             max_colocated_worker_groups=3,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -458,8 +458,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=3,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=inference_segment_size,
             node_resource_constraints=inference_node_resource_constraints,
         )
@@ -1170,8 +1170,7 @@ def distillation_train(
             total_time = timing_metrics.get("total_step_time", 0)
 
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             metrics.update(
                 {
