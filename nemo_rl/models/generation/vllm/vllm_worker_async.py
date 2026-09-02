@@ -1425,7 +1425,7 @@ class VllmAsyncGenerationWorkerImpl(
         """Apply one exact MX version on every internal vLLM rank."""
         assert self.llm is not None, "vLLM must be initialized before ModelExpress"
         results = await self.llm.collective_rpc(
-            "update_weights_from_model_express", args=(version,)
+            "update_weights_from_model_express", args=(version.version_id,)
         )
         if asyncio.iscoroutine(results):
             results = await results

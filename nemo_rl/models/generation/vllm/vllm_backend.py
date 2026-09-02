@@ -25,7 +25,7 @@ import torch
 import zmq
 
 if TYPE_CHECKING:
-    from modelexpress_rl import ModelExpressGeneratorClient, WeightVersionRef
+    from modelexpress_rl import ModelExpressGeneratorClient
 
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineMixin,
@@ -297,11 +297,15 @@ class VllmInternalWorkerExtension:
             )
         )
 
-    def update_weights_from_model_express(self, version: WeightVersionRef) -> bool:
+    def update_weights_from_model_express(self, version_id: str) -> bool:
         """Stage, verify, and install an exact MX version at a safe point."""
         if self._model_express is None:
             raise RuntimeError("ModelExpress generator client is not initialized")
-        staged = self._model_express.stage_weight(version=version)
+        from modelexpress_rl import WeightVersionRef
+
+        staged = self._model_express.stage_weight(
+            version=WeightVersionRef(version_id)
+        )
         try:
             self._model_express.apply_weight(staged)
         finally:

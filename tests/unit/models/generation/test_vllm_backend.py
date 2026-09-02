@@ -73,6 +73,34 @@ def test_initialize_model_express_uses_unwrapped_vllm_model(monkeypatch):
     )
 
 
+@pytest.mark.vllm
+def test_model_express_update_reconstructs_version_ref(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    class WeightVersionRef:
+        def __init__(self, version_id):
+            self.version_id = version_id
+
+    modelexpress_rl = ModuleType("modelexpress_rl")
+    modelexpress_rl.WeightVersionRef = WeightVersionRef
+    monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
+
+    staged = MagicMock()
+    client = MagicMock()
+    client.stage_weight.return_value = staged
+    worker = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    worker._model_express = client
+
+    assert worker.update_weights_from_model_express("version-1") is True
+
+    version = client.stage_weight.call_args.kwargs["version"]
+    assert isinstance(version, WeightVersionRef)
+    assert version.version_id == "version-1"
+    staged.release.assert_called_once_with()
+
+
 def _write_sharded_checkpoint(model_dir, shards):
     """Write safetensors shards plus a model.safetensors.index.json.
 

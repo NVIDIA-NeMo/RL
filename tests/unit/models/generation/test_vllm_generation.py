@@ -77,6 +77,38 @@ async def test_async_model_express_initializes_every_vllm_rank() -> None:
     )
 
 
+def test_model_express_update_sends_version_id_to_vllm_ranks() -> None:
+    worker = object.__new__(VllmGenerationWorkerImpl)
+    worker.llm = MagicMock()
+    worker.llm.collective_rpc.return_value = [True, True]
+
+    worker.update_weights_from_model_express(
+        version=types.SimpleNamespace(version_id="version-1")
+    )
+
+    worker.llm.collective_rpc.assert_called_once_with(
+        "update_weights_from_model_express",
+        args=("version-1",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_model_express_update_sends_version_id_to_vllm_ranks() -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = MagicMock()
+    worker.llm.collective_rpc = AsyncMock(return_value=[True, True])
+    worker._reset_encoder_cache_after_weight_update = AsyncMock()
+
+    await worker.update_weights_from_model_express_async(
+        version=types.SimpleNamespace(version_id="version-1")
+    )
+
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "update_weights_from_model_express",
+        args=("version-1",),
+    )
+
+
 def test_model_express_initialization_runs_only_on_engine_leaders(monkeypatch):
     generation = object.__new__(VllmGeneration)
     generation.cfg = {"vllm_cfg": {"async_engine": False}}

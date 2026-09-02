@@ -1284,7 +1284,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         results = cast(
             list[bool],
             self.llm.collective_rpc(
-                "update_weights_from_model_express", args=(version,)
+                "update_weights_from_model_express", args=(version.version_id,)
             ),
         )
         if not results or not all(results):
