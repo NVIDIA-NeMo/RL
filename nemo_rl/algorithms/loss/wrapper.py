@@ -20,6 +20,7 @@ import torch.distributed
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import (
+    BlockDraftLossFn,
     DraftCrossEntropyLossFn,
     DraftTTTCrossEntropyLossFn,
 )
@@ -249,9 +250,11 @@ class DraftLossWrapper:
 
     ``ttt_steps > 1`` selects the multi-pass loss
     (:class:`DraftTTTCrossEntropyLossFn`), which returns per-pass metrics
-    alongside the loss and needs ``global_draft_pass_counts``.
-    ``draft_loss_kwargs`` are the selected LossFn's remaining ctor kwargs —
-    ``pass_weights`` / ``seq_chunk_size`` for the multi-pass loss.
+    alongside the loss and needs ``global_draft_pass_counts``. Block drafts
+    are detected from ``data_dict["draft_block_logits"]`` (stashed by the
+    train loop) and use :class:`BlockDraftLossFn`. ``draft_loss_kwargs`` are
+    the selected LossFn's remaining ctor kwargs — ``slot_weights`` for block
+    drafts, ``pass_weights`` / ``seq_chunk_size`` for the multi-pass loss.
     """
 
     def __init__(
@@ -290,15 +293,21 @@ class DraftLossWrapper:
         if cu_seqlens_q is None and prepare_fn is None:
             raise ValueError("prepare_fn is required in unpacked mode.")
         self.multi_pass = ttt_steps > 1
-        if cu_seqlens_q is not None and self.multi_pass:
+        self.block_draft = "draft_block_logits" in data_dict
+        if cu_seqlens_q is not None and (self.multi_pass or self.block_draft):
             raise ValueError(
-                "Multi-pass draft training (policy.draft.ttt_steps > 1) does not "
-                "support sequence packing; the per-pass slicing convention needs "
+                "Only single-pass eagle3 draft training supports sequence "
+                "packing; the per-pass and per-slot slicing conventions need "
                 "the unpacked [B, S] layout."
             )
         draft_loss_kwargs = draft_loss_kwargs or {}
-        if self.multi_pass:
-            self.draft_loss_fn: Any = DraftTTTCrossEntropyLossFn(
+        if self.block_draft:
+            self.draft_loss_fn: Any = BlockDraftLossFn(
+                vocab_parallel_group=vocab_parallel_group,
+                **draft_loss_kwargs,
+            )
+        elif self.multi_pass:
+            self.draft_loss_fn = DraftTTTCrossEntropyLossFn(
                 vocab_parallel_group=vocab_parallel_group,
                 **draft_loss_kwargs,
             )
@@ -368,7 +377,19 @@ class DraftLossWrapper:
         )
 
         draft_metrics: dict[str, Any] = {}
-        if self.cu_seqlens_q is not None:
+        if self.block_draft:
+            # The block loss needs no prepare step: the teacher is the raw
+            # (vocab-parallel) policy logits and the student block logits were
+            # stashed by the train loop.
+            draft_loss, draft_metrics = self.draft_loss_fn(
+                data=data,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                global_draft_pass_counts=self.global_draft_pass_counts,
+                teacher_logits=next_token_logits.detach(),
+                student_block_logits=data["draft_block_logits"],
+            )
+        elif self.cu_seqlens_q is not None:
             draft_loss = self._packed_draft_loss(
                 next_token_logits, data, global_valid_seqs, global_valid_toks
             )

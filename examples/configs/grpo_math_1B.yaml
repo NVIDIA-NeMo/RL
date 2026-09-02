@@ -324,6 +324,7 @@ policy:
 
   draft:
     enabled: false
+    speculator_type: eagle3 # "eagle3", or the DFlash block drafter "dflash"
     model_name: null
     loss_weight: 0.1
     num_layers: null

@@ -52,6 +52,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import (
+    compute_block_draft_slot_valid_counts,
     compute_draft_pass_valid_counts,
 )
 from nemo_rl.data.multimodal_utils import (
@@ -861,12 +862,12 @@ class MegatronPolicyWorkerImpl(
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
-                # Draft (TTT) loss normalization: the draft's valid-token
-                # counts differ from the policy's (per-pass masks shift by
-                # d+1), so it gets its own global per-pass counts, all-reduced
-                # over DP only. The loss derives its gradient denominator
-                # (sum_d alpha_d * count_d) and the per-pass metric
-                # denominators from this vector.
+                # Draft loss normalization: the draft's valid-token counts
+                # differ from the policy's (TTT per-pass masks shift by d+1;
+                # block slots only cover anchored spans), so it gets its own
+                # global counts, all-reduced over DP only. The loss derives
+                # its gradient denominator (sum_d alpha_d * count_d) and the
+                # per-pass metric denominators from this vector.
                 draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                 raw_ttt_steps = (
                     self.cfg["draft"].get("ttt_steps", 1) if draft_enabled else 1
@@ -883,17 +884,61 @@ class MegatronPolicyWorkerImpl(
                     if draft_enabled
                     else None
                 )
+                draft_speculator_type = (
+                    (self.cfg["draft"].get("speculator_type") or "eagle3")
+                    if draft_enabled
+                    else "eagle3"
+                )
                 global_draft_pass_counts = None
-                if (
-                    draft_ttt_steps > 1
-                    and "token_mask" in batch
-                    and "sample_mask" in batch
-                ):
-                    global_draft_pass_counts = compute_draft_pass_valid_counts(
-                        batch["token_mask"],
-                        batch["sample_mask"],
-                        ttt_steps=draft_ttt_steps,
-                    ).to(device=global_valid_toks.device)
+                if draft_enabled and "token_mask" in batch and "sample_mask" in batch:
+                    if draft_speculator_type == "dflash":
+                        # Deferred import: the dflash module pulls mcore
+                        # transformer pieces only needed on this path.
+                        from nemo_rl.models.megatron.draft.dflash import (
+                            anchors_to_count_map,
+                            sample_block_anchors,
+                        )
+
+                        # Sample block anchors ONCE for the whole local batch
+                        # (deterministic from the batch content, identical on
+                        # every TP rank). They travel through the batch as a
+                        # [B, S] per-position count map: dim 1 must be the
+                        # sequence dim for every batch tensor (dynamic
+                        # batching validates, truncates, and length-bucket
+                        # reorders along it), which a [B, N] position tensor
+                        # cannot survive. The train loop rebuilds per-mb
+                        # block lists from the map. The per-slot counts are
+                        # the block analogue of the per-pass TTT counts.
+                        anchors, anchor_valid = sample_block_anchors(
+                            token_mask=batch["token_mask"],
+                            sample_mask=batch["sample_mask"],
+                            input_ids=batch["input_ids"],
+                            num_anchors=int(self.cfg["draft"]["anchors_per_seq"]),
+                            generation_only=bool(
+                                self.cfg["draft"].get(
+                                    "anchor_from_generation_only", True
+                                )
+                            ),
+                        )
+                        batch["draft_anchor_count_map"] = anchors_to_count_map(
+                            anchors, anchor_valid, batch["token_mask"].shape[1]
+                        )
+                        global_draft_pass_counts = (
+                            compute_block_draft_slot_valid_counts(
+                                batch["token_mask"],
+                                batch["sample_mask"],
+                                anchors,
+                                anchor_valid,
+                                gamma=int(self.cfg["draft"]["gamma"]),
+                            ).to(device=global_valid_toks.device)
+                        )
+                    elif draft_ttt_steps > 1:
+                        global_draft_pass_counts = compute_draft_pass_valid_counts(
+                            batch["token_mask"],
+                            batch["sample_mask"],
+                            ttt_steps=draft_ttt_steps,
+                        ).to(device=global_valid_toks.device)
+                if global_draft_pass_counts is not None:
                     torch.distributed.all_reduce(
                         global_draft_pass_counts,
                         group=parallel_state.get_data_parallel_group(),
@@ -2475,9 +2520,9 @@ class MegatronPolicyWorkerImpl(
             yield name, tensor
 
         if include_draft and self.draft_model is not None:
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
+            from nemo_rl.models.megatron.draft import export_draft_weights_to_hf
 
-            draft_weights = export_eagle_weights_to_hf(
+            draft_weights = export_draft_weights_to_hf(
                 self.draft_model,
             )
             for name, tensor in draft_weights:

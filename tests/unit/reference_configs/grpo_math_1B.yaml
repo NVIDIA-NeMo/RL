@@ -309,6 +309,7 @@ policy:
 
   draft:
     enabled: false
+    speculator_type: eagle3
     model_name: null
     loss_weight: 0.1
     num_layers: null

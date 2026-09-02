@@ -511,12 +511,37 @@ class DraftConfig(TypedDict):
     ttt_steps: NotRequired[int]
     # Per-pass loss weights alpha_d (len == ttt_steps); null = uniform 1.0.
     ttt_pass_weights: NotRequired[list[float] | None]
-    # Sequence-dim chunk size for the multi-pass draft loss internals (the
-    # fp32 soft-CE buffers and the d2t full-vocab TP gather). Trades a few
-    # extra TP collectives for peak memory; does not affect results. Only
-    # used when ttt_steps > 1 (the single-pass loss keeps the stock unchunked
-    # path). Default in the exemplar YAML: 4096.
+    # Sequence-dim chunk size for the multi-pass / block draft loss internals
+    # (the fp32 soft-CE buffers and the d2t full-vocab TP gather). Trades a
+    # few extra TP collectives for peak memory; does not affect results. The
+    # stock single-pass eagle3 loss keeps the unchunked path. Default in the
+    # exemplar YAML: 4096.
     loss_seq_chunk_size: NotRequired[int | None]
+    # Speculator family: "eagle3" (default), or the block drafter "dflash"
+    # (vLLM >= 0.25 serving; anchor + mask-token blocks, bidirectional
+    # in-block attention, trunk truncated at the anchor; additionally
+    # requires PP == 1). Matches vLLM's speculative_config method naming.
+    speculator_type: NotRequired[str]
+    # ---- dflash only ----
+    # Speculated tokens per block (vLLM num_speculative_tokens).
+    gamma: NotRequired[int]
+    # Anchors sampled per sequence (static shape).
+    anchors_per_seq: NotRequired[int]
+    # Restrict anchors to generation segments (token_loss_mask == 1 labels).
+    anchor_from_generation_only: NotRequired[bool]
+    # Reserved, unused-in-data token id (required for dflash). Mask
+    # slots embed via the target's FROZEN embedding row at this id (official
+    # DFlash contract; never trained).
+    mask_token_id: NotRequired[int | None]
+    # Named slot-weighting scheme for the block-draft loss: null/"uniform",
+    # or "exp" = the DFlash paper's exponentially decaying weight
+    # w_j = exp(-j / gamma_d), gamma_d tabulated by block size (b8 -> 4,
+    # b10 -> 5, b16 -> 7; interpolated otherwise).
+    loss_weighting: NotRequired[str | None]
+    # Trunk-attention bucketing granularity in tokens (correctness-neutral).
+    trunk_chunk: NotRequired[int]
+    # Per-head q/k RMSNorm in the draft attention (Qwen3 style).
+    qk_layernorm: NotRequired[bool]
     # Draft-only optimizer param group (separate from the policy's
     # megatron_cfg.optimizer settings). All null = share the policy optimizer
     # settings and keep the stock param-group partition.

@@ -174,6 +174,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "two."
             )
         if draft_enabled:
+            speculator_type = config["draft"].get("speculator_type") or "eagle3"
             raw_ttt_steps = config["draft"].get("ttt_steps", 1)
             draft_ttt_steps = 1 if raw_ttt_steps is None else int(raw_ttt_steps)
             if draft_ttt_steps < 1:
@@ -189,15 +190,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "policy.draft.ttt_pass_weights must have ttt_steps="
                     f"{draft_ttt_steps} entries, got {len(draft_pass_weights)}."
                 )
-            if draft_ttt_steps > 1 and bool(
-                config.get("sequence_packing", {}).get("enabled", False)
+            if bool(config.get("sequence_packing", {}).get("enabled", False)) and (
+                draft_ttt_steps > 1 or speculator_type != "eagle3"
             ):
-                # Multi-pass TTT slices the unshifted teacher per pass to build
-                # its targets, which assumes the [B, S] layout; the packed
-                # draft loss pre-shifts and packs a single mask instead.
+                # Multi-pass TTT and block drafts slice the unshifted teacher
+                # per pass/slot to build their targets, which assumes the
+                # [B, S] layout; the packed draft loss pre-shifts and packs a
+                # single mask instead.
                 raise ValueError(
-                    "policy.draft.ttt_steps > 1 does not support sequence packing "
-                    "yet. Set policy.draft.ttt_steps=1 or disable "
+                    "Only single-pass eagle3 draft training supports sequence "
+                    "packing. Set policy.draft.ttt_steps=1 and "
+                    "policy.draft.speculator_type=eagle3, or disable "
                     "policy.sequence_packing."
                 )
             # The TTT attention slices sequences locally and stashes per-pass
