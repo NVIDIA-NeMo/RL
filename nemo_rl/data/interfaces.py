@@ -45,6 +45,7 @@ class NemoGymSourceIdentity:
 
     @classmethod
     def from_stat(cls, path: str, stat: os.stat_result) -> "NemoGymSourceIdentity":
+        """Build a source identity snapshot from a resolved path and stat result."""
         return cls(
             path=path,
             device=stat.st_dev,

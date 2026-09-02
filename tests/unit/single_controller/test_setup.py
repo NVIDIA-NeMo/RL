@@ -954,7 +954,7 @@ class TestSetup:
             pytest.warns(UserWarning, match="checkpointing.save_period=2"),
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
-                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
             ),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch(
@@ -2097,7 +2097,7 @@ class TestSetup:
         endpoint_up = threading.Event()
         weight_sync.sync_weights.side_effect = lambda **_: endpoint_up.set()
 
-        def _spinup_gym(**_):
+        def _spinup_gym(_env_configs, **_):
             if not endpoint_up.wait(timeout=5):
                 raise TimeoutError("Gym was awaited before the initial refit")
             return fake_gym_actor

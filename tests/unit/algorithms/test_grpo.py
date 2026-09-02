@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import Event
@@ -51,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
+    _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
@@ -865,6 +867,16 @@ def test_raise_if_reward_penalties_enabled_without_nemo_gym_noops_when_all_flags
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=False
     )
+
+
+def test_completed_nemo_gym_startup_is_shutdown_after_sibling_failure():
+    shard_set = MagicMock()
+    future = Future()
+    future.set_result((shard_set, 1.0))
+
+    _shutdown_completed_nemo_gym_startup(future)
+
+    shard_set.shutdown.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

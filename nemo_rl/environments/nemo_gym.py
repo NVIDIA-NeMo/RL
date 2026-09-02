@@ -1677,8 +1677,8 @@ class NemoGymShardSet:
     def shutdown(
         self,
         *,
-        timeout: float | None = None,
-        force_kill: bool = False,
+        timeout: float | None = NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        force_kill: bool = True,
     ) -> None:
         """Stop every actor, then release the bundles they were pinned to."""
         handles = self.all_handles

@@ -38,6 +38,7 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    spinup_nemo_gym_actor,
 )
 
 
@@ -1133,9 +1134,7 @@ def test_task_source_is_validated_before_gym_resolves_agent_ref():
         }
     ]
 
-    nemo_gym_mod.validate_dataset_agent_coverage(
-        shard_set, {"train": dataset}
-    )
+    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
 
 
 def test_an_unsharded_job_is_not_scanned_at_all():
@@ -1262,13 +1261,17 @@ def test_shard_set_shutdown_releases_the_placement_group_once():
     with (
         patch.object(nemo_gym_mod, "shutdown_environments") as shutdown,
         patch.object(nemo_gym_mod, "remove_placement_group") as remove,
+        patch.object(nemo_gym_mod.ray, "kill") as kill,
     ):
         shard_set.shutdown()
         shard_set.shutdown()
 
     assert shutdown.call_count == 2
     assert all(
-        invocation.kwargs == {"timeout": None} for invocation in shutdown.call_args_list
+        invocation.kwargs
+        == {"timeout": nemo_gym_mod.NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S}
+        for invocation in shutdown.call_args_list
     )
+    assert kill.call_count == 4
     # Releasing a group twice raises; the second shutdown must not try.
     remove.assert_called_once_with(pg)
