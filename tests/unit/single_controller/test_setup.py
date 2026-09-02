@@ -516,7 +516,6 @@ class TestSetup:
         self, patched_factories
     ):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
-        mc.policy["generation"]["vllm_cfg"] = {"async_engine": True}
         mc.token_capture.enabled = True
         mc.grpo.invalid_tool_call_advantage = -5.0
 
