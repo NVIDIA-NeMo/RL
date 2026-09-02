@@ -21,7 +21,7 @@ import json
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -49,6 +49,7 @@ from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
     extract_input_images_from_responses_messages,
 )
+from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -75,6 +76,22 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+_REWARD_PENALTY_METRICS = {
+    "duplicated_reasoning": (
+        "penalize_duplicated_reasoning",
+        "reasoning_equal_to_final_answer_rate",
+    ),
+    "empty_final_answer": (
+        "penalize_empty_final_answer",
+        "empty_final_answer_rate",
+    ),
+    "unwanted_token": ("penalize_unwanted_tokens", "unwanted_token_rate"),
+    "malformed_think_tag": (
+        "penalize_malformed_think_tag",
+        "malformed_think_tag_rate",
+    ),
+}
 
 
 def attach_initial_nemo_gym_image_payloads(
@@ -263,16 +280,12 @@ def _add_r3_fallback_metrics(
     )
 
 
-def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
+def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
         [
-            bool(
-                (result["full_result"].get("instance_config") or {}).get(
-                    "mask_sample", False
-                )
-            )
-            for result in results
+            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
+            for extra in extras
         ],
         dtype=torch.bool,
     )
@@ -464,6 +477,38 @@ def _apply_effort_shaping(
     return _EffortShapingMetrics(
         length_rewards_low, rewards_low, low_lengths, high_lengths
     )
+
+
+def _effort_shaping_metrics(shaping: _EffortShapingMetrics) -> dict[str, float]:
+    """Build the rollout-metric entries for one group's effort-shaping lists.
+
+    Shared by the batched v1 path and the SingleController rollout manager so the
+    two cannot drift apart.
+
+    Args:
+        shaping: Per-sample tracking lists returned by ``_apply_effort_shaping``.
+
+    Returns:
+        Metric name to value. Empty only when shaping was disabled; callers
+        ``update`` an existing dict, so an absent key leaves the metric unreported
+        rather than reporting a zero.
+    """
+    metrics: dict[str, float] = {}
+    if shaping.length_rewards_low:
+        metrics["mean_length_reward_low"] = sum(shaping.length_rewards_low) / len(
+            shaping.length_rewards_low
+        )
+    if shaping.rewards_low:
+        metrics["mean_reward_low"] = sum(shaping.rewards_low) / len(shaping.rewards_low)
+    if shaping.low_lengths:
+        metrics["mean_length_low"] = sum(shaping.low_lengths) / len(shaping.low_lengths)
+        metrics["median_length_low"] = float(statistics.median(shaping.low_lengths))
+    if shaping.high_lengths:
+        metrics["mean_length_high"] = sum(shaping.high_lengths) / len(
+            shaping.high_lengths
+        )
+        metrics["median_length_high"] = float(statistics.median(shaping.high_lengths))
+    return metrics
 
 
 def generate_responses(
@@ -1843,6 +1888,22 @@ def _get_reward_penalty_config_value(
     return getattr(reward_penalty_config, key, None)
 
 
+def compute_reward_penalty_metrics(
+    penalty_counts: dict[str, int],
+    num_results: int,
+    reward_penalty_config: dict[str, Any] | BaseModel | None,
+) -> dict[str, float]:
+    """Return enabled penalty rates using the legacy NeMo-Gym metric names."""
+    if reward_penalty_config is None or not num_results:
+        return {}
+
+    return {
+        metric_name: penalty_counts[count_key] / num_results
+        for count_key, (flag, metric_name) in _REWARD_PENALTY_METRICS.items()
+        if _get_reward_penalty_config_value(reward_penalty_config, flag)
+    }
+
+
 def _get_reward_penalty_token_id(
     reward_penalty_config: dict[str, Any] | BaseModel,
     key: str,
@@ -2610,10 +2671,6 @@ def _postprocess_single_nemo_gym_group(
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
-    length_rewards_low = shaping.length_rewards_low
-    rewards_low = shaping.rewards_low
-    low_lengths = shaping.low_lengths
-    high_lengths = shaping.high_lengths
 
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
@@ -2788,44 +2845,22 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
-    # Env/agent mask flag: flagged samples are dropped from the loss but still
-    # count for advantages. env.should_mask_flagged_samples=false skips this.
+    # Carry the raw env/agent flag downstream; the advantage stage composes it
+    # into sample_mask. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:
-        final_batch["mask_sample"] = _extract_mask_sample_flags(results)
-
-    if length_rewards_low:
-        rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(
-            length_rewards_low
+        final_batch[MASK_SAMPLE] = _mask_sample_flags(
+            result["full_result"] for result in results
         )
-    if rewards_low:
-        rollout_metrics["mean_reward_low"] = sum(rewards_low) / len(rewards_low)
-    if low_lengths:
-        rollout_metrics["mean_length_low"] = sum(low_lengths) / len(low_lengths)
-        rollout_metrics["median_length_low"] = float(statistics.median(low_lengths))
-    if high_lengths:
-        rollout_metrics["mean_length_high"] = sum(high_lengths) / len(high_lengths)
-        rollout_metrics["median_length_high"] = float(statistics.median(high_lengths))
 
-    # Penalty metrics — map count keys to (config flag, metric name)
-    _PENALTY_METRICS = {
-        "duplicated_reasoning": (
-            "penalize_duplicated_reasoning",
-            "reasoning_equal_to_final_answer_rate",
-        ),
-        "empty_final_answer": (
-            "penalize_empty_final_answer",
-            "empty_final_answer_rate",
-        ),
-        "unwanted_token": ("penalize_unwanted_tokens", "unwanted_token_rate"),
-        "malformed_think_tag": (
-            "penalize_malformed_think_tag",
-            "malformed_think_tag_rate",
-        ),
-    }
-    if resolved_reward_penalty_config and results:
-        for key, (flag, metric_name) in _PENALTY_METRICS.items():
-            if _get_reward_penalty_config_value(resolved_reward_penalty_config, flag):
-                rollout_metrics[metric_name] = penalty_counts[key] / len(results)
+    rollout_metrics.update(_effort_shaping_metrics(shaping))
+
+    rollout_metrics.update(
+        compute_reward_penalty_metrics(
+            penalty_counts,
+            len(results),
+            resolved_reward_penalty_config,
+        )
+    )
 
     # Expose per-component rewards as `reward/<name>` batch keys for multi-reward NeMo
     # Gym environments so GDPO can compute per-component advantages; single-reward envs

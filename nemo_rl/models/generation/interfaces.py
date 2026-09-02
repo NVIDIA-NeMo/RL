@@ -13,12 +13,16 @@
 # limitations under the License.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from functools import cache
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
 # signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
@@ -39,6 +43,15 @@ _ROUTED_EXPERTS_DTYPE_NAMES = {
     torch.int16: "int16",
     torch.int32: "int32",
 }
+
+
+@cache
+def _warn_unsupported_in_flight_refit_pause_once(backend_name: str) -> None:
+    """Warn once per backend type when native refit pause is unavailable."""
+    print(
+        f"⚠️ {backend_name} has no native generation pause/resume support; "
+        "continuing with the backend's existing in-flight refit behavior"
+    )
 
 
 def get_num_routed_experts(hf_config: Any) -> Optional[int]:
@@ -389,8 +402,39 @@ class CollectiveSenderSpec:
     num_buffers: int | None = None
 
 
+def reject_unenforceable_refit_deadline(
+    backend: str, refit_timeout_s: Optional[float]
+) -> None:
+    """Refuse a refit deadline the backend cannot actually apply.
+
+    Accepting it and doing nothing would be worse than refusing. The deadline exists so
+    that a generation rank dying mid-refit cannot hang the weight-sync collective
+    forever; a user who sets it on a backend that ignores it gets exactly that hang,
+    while believing they are protected. Only vLLM threads the deadline down to the
+    collective today.
+
+    ``None`` -- every path that does not configure a deadline, which is all of them by
+    default -- passes through untouched, so this is inert unless someone opts in.
+    """
+    if refit_timeout_s is not None:
+        raise NotImplementedError(
+            f"{backend} generation cannot enforce a refit deadline "
+            f"(refit_timeout_s={refit_timeout_s}). Only the vLLM backend threads it "
+            "into the refit collective. Unset "
+            "async_rl.generation_fleet_health.refit_timeout_s, or use vLLM generation."
+        )
+
+
 class GenerationInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
+
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Backend-specific pure-config validation, run before any build.
+
+        Args:
+            master_config: The single-controller MasterConfig.
+        """
 
     @abstractmethod
     def init_collective(
@@ -432,6 +476,14 @@ class GenerationInterface(ABC):
         """Shut down generation resources; repeated calls must be safe."""
         pass
 
+    def pause_generation(self, mode: str) -> None:
+        """Pause in-flight generation on the backend."""
+        raise NotImplementedError
+
+    def continue_generation(self) -> None:
+        """Resume previously paused generation on the backend."""
+        raise NotImplementedError
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""
@@ -445,8 +497,18 @@ class GenerationInterface(ABC):
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
-        """Update the model weights from collective communication."""
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Update the model weights from collective communication.
+
+        ``refit_timeout_s`` bounds the receive side of the refit. It is part of the
+        signature for every backend, not just the ones that can act on it, because the
+        synchronizer calls this polymorphically -- a backend that omits the parameter
+        does not fail at import or type-check time, it fails at the Ray boundary during
+        the first refit. Backends that cannot enforce it should say so via
+        ``reject_unenforceable_refit_deadline`` rather than accept it silently.
+        """
         raise NotImplementedError
 
     def get_collective_sender_spec(self) -> CollectiveSenderSpec:
@@ -461,8 +523,21 @@ class GenerationInterface(ABC):
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError
 
-    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
-        """Receive weights from training workers via nccl_reshard."""
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard.
+
+        Takes the deadline for the same reason its sibling above does, and the reason is
+        worth repeating because this is the hook that was missed: the synchronizer calls
+        both polymorphically, so a backend whose signature omits the parameter does not
+        fail at import or type-check time -- it fails at the Ray boundary during the first
+        refit, a long way from the signature that caused it.
+
+        Args:
+            refit_timeout_s: Deadline for this collective, after which the worker aborts
+                its own communicator. None leaves the refit path unchanged.
+        """
         raise NotImplementedError
 
     def attach_fleet_health(self, monitor: Any, selector: Any) -> None:
@@ -485,6 +560,40 @@ class GenerationInterface(ABC):
     # Optional hook; backends may override to invalidate any reusable caches
     # (e.g., vLLM prefix/KV caches) after weight updates.
     def invalidate_kv_cache(self) -> bool:
+        return False
+
+    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+        """Pause in-flight generation while preserving request state.
+
+        Backends with native in-flight refit support override this hook. The default
+        implementation warns once per backend type and lets the refit continue with
+        the backend's existing in-flight behavior. On supported backends, in-flight
+        requests are frozen rather than aborted and resume from
+        :meth:`resume_generation_after_refit`; new requests queue until then.
+
+        Args:
+            clear_cache: Also clear the engine's reusable caches at pause time so
+                preserved requests recompute their KV after the weight update.
+
+        Returns:
+            True if every engine paused; False when the backend has no native pause
+            support. Backends with native support raise when pausing fails.
+        """
+        _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
+        return False
+
+    def resume_generation_after_refit(self) -> bool:
+        """Resume generation paused by :meth:`pause_generation_for_refit`.
+
+        The default implementation shares the once-per-backend warning emitted by
+        :meth:`pause_generation_for_refit` and lets the refit continue for backends
+        without native pause/resume support.
+
+        Returns:
+            True if every engine resumed; False when the backend has no native resume
+            support. Backends with native support raise when resuming fails.
+        """
+        _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
     def blocks_training(self) -> bool:
@@ -523,5 +632,21 @@ class GenerationInterface(ABC):
 
         Returns:
             Dictionary of metrics. Format may vary by backend.
+        """
+        return {}
+
+    def snapshot_step_metrics(self) -> None:
+        """Begin a per-training-step generation metric window.
+
+        Backends without per-step generation metrics may use this default no-op.
+        """
+
+    def get_step_metrics(self) -> dict[str, float]:
+        """Finish the current metric window and return generation metrics.
+
+        Returns:
+            Metrics accumulated since the matching ``snapshot_step_metrics``
+            call, not running totals. Backends without per-step generation
+            metrics return an empty dictionary.
         """
         return {}

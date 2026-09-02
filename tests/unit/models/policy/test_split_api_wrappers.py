@@ -164,6 +164,27 @@ class TestTQPolicySplitFanout:
         # get_all_worker_results (unlike the single-data fan-outs)
         wg.get_all_worker_results.assert_called_once()
 
+    def test_train_microbatches_fetches_only_requested_fields(self):
+        p, _ = _make_tq_policy()
+        meta = _meta()
+        train_fields = tuple(
+            field
+            for field in DP_TRAIN_FIELDS
+            if field not in {"prev_logprobs", "reference_policy_logprobs"}
+        )
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            p.train_microbatches_from_meta(meta, train_fields=train_fields)
+
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == list(train_fields)
+
     def test_train_microbatches_requests_routed_experts_for_router_replay(self):
         p, _ = _make_tq_policy()
         p._router_replay_enabled = True

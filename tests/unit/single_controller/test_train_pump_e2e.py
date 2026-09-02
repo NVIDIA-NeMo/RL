@@ -58,6 +58,8 @@ _REGISTERED_FIELDS = [
     "advantages",
     "token_mask",
     "sample_mask",
+    "mask_sample",
+    "truncated",
     "total_reward",
     "prompt_ids_for_adv",
 ]
@@ -94,6 +96,8 @@ def _populate_group(
             "input_lengths": torch.tensor([seq_len] * group_size).long(),
             "token_mask": torch.ones(group_size, seq_len, dtype=torch.long),
             "sample_mask": torch.ones(group_size, dtype=torch.long),
+            "mask_sample": torch.zeros(group_size, dtype=torch.bool),
+            "truncated": torch.zeros(group_size, dtype=torch.bool),
             "generation_logprobs": torch.zeros(
                 group_size, seq_len, dtype=torch.float32
             ),
@@ -199,6 +203,8 @@ class _RecordingLogger:
         metrics: dict[str, Any],
         step: int,
         prefix: str | None = "",
+        step_metric: str | None = None,
+        step_finished: bool = False,
     ) -> None:
         ray.get(
             self._log.record.remote(
@@ -207,6 +213,7 @@ class _RecordingLogger:
                     "metrics": dict(metrics),
                     "step": int(step),
                     "prefix": prefix,
+                    "step_finished": step_finished,
                 },
             )
         )
@@ -276,6 +283,7 @@ def test_train_pump_drives_mcore_training_step(
             dp_client,
             partition_id=_PARTITION_ID,
             pad_value_dict={"input_ids": int(tokenizer.pad_token_id or 0)},
+            include_message_violation_fields=False,
         )
         for step in range(train_steps):
             for g in range(num_prompts):
@@ -302,7 +310,10 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         master_config = MasterConfig.model_construct(
-            policy={"train_global_batch_size": train_gbs},
+            policy={
+                "train_global_batch_size": train_gbs,
+                "generation": {"colocated": {"enabled": False}},
+            },
             # _sync_weights gates stale-abort on should_use_nemo_gym(env); empty
             # env -> native path (nemo_gym disabled).
             env={},
@@ -387,6 +398,21 @@ def test_train_pump_drives_mcore_training_step(
             assert math.isfinite(metrics["advantages/mean"])
             assert metrics["evicted_stale_prompt_groups"] == 0
             assert metrics["aborted_stale_inflight_groups"] == 0
+
+        # The final "timing/train" log of each step must carry step_finished=True
+        # (the behavior this restores) so W&B commits the step; the "train" log must not.
+        timing_finished = [
+            p["step_finished"]
+            for kind, p in entries
+            if kind == "metrics" and p["prefix"] == "timing/train"
+        ]
+        train_finished = [
+            p["step_finished"]
+            for kind, p in entries
+            if kind == "metrics" and p["prefix"] == "train"
+        ]
+        assert timing_finished == [True] * train_steps
+        assert train_finished == [False] * train_steps
 
     finally:
         trainer.shutdown()
