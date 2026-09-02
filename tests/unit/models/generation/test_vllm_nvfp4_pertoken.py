@@ -272,6 +272,50 @@ def test_ignored_expert_layer_passes_through_bf16(nvfp4_module):
     assert torch.equal(out[0][1], tensor)
 
 
+def test_boundary_that_matched_no_module_names_is_fatal(nvfp4_module):
+    """A boundary glob that matches nothing must fail, not silently quantize.
+
+    The ignore patterns are module-name globs shaped like ``mlp.experts``.
+    A MoE family that names its container differently (Mixtral's
+    ``block_sparse_moe.experts``, DBRX's ``ffn.experts``) matches nothing, so
+    every boundary layer would be quantized in the rollout while the trainer
+    keeps it BF16 -- a silent train/rollout precision split.
+    """
+    M = nvfp4_module
+    with pytest.raises(RuntimeError, match="BF16 boundary did not match"):
+        M.NvFp4PerTokenQuantizer._verify_boundary(
+            ["*.layers.0.mlp.experts*", "*.layers.3.mlp.experts*"],
+            {0: "model.layers.0.block_sparse_moe.experts"},
+            {},
+        )
+
+
+def test_boundary_verification_is_pipeline_stage_local(nvfp4_module):
+    """A stage that owns none of the boundary layers must still pass."""
+    M = nvfp4_module
+    M.NvFp4PerTokenQuantizer._verify_boundary(
+        ["*.layers.0.mlp.experts*", "*.layers.47.mlp.experts*"],
+        {20: "model.layers.20.mlp.experts", 21: "model.layers.21.mlp.experts"},
+        {},
+    )
+    # And a stage that owns them excludes exactly those.
+    M.NvFp4PerTokenQuantizer._verify_boundary(
+        ["*.layers.0.mlp.experts*", "*.layers.47.mlp.experts*"],
+        {1: "model.layers.1.mlp.experts"},
+        {0: "model.layers.0.mlp.experts"},
+    )
+
+
+def test_boundary_excluding_a_layer_it_should_not_is_fatal(nvfp4_module):
+    M = nvfp4_module
+    with pytest.raises(RuntimeError, match="expected NVFP4"):
+        M.NvFp4PerTokenQuantizer._verify_boundary(
+            ["*.layers.0.mlp.experts*"],
+            {},
+            {0: "model.layers.0.mlp.experts", 7: "model.layers.7.mlp.experts"},
+        )
+
+
 def test_passthrough_clones_off_recycled_source_buffer(nvfp4_module):
     """Cross-batch staleness guard: passthrough tensors must not be IPC-buffer views.
 
@@ -452,7 +496,7 @@ def test_rollout_config_rejects_partial_expert_ignore(nvfp4_module, pattern):
         )
 
 
-def test_boundary_ignores_are_derived_and_legacy_patterns_require_parity(
+def test_boundary_ignores_are_derived_and_supplied_patterns_require_parity(
     nvfp4_module,
 ):
     from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
@@ -473,17 +517,28 @@ def test_boundary_ignores_are_derived_and_legacy_patterns_require_parity(
             first_last_layers_bf16=True,
             num_layers_at_start_in_bf16=2,
             num_layers_at_end_in_bf16=4,
-            legacy_additional_ignore=expected,
+            expected_additional_ignore=expected,
         )
         == expected
     )
-    with pytest.raises(ValueError, match="must exactly match"):
+    with pytest.raises(ValueError, match="does not match"):
         resolve_boundary_ignore_patterns(
             num_hidden_layers=48,
             first_last_layers_bf16=True,
             num_layers_at_start_in_bf16=2,
             num_layers_at_end_in_bf16=4,
-            legacy_additional_ignore=expected[:-1],
+            expected_additional_ignore=expected[:-1],
+        )
+    # An entry point that skipped driver-side normalization reaches the trainer
+    # with an empty value; that must fail rather than silently quantize the
+    # layers the trainer keeps in BF16.
+    with pytest.raises(ValueError, match="did not run for this entry point"):
+        resolve_boundary_ignore_patterns(
+            num_hidden_layers=48,
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=2,
+            num_layers_at_end_in_bf16=4,
+            expected_additional_ignore=[],
         )
 
 
@@ -501,13 +556,13 @@ def test_boundary_ignores_ignore_inactive_mcore_count_defaults(nvfp4_module):
         )
         == []
     )
-    with pytest.raises(ValueError, match="must exactly match"):
+    with pytest.raises(ValueError, match="does not match"):
         resolve_boundary_ignore_patterns(
             num_hidden_layers=48,
             first_last_layers_bf16=False,
             num_layers_at_start_in_bf16=1,
             num_layers_at_end_in_bf16=1,
-            legacy_additional_ignore=["*.layers.0.mlp.experts*"],
+            expected_additional_ignore=["*.layers.0.mlp.experts*"],
         )
 
 
