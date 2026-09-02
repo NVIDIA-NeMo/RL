@@ -62,13 +62,8 @@ UnsupportedNativeRefitTransport = Literal["checkpoint_engine", "sparse_delta"]
 WeightUpdateFinalizer = Callable[[], None]
 
 _GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS = (
-    "embed_vision.",
-    "embed_audio.",
-    "vision_embedder.",
-    "audio_embedder.",
-    "vision_tower.",
-    "audio_tower.",
-    "multi_modal_projector.",
+    "model.embed_vision.",
+    "model.embed_audio.",
 )
 
 
@@ -798,10 +793,7 @@ class VllmInternalWorkerExtension:
             weights = [
                 (key, weight)
                 for key, weight in weights
-                if not any(
-                    marker in key
-                    for marker in _GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS
-                )
+                if not key.startswith(_GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS)
             ]
             num_dropped = num_weights - len(weights)
             if num_dropped:

@@ -24,18 +24,30 @@ from nemo_rl.models.generation.vllm.worker_utils import (
 
 
 @pytest.mark.parametrize(
-    "architecture",
+    ("architectures", "expected"),
     [
-        "Gemma4ForConditionalGeneration",
-        "Gemma4UnifiedForConditionalGeneration",
+        (None, []),
+        ([], []),
+        (["Gemma4ForCausalLM"], []),
+        (
+            ["Gemma4ForConditionalGeneration"],
+            ["Gemma4ForConditionalGeneration"],
+        ),
+        (
+            [
+                "Gemma4ForCausalLM",
+                "Gemma4UnifiedForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
+            ],
+            [
+                "Gemma4UnifiedForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
+            ],
+        ),
     ],
 )
-def test_gemma4_architectures_require_tokenizer_initialization(architecture):
-    assert find_tokenizer_required_architectures([architecture]) == [architecture]
-
-
-def test_causal_lm_does_not_require_tokenizer_initialization():
-    assert find_tokenizer_required_architectures(["Gemma4ForCausalLM"]) == []
+def test_find_tokenizer_required_architectures(architectures, expected):
+    assert find_tokenizer_required_architectures(architectures) == expected
 
 
 @pytest.mark.parametrize(
