@@ -128,14 +128,17 @@ def _patch_runtime(
     monkeypatch.setattr(generation_module, "ManagedDynamoRuntime", FakeRuntime)
 
 
-def _data() -> BatchedDataDict:
-    return BatchedDataDict(
+def _data(*, session_id: str | None = None) -> BatchedDataDict:
+    data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[1, 2, 3, 0]], dtype=torch.long),
             "input_lengths": torch.tensor([3], dtype=torch.long),
             "stop_strings": [["stop"]],
         }
     )
+    if session_id is not None:
+        data["session_ids"] = [session_id]
+    return data
 
 
 def _completion_response(token_ids: list[int]) -> dict[str, Any]:
@@ -181,8 +184,8 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
     _patch_runtime(monkeypatch)
     requests = []
 
-    async def fake_post(url, payload, timeout_s):
-        requests.append((url, payload, timeout_s))
+    async def fake_post(url, payload, timeout_s, **kwargs):
+        requests.append((url, payload, timeout_s, kwargs))
         return _completion_response([8, 9])
 
     monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
@@ -191,7 +194,12 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
         generation.generate(_data())
 
     async def collect():
-        return [item async for item in generation.generate_async(_data())]
+        return [
+            item
+            async for item in generation.generate_async(
+                _data(session_id="trajectory-session")
+            )
+        ]
 
     outputs = asyncio.run(collect())
     assert outputs[0][0] == 0
@@ -200,6 +208,32 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
     assert requests[0][1]["max_tokens"] == 2
     assert requests[0][1]["stop"] == ["stop"]
     assert "return_tokens_as_token_ids" not in requests[0][1]
+    assert requests[0][3]["headers"] == {"X-Dynamo-Session-ID": "trajectory-session"}
+
+
+@pytest.mark.parametrize(
+    ("session_ids", "expected_message"),
+    [
+        ([], "one value for each input sample"),
+        (["a", "b"], "one value for each input sample"),
+        ([""], "must be non-empty strings"),
+        (["   "], "must be non-empty strings"),
+        ([None], "must be non-empty strings"),
+    ],
+)
+def test_async_generation_rejects_invalid_session_ids(
+    monkeypatch, session_ids, expected_message
+) -> None:
+    _patch_runtime(monkeypatch)
+    generation = DynamoGeneration(cluster=object(), config=_config())
+    data = _data()
+    data["session_ids"] = session_ids
+
+    async def collect():
+        return [item async for item in generation.generate_async(data)]
+
+    with pytest.raises(ValueError, match=expected_message):
+        asyncio.run(collect())
 
 
 def test_prompt_at_context_limit_is_rejected(monkeypatch) -> None:
@@ -447,8 +481,8 @@ def test_completion_retry_eventually_succeeds(monkeypatch) -> None:
     )
     calls = []
 
-    async def fake_post(*args):
-        calls.append(args)
+    async def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
         return next(responses)
 
     async def no_sleep(_):
@@ -464,11 +498,16 @@ def test_completion_retry_eventually_succeeds(monkeypatch) -> None:
             greedy=False,
             stop_strings=None,
             max_new_tokens=1,
+            session_id="trajectory-session",
         )
     )
 
     assert token_ids == [8]
     assert len(calls) == 2
+    assert [call[1]["headers"] for call in calls] == [
+        {"X-Dynamo-Session-ID": "trajectory-session"},
+        {"X-Dynamo-Session-ID": "trajectory-session"},
+    ]
 
 
 @pytest.mark.parametrize("status", [400, 503])
@@ -478,7 +517,7 @@ def test_completion_retry_stops_on_nonretryable_or_exhaustion(
     _patch_runtime(monkeypatch)
     calls = []
 
-    async def fake_post(*args):
+    async def fake_post(*args, **kwargs):
         calls.append(args)
         return {"status": "error", "http_status": status}
 
@@ -511,7 +550,7 @@ def test_direct_completions_are_not_limited_by_default_thread_pool(
     all_entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_post(*args):
+    async def fake_post(*args, **kwargs):
         nonlocal entered_count
         entered_count += 1
         if entered_count == request_count:

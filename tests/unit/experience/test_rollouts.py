@@ -18,6 +18,7 @@ import json
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
+from uuid import UUID
 
 import pytest
 import ray
@@ -52,6 +53,7 @@ from nemo_rl.experience.rollout_manager import (
 )
 from nemo_rl.experience.rollouts import (
     _add_multimodal_generation_payload,
+    _create_dynamo_session_id,
     _reattach_original_multimodal_payloads,
     async_generate_response_for_sample_turn,
     generate_responses_async,
@@ -773,6 +775,7 @@ def test_async_vlm_multiturn_drops_stale_native_content(
         max_seq_len,
         greedy=False,
         *,
+        session_id=None,
         sample_multimodal_data=None,
         deduplicate_multimodal_data=False,
     ):
@@ -858,6 +861,49 @@ def test_async_vlm_multiturn_drops_stale_native_content(
 class _DummyDynamoGeneration(_DummySGLangGeneration):
     def __init__(self):
         self.cfg = {"backend": "dynamo"}
+        self.generation_input = None
+
+    async def generate_async(self, data, greedy=False):
+        self.generation_input = data
+        async for item in super().generate_async(data, greedy=greedy):
+            yield item
+
+
+def test_create_dynamo_session_id_mints_a_real_uuid_string() -> None:
+    session_id = _create_dynamo_session_id(_DummyDynamoGeneration())
+
+    assert isinstance(session_id, str)
+    assert UUID(session_id).version == 4
+    assert session_id != _create_dynamo_session_id(_DummyDynamoGeneration())
+    assert _create_dynamo_session_id(_CapturingAsyncVllmGeneration()) is None
+    assert _create_dynamo_session_id(object()) is None
+
+
+def test_direct_session_id_is_added_only_for_dynamo() -> None:
+    message_log = [
+        {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+    ]
+    dynamo_generation = _DummyDynamoGeneration()
+    vllm_generation = _CapturingAsyncVllmGeneration()
+
+    for generation in (dynamo_generation, vllm_generation):
+        asyncio.run(
+            async_generate_response_for_sample_turn(
+                generation,
+                message_log,
+                None,
+                _DummyTokenizer(),
+                max_seq_len=32,
+                session_id="trajectory-session",
+            )
+        )
+
+    assert dynamo_generation.generation_input["session_ids"] == ["trajectory-session"]
+    assert "session_ids" not in vllm_generation.generation_input
 
 
 def test_generate_responses_async_requires_sglang_opt_in():
