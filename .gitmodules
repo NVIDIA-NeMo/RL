@@ -1,7 +1,7 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
 	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-	branch = main
+	branch = super-v3.5-posttraining
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
@@ -11,5 +11,5 @@
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/NVIDIA-NeMo/Gym.git
-	branch = main
+	branch = super-v3.5-posttraining
 	shallow = true

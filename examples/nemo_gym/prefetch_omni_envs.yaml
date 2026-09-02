@@ -31,3 +31,5 @@ env:
       - resources_servers/string_match/configs/string_match.yaml
       - resources_servers/circle_click/configs/circle_click.yaml
       - resources_servers/circle_count/configs/circle_count.yaml
+      - resources_servers/image_tools/configs/image_tools_pivot.yaml
+      - responses_api_agents/image_tools_agent/configs/image_tools_agent.yaml
