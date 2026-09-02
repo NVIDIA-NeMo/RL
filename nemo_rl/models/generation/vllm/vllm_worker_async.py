@@ -329,6 +329,9 @@ class VllmAsyncGenerationWorkerImpl(
             self.generation_tokens = []
 
     async def post_init_async(self):
+        self._engine_loop = asyncio.get_running_loop()
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
