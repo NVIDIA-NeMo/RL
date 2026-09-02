@@ -349,6 +349,50 @@ def test_sequence_packing_basic():
         assert len(problem_ids_seen) == batch_size
 
 
+def test_sequence_packing_materializes_each_shard_once(monkeypatch):
+    """Packed bins should not be copied individually before shard assembly."""
+    sequence_lengths = torch.full((8,), 6)
+    batch_data = BatchedDataDict(
+        {
+            "input_ids": torch.arange(64).reshape(8, 8),
+            "sequence_lengths": sequence_lengths,
+            "problem_ids": torch.arange(8),
+        }
+    )
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=10,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+    )
+
+    selected_indices = []
+    original_select_indices = BatchedDataDict.select_indices
+
+    def tracked_select_indices(self, indices):
+        selected_indices.append(list(indices))
+        return original_select_indices(self, indices)
+
+    monkeypatch.setattr(BatchedDataDict, "select_indices", tracked_select_indices)
+
+    sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
+        shards=2,
+        sequence_packing_args=sequence_packing_args,
+    )
+
+    assert len(selected_indices) == len(sharded_batches) == 2
+    assert all(len(indices) == 4 for indices in selected_indices)
+    assert sorted(index for indices in selected_indices for index in indices) == list(
+        range(8)
+    )
+
+    reconstructed = BatchedDataDict.from_batches(sharded_batches)
+    reconstructed.reorder_data(sorted_indices)
+    assert torch.equal(reconstructed["input_ids"], batch_data["input_ids"])
+    assert torch.equal(reconstructed["problem_ids"], batch_data["problem_ids"])
+
+
 def test_sequence_packing_executes_bins_largest_first():
     """Each shard keeps its assigned bins but executes them largest-first."""
     sequence_lengths = torch.tensor([46, 24, 55, 88, 11, 14, 73, 17])

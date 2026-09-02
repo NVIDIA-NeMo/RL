@@ -101,6 +101,84 @@ def calculate_kl(
     return kl
 
 
+def build_rollout_group_ids(
+    batch_size: int,
+    group_size: int,
+    *,
+    start_group_id: int = 0,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Return an explicit identifier for every rollout's sampling group.
+
+    GRPO baselines are defined over the completions sampled together for one
+    prompt instance. Prompt token IDs are not a valid group identifier for
+    multimodal prompts because different media can have identical text and
+    therefore identical token rows.
+    """
+    if group_size <= 0:
+        raise ValueError(f"group_size must be positive, got {group_size}")
+    if batch_size < 0 or batch_size % group_size != 0:
+        raise ValueError(
+            f"batch_size={batch_size} must be non-negative and divisible by "
+            f"group_size={group_size}"
+        )
+    if start_group_id < 0:
+        raise ValueError(f"start_group_id must be non-negative, got {start_group_id}")
+    num_groups = batch_size // group_size
+    return torch.arange(
+        start_group_id,
+        start_group_id + num_groups,
+        device=device,
+        dtype=torch.long,
+    ).repeat_interleave(group_size)[:, None]
+
+
+def build_rollout_group_ids_from_sample_ids(
+    sample_ids: list[str],
+    *,
+    expected_group_size: int | None = None,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Derive explicit prompt-group IDs from ``{group_id}_g{index}`` sample IDs."""
+    if expected_group_size is not None and expected_group_size <= 0:
+        raise ValueError(
+            f"expected_group_size must be positive, got {expected_group_size}"
+        )
+    group_to_index: dict[str, int] = {}
+    group_to_generation_indices: dict[str, set[int]] = {}
+    group_indices: list[int] = []
+    for sample_id in sample_ids:
+        try:
+            group_id, generation_index = sample_id.rsplit("_g", 1)
+            generation_index = int(generation_index)
+        except (ValueError, TypeError) as error:
+            raise ValueError(
+                "Expected sample ID in '{group_id}_g{generation_index}' format, "
+                f"got {sample_id!r}"
+            ) from error
+        if not group_id:
+            raise ValueError(f"Sample ID has an empty group ID: {sample_id!r}")
+        if generation_index < 0:
+            raise ValueError(
+                f"Sample ID has a negative generation index: {sample_id!r}"
+            )
+        generation_indices = group_to_generation_indices.setdefault(group_id, set())
+        if generation_index in generation_indices:
+            raise ValueError(f"Duplicate generation index in sample ID: {sample_id!r}")
+        generation_indices.add(generation_index)
+        group_indices.append(group_to_index.setdefault(group_id, len(group_to_index)))
+    if expected_group_size is not None:
+        expected_indices = set(range(expected_group_size))
+        for group_id, generation_indices in group_to_generation_indices.items():
+            if generation_indices != expected_indices:
+                raise ValueError(
+                    f"Rollout group {group_id!r} has generation indices "
+                    f"{sorted(generation_indices)}, expected "
+                    f"{list(range(expected_group_size))}"
+                )
+    return torch.tensor(group_indices, device=device, dtype=torch.long)[:, None]
+
+
 def calculate_baseline_and_std_per_prompt(
     prompts: torch.Tensor,
     rewards: torch.Tensor,

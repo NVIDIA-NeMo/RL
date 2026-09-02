@@ -1758,6 +1758,58 @@ def test_initial_refit_completes_before_async_collection_starts(
     assert events[:3] == ["refit", "set_weight_version", "start_collection"]
 
 
+def test_async_initial_buffer_wait_is_included_in_first_step_timing(
+    mock_grpo_components,
+) -> None:
+    """The startup rollout wait is part of step 1, not initialization."""
+    timing_sample_counts = []
+
+    class InspectingTimer(Timer):
+        def get_timing_metrics(self, reduction_op="mean"):
+            timing_sample_counts.append(
+                {label: len(samples) for label, samples in self._timers.items()}
+            )
+            return super().get_timing_metrics(reduction_op)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.env["should_log_nemo_gym_responses"] = True
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            {"mean_gen_tokens_per_sample": 2.0},
+        ),
+        patch("nemo_rl.algorithms.grpo.Timer", InspectingTimer),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    first_step_counts = timing_sample_counts[0]
+    # One startup-wait sample plus the regular optimizer-step context.
+    assert first_step_counts["total_step_time"] == 2
+    # Startup wait + replay sample coordination + pre-refit collector wait.
+    assert first_step_counts["exposed_generation"] == 3
+
+
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:
     master_config = mock_grpo_components["master_config"]
     master_config.policy["generation"]["backend"] = "dynamo"
@@ -2295,6 +2347,7 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
 
     repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
     repeated_batch["total_reward"] = torch.tensor([1.0, 0.0, 0.5])  # Non-zero std
+    repeated_batch["rollout_group_ids"] = torch.zeros((batch_size, 1), dtype=torch.long)
 
     prompts = torch.tensor(
         [
@@ -2334,12 +2387,15 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     assert batch_cache is not None
     assert batch_cache == result_batch
 
-    # Run dynamic sampling again with the cached batch
+    # Run dynamic sampling again with a separately namespaced rollout group.
+    next_batch = create_mock_batch(batch_size, task_names, message_logs)
+    next_batch["total_reward"] = torch.tensor([1.0, 0.0, 0.5])
+    next_batch["rollout_group_ids"] = torch.ones((batch_size, 1), dtype=torch.long)
     result_batch, is_batch_complete, batch_cache, _ = dynamic_sampling(
-        repeated_batch,
+        next_batch,
         std,
         baseline,
-        dynamic_sampling_num_gen_batches,
+        dynamic_sampling_num_gen_batches + 1,
         master_config,
         timer,
         batch_cache,
@@ -2351,6 +2407,10 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     )  # All samples from the single prompt with non-zero std
     assert is_batch_complete == True
     assert batch_cache is not None
+    assert torch.equal(
+        result_batch["rollout_group_ids"],
+        torch.tensor([[0], [0], [0], [1], [1], [1]]),
+    )
 
 
 def test_dapo_cache_aligns_deduplicated_media_with_text_only_batch(
@@ -2782,7 +2842,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     synchronizer = MagicMock()
     nemo_gym_actor = object()
     spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)
-    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
+    dummy_logger = MagicMock()
+    dummy_logger.base_log_dir = "/tmp/grpo-test-results"
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: dummy_logger)
     monkeypatch.setattr(
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
     )
@@ -2819,6 +2881,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert inference_cluster.kwargs["node_resource_constraints"] is None
     assert result[1].dp_openai_server_base_urls == ["http://dynamo-wrapper.example/v1"]
     assert result[2] is nemo_gym_actor
+    assert master_config.env["nemo_gym"]["nemo_gym_log_dir"] == (
+        "/tmp/grpo-test-results/nemo_gym"
+    )
     dynamo_config = dynamo_init.call_args.kwargs["config"]
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
@@ -2943,6 +3008,8 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
@@ -3092,6 +3159,8 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
@@ -3533,8 +3602,8 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
     policy_generation.finish_generation.side_effect = lambda *a, **k: events.append(
         ("finish_generation", k.get("release_gpu", True))
     )
-    policy_generation.prepare_for_generation.side_effect = (
-        lambda *a, **k: events.append("wake_engine")
+    policy_generation.prepare_for_generation.side_effect = lambda *a, **k: (
+        events.append("wake_engine")
     )
     policy.offload_before_refit.side_effect = lambda *a, **k: events.append(
         "offload_before_refit"

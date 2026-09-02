@@ -57,6 +57,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    build_rollout_group_ids,
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
@@ -557,6 +558,7 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
+    enable_nemo_gym = should_use_nemo_gym(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -599,6 +601,10 @@ def setup(
     #         Logger
     # ==========================
     logger = Logger(logger_config)
+    if enable_nemo_gym:
+        env_configs.setdefault("nemo_gym", {})["nemo_gym_log_dir"] = os.path.join(
+            logger.base_log_dir, "nemo_gym"
+        )
     logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
@@ -787,7 +793,6 @@ def setup(
 
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
-    enable_nemo_gym = should_use_nemo_gym(master_config)
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
@@ -2862,6 +2867,7 @@ def grpo_train(
         batch_cache: BatchedDataDict[DatumSpec] = None
         # This is the number of batches we processed so far at each step to generate responses whose std is non-zero. Maximum threshold is set by dynamic_sampling_max_gen_batches. Used in the case of dynamic sampling.
         dynamic_sampling_num_gen_batches = 0
+        next_rollout_group_id = 0
 
         # Run grpo/dapo training loop (single-turn)
         for batch in wrapped_dataloader:
@@ -2915,12 +2921,6 @@ def grpo_train(
                             enabled=master_config.grpo.debug_payload_metrics,
                         )
                     )
-                    # Convert LLMMessageLogType to FlatMessagesType for generation
-                    batched_flat, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    input_ids = batched_flat["token_ids"]
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 memory_tracker.snapshot_start_of_stage("Generation", dir())
@@ -3027,7 +3027,6 @@ def grpo_train(
                                 master_config.grpo.debug_payload_metrics
                             ),
                         )
-                        input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
@@ -3107,12 +3106,25 @@ def grpo_train(
                         and "unshaped_total_reward" in repeated_batch
                         else None
                     )
+                    reward_group_ids = build_rollout_group_ids(
+                        repeated_batch.size,
+                        master_config.grpo.num_generations_per_prompt,
+                        start_group_id=next_rollout_group_id,
+                    )
+                    next_rollout_group_id += (
+                        repeated_batch.size
+                        // master_config.grpo.num_generations_per_prompt
+                    )
+                    # Dynamic sampling may cache and concatenate survivors from
+                    # multiple generation batches. Carry the explicit identity
+                    # through those transformations instead of rebuilding it.
+                    repeated_batch["rollout_group_ids"] = reward_group_ids
                     if master_config.grpo.calculate_advantages_on_gpu:
                         print("Computing advantages on GPU!")
                         # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            reward_group_ids.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
@@ -3126,7 +3138,7 @@ def grpo_train(
                         std = std.cpu()
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            reward_group_ids,
                             rewards,
                             torch.ones_like(rewards),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
@@ -3169,24 +3181,12 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
+                    # Backfill before flattening the full rollout for training.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
 
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
-                    del input_ids
+                    # Use the sampling group itself as the GRPO identity. Distinct
+                    # media-conditioned prompts can have identical text tokens.
+                    prompt_ids_for_adv = repeated_batch.pop("rollout_group_ids")
                     del baseline
                     del std
 
@@ -3818,6 +3818,7 @@ def grpo_train(
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
+            next_rollout_group_id = 0
 
             # Clear mem
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
@@ -4457,6 +4458,7 @@ def async_grpo_train(
         f"max_generation_failures={max_generation_failures}"
     )
 
+    timer.start("init/total")
     print("⏳ Preparing policy generation for training...", flush=True)
     if POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...", flush=True)
@@ -4573,7 +4575,12 @@ def async_grpo_train(
     print(
         f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
-    timer.start("init/total")
+    # Initial rollout collection belongs to the first optimizer step.  Record
+    # it as a first timing sample; the regular per-step contexts append their
+    # samples below and get_timing_metrics(sum) combines both before logging.
+    timer.stop("init/total")
+    timer.start("total_step_time")
+    timer.start("exposed_generation")
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -4652,7 +4659,8 @@ def async_grpo_train(
         wait_iterations += 1
         time.sleep(1.0)
 
-    timer.stop("init/total")
+    timer.stop("exposed_generation")
+    timer.stop("total_step_time")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
@@ -4855,24 +4863,14 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
+                    # Backfill before flattening the full rollout for training.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
-
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
+                    # Each replay entry is one complete prompt group and the
+                    # concatenation above preserves group-contiguous ordering.
+                    prompt_ids_for_adv = build_rollout_group_ids(
+                        repeated_batch.size,
+                        master_config.grpo.num_generations_per_prompt,
                     )
-
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
 
