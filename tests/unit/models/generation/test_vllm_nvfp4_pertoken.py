@@ -319,7 +319,16 @@ def test_unreadable_boundary_pattern_is_rejected(nvfp4_module):
         boundary_layer_indices,
     )
 
-    assert boundary_layer_indices(["*.layers.7.mlp.experts*"]) == {7}
+    # vLLM rewrites each `module_path*` entry into `module_path` plus
+    # `module_path.*` before storing it (its workaround for vllm#28072), so the
+    # runtime list holds forms this module never wrote. All must read back.
+    assert boundary_layer_indices(
+        [
+            "*.layers.7.mlp.experts*",
+            "*.layers.7.mlp.experts",
+            "*.layers.7.mlp.experts.*",
+        ]
+    ) == {7}
     with pytest.raises(ValueError, match="cannot read a layer index"):
         boundary_layer_indices(["*.mlp.experts*"])
 

@@ -37,14 +37,22 @@ _MODULE_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
 def boundary_layer_indices(patterns: Iterable[str]) -> set[int]:
-    """Recover the decoder-layer indices encoded in boundary ignore patterns."""
+    """Recover the decoder-layer indices encoded in boundary ignore patterns.
+
+    Read the index rather than requiring the shape this module emits: vLLM
+    rewrites each ``module_path*`` entry into ``module_path`` plus
+    ``module_path.*`` before storing it on the quant config (its workaround for
+    vllm-project/vllm#28072), so the runtime list no longer matches the pattern
+    that was written. The exact user-facing shape is enforced separately by
+    ``_require_full_expert_layer_ignores``.
+    """
     indices: set[int] = set()
     for pattern in patterns:
-        match = _FULL_EXPERT_LAYER_IGNORE_RE.fullmatch(pattern)
+        match = _MODULE_LAYER_INDEX_RE.search(pattern)
         if match is None:
             raise ValueError(
-                "NVFP4 boundary verification requires complete expert-layer "
-                f"ignore patterns; cannot read a layer index from {pattern!r}"
+                "NVFP4 boundary verification requires expert-layer ignore "
+                f"patterns; cannot read a layer index from {pattern!r}"
             )
         indices.add(int(match.group(1)))
     return indices
