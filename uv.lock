@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 4
 requires-python = ">=3.13.14, <3.14"
 resolution-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
@@ -119,7 +119,7 @@ overrides = [
     { name = "numpy", specifier = ">=2.1.0" },
     { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.5.1.27" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
-    { name = "nvidia-cudnn-frontend", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.25.0" },
+    { name = "nvidia-cudnn-frontend", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.26.0" },
     { name = "nvidia-modelopt", extras = ["torch"], git = "https://github.com/NVIDIA/Model-Optimizer?rev=c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" },
     { name = "nvidia-nccl-cu13", specifier = "==2.30.7" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform != 'darwin'", specifier = ">=3.6.5" },
@@ -131,7 +131,7 @@ overrides = [
     { name = "timm", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.15" },
+    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=27486e03cfc1fa41f6932dcecdc47c71c47eac3e" },
     { name = "xgrammar", specifier = ">=0.2.1,<1.0.0" },
 ]
 excludes = ["nvidia-cutlass-dsl-libs-base"]
@@ -204,12 +204,13 @@ version = "10.16.1.11"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.15.0+42b8400"
-requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
+version = "2.18.0+27486e03"
+requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect", "nvidia-cudnn-frontend>=1.25.0"]
+provides-extras = ["core-cu13", "pytorch"]
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.15.0+42b8400"
+version = "2.18.0+27486e03"
 requires-dist = ["torch", "transformer-engine"]
 
 [[package]]
@@ -1818,15 +1819,6 @@ wheels = [
     { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl", hash = "sha256:9fdfbdf2d4ca984ffa34518a4054c62c295fa06e184d7a233848dc06be8f1ec2" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "einops" },
-    { name = "ninja" },
-    { name = "psutil" },
-    { name = "setuptools" },
-    { name = "torch" },
-]
-
 [[package]]
 name = "flash-attn"
 version = "2.8.1+cu13torch2.10cxx11abitrue"
@@ -1843,15 +1835,6 @@ dependencies = [
 ]
 wheels = [
     { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl", hash = "sha256:a14fea157eb61dfee56f605a24a7a6150704517759125b3942dd04bffa05d6cf" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "einops" },
-    { name = "ninja" },
-    { name = "psutil" },
-    { name = "setuptools" },
-    { name = "torch" },
 ]
 
 [[package]]
@@ -3405,93 +3388,6 @@ te = [
     { name = "megatron-core", extra = ["te"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-vllm' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-8-nemo-gym-vllm')" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "accelerate" },
-    { name = "causal-conv1d", marker = "extra == 'ssm'" },
-    { name = "comet-ml", specifier = ">=3.50.0" },
-    { name = "datasets", specifier = ">=2.20.0" },
-    { name = "diffusers", specifier = ">=0.36.0" },
-    { name = "einops" },
-    { name = "fast-hadamard-transform", specifier = ">=1.1.0" },
-    { name = "flash-linear-attention" },
-    { name = "flashinfer-cubin", specifier = "==0.6.8.post1" },
-    { name = "flashinfer-python", specifier = "==0.6.8.post1" },
-    { name = "hydra-core", specifier = ">1.3,<=1.3.2" },
-    { name = "librosa", marker = "extra == 'audio'" },
-    { name = "mamba-ssm", marker = "extra == 'ssm'" },
-    { name = "megatron-core", extras = ["dev", "mlm"], editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" },
-    { name = "megatron-core", extras = ["te"], marker = "extra == 'te'", editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" },
-    { name = "mistral-common", specifier = ">=1.10.0" },
-    { name = "mlflow", specifier = ">=3.15.1" },
-    { name = "nemo-run", marker = "extra == 'recipes'" },
-    { name = "nvdlfw-inspect", marker = "extra == 'tensor-inspect'", specifier = "==0.2.1" },
-    { name = "nvidia-resiliency-ext" },
-    { name = "omegaconf", specifier = ">=2.3.0" },
-    { name = "open-clip-torch", specifier = ">=3.2.0" },
-    { name = "peft", specifier = ">=0.18.0" },
-    { name = "peft", specifier = ">=0.18.1" },
-    { name = "pyarrow", marker = "extra == 'parquet'", specifier = ">=14.0.0" },
-    { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "qwen-vl-utils" },
-    { name = "regex", specifier = ">=2024.11.6" },
-    { name = "rich" },
-    { name = "six", specifier = ">=1.17.0" },
-    { name = "tensorboard", specifier = ">=2.19.0" },
-    { name = "tilelang", marker = "extra == 'ssm'", specifier = ">=0.1.9" },
-    { name = "timm" },
-    { name = "torch", specifier = ">=2.6.0" },
-    { name = "tqdm", specifier = ">=4.67.1" },
-    { name = "transformers", specifier = ">=5.8,<=5.12.1" },
-    { name = "typing-extensions" },
-    { name = "wandb", specifier = ">=0.25.0" },
-]
-provides-extras = ["recipes", "parquet", "tensor-inspect", "te", "ssm", "audio"]
-
-[package.metadata.requires-dev]
-build = [
-    { name = "cython", specifier = ">=3.0.0" },
-    { name = "ninja" },
-    { name = "numpy" },
-    { name = "nvidia-cudnn-frontend", specifier = ">=1.25.0" },
-    { name = "nvidia-mathdx" },
-    { name = "pybind11" },
-    { name = "setuptools" },
-    { name = "torch" },
-]
-dev = [
-    { name = "mypy", specifier = ">=1.8.0" },
-    { name = "pre-commit", specifier = ">=3.6.0" },
-    { name = "ruff", specifier = ">=0.9.9" },
-]
-diffusion = [
-    { name = "av" },
-    { name = "imageio" },
-    { name = "imageio-ffmpeg" },
-]
-docs = [
-    { name = "myst-parser", specifier = ">=4.0.1" },
-    { name = "nvidia-sphinx-theme", specifier = ">=0.0.8" },
-    { name = "sphinx", specifier = ">=8.1.3" },
-    { name = "sphinx-autobuild", specifier = ">=2024.10.3" },
-    { name = "sphinx-autodoc2", specifier = ">=0.5.0" },
-    { name = "sphinx-copybutton", specifier = ">=0.5.2" },
-    { name = "sphinxcontrib-mermaid" },
-]
-no-pypi-wheels = [{ name = "flash-mla", git = "https://github.com/deepseek-ai/FlashMLA?rev=nv_dev" }]
-test = [
-    { name = "click" },
-    { name = "coverage", specifier = ">=7.8.1" },
-    { name = "flake8", specifier = ">=7.2.0" },
-    { name = "pygithub" },
-    { name = "pylint", specifier = ">=3.3.7" },
-    { name = "pytest", specifier = ">=8.3.5" },
-    { name = "pytest-mock", specifier = ">=3.14.0" },
-    { name = "pytest-runner", specifier = ">=6.0.1" },
-    { name = "pytest-shard", specifier = ">=0.1.2" },
-    { name = "pytest-timeout", specifier = ">=2.4.0" },
-]
-
 [[package]]
 name = "megatron-core"
 source = { editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" }
@@ -3540,114 +3436,6 @@ mlm = [
 ]
 te = [
     { name = "transformer-engine", marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-vllm' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-8-nemo-gym-vllm')" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", marker = "extra == 'mlm'" },
-    { name = "accelerate", marker = "extra == 'training'" },
-    { name = "av", marker = "extra == 'dev'" },
-    { name = "causal-conv1d", marker = "extra == 'ssm'", specifier = "~=1.5" },
-    { name = "datasets", marker = "extra == 'dev'" },
-    { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
-    { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
-    { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
-    { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
-    { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
-    { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.5.0,<0.7.0" },
-    { name = "flask-restful", marker = "extra == 'mlm'" },
-    { name = "flask-restful", marker = "extra == 'training'" },
-    { name = "gigatoken", marker = "extra == 'mlm'" },
-    { name = "gigatoken", marker = "extra == 'training'" },
-    { name = "hypercorn", marker = "extra == 'dev'" },
-    { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" },
-    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
-    { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
-    { name = "nemo-lens", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
-    { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'otel'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
-    { name = "numpy" },
-    { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.26.0" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.44" },
-    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.6.0" },
-    { name = "omegaconf", marker = "extra == 'mlm'" },
-    { name = "omegaconf", marker = "extra == 'training'" },
-    { name = "onnxscript", marker = "extra == 'dev'" },
-    { name = "openai", extras = ["aiohttp"], marker = "extra == 'dev'" },
-    { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.33.1,<2" },
-    { name = "orjson", marker = "extra == 'dev'" },
-    { name = "packaging", specifier = ">=24.2" },
-    { name = "pillow", marker = "extra == 'dev'" },
-    { name = "quart", marker = "extra == 'dev'" },
-    { name = "sentencepiece", marker = "extra == 'mlm'" },
-    { name = "sentencepiece", marker = "extra == 'training'" },
-    { name = "tensorstore", marker = "extra == 'dev'", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
-    { name = "tiktoken", marker = "extra == 'mlm'" },
-    { name = "tiktoken", marker = "extra == 'training'" },
-    { name = "torch", specifier = ">=2.6.0" },
-    { name = "torch-memory-saver", marker = "extra == 'dev'", git = "https://github.com/fzyzcjy/torch_memory_saver.git?rev=9bc9a442e6d108c7b7903def199896a005143aaf" },
-    { name = "tqdm", marker = "extra == 'dev'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=4329ff84bfbdaa778a33cba02a15fb0807c64689" },
-    { name = "transformers", marker = "extra == 'mlm'" },
-    { name = "transformers", marker = "extra == 'training'" },
-    { name = "wandb", marker = "extra == 'mlm'" },
-    { name = "wandb", marker = "extra == 'training'" },
-    { name = "wget", marker = "extra == 'dev'" },
-    { name = "zstandard", marker = "extra == 'dev'" },
-]
-provides-extras = ["training", "mlm", "dev", "otel", "lts", "te", "ssm"]
-
-[package.metadata.requires-dev]
-batch-invariant = [{ name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=714dd1a4a980f7937a74343d19a8eba4fe321480" }]
-build = [
-    { name = "cython", specifier = ">=3.0.0" },
-    { name = "hatchling" },
-    { name = "nvidia-cudnn-frontend", specifier = ">=1.25.0" },
-    { name = "nvidia-mathdx" },
-    { name = "packaging", specifier = ">=24.2" },
-    { name = "pybind11" },
-    { name = "setuptools", specifier = ">=80" },
-    { name = "torch" },
-]
-ci = [
-    { name = "pandas" },
-    { name = "python-gitlab" },
-    { name = "slack-sdk" },
-]
-docs = [
-    { name = "myst-parser" },
-    { name = "nvidia-sphinx-theme" },
-    { name = "sphinx" },
-    { name = "sphinx-autobuild" },
-    { name = "sphinx-autodoc2" },
-    { name = "sphinx-copybutton" },
-]
-linting = [
-    { name = "black", specifier = "==26.3.0" },
-    { name = "flake8", specifier = "==7.1.0" },
-    { name = "isort", specifier = "==5.13.2" },
-    { name = "pylint", specifier = "==3.2.6" },
-    { name = "ruff", specifier = "~=0.9.0" },
-]
-no-pypi-wheels = [
-    { name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=714dd1a4a980f7937a74343d19a8eba4fe321480" },
-    { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
-    { name = "flash-mla", git = "https://github.com/deepseek-ai/FlashMLA?rev=nv_dev" },
-]
-test = [
-    { name = "coverage" },
-    { name = "mock" },
-    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=e3935393a290aed1822af52139b4b8ee270fed1f" },
-    { name = "nltk" },
-    { name = "pydantic" },
-    { name = "pygithub" },
-    { name = "pytest", specifier = "==9.1.1" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-mock" },
-    { name = "pytest-random-order" },
-    { name = "pyyaml" },
-    { name = "tensorboard" },
-    { name = "wrapt" },
 ]
 
 [[package]]
@@ -4092,126 +3880,6 @@ moe = [
     { name = "transformer-engine", marker = "extra == 'extra-7-nemo-rl-automodel' or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-vllm' and extra == 'extra-8-nemo-gym-vllm')" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "albumentations", marker = "extra == 'vlm-media'" },
-    { name = "apache-tvm-ffi", marker = "extra == 'cuda'", specifier = "<=0.1.11" },
-    { name = "av", marker = "extra == 'diffusion-media'" },
-    { name = "backoff", marker = "extra == 'vlm'" },
-    { name = "bitsandbytes", marker = "extra == 'cuda-source'" },
-    { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },
-    { name = "causal-conv1d", marker = "extra == 'cuda'" },
-    { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=4.4.0" },
-    { name = "datasets", specifier = ">=4.0.0" },
-    { name = "decord", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm-media'" },
-    { name = "deep-ep", marker = "extra == 'moe'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca" },
-    { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
-    { name = "diffusers", marker = "extra == 'diffusion'", specifier = ">=0.39.0" },
-    { name = "ffpa-attn", marker = "extra == 'ffpa'", specifier = ">=0.2.2" },
-    { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
-    { name = "flash-linear-attention", marker = "extra == 'fla'", specifier = ">=0.4.2" },
-    { name = "flashoptim", specifier = ">=0.1.3" },
-    { name = "ftfy", marker = "extra == 'diffusion'" },
-    { name = "imageio", marker = "extra == 'diffusion'" },
-    { name = "imageio-ffmpeg", marker = "extra == 'diffusion-media'" },
-    { name = "kernels", marker = "extra == 'diffusion-kernels'" },
-    { name = "mamba-ssm", marker = "extra == 'cuda'" },
-    { name = "megatron-fsdp", git = "https://github.com/yuhezhang-ai/Megatron-LM.git?subdirectory=megatron%2Fcore%2Fdistributed%2Ffsdp%2Fsrc&rev=455389c480af6b3acdca74c7830c68b3274eb083" },
-    { name = "mistral-common", marker = "extra == 'vlm'", specifier = ">=1.11.0" },
-    { name = "mistral-common", extras = ["audio", "hf-hub", "sentencepiece"] },
-    { name = "mlflow" },
-    { name = "multi-storage-client", marker = "extra == 'msc'", specifier = ">=0.13" },
-    { name = "nemo-automodel", extras = ["cli"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'moe'" },
-    { name = "nemo-automodel", extras = ["delta-databricks"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["diffusion"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["diffusion"], marker = "extra == 'diffusion-kernels'" },
-    { name = "nemo-automodel", extras = ["diffusion-media"], marker = "extra == 'media'" },
-    { name = "nemo-automodel", extras = ["extra"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'moe'" },
-    { name = "nemo-automodel", extras = ["s3"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["vlm-media"], marker = "extra == 'media'" },
-    { name = "nemo-run", marker = "extra == 'cli'" },
-    { name = "numba", marker = "extra == 'vlm'" },
-    { name = "numpy", marker = "extra == 'vlm'" },
-    { name = "nv-grouped-gemm", marker = "extra == 'cuda'" },
-    { name = "nvidia-cutlass-dsl", marker = "extra == 'ffpa'", specifier = "==4.6.0" },
-    { name = "onnxscript", marker = "extra == 'cuda'", specifier = ">=0.5.6" },
-    { name = "open-clip-torch", marker = "extra == 'vlm'" },
-    { name = "opencv-python-headless", marker = "extra == 'diffusion-media'", specifier = "==4.10.0.84" },
-    { name = "opencv-python-headless", marker = "extra == 'vlm-media'", specifier = "==4.10.0.84" },
-    { name = "perceptron", marker = "extra == 'extra'" },
-    { name = "pillow", marker = "extra == 'vlm'" },
-    { name = "pybind11" },
-    { name = "pyyaml" },
-    { name = "pyyaml", marker = "extra == 'cli'" },
-    { name = "quack-kernels", marker = "sys_platform == 'linux'", specifier = "==0.6.1" },
-    { name = "qwen-omni-utils", marker = "extra == 'vlm-media'" },
-    { name = "qwen-vl-utils", marker = "extra == 'vlm-media'" },
-    { name = "sentencepiece", marker = "extra == 'extra'" },
-    { name = "soundfile", marker = "extra == 'vlm'" },
-    { name = "tiktoken" },
-    { name = "tile-kernels", marker = "extra == 'cuda'", specifier = "==1.0.0" },
-    { name = "tilelang", marker = "extra == 'cuda'", specifier = ">=0.1.11" },
-    { name = "timm", marker = "extra == 'vlm'", specifier = "<=1.0.22" },
-    { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.6.0", index = "https://pypi.org/simple" },
-    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao" },
-    { name = "torchdata" },
-    { name = "torchvision", marker = "sys_platform == 'darwin' and extra == 'diffusion'", index = "https://pypi.org/simple" },
-    { name = "torchvision", marker = "sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = ">=2.14.1" },
-    { name = "transformers", specifier = "==5.12.1" },
-    { name = "wandb", specifier = ">=0.28.0" },
-]
-provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "ffpa", "fla", "delta-databricks", "moe", "vlm", "cli", "s3", "msc", "vlm-media", "diffusion-media", "media", "all"]
-
-[package.metadata.requires-dev]
-build = [
-    { name = "packaging" },
-    { name = "psutil" },
-    { name = "setuptools" },
-    { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = "<=2.10.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.10.0", index = "https://pypi.org/simple" },
-    { name = "torch", marker = "sys_platform == 'linux'", specifier = "<=2.10.0", index = "https://download.pytorch.org/whl/cu130" },
-]
-dev = [
-    { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" },
-    { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/microsoft/dion.git" },
-    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" },
-]
-docs = [
-    { name = "myst-parser" },
-    { name = "nvidia-sphinx-theme" },
-    { name = "sphinx" },
-    { name = "sphinx-autobuild" },
-    { name = "sphinx-autodoc2" },
-    { name = "sphinx-copybutton" },
-    { name = "sphinx-design" },
-]
-linting = [
-    { name = "bandit", specifier = "~=1.9.0" },
-    { name = "import-linter", specifier = "~=2.4" },
-    { name = "pre-commit", specifier = ">=4.2.0" },
-    { name = "ruff", specifier = "~=0.9.0" },
-    { name = "ty", specifier = ">=0.0.20" },
-]
-magi = [{ name = "magi-attention", git = "https://github.com/SandAI-org/MagiAttention.git?rev=d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }]
-test = [
-    { name = "coverage" },
-    { name = "onnxruntime-gpu", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-13/pypi/simple/" },
-    { name = "peft", specifier = ">=0.18.1" },
-    { name = "pytest" },
-    { name = "pytest-shard" },
-    { name = "ruamel-yaml" },
-    { name = "sentence-transformers", specifier = ">=5.6.0" },
-]
-
 [[package]]
 name = "nemo-gym"
 source = { editable = "3rdparty/Gym-workspace/Gym" }
@@ -4301,70 +3969,6 @@ vllm = [
 codec = [
     { name = "torchaudio" },
     { name = "torchvision" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.14.1" },
-    { name = "anthropic", specifier = "<=0.109.2" },
-    { name = "boto3", marker = "extra == 'sandbox'", specifier = ">=1.34" },
-    { name = "coverage", extras = ["toml"], marker = "extra == 'dev'" },
-    { name = "datasets" },
-    { name = "daytona", marker = "extra == 'sandbox'", specifier = ">=0.179.0" },
-    { name = "defusedxml", marker = "extra == 'dev'", specifier = ">=0.7.1" },
-    { name = "devtools" },
-    { name = "fastapi" },
-    { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.6.12" },
-    { name = "fonttools", specifier = ">=4.60.2" },
-    { name = "gitpython", specifier = ">=3.1.57" },
-    { name = "gprof2dot", marker = "extra == 'dev'" },
-    { name = "httpx-aiohttp", marker = "extra == 'sandbox'", specifier = ">=0.2.0" },
-    { name = "hydra-core" },
-    { name = "itsdangerous" },
-    { name = "mcp", specifier = ">=1.28.1,<2" },
-    { name = "mlflow", specifier = ">=3.15.1" },
-    { name = "mlflow-skinny", specifier = ">=3.15.1" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
-    { name = "nemo-gym", extras = ["dev", "sandbox"], marker = "extra == 'all'", editable = "3rdparty/Gym-workspace/Gym" },
-    { name = "omegaconf" },
-    { name = "openai", specifier = "<=2.7.2" },
-    { name = "opensandbox", marker = "extra == 'sandbox'", specifier = ">=0.1.15" },
-    { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.92,<0.1" },
-    { name = "orjson" },
-    { name = "packaging", specifier = ">=24.2" },
-    { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6.0" },
-    { name = "psutil" },
-    { name = "pyarrow", specifier = ">=23.0.1" },
-    { name = "pyasn1", specifier = ">=0.6.4" },
-    { name = "pydantic" },
-    { name = "pydantic-core" },
-    { name = "pydot" },
-    { name = "pytest", marker = "extra == 'dev'" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'" },
-    { name = "pytest-cov", marker = "extra == 'dev'" },
-    { name = "pytest-xdist", marker = "extra == 'dev'" },
-    { name = "python-multipart", specifier = ">=0.0.22" },
-    { name = "ray", extras = ["default"], specifier = ">=2.56.1" },
-    { name = "requests-mock", marker = "extra == 'dev'" },
-    { name = "rich" },
-    { name = "ruff", marker = "extra == 'dev'" },
-    { name = "tenacity", marker = "extra == 'sandbox'", specifier = ">=9.1.4" },
-    { name = "tqdm" },
-    { name = "urllib3", specifier = ">=2.7.0" },
-    { name = "uvicorn" },
-    { name = "uvloop" },
-    { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.24.0" },
-    { name = "wandb" },
-    { name = "yappi", specifier = ">=1.7.6" },
-]
-provides-extras = ["all", "vllm", "sandbox", "openshell", "dev"]
-
-[package.metadata.requires-dev]
-codec = [
-    { name = "opencv-python-headless" },
-    { name = "torchaudio" },
-    { name = "torchvision", marker = "sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchvision", marker = "sys_platform == 'darwin'", index = "https://pypi.org/simple" },
 ]
 
 [[package]]
@@ -4560,167 +4164,6 @@ test = [
     { name = "pytest-timeout" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", specifier = ">=0.26" },
-    { name = "awscrt", specifier = ">=0.35.0" },
-    { name = "blobfile" },
-    { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" },
-    { name = "causal-conv1d", marker = "extra == 'fsdp'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" },
-    { name = "causal-conv1d", marker = "extra == 'mcore'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" },
-    { name = "colored", specifier = "==2.2.3" },
-    { name = "cuda-bindings", marker = "sys_platform != 'darwin'" },
-    { name = "cuda-python", marker = "extra == 'vllm'" },
-    { name = "cupy-cuda13x", marker = "extra == 'mcore'" },
-    { name = "datasets", specifier = ">=4.0.0" },
-    { name = "debugpy" },
-    { name = "deep-ep", marker = "extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=17cfb817bccec3a9c247013360cc550c2bac441e" },
-    { name = "deep-ep", marker = "extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=17cfb817bccec3a9c247013360cc550c2bac441e" },
-    { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=17cfb817bccec3a9c247013360cc550c2bac441e" },
-    { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=67fc64863d43521080bf2005e6528d0fceee9510" },
-    { name = "fastokens", specifier = ">=0.2.0" },
-    { name = "flash-attn", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'automodel'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl" },
-    { name = "flash-attn", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'fsdp'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl" },
-    { name = "flash-attn", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl" },
-    { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'automodel'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" },
-    { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'fsdp'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" },
-    { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" },
-    { name = "flash-attn", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'automodel') or (sys_platform != 'linux' and extra == 'automodel')", specifier = "==2.8.1" },
-    { name = "flash-attn", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'fsdp') or (sys_platform != 'linux' and extra == 'fsdp')", specifier = "==2.8.1" },
-    { name = "flash-attn", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'mcore') or (sys_platform != 'linux' and extra == 'mcore')", specifier = "==2.8.1" },
-    { name = "flash-mla", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", git = "https://github.com/deepseek-ai/FlashMLA?rev=b7643bd54521f563b839b98289b5cd048c062ba2" },
-    { name = "flashinfer-cubin", marker = "extra == 'mcore'", specifier = "==0.6.8.post1" },
-    { name = "flashinfer-cubin", marker = "extra == 'sglang'", specifier = "==0.6.14", index = "https://flashinfer.ai/whl", conflict = { package = "nemo-rl", extra = "sglang" } },
-    { name = "flashinfer-cubin", marker = "extra == 'vllm'", specifier = "==0.6.13" },
-    { name = "flashinfer-jit-cache", marker = "extra == 'mcore'", specifier = "==0.6.8.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache", marker = "extra == 'sglang'", specifier = "==0.6.14", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache", marker = "extra == 'vllm'", specifier = "==0.6.13", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-python", marker = "extra == 'mcore'", specifier = "==0.6.8.post1" },
-    { name = "flashinfer-python", marker = "extra == 'sglang'", specifier = "==0.6.14" },
-    { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.6.13" },
-    { name = "hydra-core" },
-    { name = "kernels", marker = "extra == 'sglang'", specifier = ">=0.14.1,<0.15" },
-    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" },
-    { name = "mamba-ssm", marker = "extra == 'fsdp'", git = "https://github.com/state-spaces/mamba.git?rev=a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" },
-    { name = "mamba-ssm", marker = "extra == 'mcore'", git = "https://github.com/state-spaces/mamba.git?rev=a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" },
-    { name = "math-verify" },
-    { name = "matplotlib" },
-    { name = "megatron-bridge", extras = ["ssm", "te"], marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge" },
-    { name = "mistral-common", marker = "extra == 'automodel'", specifier = ">=1.11.0" },
-    { name = "mlflow", specifier = ">=3.13.0" },
-    { name = "mooncake-transfer-engine-cuda13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==0.3.11.post1" },
-    { name = "nccl4py", marker = "sys_platform != 'darwin'" },
-    { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
-    { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
-    { name = "nemo-lens", extras = ["sdk"], git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
-    { name = "ninja" },
-    { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.3.0" },
-    { name = "num2words", specifier = ">=0.5.14" },
-    { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
-    { name = "numpy" },
-    { name = "nv-grouped-gemm", marker = "extra == 'automodel'", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
-    { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = "==4.5.2" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'vllm'", specifier = "==4.5.2" },
-    { name = "nvidia-ml-py" },
-    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" },
-    { name = "nvidia-nvshmem-cu13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=3.6.5" },
-    { name = "nvidia-resiliency-ext", marker = "extra == 'nvrx'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?tag=v0.6.0" },
-    { name = "nvshmem4py-cu13", marker = "extra == 'mcore'", specifier = ">=0.2.1" },
-    { name = "nvtx" },
-    { name = "omegaconf" },
-    { name = "open-clip-torch", specifier = ">=3.2.0" },
-    { name = "pillow", specifier = ">=12.3.0" },
-    { name = "pip" },
-    { name = "plotly" },
-    { name = "pybase64" },
-    { name = "pyzmq" },
-    { name = "ray", extras = ["default"], specifier = ">=2.55.1" },
-    { name = "rich" },
-    { name = "sentencepiece" },
-    { name = "setuptools" },
-    { name = "sglang", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang.git?subdirectory=python&rev=3003d70f680d41c59d1b7acbf65cb47795dfd19e" },
-    { name = "sglang-kernel", marker = "extra == 'sglang'", specifier = "==0.4.5" },
-    { name = "sglang-router", marker = "extra == 'sglang'" },
-    { name = "soundfile", specifier = ">=0.13.1" },
-    { name = "swanlab" },
-    { name = "sympy", specifier = ">=1.14.0" },
-    { name = "tensorboard" },
-    { name = "tensordict" },
-    { name = "tensorrt-llm", marker = "extra == 'trtllm'", directory = "3rdparty/TensorRT-LLM-workspace" },
-    { name = "tiktoken" },
-    { name = "tilelang", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=0.1.9,<0.1.12" },
-    { name = "tilelang", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = "==0.1.9" },
-    { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'automodel'", specifier = "==0.1.11" },
-    { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'fsdp'", specifier = "==0.1.9" },
-    { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'sglang'", specifier = "==0.1.11" },
-    { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'trtllm'", specifier = "==0.1.9" },
-    { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'vllm'", specifier = "==0.1.9" },
-    { name = "timm" },
-    { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
-    { name = "torch-memory-saver", marker = "extra == 'mcore'", specifier = ">=0.0.9.post1" },
-    { name = "torchdata" },
-    { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = "==0.26.0", index = "https://pypi.org/simple" },
-    { name = "transferqueue", git = "https://github.com/Ascend/TransferQueue.git?rev=c51614308b68c8d7a87c9b3ef62d59e14c69bde2" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'automodel'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
-    { name = "transformers", specifier = ">=5.5.0,<=5.12.1" },
-    { name = "transformers", marker = "extra == 'automodel'", specifier = "==5.12.1" },
-    { name = "transformers", marker = "extra == 'fsdp'", specifier = "==5.12.1" },
-    { name = "transformers", marker = "extra == 'mcore'", specifier = "==5.12.1" },
-    { name = "transformers", marker = "extra == 'sglang'", specifier = "==5.12.1" },
-    { name = "transformers", marker = "extra == 'trtllm'", specifier = "==5.5.4" },
-    { name = "transformers", marker = "extra == 'vllm'", specifier = "==5.12.1" },
-    { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "vllm", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'vllm'", url = "https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl" },
-    { name = "vllm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'vllm'", url = "https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl" },
-    { name = "vllm", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'vllm') or (sys_platform != 'linux' and extra == 'vllm')", specifier = "==0.25.1" },
-    { name = "wandb", specifier = ">=0.28.0" },
-    { name = "zstandard" },
-]
-provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "trtllm", "modelopt", "nvrx", "nemo-gym"]
-
-[package.metadata.requires-dev]
-build = [
-    { name = "einops" },
-    { name = "hatchling" },
-    { name = "packaging" },
-    { name = "psutil" },
-    { name = "pybind11" },
-    { name = "setuptools" },
-    { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
-]
-dev = [
-    { name = "pre-commit", specifier = ">=4.2.0" },
-    { name = "pyrefly", specifier = "==0.24.2" },
-    { name = "ruff", specifier = "==0.9.9" },
-    { name = "types-pyyaml" },
-    { name = "types-requests" },
-]
-docs = [
-    { name = "gitpython", specifier = ">=3.1.45" },
-    { name = "myst-parser" },
-    { name = "nvidia-sphinx-theme" },
-    { name = "python-dotenv" },
-    { name = "sphinx" },
-    { name = "sphinx-autobuild" },
-    { name = "sphinx-autodoc2" },
-    { name = "sphinx-copybutton" },
-    { name = "sphinx-design" },
-    { name = "sphinxcontrib-mermaid" },
-    { name = "swagger-plugin-for-sphinx" },
-]
-test = [
-    { name = "pytest", specifier = ">=8.4.2" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-shard" },
-    { name = "pytest-testmon" },
-    { name = "pytest-timeout" },
-]
-
 [[package]]
 name = "networkx"
 version = "3.6.1"
@@ -4876,6 +4319,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvdlfw-inspect"
+version = "0.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/86/94188e03e5d4dd7b73c390b0cddcde5618b3799c18e327b2bf15763f6137/nvdlfw_inspect-0.2.2-py3-none-any.whl", hash = "sha256:8a4dc2814c5a4cd19ae304170b9bfa514538ef3c3eb243a45a82404ec3cb279d", size = 30964, upload-time = "2025-12-03T10:52:01.933Z" },
+]
+
+[[package]]
 name = "nvidia-cublas"
 version = "13.5.1.27"
 source = { registry = "https://pypi.org/simple" }
@@ -4978,11 +4433,11 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.25.0"
+version = "1.26.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0e/37/ea07ff3578cb3cc847fbed4e7eb84bf02afa81bed437dc0a5e8b7f040c9f/nvidia_cudnn_frontend-1.25.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e8a223ef2e821bbe89fdc6a461cbce36b509e2daaa0a4425eb387060e0cc6ec7", size = 3263340, upload-time = "2026-06-10T21:08:53.528Z" },
-    { url = "https://files.pythonhosted.org/packages/ff/ff/072bc1ed5e6d7efaf785498e6610a0b2152603c1e020faa6e6b8761d4505/nvidia_cudnn_frontend-1.25.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:95ab349dfc871a4e7e5b7ceaed649a22b968ce02bca9be1d0a0a577e80fa6832", size = 3414303, upload-time = "2026-06-10T21:09:15.951Z" },
+    { url = "https://files.pythonhosted.org/packages/59/71/b09fa3625b8ab915ef4925e8704bf189754dad8386208fa22304171b81b9/nvidia_cudnn_frontend-1.26.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7fee9922c6be2c1b43cb10162e7cd63ce102b0509c0f028e37ac23a959e761b4", size = 3470545, upload-time = "2026-07-07T20:56:30.992Z" },
+    { url = "https://files.pythonhosted.org/packages/48/6d/b85a9b36948c0f176a0ea1e137e60e64ea8dc2b2cefc4560b7070536afdc/nvidia_cudnn_frontend-1.26.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cf064832e29d74ab5bafa341b1793650496ebfe0c94292ee00b61008ecf9aac4", size = 3626160, upload-time = "2026-07-07T20:56:53.298Z" },
 ]
 
 [[package]]
@@ -7711,16 +7166,6 @@ test = [
     { name = "pytest-timeout" },
 ]
 
-[package.metadata]
-requires-dist = [{ name = "nemo-rl", editable = "." }]
-
-[package.metadata.requires-dev]
-test = [
-    { name = "pytest", specifier = ">=7.0.0" },
-    { name = "pytest-cov" },
-    { name = "pytest-timeout" },
-]
-
 [[package]]
 name = "tenacity"
 version = "9.1.4"
@@ -7892,85 +7337,6 @@ dependencies = [
     { name = "uvicorn" },
     { name = "xdsl" },
     { name = "xgrammar" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", specifier = ">=1.7.0" },
-    { name = "aenum" },
-    { name = "apache-tvm-ffi", specifier = "==0.1.6" },
-    { name = "backoff" },
-    { name = "blake3" },
-    { name = "blobfile" },
-    { name = "cache-dit", specifier = ">=1.3.5" },
-    { name = "click", specifier = ">=8.3.1" },
-    { name = "click-option-group" },
-    { name = "colored" },
-    { name = "cuda-python", specifier = ">=13" },
-    { name = "cuda-tile", specifier = ">=1.0.1" },
-    { name = "diffusers", specifier = ">=0.37.1" },
-    { name = "einops" },
-    { name = "etcd-sdk-python", specifier = "==0.0.7" },
-    { name = "fastapi", specifier = ">=0.120.1" },
-    { name = "flash-attn-4", specifier = "==4.0.0b11" },
-    { name = "flashinfer-python", specifier = "==0.6.12" },
-    { name = "ftfy" },
-    { name = "h5py", specifier = "==3.12.1" },
-    { name = "jsonschema" },
-    { name = "lark" },
-    { name = "librosa" },
-    { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
-    { name = "llist" },
-    { name = "matplotlib" },
-    { name = "mistral-common", specifier = ">=1.10.0" },
-    { name = "mpi4py" },
-    { name = "mpmath", specifier = ">=1.3.0" },
-    { name = "msgpack" },
-    { name = "numexpr" },
-    { name = "numpy", specifier = ">=2.0.0,<2.4" },
-    { name = "nvidia-cuda-nvrtc" },
-    { name = "nvidia-cuda-tileiras", specifier = ">=13.1,<13.2" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = "==4.5.0" },
-    { name = "nvidia-ml-py", specifier = ">=13" },
-    { name = "nvidia-modelopt", specifier = ">=0.37.0" },
-    { name = "nvidia-nccl-cu13", specifier = ">=2.28.9,<=2.30.7" },
-    { name = "nvtx" },
-    { name = "omegaconf" },
-    { name = "onnx", specifier = ">=1.21.0" },
-    { name = "onnx-graphsurgeon", specifier = ">=0.5.2" },
-    { name = "openai" },
-    { name = "openai-harmony", specifier = "==0.0.4" },
-    { name = "opencv-python-headless" },
-    { name = "optimum" },
-    { name = "ordered-set" },
-    { name = "pandas" },
-    { name = "partial-json-parser" },
-    { name = "peft", specifier = ">=0.18.1" },
-    { name = "pillow" },
-    { name = "plotly" },
-    { name = "prometheus-client" },
-    { name = "prometheus-fastapi-instrumentator", specifier = ">=8.0.2" },
-    { name = "psutil" },
-    { name = "pulp" },
-    { name = "pydantic", specifier = ">=2.9.1" },
-    { name = "pydantic-settings", extras = ["yaml"] },
-    { name = "python-multipart" },
-    { name = "pyzmq" },
-    { name = "sentencepiece", specifier = ">=0.1.99" },
-    { name = "smg-grpc-proto", specifier = ">=0.4.2" },
-    { name = "soundfile" },
-    { name = "starlette", specifier = ">=0.49.1" },
-    { name = "strenum" },
-    { name = "tensorrt", specifier = "~=10.16.1" },
-    { name = "tiktoken" },
-    { name = "torch", specifier = ">=2.11.0" },
-    { name = "torch-c-dlpack-ext", specifier = "==0.1.3" },
-    { name = "torchao", specifier = ">=0.14.1,<0.16.0" },
-    { name = "torchvision" },
-    { name = "transformers", specifier = "==5.5.4" },
-    { name = "uvicorn" },
-    { name = "xdsl", specifier = ">=0.59.0" },
-    { name = "xgrammar", specifier = ">=0.1.32" },
 ]
 
 [[package]]
@@ -8393,10 +7759,15 @@ dependencies = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.15.0+42b8400"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.15#42b840051647eef89761a16dfdff87e82bb253ab" }
+version = "2.18.0+27486e03"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=27486e03cfc1fa41f6932dcecdc47c71c47eac3e#27486e03cfc1fa41f6932dcecdc47c71c47eac3e" }
 dependencies = [
+    { name = "einops" },
     { name = "importlib-metadata" },
+    { name = "nvdlfw-inspect" },
+    { name = "nvidia-cudnn-frontend" },
+    { name = "onnx" },
+    { name = "onnxscript" },
     { name = "packaging" },
     { name = "pydantic" },
     { name = "torch" },
@@ -8785,109 +8156,6 @@ wheels = [
     { url = "https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:902be760af4c5ebfad8af5b8ea07a53ae14e5a6c839c8ab56da30581abb75ad2" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.13.3" },
-    { name = "anthropic", specifier = ">=0.71.0" },
-    { name = "apache-tvm-ffi", specifier = "==0.1.9" },
-    { name = "av", marker = "extra == 'audio'" },
-    { name = "blake3" },
-    { name = "cachetools" },
-    { name = "cbor2" },
-    { name = "cloudpickle" },
-    { name = "compressed-tensors", specifier = "==0.17.0" },
-    { name = "datasets", marker = "extra == 'bench'" },
-    { name = "depyf", specifier = "==0.20.0" },
-    { name = "diskcache", specifier = "==5.6.3" },
-    { name = "einops" },
-    { name = "fastapi", extras = ["standard"], specifier = ">=0.133.0,<0.137.0" },
-    { name = "fastsafetensors", specifier = ">=0.3.2" },
-    { name = "fastsafetensors", marker = "extra == 'fastsafetensors'", specifier = ">=0.3.2" },
-    { name = "filelock", specifier = ">=3.16.1" },
-    { name = "flashinfer-cubin", specifier = "==0.6.13" },
-    { name = "flashinfer-python", specifier = "==0.6.13" },
-    { name = "helion", marker = "extra == 'helion'", specifier = "==1.1.0" },
-    { name = "humming-kernels", extras = ["cu13"], specifier = "==0.1.10" },
-    { name = "ijson" },
-    { name = "instanttensor", marker = "extra == 'instanttensor'", specifier = ">=0.1.5" },
-    { name = "jsonschema", specifier = ">=4.23.0" },
-    { name = "lark", specifier = "==1.2.2" },
-    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'", specifier = ">=1.7.0,<1.8.0" },
-    { name = "lm-format-enforcer", specifier = "==0.11.3" },
-    { name = "matplotlib", marker = "extra == 'bench'" },
-    { name = "mcp" },
-    { name = "mistral-common", extras = ["audio"], marker = "extra == 'audio'" },
-    { name = "mistral-common", extras = ["image"], specifier = ">=1.11.5" },
-    { name = "model-hosting-container-standards", specifier = ">=0.1.14,<1.0.0" },
-    { name = "msgspec" },
-    { name = "ninja" },
-    { name = "numba", specifier = "==0.65.0" },
-    { name = "numpy" },
-    { name = "nvidia-cudnn-frontend", specifier = ">=1.19.1" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = "==4.5.2" },
-    { name = "nvtx", specifier = "==0.2.15" },
-    { name = "openai", specifier = ">=2.0.0" },
-    { name = "openai-harmony", specifier = ">=0.0.3" },
-    { name = "opencv-python-headless", specifier = ">=4.13.0" },
-    { name = "opentelemetry-api", specifier = ">=1.27.0" },
-    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.26.0" },
-    { name = "opentelemetry-exporter-otlp", specifier = ">=1.27.0" },
-    { name = "opentelemetry-exporter-otlp", marker = "extra == 'otel'", specifier = ">=1.26.0" },
-    { name = "opentelemetry-sdk", specifier = ">=1.27.0" },
-    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.26.0" },
-    { name = "opentelemetry-semantic-conventions-ai", specifier = ">=0.4.1" },
-    { name = "opentelemetry-semantic-conventions-ai", marker = "extra == 'otel'", specifier = ">=0.4.1" },
-    { name = "outlines-core", specifier = "==0.2.14" },
-    { name = "pandas", marker = "extra == 'bench'" },
-    { name = "partial-json-parser" },
-    { name = "pillow" },
-    { name = "plotly", marker = "extra == 'bench'" },
-    { name = "prometheus-client", specifier = ">=0.18.0" },
-    { name = "prometheus-fastapi-instrumentator", specifier = ">=8.0.0" },
-    { name = "protobuf", specifier = ">=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*" },
-    { name = "psutil" },
-    { name = "py-cpuinfo" },
-    { name = "pybase64" },
-    { name = "pydantic", specifier = ">=2.12.0" },
-    { name = "pynvvideocodec", specifier = "==2.0.4" },
-    { name = "python-json-logger" },
-    { name = "pyyaml" },
-    { name = "pyzmq", specifier = ">=25.0.0" },
-    { name = "quack-kernels", specifier = ">=0.3.3" },
-    { name = "regex" },
-    { name = "requests", specifier = ">=2.26.0" },
-    { name = "runai-model-streamer", extras = ["azure", "gcs", "s3"], marker = "extra == 'runai'", specifier = ">=0.15.7" },
-    { name = "safetensors", specifier = ">=0.6.2" },
-    { name = "scipy", marker = "extra == 'audio'" },
-    { name = "scipy", marker = "extra == 'bench'" },
-    { name = "seaborn", marker = "extra == 'bench'" },
-    { name = "sentencepiece" },
-    { name = "setproctitle" },
-    { name = "setuptools", marker = "python_full_version >= '3.12'", specifier = ">=77.0.3,<81.0.0" },
-    { name = "six", marker = "python_full_version >= '3.12'", specifier = ">=1.16.0" },
-    { name = "smg-grpc-servicer", extras = ["vllm"], marker = "extra == 'grpc'", specifier = ">=0.5.2" },
-    { name = "soundfile", marker = "extra == 'audio'" },
-    { name = "soxr", marker = "extra == 'audio'" },
-    { name = "starlette", specifier = ">=1.0.1" },
-    { name = "tensorizer", marker = "extra == 'tensorizer'", specifier = "==2.10.1" },
-    { name = "tiktoken", specifier = ">=0.6.0" },
-    { name = "tilelang", specifier = "==0.1.9" },
-    { name = "tokenizers", specifier = ">=0.21.1" },
-    { name = "tokenspeed-mla", marker = "sys_platform == 'linux'", specifier = "==0.1.2" },
-    { name = "torch", specifier = "==2.11.0" },
-    { name = "torchaudio", specifier = "==2.11.0" },
-    { name = "torchcodec", specifier = ">=0.14" },
-    { name = "torchvision", specifier = "==0.26.0" },
-    { name = "tqdm" },
-    { name = "transformers", specifier = ">=5.5.3" },
-    { name = "typing-extensions", specifier = ">=4.10" },
-    { name = "vllm-gguf-plugin", marker = "extra == 'extra-quant'", specifier = ">=0.0.2" },
-    { name = "watchfiles" },
-    { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", specifier = ">=0.2.1,<1.0.0" },
-    { name = "zentorch", marker = "extra == 'zen'", specifier = "==2.11.0.0" },
-]
-provides-extras = ["zen", "bench", "tensorizer", "fastsafetensors", "instanttensor", "runai", "audio", "video", "flashinfer", "helion", "grpc", "otel", "extra-quant"]
-
 [[package]]
 name = "vllm"
 version = "0.25.1"
@@ -8974,109 +8242,6 @@ dependencies = [
 wheels = [
     { url = "https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:16fc7a28df1576eb6f7ca0455026551b8f9adb674c19c66059359ef3e964bd1e" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.13.3" },
-    { name = "anthropic", specifier = ">=0.71.0" },
-    { name = "apache-tvm-ffi", specifier = "==0.1.9" },
-    { name = "av", marker = "extra == 'audio'" },
-    { name = "blake3" },
-    { name = "cachetools" },
-    { name = "cbor2" },
-    { name = "cloudpickle" },
-    { name = "compressed-tensors", specifier = "==0.17.0" },
-    { name = "datasets", marker = "extra == 'bench'" },
-    { name = "depyf", specifier = "==0.20.0" },
-    { name = "diskcache", specifier = "==5.6.3" },
-    { name = "einops" },
-    { name = "fastapi", extras = ["standard"], specifier = ">=0.133.0,<0.137.0" },
-    { name = "fastsafetensors", specifier = ">=0.3.2" },
-    { name = "fastsafetensors", marker = "extra == 'fastsafetensors'", specifier = ">=0.3.2" },
-    { name = "filelock", specifier = ">=3.16.1" },
-    { name = "flashinfer-cubin", specifier = "==0.6.13" },
-    { name = "flashinfer-python", specifier = "==0.6.13" },
-    { name = "helion", marker = "extra == 'helion'", specifier = "==1.1.0" },
-    { name = "humming-kernels", extras = ["cu13"], specifier = "==0.1.10" },
-    { name = "ijson" },
-    { name = "instanttensor", marker = "extra == 'instanttensor'", specifier = ">=0.1.5" },
-    { name = "jsonschema", specifier = ">=4.23.0" },
-    { name = "lark", specifier = "==1.2.2" },
-    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'", specifier = ">=1.7.0,<1.8.0" },
-    { name = "lm-format-enforcer", specifier = "==0.11.3" },
-    { name = "matplotlib", marker = "extra == 'bench'" },
-    { name = "mcp" },
-    { name = "mistral-common", extras = ["audio"], marker = "extra == 'audio'" },
-    { name = "mistral-common", extras = ["image"], specifier = ">=1.11.5" },
-    { name = "model-hosting-container-standards", specifier = ">=0.1.14,<1.0.0" },
-    { name = "msgspec" },
-    { name = "ninja" },
-    { name = "numba", specifier = "==0.65.0" },
-    { name = "numpy" },
-    { name = "nvidia-cudnn-frontend", specifier = ">=1.19.1" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = "==4.5.2" },
-    { name = "nvtx", specifier = "==0.2.15" },
-    { name = "openai", specifier = ">=2.0.0" },
-    { name = "openai-harmony", specifier = ">=0.0.3" },
-    { name = "opencv-python-headless", specifier = ">=4.13.0" },
-    { name = "opentelemetry-api", specifier = ">=1.27.0" },
-    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.26.0" },
-    { name = "opentelemetry-exporter-otlp", specifier = ">=1.27.0" },
-    { name = "opentelemetry-exporter-otlp", marker = "extra == 'otel'", specifier = ">=1.26.0" },
-    { name = "opentelemetry-sdk", specifier = ">=1.27.0" },
-    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.26.0" },
-    { name = "opentelemetry-semantic-conventions-ai", specifier = ">=0.4.1" },
-    { name = "opentelemetry-semantic-conventions-ai", marker = "extra == 'otel'", specifier = ">=0.4.1" },
-    { name = "outlines-core", specifier = "==0.2.14" },
-    { name = "pandas", marker = "extra == 'bench'" },
-    { name = "partial-json-parser" },
-    { name = "pillow" },
-    { name = "plotly", marker = "extra == 'bench'" },
-    { name = "prometheus-client", specifier = ">=0.18.0" },
-    { name = "prometheus-fastapi-instrumentator", specifier = ">=8.0.0" },
-    { name = "protobuf", specifier = ">=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*" },
-    { name = "psutil" },
-    { name = "py-cpuinfo" },
-    { name = "pybase64" },
-    { name = "pydantic", specifier = ">=2.12.0" },
-    { name = "pynvvideocodec", specifier = "==2.0.4" },
-    { name = "python-json-logger" },
-    { name = "pyyaml" },
-    { name = "pyzmq", specifier = ">=25.0.0" },
-    { name = "quack-kernels", specifier = ">=0.3.3" },
-    { name = "regex" },
-    { name = "requests", specifier = ">=2.26.0" },
-    { name = "runai-model-streamer", extras = ["azure", "gcs", "s3"], marker = "extra == 'runai'", specifier = ">=0.15.7" },
-    { name = "safetensors", specifier = ">=0.6.2" },
-    { name = "scipy", marker = "extra == 'audio'" },
-    { name = "scipy", marker = "extra == 'bench'" },
-    { name = "seaborn", marker = "extra == 'bench'" },
-    { name = "sentencepiece" },
-    { name = "setproctitle" },
-    { name = "setuptools", marker = "python_full_version >= '3.12'", specifier = ">=77.0.3,<81.0.0" },
-    { name = "six", marker = "python_full_version >= '3.12'", specifier = ">=1.16.0" },
-    { name = "smg-grpc-servicer", extras = ["vllm"], marker = "extra == 'grpc'", specifier = ">=0.5.2" },
-    { name = "soundfile", marker = "extra == 'audio'" },
-    { name = "soxr", marker = "extra == 'audio'" },
-    { name = "starlette", specifier = ">=1.0.1" },
-    { name = "tensorizer", marker = "extra == 'tensorizer'", specifier = "==2.10.1" },
-    { name = "tiktoken", specifier = ">=0.6.0" },
-    { name = "tilelang", specifier = "==0.1.9" },
-    { name = "tokenizers", specifier = ">=0.21.1" },
-    { name = "tokenspeed-mla", marker = "sys_platform == 'linux'", specifier = "==0.1.2" },
-    { name = "torch", specifier = "==2.11.0" },
-    { name = "torchaudio", specifier = "==2.11.0" },
-    { name = "torchcodec", specifier = ">=0.14" },
-    { name = "torchvision", specifier = "==0.26.0" },
-    { name = "tqdm" },
-    { name = "transformers", specifier = ">=5.5.3" },
-    { name = "typing-extensions", specifier = ">=4.10" },
-    { name = "vllm-gguf-plugin", marker = "extra == 'extra-quant'", specifier = ">=0.0.2" },
-    { name = "watchfiles" },
-    { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", specifier = ">=0.2.1,<1.0.0" },
-    { name = "zentorch", marker = "extra == 'zen'", specifier = "==2.11.0.0" },
-]
-provides-extras = ["zen", "bench", "tensorizer", "fastsafetensors", "instanttensor", "runai", "audio", "video", "flashinfer", "helion", "grpc", "otel", "extra-quant"]
 
 [[package]]
 name = "wandb"
