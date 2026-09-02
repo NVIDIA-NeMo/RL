@@ -86,3 +86,41 @@ Common failure patterns:
 | `semantic-pull-request` fails | PR title doesn't follow Conventional Commits | Fix PR title; see `contributing` skill |
 | Linting fails | Style violation | Run `uv run ruff check --fix . && uv run ruff format .` |
 | Unit test failure | Code regression or missing dependency | Reproduce locally; see `testing` skill |
+
+---
+
+## Adding Tests to CI
+
+See `docs/ci-cd.md` → "Adding Tests to CI" for the full guide with code links.
+Key decision tree for common cases:
+
+### Adding a single test to an existing L1 suite
+
+1. Write `tests/functional/<scenario>.sh`
+2. Add `run_test [fast] uv run --no-sync bash ./tests/functional/<scenario>.sh` to the suite orchestrator `tests/functional/L1_Functional_Tests_<Suite>.sh`
+3. Use `run_test fast` to also include it in `Lfast`; plain `run_test` for L1 only
+
+Reference: [L1_Functional_Tests_SGLang.sh](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/functional/L1_Functional_Tests_SGLang.sh)
+
+### Adding a single unit test to an existing L0 shard
+
+Add the test file to the appropriate `tests/unit/` subdirectory with the correct
+`@pytest.mark.<backend>` decorator. It is picked up automatically by the shard
+script that runs `--<backend>-only`.
+
+Reference: [tests/unit/models/generation/trtllm/](https://github.com/NVIDIA-NeMo/RL/tree/main/tests/unit/models/generation/trtllm)
+
+### Adding a brand-new suite (new backend)
+
+Eight touch-points, in order:
+
+1. **`tests/unit/conftest.py`** — add `--<backend>-only` option + filter block
+2. **`pyproject.toml`** — add marker under `[tool.pytest.ini_options] markers` and optional dep under `[project.optional-dependencies]`
+3. **Unit test files** — `tests/unit/models/generation/<backend>/` with `@pytest.mark.<backend>`
+4. **`tests/unit/L0_Unit_Tests_<Backend>.sh`** — sources `run_unit_shard_common.sh`, runs `uv run --extra <backend> ... --<backend>-only`
+5. **`tests/functional/<scenario>.sh`** files — individual functional scenarios
+6. **`tests/functional/L1_Functional_Tests_<Backend>.sh`** — suite orchestrator; add `run_test fast` for Lfast-eligible tests
+7. **`.github/workflows/cicd-main.yml`** — add to L0 unit matrix, L1 functional matrix (standard), and L1 functional matrix (GB200)
+8. **`examples/configs/`** — at least one exemplar YAML
+
+Reference suites: [TRT-LLM](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/functional/L1_Functional_Tests_Trtllm.sh) · [SGLang](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/functional/L1_Functional_Tests_SGLang.sh)
