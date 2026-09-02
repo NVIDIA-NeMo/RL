@@ -19,7 +19,20 @@ fi
 DETECTED_CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0)
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-${DETECTED_CUDA_ARCH}}"
 MEGATRON_TRANSFORMER_IMPL="${MEGATRON_TRANSFORMER_IMPL:-inference_optimized}"
-MOE_PAD_EXPERTS_FOR_CG=false
+MEGATRON_CUDA_GRAPH_IMPL="${MEGATRON_CUDA_GRAPH_IMPL:-local}"
+if [[ "${MEGATRON_CUDA_GRAPH_IMPL}" == "local" ]]; then
+    INFERENCE_CUDA_GRAPH_SCOPE=block
+    NUM_CUDA_GRAPHS=-1
+else
+    INFERENCE_CUDA_GRAPH_SCOPE=none
+    NUM_CUDA_GRAPHS=0
+fi
+if [[ "${MEGATRON_TRANSFORMER_IMPL}" != "inference_optimized" &&
+      "${MEGATRON_CUDA_GRAPH_IMPL}" == "local" ]]; then
+    MOE_PAD_EXPERTS_FOR_CG=true
+else
+    MOE_PAD_EXPERTS_FOR_CG=false
+fi
 
 EXP_NAME=$(basename "$0" .sh)
 EXP_DIR="${SCRIPT_DIR}/${EXP_NAME}"
@@ -66,6 +79,9 @@ uv run --no-sync examples/nemo_gym/prepare_video_dataset.py convert \
     --input "${RAW_VAL_PATH}" \
     --output "${VAL_PATH}"
 
+# TODO(@cspades): Replace Omni 30B with a smaller pretrained model.
+# For now, just use this as a partially-trainable functional test
+# (frozen decoder trunk) for inference and multimodal RL.
 uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml \
     cluster.num_nodes=1 \
@@ -78,11 +94,15 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     policy.megatron_cfg.context_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=true \
     policy.megatron_cfg.activation_checkpointing=true \
+    ++policy.megatron_cfg.freeze_config.freeze_language_model=true \
     policy.megatron_cfg.optimizer.optimizer_cpu_offload=false \
     policy.megatron_cfg.optimizer.optimizer_offload_fraction=0.0 \
+    ++policy.megatron_cfg.optimizer.params_dtype=bfloat16 \
+    ++policy.megatron_cfg.optimizer.main_grads_dtype=bfloat16 \
+    ++policy.megatron_cfg.optimizer.main_params_dtype=float16 \
     ++policy.megatron_cfg.optimizer.exp_avg_dtype=bfloat16 \
     ++policy.megatron_cfg.optimizer.exp_avg_sq_dtype=bfloat16 \
-    ++policy.megatron_cfg.optimizer.store_param_remainders=true \
+    ++policy.megatron_cfg.optimizer.store_param_remainders=false \
     policy.generation.backend=megatron \
     ++policy.generation.bad_words=null \
     policy.generation.colocated.enabled=true \
@@ -98,21 +118,21 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     policy.generation.mcore_generation_config.transformer_impl="${MEGATRON_TRANSFORMER_IMPL}" \
     policy.generation.mcore_generation_config.sequence_parallel=true \
     policy.generation.mcore_generation_config.refit_backend=nccl \
-    policy.generation.mcore_generation_config.buffer_size_gb=8 \
-    policy.generation.mcore_generation_config.cuda_graph_impl=none \
-    policy.generation.mcore_generation_config.inference_cuda_graph_scope=none \
-    policy.generation.mcore_generation_config.num_cuda_graphs=0 \
+    policy.generation.mcore_generation_config.buffer_size_gb=2 \
+    policy.generation.mcore_generation_config.cuda_graph_impl="${MEGATRON_CUDA_GRAPH_IMPL}" \
+    policy.generation.mcore_generation_config.inference_cuda_graph_scope="${INFERENCE_CUDA_GRAPH_SCOPE}" \
+    policy.generation.mcore_generation_config.num_cuda_graphs="${NUM_CUDA_GRAPHS}" \
     policy.generation.mcore_generation_config.use_cuda_graphs_for_non_decode_steps=false \
     ++policy.generation.mcore_generation_config.moe_pad_experts_for_cuda_graph_inference="${MOE_PAD_EXPERTS_FOR_CG}" \
     policy.generation.mcore_generation_config.enable_chunked_prefill=true \
     ++policy.generation.mcore_generation_config.async_sched_mode=async \
     policy.generation.mcore_generation_config.enable_prefix_caching=true \
-    policy.generation.mcore_generation_config.max_model_len=4096 \
-    policy.generation.mcore_generation_config.max_tokens=4096 \
+    policy.generation.mcore_generation_config.max_model_len=1024 \
+    policy.generation.mcore_generation_config.max_tokens=1024 \
     ++policy.generation.mcore_generation_config.video_num_frames=8 \
     ++policy.generation.mcore_generation_config.video_temporal_patch_size=2 \
     ++policy.generation.mcore_generation_config.video_target_num_patches=256 \
-    policy.max_total_sequence_length=4096 \
+    policy.max_total_sequence_length=1024 \
     +data.default.num_frames=8 \
     +data.default.video_sampling_style=nemotron_vl \
     +data.default.video_temporal_patch_size=2 \
@@ -140,15 +160,6 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     "$@" 2>&1 | tee "${RUN_LOG}"
 
 uv run --no-sync tests/json_dump_tb_logs.py "${LOG_DIR}" --output_path "${JSON_METRICS}"
-
-RECORDED_STEP=$(jq -r \
-    'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' \
-    "${JSON_METRICS}")
-if (( RECORDED_STEP < 1 )); then
-    echo "[ERROR] Expected at least one completed Gym-video training step"
-    exit 1
-fi
-
 uv run --no-sync tests/check_metrics.py "${JSON_METRICS}" \
-    'max(data["train/loss"]) < 1e6' \
-    'min(data["train/loss"]) > -1e6'
+    'max(data["train/gen_kl_error"]) < 0.05' \
+    'all_finite(data["train/reward"])'

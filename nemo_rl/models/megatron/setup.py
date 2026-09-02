@@ -270,14 +270,30 @@ _OPTIMIZER_DTYPE_KEYS = (
 
 
 def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Resolve optimizer dtype strings."""
-    from megatron.bridge.utils.activation_map import str_to_dtype
-
+    """Resolve optimizer dtype strings, including TE's uint8-backed FP8 moments."""
     resolved = dict(optimizer_cfg)
+    dtype_aliases = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp8": torch.uint8,
+        "uint8": torch.uint8,
+    }
     for key in _OPTIMIZER_DTYPE_KEYS:
         value = resolved.get(key)
         if isinstance(value, str):
-            resolved[key] = str_to_dtype(value)
+            normalized = value.lower().removeprefix("torch.")
+            try:
+                resolved[key] = dtype_aliases[normalized]
+            except KeyError as e:
+                raise ValueError(
+                    f"Unsupported optimizer dtype {value!r} for {key}. "
+                    "Supported Transformer Engine FusedAdam dtype aliases: "
+                    f"{', '.join(dtype_aliases)}"
+                ) from e
     return resolved
 
 
