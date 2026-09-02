@@ -103,7 +103,11 @@ def _make_master_config(
     block is active and the other one stays None.
     """
     return MasterConfig.model_construct(
-        data_plane={"enabled": True, "impl": "transfer_queue"},
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+        },
         data={
             "use_multiple_dataloader": False,
             "shuffle": False,
@@ -234,6 +238,16 @@ class TestPPOValidation:
     def test_accepts_a_well_formed_ppo_config(self):
         validate_single_controller_config(_ppo_master_config())
 
+    def test_rejects_message_penalties_without_nemo_gym(self):
+        mc = _ppo_master_config()
+        assert mc.ppo is not None
+        mc.ppo.invalid_tool_call_advantage = -5.0
+
+        with pytest.raises(
+            ValueError, match="active algorithm block require the NeMo-Gym"
+        ):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("missing", ["value", "value_loss_fn"])
     def test_rejects_ppo_without_its_critic_blocks(self, missing):
         mc = _ppo_master_config(**{missing: None})
@@ -249,8 +263,7 @@ class TestPPOValidation:
             validate_single_controller_config(mc)
 
     def test_rejects_multi_chunk_streaming(self):
-        """The critic has no split API, so it would step once per chunk while
-        the policy steps once per RL step."""
+        """PPO cannot spread one full-batch optimizer epoch across chunks."""
         mc = _ppo_master_config(min_groups_for_streaming_train=1)
 
         with pytest.raises(
@@ -267,16 +280,6 @@ class TestPPOValidation:
             ValueError,
             match=r"must equal value.train_global_batch_size \(4\)",
         ):
-            validate_single_controller_config(mc)
-
-    def test_rejects_a_ppo_epoch_count_below_one(self):
-        mc = _ppo_master_config(
-            ppo=PPOConfig.model_construct(
-                max_num_steps=100, ppo_epochs=0, **_STEP_CONFIG
-            )
-        )
-
-        with pytest.raises(ValueError, match="ppo_epochs must be at least 1"):
             validate_single_controller_config(mc)
 
     @pytest.mark.parametrize(
@@ -325,13 +328,11 @@ class TestPPOValidation:
     @pytest.mark.parametrize(
         "enable",
         [
-            lambda cfg: setattr(cfg, "overlong_filtering", True),
             lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
             lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
             lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
         ],
         ids=[
-            "overlong_filtering",
             "use_dynamic_sampling",
             "reward_scaling",
             "reward_shaping",
@@ -346,14 +347,12 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
-    def test_rejects_shaping_on_a_grpo_run_too(self):
-        mc = _make_master_config()
-        mc.grpo.overlong_filtering = True
+    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+    def test_accepts_overlong_filtering(self, algorithm: str):
+        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
+        getattr(mc, algorithm).overlong_filtering = True
 
-        with pytest.raises(
-            NotImplementedError, match="overlong_filtering not supported"
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_a_dtensor_critic(self):
         """Only the Megatron value worker carries TQWorkerMixin."""
@@ -408,6 +407,19 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="colocated.enabled=false"):
             validate_single_controller_config(mc)
 
+    @pytest.mark.parametrize(
+        "make_config", [_ppo_master_config, _make_master_config], ids=["ppo", "grpo"]
+    )
+    @pytest.mark.parametrize("epochs", [-1, 0], ids=["negative", "zero"])
+    def test_rejects_a_non_positive_max_num_epochs(self, make_config, epochs):
+        """docs/guides/ppo.md tells async-PPO users to set -1; carried onto SC it
+        makes the rollout pump's epoch gate unsatisfiable and the run exits 0."""
+        mc = make_config()
+        algo_config(mc).max_num_epochs = epochs
+
+        with pytest.raises(ValueError, match="trains zero steps"):
+            validate_single_controller_config(mc)
+
     def test_grpo_is_free_to_use_any_sampler(self):
         mc = _make_master_config()
         mc.async_rl.sampler = WindowedSamplerConfig()
@@ -444,20 +456,59 @@ class TestAdvantageEstimatorSelection:
 
 
 class TestMegatronTrainIters:
-    @pytest.mark.parametrize(("ppo_epochs", "expected"), [(1, 7), (3, 21)])
-    def test_injects_into_both_policy_and_value(self, ppo_epochs, expected):
-        """Each epoch steps both optimizers, so each is a scheduler tick."""
+    @pytest.mark.parametrize(
+        (
+            "ppo_epochs",
+            "policy_training_start_step",
+            "expected_policy",
+            "expected_value",
+        ),
+        [
+            (1, 0, 7, 7),
+            (3, 0, 21, 21),
+            (3, 2, 15, 21),
+            (3, 7, 1, 21),
+        ],
+    )
+    def test_injects_into_both_policy_and_value(
+        self,
+        ppo_epochs,
+        policy_training_start_step,
+        expected_policy,
+        expected_value,
+    ):
+        """Each scheduler budget matches its model's optimizer update count."""
         mc = _ppo_master_config(
             megatron_enabled=True,
             ppo=PPOConfig.model_construct(
-                max_num_steps=7, ppo_epochs=ppo_epochs, **_STEP_CONFIG
+                max_num_steps=7,
+                ppo_epochs=ppo_epochs,
+                critic_ppo_epochs=ppo_epochs,
+                policy_training_start_step=policy_training_start_step,
+                **_STEP_CONFIG,
             ),
         )
 
         sc_setup_mod._maybe_inject_megatron_train_iters(mc)
 
-        assert mc.policy["megatron_cfg"]["train_iters"] == expected
-        assert mc.value["megatron_cfg"]["train_iters"] == expected
+        assert mc.policy["megatron_cfg"]["train_iters"] == expected_policy
+        assert mc.value["megatron_cfg"]["train_iters"] == expected_value
+
+    def test_injects_distinct_policy_and_value_budgets(self):
+        mc = _ppo_master_config(
+            megatron_enabled=True,
+            ppo=PPOConfig.model_construct(
+                max_num_steps=7,
+                ppo_epochs=1,
+                critic_ppo_epochs=3,
+                **_STEP_CONFIG,
+            ),
+        )
+
+        sc_setup_mod._maybe_inject_megatron_train_iters(mc)
+
+        assert mc.policy["megatron_cfg"]["train_iters"] == 7
+        assert mc.value["megatron_cfg"]["train_iters"] == 21
 
     def test_skips_a_critic_on_a_non_megatron_backend(self):
         mc = _ppo_master_config(megatron_enabled=False, max_num_steps=7)
@@ -568,6 +619,97 @@ class TestSetupBuildsTheCritic:
         assert actor_args.value_loss_fn is None
         assert timing.value_init_time_s is None
         patched_ppo_factories["policy"].offload_to_cpu.assert_not_called()
+
+
+class TestValueWarmStart:
+    def test_fresh_run_builds_the_critic_from_the_warm_start(
+        self, patched_ppo_factories, tmp_path
+    ):
+        seed = tmp_path / "critic_pretrain" / "step_370"
+        (seed / "value" / "weights").mkdir(parents=True)
+        (seed / "value" / "optimizer").mkdir()
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                warm_start_value_checkpoint=str(seed),
+                **_STEP_CONFIG,
+            )
+        )
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["weights_path"] == seed / "value" / "weights"
+        assert value_kwargs["optimizer_path"] == seed / "value" / "optimizer"
+        # The policy is untouched by a warm start: pi_0 comes from the base model.
+        trainer_kwargs = patched_ppo_factories["_build_trainer"].call_args.kwargs
+        assert trainer_kwargs["weights_path"] is None
+
+    def test_unset_leaves_the_critic_cold(self, patched_ppo_factories, tmp_path):
+        mc = _ppo_master_config()
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["weights_path"] is None
+        assert value_kwargs["optimizer_path"] is None
+
+    @pytest.mark.parametrize(
+        ("warm_start", "message"),
+        [
+            ("", "warm_start_value_checkpoint is empty"),
+            ("{tmp}/typo", "would silently start cold"),
+        ],
+        ids=["empty_string", "typo"],
+    )
+    def test_rejects_a_warm_start_that_does_not_resolve(
+        self, patched_ppo_factories, tmp_path, warm_start, message
+    ):
+        """get_resume_paths never stats the path, so an unresolvable one would
+        train a cold critic behind the line claiming a warm start. A Hydra
+        override written as `key=` with an unset variable arrives as ""."""
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                warm_start_value_checkpoint=warm_start.format(tmp=tmp_path),
+                **_STEP_CONFIG,
+            )
+        )
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        with pytest.raises(ValueError, match=message):
+            setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        patched_ppo_factories["_build_value"].assert_not_called()
+
+    def test_resume_ignores_the_warm_start(self, patched_ppo_factories, tmp_path):
+        """Re-seeding a resumed run would discard the critic's own progress, so
+        the run's checkpoint has to win over the key left in the config."""
+        seed = tmp_path / "critic_pretrain" / "step_370"
+        (seed / "value" / "weights").mkdir(parents=True)
+        (seed / "value" / "optimizer").mkdir()
+        step_5 = tmp_path / "run" / "step_5"
+        for component in ("policy", "value"):
+            (step_5 / component / "weights").mkdir(parents=True)
+            (step_5 / component / "optimizer").mkdir()
+        (step_5 / "training_info.json").write_text("{}")
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                warm_start_value_checkpoint=str(seed),
+                **_STEP_CONFIG,
+            )
+        )
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        with patch.object(sc_setup_mod, "load_dataloader_state"):
+            setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["weights_path"] == step_5 / "value" / "weights"
+        assert value_kwargs["optimizer_path"] == step_5 / "value" / "optimizer"
 
 
 def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> MasterConfig:

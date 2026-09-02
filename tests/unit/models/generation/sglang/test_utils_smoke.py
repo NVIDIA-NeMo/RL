@@ -19,6 +19,8 @@ require a running SGLang server or GPU.
 """
 
 import pytest
+import torch
+from torch.multiprocessing import reductions
 
 from . import (
     helpers,  # noqa: F401  — installs env vars + module stubs before nemo_rl imports
@@ -26,6 +28,7 @@ from . import (
 
 pytestmark = pytest.mark.sglang
 
+from nemo_rl.models.generation.sglang.utils import train_utils
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
 from nemo_rl.models.generation.sglang.utils.train_utils import (
@@ -70,3 +73,46 @@ def test_serializer_roundtrip():
     assert isinstance(serialized, str) and len(serialized) > 0
     deserialized = MultiprocessingSerializer.deserialize(serialized)
     assert deserialized == obj
+
+
+def test_reduce_tensor_modified_preserves_cpu_reduction(monkeypatch):
+    """The CUDA UUID patch must leave the shorter CPU reducer protocol intact."""
+    tensor = torch.tensor([1, 2, 3])
+    monkeypatch.setattr(
+        reductions,
+        "_reduce_tensor_original",
+        getattr(reductions, "_reduce_tensor_original", reductions.reduce_tensor),
+        raising=False,
+    )
+
+    output_fn, output_args = train_utils._reduce_tensor_modified(tensor)
+
+    assert output_fn is reductions.rebuild_tensor
+    assert len(output_args) == 3
+    torch.testing.assert_close(output_fn(*output_args), tensor)
+
+
+def test_reduce_tensor_modified_converts_cuda_device_to_uuid(monkeypatch):
+    """The dense CUDA reducer still converts its device argument to a UUID."""
+    cuda_output_args = tuple(range(15))
+    monkeypatch.setattr(
+        reductions,
+        "_reduce_tensor_original",
+        lambda *_args, **_kwargs: (
+            train_utils._rebuild_cuda_tensor_modified,
+            cuda_output_args,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        train_utils,
+        "_device_to_uuid",
+        lambda device: f"cuda-uuid-{device}",
+    )
+
+    output_fn, output_args = train_utils._reduce_tensor_modified(object())
+
+    assert output_fn is train_utils._rebuild_cuda_tensor_modified
+    assert output_args[:6] == cuda_output_args[:6]
+    assert output_args[6] == "cuda-uuid-6"
+    assert output_args[7:] == cuda_output_args[7:]
