@@ -1433,12 +1433,11 @@ def apply_te_precision_config(model_cfg: Any, config: PolicyConfig) -> None:
         num_hidden_layers = getattr(
             model_cfg, "num_layers", getattr(model_cfg, "num_hidden_layers", None)
         )
-        raw_rollout = cast(dict[str, Any], generation_cfg)["nvfp4_pertoken_rollout"]
-        legacy_ignore = (
-            per_token_rollout.additional_ignore
-            if "additional_ignore" in raw_rollout
-            else None
-        )
+        # Unconditional parity check against the instantiated MCore config.
+        # The driver owns the derivation; this side only verifies that what the
+        # rollout actually received is the boundary the trainer will use. An
+        # entry point that skipped normalization arrives here with an empty
+        # value and fails, instead of quantizing layers the trainer keeps BF16.
         resolved_ignore = resolve_boundary_ignore_patterns(
             num_hidden_layers=num_hidden_layers,
             first_last_layers_bf16=bool(
@@ -1450,9 +1449,8 @@ def apply_te_precision_config(model_cfg: Any, config: PolicyConfig) -> None:
             num_layers_at_end_in_bf16=int(
                 getattr(model_cfg, "num_layers_at_end_in_bf16", 1) or 0
             ),
-            legacy_additional_ignore=legacy_ignore,
+            expected_additional_ignore=per_token_rollout.additional_ignore,
         )
-        raw_rollout["additional_ignore"] = resolved_ignore
         print(
             "[fp4_cfg] verified routed-expert NVFP4 coverage and BF16 boundary "
             f"parity: {resolved_ignore}",

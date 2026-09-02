@@ -34,6 +34,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+# The BF16 decoder-layer boundary a 48-layer model with 2 start / 4 end layers
+# resolves to. The driver derives this and writes it into the rollout config;
+# the Megatron worker verifies against it.
+_EXPECTED_BF16_BOUNDARY = [
+    "*.layers.0.mlp.experts*",
+    "*.layers.1.mlp.experts*",
+    "*.layers.44.mlp.experts*",
+    "*.layers.45.mlp.experts*",
+    "*.layers.46.mlp.experts*",
+    "*.layers.47.mlp.experts*",
+]
+
 
 @dataclass
 class _NestedModelConfig:
@@ -1794,7 +1806,12 @@ class TestApplyPerformanceConfig:
             "precision": "bfloat16",
             "generation": {
                 "backend": "vllm",
-                "nvfp4_pertoken_rollout": {"enabled": True},
+                "nvfp4_pertoken_rollout": {
+                    "enabled": True,
+                    # The driver derives and writes this before workers start;
+                    # the trainer only verifies it against its own MCore config.
+                    "additional_ignore": _EXPECTED_BF16_BOUNDARY,
+                },
             },
             "megatron_cfg": {
                 "fp4_cfg": {"enabled": True, "fp4": "e2m1"},
@@ -1814,14 +1831,48 @@ class TestApplyPerformanceConfig:
 
         apply_te_precision_config(model_cfg, config)
 
-        assert config["generation"]["nvfp4_pertoken_rollout"]["additional_ignore"] == [
-            "*.layers.0.mlp.experts*",
-            "*.layers.1.mlp.experts*",
-            "*.layers.44.mlp.experts*",
-            "*.layers.45.mlp.experts*",
-            "*.layers.46.mlp.experts*",
-            "*.layers.47.mlp.experts*",
-        ]
+        assert (
+            config["generation"]["nvfp4_pertoken_rollout"]["additional_ignore"]
+            == _EXPECTED_BF16_BOUNDARY
+        )
+
+    def test_nvfp4_pertoken_rejects_unnormalized_rollout_boundary(self):
+        """A missed driver-side normalization must fail here, not run split.
+
+        ``normalize_nvfp4_pertoken_policy_config`` has to run on every entry
+        point. If one is missed the rollout arrives with no BF16 boundary while
+        the trainer keeps first/last layers in BF16, so the two would disagree
+        on precision with nothing to signal it.
+        """
+        from pathlib import Path
+
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        model_cfg = SimpleNamespace(num_layers=48)
+        config = {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {"enabled": True},
+            },
+            "megatron_cfg": {
+                "fp4_cfg": {"enabled": True, "fp4": "e2m1"},
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
+                "te_precision_config_file": str(
+                    Path(__file__).resolve().parents[4]
+                    / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                ),
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="did not run for this entry point"):
+            apply_te_precision_config(model_cfg, config)
 
     def test_first_and_last_bf16_layers_are_forwarded(self):
         from nemo_rl.models.megatron.setup import apply_te_precision_config

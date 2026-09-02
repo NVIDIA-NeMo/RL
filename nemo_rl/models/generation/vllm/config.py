@@ -339,7 +339,9 @@ def normalize_nvfp4_pertoken_policy_config(
         or 0
     )
     raw_rollout = generation_config.setdefault("nvfp4_pertoken_rollout", {})
-    legacy_ignore = (
+    # A user-written value is only cross-checked; the Megatron boundary below
+    # is what the rollout ends up using.
+    expected_ignore = (
         rollout.additional_ignore if "additional_ignore" in raw_rollout else None
     )
     resolved = resolve_boundary_ignore_patterns(
@@ -347,7 +349,7 @@ def normalize_nvfp4_pertoken_policy_config(
         first_last_layers_bf16=first_last_layers_bf16,
         num_layers_at_start_in_bf16=num_start,
         num_layers_at_end_in_bf16=num_end,
-        legacy_additional_ignore=legacy_ignore,
+        expected_additional_ignore=expected_ignore,
     )
     raw_rollout["additional_ignore"] = resolved
     print(
