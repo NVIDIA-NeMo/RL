@@ -66,6 +66,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    configure_vllm_lora_refit,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
@@ -254,6 +255,7 @@ def setup(
             policy_config, entry_point="distillation"
         )
         vllm_config = cast(VllmConfig, generation_config)
+        configure_vllm_lora_refit(policy_config)
         normalize_vllm_refit_config(vllm_config)
         refit_transport = vllm_config.get("refit_transport")
         if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
