@@ -869,21 +869,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    # Each PPO epoch must consume the complete RL batch. Without this guard, every
-    # chunk would independently run the configured actor and critic optimizer steps.
-    if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
-        raise ValueError(
-            "PPO on the SingleController path requires "
-            "async_rl.min_groups_for_streaming_train "
-            f"({async_config.min_groups_for_streaming_train}) == "
-            f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
-            "step is assembled from a single chunk. Otherwise each chunk would "
-            "run ppo.critic_ppo_epochs critic optimizer steps and ppo.ppo_epochs "
-            "policy optimizer steps on only part of the RL batch. Streaming PPO "
-            "needs a split train API on the value workers, which they do not have "
-            "yet (#2625)."
-        )
-
+    # Split training removes the one-chunk restriction, but a dropped prompt
+    # can still make the shortened step indivisible by critic DP. Keep the
+    # existing conservative contract until uneven/padded critic sharding is
+    # implemented explicitly.
     failure_config = async_config.rollout_failure
     drop_budget = (
         failure_config.max_skipped_prompts
@@ -894,10 +883,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "PPO on the SingleController path requires "
             "async_rl.rollout_failure.max_skipped_prompts=0 and "
             "max_consecutive_dropped_prompts=0, but they sum to "
-            f"{drop_budget}. A drop shortens the step, and the critic shards that "
-            "step against the configured value.train_global_batch_size rather than "
-            "its actual size, so the first short step fails a divisibility assert "
-            "inside the value workers (#2625)."
+            f"{drop_budget}. A shortened step is not guaranteed to divide "
+            "evenly across the critic data-parallel ranks."
         )
 
     policy_megatron_cfg = master_config.policy.get("megatron_cfg", {})  # type: ignore

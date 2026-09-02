@@ -1694,20 +1694,12 @@ class SingleControllerActor:
                 b. Value model forward (PPO only), with the policy parked on CPU
                     so the critic never shares the training GPUs with it.
                 c. _advantage_stage.
-            3. Train on the chunk.
-                a. Value model (PPO only): train_from_meta, which is a whole
-                    optimizer step. That is why a PPO step is pinned to a single
-                    chunk -- the value workers have no split train API yet (#2625).
-                b. Policy model: train_microbatches_from_meta, which only
-                    accumulates gradients.
-                c. PPO only: all critic updates run before all policy updates.
-                    Their counts are ppo.critic_ppo_epochs and ppo.ppo_epochs,
-                    respectively. Each policy optimizer step closes here rather
-                    than in 5 -- a PPO step is one chunk, so there is nothing to
-                    accumulate across chunks.
+            3. Train on the chunk (GRPO only). PPO retains each prepared metadata
+                slice in TQ until the complete RL step is assembled.
             4. Clear the batch. dp_client.clear_samples on the consumed sample_ids.
-            5. Train the policy model (GRPO) -- finish_train_step all_reduces the
-                accumulated gradients, rescales, and runs optimizer.step.
+            5. Close model updates. GRPO finishes its one policy step. PPO replays
+                every prepared metadata slice for each critic epoch, then each actor
+                epoch; both split APIs step only after the full RL batch.
             6. Refit the model. Sync the new policy weights to generation.
 
         PPO critic warmup (ppo.policy_training_start_step > 0) changes which of those
@@ -1729,8 +1721,8 @@ class SingleControllerActor:
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
             selected_rollout_metrics: list[dict[str, Any]] = []
-            # One chunk per step on the PPO path, so these are the step's own
-            # model updates -- the last epoch's, when there is more than one.
+            ppo_chunks: list[tuple[KVBatchMeta, bool, int]] = []
+            # These are the step's final actor/critic epoch results.
             policy_result: Optional[dict[str, Any]] = None
             value_result: Optional[dict[str, Any]] = None
             # Always True off the PPO path: the start step is pinned to 0 there.
@@ -1808,9 +1800,11 @@ class SingleControllerActor:
                             await asyncio.sleep(0.005)
                             continue
 
-                        # Release buffer capacity
-                        for _ in range(num_groups):
-                            self._buffer_capacity.release()
+                        # PPO retains TQ rows through every actor/critic epoch, so
+                        # its matching capacity permits are released after training.
+                        if not self._is_ppo:
+                            for _ in range(num_groups):
+                                self._buffer_capacity.release()
 
                         selected_rollout_metrics.extend(
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
@@ -1865,45 +1859,14 @@ class SingleControllerActor:
                             has_valid_training_tokens,
                         ) = await self._advantage_stage(train_meta)
 
-                    # A PPO step is this one chunk, so a chunk with nothing left
-                    # after filtering is a step that trains neither model.
-                    if self._is_ppo and not has_valid_training_tokens:
-                        raise RuntimeError(
-                            "SingleController has no valid response tokens after "
-                            "filtering. Check seq_logprob_error_threshold, "
-                            "overlong_filtering, and environment mask_sample flags "
-                            "to avoid an optimizer step with an empty batch."
-                        )
-
                     # ---- 3. Train the model -- train_microbatches_from_meta ----
                     # Filtering can leave a GRPO streaming chunk with no training
                     # tokens. Consume that chunk without F/B, then continue the same
                     # optimizer step with the next chunk.
 
-                    # GRPO runs one iteration: F/B only, its optimizer step is in 5.
-                    # For PPO, each actor epoch and critic epoch is a full optimizer
-                    # step. Group each model's epochs under one residency cycle so
-                    # the colocated models do not move between CPU and GPU per epoch.
-                    # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
-                    # That matches ppo.py for the losses; total_flops is additive and undercounted.
-                    if self._is_ppo:
-                        with self._timer.time("value_training"):
-                            value_result = await self._value_train_epochs(
-                                train_meta,
-                                num_epochs=self._critic_ppo_epochs,
-                            )
-
-                    if is_policy_training_step:
-                        if (
-                            self._is_ppo
-                            and self._train_steps == policy_training_start_step
-                            and policy_training_start_step > 0
-                        ):
-                            print(
-                                f"  ✓ Critic warmup complete ({policy_training_start_step} "
-                                "steps). Starting policy training.",
-                                flush=True,
-                            )
+                    # PPO trains after the chunk loop so every epoch sees all
+                    # prepared chunks. GRPO continues accumulating immediately.
+                    if is_policy_training_step and not self._is_ppo:
                         # Always restore training mode because log-prob inference may have
                         # switched the model to inference mode. Keep it resident
                         # across every PPO actor epoch.
@@ -1911,26 +1874,18 @@ class SingleControllerActor:
                             await asyncio.to_thread(self._trainer.prepare_for_training)
 
                         if has_valid_training_tokens:
-                            for _ in range(self._ppo_epochs):
-                                with self._timer.time("policy_training"):
-                                    if not step_open:
-                                        await asyncio.to_thread(
-                                            self._trainer.begin_train_step,
-                                            self._loss_fn,
-                                        )
-                                        step_open = True
+                            with self._timer.time("policy_training"):
+                                if not step_open:
                                     await asyncio.to_thread(
-                                        self._trainer.train_microbatches_from_meta,
-                                        train_meta,
-                                        train_fields=self._train_fields,
+                                        self._trainer.begin_train_step,
+                                        self._loss_fn,
                                     )
-                                    # A PPO step is one chunk: nothing to
-                                    # accumulate, so close every epoch here.
-                                    if self._is_ppo:
-                                        policy_result = await asyncio.to_thread(
-                                            self._trainer.finish_train_step
-                                        )
-                                        step_open = False
+                                    step_open = True
+                                await asyncio.to_thread(
+                                    self._trainer.train_microbatches_from_meta,
+                                    train_meta,
+                                    train_fields=self._train_fields,
+                                )
 
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
@@ -1964,8 +1919,14 @@ class SingleControllerActor:
                     else:
                         min_sample_version = curr_min_sample_version
 
-                    # Remove consumed sample_ids from the buffer
-                    await self._clear_data_plane_samples(list(train_meta.sample_ids))
+                    if self._is_ppo:
+                        ppo_chunks.append(
+                            (train_meta, has_valid_training_tokens, num_groups)
+                        )
+                    else:
+                        await self._clear_data_plane_samples(
+                            list(train_meta.sample_ids)
+                        )
 
                     groups_dispatched += num_groups
                     chunks_dispatched += 1
@@ -1997,8 +1958,56 @@ class SingleControllerActor:
                     groups_dispatched,
                 )
 
-                # Only the streaming path has anything left open: a PPO step is one
-                # chunk, so each epoch already closed its own optimizer step above.
+                if self._is_ppo:
+                    try:
+                        valid_ppo_metas = [
+                            meta for meta, is_valid, _ in ppo_chunks if is_valid
+                        ]
+                        if not valid_ppo_metas:
+                            raise RuntimeError(
+                                "SingleController has no valid response tokens after "
+                                "filtering. Check seq_logprob_error_threshold, "
+                                "overlong_filtering, and environment mask_sample flags "
+                                "to avoid an optimizer step with an empty batch."
+                            )
+
+                        with self._timer.time("value_training"):
+                            value_result = await self._value_train_epochs(
+                                valid_ppo_metas,
+                                num_epochs=self._critic_ppo_epochs,
+                            )
+
+                        if is_policy_training_step:
+                            if (
+                                self._train_steps == policy_training_start_step
+                                and policy_training_start_step > 0
+                            ):
+                                print(
+                                    "  ✓ Critic warmup complete "
+                                    f"({policy_training_start_step} steps). "
+                                    "Starting policy training.",
+                                    flush=True,
+                                )
+                            with self._timer.time("training_prep"):
+                                await asyncio.to_thread(
+                                    self._trainer.prepare_for_training
+                                )
+                            policy_result = await self._policy_train_epochs(
+                                valid_ppo_metas,
+                                num_epochs=self._ppo_epochs,
+                            )
+                    finally:
+                        # Retained TQ rows own matching buffer-capacity permits.
+                        # Release both even when filtering or model training fails,
+                        # otherwise the rollout pump can deadlock during teardown.
+                        for chunk_meta, _, num_groups in ppo_chunks:
+                            await self._clear_data_plane_samples(
+                                list(chunk_meta.sample_ids)
+                            )
+                            for _ in range(num_groups):
+                                self._buffer_capacity.release()
+
+                # GRPO kept one policy optimizer step open across its chunks.
                 if not self._is_ppo:
                     if not step_open:
                         raise RuntimeError(
@@ -3180,23 +3189,59 @@ class SingleControllerActor:
         return meta.with_fields([self._advantage_cfg.values_field])
 
     async def _value_train_epochs(
-        self, meta: KVBatchMeta, *, num_epochs: int
+        self, metas: list[KVBatchMeta], *, num_epochs: int
     ) -> dict[str, Any]:
-        """Run consecutive critic epochs under one model onload/offload cycle.
+        """Train each critic epoch across all prepared PPO chunks.
 
         Returns:
-            The final epoch's ``train_from_meta`` output; earlier epochs'
-            results are discarded.
+            The final epoch's split-step output; earlier epochs are discarded.
         """
+        assert self._value is not None
         await asyncio.to_thread(self._value.prepare_for_training)
         result: dict[str, Any] | None = None
+        try:
+            for _ in range(num_epochs):
+                try:
+                    await asyncio.to_thread(
+                        self._value.begin_train_step,
+                        self._value_loss_fn,  # pyrefly: ignore
+                    )
+                    for meta in metas:
+                        await asyncio.to_thread(
+                            self._value.train_microbatches_from_meta,
+                            meta,
+                        )
+                    result = await asyncio.to_thread(self._value.finish_train_step)
+                except BaseException:
+                    await asyncio.to_thread(self._value.abort_train_step)
+                    raise
+        finally:
+            await asyncio.to_thread(self._value.finish_training)
+        assert result is not None
+        return result
+
+    async def _policy_train_epochs(
+        self, metas: list[KVBatchMeta], *, num_epochs: int
+    ) -> dict[str, Any]:
+        """Train each PPO actor epoch across all prepared chunks."""
+        result: dict[str, Any] | None = None
         for _ in range(num_epochs):
-            result = await asyncio.to_thread(
-                self._value.train_from_meta,
-                meta,
-                self._value_loss_fn,  # pyrefly: ignore
-            )
-        await asyncio.to_thread(self._value.finish_training)
+            with self._timer.time("policy_training"):
+                try:
+                    await asyncio.to_thread(
+                        self._trainer.begin_train_step,
+                        self._loss_fn,
+                    )
+                    for meta in metas:
+                        await asyncio.to_thread(
+                            self._trainer.train_microbatches_from_meta,
+                            meta,
+                            train_fields=self._train_fields,
+                        )
+                    result = await asyncio.to_thread(self._trainer.finish_train_step)
+                except BaseException:
+                    await asyncio.to_thread(self._trainer.abort_train_step)
+                    raise
         assert result is not None
         return result
 

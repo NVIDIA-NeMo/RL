@@ -1120,6 +1120,9 @@ class _NoOpTrainer:
     def finish_train_step(self) -> dict:
         return {}
 
+    def abort_train_step(self) -> None:
+        pass
+
     def offload_to_cpu(self) -> None:
         pass
 
@@ -1234,8 +1237,11 @@ class _StepMetricRecordingGeneration:
 
 
 class _NoOpDataPlane:
+    def __init__(self) -> None:
+        self.clear_calls: list[list[str]] = []
+
     def clear_samples(self, **kwargs) -> None:
-        del kwargs
+        self.clear_calls.append(list(kwargs["sample_ids"]))
 
 
 def _train_pump_controller(*, sampler) -> object:
@@ -1812,14 +1818,24 @@ class _NoOpValue:
     def prepare_for_training(self) -> None:
         self._record("prepare_for_training")
 
-    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
-        del meta, loss_fn
-        self._record("train_from_meta")
+    def begin_train_step(self, loss_fn) -> None:
+        del loss_fn
+        self._record("begin_train_step")
+
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+        del meta
+        self._record("train_microbatches_from_meta")
+
+    def finish_train_step(self) -> dict:
+        self._record("finish_train_step")
         return {
             "loss": torch.tensor([0.25]),
             "grad_norm": torch.tensor([1.5]),
             "all_mb_metrics": {"vf_clipfrac": [0.0], "values_min": [-1.0]},
         }
+
+    def abort_train_step(self) -> None:
+        self._record("abort_train_step")
 
     def finish_training(self) -> None:
         self._record("finish_training")
@@ -1832,6 +1848,7 @@ def _ppo_train_pump_controller(
     value: _NoOpValue | None = None,
     ppo_epochs: int = 1,
     critic_ppo_epochs: int | None = None,
+    num_prompts_per_step: int = 1,
 ) -> tuple[object, _NoOpValue]:
     ctrl = _train_pump_controller(sampler=sampler)
     value = _NoOpValue() if value is None else value
@@ -1844,7 +1861,7 @@ def _ppo_train_pump_controller(
     ctrl._value_loss_fn = MagicMock(name="value_loss_fn")
     ctrl._master_config.grpo = None
     ctrl._master_config.ppo = PPOConfig.model_construct(
-        num_prompts_per_step=1,
+        num_prompts_per_step=num_prompts_per_step,
         max_num_steps=1,
         policy_training_start_step=policy_training_start_step,
         seq_logprob_error_threshold=None,
@@ -1897,7 +1914,9 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
         "critic.get_values_from_meta",
         "critic.finish_inference",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
         "critic.finish_training",
         "policy.prepare_for_training",
     ]
@@ -1970,9 +1989,51 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="no valid response tokens after filtering"):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert "train_from_meta" not in value.calls
+    assert "train_microbatches_from_meta" not in value.calls
     # The forward still ran -- it is what the advantage stage consumes.
     assert "get_values_from_meta" in value.calls
+    assert ctrl._dp_client.clear_calls == [["sample-0"]]
+
+
+def test_train_pump_aborts_a_failed_split_critic_step_and_clears_tq(
+    monkeypatch,
+) -> None:
+    meta = _single_group_meta()
+    value = _NoOpValue()
+    value.train_microbatches_from_meta = MagicMock(
+        side_effect=RuntimeError("critic failed")
+    )
+    value.abort_train_step = MagicMock()
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta), value=value
+    )
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    with pytest.raises(RuntimeError, match="critic failed"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    value.abort_train_step.assert_called_once_with()
+    assert value.calls.count("finish_training") == 1
+    assert ctrl._dp_client.clear_calls == [["sample-0"]]
+
+
+def test_train_pump_aborts_a_failed_split_policy_step_and_clears_tq(
+    monkeypatch,
+) -> None:
+    meta = _single_group_meta()
+    ctrl, _ = _ppo_train_pump_controller(sampler=_OneThenEmptySampler(meta))
+    trainer = MagicMock(spec=_NoOpTrainer)
+    trainer.train_microbatches_from_meta.side_effect = RuntimeError("actor failed")
+    ctrl._trainer = trainer
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    with pytest.raises(RuntimeError, match="actor failed"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    trainer.abort_train_step.assert_called_once_with()
+    assert ctrl._dp_client.clear_calls == [["sample-0"]]
 
 
 @pytest.mark.parametrize("ppo_epochs", [1, 2])
@@ -1997,7 +2058,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert value.calls.count("train_from_meta") == critic_ppo_epochs
+    assert value.calls.count("finish_train_step") == critic_ppo_epochs
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
@@ -2060,8 +2121,12 @@ def test_train_pump_groups_ppo_epochs_by_model(monkeypatch) -> None:
         "critic.get_values_from_meta",
         "critic.finish_inference",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
         "critic.finish_training",
         "policy.prepare_for_training",
         "policy.begin_train_step",
@@ -2100,9 +2165,15 @@ def test_train_pump_runs_all_critic_epochs_before_actor_epochs(monkeypatch) -> N
         "critic.get_values_from_meta",
         "critic.finish_inference",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
         "critic.finish_training",
         "policy.prepare_for_training",
         "policy.begin_train_step",
@@ -2110,6 +2181,36 @@ def test_train_pump_runs_all_critic_epochs_before_actor_epochs(monkeypatch) -> N
         "policy.finish_train_step",
     ]
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+
+
+def test_train_pump_accumulates_every_ppo_chunk_into_each_optimizer_step(
+    monkeypatch,
+) -> None:
+    """A PPO epoch spans the full step even when the sampler yields it in chunks."""
+    meta = _single_group_meta()
+    calls: list[str] = []
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_ChunkedSampler(meta, chunks=2),
+        value=_NoOpValue(calls=calls, prefix="critic."),
+        ppo_epochs=2,
+        critic_ppo_epochs=2,
+        num_prompts_per_step=2,
+    )
+    ctrl._trainer = _EpochRecordingTrainer(calls)
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert calls.count("critic.begin_train_step") == 2
+    assert calls.count("critic.train_microbatches_from_meta") == 4
+    assert calls.count("critic.finish_train_step") == 2
+    assert calls.count("policy.begin_train_step") == 2
+    assert calls.count("policy.train_microbatches_from_meta") == 4
+    assert calls.count("policy.finish_train_step") == 2
+    assert calls.index("critic.finish_training") < calls.index(
+        "policy.prepare_for_training"
+    )
 
 
 def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:

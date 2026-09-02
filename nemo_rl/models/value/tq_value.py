@@ -53,9 +53,8 @@ class TQValue(TQDriverMixin, Value):
     built alongside this critic already did that. Partition lifecycle stays
     with the caller.
 
-    TODO(#2625): the value workers have no split begin/microbatch/finish train
-    API yet, so one train_from_meta call is one optimizer step and the
-    SingleController requires a PPO step to be a single streaming chunk.
+    The split begin/microbatch/finish API lets SingleController accumulate one
+    PPO critic optimizer step across several rollout chunks.
     """
 
     def __init__(
@@ -196,3 +195,72 @@ class TQValue(TQDriverMixin, Value):
         return _aggregate_train_results(
             self.worker_group.get_all_worker_results(futures)
         )
+
+    # ── split-API fanout (SC async PPO path) ──────────────────────────────
+
+    def begin_train_step(
+        self,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open one logical critic optimizer step on every worker."""
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        futures = self.worker_group.run_all_workers_single_data(
+            "begin_train_step_presharded",
+            loss_fn=loss_fn,
+            gbs=batch_size,
+            mbs=micro_batch_size,
+        )
+        ray.get(futures)
+
+    def train_microbatches_from_meta(
+        self,
+        meta: KVBatchMeta,
+        timer: Optional[Timer] = None,
+    ) -> None:
+        """Accumulate one TQ metadata slice into the open critic step."""
+        spa, dba = self._packing_args("train_mb_tokens")
+        train_meta = self._isolated_meta(
+            meta,
+            fields=list(DP_VALUE_TRAIN_FIELDS),
+            task_name="value_train",
+        )
+        with timer.time("value_training/shard_meta") if timer else nullcontext():
+            dp_metas, _ = shard_meta_for_dp(
+                train_meta,
+                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                batch_size=None,
+                sequence_packing_args=spa,
+                dynamic_batching_args=dba,
+            )
+        with (
+            timer.time("value_training/submit_microbatch_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_microbatch_presharded",
+                meta=dp_metas,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=_REPLICATED_AXES,
+                output_is_replicated=_REPLICATED_AXES,
+            )
+        self.worker_group.get_all_worker_results(futures)
+
+    def finish_train_step(self) -> dict[str, Any]:
+        """Finish and aggregate one logical critic optimizer step."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "finish_train_step_presharded"
+        )
+        results = ray.get(futures)
+        leader_results = [r for r in results if r.get("is_replica_leader", True)]
+        return _aggregate_train_results(leader_results)
+
+    def abort_train_step(self) -> None:
+        """Drop a partially accumulated critic step without updating weights."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "abort_train_step_presharded"
+        )
+        ray.get(futures)
