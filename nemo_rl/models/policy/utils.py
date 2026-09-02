@@ -221,6 +221,37 @@ def configure_dynamo_cache() -> None:
     torch._inductor.config.autotune_local_cache = False
 
 
+def validate_sequence_length_divisibility(
+    make_sequence_length_divisible_by: int,
+    *,
+    context_parallel_size: int,
+    tensor_parallel_size: int,
+    sequence_parallel: bool,
+) -> None:
+    """Validate the sequence-padding multiple required by CP and TP+SP."""
+    minimum_pad_factor = 1
+    if context_parallel_size > 1:
+        minimum_pad_factor *= 2 * context_parallel_size
+    if tensor_parallel_size > 1 and sequence_parallel:
+        minimum_pad_factor *= tensor_parallel_size
+
+    if (
+        make_sequence_length_divisible_by <= 0
+        or make_sequence_length_divisible_by % minimum_pad_factor != 0
+    ):
+        raise ValueError(
+            "make_sequence_length_divisible_by "
+            f"({make_sequence_length_divisible_by}) must be a positive multiple "
+            f"of the minimum pad factor ({minimum_pad_factor}).\n"
+            f"Please set policy.make_sequence_length_divisible_by to a positive "
+            f"multiple of {minimum_pad_factor}.\n"
+            "    - CP requires `2 * context_parallel_size`.\n"
+            "    - TP requires `tensor_parallel_size` only when sequence parallel "
+            "is enabled.\n"
+            "    - When both constraints apply, their factors are multiplied."
+        )
+
+
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
     """Get runtime environment configuration for policy workers.
 

@@ -108,6 +108,7 @@ def create_dtensor_config(
         "sequence_packing": {
             "enabled": False,
         },
+        "make_sequence_length_divisible_by": 2 * cp if cp > 1 else 1,
         "optimizer": {
             "name": "torch.optim.AdamW",
             "lr": 5e-6,

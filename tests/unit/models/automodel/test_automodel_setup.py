@@ -50,6 +50,7 @@ def mock_config():
         "max_grad_norm": 1.0,
         "offload_optimizer_for_logprob": False,
         "sequence_packing": {"enabled": False},
+        "make_sequence_length_divisible_by": 1,
         "dtensor_cfg": {
             "cpu_offload": False,
             "tensor_parallel_size": 1,
@@ -256,6 +257,26 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_make_sequence_length_divisible_by_rejects_invalid_cp_multiple(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+    ):
+        mock_config["dtensor_cfg"]["context_parallel_size"] = 2
+        mock_config["make_sequence_length_divisible_by"] = 2
+
+        with pytest.raises(ValueError, match=r"minimum pad factor \(4\)"):
+            validate_and_prepare_config(
+                config=mock_config,
+                processor=None,
+                rank=0,
+            )
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     def test_attention_implementation_selection(
         self,
         mock_dynamo,
@@ -277,11 +298,13 @@ class TestValidateAndPrepareConfig:
         # Test SDPA for cp > 1
         mock_config["sequence_packing"]["enabled"] = False
         mock_config["dtensor_cfg"]["context_parallel_size"] = 2
+        mock_config["make_sequence_length_divisible_by"] = 4
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl == "sdpa"
 
         # Test None for cp=1 without sequence packing
         mock_config["dtensor_cfg"]["context_parallel_size"] = 1
+        mock_config["make_sequence_length_divisible_by"] = 1
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl is None
 
