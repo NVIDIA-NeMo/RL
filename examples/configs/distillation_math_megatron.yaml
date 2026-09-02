@@ -188,6 +188,13 @@ policy: &POLICY_BASE
 teacher:
     <<: *POLICY_BASE
     model_name: "Qwen/Qwen3-4B"
+    # The `<<` merge key above is resolved by the YAML parser, so it copies the
+    # policy values as they are written in this file and does not see later CLI
+    # overrides. Track the student sequence length through an interpolation
+    # instead, so `policy.max_total_sequence_length=...` on the command line
+    # applies to both models (and to everything derived from it below, such as
+    # dynamic batching and the vLLM `max_model_len`).
+    max_total_sequence_length: ${policy.max_total_sequence_length}
     megatron_cfg:
         <<: *MEGATRON_BASE
         context_parallel_size: 2
