@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Annotated, Literal, Self
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -44,6 +45,22 @@ class Eagle3DraftConfig(BaseModel, extra="allow"):
     optimizer: DraftOptimizerConfig | None = None
 
 
-def draft_refit_enabled(config: Eagle3DraftConfig | None) -> bool:
+def coerce_draft_config(
+    config: "Eagle3DraftConfig | Mapping[str, Any] | None",
+) -> Eagle3DraftConfig | None:
+    """Accept either a validated model or a raw mapping at API boundaries.
+
+    ``MasterConfig`` validation normally produces the model, but ``PolicyConfig``
+    is a TypedDict, so callers that assemble one by hand still pass a plain dict.
+    """
+    if config is None or isinstance(config, Eagle3DraftConfig):
+        return config
+    return Eagle3DraftConfig.model_validate(config)
+
+
+def draft_refit_enabled(
+    config: "Eagle3DraftConfig | Mapping[str, Any] | None",
+) -> bool:
     """Return whether generation must accept refitted draft weights."""
-    return config is not None and config.enabled
+    coerced = coerce_draft_config(config)
+    return coerced is not None and coerced.enabled
