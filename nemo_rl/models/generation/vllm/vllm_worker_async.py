@@ -15,7 +15,9 @@
 import asyncio
 import copy
 import gc
+import importlib.util
 import logging
+import os
 import threading
 import time
 import uuid
@@ -79,6 +81,14 @@ def _is_context_length_error(error: BaseException) -> bool:
     return any(marker in message for marker in _CONTEXT_LENGTH_ERROR_MARKERS)
 
 
+def _resolved_module_source(module_name: str) -> str:
+    """Return both the import origin and resolved path for startup diagnostics."""
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.origin is None:
+        return "<not found>"
+    return f"{spec.origin} -> {os.path.realpath(spec.origin)}"
+
+
 class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
 ):
@@ -122,6 +132,16 @@ class VllmAsyncGenerationWorkerImpl(
         self.http_server = None
         self._routed_experts_store_writer = None
         self._routed_experts_store_writer_lock = threading.Lock()
+
+        LOGGER.info(
+            "vLLM runtime sources: package=%s; routed_experts_capturer=%s; "
+            "gpu_model_runner=%s",
+            _resolved_module_source("vllm"),
+            _resolved_module_source(
+                "vllm.model_executor.layers.fused_moe.routed_experts_capturer"
+            ),
+            _resolved_module_source("vllm.v1.worker.gpu_model_runner"),
+        )
 
         super().__init__(
             config,
