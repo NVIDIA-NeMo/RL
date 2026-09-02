@@ -14,9 +14,14 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
-from nemo_rl.data.collate_fn import preference_collate_fn
+from nemo_rl.data.collate_fn import (
+    eval_collate_fn,
+    preference_collate_fn,
+    rl_collate_fn,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -149,3 +154,60 @@ def test_preference_collate_fn():
     assert torch.equal(
         train_data["input_ids"][1][3:5], torch.tensor([8, 9])
     )  # assistant
+
+
+def _vllm_datum(idx: int, **vllm_kwargs) -> DatumSpec:
+    """Minimal DatumSpec carrying only the fields both collators need."""
+    return DatumSpec(
+        message_log=[
+            {"role": "user", "content": "hi", "token_ids": torch.tensor([1, 2])}
+        ],
+        length=2,
+        loss_multiplier=1.0,
+        extra_env_info={"ground_truth": "a"},
+        idx=idx,
+        task_name="vlm",
+        **vllm_kwargs,
+    )
+
+
+@pytest.mark.parametrize("collate_fn", [rl_collate_fn, eval_collate_fn])
+def test_collate_fn_omits_vllm_columns_for_text_only_batch(collate_fn):
+    """Rows from a text-only processor carry no vLLM prompt keys at all."""
+    batch = collate_fn([_vllm_datum(0), _vllm_datum(1)])
+
+    assert "vllm_content" not in batch
+    assert "vllm_multi_modal_data" not in batch
+
+
+@pytest.mark.parametrize("collate_fn", [rl_collate_fn, eval_collate_fn])
+def test_collate_fn_keeps_vllm_columns_for_fully_truncated_batch(collate_fn):
+    """A batch where every row was truncated still emits both prompt columns.
+
+    ``vlm_hf_data_processor`` sets ``vllm_content=None`` /
+    ``vllm_multi_modal_data={}`` for over-length rows, so the gate must key off
+    presence rather than value or the vLLM path silently loses its columns.
+    """
+    batch = collate_fn(
+        [_vllm_datum(i, vllm_content=None, vllm_multi_modal_data={}) for i in range(2)]
+    )
+
+    assert batch["vllm_content"] == [None, None]
+    assert batch["vllm_multi_modal_data"] == [{}, {}]
+
+
+@pytest.mark.parametrize("collate_fn", [rl_collate_fn, eval_collate_fn])
+def test_collate_fn_pads_rows_missing_vllm_keys(collate_fn):
+    """Mixed batches align every row so the columns stay row-indexable."""
+    image = MagicMock()
+    batch = collate_fn(
+        [
+            _vllm_datum(
+                0, vllm_content="<image> q", vllm_multi_modal_data={"image": image}
+            ),
+            _vllm_datum(1),
+        ]
+    )
+
+    assert batch["vllm_content"] == ["<image> q", None]
+    assert batch["vllm_multi_modal_data"] == [{"image": image}, {}]

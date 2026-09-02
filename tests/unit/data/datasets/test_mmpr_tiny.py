@@ -233,13 +233,67 @@ class TestVLMProcessorMMPRTiny:
         assert "ground_truth" in result["extra_env_info"]
         assert result["extra_env_info"]["ground_truth"] == "A"
         assert "vllm_content" in result
-        assert "vllm_images" in result
-        assert len(result["vllm_images"]) == 1
+        assert "vllm_multi_modal_data" in result
+        assert isinstance(result["vllm_multi_modal_data"]["image"], Image.Image)
         assert result["task_name"] == "mmpr-tiny"
         user_message = result["message_log"][0]
         assert torch.equal(user_message["num_frames"].as_tensor(), torch.tensor([1]))
         assert user_message["pixel_values"].pad_to_max_shape is True
         assert user_message["pixel_values"].as_tensor().dtype == torch.float32
+
+    def test_vllm_multi_modal_data_collapses_single_item_and_keeps_lists(
+        self, tiny_image_path
+    ):
+        """vLLM's ``multi_modal_data`` takes a bare value for one item per
+        modality and a list for several; the processor performs that collapse."""
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        single, _ = _run_processor(tiny_image_path)
+        assert isinstance(single["vllm_multi_modal_data"]["image"], Image.Image)
+
+        task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
+        task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
+        multi = vlm_hf_data_processor(
+            datum_dict={
+                "images": [tiny_image_path, tiny_image_path],
+                "question": "<image>\nLeft.\n<image>\nRight.",
+                "answer": "A",
+                "task_name": "mmpr-tiny",
+            },
+            task_data_spec=task_data_spec,
+            processor=_make_stub_nemotron_processor(num_tiles=2),
+            max_seq_length=8192,
+            idx=0,
+        )
+        images = multi["vllm_multi_modal_data"]["image"]
+        assert isinstance(images, list)
+        assert len(images) == 2
+        assert all(isinstance(image, Image.Image) for image in images)
+
+    def test_truncated_datum_emits_empty_vllm_prompt_data(self, tiny_image_path):
+        """Over-length rows are masked out and must carry no vLLM media."""
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
+        task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "images": [tiny_image_path],
+                "question": _RAW_QUESTION,
+                "answer": "A",
+                "task_name": "mmpr-tiny",
+            },
+            task_data_spec=task_data_spec,
+            processor=_make_stub_nemotron_processor(),
+            max_seq_length=1,
+            idx=0,
+        )
+
+        assert result["loss_multiplier"] == 0.0
+        assert result["vllm_content"] is None
+        assert result["vllm_multi_modal_data"] == {}
 
     def test_conversation_preprocessor_is_preserved(self, tiny_image_path):
         processor = _make_stub_nemotron_processor()

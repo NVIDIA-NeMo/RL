@@ -32,8 +32,9 @@ from transformers import PreTrainedTokenizerBase
 from transformers.audio_utils import load_audio
 from transformers.video_utils import load_video
 
-VLLM_MULTIMODAL_DATA_KEYS = frozenset({"vllm_images", "vllm_videos", "vllm_audios"})
-NATIVE_MULTIMODAL_KEYS = frozenset({"vllm_content", *VLLM_MULTIMODAL_DATA_KEYS})
+VLLM_CONTENT_KEY = "vllm_content"
+VLLM_MULTI_MODAL_DATA_KEY = "vllm_multi_modal_data"
+VLLM_PROMPT_KEYS = frozenset({VLLM_CONTENT_KEY, VLLM_MULTI_MODAL_DATA_KEY})
 IMAGE_CONTENT_TYPES = frozenset({"input_image", "image", "image_url"})
 VIDEO_CONTENT_TYPES = frozenset({"input_video", "video", "video_url"})
 AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})

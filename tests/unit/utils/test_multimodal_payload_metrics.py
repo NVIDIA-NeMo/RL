@@ -252,7 +252,7 @@ def test_nested_payload_metrics_aggregate_by_media_key():
     assert not any("[0]" in key or "[1]" in key for key in metrics)
 
 
-def test_native_audio_video_and_typed_image_metrics_count_shared_media():
+def test_vllm_data_and_typed_image_metrics_count_shared_media():
     image = Image.new("RGB", (4, 3))
     video = np.ones((2, 3, 4, 3), dtype=np.uint8)
     audio = np.ones(16, dtype=np.float32)
@@ -267,8 +267,10 @@ def test_native_audio_video_and_typed_image_metrics_count_shared_media():
                 {"type": "image", "image": image},
             ],
         ],
-        "vllm_videos": [[video], [video]],
-        "vllm_audios": [[(audio, 16_000)], [(audio, 16_000)]],
+        "vllm_multi_modal_data": [
+            {"video": video, "audio": (audio, 16_000)},
+            {"video": video, "audio": (audio, 16_000)},
+        ],
     }
 
     metrics = collect_multimodal_payload_metrics(

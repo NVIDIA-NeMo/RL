@@ -326,30 +326,20 @@ async def _run_env_eval_impl(
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
 
-        # get input prompt from message_log
-        is_multimodal = "vllm_content" in batch
+        # Get input prompts from message_log, preserving any vLLM-ready data.
+        vllm_content_rows = batch.get("vllm_content", None)
+        multi_modal_rows = batch.get("vllm_multi_modal_data", None)
         prompts = []
         prompts_for_display = []
         for i, message_log in enumerate(batch["message_log"]):
-            if is_multimodal and batch["vllm_content"][i] is not None:
-                vllm_content = batch["vllm_content"][i]
+            vllm_content = (
+                vllm_content_rows[i] if vllm_content_rows is not None else None
+            )
+            multi_modal_data = (
+                multi_modal_rows[i] if multi_modal_rows is not None else None
+            )
+            if vllm_content is not None:
                 prompt_dict = {"prompt": vllm_content}
-                multi_modal_data = {}
-                audios = batch.get("vllm_audios", None)
-                if audios is not None and len(audios[i]) > 0:
-                    multi_modal_data["audio"] = (
-                        audios[i][0] if len(audios[i]) == 1 else audios[i]
-                    )
-                images = batch.get("vllm_images", None)
-                if images is not None and len(images[i]) > 0:
-                    multi_modal_data["image"] = (
-                        images[i][0] if len(images[i]) == 1 else images[i]
-                    )
-                videos = batch.get("vllm_videos", None)
-                if videos is not None and len(videos[i]) > 0:
-                    multi_modal_data["video"] = (
-                        videos[i][0] if len(videos[i]) == 1 else videos[i]
-                    )
                 if multi_modal_data:
                     prompt_dict["multi_modal_data"] = multi_modal_data
                 prompts.append(prompt_dict)
@@ -359,11 +349,13 @@ async def _run_env_eval_impl(
                 # Note: utils.py's format_prompt_for_vllm_generation uses pre-tokenized
                 # prompt_token_ids instead, since the training pipeline already has
                 # input_ids tensors. Both are valid vLLM inputs but may tokenize
-                # slightly differently.
-                content = [message["content"] for message in message_log]
-                content = "\n".join(content)
-                prompts.append(content)
-                prompts_for_display.append(content)
+                # slightly differently. Only text-only rows have joinable
+                # string content; VLM rows carry a list of typed content parts.
+                fallback_content = "\n".join(
+                    message["content"] for message in message_log
+                )
+                prompts.append(fallback_content)
+                prompts_for_display.append(fallback_content)
 
         # generate by vllm
         inputs = BatchedDataDict({"prompts": prompts})
