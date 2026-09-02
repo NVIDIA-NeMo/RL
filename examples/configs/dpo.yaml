@@ -178,6 +178,17 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    # Compute the LM output-layer GEMM in fp32 rather than bf16. bf16 rounding of
+    # the logits dominates generation/training logprob mismatch
+    # (train/token_mult_prob_error). Pair with NRL_VLLM_FP32_LM_HEAD=1 in
+    # generation.vllm_cfg.env_vars: enabling it on only one engine makes the
+    # multiplicative error worse, because both otherwise round to the same grid.
+    # False | True (full fp32, ~2x cost on the logprob pass) | "tf32" (fp32 head
+    # on TF32 tensor cores: numerically identical here, ~baseline speed; preferred).
+    fp32_lm_head: False
+    # Keep the transformer residual stream in fp32; small additional reduction in
+    # gen/train logprob mismatch on top of fp32_lm_head.
+    fp32_residual_connection: False
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"

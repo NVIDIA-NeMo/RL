@@ -582,3 +582,143 @@ def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypat
     ext._maybe_process_mtp_drafter_after_loading()
 
     process_weights.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# fp32 LM head refit sync (NRL_VLLM_FP32_LM_HEAD)
+#
+# Regression tests for the production failure where the fp32 head cache was
+# built from dummy weights during warmup and never refreshed: the sync looked
+# for `lm_head` on `model_runner.model`, which was a CUDAGraphWrapper around a
+# NemotronH_Nano_VL_V2 that nests the text model as `language_model`.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLMHead(torch.nn.Module):
+    def __init__(self, vocab: int = 8, hidden: int = 4):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.randn(vocab, hidden, dtype=torch.bfloat16), requires_grad=False
+        )
+
+
+class _FakeTextModel(torch.nn.Module):
+    """Stands in for NemotronHForCausalLM: owns lm_head and compute_logits."""
+
+    def __init__(self):
+        super().__init__()
+        self.lm_head = _FakeLMHead()
+
+
+class _FakeVLModel(torch.nn.Module):
+    """Stands in for NemotronH_Nano_VL_V2: no lm_head, delegates to language_model."""
+
+    def __init__(self):
+        super().__init__()
+        self.language_model = _FakeTextModel()
+
+
+class _FakeCUDAGraphWrapper:
+    """Mirrors vllm.compilation.cuda_graph.CUDAGraphWrapper's attribute rules."""
+
+    def __init__(self, runnable):
+        self.runnable = runnable
+
+    def __getattr__(self, key):
+        if hasattr(self.runnable, key):
+            return getattr(self.runnable, key)
+        raise AttributeError(key)
+
+    def unwrap(self):
+        return self.runnable
+
+
+def _make_fp32_head_extension(backend, model, drafter_model=None):
+    ext = backend.VllmInternalWorkerExtension.__new__(
+        backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=model,
+        drafter=SimpleNamespace(model=drafter_model) if drafter_model else None,
+    )
+    return ext
+
+
+@pytest.mark.vllm
+def test_resolve_lm_head_owner_descends_wrappers_and_language_model():
+    from nemo_rl.models.generation.vllm import vllm_backend as backend
+
+    text = _FakeTextModel()
+    assert backend._resolve_lm_head_owner(text) is text
+
+    vl = _FakeVLModel()
+    assert backend._resolve_lm_head_owner(vl) is vl.language_model
+    assert backend._resolve_lm_head_owner(_FakeCUDAGraphWrapper(vl)) is (
+        vl.language_model
+    )
+    assert backend._resolve_lm_head_owner(_FakeCUDAGraphWrapper(text)) is text
+
+    assert backend._resolve_lm_head_owner(torch.nn.Module()) is None
+    assert backend._resolve_lm_head_owner(None) is None
+
+
+@pytest.mark.vllm
+def test_sync_fp32_lm_head_builds_then_refreshes_on_language_model(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend as backend
+
+    monkeypatch.setenv("NRL_VLLM_FP32_LM_HEAD", "1")
+    vl = _FakeVLModel()
+    text = vl.language_model
+    ext = _make_fp32_head_extension(backend, _FakeCUDAGraphWrapper(vl))
+
+    # First refit: engines start on dummy weights, so the cache must be built
+    # on the module that owns lm_head (the text model), not the wrapper.
+    ext._sync_fp32_lm_head()
+    cached = text._nrl_lm_head_fp32
+    assert cached.weight.dtype == torch.float32
+    torch.testing.assert_close(cached.weight, text.lm_head.weight.float())
+    assert text._nrl_lm_head_fp32_dirty is False
+    assert "_nrl_lm_head_fp32" not in dict(text.named_parameters())
+    assert not hasattr(vl, "_nrl_lm_head_fp32")
+
+    # Second refit lands new weights in place (nccl_reshard / sparse paths).
+    with torch.no_grad():
+        text.lm_head.weight.copy_(torch.randn_like(text.lm_head.weight))
+    ext._mark_fp32_lm_head_dirty()
+    assert text._nrl_lm_head_fp32_dirty is True
+
+    ext._sync_fp32_lm_head()
+    assert text._nrl_lm_head_fp32 is cached, "refresh must be in place"
+    torch.testing.assert_close(cached.weight, text.lm_head.weight.float())
+    assert text._nrl_lm_head_fp32_dirty is False
+
+
+@pytest.mark.vllm
+def test_sync_fp32_lm_head_raises_when_policy_has_no_lm_head(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend as backend
+
+    monkeypatch.setenv("NRL_VLLM_FP32_LM_HEAD", "1")
+    ext = _make_fp32_head_extension(backend, _FakeCUDAGraphWrapper(torch.nn.Module()))
+
+    with pytest.raises(RuntimeError, match="no module owning `lm_head`"):
+        ext._sync_fp32_lm_head()
+
+
+@pytest.mark.vllm
+def test_sync_fp32_lm_head_ignores_the_drafter(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend as backend
+
+    monkeypatch.setenv("NRL_VLLM_FP32_LM_HEAD", "1")
+    text = _FakeTextModel()
+    # NemotronHMTP has its own head but its compute_logits is not patched, so an
+    # fp32 copy there (~512 MiB/rank) would never be read. Must not be built.
+    drafter = _FakeTextModel()
+    ext = _make_fp32_head_extension(backend, text, drafter_model=drafter)
+
+    ext._sync_fp32_lm_head()
+    ext._mark_fp32_lm_head_dirty()
+    torch.testing.assert_close(
+        text._nrl_lm_head_fp32.weight, text.lm_head.weight.float()
+    )
+    assert not hasattr(drafter, "_nrl_lm_head_fp32")
+    assert not hasattr(drafter, "_nrl_lm_head_fp32_dirty")

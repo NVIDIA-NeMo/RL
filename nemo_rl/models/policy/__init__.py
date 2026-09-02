@@ -369,6 +369,22 @@ class MegatronConfig(TypedDict):
     # If True, defer the casting of logits to float32 until the backward pass.
     # If you are using logprob_chunk_size, you must set this to True.
     defer_fp32_logits: NotRequired[bool]
+    # Compute the LM output-layer GEMM in fp32 instead of bf16. bf16 rounding of
+    # the logits is the dominant source of generation/training logprob mismatch
+    # (train/token_mult_prob_error). Set the matching NRL_VLLM_FP32_LM_HEAD=1 in
+    # generation.vllm_cfg.env_vars: applying this to only one engine makes the
+    # multiplicative error worse, since both otherwise round to the same grid.
+    #   False   - bf16 head (default)
+    #   True    - full fp32 head (~2x cost on the logprob pass)
+    #   "tf32"  - fp32 head on TF32 tensor cores; numerically identical here
+    #             because the inputs are already exact bf16 values, at ~baseline
+    #             speed. Prefer this.
+    # No effect when use_fused_linear_logprobs is set, which bypasses the
+    # output layer's standalone forward.
+    fp32_lm_head: NotRequired[bool | Literal["tf32"]]
+    # Keep the transformer residual stream in fp32. Small additional reduction in
+    # gen/train logprob mismatch on top of fp32_lm_head.
+    fp32_residual_connection: NotRequired[bool]
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion

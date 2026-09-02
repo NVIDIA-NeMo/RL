@@ -57,6 +57,34 @@ from nemo_rl.models.generation.openai_server_utils import (
 
 LOGGER = logging.getLogger(__name__)
 
+# NeMo Gym's vllm_model proxy recovers from a prompt that overflows the context
+# window by turning the failure into an empty completion with
+# finish_reason="length" instead of failing the rollout. That handler keys on
+# HTTP 400 *and* this marker appearing in the response body (see
+# responses_api_models/vllm_model/app.py). Both halves of that contract are
+# asserted in tests/unit/models/generation/test_vllm_context_length_overflow.py;
+# do not reword without updating the proxy.
+CONTEXT_LENGTH_ERROR_MARKER = "context length"
+
+
+def context_length_overflow_message(prompt_len: int, max_model_len: int) -> str:
+    """Message for a prompt that leaves no room for output tokens."""
+    return (
+        f"Prompt length ({prompt_len}) fills or exceeds the model's maximum "
+        f"{CONTEXT_LENGTH_ERROR_MARKER} ({max_model_len}). "
+        f"No room for output tokens."
+    )
+
+
+def is_context_length_error(exc: BaseException) -> bool:
+    """Whether ``exc`` reports a prompt that exceeds the model's context window.
+
+    vLLM signals this several ways: VLLMValidationError from tokenization, and
+    a plain ValueError from the online renderer or from the max-token clamp.
+    Only the message is reliable across those paths.
+    """
+    return CONTEXT_LENGTH_ERROR_MARKER in str(exc)
+
 
 class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
@@ -441,10 +469,9 @@ class VllmAsyncGenerationWorkerImpl(
                 remaining = self.model_config.max_model_len - len(prompt_token_ids)
                 if remaining <= 0:
                     raise ValueError(
-                        f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                        "this model's maximum context length "
-                        f"(max_model_len={self.model_config.max_model_len}). "
-                        f"No room for output tokens."
+                        context_length_overflow_message(
+                            len(prompt_token_ids), self.model_config.max_model_len
+                        )
                     )
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
@@ -778,35 +805,28 @@ class VllmAsyncGenerationWorkerImpl(
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
-            except VLLMValidationError as e:
-                # Preserve the existing behavior for all typed vLLM request
-                # validation failures. VLLMValidationError inherits ValueError,
-                # so this handler must precede the narrower plain-ValueError case.
-                return JSONResponse(
-                    content={
-                        "error": {
-                            "message": str(e),
-                            "type": "invalid_request_error",
-                            "code": 400,
-                        }
-                    },
-                    status_code=400,
-                )
-            except ValueError as e:
-                # vLLM 0.25 can raise a plain ValueError for context overflow
-                # while preprocessing a chat request. Convert only that known
-                # request error to HTTP 400; unrelated ValueErrors are server
-                # bugs and must remain visible.
-                message = str(e)
-                if (
-                    "max_model_len" not in message
-                    and "maximum context length" not in message
+            except (VLLMValidationError, ValueError) as e:
+                # vLLM raises VLLMValidationError for prompts exceeding
+                # max_model_len during tokenization, instead of returning an
+                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
+                # detect context-length overflow and handle it gracefully.
+                #
+                # The renderer and _clamp_max_tokens raise a plain ValueError
+                # for the same condition. Without this, it escapes as a 500 and
+                # the Gym vllm_model proxy's handler never fires: it keys on
+                # `e.status == 400 and "context length" in body`, turning the
+                # overflow into an empty completion with finish_reason="length"
+                # (responses_api_models/vllm_model/app.py). A 500 instead burns
+                # the retry budget and then fails the rollout.
+                # Any other ValueError is a real error: let it 500.
+                if not isinstance(e, VLLMValidationError) and not (
+                    is_context_length_error(e)
                 ):
                     raise
                 return JSONResponse(
                     content={
                         "error": {
-                            "message": message,
+                            "message": str(e),
                             "type": "invalid_request_error",
                             "code": 400,
                         }

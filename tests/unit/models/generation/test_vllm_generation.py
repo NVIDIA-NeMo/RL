@@ -454,8 +454,13 @@ def _fake_chat_request():
 @pytest.mark.parametrize(
     "message",
     [
-        "Input length (196609) exceeds model's maximum context length (196608)",
-        "Prompt fills or exceeds max_model_len (196608)",
+        # vLLM tokenization-time rejection (VLLMValidationError text).
+        "You passed 131073 input tokens and requested 0 output tokens. However, "
+        "the model's context length is only 131072 tokens, resulting in a maximum "
+        "input length of 131072 tokens.",
+        # vLLM renderer rejection (plain ValueError text).
+        "This model's maximum context length is 98304 tokens. However, you "
+        "requested 1 output tokens and your prompt contains at least 98329 tokens.",
     ],
 )
 async def test_vllm_http_server_maps_plain_context_overflow_to_400(
