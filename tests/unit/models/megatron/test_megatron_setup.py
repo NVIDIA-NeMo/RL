@@ -1785,6 +1785,8 @@ class TestApplyPerformanceConfig:
             apply_te_precision_config(SimpleNamespace(num_layers=48), config)
 
     def test_nvfp4_pertoken_accepts_complete_training_contract(self):
+        from pathlib import Path
+
         from nemo_rl.models.megatron.setup import apply_te_precision_config
 
         model_cfg = SimpleNamespace(num_layers=48)
@@ -1799,8 +1801,9 @@ class TestApplyPerformanceConfig:
                 "first_last_layers_bf16": True,
                 "num_layers_at_start_in_bf16": 2,
                 "num_layers_at_end_in_bf16": 4,
-                "te_precision_config_file": (
-                    "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                "te_precision_config_file": str(
+                    Path(__file__).resolve().parents[4]
+                    / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
                 ),
                 "env_vars": {
                     "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",

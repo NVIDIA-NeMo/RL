@@ -553,6 +553,7 @@ def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
 @pytest.mark.asyncio
 async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {}
     worker._sparse_refit_receiver = MagicMock()
     worker._mtp_load_from_disk = False
     worker.report_device_id_async = AsyncMock(return_value=["0"])
@@ -573,6 +574,7 @@ async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
 
 def test_sync_post_init_binds_numa() -> None:
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {}
     worker._sparse_refit_receiver = None
     worker._mtp_load_from_disk = False
     worker.report_device_id = MagicMock(return_value=["0"])
