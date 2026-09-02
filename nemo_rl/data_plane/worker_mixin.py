@@ -135,12 +135,15 @@ class TQWorkerMixin:
 
         Called once by the driver after worker construction. Idempotent.
         """
-        if getattr(self, "model_slices_context_parallel_inputs", False):
-            raise NotImplementedError(
-                "TransferQueue/SingleController does not yet support models that "
-                "insert media before context-parallel input selection. Use the "
-                "synchronous NeMo-RL policy path for Nemotron Omni."
-            )
+        # Models that insert media before CP input selection
+        # (``model_slices_context_parallel_inputs``) need the caller to hand
+        # them full, unsliced THD rows. That is what they get: ``_fetch``
+        # leader-fetches one DP slice and NCCL-broadcasts it across the
+        # replica group, which is TP x CP x PP siblings of a single DP rank,
+        # so every CP sibling sees identical full rows and the model applies
+        # its own post-embedding slice. The presharded entrypoints then
+        # delegate to the same ``train`` / ``get_logprobs`` that carry the flag
+        # into ``models/megatron/data.py``.
         if self._dp_client is not None:
             return
         from nemo_rl.data_plane import build_data_plane_client

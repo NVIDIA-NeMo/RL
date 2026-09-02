@@ -1,0 +1,9 @@
+defaults: vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml
+data_plane:
+  enabled: true
+  backend: mooncake_cpu
+cluster:
+  # tp8 on one node leaves dp=1, so the distributed optimizer has nothing to
+  # shard across and the run lands ~108 MiB short in the MoE forward. dp=2 fits.
+  # Name stays 1n8g: common-tq.env derives the base recipe from it.
+  num_nodes: 2
