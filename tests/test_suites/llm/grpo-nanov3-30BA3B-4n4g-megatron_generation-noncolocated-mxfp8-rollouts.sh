@@ -43,7 +43,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'max(data["train/gen_kl_error"]) < 0.15' \
         'median(data["train/token_mult_prob_error"]) < 1.5' \
         "data['train/token_mult_prob_error']['${MAX_STEPS}'] < 2.0" \
-        'max(data["train/reward"]) > 0.0'
+        'max(data["train/reward"]) > 0.0' \
+        'median(data["timing/train/total_step_time"]) < 48'
 
     # Generation CUDA graphs must actually engage under MXFP8.
     if ! grep -Eq "cuda graph warmup" $RUN_LOG; then
