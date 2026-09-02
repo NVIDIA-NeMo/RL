@@ -76,6 +76,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
+    apply_fp32_lm_head,
     build_inference_model,
     finalize_megatron_setup,
     handle_model_import,
@@ -551,8 +552,6 @@ class MegatronPolicyWorkerImpl(
         self.model = model_and_optimizer_state.model
         fp32_lm_head = self.cfg["megatron_cfg"].get("fp32_lm_head")
         if fp32_lm_head:
-            from nemo_rl.models.megatron.setup import apply_fp32_lm_head
-
             apply_fp32_lm_head(self.model, use_tf32=(fp32_lm_head == "tf32"))
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler

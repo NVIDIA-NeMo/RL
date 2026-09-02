@@ -216,6 +216,9 @@ class VllmInternalWorkerExtension:
     # True once the MTP drafter has been served by a one-time disk load (see
     # load_mtp_weights_from_disk); refit then leaves those static weights alone.
     _mtp_drafter_from_disk: bool = False
+    # fp32 LM head (NRL_VLLM_FP32_LM_HEAD) once-per-worker log gates.
+    _nrl_fp32_dirty_logged: bool = False
+    _nrl_fp32_refresh_logged: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
 
@@ -643,18 +646,12 @@ class VllmInternalWorkerExtension:
           as ``language_model`` and delegate ``compute_logits`` to it.
 
         Resolve through both so refit sync and dirty-marking act on the same
-        object the patch reads from. Returns ``(label, module)`` pairs; the
-        drafter entry is omitted when there is no drafter.
+        object the patch reads from. Only the policy is covered: the
+        speculative drafter (``NemotronHMTP``) has its own, unpatched
+        ``compute_logits`` in a separate model file, so an fp32 copy of its
+        head would cost ~512 MiB/rank and never be read.
         """
-        targets: list[tuple[str, Any]] = []
-        for label, model in (
-            ("policy", self.model_runner.model),
-            ("drafter", self._get_drafter_model()),
-        ):
-            if model is None:
-                continue
-            targets.append((label, _resolve_lm_head_owner(model)))
-        return targets
+        return [("policy", _resolve_lm_head_owner(self.model_runner.model))]
 
     def _mark_fp32_lm_head_dirty(self) -> None:
         """Flag the NRL_VLLM_FP32_LM_HEAD cached head for refresh.
@@ -708,27 +705,20 @@ class VllmInternalWorkerExtension:
         (eager, post-refit) rather than lazily in compute_logits also keeps the
         allocation out of any CUDA graph pool.
 
-        Covers the MTP/Eagle3 drafter too when speculative decoding is on: it
-        is a separate module with its own head and its own refit stream.
-
         Raises:
             RuntimeError: if the policy model has no resolvable ``lm_head``.
                 A silent skip here is exactly the failure mode this guards
-                against, so it is fatal for the policy. Drafters commonly tie
-                their head to the policy's and are allowed to have none.
+                against (see ``_fp32_lm_head_targets``), so it is fatal.
         """
         for label, owner in self._fp32_lm_head_targets():
             if owner is None:
-                if label == "policy":
-                    raise RuntimeError(
-                        "[fp32_lm_head] NRL_VLLM_FP32_LM_HEAD=1 but no module "
-                        "owning `lm_head` could be resolved from "
-                        f"model_runner.model ({type(self.model_runner.model).__name__}). "
-                        "The fp32 head cache cannot be refreshed after refit, so "
-                        "generation would run on stale (dummy) head weights."
-                    )
-                logger.info("[fp32_lm_head] %s has no lm_head; skipping", label)
-                continue
+                raise RuntimeError(
+                    "[fp32_lm_head] NRL_VLLM_FP32_LM_HEAD=1 but no module owning "
+                    f"`lm_head` could be resolved for {label} from "
+                    f"model_runner.model ({type(self.model_runner.model).__name__}). "
+                    "The fp32 head cache cannot be refreshed after refit, so "
+                    "generation would run on stale (dummy) head weights."
+                )
             self._sync_fp32_lm_head_for(label, owner)
 
     def _sync_fp32_lm_head_for(self, label: str, model: Any) -> None:
@@ -761,11 +751,18 @@ class VllmInternalWorkerExtension:
             cached.weight.data.copy_(lm_head.weight)
             if getattr(cached, "bias", None) is not None:
                 cached.bias.data.copy_(lm_head.bias)
-            print(
+            # Runs every refit on every rank: print the first refresh (the
+            # dummy-weights -> real-weights transition, whose drift is the
+            # useful signal) and demote the rest to debug.
+            message = (
                 f"[fp32_lm_head] {label} ({type(model).__name__}): refreshed fp32 "
-                f"head cache after refit (pre-refresh drift={drift:.6g})",
-                flush=True,
+                f"head cache after refit (pre-refresh drift={drift:.6g})"
             )
+            if not self._nrl_fp32_refresh_logged:
+                self._nrl_fp32_refresh_logged = True
+                print(message, flush=True)
+            else:
+                logger.debug(message)
         model._nrl_lm_head_fp32_dirty = False
         # An fp32 copy of a bf16/fp16 tensor is exact, so any mismatch here
         # means the cache and the live head have diverged (wrong module, wrong

@@ -705,15 +705,20 @@ def test_sync_fp32_lm_head_raises_when_policy_has_no_lm_head(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_sync_fp32_lm_head_tolerates_drafter_without_lm_head(monkeypatch):
+def test_sync_fp32_lm_head_ignores_the_drafter(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend as backend
 
     monkeypatch.setenv("NRL_VLLM_FP32_LM_HEAD", "1")
     text = _FakeTextModel()
-    # Eagle3/MTP drafters commonly tie their head to the policy's.
-    ext = _make_fp32_head_extension(backend, text, drafter_model=torch.nn.Module())
+    # NemotronHMTP has its own head but its compute_logits is not patched, so an
+    # fp32 copy there (~512 MiB/rank) would never be read. Must not be built.
+    drafter = _FakeTextModel()
+    ext = _make_fp32_head_extension(backend, text, drafter_model=drafter)
 
     ext._sync_fp32_lm_head()
+    ext._mark_fp32_lm_head_dirty()
     torch.testing.assert_close(
         text._nrl_lm_head_fp32.weight, text.lm_head.weight.float()
     )
+    assert not hasattr(drafter, "_nrl_lm_head_fp32")
+    assert not hasattr(drafter, "_nrl_lm_head_fp32_dirty")
