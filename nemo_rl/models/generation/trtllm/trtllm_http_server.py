@@ -123,6 +123,7 @@ def _context_leg_response(
     gen: Any,
     disagg_params: Any,
     arrival_ts_us: "int | None" = None,
+    tokens_per_block: "int | None" = None,
 ) -> Any:
     """Reply to a ``context_only`` request.
 
@@ -189,6 +190,15 @@ def _context_leg_response(
             if timing.get(src):
                 response[dst] = timing[src]
         response["nemo_ctx_done_ts_us"] = time.time_ns() // 1_000
+        # Context-side prefix reuse for THIS request: the executor sets
+        # request.cached_tokens to the reused prefix length at the first
+        # chunk and bridges it onto the result. The final (gen) response's
+        # usage cannot stand in for it under ctx-first disaggregation.
+        cached = getattr(gen, "cached_tokens", None)
+        if cached is None and tokens_per_block:
+            cached = _tl_cached_tokens(gen, tokens_per_block)
+        if isinstance(cached, int) and cached >= 0:
+            response["nemo_ctx_cached_tokens"] = cached
 
     return JSONResponse(content=response)
 
@@ -685,6 +695,7 @@ def create_app(
             return _context_leg_response(
                 model_name, adj_prompt, gen, disagg_params,
                 arrival_ts_us=_tl_arrival_ts_us,
+                tokens_per_block=_tl_tpb,
             )
 
         gen_token_ids = list(gen.token_ids)
