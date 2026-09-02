@@ -1,0 +1,54 @@
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml
+
+grpo:
+  num_prompts_per_step: 64
+
+loss_fn:
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: true
+
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_8n4g_megatron
+
+policy:
+  is_vlm: true
+  train_global_batch_size: 1024
+  generation_batch_size: 1024
+  logprob_chunk_size: 1024
+  make_sequence_length_divisible_by: 256
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  sequence_packing:
+    train_mb_tokens: 10240
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    tensor_model_parallel_size: 1
+    activation_checkpointing: false
+    defer_fp32_logits: true
+    use_fused_weighted_squared_relu: true
+  generation:
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 2
+      expert_parallel_size: 2
+      enforce_eager: false
+    vllm_kwargs:
+      max_num_batched_tokens: 32768
+      max_num_seqs: 64
+      all2all_backend: flashinfer_nvlink_one_sided
+      kernel_config:
+        moe_backend: flashinfer_cutlass
+        enable_flashinfer_autotune: true
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: false
+  wandb:
+    name: nemotron-omni-8n4g-sync
+
+cluster:
+  num_nodes: 8
+  gpus_per_node: 4
+  segment_size: 8
