@@ -20,29 +20,14 @@ from nemo_rl.utils.routed_experts_ref import (
     ROUTED_EXPERTS_REF_DTYPE,
     ROUTED_EXPERTS_REF_KEY,
     ROUTED_EXPERTS_REF_SCHEMA,
-    RoutedExpertsMaterializerState,
     RoutedExpertsStoreState,
     _assemble_routed_experts_range_results,
     _normalize_routed_experts_batch,
     _plan_routed_experts_range_reads,
     materialize_routed_experts_refs,
     routed_experts_ref_lookup_key,
-    routed_experts_materialization_key,
     slice_routed_experts_ref,
 )
-
-
-_ZERO_RANGE_READ_STATS = {
-    "range_read_requests": 0,
-    "range_read_store_calls": 0,
-    "range_read_source_objects": 0,
-    "range_read_segments": 0,
-    "range_read_rows": 0,
-    "range_read_bytes": 0,
-    "full_source_rows_equivalent": 0,
-    "full_source_bytes_equivalent": 0,
-    "range_read_avoided_bytes": 0,
-}
 
 
 def _ref(*, target: int = 3, shape: tuple[int, int, int] = (5, 2, 2)):
@@ -60,6 +45,16 @@ def _ref(*, target: int = 3, shape: tuple[int, int, int] = (5, 2, 2)):
         "shape": list(shape),
         "dtype": ROUTED_EXPERTS_REF_DTYPE,
     }
+
+
+def _put_state(state: RoutedExpertsStoreState, ref: dict, value: np.ndarray) -> None:
+    state.put(
+        key=routed_experts_ref_lookup_key(ref),
+        object_ref=value,
+        nbytes=int(value.nbytes),
+        shape=value.shape,
+        dtype=str(value.dtype),
+    )
 
 
 def test_materialize_refs_resolves_one_full_object_for_multiple_message_slices():
@@ -90,6 +85,33 @@ def test_materialize_refs_resolves_one_full_object_for_multiple_message_slices()
     assert torch.equal(
         materialized[0, 5:], torch.full((3, 2, 2), -1, dtype=torch.int16)
     )
+
+
+def test_materialize_single_full_object_preserves_batch_shape_without_copy():
+    source = np.arange(5 * 2 * 2, dtype=np.int16).reshape(5, 2, 2)
+    materialized = materialize_routed_experts_refs(
+        [[_ref()]],
+        input_ids=torch.zeros(1, 5, dtype=torch.long),
+        input_lengths=torch.tensor([5], dtype=torch.int32),
+        resolver=lambda ref: source,
+    )
+
+    assert materialized.shape == (1, 5, 2, 2)
+    source[0, 0, 0] = 123
+    assert materialized[0, 0, 0, 0].item() == 123
+
+
+def test_materialize_single_full_object_adds_requested_padding():
+    source = np.arange(5 * 2 * 2, dtype=np.int16).reshape(5, 2, 2)
+    materialized = materialize_routed_experts_refs(
+        [[_ref()]],
+        input_ids=torch.zeros(1, 8, dtype=torch.long),
+        input_lengths=torch.tensor([5], dtype=torch.int32),
+        resolver=lambda ref: source,
+    )
+
+    assert torch.equal(materialized[0, :5], torch.from_numpy(source))
+    assert torch.all(materialized[0, 5:] == -1)
 
 
 def test_materialize_refs_concatenates_segments_from_multiple_turn_requests():
@@ -128,8 +150,8 @@ def test_store_state_returns_only_requested_ranges_from_owned_arrays():
     second_source = np.arange(4 * 2 * 2, dtype=np.int16).reshape(4, 2, 2) + 100
     first_ref = _ref(shape=(5, 2, 2)) | {"request_id": "request-first"}
     second_ref = _ref(shape=(4, 2, 2)) | {"request_id": "request-second"}
-    state.put(key=routed_experts_ref_lookup_key(first_ref), value=first_source)
-    state.put(key=routed_experts_ref_lookup_key(second_ref), value=second_source)
+    _put_state(state, first_ref, first_source)
+    _put_state(state, second_ref, second_source)
 
     refs = [
         slice_routed_experts_ref(first_ref, offset=1, length=2),
@@ -174,8 +196,8 @@ def test_range_plan_and_scatter_preserve_interleaved_store_order():
         "store-a": RoutedExpertsStoreState("instance-a"),
         "store-b": RoutedExpertsStoreState("instance-b"),
     }
-    states["store-a"].put(key=routed_experts_ref_lookup_key(ref_a), value=source_a)
-    states["store-b"].put(key=routed_experts_ref_lookup_key(ref_b), value=source_b)
+    _put_state(states["store-a"], ref_a, source_a)
+    _put_state(states["store-b"], ref_b, source_b)
     results = []
     for group in groups:
         values = states[group.store_name].get_ranges(
@@ -254,123 +276,6 @@ def test_materialize_refs_rejects_incomplete_sample_coverage():
         )
 
 
-def test_materialization_key_covers_order_slices_padding_and_target_version():
-    full_ref = _ref()
-    first = slice_routed_experts_ref(full_ref, offset=0, length=2)
-    second = slice_routed_experts_ref(full_ref, offset=2, length=3)
-
-    def key(refs, *, padded_length=8):
-        return routed_experts_materialization_key(
-            refs,
-            batch_size=1,
-            padded_length=padded_length,
-            input_lengths=[5],
-        )
-
-    baseline = key([[first, second]])
-
-    assert key([[dict(first), dict(second)]]) == baseline
-    assert key([[second | {"length": 3}, first | {"length": 2}]]) != baseline
-    assert key([[first, second]], padded_length=9) != baseline
-    assert (
-        key(
-            [[first | {"target_weight_version": 4}, second]],
-        )
-        != baseline
-    )
-
-    sample_a = _ref(shape=(2, 2, 2)) | {"request_id": "sample-a"}
-    sample_b = _ref(shape=(3, 2, 2)) | {"request_id": "sample-b"}
-    ordered = routed_experts_materialization_key(
-        [[sample_a], [sample_b]],
-        batch_size=2,
-        padded_length=4,
-        input_lengths=[2, 3],
-    )
-    reordered = routed_experts_materialization_key(
-        [[sample_b], [sample_a]],
-        batch_size=2,
-        padded_length=4,
-        input_lengths=[3, 2],
-    )
-    assert ordered != reordered
-
-
-def test_materializer_state_singleflights_sibling_requests_and_retires():
-    state = RoutedExpertsMaterializerState(max_entries=2)
-    key = "microbatch-a"
-
-    assert state.get(key) is None
-    state.put(
-        key=key,
-        object_ref="dense-ref-a",
-        nbytes=80,
-        shape=(1, 5, 2, 2),
-        dtype="int16",
-        target_weight_versions=[3],
-    )
-    for _ in range(63):
-        assert state.get(key).object_ref == "dense-ref-a"
-
-    assert (
-        state.stats()
-        == {
-            "remaining_materializations": 1,
-            "materialization_cache_requests": 64,
-            "materialization_cache_hits": 63,
-            "materialization_cache_misses": 1,
-            "materializations": 1,
-            "materialized_bytes": 80,
-            "materialization_cache_evictions": 0,
-        }
-        | _ZERO_RANGE_READ_STATS
-    )
-
-    assert (
-        state.retire_through(3)
-        == {
-            "remaining_materializations": 0,
-            "materialization_cache_requests": 64,
-            "materialization_cache_hits": 63,
-            "materialization_cache_misses": 1,
-            "materializations": 1,
-            "materialized_bytes": 80,
-            "materialization_cache_evictions": 0,
-            "retired_through": 3,
-            "retired_materializations": 1,
-            "retired_materialized_bytes": 80,
-        }
-        | _ZERO_RANGE_READ_STATS
-    )
-
-
-def test_materializer_state_lru_bound_evicts_least_recently_used_entry():
-    state = RoutedExpertsMaterializerState(max_entries=2)
-    for index in range(2):
-        state.put(
-            key=f"microbatch-{index}",
-            object_ref=f"dense-ref-{index}",
-            nbytes=40,
-            shape=(1, 5, 2, 2),
-            dtype="int16",
-            target_weight_versions=[3],
-        )
-    assert state.get("microbatch-0") is not None
-    state.put(
-        key="microbatch-2",
-        object_ref="dense-ref-2",
-        nbytes=40,
-        shape=(1, 5, 2, 2),
-        dtype="int16",
-        target_weight_versions=[4],
-    )
-
-    assert state.get("microbatch-1") is None
-    assert state.get("microbatch-0") is not None
-    assert state.get("microbatch-2") is not None
-    assert state.stats()["materialization_cache_evictions"] == 1
-
-
 def test_store_state_retire_through_is_monotonic_and_rejects_late_puts():
     state = RoutedExpertsStoreState("instance-a")
     target_three = _ref(target=3)
@@ -378,8 +283,8 @@ def test_store_state_retire_through_is_monotonic_and_rejects_late_puts():
     target_four["request_id"] = "request-b"
     value_three = np.zeros((5, 2, 2), dtype=np.int16)
     value_four = np.zeros((5, 3, 2), dtype=np.int16)
-    state.put(key=routed_experts_ref_lookup_key(target_three), value=value_three)
-    state.put(key=routed_experts_ref_lookup_key(target_four), value=value_four)
+    _put_state(state, target_three, value_three)
+    _put_state(state, target_four, value_four)
 
     result = state.retire_through(3)
 
@@ -393,11 +298,14 @@ def test_store_state_retire_through_is_monotonic_and_rejects_late_puts():
         state.get(
             key=routed_experts_ref_lookup_key(target_four),
             store_instance_id="instance-a",
-        ).value
+        ).object_ref
         is value_four
     )
     with pytest.raises(RuntimeError, match="retired target-weight version"):
         state.put(
             key=routed_experts_ref_lookup_key(target_three),
-            value=value_three,
+            object_ref=value_three,
+            nbytes=int(value_three.nbytes),
+            shape=value_three.shape,
+            dtype=str(value_three.dtype),
         )
