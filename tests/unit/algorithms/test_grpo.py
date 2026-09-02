@@ -345,7 +345,7 @@ def mock_grpo_components():
     tokenizer.pad_token_id = 0
 
     loss_config = ClippedPGLossConfig(
-        ratio_clip_min=0.8, ratio_clip_max=1.2, ratio_clip_c=1.0
+        ratio_clip_min=0.8, ratio_clip_max=1.2, ratio_clip_c=None
     )
     loss_fn = ClippedPGLossFn(loss_config)
     logger = MagicMock()
