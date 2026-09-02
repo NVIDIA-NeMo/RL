@@ -67,6 +67,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.algorithms.utils import build_rollout_group_ids_from_sample_ids
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
@@ -1696,7 +1697,12 @@ class SingleControllerActor:
             select_fields=self._advantage_input_fields(),
         )
 
-        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        # The selected metadata retains each prompt group's UUID in its sample
+        # IDs. Text-token equality is insufficient for multimodal prompts.
+        prompt_ids = build_rollout_group_ids_from_sample_ids(
+            meta.sample_ids,
+            expected_group_size=self._algo_cfg.num_generations_per_prompt,
+        )
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
@@ -1810,7 +1816,6 @@ class SingleControllerActor:
     def _advantage_input_fields(self) -> list[str]:
         adv_cfg = self._advantage_cfg
         fields = [
-            adv_cfg.prompt_ids_field,
             adv_cfg.reward_field,
             adv_cfg.token_mask_field,
             adv_cfg.sample_mask_field,
