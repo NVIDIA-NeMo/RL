@@ -289,7 +289,7 @@ class VllmInternalWorkerExtension:
         self._model_express = ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
                 engine_context=VllmGeneratorContext(
-                    model=self.model_runner.model,
+                    model=self.model_runner.get_model(),
                     vllm_config=self.model_runner.vllm_config,
                 ),
                 model_name=self.model_runner.model_config.model,

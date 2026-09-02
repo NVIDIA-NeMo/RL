@@ -18,7 +18,8 @@
 
 import contextlib
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -37,6 +38,39 @@ def _make_collective_update_extension(backend):
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
+
+
+@pytest.mark.vllm
+def test_initialize_model_express_uses_unwrapped_vllm_model(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = torch.nn.Module()
+    model_runner = MagicMock()
+    model_runner.get_model.return_value = model
+    model_runner.vllm_config = object()
+    model_runner.model_config.model = "test/model"
+
+    context = MagicMock()
+    config = MagicMock()
+    client = MagicMock()
+    client.initialize.return_value = object()
+    modelexpress_rl = ModuleType("modelexpress_rl")
+    modelexpress_rl.ModelExpressGeneratorClient = client
+    modelexpress_rl.ModelExpressGeneratorConfig = config
+    modelexpress_rl.VllmGeneratorContext = context
+    monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
+
+    worker = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    worker.model_runner = model_runner
+    worker.initialize_model_express(server_url="mx-server:8000")
+
+    model_runner.get_model.assert_called_once_with()
+    context.assert_called_once_with(
+        model=model,
+        vllm_config=model_runner.vllm_config,
+    )
 
 
 def _write_sharded_checkpoint(model_dir, shards):
