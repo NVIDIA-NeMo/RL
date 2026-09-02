@@ -20,6 +20,8 @@ policy:
       lr_warmup_iters: 50
   sequence_packing:
     enabled: false
+  generation:
+    lora_refit_mode: merged
 logger:
   log_dir: logs/grpo-qwen3-8b-base-1n8g-megatron-lora
   wandb_enabled: true
