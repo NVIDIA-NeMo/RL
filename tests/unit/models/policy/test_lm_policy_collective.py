@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
-
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 
@@ -89,16 +87,6 @@ def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
             },
         )
     ]
-
-
-def test_policy_rejects_user_configured_checkpoint_async_mode():
-    with pytest.raises(ValueError, match="checkpointing.is_async is managed"):
-        Policy(
-            cluster=None,
-            config={},
-            tokenizer=None,
-            checkpointing_cfg={"is_async": True},
-        )
 
 
 def test_policy_uses_megatron_save_path_when_dtensor_is_disabled(monkeypatch):

@@ -19,7 +19,7 @@ for saving and loading model checkpoints in DTensor-based policy workers.
 
 import logging
 import os
-from typing import Any, Mapping, Optional
+from typing import Any, Optional
 
 import torch
 from nemo_automodel.components._peft.lora import PeftConfig
@@ -53,42 +53,6 @@ _AUTOMODEL_CONFIG_FIELDS = frozenset(
         "skip_task_head_prefixes_for_base_model",
     }
 )
-# NeMo-RL always finalizes async saves before promoting tmp_step_N, owns
-# checkpoint selection/retention, and does not expose Diffusers checkpoints.
-_UNSUPPORTED_AUTOMODEL_CONFIG_FIELDS = frozenset(
-    {
-        "allow_legacy_pickle_restore",
-        "best_metric_key",
-        "diffusers_compatible",
-        "max_recent_checkpoints",
-        "wait_for_staging",
-    }
-)
-
-
-def _extract_automodel_config_updates(
-    config_updates: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return supported Automodel fields and reject known unsupported ones."""
-    unsupported_fields = sorted(
-        _UNSUPPORTED_AUTOMODEL_CONFIG_FIELDS.intersection(config_updates)
-    )
-    if unsupported_fields:
-        raise ValueError(
-            "Unsupported checkpointing field(s) for NeMo-RL's Automodel "
-            f"integration: {', '.join(unsupported_fields)}. NeMo-RL owns async "
-            "save finalization, checkpoint metric selection, and checkpoint "
-            "retention; use metric_name, keep_top_k, and ft_keep_latest_k for "
-            "the corresponding NeMo-RL behavior. Diffusers checkpoint export is "
-            "not supported by NeMo-RL. Automodel's legacy pickle restore only "
-            "applies to training-state loaders that NeMo-RL does not use."
-        )
-
-    return {
-        key: value
-        for key, value in config_updates.items()
-        if key in _AUTOMODEL_CONFIG_FIELDS
-    }
 
 
 def _patch_qwen_vl_vision_key_mapping() -> None:
@@ -212,7 +176,11 @@ class AutomodelCheckpointManager:
         # Let Automodel own defaults, validation, and normalization. All
         # resource-owning settings must be present before build() creates async
         # stagers and dedicated process groups on every rank.
-        automodel_config_updates = _extract_automodel_config_updates(config_updates)
+        automodel_config_updates = {
+            key: value
+            for key, value in config_updates.items()
+            if key in _AUTOMODEL_CONFIG_FIELDS
+        }
         base_cfg = AutomodelCheckpointingConfig(
             enabled=True,
             checkpoint_dir=checkpoint_root or "",

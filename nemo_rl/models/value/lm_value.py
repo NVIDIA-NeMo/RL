@@ -79,14 +79,6 @@ class Value(ValueInterface):
         # Value models use the same backend configuration as policy models
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-        if checkpointing_cfg is not None and "is_async" in checkpointing_cfg:
-            raise ValueError(
-                "checkpointing.is_async is managed by the training backend and "
-                "must not be set. Configure Megatron async saves with "
-                "value.megatron_cfg.checkpoint.async_save; Automodel value saves "
-                "are always synchronous."
-            )
-
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (value.megatron_cfg.enabled=true) or "

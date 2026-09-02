@@ -275,6 +275,44 @@ def test_world_size_validation_dtensor(
         mock_ray_worker_group.assert_not_called()
 
 
+@pytest.mark.parametrize("checkpointing_enabled", [True, False])
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_v1_model_save_format_guard_respects_checkpointing_enabled(
+    mock_ray_worker_group,
+    checkpointing_enabled,
+):
+    """A disabled checkpointer must not reject dormant DTensor v1 settings."""
+    config = create_dtensor_config("test/model", tp=1)
+    config["dtensor_cfg"]["_v2"] = False
+    checkpointing_cfg = {
+        "enabled": checkpointing_enabled,
+        "model_save_format": "safetensors",
+    }
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker.from_config"),
+    ):
+        if checkpointing_enabled:
+            with pytest.raises(ValueError, match="model_save_format must be None"):
+                Policy(
+                    cluster=create_mock_cluster(world_size=1),
+                    config=config,
+                    tokenizer=create_mock_tokenizer(),
+                    checkpointing_cfg=checkpointing_cfg,
+                )
+            mock_ray_worker_group.assert_not_called()
+        else:
+            Policy(
+                cluster=create_mock_cluster(world_size=1),
+                config=config,
+                tokenizer=create_mock_tokenizer(),
+                checkpointing_cfg=checkpointing_cfg,
+            )
+            mock_ray_worker_group.assert_called_once()
+
+
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
 def test_dtensor_dp_replicate_size_sets_batching_dp(
     mock_ray_worker_group,

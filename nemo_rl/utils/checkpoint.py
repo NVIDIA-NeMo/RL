@@ -177,22 +177,14 @@ class CheckpointingConfig(TypedDict):
     model_save_format: NotRequired[str | None]  # Default: "safetensors"
     save_consolidated: NotRequired[
         Literal["false", "final", "every"]
-    ]  # Automodel default: "final"
+    ]  # Default: "false"
     single_rank_consolidation: NotRequired[bool]  # Default: False
     consolidation_timeout_minutes: NotRequired[int]  # Default: 30
     model_cache_dir: NotRequired[str]  # Default: ""
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
-    # Reserved for backend-owned Automodel setup; user values are rejected.
-    is_async: NotRequired[bool]
-    # Keep known upstream-only keys through Pydantic parsing so the Automodel
-    # wrapper can reject them explicitly instead of silently dropping them.
-    wait_for_staging: NotRequired[bool]
-    diffusers_compatible: NotRequired[bool]
-    best_metric_key: NotRequired[str]
-    max_recent_checkpoints: NotRequired[int | None]
-    allow_legacy_pickle_restore: NotRequired[bool]  # Rejected by NeMo-RL.
+    is_async: NotRequired[bool]  # Default: False
 
 
 def should_save_as_final_checkpoint(

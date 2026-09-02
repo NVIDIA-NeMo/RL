@@ -120,13 +120,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
         draft_enabled = bool(config.get("draft", {}).get("enabled", False))
-        if checkpointing_cfg is not None and "is_async" in checkpointing_cfg:
-            raise ValueError(
-                "checkpointing.is_async is managed by the training backend and "
-                "must not be set. Configure Megatron async saves with "
-                "policy.megatron_cfg.checkpoint.async_save; Automodel policy "
-                "saves are always asynchronous."
-            )
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
@@ -248,6 +241,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             dtensor_enable
             and not use_v2
             and checkpointing_cfg is not None
+            and checkpointing_cfg["enabled"]
             and checkpointing_cfg.get("model_save_format", None) is not None
         ):
             raise ValueError(

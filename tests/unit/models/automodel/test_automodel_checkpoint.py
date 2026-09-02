@@ -14,12 +14,15 @@
 """Unit tests for automodel checkpoint utilities."""
 
 import os
-from dataclasses import fields
+import time
+from datetime import timedelta
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 # Skip entire module if nemo_automodel is not available
 try:
@@ -31,76 +34,11 @@ from nemo_automodel.components._peft.lora import (
     PeftConfig,
     apply_lora_to_linear_modules,
 )
-from nemo_automodel.components.checkpoint.config import (
-    CheckpointingConfig as AutomodelCheckpointingConfig,
-)
 from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
 
 from nemo_rl.models.automodel.checkpoint import (
-    _AUTOMODEL_CONFIG_FIELDS,
-    _UNSUPPORTED_AUTOMODEL_CONFIG_FIELDS,
     AutomodelCheckpointManager,
-    _extract_automodel_config_updates,
 )
-from nemo_rl.utils.checkpoint import CheckpointingConfig
-
-
-@pytest.mark.automodel
-def test_automodel_checkpoint_fields_are_explicitly_classified():
-    """An upstream field must be supported, rejected, internal, or unexposed."""
-    internal_fields = frozenset(
-        {
-            "checkpoint_dir",
-            "enabled",
-            "model_state_dict_keys",
-            "original_model_root_dir",
-        }
-    )
-    # Upstream options intentionally not exposed by NeMo-RL yet.
-    unexposed_fields = frozenset({"cpu_offload", "staging_dir", "v4_compatible"})
-    field_groups = (
-        _AUTOMODEL_CONFIG_FIELDS,
-        _UNSUPPORTED_AUTOMODEL_CONFIG_FIELDS,
-        internal_fields,
-        unexposed_fields,
-    )
-    classified_fields = set().union(*field_groups)
-    assert sum(map(len, field_groups)) == len(classified_fields)
-    upstream_fields = {field.name for field in fields(AutomodelCheckpointingConfig)}
-    assert classified_fields == upstream_fields
-
-    # These fields are populated by the worker/runtime rather than user YAML.
-    caller_supplied_fields = (
-        classified_fields
-        - unexposed_fields
-        - {
-            "checkpoint_dir",
-            "enabled",
-            "model_state_dict_keys",
-            "original_model_root_dir",
-            "dequantize_base_checkpoint",
-            "skip_task_head_prefixes_for_base_model",
-            "is_async",
-        }
-    )
-    assert caller_supplied_fields <= CheckpointingConfig.__annotations__.keys()
-
-
-@pytest.mark.automodel
-@pytest.mark.parametrize(
-    ("field_name", "value"),
-    [
-        ("allow_legacy_pickle_restore", True),
-        ("best_metric_key", "loss"),
-        ("diffusers_compatible", True),
-        ("max_recent_checkpoints", 2),
-        ("wait_for_staging", True),
-    ],
-)
-def test_known_unsupported_automodel_fields_fail_loudly(field_name, value):
-    """Known upstream fields are never silently discarded."""
-    with pytest.raises(ValueError, match=field_name):
-        _extract_automodel_config_updates({field_name: value})
 
 
 class TestModel(torch.nn.Module):
@@ -124,6 +62,111 @@ class TestModel(torch.nn.Module):
 
     def apply_lora(self, lora_config: PeftConfig):
         apply_lora_to_linear_modules(self, lora_config)
+
+
+def _run_two_rank_consolidated_save(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    weights_path: str,
+) -> None:
+    """Save one small consolidated checkpoint on a real two-rank Gloo group."""
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    checkpoint_manager = None
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cpu",
+            (world_size, 1),
+            mesh_dim_names=("dp", "tp"),
+        )
+        checkpoint_manager = AutomodelCheckpointManager(
+            dp_mesh=mesh["dp"],
+            tp_mesh=mesh["tp"],
+        )
+        checkpoint_manager.init_checkpointer(
+            config_updates={
+                "is_async": False,
+                "model_save_format": "safetensors",
+                "save_consolidated": "every",
+                "single_rank_consolidation": False,
+                "consolidation_timeout_minutes": 1,
+            },
+            checkpoint_root=str(Path(weights_path).parent),
+        )
+
+        # Secondary structural assertion: the real multi-rank construction path
+        # must allocate the dedicated Gloo group used by consolidation.
+        assert checkpoint_manager.checkpointer is not None
+        assert checkpoint_manager.checkpointer._consolidation_process_group is not None
+
+        torch.manual_seed(1234)
+        checkpoint_manager.save_checkpoint(
+            model=TestModel(),
+            weights_path=weights_path,
+            is_final_checkpoint=False,
+        )
+        torch.distributed.barrier()
+    finally:
+        if (
+            checkpoint_manager is not None
+            and checkpoint_manager.checkpointer is not None
+        ):
+            checkpoint_manager.checkpointer.close()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="Gloo distributed backend is unavailable",
+)
+def test_two_rank_consolidated_save_uses_real_distributed_path(tmp_path):
+    """Exercise Automodel's multi-rank consolidated-save path on CPU/Gloo.
+
+    This validates multi-rank output and process-group construction. It does not
+    reproduce the NCCL fallback hang from issue #3893 because the test's WORLD
+    process group is itself Gloo.
+    """
+    world_size = 2
+    init_file = str(tmp_path / "two_rank_init")
+    weights_path = str(tmp_path / "two_rank_checkpoint")
+    context = mp.get_context("spawn")
+    processes = [
+        context.Process(
+            target=_run_two_rank_consolidated_save,
+            args=(rank, world_size, init_file, weights_path),
+        )
+        for rank in range(world_size)
+    ]
+
+    for process in processes:
+        process.start()
+
+    deadline = time.monotonic() + 180
+    for process in processes:
+        process.join(timeout=max(0, deadline - time.monotonic()))
+
+    hung_processes = [process for process in processes if process.is_alive()]
+    for process in hung_processes:
+        process.terminate()
+        process.join(timeout=5)
+    assert not hung_processes, "Two-rank consolidated save did not finish within 180s"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+    model_dir = Path(weights_path) / "model"
+    consolidated_dir = model_dir / "consolidated"
+    assert list(model_dir.glob("*.safetensors"))
+    assert list(consolidated_dir.glob("*.safetensors"))
+    assert (consolidated_dir / "model.safetensors.index.json").is_file()
 
 
 @pytest.fixture

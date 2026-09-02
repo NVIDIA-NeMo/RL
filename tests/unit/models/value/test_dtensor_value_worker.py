@@ -205,16 +205,6 @@ def _make_checkpointing_cfg(checkpoint_dir) -> dict:
     }
 
 
-def test_value_rejects_user_configured_checkpoint_async_mode():
-    with pytest.raises(ValueError, match="checkpointing.is_async is managed"):
-        Value(
-            cluster=None,
-            config={},
-            tokenizer=None,
-            checkpointing_cfg={"is_async": True},
-        )
-
-
 def _load_dcp_state(checkpoint_dir: Path, output_path: Path) -> dict[str, Any]:
     """Consolidate a small test DCP checkpoint into a logical state dict."""
     dcp_to_torch_save(checkpoint_dir, output_path)
