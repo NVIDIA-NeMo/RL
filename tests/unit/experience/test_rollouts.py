@@ -2330,8 +2330,8 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, tokenizer, timer_prefix):
-            del inputs, tokenizer, timer_prefix
+        def remote(self, inputs, timer_prefix):
+            del inputs, timer_prefix
             return _FailedStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
@@ -2342,7 +2342,7 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
     }
     manager._tokenizer = None
 
-    with pytest.raises(RuntimeError, match="instance 'nemo_gym' failed"):
+    with pytest.raises(RuntimeError, match="actor died") as exc_info:
         asyncio.run(
             manager._run_rollouts(
                 inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
@@ -2350,6 +2350,9 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
                 timer_prefix="timing/test",
             )
         )
+    assert exc_info.value.__notes__ == [
+        "NeMo-Gym instance 'nemo_gym' failed during rollout collection"
+    ]
 
 
 @pytest.mark.nemo_gym
