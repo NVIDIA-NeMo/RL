@@ -161,6 +161,10 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     use_cispo: bool = False
     # VAPO: weight μ for positive-example NLL loss on correct samples.
     # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
+    # The NLL term is averaged over the same global valid-token count as the
+    # policy loss, so μ is defined relative to all valid tokens rather than to
+    # the correct-sample tokens alone. That keeps the term invariant to the
+    # microbatch split and to the DP/CP world size.
     # Set to 0 to disable.
     positive_example_nll_weight: float = 0.0
 
@@ -354,9 +358,8 @@ class ClippedPGLossFn(LossFunction):
             ),
             # Raw count — the downstream per-microbatch sum IS the value.
             "num_valid_samples": MetricNormalizer.NONE,
-            # Normalized by the microbatch's own correct-token count, not a
-            # global factor — already a per-microbatch mean.
-            "positive_nll_loss": MetricNormalizer.NONE,
+            # Token-normalized like the loss term it reports.
+            "positive_nll_loss": MetricNormalizer.TOKENS,
             # Extrema — combined downstream with min/max, never scaled.
             "probs_ratio_min": MetricNormalizer.NONE,
             "probs_ratio_max": MetricNormalizer.NONE,
@@ -725,13 +728,18 @@ class ClippedPGLossFn(LossFunction):
         if self.positive_example_nll_weight > 0 and "rewards" in data:
             correct_sample_mask = (data["rewards"] > 0).float()  # [batch]
             correct_mask = mask * correct_sample_mask.unsqueeze(-1)
-            correct_valid_toks = correct_mask.sum()
-            if correct_valid_toks > 0:
-                nll_loss = masked_mean(
-                    -curr_logprobs,
-                    correct_mask,
-                    global_normalization_factor=correct_valid_toks,
-                )
+            # Normalize by the same global token count the policy loss uses.
+            # correct_mask.sum() is a microbatch-local quantity, and the trainers
+            # sum the per-microbatch losses (then rescale by the DP/CP world
+            # size), so a local denominator makes each microbatch contribute a
+            # full mean instead of its share of one. The effective weight would
+            # then scale with the number of microbatches and with dp_size and
+            # cp_size, none of which should change the objective.
+            nll_loss = masked_mean(
+                -curr_logprobs,
+                correct_mask,
+                global_normalization_factor=global_valid_toks,
+            )
 
         loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
         with torch.no_grad():
