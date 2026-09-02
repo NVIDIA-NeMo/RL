@@ -3341,10 +3341,13 @@ class MegatronPolicyWorkerImpl(
 
     def finish_inference(self) -> None:
         """Offload model params to CPU after inference. Only used in PPO."""
+        # MambaMixer.eval() recomputes and caches a state transition decay,
+        # -torch.exp(self.A_log.float()). Set the model in inference mode
+        # before offloading the model parameters (including self.A_log).
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
-        self.model.eval()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -3490,10 +3493,13 @@ class MegatronPolicyWorkerImpl(
             and self.inference_model is None
             and self._colocated_reshard_plan is None
         )
+        # MambaMixer.eval() recomputes and caches a state transition decay,
+        # -torch.exp(self.A_log.float()). Set the model in inference mode
+        # before offloading the model parameters (including self.A_log).
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=not keep_params_for_generation
         )
-        self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 

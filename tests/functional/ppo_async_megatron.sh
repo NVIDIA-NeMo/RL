@@ -70,7 +70,7 @@ cd "${PROJECT_ROOT}"
 grep -q "Separate PPO clusters initialized" "${EXP_DIR}/run1.log"
 grep -q "Updated generation window: version=0, lead=2, max_age=2" "${EXP_DIR}/run1.log"
 grep -q "Updated generation window: version=1, lead=1, max_age=2" "${EXP_DIR}/run1.log"
-test "$(grep -c "PPO epoch 2/2" "${EXP_DIR}/run1.log")" -eq 2
+test "$(grep -c "Value epoch 2/2" "${EXP_DIR}/run1.log")" -eq 2
 test -f "${CKPT_DIR}/step_1/replay_buffer.pt"
 test -f "${CKPT_DIR}/step_2/replay_buffer.pt"
 
@@ -83,7 +83,7 @@ test -f "${CKPT_DIR}/step_2/replay_buffer.pt"
 grep -q "Restoring replay buffer from checkpoint" "${EXP_DIR}/run2.log"
 grep -q "ReplayBuffer restored:" "${EXP_DIR}/run2.log"
 grep -q "Updated generation window: version=3, lead=1, max_age=1" "${EXP_DIR}/run2.log"
-test "$(grep -c "PPO epoch 2/2" "${EXP_DIR}/run2.log")" -eq 2
+test "$(grep -c "Value epoch 2/2" "${EXP_DIR}/run2.log")" -eq 2
 test -d "${CKPT_DIR}/step_4/policy/weights"
 test -d "${CKPT_DIR}/step_4/value/weights"
 

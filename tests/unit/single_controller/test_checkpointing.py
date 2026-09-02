@@ -103,6 +103,18 @@ _PARTITION_ID = "rollout_data"
 # ── fakes ────────────────────────────────────────────────────────────────────
 
 
+class _FakeGeneration:
+    """Generation stand-in for train-pump tests that do not run rollouts."""
+
+    requires_kv_scale_sync = False
+
+    def snapshot_step_metrics(self) -> None:
+        pass
+
+    def get_step_metrics(self) -> dict[str, float]:
+        return {}
+
+
 class _FakeTrainer:
     """TQPolicy stand-in: train methods are no-ops, save_checkpoint records calls."""
 
@@ -126,7 +138,9 @@ class _FakeTrainer:
     def begin_train_step(self, loss_fn: Any) -> None:
         pass
 
-    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
         pass
 
     def finish_train_step(self) -> dict[str, Any]:
@@ -541,7 +555,7 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
-        gen_handle=object(),
+        gen_handle=_FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]
