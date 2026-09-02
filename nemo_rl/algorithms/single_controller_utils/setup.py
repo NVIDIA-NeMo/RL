@@ -1787,6 +1787,9 @@ def setup_single_controller(
         staging_partition_id=(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
+        require_reward_components=(
+            not is_ppo_run(master_config) and algo_cfg.adv_estimator.name == "gdpo"
+        ),
     )
     finalizer_actors: list[Any] = []
     if token_capture_cfg.enabled:

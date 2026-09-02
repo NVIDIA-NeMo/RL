@@ -189,6 +189,27 @@ class TestPenalizeDuplicatedReasoning:
         assert result["full_result"]["reward"] == 0.0
         assert counts["duplicated_reasoning"] == 1
 
+    def test_penalty_zeros_named_reward_components(self):
+        result = _make_result(
+            reward=1.0,
+            output_items=[
+                _reasoning_item("The answer is 42"),
+                _message_item("The answer is 42"),
+            ],
+        )
+        result["full_result"]["reward_components"] = {
+            "correctness": 0.75,
+            "format": 0.25,
+        }
+
+        apply_reward_penalties([result], self.CFG)
+
+        assert result["full_result"]["reward"] == 0.0
+        assert result["full_result"]["reward_components"] == {
+            "correctness": 0.0,
+            "format": 0.0,
+        }
+
     def test_different_text_not_penalized(self):
         result = _make_result(
             reward=1.0,

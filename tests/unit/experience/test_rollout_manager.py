@@ -944,6 +944,45 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
     assert "mask_sample" not in completion.env_extras["instance_config"]
 
 
+def test_result_to_completion_preserves_named_reward_components():
+    result = _mask_gate_result()
+    result["full_result"]["reward"] = 1.5
+    result["full_result"]["reward_components"] = {
+        "correctness": 1.0,
+        "style": 0.5,
+    }
+
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+
+    assert completion.reward == 1.5
+    assert completion.reward_components == {"correctness": 1.0, "style": 0.5}
+
+
+def test_result_to_completion_rejects_mismatched_component_sum():
+    result = _mask_gate_result()
+    result["full_result"]["reward_components"] = {
+        "correctness": 0.25,
+        "style": 0.25,
+    }
+
+    with pytest.raises(ValueError, match="reward_components sum"):
+        _nemo_gym_impl(True)._results_to_completions([result])
+
+
+def test_receipt_completion_preserves_named_reward_components():
+    result = _mask_gate_receipt_result()
+    result["full_result"]["reward"] = 1.5
+    result["full_result"]["reward_components"] = {
+        "correctness": 1.0,
+        "style": 0.5,
+    }
+
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+
+    assert completion.reward == 1.5
+    assert completion.reward_components == {"correctness": 1.0, "style": 0.5}
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     impl = _nemo_gym_impl(True, log_full_result_tables=log_full_result_tables)
