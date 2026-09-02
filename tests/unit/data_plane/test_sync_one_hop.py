@@ -323,6 +323,71 @@ def test_apply_dynamic_sampling_completes_when_train_size_reached():
     assert torch.equal(unfiltered, torch.tensor([1.0, 2.0, 3.0, 4.0]))
 
 
+def test_apply_dynamic_sampling_rebuilds_group_ids_across_generation_batches():
+    """Cached batches must not reuse the same dense rollout-group IDs."""
+    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
+    from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+
+    client = NoOpDataPlaneClient()
+    register_train_partition(client, num_samples=4)
+    full_meta = kv_first_write(
+        _final_batch(4),
+        sample_ids=keys_from_uids(["prompt-a", "prompt-b"], n_gen=2),
+        dp_client=client,
+        partition_id="train",
+    )
+    meta_a = _stamp_filter_tags(full_meta.slice(0, 2), [0.5, 0.5])
+    meta_b = _stamp_filter_tags(full_meta.slice(2, 4), [0.5, 0.5])
+
+    # Each generation batch independently starts its temporary dense IDs at 0.
+    carry_a = _make_driver_carry([1.0, 0.0], [0.5, 0.5])
+    carry_b = _make_driver_carry([10.0, 20.0], [0.5, 0.5])
+    carry_a["prompt_ids_for_adv"] = torch.zeros((2, 1), dtype=torch.long)
+    carry_b["prompt_ids_for_adv"] = torch.zeros((2, 1), dtype=torch.long)
+
+    pending_meta, pending_carry, pending_rewards, complete, _, _ = (
+        _apply_dynamic_sampling(
+            meta=meta_a,
+            driver_carry=carry_a,
+            pending_meta=None,
+            pending_carry=None,
+            pending_unfiltered_rewards=[],
+            train_prompts_size=4,
+            num_gen_batches=1,
+            max_gen_batches=2,
+            policy=_fake_policy(client),
+        )
+    )
+    assert complete is False
+
+    final_meta, final_carry, _, complete, _, _ = _apply_dynamic_sampling(
+        meta=meta_b,
+        driver_carry=carry_b,
+        pending_meta=pending_meta,
+        pending_carry=pending_carry,
+        pending_unfiltered_rewards=pending_rewards,
+        train_prompts_size=4,
+        num_gen_batches=2,
+        max_gen_batches=2,
+        policy=_fake_policy(client),
+    )
+
+    assert complete is True
+    assert final_meta is not None and final_carry is not None
+    assert torch.equal(
+        final_carry["prompt_ids_for_adv"],
+        torch.tensor([[0], [0], [1], [1]]),
+    )
+
+    rewards = final_carry["filtered_reward"]
+    baseline, _ = calculate_baseline_and_std_per_prompt(
+        final_carry["prompt_ids_for_adv"],
+        rewards,
+        torch.ones_like(rewards),
+    )
+    assert torch.equal(baseline, torch.tensor([0.0, 1.0, 20.0, 10.0]))
+
+
 def test_apply_dynamic_sampling_overflow_slices_and_clears():
     """When the cache exceeds train_prompts_size, slice + clear_samples discards."""
     from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling

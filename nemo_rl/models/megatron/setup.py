@@ -476,6 +476,141 @@ def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
     return os.path.join(path, iter_subdirs[-1])
 
 
+def validate_fp32_lm_head_config(config: PolicyConfig) -> None:
+    """Reject an fp32 LM head that is enabled on only one engine.
+
+    ``megatron_cfg.fp32_lm_head`` and vLLM's ``NRL_VLLM_FP32_LM_HEAD`` (set via
+    ``generation.vllm_cfg.env_vars``) must agree: with bf16 heads on both sides
+    the logits round to the same grid, so enabling fp32 on one side alone makes
+    train/token_mult_prob_error *worse* than leaving the feature off. The
+    fused linear+CE path bypasses ``output_layer`` entirely, so the trainer
+    head would silently stay bf16 there too.
+
+    Only checked when generation uses the vLLM backend; SFT/DPO have no
+    generation engine to disagree with.
+    """
+    megatron_cfg = config.get("megatron_cfg") or {}
+    trainer_fp32 = bool(megatron_cfg.get("fp32_lm_head"))
+    generation = config.get("generation") or {}
+    if generation.get("backend") != "vllm":
+        return
+    env_vars = (generation.get("vllm_cfg") or {}).get("env_vars") or {}
+    vllm_fp32 = str(env_vars.get("NRL_VLLM_FP32_LM_HEAD", "0")) == "1"
+    if trainer_fp32 != vllm_fp32:
+        raise ValueError(
+            "fp32 LM head must be enabled on both engines or neither: "
+            f"megatron_cfg.fp32_lm_head={megatron_cfg.get('fp32_lm_head')!r} but "
+            f"generation.vllm_cfg.env_vars.NRL_VLLM_FP32_LM_HEAD="
+            f"{env_vars.get('NRL_VLLM_FP32_LM_HEAD')!r}. A one-sided fp32 head "
+            "increases the generation/training logprob mismatch instead of "
+            "reducing it."
+        )
+    if trainer_fp32 and megatron_cfg.get("use_fused_linear_logprobs", False):
+        raise ValueError(
+            "megatron_cfg.fp32_lm_head has no effect with "
+            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
+            "output_layer), which would leave the trainer in bf16 while vLLM "
+            "runs fp32. Disable one of them."
+        )
+
+
+def _resolve_output_layer_owner(chunk: Any) -> Any:
+    """Return the module that owns ``output_layer`` for a Megatron model chunk.
+
+    Sheds the ``Float16Module`` / DDP ``.module`` wrappers, then the multimodal
+    wrappers that nest the language model instead of exposing ``output_layer``
+    themselves: ``NemotronOmniModel.thinker`` / ``.language_model`` and
+    ``NemotronVLModel.llava_model.language_model`` / ``.language_model``. The
+    descent stops as soon as a module exposes ``output_layer`` so plain
+    ``GPTModel`` / ``MambaModel`` chunks resolve to themselves. Mirrors the
+    unwrap chain in ``freeze_moe_router``.
+    """
+    module = chunk
+    while hasattr(module, "module"):
+        module = module.module
+    for _ in range(4):
+        if getattr(module, "output_layer", None) is not None:
+            break
+        for attr in ("thinker", "llava_model", "language_model"):
+            inner = getattr(module, attr, None)
+            if inner is not None:
+                module = inner
+                break
+        else:
+            break
+    return module
+
+
+def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
+    """Run the LM output-layer GEMM in fp32 (MiniMax-M1-style, arXiv:2506.13585).
+
+    bf16 rounding of the logits (magnitude ~15-30, bf16 ulp 0.125-0.25) is the
+    dominant contributor to generation/training logprob mismatch
+    (train/token_mult_prob_error). Upcasting the head input and weight to fp32
+    removes that rounding. The casts are part of the autograd graph, so
+    training gradients flow to the bf16 weight through the fp32 cast.
+
+    Note: has no effect on the fused linear+CE path
+    (megatron_cfg.use_fused_linear_logprobs), which bypasses output_layer's
+    standalone forward.
+
+    With ``use_tf32`` (megatron_cfg.fp32_lm_head: "tf32"), the fp32 head GEMM
+    runs with TF32 tensor cores. The inputs are exact bf16 values (<= 8-bit
+    mantissa), so TF32's 10-bit input rounding loses nothing; accumulation and
+    output stay fp32. Numerically equivalent to full fp32 here, at near-bf16
+    tensor-core throughput.
+    """
+    if not isinstance(model_chunks, (list, tuple)):
+        model_chunks = [model_chunks]
+    for chunk in model_chunks:
+        module = _resolve_output_layer_owner(chunk)
+        output_layer = getattr(module, "output_layer", None)
+        if output_layer is None:
+            # Zero matches must not look like success: on the chunk that owns
+            # the head, silently wrapping nothing leaves the trainer in bf16
+            # while vLLM (NRL_VLLM_FP32_LM_HEAD) runs fp32, which is worse than
+            # disabling the feature on both sides. ``post_process`` is how
+            # Megatron marks that chunk (GPTModel, MambaModel/HybridModel,
+            # NemotronVLModel, NemotronOmniModel all carry it).
+            if getattr(module, "post_process", False) or getattr(
+                chunk, "post_process", False
+            ):
+                raise ValueError(
+                    "fp32_lm_head is enabled but no output_layer was found on a "
+                    f"post_process model chunk of type {type(module).__name__} "
+                    f"(chunk type {type(chunk).__name__}). The trainer would run "
+                    "the LM head in bf16 while generation runs fp32, which is "
+                    "worse than disabling both."
+                )
+            continue  # not the last pipeline stage
+        original_forward = output_layer.forward
+
+        def _fp32_forward(
+            input_,
+            *args,
+            weight=None,
+            _orig_forward=original_forward,
+            _layer=output_layer,
+            _tf32=use_tf32,
+            **kwargs,
+        ):
+            w = weight if weight is not None else _layer.weight
+            if not _tf32:
+                return _orig_forward(input_.float(), *args, weight=w.float(), **kwargs)
+            prev = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = True
+            try:
+                return _orig_forward(input_.float(), *args, weight=w.float(), **kwargs)
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = prev
+
+        output_layer.forward = _fp32_forward
+        print(
+            "[fp32_lm_head] output layer will compute logits in fp32"
+            + (" (tf32 tensor cores)" if use_tf32 else "")
+        )
+
+
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths.
 
@@ -690,6 +825,14 @@ def setup_model_config(
     # Optional layernorm epsilon
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
+
+    # Optional fp32 residual stream. Reduces generation/training logprob
+    # mismatch (train/token_mult_prob_error) by accumulating the residual in
+    # fp32; supported by both transformer and mamba layers.
+    if "fp32_residual_connection" in config["megatron_cfg"]:
+        model_cfg.fp32_residual_connection = config["megatron_cfg"][
+            "fp32_residual_connection"
+        ]
 
     # Provider objects loaded from checkpoint metadata otherwise retain the
     # serialized defaults. Apply explicit recipe controls before model
