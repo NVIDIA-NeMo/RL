@@ -28,6 +28,8 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 30720
   refit_buffer_size_gb: 4
+  # Ray/container launchers must override this repo-relative example path with
+  # an absolute path visible to every worker.
   quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
   dtensor_cfg:
     enabled: false

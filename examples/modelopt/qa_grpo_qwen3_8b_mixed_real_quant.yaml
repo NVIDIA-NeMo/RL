@@ -1,10 +1,13 @@
 # Qwen3-8B mixed real-quant treatment for comparison with the W4A16 control.
 # Training and rollout settings are inherited unchanged from the control. This
-# treatment adds the calibration required by MXFP8 attention.
+# treatment adds dynamic-block MXFP8 attention and the calibration required by
+# its input quantizers.
 
 defaults: "../configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml"
 
 policy:
+  # Ray/container launchers must override this repo-relative example path with
+  # an absolute path visible to every worker.
   quant_cfg: examples/modelopt/quant_configs/mxfp8_attention_nvfp4_mlp.yaml
   quant_calib_data: cnn_dailymail
   quant_calib_size: 512
