@@ -69,10 +69,8 @@ async_rl:
     # INDEPENDENT counters, so one prompt can consume up to their sum minus one.
     max_skipped_prompts: 0
     # CONSECUTIVE prompts allowed to exhaust their infra budget and be dropped; any
-    # committed rollout resets the count. Must stay 0 on a PPO run: a drop shortens the
-    # step, and the critic shards it against the configured value.train_global_batch_size
-    # rather than its actual size, so _validate_algo_settings rejects a non-zero budget.
-    # (On GRPO you may raise it on a large fleet where losing the odd shard is expected.)
+    # committed rollout resets the count. Must stay 0 on PPO until shortened
+    # batches support uneven/padded sharding across critic DP ranks.
     max_consecutive_dropped_prompts: 0
     # Smallest batch a step may train on, as a fraction of num_prompts_per_step.
     # The budgets above are run-scoped and cannot bound how short one step gets, so

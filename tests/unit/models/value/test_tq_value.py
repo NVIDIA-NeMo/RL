@@ -204,6 +204,79 @@ class TestTQValueFanout:
         assert out["all_mb_metrics"]["loss"] == [0.1, 0.2]
 
 
+class TestTQValueSplitFanout:
+    def test_begin_consumes_single_data_futures_with_ray_get(self):
+        v, wg = _make_tq_value()
+        wg.run_all_workers_single_data.return_value = ["f0", "f1"]
+
+        with patch("nemo_rl.models.value.tq_value.ray") as mock_ray:
+            v.begin_train_step(loss_fn="LF")
+
+        wg.run_all_workers_single_data.assert_called_once_with(
+            "begin_train_step_presharded", loss_fn="LF", gbs=8, mbs=2
+        )
+        mock_ray.get.assert_called_once_with(["f0", "f1"])
+
+    def test_microbatch_dispatches_only_value_train_columns(self):
+        v, wg = _make_tq_value()
+        meta = _meta()
+        with (
+            patch.object(TQValue, "_stamp_pad_seqlen"),
+            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            out = v.train_microbatches_from_meta(meta)
+
+        assert out is None
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == list(DP_VALUE_TRAIN_FIELDS)
+        assert train_meta.task_name == "value_train"
+        assert (
+            wg.run_all_workers_sharded_data.call_args.args[0]
+            == "train_microbatch_presharded"
+        )
+        wg.get_all_worker_results.assert_called_once()
+
+    def test_finish_deduplicates_replica_twins_before_aggregation(self):
+        v, wg = _make_tq_value()
+        wg.run_all_workers_single_data.return_value = ["f0", "f1"]
+
+        def _result(loss: float, *, leader: bool) -> dict:
+            return {
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {"loss": [loss]},
+                "is_replica_leader": leader,
+            }
+
+        with patch("nemo_rl.models.value.tq_value.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                _result(0.1, leader=True),
+                _result(99.0, leader=False),
+            ]
+            out = v.finish_train_step()
+
+        wg.run_all_workers_single_data.assert_called_once_with(
+            "finish_train_step_presharded"
+        )
+        assert out["all_mb_metrics"]["loss"] == [0.1]
+
+    def test_abort_consumes_single_data_futures(self):
+        v, wg = _make_tq_value()
+        wg.run_all_workers_single_data.return_value = ["f0", "f1"]
+
+        with patch("nemo_rl.models.value.tq_value.ray") as mock_ray:
+            v.abort_train_step()
+
+        wg.run_all_workers_single_data.assert_called_once_with(
+            "abort_train_step_presharded"
+        )
+        mock_ray.get.assert_called_once_with(["f0", "f1"])
+
+
 class TestPadTargetIsolation:
     """Each dispatch mints its own pad target, in both directions: the critic
     goes first within a step, and with ppo_epochs > 1 the policy has already
