@@ -104,7 +104,15 @@ _PARTITION_ID = "rollout_data"
 
 
 class _FakeGeneration:
-    """Unsupported generation backend for checkpointing-only actor tests."""
+    """Generation stand-in for checkpointing-only actor tests."""
+
+    requires_kv_scale_sync = False
+
+    def snapshot_step_metrics(self) -> None:
+        pass
+
+    def get_step_metrics(self) -> dict[str, float]:
+        return {}
 
     def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
         del clear_cache
@@ -113,8 +121,8 @@ class _FakeGeneration:
     def resume_generation_after_refit(self) -> bool:
         return False
 
-    def invalidate_kv_cache(self) -> None:
-        pass
+    def invalidate_kv_cache(self) -> bool:
+        return False
 
 
 class _FakeTrainer:

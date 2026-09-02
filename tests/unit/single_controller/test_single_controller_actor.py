@@ -40,6 +40,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -695,13 +696,13 @@ class _MaskRecordingAdvantageEstimator:
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
-def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
+def test_advantage_stage_composes_all_filters_before_computing_advantages(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     batch_size, sequence_length = 4, 5
     generation_logprobs = torch.zeros(batch_size, sequence_length)
-    # exp(abs(1 - 0)) > the configured threshold of 2, so only row 2
-    # should be removed from the loss while the other rows remain trainable.
+    # Rows 1, 2, and 3 are removed by the environment, sequence-error,
+    # and overlong masks respectively. Row 0 remains trainable.
     generation_logprobs[2, 1:] = 1.0
     data = TensorDict(
         {
@@ -711,10 +712,12 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
             "total_reward": torch.tensor([0.0, 0.0, 1.0, 0.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.tensor([False, True, False, False]),
+            "truncated": torch.tensor([False, False, False, True]),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
-            # The filtered row is also flagged. Its penalty must not overwrite
-            # the sequence-error mask and leak back into streaming training.
+            # The sequence-error- and overlong-filtered rows are also flagged.
+            # Their penalties must not leak back into streaming training.
             "invalid_tool_call_mask": torch.tensor(
                 [[False] * sequence_length] * 2 + [[True] * sequence_length] * 2
             ),
@@ -737,6 +740,7 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(
             seq_logprob_error_threshold=2.0,
+            overlong_filtering=True,
             invalid_tool_call_advantage=-5.0,
             malformed_thinking_advantage=None,
         )
@@ -747,6 +751,7 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
         "rewards": [],
         "masked_advantages": [],
         "sequence_lengths": [],
+        "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
     }
     meta = KVBatchMeta(
@@ -765,27 +770,100 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     assert "invalid_tool_call_mask" in data_plane.selected_fields
     assert "generation_logprobs" in data_plane.selected_fields
     assert data_plane.written_fields is not None
-    # The estimator's value remains, but the penalty did not overwrite it with
-    # -5; sample_mask below is what excludes this row from streaming training.
+    # The estimator's values remain, but the penalty did not overwrite them with
+    # -5; sample_mask below is what excludes these rows from streaming training.
     torch.testing.assert_close(
         data_plane.written_fields["advantages"][2], torch.ones(5)
     )
     torch.testing.assert_close(
-        data_plane.written_fields["advantages"][3], torch.full((5,), -5.0)
+        data_plane.written_fields["advantages"][3], torch.zeros(5)
     )
     assert torch.equal(
         data_plane.written_fields["sample_mask"],
-        torch.tensor([1.0, 1.0, 0.0, 1.0]),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
     )
     assert estimator.mask is not None
-    assert estimator.mask[2].count_nonzero() == 0
-    assert estimator.mask[[0, 1, 3]].all()
+    assert estimator.mask[0].all()
+    assert estimator.mask[1:].count_nonzero() == 0
+    assert ctrl._step_log_dict["num_mask_sample_filtered"] == [1]
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 1
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
     assert "advantages" in (result_meta.fields or [])
+
+
+@pytest.mark.parametrize(
+    "overlong_filtering, mask_sample, truncated, expected_sample_mask",
+    [
+        (False, [True, False], [True, True], [0.0, 1.0]),
+        (True, [False, False], [False, True], [1.0, 0.0]),
+    ],
+    ids=["env_mask_only", "overlong_only"],
+)
+def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
+    overlong_filtering: bool,
+    mask_sample: list[bool],
+    truncated: list[bool],
+    expected_sample_mask: list[float],
+) -> None:
+    batch_size, sequence_length = 2, 5
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.tensor(mask_sample),
+            "truncated": torch.tensor(truncated),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._algo_cfg = SimpleNamespace(
+        seq_logprob_error_threshold=None,
+        overlong_filtering=overlong_filtering,
+    )
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "num_mask_sample_filtered": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    expected = torch.tensor(expected_sample_mask)
+    assert has_valid_training_tokens
+    assert data_plane.written_fields is not None
+    assert torch.equal(data_plane.written_fields["sample_mask"], expected)
+    assert estimator.mask is not None
+    assert torch.equal(
+        estimator.mask,
+        data["token_mask"] * expected.unsqueeze(-1),
+    )
 
 
 def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
@@ -802,6 +880,8 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
             "sample_mask": torch.ones(batch_size),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.tensor([False, True]),
         },
         batch_size=[batch_size],
     )
@@ -818,13 +898,14 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
+        "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -848,6 +929,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 0
+    assert ctrl._step_log_dict["num_mask_sample_filtered"] == [0]
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
 
@@ -866,6 +948,8 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
             "sample_mask": torch.ones(batch_size),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": torch.ones(batch_size, sequence_length),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
         },
         batch_size=[batch_size],
     )
@@ -882,13 +966,14 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0, overlong_filtering=False)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
+        "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -923,6 +1008,8 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
             "total_reward": torch.tensor([1.0, 0.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.zeros(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
         },
         batch_size=[batch_size],
     )
@@ -939,13 +1026,14 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
+        "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -997,6 +1085,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
                     "total_reward": torch.zeros(2),
                     "token_mask": torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
                     "sample_mask": torch.ones(2),
+                    "mask_sample": torch.zeros(2, dtype=torch.bool),
+                    "truncated": torch.zeros(2, dtype=torch.bool),
                     "generation_logprobs": torch.full((2, 3), 0.5),
                     "prev_logprobs": torch.full((2, 3), 0.5),
                     "teacher_reference_logprobs": torch.full((2, 3), 0.75),
@@ -1016,7 +1106,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -1025,6 +1115,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         "masked_advantages": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
+        "num_mask_sample_filtered": [],
     }
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
@@ -1257,6 +1348,39 @@ class _EpochRecordingTrainer(_OrderRecordingTrainer):
         return {}
 
 
+class _StepMetricRecordingTrainer(_NoOpTrainer):
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def begin_train_step(self, loss_fn) -> None:
+        del loss_fn
+        self._events.append("begin_train_step")
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
+        self._events.append("train_microbatches")
+
+    def finish_train_step(self) -> dict:
+        self._events.append("finish_train_step")
+        return {}
+
+
+class _StepMetricRecordingGeneration:
+    requires_kv_scale_sync = False
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def snapshot_step_metrics(self) -> None:
+        self._events.append("snapshot_step_metrics")
+
+    def get_step_metrics(self) -> dict[str, float]:
+        self._events.append("get_step_metrics")
+        return {"vllm/spec_acceptance_rate": 0.8}
+
+
 class _NoOpDataPlane:
     def clear_samples(self, **kwargs) -> None:
         del kwargs
@@ -1309,7 +1433,11 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
     ctrl._value_loss_fn = None
-    ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        snapshot_step_metrics=lambda: None,
+        get_step_metrics=lambda: {},
+    )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
@@ -1324,6 +1452,7 @@ def _train_pump_controller(*, sampler) -> object:
         "rewards": [],
         "masked_advantages": [],
         "sequence_lengths": [],
+        "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
     }
     ctrl._opd_stat_sum = 0.0
@@ -1630,6 +1759,119 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
+
+
+def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
+    monkeypatch,
+    capsys,
+) -> None:
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{index}"],
+            fields=[],
+            sequence_lengths=[1],
+            extra_info={ROLLOUT_METRICS: [metrics]},
+            tags=[{"weight_version": 0}],
+        )
+        for index, metrics in enumerate(
+            [
+                {
+                    "gen_tokens/min": 7,
+                    "gen_tokens/max": 10,
+                    "total_turns": 2,
+                    "accuracy": 0.25,
+                    "trajectory_duration_s": 1.0,
+                    "histogram/gen_tokens_length": [7, 10],
+                },
+                {
+                    "gen_tokens/min": 3,
+                    "gen_tokens/max": 20,
+                    "total_turns": 5,
+                    "accuracy": 0.75,
+                    "trajectory_duration_s": 3.0,
+                    "histogram/gen_tokens_length": [3, 20],
+                },
+            ]
+        )
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_call = ctrl._logger.log_metrics.call_args_list[0]
+    train_metrics = train_call.args[0]
+    assert train_metrics["gen_tokens/min"] == 3
+    assert train_metrics["gen_tokens/max"] == 20
+    assert train_metrics["total_turns"] == 7
+    assert train_metrics["accuracy"] == pytest.approx(0.5)
+    assert train_metrics["trajectory_duration_s"] == pytest.approx(2.0)
+    assert train_metrics["trajectory_duration_s/max"] == 3.0
+    assert train_metrics["trajectory_duration_s/p95"] == 3.0
+    assert train_metrics["histogram/gen_tokens_length"] == [7, 10, 3, 20]
+    assert train_call.kwargs == {"step": 1, "prefix": "train"}
+    assert all(ROLLOUT_METRICS not in meta.extra_info for meta in metas)
+    assert "histogram/gen_tokens_length" not in capsys.readouterr().out
+
+
+def test_train_pump_collects_generation_metrics_at_step_boundaries(
+    monkeypatch,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    events: list[str] = []
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._trainer = _StepMetricRecordingTrainer(events)
+    ctrl._gen = _StepMetricRecordingGeneration(events)
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert events == [
+        "snapshot_step_metrics",
+        "begin_train_step",
+        "train_microbatches",
+        "train_microbatches",
+        "finish_train_step",
+        "get_step_metrics",
+    ]
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
+
+
+def test_train_pump_skips_generation_metrics_without_generation_handle(
+    monkeypatch,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._gen = None
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert "vllm/spec_acceptance_rate" not in train_metrics
 
 
 def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
@@ -2031,6 +2273,8 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
             "values": torch.zeros(batch_size, sequence_length),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
         },
         batch_size=[batch_size],
     )
@@ -2056,7 +2300,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
-        ppo=SimpleNamespace(seq_logprob_error_threshold=None)
+        ppo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -2064,6 +2308,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
         "rewards": [],
         "masked_advantages": [],
         "sequence_lengths": [],
+        "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
     }
     meta = KVBatchMeta(
