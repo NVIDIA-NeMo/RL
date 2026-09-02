@@ -6024,3 +6024,34 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+def test_validate_reports_empty_metrics_when_max_val_samples_below_batch_size():
+    """max_val_samples < val_batch_size floors max_batches to 0.
+
+    The loop then breaks on its first iteration, so no metrics are collected.
+    validate() must still return its metric dicts instead of raising
+    UnboundLocalError on the hoisted additional_metrics_to_report.
+    """
+    master_config = MasterConfig.model_construct(
+        grpo=GRPOConfig.model_construct(
+            val_num_generations_per_prompt=1,
+            max_val_samples=1,
+            val_batch_size=256,
+        ),
+        logger={"num_val_samples_to_print": 0},
+    )
+    policy_generation = MagicMock()
+
+    val_metrics, timing_metrics = validate(
+        policy_generation,
+        [MagicMock()],  # one batch stays queued; the loop must skip it
+        tokenizer=MagicMock(),
+        val_task_to_env=None,
+        step=0,
+        master_config=master_config,
+    )
+
+    assert val_metrics == {"accuracy": 0.0, "avg_length": 0.0}
+    assert "total_validation_time" in timing_metrics
+    policy_generation.assert_not_called()

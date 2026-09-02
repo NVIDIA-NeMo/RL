@@ -4118,14 +4118,13 @@ def validate(
         max_batches = (
             master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
+        additional_metrics_to_report = dict()
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
 
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
-
-            additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
