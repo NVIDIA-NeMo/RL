@@ -27,7 +27,10 @@ from transformers import (
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
+from nemo_rl.models.automodel.checkpoint import (
+    AutomodelCheckpointManager,
+    build_checkpoint_config,
+)
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
@@ -182,27 +185,14 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
 
         # Initialize checkpoint manager
         dtensor_cfg = config["dtensor_cfg"]
-        checkpoint_config = {
-            field: dtensor_cfg[field]
-            for field in (
-                "model_save_format",
-                "save_consolidated",
-                "single_rank_consolidation",
-                "consolidation_timeout_minutes",
-            )
-            if field in dtensor_cfg
-        }
-        checkpoint_config.update(
-            {
-                "model_repo_id": config["model_name"],
-                "dequantize_base_checkpoint": config.get(
-                    "dequantize_base_checkpoint", False
-                ),
-                "is_peft": self.lora_enabled,
-                "skip_task_head_prefixes_for_base_model": ["score."],
-                # Callers rename after Value.save_checkpoint returns.
-                "is_async": False,
-            }
+        checkpoint_config = build_checkpoint_config(
+            dtensor_cfg,
+            model_repo_id=config["model_name"],
+            dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
+            is_peft=self.lora_enabled,
+            skip_task_head_prefixes_for_base_model=["score."],
+            # Callers rename after Value.save_checkpoint returns.
+            is_async=False,
         )
         self._init_checkpoint_manager(
             config_updates=checkpoint_config,

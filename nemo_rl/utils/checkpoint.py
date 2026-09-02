@@ -166,6 +166,21 @@ class CheckpointingConfig(TypedDict):
     load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
 
 
+_AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
+    {
+        "model_save_format",
+        "save_consolidated",
+        "single_rank_consolidation",
+        "consolidation_timeout_minutes",
+        "model_cache_dir",
+        "model_repo_id",
+        "is_peft",
+        "peft_config",
+        "is_async",
+    }
+)
+
+
 def should_save_as_final_checkpoint(
     *, is_last_step: bool, early_stop_requested: bool = False
 ) -> bool:
@@ -211,6 +226,20 @@ class CheckpointManager:
         Args:
             config (CheckpointingConfig)
         """
+        automodel_only_fields = sorted(
+            _AUTOMODEL_ONLY_CHECKPOINT_FIELDS.intersection(config)
+        )
+        if automodel_only_fields:
+            raise ValueError(
+                "Automodel-only fields are not supported under the top-level "
+                f"checkpointing config: {', '.join(automodel_only_fields)}. "
+                "Configure model_save_format, save_consolidated, "
+                "single_rank_consolidation, and consolidation_timeout_minutes "
+                "under policy.dtensor_cfg (and value.dtensor_cfg for value "
+                "models); remove the remaining fields because they are managed "
+                "internally."
+            )
+
         self.checkpoint_dir = Path(config["checkpoint_dir"])
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]

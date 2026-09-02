@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from omegaconf import OmegaConf
 
 import nemo_rl.utils.checkpoint as checkpoint_module
 from nemo_rl.utils.checkpoint import CheckpointManager
@@ -67,6 +68,27 @@ def test_should_save_as_final_checkpoint(is_last_step, early_stop_requested, exp
         )
         is expected
     )
+
+
+def test_checkpoint_manager_rejects_top_level_automodel_fields(checkpoint_config):
+    legacy_fields = {
+        "model_save_format": "torch_save",
+        "save_consolidated": True,
+        "single_rank_consolidation": False,
+        "consolidation_timeout_minutes": 30,
+        "model_cache_dir": "/tmp/model-cache",
+        "model_repo_id": "org/model",
+        "is_peft": False,
+        "peft_config": None,
+        "is_async": True,
+    }
+    checkpoint_config.update(legacy_fields)
+
+    with pytest.raises(ValueError) as error:
+        CheckpointManager(OmegaConf.create(checkpoint_config))
+
+    for field in legacy_fields:
+        assert field in str(error.value)
 
 
 def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):

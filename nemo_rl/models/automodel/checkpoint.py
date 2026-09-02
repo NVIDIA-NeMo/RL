@@ -19,6 +19,7 @@ for saving and loading model checkpoints in DTensor-based policy workers.
 
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any, Optional
 
 import torch
@@ -36,6 +37,60 @@ from transformers import AutoTokenizer
 from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
 
 logger = logging.getLogger(__name__)
+
+
+def build_checkpoint_config(
+    dtensor_cfg: Mapping[str, Any],
+    *,
+    model_repo_id: str,
+    dequantize_base_checkpoint: bool,
+    is_peft: bool,
+    is_async: bool,
+    skip_task_head_prefixes_for_base_model: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Build the Automodel checkpoint config for a DTensor v2 worker.
+
+    Component configs such as teachers and reward models do not necessarily
+    inherit the policy exemplar. Preserve NeMo-RL's established defaults at
+    this single integration boundary instead of inheriting Automodel's
+    ``save_consolidated="final"`` default accidentally.
+    """
+    if "model_save_format" in dtensor_cfg:
+        model_save_format = dtensor_cfg["model_save_format"]
+        if model_save_format not in ("torch_save", "safetensors"):
+            raise ValueError(
+                "dtensor_cfg.model_save_format must be 'torch_save' or "
+                "'safetensors' when using DTensor v2; omit it to use "
+                "'safetensors'."
+            )
+    else:
+        model_save_format = "safetensors"
+
+    checkpoint_config = {
+        "model_save_format": model_save_format,
+        "save_consolidated": (
+            dtensor_cfg["save_consolidated"]
+            if "save_consolidated" in dtensor_cfg
+            else "false"
+        ),
+        "model_repo_id": model_repo_id,
+        "dequantize_base_checkpoint": dequantize_base_checkpoint,
+        "is_peft": is_peft,
+        "is_async": is_async,
+    }
+    for field in (
+        "single_rank_consolidation",
+        "consolidation_timeout_minutes",
+    ):
+        if field in dtensor_cfg:
+            checkpoint_config[field] = dtensor_cfg[field]
+
+    if skip_task_head_prefixes_for_base_model is not None:
+        checkpoint_config["skip_task_head_prefixes_for_base_model"] = (
+            skip_task_head_prefixes_for_base_model
+        )
+
+    return checkpoint_config
 
 
 def _patch_qwen_vl_vision_key_mapping() -> None:

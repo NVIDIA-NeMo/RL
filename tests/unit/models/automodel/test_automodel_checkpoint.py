@@ -38,7 +38,63 @@ from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
 
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
+    build_checkpoint_config,
 )
+
+
+@pytest.mark.automodel
+def test_build_checkpoint_config_preserves_nemorl_defaults():
+    config = build_checkpoint_config(
+        {},
+        model_repo_id="org/model",
+        dequantize_base_checkpoint=False,
+        is_peft=False,
+        is_async=True,
+    )
+
+    assert config["model_save_format"] == "safetensors"
+    assert config["save_consolidated"] == "false"
+
+
+@pytest.mark.automodel
+def test_build_checkpoint_config_forwards_explicit_settings():
+    config = build_checkpoint_config(
+        {
+            "model_save_format": "torch_save",
+            "save_consolidated": "every",
+            "single_rank_consolidation": True,
+            "consolidation_timeout_minutes": 10,
+        },
+        model_repo_id="org/model",
+        dequantize_base_checkpoint=True,
+        is_peft=True,
+        is_async=False,
+        skip_task_head_prefixes_for_base_model=["score."],
+    )
+
+    assert config == {
+        "model_save_format": "torch_save",
+        "save_consolidated": "every",
+        "single_rank_consolidation": True,
+        "consolidation_timeout_minutes": 10,
+        "model_repo_id": "org/model",
+        "dequantize_base_checkpoint": True,
+        "is_peft": True,
+        "is_async": False,
+        "skip_task_head_prefixes_for_base_model": ["score."],
+    }
+
+
+@pytest.mark.automodel
+def test_build_checkpoint_config_rejects_null_model_save_format():
+    with pytest.raises(ValueError, match="dtensor_cfg.model_save_format"):
+        build_checkpoint_config(
+            {"model_save_format": None},
+            model_repo_id="org/model",
+            dequantize_base_checkpoint=False,
+            is_peft=False,
+            is_async=True,
+        )
 
 
 class TestModel(torch.nn.Module):
