@@ -56,8 +56,10 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _find_routed_experts_template,
     _tensorize_by_key,
+    apply_reward_penalties,
     attach_static_multimodal_payload,
     calculate_rewards,
+    compute_reward_penalty_metrics,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -765,6 +767,7 @@ class AsyncNemoGymRolloutImpl:
         max_rollout_turns: int,
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
+        reward_penalty_config: Optional[dict[str, Any]] = None,
         # Optional so direct construction does not have to carry the resiliency wiring;
         # RolloutManager always passes both explicitly.
         timeouts: Optional[RolloutTimeouts] = None,
@@ -783,6 +786,7 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._max_gym_row_attempts = (
             retry_policy
@@ -1018,10 +1022,11 @@ class AsyncNemoGymRolloutImpl:
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
-            # Convert results to completions.
-            completions = [
-                self._result_to_completion(result) for result in completed_results
-            ]
+            # Apply penalties before Completion captures each result's reward, while
+            # preserving the batch-level counts used by legacy Gym metrics.
+            completions, penalty_counts = self._results_to_completions(
+                completed_results
+            )
 
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
@@ -1030,36 +1035,59 @@ class AsyncNemoGymRolloutImpl:
             )
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
+            rollout_metrics.update(
+                self._compute_reward_penalty_metrics(
+                    penalty_counts, len(completed_results)
+                )
+            )
 
         rollout_metrics.update(env_timing_metrics)
 
         return completions, prompt_message_log, rollout_metrics
 
-    def _result_to_completion(self, result: dict) -> Completion:
-        """Convert one run_rollouts result dict into a Completion."""
-        # Tensorize token fields.
-        _tensorize_by_key(result["message_log"], "token_ids")
-        _tensorize_by_key(
-            [m for m in result["message_log"] if m["role"] == "assistant"],
-            "generation_logprobs",
-        )
-        # Calculate truncation.
-        truncated = (
-            sum(len(m["token_ids"]) for m in result["message_log"]) == self._max_seq_len
-        )
-
-        # Same gate as the batched path: when masking is off, drop the env
-        # mask flag so later batch building never sees it.
-        if not self._mask_env_flagged_samples:
-            (result["full_result"].get("instance_config") or {}).pop(
-                "mask_sample", None
+    def _results_to_completions(
+        self, results: list[dict]
+    ) -> tuple[list[Completion], dict[str, int]]:
+        """Apply configured penalties and convert a Gym result batch."""
+        for result in results:
+            _tensorize_by_key(result["message_log"], "token_ids")
+            _tensorize_by_key(
+                [m for m in result["message_log"] if m["role"] == "assistant"],
+                "generation_logprobs",
             )
 
-        return Completion(
-            message_log=result["message_log"],
-            env_extras=result["full_result"],
-            truncated=truncated,
-            reward=float(result["full_result"]["reward"]),
+            # Same gate as the batched path: when masking is off, drop the env
+            # mask flag so later batch building never sees it.
+            if not self._mask_env_flagged_samples:
+                (result["full_result"].get("instance_config") or {}).pop(
+                    "mask_sample", None
+                )
+
+        penalty_counts = apply_reward_penalties(results, self._reward_penalty_config)
+        completions = []
+        for result in results:
+            truncated = (
+                sum(len(m["token_ids"]) for m in result["message_log"])
+                == self._max_seq_len
+            )
+            completions.append(
+                Completion(
+                    message_log=result["message_log"],
+                    env_extras=result["full_result"],
+                    truncated=truncated,
+                    reward=float(result["full_result"]["reward"]),
+                )
+            )
+        return completions, penalty_counts
+
+    def _compute_reward_penalty_metrics(
+        self, penalty_counts: dict[str, int], num_results: int
+    ) -> dict[str, float]:
+        """Return enabled penalty rates using the legacy Gym metric names."""
+        return compute_reward_penalty_metrics(
+            penalty_counts,
+            num_results,
+            self._reward_penalty_config,
         )
 
     def _compute_rollout_metrics(
@@ -1154,6 +1182,7 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
+        reward_penalty_config: Optional[dict[str, Any]] = None,
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
@@ -1193,6 +1222,7 @@ class RolloutManager:
             generation_config=generation_config,
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.
             timeouts=timeouts if timeouts is not None else RolloutTimeouts(),

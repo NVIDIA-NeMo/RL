@@ -479,6 +479,9 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Path to a per-module Transformer Engine precision recipe loaded into
+    # Megatron quant_recipe.
+    te_precision_config_file: NotRequired[str]
     # Passed through to the Megatron model's freeze() method.
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
@@ -513,8 +516,8 @@ class TokenizerConfig(TypedDict):
     audio: NotRequired[dict[str, Any]]
     video: NotRequired[dict[str, Any]]
     use_processor: NotRequired[bool]
-    # Opt-in fastokens Rust-backed BPE tokenizer (~10x faster encode). Defaults to
-    # off when absent; NRL_USE_FASTOKENS overrides at runtime when set.
+    # Opt-in fastokens Rust-backed BPE tokenizer for NeMo-RL tokenization.
+    # Defaults to off when absent; NRL_USE_FASTOKENS overrides this and also sets VLLM_USE_FASTOKENS.
     use_fastokens: NotRequired[bool]
 
 

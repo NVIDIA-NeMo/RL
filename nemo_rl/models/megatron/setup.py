@@ -63,6 +63,7 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import load_quantization_recipe
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
@@ -1067,6 +1068,74 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
 
 
+def _quant_recipe_name(recipe: Any) -> str | None:
+    if recipe is None:
+        return None
+    return str(getattr(recipe, "value", recipe))
+
+
+def _validate_te_precision_config(
+    quant_recipe: Any, fp8_cfg: Mapping[str, Any] | None
+) -> None:
+    fp8_cfg_enabled = fp8_cfg is not None and fp8_cfg.get("enabled", False)
+    fp8_cfg_recipe = (
+        _quant_recipe_name(fp8_cfg.get("fp8_recipe")) if fp8_cfg_enabled else None
+    )
+
+    # A recipe can store primary weights in FP8/FP4 through its own
+    # fp8_param/fp4_param fields, which are separate from fp8_cfg.fp8_param.
+    # NeMo-RL derives sequence padding, refit export, and reshard validation
+    # from fp8_cfg alone, so such weights would reach the inference engine as
+    # if they were BF16. Reject until the refit path understands them.
+    for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
+        payload = quant_recipe.configs.get(config_key) or {}
+        for block in ("training_recipe", "evaluation_recipe"):
+            block_cfg = payload.get(block) or {}
+            if block_cfg.get("fp8_param") or block_cfg.get("fp4_param"):
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets fp8_param or "
+                    f"fp4_param in '{config_key}.{block}'. NeMo-RL reads "
+                    "megatron_cfg.fp8_cfg for all FP8 behavior, so these "
+                    "weights would be sent to the inference engine as BF16. "
+                    "Use megatron_cfg.fp8_cfg for FP8 parameter storage."
+                )
+
+            if not fp8_cfg_enabled:
+                continue
+
+            fp4_recipe = _quant_recipe_name(block_cfg.get("fp4_quantization_recipe"))
+            if fp4_recipe is not None:
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets "
+                    f"fp4_quantization_recipe={fp4_recipe!r} in "
+                    f"'{config_key}.{block}', but megatron_cfg.fp8_cfg is enabled. "
+                    "NeMo-RL derives sequence padding and FP8 refit behavior from "
+                    "megatron_cfg.fp8_cfg.fp8_recipe, so mixed FP4/FP8 precision "
+                    "recipes are not supported."
+                )
+
+            fp8_recipe = _quant_recipe_name(block_cfg.get("fp8_quantization_recipe"))
+            if fp8_recipe is None:
+                continue
+            if fp8_cfg_recipe is None:
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets "
+                    f"fp8_quantization_recipe={fp8_recipe!r} in "
+                    f"'{config_key}.{block}', but megatron_cfg.fp8_cfg.fp8_recipe "
+                    "is not set. Set megatron_cfg.fp8_cfg.fp8_recipe to the same "
+                    "recipe or remove the per-module FP8 recipe."
+                )
+            if fp8_recipe != fp8_cfg_recipe:
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets "
+                    f"fp8_quantization_recipe={fp8_recipe!r} in "
+                    f"'{config_key}.{block}', but megatron_cfg.fp8_cfg.fp8_recipe "
+                    f"is {fp8_cfg_recipe!r}. NeMo-RL derives sequence padding and "
+                    "FP8 refit behavior from megatron_cfg.fp8_cfg.fp8_recipe, so "
+                    "mixed FP8 precision recipes are not supported."
+                )
+
+
 def _apply_precision_config(
     model_cfg: Any, config: PolicyConfig, dtype: torch.dtype
 ) -> None:
@@ -1089,6 +1158,29 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
+
+    te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
+    if te_precision_config_file is not None:
+        te_precision_config_exists = os.path.isfile(te_precision_config_file)
+        if not te_precision_config_exists:
+            raise FileNotFoundError(
+                "megatron_cfg.te_precision_config_file does not exist: "
+                f"{te_precision_config_file}"
+            )
+        fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+        fp8_cfg_enabled = fp8_cfg is not None and fp8_cfg.get("enabled", False)
+        if fp8_cfg_enabled:
+            warnings.warn(
+                "Both megatron_cfg.fp8_cfg and megatron_cfg.te_precision_config_file "
+                "are set; modules matched by the precision recipe use the recipe's "
+                "per-module quantization config instead of fp8_cfg.",
+                stacklevel=2,
+            )
+        # NeMo-RL constructs TransformerConfig directly and therefore bypasses
+        # Megatron-LM's CLI path that normally turns this file into quant_recipe.
+        quant_recipe = load_quantization_recipe(te_precision_config_file)
+        _validate_te_precision_config(quant_recipe, fp8_cfg)
+        model_cfg.quant_recipe = quant_recipe
 
 
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:

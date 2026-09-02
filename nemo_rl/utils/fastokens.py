@@ -20,9 +20,11 @@ implementation (~10x faster BPE encoding).  The patch is idempotent — calling 
 multiple times in the same process is a no-op after the first successful
 application.
 
-The config field is the source of truth. The ``NRL_USE_FASTOKENS`` environment
-variable, when set, overrides the config as an escape hatch for toggling without
-editing YAML: ``NRL_USE_FASTOKENS=1`` forces on, any other value forces off.
+The config field controls this NeMo-RL-side patch when no environment override
+is set. ``NRL_USE_FASTOKENS`` is the top-level NeMo-RL override and is mirrored
+to ``VLLM_USE_FASTOKENS`` so vLLM workers follow the same setting. A standalone
+``VLLM_USE_FASTOKENS`` setting is left for vLLM and does not control this
+NeMo-RL-side patch.
 
 See: https://github.com/Atero-ai/fast-tokens
 """
@@ -33,6 +35,17 @@ import os
 logger = logging.getLogger(__name__)
 
 _patched = False
+_NRL_ENV_VAR = "NRL_USE_FASTOKENS"
+_VLLM_ENV_VAR = "VLLM_USE_FASTOKENS"
+
+
+def normalize_fastokens_env() -> None:
+    """Mirror NeMo-RL's fastokens override to vLLM's fastokens flag."""
+    nrl_value = os.environ.get(_NRL_ENV_VAR)
+    if nrl_value is None:
+        return
+
+    os.environ[_VLLM_ENV_VAR] = "1" if nrl_value == "1" else "0"
 
 
 def maybe_patch_fastokens(enabled: bool) -> None:
@@ -40,14 +53,15 @@ def maybe_patch_fastokens(enabled: bool) -> None:
 
     Args:
         enabled: The resolved ``policy.tokenizer.use_fastokens`` config value.
-            The ``NRL_USE_FASTOKENS`` env var, when set, overrides this: ``"1"``
-            forces on, anything else forces off.
+            The ``NRL_USE_FASTOKENS`` env var, when set, overrides this:
+            ``"1"`` forces on, anything else forces off.
     """
     global _patched
     if _patched:
         return
 
-    override = os.environ.get("NRL_USE_FASTOKENS")
+    normalize_fastokens_env()
+    override = os.environ.get(_NRL_ENV_VAR)
     if override is not None:
         enabled = override == "1"
 

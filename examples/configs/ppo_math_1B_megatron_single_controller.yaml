@@ -15,6 +15,19 @@ ppo:
     enabled: false
   reward_scaling:
     enabled: false
+  # Optional NeMo-Gym message-level penalties. Values overwrite computed
+  # advantages on tokens belonging to the corresponding assistant message.
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+
+# Reward-zeroing penalties applied to NeMo-Gym rollout results.
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: false
+  # Optional model/tokenizer-specific IDs. Example:
+  # token_ids: {unwanted: [2], think_open: 12, think_close: 13}
 
 async_rl:
   sampler:
@@ -123,8 +136,8 @@ async_rl:
   # Only meaningful on the NeMo-Gym path; the native path calls generation over Ray.
   generation_router:
     enabled: false
-    port_range_low: 6000              # distinct from Gym (5000-5999) and vLLM (7000-8999)
-    port_range_high: 6099
+    port_range_low: 1202              # between Ray client (1201) and management (1301+)
+    port_range_high: 1300
     backend_timeout_s: 600.0          # covers a whole generation; Gym sets none at all
     connect_timeout_s: 5.0            # a local handshake is ms-or-never
     no_healthy_backend_status: 409    # must stay outside Gym's retry set
@@ -136,8 +149,8 @@ checkpointing:
 
 policy:
   tokenizer:
-    # Opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the
-    # fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
+    # Opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens wheel.
+    # NRL_USE_FASTOKENS overrides at runtime.
     use_fastokens: false
   # The only thing on the SC path that takes the policy optimizer off the GPU.
   # Without it the critic's forward and train stages run on top of it.
@@ -156,8 +169,7 @@ policy:
     aux_layer_indices: null
 
   generation:
-    port_range_low: 11001
-    port_range_high: 15000
+    # HTTP ports use the shared [3000, 4999) virtual-cluster defaults.
     mcore_generation_config:
       unified_memory_level: 0
     vllm_cfg:
@@ -201,6 +213,5 @@ data_plane:
   #   enabled: false
 
 cluster:
+  # Master ports inherit the shared 1400-1999 band from ppo_math_1B.yaml.
   gpus_per_node: 2
-  master_port_range_low: 25000
-  master_port_range_high: 28000
