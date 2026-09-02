@@ -103,15 +103,12 @@ def test_merged_lora_refit_is_an_explicit_unchanged_opt_in() -> None:
     assert generation_config["vllm_kwargs"] == original_vllm_kwargs
 
 
-def test_omitted_lora_refit_mode_defaults_to_native() -> None:
+def test_lora_refit_rejects_missing_mode() -> None:
     policy_config = _native_policy_config()
     del policy_config["generation"]["lora_refit_mode"]
 
-    configure_vllm_lora_refit(policy_config)
-
-    generation_config = policy_config["generation"]
-    assert generation_config["lora_refit_mode"] == "native"
-    assert generation_config["vllm_kwargs"]["enable_lora"] is True
+    with pytest.raises(KeyError, match="lora_refit_mode"):
+        configure_vllm_lora_refit(policy_config)
 
 
 def test_lora_refit_rejects_invalid_mode() -> None:
