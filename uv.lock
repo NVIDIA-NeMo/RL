@@ -131,7 +131,7 @@ overrides = [
     { name = "timm", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=27486e03cfc1fa41f6932dcecdc47c71c47eac3e" },
+    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.18" },
     { name = "xgrammar", specifier = ">=0.2.1,<1.0.0" },
 ]
 excludes = ["nvidia-cutlass-dsl-libs-base"]
@@ -7760,7 +7760,7 @@ dependencies = [
 [[package]]
 name = "transformer-engine"
 version = "2.18.0+27486e03"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=27486e03cfc1fa41f6932dcecdc47c71c47eac3e#27486e03cfc1fa41f6932dcecdc47c71c47eac3e" }
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.18#27486e03cfc1fa41f6932dcecdc47c71c47eac3e" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
