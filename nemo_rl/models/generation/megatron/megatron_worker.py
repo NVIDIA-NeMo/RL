@@ -333,7 +333,6 @@ class MegatronGenerationMixin:
                 mcore_generation_config
             ),
             prefix_caching_mamba_gb=mcore_generation_config.get("prefix_caching_mamba_gb", 50),
-            prefix_caching_routing_alpha=0.5,
             prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
             prefix_cache_ttl_seconds=mcore_generation_config.get(
                 "prefix_cache_ttl_seconds", 300.0
