@@ -112,7 +112,7 @@ def _combine_agent_name_sources(
     datasets: list[Any],
 ) -> frozenset[NemoGymSourceIdentity] | None:
     return _combine_agent_name_source_sets(
-        [dataset.agent_name_sources for dataset in datasets]
+        [getattr(dataset, "agent_name_sources", None) for dataset in datasets]
     )
 
 
@@ -226,7 +226,7 @@ def setup_response_data(
                 task_data_processors,
                 task_data_preprocessors=task_data_preprocessors,
                 max_seq_length=data_config["max_input_seq_length"],
-                agent_name_sources=data.agent_name_sources,
+                agent_name_sources=getattr(data, "agent_name_sources", None),
             )
             for data in data_list
         }
@@ -258,7 +258,7 @@ def setup_response_data(
     for data in data_list:
         if hasattr(data, "val_dataset") and data.val_dataset is not None:
             val_data_list.append(data.val_dataset)
-            val_agent_name_source_sets.append(data.agent_name_sources)
+            val_agent_name_source_sets.append(getattr(data, "agent_name_sources", None))
             print(
                 f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
             )
@@ -283,7 +283,9 @@ def setup_response_data(
                 update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
             val_data_list.append(val_data.dataset)
-            val_agent_name_source_sets.append(val_data.agent_name_sources)
+            val_agent_name_source_sets.append(
+                getattr(val_data, "agent_name_sources", None)
+            )
             print(
                 f"  - Loaded validation dataset {val_data.task_name} with {len(val_data.dataset)} samples."
             )

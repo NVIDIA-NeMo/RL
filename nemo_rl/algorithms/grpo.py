@@ -16,7 +16,7 @@ import json
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Optional, TypeVar, cast
@@ -86,6 +86,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
+    NemoGymShardSet,
     build_nemo_gym_actors,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
@@ -500,6 +501,18 @@ def _needs_hf_refit_handshake(
     if generation_backend == "megatron":
         return False
     return not (nccl_reshard_refit_enabled and not colocated_inference)
+
+
+def _shutdown_completed_nemo_gym_startup(
+    future: Future[tuple[NemoGymShardSet, float]] | None,
+) -> None:
+    if future is None:
+        return
+    try:
+        shard_set, _ = future.result()
+    except BaseException:
+        return
+    shard_set.shutdown()
 
 
 def setup(
@@ -1449,6 +1462,7 @@ def setup(
 
             print("  ⚡ Init tasks: policy, megatron_generation, nemo_gym", flush=True)
             init_tasks_t0 = time.perf_counter()
+            nemo_gym_future: Future[tuple[NemoGymShardSet, float]] | None = None
             try:
                 with ThreadPoolExecutor(max_workers=3) as executor:
                     policy_future = executor.submit(
@@ -1470,6 +1484,9 @@ def setup(
                         # so it must happen while Gym is waiting rather than after it resolves.
                         init_megatron_weight_synchronizer(policy, policy_generation)
                     nemo_gym_actor, nemo_gym_time = nemo_gym_future.result()
+            except BaseException:
+                _shutdown_completed_nemo_gym_startup(nemo_gym_future)
+                raise
             finally:
                 for port_holder in port_holders:
                     ray.kill(port_holder)
@@ -1609,9 +1626,18 @@ def setup(
                 f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
                 flush=True,
             )
-            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
-                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
-                results = {k: f.result() for k, f in submitted.items()}
+            submitted: dict[str, Future[Any]] = {}
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {
+                        key: executor.submit(task) for key, task in init_tasks.items()
+                    }
+                    results = {
+                        key: future.result() for key, future in submitted.items()
+                    }
+            except BaseException:
+                _shutdown_completed_nemo_gym_startup(submitted.get("nemo_gym"))
+                raise
 
             if colocated_inference:
                 policy_generation, vllm_load_time, policy, policy_time = results[
@@ -3211,9 +3237,6 @@ def _grpo_train_impl(
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
-                            num_generations_per_prompt=(
-                                master_config.grpo.num_generations_per_prompt
-                            ),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
                             ),
@@ -4237,7 +4260,6 @@ def validate(
                     effort_config=_get_effort_config(master_config),
                     reward_penalty_config=master_config.reward_penalties,
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
-                    num_generations_per_prompt=val_num_generations_per_prompt,
                     mask_env_flagged_samples=should_mask_flagged_samples(
                         master_config.env
                     ),
