@@ -9,10 +9,10 @@ defaults: grpo_nemotron_omni_30ba3b_scripted_multiturn_cc.yaml
 grpo:
   num_prompts_per_step: ${oc.decode:${oc.env:OSWORLD_NUM_PROMPTS_PER_STEP,1}}
   num_generations_per_prompt: ${oc.decode:${oc.env:OSWORLD_NUM_GENERATIONS,2}}
-  num_val_generations_per_prompt: 1
+  num_val_generations_per_prompt: ${oc.decode:${oc.env:OSWORLD_NUM_VAL_GENERATIONS,1}}
   val_batch_size: ${oc.decode:${oc.env:OSWORLD_VAL_BATCH_SIZE,32}}
   max_rollout_turns: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,3}}
-  max_num_epochs: 1
+  max_num_epochs: ${oc.decode:${oc.env:GRPO_MAX_NUM_EPOCHS,1}}
   max_num_steps: ${oc.decode:${oc.env:GRPO_MAX_NUM_STEPS,1}}
   val_period: ${oc.decode:${oc.env:OSWORLD_VAL_PERIOD,100}}
   val_at_start: ${oc.decode:${oc.env:OSWORLD_VAL_AT_START,false}}
@@ -48,34 +48,59 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: ${oc.decode:${oc.env:OSWORLD_MAX_MODEL_LEN,8192}}
   make_sequence_length_divisible_by: 8
+  # Jianh's canonical VLM recipe disables sequence packing. CP still shards
+  # each long sequence; avoiding packed multi-trace ownership also bounds the
+  # trainer-side host materialization peak for B=8.
+  sequence_packing:
+    enabled: ${oc.decode:${oc.env:MOLT_SEQUENCE_PACKING_ENABLED,true}}
+    train_mb_tokens: ${oc.decode:${oc.env:MOLT_TRAIN_MB_TOKENS,49152}}
+    logprob_mb_tokens: ${oc.decode:${oc.env:MOLT_LOGPROB_MB_TOKENS,49152}}
   router_replay:
-    enabled: true
+    enabled: ${oc.decode:${oc.env:MOLT_ROUTER_REPLAY_ENABLED,true}}
   megatron_cfg:
     distributed_data_parallel_config:
       overlap_grad_reduce: false
       overlap_param_gather: false
     scheduler:
-      lr_warmup_iters: 0
-      lr_warmup_init: ${oc.decode:${oc.env:OSWORLD_LEARNING_RATE,2e-7}}
+      # Jianh's canonical Step-400 recipe keeps the Molt actor default of a
+      # 3% warmup. For the 300-step parity run this resolves to 9 updates.
+      lr_warmup_iters: ${oc.decode:${oc.env:MOLT_LR_WARMUP_ITERS,9}}
+      lr_warmup_init: ${oc.decode:${oc.env:MOLT_LR_WARMUP_INIT,0.0}}
     optimizer:
       lr: ${oc.decode:${oc.env:OSWORLD_LEARNING_RATE,2e-7}}
       min_lr: ${oc.decode:${oc.env:OSWORLD_LEARNING_RATE,2e-7}}
   generation:
-    max_new_tokens: 4096
+    max_new_tokens: ${oc.decode:${oc.env:OSWORLD_MAX_NEW_TOKENS,4096}}
     temperature: ${oc.decode:${oc.env:OSWORLD_TEMPERATURE,1.0}}
     top_p: ${oc.decode:${oc.env:OSWORLD_TOP_P,1.0}}
     vllm_cfg:
       max_model_len: ${oc.decode:${oc.env:OSWORLD_MAX_MODEL_LEN,8192}}
-      logprobs_mode: raw_logprobs
+      # Match Jianh's OSWorld rollout engine: reserve enough device memory for
+      # long-lived KV blocks and reuse the unchanged prefix between agent turns.
+      expert_parallel_size: ${oc.decode:${oc.env:OSWORLD_VLLM_EXPERT_PARALLEL_SIZE,2}}
+      gpu_memory_utilization: ${oc.decode:${oc.env:OSWORLD_VLLM_GPU_MEMORY_UTILIZATION,0.8}}
+      enable_prefix_caching: ${oc.decode:${oc.env:OSWORLD_VLLM_ENABLE_PREFIX_CACHING,true}}
+      env_vars:
+        VLLM_ATTENTION_BACKEND: ${oc.env:OSWORLD_VLLM_ATTENTION_BACKEND,TRITON_ATTN}
+        VLLM_MM_ENCODER_ATTN_BACKEND: ${oc.env:OSWORLD_VLLM_MM_ENCODER_ATTN_BACKEND,TORCH_SDPA}
+        VLLM_GDN_PREFILL_BACKEND: ${oc.env:OSWORLD_VLLM_GDN_PREFILL_BACKEND,triton}
+        VLLM_USE_FLASHINFER_MOE_FP16: "0"
+      # Jianh uses post-sampling-transform logprobs so actor recomputation and
+      # rollout behavior probabilities remain aligned when temperature changes.
+      logprobs_mode: processed_logprobs
       http_server_serving_chat_kwargs:
         chat_template_content_format: string
     vllm_kwargs:
       limit_mm_per_prompt:
-        image: ${oc.decode:${oc.env:OSWORLD_MAX_ACTIVE_IMAGES,8}}
+        # Must admit one candidate beyond Gym's active-history guard so the
+        # tokenize preflight can trigger compaction before generation.
+        image: ${oc.decode:${oc.env:OSWORLD_VLLM_MAX_IMAGES,9}}
       mm_processor_cache_gb: 0
-      max_num_batched_tokens: 16384
+      # Jianh uses a 4096-token scheduler budget. Combined with chunked
+      # prefill, this prevents one long 49K prompt from monopolizing an engine.
+      max_num_batched_tokens: ${oc.decode:${oc.env:OSWORLD_VLLM_MAX_NUM_BATCHED_TOKENS,4096}}
       mamba_ssm_cache_dtype: float32
-      enable_chunked_prefill: false
+      enable_chunked_prefill: ${oc.decode:${oc.env:OSWORLD_VLLM_ENABLE_CHUNKED_PREFILL,true}}
 
 data:
   max_input_seq_length: ${oc.decode:${oc.env:OSWORLD_MAX_MODEL_LEN,8192}}
@@ -87,6 +112,9 @@ data:
 env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: false
+  # Ordinary timeout/max-turn/task FAILs are not flagged and remain reward-zero
+  # training samples. Only explicit infrastructure-corruption flags are masked.
+  should_mask_flagged_samples: true
   nemo_gym:
     is_trajectory_collection: ${oc.decode:${oc.env:OSWORLD_TRAJECTORY_COLLECTION,false}}
     num_workers: ${oc.decode:${oc.env:OSWORLD_NEMO_GYM_NUM_WORKERS,2}}
@@ -106,6 +134,10 @@ env:
                 keep_last_image_groups: ${oc.decode:${oc.env:OSWORLD_CC_KEEP_LAST_IMAGE_GROUPS,1}}
             schedule:
               actions_per_chunk: ${oc.decode:${oc.env:OSWORLD_CC_ACTIONS_PER_CHUNK,2}}
+            guards:
+              # This is the Gym-side live-history high watermark. It is
+              # independent of vLLM's multimodal admission limit above.
+              max_active_images: ${oc.decode:${oc.env:OSWORLD_MAX_ACTIVE_IMAGES,8}}
 
 logger:
   log_dir: ${oc.env:OSWORLD_RESULTS_DIR,logs/osworld-context-compaction}

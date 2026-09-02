@@ -98,6 +98,71 @@ class GRPOAdvantageEstimator:
         return advantages.expand(mask.shape)
 
 
+class ReinforceBaselineAdvantageEstimator:
+    """Molt REINFORCE baseline: group mean followed by global whitening.
+
+    The baseline is computed once per logical rollout group. Each resulting
+    rollout scalar is broadcast to all of that rollout's eligible action tokens
+    before statistics are computed, so rollout lengths determine their weight
+    in the batch-wide whitening pass.
+    """
+
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        del estimator_config, loss_config
+
+    @staticmethod
+    def compute_rollout_advantages(
+        prompt_ids: torch.Tensor,
+        rewards: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return unwhitened ``reward - group_mean`` per logical rollout."""
+        baseline, _ = calculate_baseline_and_std_per_prompt(
+            prompt_ids,
+            rewards,
+            torch.ones_like(rewards),
+            leave_one_out_baseline=False,
+        )
+        return rewards - baseline
+
+    @staticmethod
+    def whiten_rollout_advantages(
+        rollout_advantages: torch.Tensor,
+        action_token_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Whiten rollout scalars as if expanded over all eligible tokens."""
+        if rollout_advantages.ndim != 1 or action_token_counts.shape != (
+            rollout_advantages.shape[0],
+        ):
+            raise ValueError(
+                "Rollout advantages and action-token counts must be aligned vectors"
+            )
+        if torch.any(action_token_counts < 0):
+            raise ValueError("Action-token counts must be non-negative")
+
+        advantages = rollout_advantages.float()
+        weights = action_token_counts.to(device=advantages.device, dtype=advantages.dtype)
+        num_actions = weights.sum()
+        if num_actions.item() == 0:
+            return torch.zeros_like(advantages)
+
+        mean = (advantages * weights).sum() / num_actions
+        variance = ((advantages - mean).pow(2) * weights).sum() / num_actions
+        return (advantages - mean) * variance.clamp(min=1e-8).rsqrt()
+
+    def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
+        """Compute action-token-weighted advantages for a complete batch."""
+        del kwargs
+        rollout_advantages = self.compute_rollout_advantages(prompt_ids, rewards)
+        action_token_counts = mask.to(dtype=torch.float32).sum(dim=1)
+        rollout_advantages = self.whiten_rollout_advantages(
+            rollout_advantages,
+            action_token_counts,
+        )
+        return rollout_advantages.unsqueeze(-1).expand(mask.shape) * mask
+
+
 class GDPOAdvantageEstimator:
     """GDPO-style advantage estimator with leave-one-out baseline.
 

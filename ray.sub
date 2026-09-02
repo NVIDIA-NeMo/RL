@@ -24,6 +24,32 @@
 
 set -eoux pipefail
 
+# Match the proven OSWorld W&B authentication path: mount the submit user's
+# netrc read-only into every Ray container. Do not export WANDB_API_KEY because
+# it takes precedence over netrc and can silently override the valid credential.
+if [[ "${WANDB_ENABLED:-false}" == "true" ]]; then
+  wandb_netrc_file="${WANDB_NETRC_FILE:-${HOME}/.netrc}"
+  if [[ -f "${wandb_netrc_file}" ]]; then
+    unset WANDB_API_KEY
+    export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.wandb.ai}"
+    if [[ -n "${MOUNTS:-}" ]]; then
+      MOUNTS+=",${wandb_netrc_file}:/root/.netrc:ro"
+    else
+      MOUNTS="${wandb_netrc_file}:/root/.netrc:ro"
+    fi
+  else
+    echo "ERROR: WANDB_ENABLED=true but credential file is missing: ${wandb_netrc_file}" >&2
+    exit 1
+  fi
+fi
+
+# Allow a mounted project environment to provide the Ray CLI. This keeps the
+# head/worker cluster version identical to Python actor runtime environments
+# when the fallback container's bundled Ray is older than the lockfile.
+if [[ -n "${NRL_RAY_BIN_DIR:-}" ]]; then
+  export PATH="${NRL_RAY_BIN_DIR}:${PATH}"
+fi
+
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 
@@ -32,6 +58,43 @@ log_phase() {
   echo "[NRL_PHASE][$(date '+%Y-%m-%dT%H:%M:%S%z')][+$(( $(date +%s) - ${NRL_JOB_START_EPOCH%.*} ))s] $*"
 }
 log_phase "ray.sub started (job=${SLURM_JOB_ID:-?} nodes=${SLURM_JOB_NUM_NODES:-?} partition=${SLURM_JOB_PARTITION:-?} node=$(hostname))"
+
+# Molt OSWorld steps can take longer than half of the four-hour allocation.
+# Match the canonical Jianh recipe by pre-submitting an afterany successor at
+# job start. This is opt-in so generic ray.sub users are unchanged.
+if [[ "${MOLT_AUTO_RESUME_CHAIN:-false}" == "true" && -n "${SLURM_JOB_ID:-}" ]]; then
+  chain_depth="${MOLT_CHAIN_DEPTH:-0}"
+  chain_max="${MOLT_CHAIN_MAX:-80}"
+  existing_successor="$(
+    squeue -h -u "${USER}" -o '%i|%E|%j' |
+      awk -F'|' -v dep="afterany:${SLURM_JOB_ID}" -v name="${SLURM_JOB_NAME}" \
+        '$2 == dep && $3 == name { print $1; exit }'
+  )"
+  if [[ -n "${existing_successor}" ]]; then
+    echo "[resume-chain] existing successor=${existing_successor} dependency=afterany:${SLURM_JOB_ID}"
+  elif (( chain_depth < chain_max )); then
+    next_depth=$((chain_depth + 1))
+    submit_args=(
+      --parsable
+      --dependency="afterany:${SLURM_JOB_ID}"
+      --chdir="${SLURM_SUBMIT_DIR}"
+      --nodes="${SLURM_JOB_NUM_NODES}"
+      --gres="gpu:${GPUS_PER_NODE}"
+      --account="${SLURM_JOB_ACCOUNT}"
+      --partition="${SLURM_JOB_PARTITION}"
+      --job-name="${SLURM_JOB_NAME}"
+      --time="${SBATCH_TIME:-04:00:00}"
+      --output="${BASE_LOG_DIR}/slurm-%j.out"
+      --export="ALL,MOLT_CHAIN_DEPTH=${next_depth}"
+      --requeue
+    )
+    if [[ -n "${SBATCH_COMMENT:-}" ]]; then
+      submit_args+=(--comment="${SBATCH_COMMENT}")
+    fi
+    next_job_id="$(sbatch "${submit_args[@]}" "$0")"
+    echo "[resume-chain] depth=${next_depth}/${chain_max} next_job_id=${next_job_id} dependency=afterany:${SLURM_JOB_ID}"
+  fi
+fi
 
 # Log a final marker on exit; trap TERM/HUP/INT too so a scancel/time-limit kill is still stamped.
 _nrl_log_exit() { local rc=$?; trap - EXIT; log_phase "ray.sub exiting (exit_code=$rc)"; exit $rc; }
@@ -605,6 +668,12 @@ fi
 # exit codes to stay non-fatal.
 set -o pipefail
 
+# Pyxis may restore the image's PATH when entering the container. Re-apply the
+# mounted Ray environment here so the cluster matches actor runtime versions.
+if [[ -n "\${NRL_RAY_BIN_DIR:-}" ]]; then
+  export PATH="\${NRL_RAY_BIN_DIR}:\${PATH}"
+fi
+
 # If this node can't see the canary, LOG_DIR is not shared. Fail now instead of
 # waiting forever for signal files the submit host writes but this node can't read.
 if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
@@ -836,6 +905,9 @@ EOF
 worker_cmd=$(cat <<EOF
 if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
+fi
+if [[ -n "\${NRL_RAY_BIN_DIR:-}" ]]; then
+  export PATH="\${NRL_RAY_BIN_DIR}:\${PATH}"
 fi
 echo "[INFO] Worker \$SLURM_PROCID on node \$SLURMD_NODENAME"
 

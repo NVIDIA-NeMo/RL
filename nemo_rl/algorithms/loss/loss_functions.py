@@ -150,8 +150,9 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- On-policy ---
     # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
     use_on_policy_kl_approximation: bool = False
-    # If True, force the ratio to 1.0 for truly on-policy behavior,
-    # eliminating any importance sampling effects.
+    # If True, force PPO's old-policy ratio to 1.0. When actor/rollout IS
+    # correction is enabled, it remains active with the detached training
+    # forward as numerator and generation logprobs as behavior denominator.
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
@@ -382,9 +383,11 @@ class ClippedPGLossFn(LossFunction):
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
-        # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
+        stored_prev_logprobs = data.get("prev_logprobs")
         prev_logprobs = (
-            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+            curr_logprobs.detach()
+            if self.force_on_policy_ratio
+            else stored_prev_logprobs[:, 1:]
         )
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
@@ -395,10 +398,10 @@ class ClippedPGLossFn(LossFunction):
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        # For truly on-policy training, use curr_logprobs as prev_logprobs
-        # This avoids computing prev_logprobs upstream
-        if self.force_on_policy_ratio:
-            prev_logprobs = curr_logprobs.detach()
+        # Match Molt's force-on-policy path: the training forward supplies both
+        # PPO's detached old-policy value and the IS numerator. Generation
+        # logprobs remain the rollout behavior denominator.
+        behavior_logprobs = prev_logprobs
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -566,7 +569,9 @@ class ClippedPGLossFn(LossFunction):
         # See: docs/guides/grpo.md#importance-sampling-correction
         if self.sequence_level_importance_ratios:
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
-            seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
+            seq_lp_diff = (
+                (behavior_logprobs - generation_logprobs) * mask
+            ).sum(dim=-1)
             actor_importance_weights = torch.exp(seq_lp_diff).detach()
             actor_importance_weights = torch.nan_to_num(
                 actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
@@ -576,7 +581,7 @@ class ClippedPGLossFn(LossFunction):
         else:
             # Token-level correction
             actor_importance_weights_expanded = torch.exp(
-                prev_logprobs - generation_logprobs
+                behavior_logprobs - generation_logprobs
             )
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
@@ -634,23 +639,30 @@ class ClippedPGLossFn(LossFunction):
                     torch.zeros_like(actor_importance_weights_expanded),
                 )
             elif self.truncated_importance_sampling_type == "seq-mask-tis":
-                # geo_mean_i = exp( mean_t( log(π_prev / π_gen) ) )
+                # Compute one geometric gate per physical trace/segment row.
+                # Logical rollout IDs still own rewards/advantages, but must not
+                # couple independent segment validity decisions.
                 log_is_ratio = torch.nan_to_num(
-                    prev_logprobs - generation_logprobs,
+                    behavior_logprobs - generation_logprobs,
                     nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
+                    posinf=30.0,
+                    neginf=-30.0,
+                ).clamp(min=-30.0, max=30.0)
                 seq_log_is_ratio_mean = masked_mean(
                     log_is_ratio, token_mask, dim=-1
                 )  # [B]
-                seq_geomean_is_ratio = torch.exp(seq_log_is_ratio_mean).detach()  # [B]
+                seq_geomean_is_ratio = torch.exp(
+                    seq_log_is_ratio_mean
+                ).detach()  # [B]
                 seq_kept_mask = (
                     (
                         seq_geomean_is_ratio
                         >= self.truncated_importance_sampling_ratio_min
                     )
-                    & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
+                    & (
+                        seq_geomean_is_ratio
+                        <= self.truncated_importance_sampling_ratio
+                    )
                 ).float()  # [B]
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(

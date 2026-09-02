@@ -1043,7 +1043,12 @@ Depending on your data shape, you may want to change these values."""
         trace_bundle = build_rollout_trace_bundle(
             rollout_id=rollout_id,
             calls=trace_calls,
-            boundary_events=response.get("boundary_events") or [],
+            # Evaluation does not train from physical trace boundaries. Infer
+            # discontinuities from the calls instead, so a terminal boundary
+            # emitted after the final admitted call cannot abort a whole shard.
+            boundary_events=(
+                [] if generation_only else response.get("boundary_events") or []
+            ),
             policy_name=policy_name,
             group_id=(contract.get("group_id") if exact_trace_authority else None),
             source_row_index=nemo_gym_row.get("_rowidx"),
@@ -1055,7 +1060,10 @@ Depending on your data shape, you may want to change these values."""
             training_admission=training_admission,
             final_policy_decision=response.get("final_policy_decision"),
             lineage_deltas=response.get("lineage_deltas"),
-            strict=exact_trace_authority,
+            # Validation only needs rewards and bounded projections. Keep exact
+            # trace construction best-effort there so a terminal/guard boundary
+            # cannot abort an entire Eval shard; training remains strict.
+            strict=exact_trace_authority and not generation_only,
         )
         trace_model_calls = trace_bundle["model_calls"]
         turn_idx = 0

@@ -27,7 +27,9 @@ from nemo_rl.algorithms.loss import (
     prepare_loss_input,
 )
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
-from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    CrossTokenizerDistillationLossFn,
+)
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
@@ -1582,6 +1584,9 @@ def test_clipped_pg_loss_tis_min_bound_defaults_to_zero(
     data["advantages"][0, 1:] = torch.ones(3)
     data["generation_logprobs"][0, 1:] = torch.zeros(3)
     next_token_logprobs = torch.log(torch.tensor([[0.1, 1.0, 3.0]]))
+    # force_on_policy_ratio only controls the PPO ratio. Behavior IS remains
+    # independently sourced from prev_logprobs.
+    data["prev_logprobs"][0, 1:] = next_token_logprobs
 
     loss, metrics = loss_fn(
         next_token_logprobs=next_token_logprobs,
@@ -1650,6 +1655,58 @@ def test_clipped_pg_loss_seq_mask_tis():
     )
     assert not torch.isnan(actual_loss2), "Loss is NaN — nan_to_num fix not working"
     assert not torch.isinf(actual_loss2), "Loss is inf — nan_to_num fix not working"
+
+
+@pytest.mark.parametrize("include_logical_rollout_ids", [False, True])
+def test_seq_mask_tis_gates_physical_rows_and_force_on_policy_uses_curr(
+    include_logical_rollout_ids,
+):
+    """Each segment gates independently, with curr/generation used for forced IS."""
+    data, _, seq_len, _ = _setup_clipped_pg_test_data(
+        batch_size=2, seq_len=3, device="cpu"
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            force_on_policy_ratio=True,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="seq-mask-tis",
+            truncated_importance_sampling_ratio_min=0.9,
+            truncated_importance_sampling_ratio=1.1,
+        )
+    )
+
+    # Physical segment A is in-band while B is out-of-band. Giving both the
+    # same logical rollout ID must not couple their geometric gates.
+    curr_vs_generation_weights = torch.tensor([[1.0, 1.0], [2.0, 2.0]])
+    if include_logical_rollout_ids:
+        data["logical_rollout_ids"] = torch.tensor([10, 10])
+    data["advantages"][:, 1:] = 1.0
+    data["generation_logprobs"][:, 1:] = 0.0
+    # This placeholder must not become the IS numerator in force-on-policy mode.
+    data["prev_logprobs"][:, 1:] = torch.log(torch.full((2, 2), 0.25))
+
+    next_token_logprobs = torch.log(curr_vs_generation_weights).requires_grad_()
+    loss, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"][:, 1:]
+        ),
+    )
+
+    # Only A contributes its raw curr/generation IS weights. PPO remains exactly
+    # one but its curr-curr.detach() construction still carries gradient.
+    torch.testing.assert_close(loss, torch.tensor(-0.5))
+    assert metrics["probs_ratio"] == pytest.approx(1.0)
+    assert metrics["is_oob_ratio"] == pytest.approx(0.5)
+    loss.backward()
+    assert torch.isfinite(next_token_logprobs.grad).all()
+    torch.testing.assert_close(
+        next_token_logprobs.grad,
+        torch.tensor([[-0.25, -0.25], [0.0, 0.0]]),
+    )
 
 
 def test_masked_mean_all_zeros():

@@ -977,6 +977,46 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def pause_generation_for_refit(self) -> None:
+        """Pause vLLM scheduling while preserving in-flight requests and KV."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "Molt-style in-flight refit requires vLLM async_engine=True"
+            )
+        futures = self.worker_group.run_all_workers_single_data(
+            "pause_generation_for_refit_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        timeout_s = float(os.environ.get("MOLT_REFIT_RPC_TIMEOUT_S", "600"))
+        try:
+            results = ray.get(futures, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RuntimeError(
+                f"vLLM pause before refit exceeded {timeout_s:.0f}s"
+            ) from exc
+        if not results or not all(result for result in results if result is not None):
+            raise RuntimeError("Failed to pause vLLM generation before refit")
+
+    def resume_generation_after_refit(self) -> None:
+        """Resume vLLM requests preserved across an in-flight refit."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "resume_generation_after_refit_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        timeout_s = float(os.environ.get("MOLT_REFIT_RPC_TIMEOUT_S", "600"))
+        try:
+            results = ray.get(futures, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RuntimeError(
+                f"vLLM resume after refit exceeded {timeout_s:.0f}s"
+            ) from exc
+        if not results or not all(result for result in results if result is not None):
+            raise RuntimeError("Failed to resume vLLM generation after refit")
+
     def init_nccl_reshard_comm_group(
         self,
         pp_ips: list[str],
@@ -1147,7 +1187,15 @@ class VllmGeneration(GenerationInterface):
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
-            results = ray.get(futures)
+            timeout_s = float(os.environ.get("MOLT_REFIT_RPC_TIMEOUT_S", "600"))
+            try:
+                results = ray.get(futures, timeout=timeout_s)
+            except ray.exceptions.GetTimeoutError as exc:
+                for ref in futures:
+                    ray.cancel(ref, force=False)
+                raise RuntimeError(
+                    f"vLLM cache reset after refit exceeded {timeout_s:.0f}s"
+                ) from exc
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")

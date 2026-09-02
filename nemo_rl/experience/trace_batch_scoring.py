@@ -17,11 +17,14 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Protocol, TypedDict
+from typing import Any, Mapping, MutableMapping, Protocol, TypedDict
 
 import torch
 
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_traces import (
     TraceBatchPlan,
@@ -128,16 +131,20 @@ def _validate_prompt_group_partition(
 
 
 def _compute_rollout_advantages(
-    advantage_estimator: GRPOAdvantageEstimator,
+    advantage_estimator: GRPOAdvantageEstimator | ReinforceBaselineAdvantageEstimator,
     *,
     bundles: list[Mapping[str, Any]],
     prompt_ids: torch.Tensor,
     rewards: torch.Tensor,
 ) -> dict[str, float]:
-    if not isinstance(advantage_estimator, GRPOAdvantageEstimator):
+    supported_estimators = (
+        GRPOAdvantageEstimator,
+        ReinforceBaselineAdvantageEstimator,
+    )
+    if not isinstance(advantage_estimator, supported_estimators):
         raise TypeError(
             "Trace-aware scoring preparation currently supports only the "
-            "standard GRPOAdvantageEstimator"
+            "GRPOAdvantageEstimator and ReinforceBaselineAdvantageEstimator"
         )
     rollout_count = len(bundles)
     if (
@@ -153,23 +160,47 @@ def _compute_rollout_advantages(
         raise ValueError("Trace-aware rollout rewards must be finite")
     _validate_prompt_group_partition(prompt_ids, bundles)
 
-    scalar_mask = torch.ones(
-        (rollout_count, 1),
-        dtype=rewards.dtype,
-        device=rewards.device,
-    )
-    advantages = advantage_estimator.compute_advantage(
-        prompt_ids=prompt_ids,
-        rewards=rewards,
-        mask=scalar_mask,
-    )
+    if isinstance(advantage_estimator, ReinforceBaselineAdvantageEstimator):
+        advantages = advantage_estimator.compute_rollout_advantages(
+            prompt_ids,
+            rewards,
+        )
+        action_token_counts = torch.tensor(
+            [
+                sum(
+                    int(token_is_eligible)
+                    for trace in bundle.get("physical_traces", [])
+                    for segment in trace.get("segments", [])
+                    for token_is_eligible in segment.get("loss_mask", [])
+                )
+                for bundle in bundles
+            ],
+            dtype=torch.float32,
+            device=rewards.device,
+        )
+        advantages = advantage_estimator.whiten_rollout_advantages(
+            advantages,
+            action_token_counts,
+        ).unsqueeze(-1)
+    else:
+        scalar_mask = torch.ones(
+            (rollout_count, 1),
+            dtype=rewards.dtype,
+            device=rewards.device,
+        )
+        advantages = advantage_estimator.compute_advantage(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=scalar_mask,
+        )
+    expected_shape = (rollout_count, 1)
     if (
         not isinstance(advantages, torch.Tensor)
-        or advantages.shape != scalar_mask.shape
+        or advantages.shape != expected_shape
         or not torch.isfinite(advantages).all()
     ):
         raise ValueError(
-            "GRPO did not produce one finite scalar advantage per logical rollout"
+            "Advantage estimator did not produce one finite scalar per logical rollout"
         )
 
     result: dict[str, float] = {}
@@ -210,6 +241,9 @@ def _build_logprob_data(
         }
     )
     logprob_data.update(train_data.get_multimodal_dict(as_tensors=False))
+    # This non-tensor identity stays row-aligned for audit/debugging; the
+    # model-facing image_cache_keys PackedTensor is copied above.
+    logprob_data["ordered_media_ids"] = train_data["ordered_media_ids"]
     if "routed_experts" in train_data:
         logprob_data["routed_experts"] = train_data["routed_experts"]
     return logprob_data
@@ -219,7 +253,7 @@ def prepare_trace_batch_for_scoring(
     rollout_batch: Mapping[str, Any],
     *,
     prompt_ids: torch.Tensor,
-    advantage_estimator: GRPOAdvantageEstimator,
+    advantage_estimator: GRPOAdvantageEstimator | ReinforceBaselineAdvantageEstimator,
     expected_rollouts_per_group: int,
     batch_quantum: int,
     optimizer_step_id: str,
@@ -262,6 +296,11 @@ def prepare_trace_batch_for_scoring(
         prompt_ids=prompt_ids,
         rewards=rewards,
     )
+    advantage_estimator_name = (
+        "reinforce_baseline"
+        if isinstance(advantage_estimator, ReinforceBaselineAdvantageEstimator)
+        else "grpo"
+    )
 
     plan = build_trace_batch_plan(
         bundles,
@@ -270,7 +309,7 @@ def prepare_trace_batch_for_scoring(
         batch_quantum=batch_quantum,
         optimizer_step_id=optimizer_step_id,
         training_admission=training_admission,
-        advantage_estimator_name="grpo",
+        advantage_estimator_name=advantage_estimator_name,
         sequence_level_ratios_enabled=False,
         sequence_level_clipping_enabled=False,
     )
@@ -287,6 +326,14 @@ def prepare_trace_batch_for_scoring(
         pad_token_id=pad_token_id,
         make_sequence_length_divisible_by=make_sequence_length_divisible_by,
     )
+    # This is an ownership-transfer boundary: train_data now owns the packed
+    # multimodal inputs needed by workers, while materialization retained only
+    # compact text for metrics. Drop the rollout-side graph promptly so raw
+    # images and per-message tensors are not kept alive by both representations.
+    if isinstance(rollout_batch, MutableMapping):
+        rollout_batch.pop("physical_message_logs", None)
+    del physical_message_logs_by_rollout
+    del physical_message_logs
     return {
         "rollout_advantages": rollout_advantages,
         "plan": plan,

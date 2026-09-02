@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 import ray
 import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 # Set up Ray temp directory before any Ray operations
 # Try multiple approaches to ensure Ray uses a writable directory
@@ -42,6 +43,7 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     MasterConfig,
     _get_next_nemo_gym_task_index,
+    _resolve_async_generation_batch_size,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
 )
@@ -79,6 +81,40 @@ from nemo_rl.environments.interfaces import (
 def test_get_next_nemo_gym_task_index(rollouts_state, replay_buffer_state, expected):
     assert (
         _get_next_nemo_gym_task_index(rollouts_state, replay_buffer_state) == expected
+    )
+
+
+def test_async_generation_batch_size_matches_molt_pool_capacity():
+    config = GRPOConfig(
+        num_prompts_per_step=8,
+        async_grpo=AsyncGRPOConfig(
+            enabled=True,
+            async_queue_size=2,
+            vllm_generate_batch_size=16,
+        ),
+    )
+
+    assert (
+        _resolve_async_generation_batch_size(config, num_prompts_per_step=8) == 16
+    )
+
+
+@pytest.mark.parametrize("generate_batch_size", [4, 24])
+def test_async_generation_batch_size_is_independent_from_train_fifo(
+    generate_batch_size,
+):
+    config = GRPOConfig(
+        num_prompts_per_step=8,
+        async_grpo=AsyncGRPOConfig(
+            enabled=True,
+            async_queue_size=2,
+            vllm_generate_batch_size=generate_batch_size,
+        ),
+    )
+
+    assert (
+        _resolve_async_generation_batch_size(config, num_prompts_per_step=8)
+        == generate_batch_size
     )
 
 
@@ -136,6 +172,54 @@ class TestReplayBufferImplCheckpointing:
     Ray actor execution is not reliably attributed to source coverage, so these
     tests cover the checkpoint/restore helpers on the local implementation class.
     """
+
+    def test_reserve_incrementally_refills_available_pool_capacity(self):
+        buffer = ReplayBufferImpl(max_size=4)
+
+        assert buffer.reserve(3) == 3
+        assert buffer.reserve(3) == 1
+        assert buffer.reserve(1) == 0
+        assert buffer.get_debug_info()["reserved_slots"] == 4
+
+        buffer.release_reserved(4)
+
+    def test_finished_fifo_and_inflight_capacity_are_independent(self):
+        buffer = ReplayBufferImpl(max_size=2, max_reserved_slots=2)
+        assert buffer.reserve(2) == 2
+        assert buffer.add({"batch": {"data": "a"}}, 0, reserved=True) == "success"
+        assert buffer.add({"batch": {"data": "b"}}, 0, reserved=True) == "success"
+
+        assert buffer.size() == 2
+        assert buffer.reserve(2) == 2
+        assert buffer.get_debug_info()["reserved_slots"] == 2
+        assert buffer.add({"batch": {"data": "c"}}, 0, reserved=True) == "full"
+        assert buffer.get_debug_info()["reserved_slots"] == 2
+
+        assert buffer.sample(1, current_weight_version=0, max_age_steps=1)
+        assert buffer.add({"batch": {"data": "c"}}, 0, reserved=True) == "success"
+        assert buffer.get_debug_info()["reserved_slots"] == 1
+        buffer.release_reserved(1)
+
+    def test_sample_evicts_nonprefix_stale_groups_preserving_valid_fifo(self):
+        buffer = ReplayBufferImpl(max_size=4)
+        for name, version in (("fresh-a", 5), ("stale", 2), ("fresh-b", 5)):
+            assert (
+                buffer.add({"batch": {"data": name}}, weight_version=version)
+                == "success"
+            )
+
+        result = buffer.sample(
+            2,
+            current_weight_version=5,
+            max_age_steps=1,
+        )
+
+        assert result is not None
+        assert [
+            trajectory["batch"]["data"] for trajectory in result["trajectories"]
+        ] == ["fresh-a", "fresh-b"]
+        assert result["evicted_stale_count"] == 1
+        assert buffer.size() == 0
 
     def _state(
         self,
@@ -1366,6 +1450,17 @@ class TestAsyncTrajectoryCollector:
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
 
+    def test_resume_after_refit_skips_duplicate_cache_invalidation(self):
+        """The driver resets cache while vLLM is paused, before collector admission."""
+        collector = self.create_local_collector()
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.recompute_kv_cache_after_weight_updates = True
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+
+        collector.resume_after_refit(cache_already_invalidated=True)
+
+        collector.policy_generation.invalidate_kv_cache.assert_not_called()
+
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""
         buffer = ReplayBuffer.remote(max_size=10)
@@ -1589,6 +1684,321 @@ class TestAsyncTrajectoryCollector:
         assert collector.get_rollouts_state() == {"next_ng_task_index": 39}
         assert target_weight not in collector._generating_targets
 
+    def test_process_batch_preserves_remainder_across_partial_reservations(
+        self, monkeypatch
+    ):
+        """A larger Molt generation batch is admitted in full as capacity opens."""
+
+        class ReserveRemoteMethod:
+            def __init__(self):
+                self.grants = iter((2, 2))
+
+            def remote(self, *args, **kwargs):
+                return next(self.grants)
+
+        class ReleaseRemoteMethod:
+            def remote(self, *args, **kwargs):
+                return None
+
+        class FakeReplayBuffer:
+            reserve = ReserveRemoteMethod()
+            release_reserved = ReleaseRemoteMethod()
+
+        started_threads = []
+
+        class RecordingThread:
+            def __init__(self, *, target, daemon):
+                assert daemon
+                self.target = target
+
+            def start(self):
+                started_threads.append(self)
+                self.target()
+
+            def is_alive(self):
+                return False
+
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+        captured_prompt_batches = []
+
+        async def capture_batch(**kwargs):
+            repeated_batch = kwargs["repeated_batch"]
+            captured_prompt_batches.append(
+                [
+                    messages[0]["content"]
+                    for messages in repeated_batch["message_log"][::3]
+                ]
+            )
+
+        collector._run_rollout_batch_worker = capture_batch
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: False)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+
+        collector._process_batch(self.create_mock_batch(size=4))
+
+        assert len(started_threads) == 2
+        assert captured_prompt_batches == [
+            ["Test prompt 0", "Test prompt 1"],
+            ["Test prompt 2", "Test prompt 3"],
+        ]
+
+    def test_overfit361_batch16_reserve1_has_zero_prompt_loss(self, monkeypatch):
+        """One epoch admits every OSWorld prompt when capacity opens one slot at a time."""
+
+        class ReserveOne:
+            def remote(self, *args, **kwargs):
+                return 1
+
+        class Release:
+            def remote(self, *args, **kwargs):
+                return None
+
+        class FakeReplayBuffer:
+            reserve = ReserveOne()
+            release_reserved = Release()
+
+        class SynchronousThread:
+            def __init__(self, *, target, daemon):
+                assert daemon
+                self.target = target
+
+            def start(self):
+                self.target()
+
+            def is_alive(self):
+                return False
+
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+        admitted_prompt_ids = []
+
+        async def capture_batch(**kwargs):
+            repeated_batch = kwargs["repeated_batch"]
+            admitted_prompt_ids.extend(
+                int(messages[0]["content"])
+                for messages in repeated_batch["message_log"][::3]
+            )
+
+        collector._run_rollout_batch_worker = capture_batch
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: False)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", SynchronousThread
+        )
+
+        for start in range(0, 361, 16):
+            end = min(start + 16, 361)
+            prompt_ids = list(range(start, end))
+            collector._process_batch(
+                BatchedDataDict[DatumSpec](
+                    {
+                        "task_name": ["test"] * len(prompt_ids),
+                        "message_log": [
+                            [{"role": "user", "content": str(prompt_id)}]
+                            for prompt_id in prompt_ids
+                        ],
+                        "extra_env_info": [{} for _ in prompt_ids],
+                        "loss_multiplier": torch.ones(len(prompt_ids)),
+                    }
+                )
+            )
+
+        assert admitted_prompt_ids == list(range(361))
+        assert len(set(admitted_prompt_ids)) == 361
+
+    def test_real_dataloader_cycles_two_complete_361_prompt_epochs(self):
+        """The collector recreates the iterator and retains the nine-row tail."""
+
+        def collate(prompt_ids):
+            return BatchedDataDict[DatumSpec](
+                {
+                    "task_name": ["test"] * len(prompt_ids),
+                    "message_log": [
+                        [{"role": "user", "content": str(prompt_id)}]
+                        for prompt_id in prompt_ids
+                    ],
+                    "extra_env_info": [{} for _ in prompt_ids],
+                    "loss_multiplier": torch.ones(len(prompt_ids)),
+                }
+            )
+
+        dataloader = StatefulDataLoader(
+            list(range(361)),
+            batch_size=16,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate,
+            num_workers=0,
+        )
+        collector = self.create_local_collector()
+        collector.master_config.grpo.max_num_epochs = 2
+        collector.dataloader = dataloader
+        collector.running = True
+        admitted_prompt_ids = []
+
+        def capture_batch(batch, retry_count=0):
+            del retry_count
+            admitted_prompt_ids.extend(
+                int(messages[0]["content"]) for messages in batch["message_log"]
+            )
+
+        collector._process_batch = capture_batch
+        collector._collection_loop()
+
+        assert collector.data_exhausted
+        assert collector._completed_epochs == 2
+        assert admitted_prompt_ids == list(range(361)) * 2
+
+    def test_startup_refit_finishes_before_collection_admission(self, monkeypatch):
+        events = []
+
+        class RemoteMethod:
+            def __init__(self, event):
+                self.event = event
+
+            def remote(self, *args):
+                events.append(
+                    f"{self.event}:{args[0]}" if args and self.event == "set" else self.event
+                )
+                return None
+
+        collector = SimpleNamespace(
+            set_weight_version=RemoteMethod("set"),
+            start_collection=RemoteMethod("start"),
+        )
+        generation = SimpleNamespace(
+            prepare_for_generation=lambda: events.append("prepare")
+        )
+        monkeypatch.setattr(grpo_mod.ray, "get", lambda value, **_: value)
+        monkeypatch.setattr(
+            grpo_mod,
+            "refit_policy_generation",
+            lambda *args, **kwargs: events.append("refit"),
+        )
+
+        stale = grpo_mod._prepare_async_generation_and_start_collection(
+            object(),
+            generation,
+            collector,
+            object(),
+            need_refit=True,
+            generation_stale=True,
+            colocated_inference=False,
+            weight_version=7,
+        )
+
+        assert stale is False
+        assert events == ["refit", "set:7", "start"]
+
+    def test_native_vllm_refit_orders_both_scheduling_barriers(self, monkeypatch):
+        events = []
+
+        class RemoteMethod:
+            def __init__(self, event):
+                self.event = event
+
+            def remote(self, *args):
+                events.append(
+                    f"{self.event}:{args[0]}" if args and self.event == "set" else self.event
+                )
+                return None
+
+        class FakeVllmGeneration:
+            def pause_generation_for_refit(self):
+                events.append("vllm_pause")
+
+            def invalidate_kv_cache(self):
+                events.append("cache_reset")
+                return True
+
+            def resume_generation_after_refit(self):
+                events.append("vllm_resume")
+
+        collector = SimpleNamespace(
+            prepare_for_refit=RemoteMethod("collector_pause"),
+            set_weight_version=RemoteMethod("set"),
+            resume_after_refit=RemoteMethod("collector_resume"),
+        )
+        generation = FakeVllmGeneration()
+        monkeypatch.setattr(grpo_mod, "VllmGeneration", FakeVllmGeneration)
+        monkeypatch.setattr(grpo_mod.ray, "get", lambda value, **_: value)
+        monkeypatch.setattr(
+            grpo_mod,
+            "refit_policy_generation",
+            lambda *args, **kwargs: events.append("refit") or {"ok": 1.0},
+        )
+
+        metrics, version = grpo_mod._refit_async_generation_safely(
+            object(),
+            generation,
+            collector,
+            colocated_inference=False,
+            weight_version=3,
+        )
+
+        assert metrics == {"ok": 1.0}
+        assert version == 4
+        assert events == [
+            "collector_pause",
+            "vllm_pause",
+            "refit",
+            "cache_reset",
+            "set:4",
+            "vllm_resume",
+            "collector_resume",
+        ]
+
+    def test_checkpoint_captures_pending_and_unresolved_inflight_inputs(
+        self, monkeypatch
+    ):
+        class RemoteMethod:
+            def remote(self):
+                return {"trajectories": [], "trajectory_versions": []}
+
+        replay_buffer = SimpleNamespace(state_dict=RemoteMethod())
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.dataloader = SimpleNamespace(state_dict=lambda: {"cursor": 12})
+        collector._completed_epochs = 4
+        collector._next_nemo_gym_task_index = 20
+        collector._queue_pending_input(
+            BatchedDataDict(
+                {
+                    "extra_env_info": [{"_ng_task_index": 9}],
+                    "loss_multiplier": torch.ones(1),
+                }
+            ),
+            retry_count=1,
+        )
+        collector._inflight_inputs["active"] = {
+            "batch": BatchedDataDict(
+                {
+                    "extra_env_info": [
+                        {"_ng_task_index": 10},
+                        {"_ng_task_index": 11},
+                    ],
+                    "loss_multiplier": torch.ones(2),
+                }
+            ),
+            "retry_count": 0,
+            "unresolved_group_indices": {1},
+        }
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+
+        state = collector.get_checkpoint_state()
+        pending_ids = [
+            item["batch"]["extra_env_info"][0]["_ng_task_index"]
+            for item in state["rollouts"]["pending_inputs"]
+        ]
+
+        assert state["dataloader"] == {"cursor": 12}
+        assert state["rollouts"]["completed_epochs"] == 4
+        assert state["rollouts"]["next_ng_task_index"] == 20
+        assert pending_ids == [9, 11]
+
     def test_process_batch_non_gym_uses_one_batched_worker(self, monkeypatch):
         """Native collection repeats all prompts into one batch worker."""
 
@@ -1770,6 +2180,39 @@ class TestAsyncTrajectoryCollector:
         assert exc.value.__cause__ is not None
         assert "unexpected add status" in str(exc.value.__cause__)
 
+    def test_irrecoverable_prompt_attempt_does_not_stop_collector(self, monkeypatch):
+        """A repeatedly malformed rollout is skipped without killing training."""
+        collector = self.create_local_collector()
+        collector.running = True
+        admission_id = "malformed-trace-attempt"
+        batch = self.create_mock_batch(size=1)
+        collector._inflight_inputs[admission_id] = {
+            "batch": batch,
+            "retry_count": trajectory_collector_mod._MAX_FAILED_GROUP_REQUEUES,
+            "unresolved_group_indices": {0},
+        }
+
+        async def fail_collection(**kwargs):
+            raise ValueError("invalid compaction boundary")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail_collection)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=batch.repeat_interleave(3),
+                generation_weight_version=5,
+                target_weight_version=None,
+                num_generations=3,
+                use_nemo_gym=True,
+                admission_id=admission_id,
+            )
+        )
+
+        assert collector.running is True
+        assert collector.collection_failed is False
+        assert admission_id not in collector._inflight_inputs
+        assert not collector._pending_inputs
+
     def test_nemo_gym_batch_retry_does_not_duplicate_buffered_groups(self, monkeypatch):
         """A partial stream retry only enqueues prompt groups not already buffered."""
 
@@ -1787,7 +2230,7 @@ class TestAsyncTrajectoryCollector:
             def __init__(self):
                 self.task_indices = []
 
-            def remote(self, trajectory_group, *args):
+            def remote(self, trajectory_group, *args, **kwargs):
                 self.task_indices.append(trajectory_group["_ng_task_index"])
                 return _ReadyResult("success")
 
@@ -1973,7 +2416,7 @@ class TestAsyncTrajectoryCollector:
             add = RemoteAdd()
 
         collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
-        collector.master_config.grpo["context_compaction_training"] = {"enabled": True}
+        collector.master_config.grpo.context_compaction_training.enabled = True
         collector.master_config.policy["generation"] = {
             "temperature": 1.0,
             "top_p": 1.0,
@@ -2460,3 +2903,196 @@ def test_turn_count_fallback_priority():
     assert f({"turns_per_sample/max": 5, "turns_per_sample/mean": 3}) == 5.0
     assert f({"turns_per_sample/mean": 6}) == 6.0
     assert f({"reward": 1.0}) is None
+
+
+class TestMoltFIFOScheduling:
+    @staticmethod
+    def _trajectory(name):
+        return {"batch": {"data": name}, "rollout_metrics": {}}
+
+    def test_fifo_across_versions_and_one_time_consumption(self):
+        buffer = ReplayBufferImpl(max_size=4)
+        buffer.add(self._trajectory("v2"), 2, 99)
+        buffer.add(self._trajectory("v0"), 0, 1)
+        buffer.add(self._trajectory("v3"), 3, 500)
+
+        first = buffer.sample(2, current_weight_version=3, max_age_steps=10)
+        assert [t["batch"]["data"] for t in first["trajectories"]] == ["v2", "v0"]
+        second = buffer.sample(1, current_weight_version=3, max_age_steps=10)
+        assert [t["batch"]["data"] for t in second["trajectories"]] == ["v3"]
+        assert buffer.sample(1, current_weight_version=3, max_age_steps=10) is None
+
+    def test_capacity_reservations_are_separate_from_finished_backpressure(self):
+        buffer = ReplayBufferImpl(max_size=2)
+        assert buffer.reserve(2) == 2
+        assert buffer.reserve(1) == 0
+        assert buffer.add(self._trajectory("reserved"), 0, reserved=True) == "success"
+        assert buffer.add(self._trajectory("unreserved"), 0) == "success"
+        assert buffer.add(self._trajectory("tail"), 0) == "full"
+        buffer.release_reserved(1)
+
+    def test_stale_head_eviction_does_not_target_pin(self):
+        buffer = ReplayBufferImpl(max_size=5)
+        buffer.add(self._trajectory("stale-a"), 0, 100)
+        buffer.add(self._trajectory("stale-b"), 1, 100)
+        buffer.add(self._trajectory("fresh-future-target"), 4, 999)
+        buffer.add(self._trajectory("fresh-past-target"), 5, -1)
+
+        sampled = buffer.sample(2, current_weight_version=5, max_age_steps=1)
+        assert sampled["evicted_stale_count"] == 2
+        assert [t["batch"]["data"] for t in sampled["trajectories"]] == [
+            "fresh-future-target",
+            "fresh-past-target",
+        ]
+
+    def test_checkpoint_restores_fifo_and_migrates_legacy_targets(self):
+        legacy = {
+            "trajectories": [
+                self._trajectory("first"),
+                self._trajectory("second"),
+                self._trajectory("third"),
+            ],
+            "trajectory_versions": [1, 3, 2],
+            "target_weight_versions": [8, 2, 7],
+            "last_target_weight_already_generated": 7,
+            "max_size": 9,
+        }
+        buffer = ReplayBufferImpl(max_size=2)
+        buffer.load_state_dict(
+            legacy,
+            num_prompts_per_step=99,
+            current_training_step=500,
+            max_age_steps=0,
+        )
+        sampled = buffer.sample(2, current_weight_version=3, max_age_steps=10)
+        assert [t["batch"]["data"] for t in sampled["trajectories"]] == [
+            "first",
+            "second",
+        ]
+
+    def test_refit_closes_admission_before_snapshot(self, monkeypatch):
+        reserve_entered = threading.Event()
+        allow_reserve = threading.Event()
+        worker_started = threading.Event()
+        refit_done = threading.Event()
+
+        class RemoteMethod:
+            def __init__(self, fn):
+                self.fn = fn
+
+            def remote(self, *args, **kwargs):
+                return self.fn(*args, **kwargs)
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.reserve = RemoteMethod(self._reserve)
+                self.release_reserved = RemoteMethod(lambda count: None)
+
+            def _reserve(self, count):
+                reserve_entered.set()
+                assert allow_reserve.wait(timeout=2)
+                return 1
+
+        class PersistentThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                worker_started.set()
+
+            def is_alive(self):
+                return True
+
+        collector = TestAsyncTrajectoryCollector().create_local_collector(
+            replay_buffer=FakeReplayBuffer()
+        )
+        collector.running = True
+        collector.master_config.policy["generation"] = {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        real_thread = threading.Thread
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", PersistentThread
+        )
+        monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: False)
+
+        process = real_thread(
+            target=collector._process_batch,
+            args=(TestAsyncTrajectoryCollector().create_mock_batch(size=1),),
+        )
+        process.start()
+        assert reserve_entered.wait(timeout=2)
+
+        refit = real_thread(
+            target=lambda: (collector.prepare_for_refit(), refit_done.set())
+        )
+        refit.start()
+        assert not refit_done.wait(timeout=0.05)
+        allow_reserve.set()
+        process.join(timeout=2)
+        refit.join(timeout=2)
+
+        assert worker_started.is_set()
+        assert refit_done.is_set()
+        assert not collector._refit_pause_cleared.is_set()
+
+    def test_mixed_start_end_provenance_preserves_behavior_logprobs(
+        self, monkeypatch
+    ):
+        calls = []
+
+        class Ready:
+            def __init__(self, value):
+                self.value = value
+
+            def __await__(self):
+                async def resolve():
+                    return self.value
+
+                return resolve().__await__()
+
+        class Add:
+            def remote(self, *args, **kwargs):
+                calls.append((args, kwargs))
+                return Ready("success")
+
+        collector = TestAsyncTrajectoryCollector().create_local_collector(
+            replay_buffer=SimpleNamespace(add=Add())
+        )
+        collector.running = True
+        collector.current_weight_version = 8
+        behavior_logprobs = torch.tensor([0.2, 0.4])
+        final_batch = BatchedDataDict(
+            {
+                "generation_logprobs": behavior_logprobs.unsqueeze(0),
+                "value": torch.tensor([1]),
+            }
+        )
+        result = trajectory_collector_mod.RolloutGroupResult(
+            group_index=0,
+            final_batch=final_batch,
+            rollout_metrics={},
+        )
+
+        asyncio.run(
+            collector._enqueue_rollout_group(
+                rollout_result=result,
+                generation_weight_version=7,
+                target_weight_version=None,
+                expected_prompt_groups=1,
+                buffered_group_indices=set(),
+                collection_started_at=0.0,
+            )
+        )
+
+        trajectory = calls[0][0][0]
+        assert trajectory["start_weight_version"] == 7
+        assert trajectory["end_weight_version"] == 8
+        assert trajectory["mixed_weight_versions"] is True
+        assert torch.equal(
+            trajectory["batch"]["generation_logprobs"][0], behavior_logprobs
+        )

@@ -82,6 +82,13 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     # before `.view(torch.uint8)` — Long→Byte view is illegal
                     # on scalars.
                     tensor = post_iter_func(next(iterator)).contiguous()
+                    # Frozen/offloaded multimodal towers may legitimately keep
+                    # parameters on CPU while trainable language weights remain
+                    # on CUDA. Refit collectives require one CUDA packing
+                    # device, so stage CPU tensors into the current rank's
+                    # device before viewing and concatenating their bytes.
+                    if tensor.device.type != "cuda":
+                        tensor = tensor.to(device=torch.device("cuda"))
                     if tensor.dim() == 0:
                         tensor = tensor.reshape(1)
                     tensor = tensor.view(torch.uint8).view(-1)

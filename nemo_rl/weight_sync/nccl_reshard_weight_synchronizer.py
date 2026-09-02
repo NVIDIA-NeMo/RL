@@ -36,6 +36,7 @@ run on separate GPU clusters, so the phase transitions (offload / restore) are
 owned by the orchestrator, not here.
 """
 
+import os
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -115,8 +116,16 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             futures_train = self._policy.nccl_reshard_refit(kv_scales=kv_scales)
             futures_inference = self._generation.nccl_reshard_refit()
 
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
+            timeout_s = float(os.environ.get("MOLT_REFIT_RPC_TIMEOUT_S", "600"))
+            try:
+                ray.get(futures_train, timeout=timeout_s)
+                results = ray.get(futures_inference, timeout=timeout_s)
+            except ray.exceptions.GetTimeoutError as exc:
+                raise RuntimeError(
+                    "NCCL reshard refit exceeded "
+                    f"MOLT_REFIT_RPC_TIMEOUT_S={timeout_s:.0f}s; failing fast "
+                    "so the checkpoint resume watchdog can recover."
+                ) from exc
             update_success = all(result for result in results if result is not None)
 
             if not update_success:

@@ -2189,51 +2189,60 @@ async def run_async_nemo_gym_rollout(
             )
         rollout_iterator = rollout_gen.__aiter__()
 
-    while True:
-        stream_finished = False
-        group_to_yield: NemoGymRolloutResult | None = None
-        with timer.time(total_timer_label):
-            with timer.time(run_rollouts_timer_label):
-                try:
-                    future = await anext(rollout_iterator)
-                except StopAsyncIteration:
-                    stream_finished = True
-                else:
-                    rowidx, result, timing_metrics = await future
-
-            if not stream_finished:
-                if timing_metrics is not None:
-                    actor_timing_metrics = timing_metrics
-
-                _tensorize_nemo_gym_result(result)
-                completed_group = accumulator.add(rowidx, result)
-                if completed_group is not None:
-                    rollout_result = _postprocess_single_nemo_gym_group(
-                        nemo_gym_rows=completed_group.rows,
-                        results=completed_group.results,
-                        timer=timer,
-                        timer_prefix=timer_prefix,
-                        policy_generation=policy_generation,
-                        input_batch=input_batch.slice(
-                            completed_group.group_index * num_generations,
-                            (completed_group.group_index + 1) * num_generations,
-                        ),
-                        tokenizer=tokenizer,
-                        log_full_result_tables=log_full_result_tables,
-                        effort_config=effort_config,
-                        reward_penalty_config=reward_penalty_config,
-                        thinking_tags=thinking_tags,
-                        mask_env_flagged_samples=mask_env_flagged_samples,
-                    )
-                    if accumulator.is_complete:
-                        final_rollout_result = rollout_result
+    remote_stream_finished = False
+    try:
+        while True:
+            stream_finished = False
+            group_to_yield: NemoGymRolloutResult | None = None
+            with timer.time(total_timer_label):
+                with timer.time(run_rollouts_timer_label):
+                    try:
+                        future = await anext(rollout_iterator)
+                    except StopAsyncIteration:
+                        stream_finished = True
+                        remote_stream_finished = True
                     else:
-                        group_to_yield = rollout_result
+                        rowidx, result, timing_metrics = await future
 
-        if stream_finished:
-            break
-        if group_to_yield is not None:
-            yield group_to_yield
+                if not stream_finished:
+                    if timing_metrics is not None:
+                        actor_timing_metrics = timing_metrics
+
+                    _tensorize_nemo_gym_result(result)
+                    completed_group = accumulator.add(rowidx, result)
+                    if completed_group is not None:
+                        rollout_result = _postprocess_single_nemo_gym_group(
+                            nemo_gym_rows=completed_group.rows,
+                            results=completed_group.results,
+                            timer=timer,
+                            timer_prefix=timer_prefix,
+                            policy_generation=policy_generation,
+                            input_batch=input_batch.slice(
+                                completed_group.group_index * num_generations,
+                                (completed_group.group_index + 1) * num_generations,
+                            ),
+                            tokenizer=tokenizer,
+                            log_full_result_tables=log_full_result_tables,
+                            effort_config=effort_config,
+                            reward_penalty_config=reward_penalty_config,
+                            thinking_tags=thinking_tags,
+                            mask_env_flagged_samples=mask_env_flagged_samples,
+                        )
+                        if accumulator.is_complete:
+                            final_rollout_result = rollout_result
+                        else:
+                            group_to_yield = rollout_result
+
+            if stream_finished:
+                break
+            if group_to_yield is not None:
+                yield group_to_yield
+    finally:
+        if not remote_stream_finished:
+            # asyncio.wait_for cancellation must propagate through the streaming
+            # proxy; otherwise the remote Gym rollout keeps consuming desktops,
+            # HTTP connections, and vLLM capacity while its replacement runs.
+            ray.cancel(rollout_gen, force=False)
 
     with timer.time(total_timer_label):
         accumulator.finish()

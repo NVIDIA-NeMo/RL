@@ -25,6 +25,7 @@ from nemo_rl.experience.trace_batch_materialization import (
     materialize_trace_batch_plan,
     validate_trace_batch_materialization,
 )
+from nemo_rl.experience.trace_batch_scoring import _build_logprob_data
 
 
 _FIXTURE_DIR = Path(__file__).parents[2] / "fixtures" / "context_compaction_traces"
@@ -144,6 +145,11 @@ def test_identity_trace_materializes_exact_pre_scoring_tensors():
         torch.tensor(expected_logprobs),
     )
     assert torch.all(train_data["advantages"] == 1.75)
+    assert train_data["ordered_media_ids"] == [trace["ordered_media_ids"]]
+    cache_keys = train_data["image_cache_keys"]
+    assert isinstance(cache_keys, PackedTensor)
+    assert cache_keys.tensors[0].shape == (len(trace["ordered_media_ids"]), 2)
+    assert cache_keys.tensors[0].dtype == torch.int64
     assert plan["eligible_action_token_count"] == int(
         train_data["token_mask"].sum().item()
     )
@@ -194,6 +200,38 @@ def test_materialization_does_not_mutate_source_message_logs():
     )
 
 
+def test_returned_message_logs_retain_only_metric_text_without_tensor_aliases():
+    bundle = _fixture("k2_compaction.json")
+    source_logs = _message_logs(
+        bundle,
+        visual_trace_indices={0},
+        routed_experts=True,
+    )
+
+    _, materialization = _materialize(
+        [bundle],
+        batch_quantum=4,
+        logs={bundle["rollout_id"]: source_logs},
+    )
+
+    assert materialization["materialized_message_logs_are_compact"] is True
+    retained_logs = materialization["materialized_message_logs"]
+    assert [row[0]["content"] for row in retained_logs[:3]] == [
+        "".join(str(message["content"]) for message in trace_log)
+        for trace_log in source_logs
+    ]
+    assert retained_logs[3] == [{"content": ""}]
+    assert all(
+        set(message) == {"content"}
+        and not any(
+            isinstance(value, (torch.Tensor, PackedTensor))
+            for value in message.values()
+        )
+        for message_log in retained_logs
+        for message in message_log
+    )
+
+
 def test_text_first_batch_preserves_later_visual_row_ownership():
     compacted = _fixture("k2_compaction.json")
     identity = _fixture("without_compaction.json")
@@ -240,6 +278,29 @@ def test_visual_first_batch_preserves_padding_as_empty_media_row():
     assert len(packed) == 2
     assert torch.equal(packed.tensors[0], torch.ones((1, 3, 2, 2)))
     assert packed.tensors[1] is None
+
+
+def test_ordered_media_and_cache_keys_survive_logprob_projection():
+    bundle = _fixture("k2_compaction.json")
+    _, materialization = _materialize([bundle], batch_quantum=4)
+    train_data = materialization["train_data"]
+    logprob_data = _build_logprob_data(materialization)
+    expected_order = [
+        list(trace["ordered_media_ids"]) for trace in bundle["physical_traces"]
+    ] + [[]]
+
+    assert train_data["ordered_media_ids"] == expected_order
+    assert logprob_data["ordered_media_ids"] == expected_order
+    train_keys = train_data["image_cache_keys"]
+    logprob_keys = logprob_data["image_cache_keys"]
+    assert isinstance(train_keys, PackedTensor)
+    assert isinstance(logprob_keys, PackedTensor)
+    assert len(train_keys) == len(logprob_keys) == 4
+    for train_row, logprob_row in zip(train_keys.tensors, logprob_keys.tensors):
+        if train_row is None:
+            assert logprob_row is None
+        else:
+            assert torch.equal(train_row, logprob_row)
 
 
 def test_routed_experts_follow_exact_tokens_and_use_valid_padding_route():

@@ -598,7 +598,11 @@ def _apply_vllm_patches(
     # _init_workers_ray; the patch is only load-bearing when it is set to "0".
     # Reporting the same way in both cases either cries wolf or hides a real
     # break, so branch on it.
-    uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+    # Older vLLM releases predate this selector and only have the legacy
+    # executor, which is equivalent to the flag being false.
+    uses_v1_executor = not getattr(
+        envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", False
+    )
     applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
 
     if applied and uses_v1_executor:

@@ -35,7 +35,7 @@ from nemo_rl.environments.nemo_gym_trace import (
 
 _TRACE_BATCH_PLAN_SCHEMA_VERSION = 1
 _LOSS_NORMALIZATION = "global_action_token_mean"
-_SUPPORTED_ADVANTAGE_ESTIMATORS = frozenset({"grpo"})
+_SUPPORTED_ADVANTAGE_ESTIMATORS = frozenset({"grpo", "reinforce_baseline"})
 
 
 class TraceBatchRowPlan(TypedDict):
@@ -66,6 +66,7 @@ class TraceBatchPlan(TypedDict):
     optimizer_step_id: str
     generation_contract_id: str
     training_admission_contract_id: str | None
+    training_admission_contract_ids: list[str]
     advantage_estimator_name: str
     loss_normalization: str
     training_admitted: bool
@@ -186,11 +187,24 @@ def build_trace_batch_plan(
             "One TraceBatchPlan cannot mix generation contracts: "
             f"{sorted(generation_contract_ids)!r}"
         )
-    if training_admission and len(training_admission_contract_ids) != 1:
-        raise ValueError(
-            "One TraceBatchPlan cannot mix training admission contracts: "
-            f"{sorted(training_admission_contract_ids)!r}"
+    sorted_training_admission_contract_ids = sorted(
+        training_admission_contract_ids
+    )
+    if training_admission and not sorted_training_admission_contract_ids:
+        raise ValueError("Training-admitted TraceBatchPlan has no admission identity")
+    if len(sorted_training_admission_contract_ids) == 1:
+        training_admission_contract_id = (
+            sorted_training_admission_contract_ids[0]
         )
+    elif sorted_training_admission_contract_ids:
+        training_admission_contract_id = (
+            "training-admission-batch-contract-"
+            + _canonical_digest(
+                {"contract_ids": sorted_training_admission_contract_ids}
+            )[:24]
+        )
+    else:
+        training_admission_contract_id = None
 
     unique_bundles: list[Mapping[str, Any]] = []
     seen_rollout_groups: dict[str, str] = {}
@@ -298,11 +312,8 @@ def build_trace_batch_plan(
         "schema_version": _TRACE_BATCH_PLAN_SCHEMA_VERSION,
         "optimizer_step_id": optimizer_step_id,
         "generation_contract_id": next(iter(generation_contract_ids)),
-        "training_admission_contract_id": (
-            next(iter(training_admission_contract_ids))
-            if training_admission_contract_ids
-            else None
-        ),
+        "training_admission_contract_id": training_admission_contract_id,
+        "training_admission_contract_ids": sorted_training_admission_contract_ids,
         "advantage_estimator_name": advantage_estimator_name,
         "loss_normalization": _LOSS_NORMALIZATION,
         "training_admitted": training_admission,
@@ -373,12 +384,24 @@ def validate_trace_batch_plan(
     ):
         raise ValueError("TraceBatchPlan has no generation-contract identity")
     admission_contract_id = plan.get("training_admission_contract_id")
+    admission_contract_ids = plan.get("training_admission_contract_ids")
+    if not isinstance(admission_contract_ids, list) or any(
+        not isinstance(value, str) or not value
+        for value in admission_contract_ids
+    ):
+        raise ValueError(
+            "TraceBatchPlan training admission identities must be a list of strings"
+        )
     if plan["training_admitted"]:
         if not isinstance(admission_contract_id, str) or not admission_contract_id:
             raise ValueError(
                 "Training-admitted TraceBatchPlan has no admission identity"
             )
-    elif admission_contract_id is not None:
+        if not admission_contract_ids:
+            raise ValueError(
+                "Training-admitted TraceBatchPlan has no source admission identities"
+            )
+    elif admission_contract_id is not None or admission_contract_ids:
         raise ValueError(
             "Generation-only TraceBatchPlan unexpectedly has an admission identity"
         )
@@ -657,9 +680,9 @@ def validate_trace_batch_plan(
             raise ValueError(
                 "TraceBatchPlan generation contract disagrees with its bundles"
             )
-        if plan["training_admitted"] and observed_admission_ids != {
-            plan.get("training_admission_contract_id")
-        }:
+        if plan["training_admitted"] and observed_admission_ids != set(
+            plan.get("training_admission_contract_ids", [])
+        ):
             raise ValueError(
                 "TraceBatchPlan training admission disagrees with its bundles"
             )

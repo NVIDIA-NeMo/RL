@@ -36,6 +36,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -70,6 +71,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -140,6 +142,52 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
+
+def _detach_checkpoint_tensor_storage(value: Any) -> Any:
+    """Clone tensor leaves before torch.save sees Ray zero-copy storage aliases."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, PackedTensor):
+        return PackedTensor(
+            [
+                None
+                if tensor is None
+                else _detach_checkpoint_tensor_storage(tensor)
+                for tensor in value.tensors
+            ],
+            value.dim_to_pack,
+            pad_to_max_shape=value.pad_to_max_shape,
+        )
+    if isinstance(value, BatchedDataDict):
+        cloned = BatchedDataDict(
+            {
+                key: _detach_checkpoint_tensor_storage(item)
+                for key, item in value.items()
+            }
+        )
+        for attribute in (
+            "micro_batch_indices",
+            "micro_batch_lengths",
+            "elem_counts_per_gb",
+        ):
+            setattr(
+                cloned,
+                attribute,
+                _detach_checkpoint_tensor_storage(getattr(value, attribute)),
+            )
+        return cloned
+    if isinstance(value, dict):
+        return {
+            key: _detach_checkpoint_tensor_storage(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_detach_checkpoint_tensor_storage(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_checkpoint_tensor_storage(item) for item in value)
+    return value
+
+
 # ===============================================================================
 # Configuration
 # ===============================================================================
@@ -182,6 +230,11 @@ class RewardScalingConfig(BaseModel, extra="allow"):
 
 class AsyncGRPOConfig(BaseModel, extra="allow"):
     enabled: bool = False
+    # Number of complete optimizer batches admitted to the bounded FIFO.
+    async_queue_size: int = Field(default=1, ge=1)
+    # Independent persistent-pool capacity for prompt groups in generation.
+    # Defaults to one optimizer batch for backward compatibility.
+    vllm_generate_batch_size: Optional[int] = Field(default=None, ge=1)
     # Maximum trajectory age in training steps for samples drawn from the
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
@@ -191,6 +244,14 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
+
+
+def _resolve_async_generation_batch_size(
+    grpo_config: "GRPOConfig", *, num_prompts_per_step: int
+) -> int:
+    """Resolve persistent rollout-pool capacity independently of train FIFO size."""
+    configured = grpo_config.async_grpo.vllm_generate_batch_size
+    return configured if configured is not None else num_prompts_per_step
 
 
 class ContextCompactionTrainingConfig(BaseModel, extra="forbid"):
@@ -242,6 +303,7 @@ _REWARD_PENALTY_FLAGS = (
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
+    num_val_generations_per_prompt: int = 1
     max_num_epochs: int = 1
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
@@ -283,6 +345,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     batch_multiplier: float = 1.0
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
+    reward_clip_low: float | None = None
+    reward_clip_high: float | None = None
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: bool = False
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
@@ -443,6 +507,20 @@ def setup(
     else:
         dataloader_batch_size = num_prompts_per_step
 
+    if grpo_config.async_grpo.enabled:
+        generation_batch_size = _resolve_async_generation_batch_size(
+            grpo_config,
+            num_prompts_per_step=num_prompts_per_step,
+        )
+        if generation_batch_size > dataloader_batch_size:
+            dataloader_batch_size = generation_batch_size
+            print(
+                "  ✓ Molt rollout over-dispatch enabled: "
+                f"train_groups={num_prompts_per_step}, "
+                f"inflight_groups={generation_batch_size}",
+                flush=True,
+            )
+
     # Validate batch_multiplier
     batch_multiplier = grpo_config.batch_multiplier
     if grpo_config.use_dynamic_sampling:
@@ -476,7 +554,10 @@ def setup(
             batch_size=dataloader_batch_size,
             shuffle=data_config["shuffle"],
             collate_fn=rl_collate_fn,
-            drop_last=True,
+            # OSWorld has 361 prompts, which is not divisible by the persistent
+            # rollout pool size. Every epoch must retain its tail rather than
+            # permanently omitting the same tasks.
+            drop_last=False,
             num_workers=data_config["num_workers"],
         )
         if last_checkpoint_path is not None:
@@ -1745,6 +1826,23 @@ def scale_rewards(
     return repeated_batch
 
 
+def clip_total_rewards(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    *,
+    low: float | None,
+    high: float | None,
+) -> BatchedDataDict[DatumSpec]:
+    """Clamp scalar rollout rewards before advantage estimation."""
+    if low is None and high is None:
+        return repeated_batch
+    if low is not None and high is not None and low > high:
+        raise ValueError(f"reward_clip_low ({low}) must not exceed reward_clip_high ({high})")
+    repeated_batch["total_reward"] = repeated_batch["total_reward"].clamp(
+        min=low, max=high
+    )
+    return repeated_batch
+
+
 def extract_initial_prompt_messages(
     message_logs: list,
     original_prompt_lengths: torch.Tensor,
@@ -2167,23 +2265,22 @@ def _validate_context_compaction_training_config(
         )
 
     adv_config = _config_value(grpo_config, "adv_estimator", {"name": "grpo"})
-    if _config_value(adv_config, "name", "grpo") != "grpo":
-        errors.append("only the standard GRPO advantage estimator is supported")
+    if _config_value(adv_config, "name", "grpo") not in {
+        "grpo",
+        "reinforce_baseline",
+    }:
+        errors.append(
+            "only GRPO and Molt reinforce_baseline advantage estimators are supported"
+        )
     if loss_config.sequence_level_importance_ratios:
         errors.append("sequence-level importance ratios are not supported")
     if not loss_config.token_level_loss:
         errors.append("sequence-level loss reduction is not supported")
-    if loss_config.truncated_importance_sampling_type == "seq-mask-tis":
-        errors.append("sequence-level TIS masking is not supported")
+
     if loss_config.use_kl_in_reward:
         errors.append("KL-in-reward advantage rewriting is not supported")
     if loss_config.positive_example_nll_weight != 0:
         errors.append("positive-example sequence weighting is not supported")
-    if async_grpo_enabled and loss_config.force_on_policy_ratio:
-        errors.append(
-            "async replay requires measured token-level importance ratios; "
-            "force_on_policy_ratio is not supported"
-        )
     if async_grpo_enabled and not loss_config.use_importance_sampling_correction:
         errors.append(
             "async replay requires token-level importance sampling correction"
@@ -2352,21 +2449,12 @@ def _validate_async_context_compaction_replay_groups(
             )
 
         generation_weight_version = trajectory.get("generation_weight_version")
-        target_weight_version = trajectory.get("target_weight_version")
-        if (
-            isinstance(generation_weight_version, bool)
-            or not isinstance(generation_weight_version, int)
-            or isinstance(target_weight_version, bool)
-            or not isinstance(target_weight_version, int)
+        if isinstance(generation_weight_version, bool) or not isinstance(
+            generation_weight_version, int
         ):
             raise ValueError(
                 f"Async context-compaction replay group {group_index} is missing "
-                "integer generation/target weight provenance"
-            )
-        if target_weight_version != current_weight_version:
-            raise ValueError(
-                f"Async context-compaction replay group {group_index} targets "
-                f"weight {target_weight_version}, expected {current_weight_version}"
+                "integer generation weight provenance"
             )
         trajectory_age = current_weight_version - generation_weight_version
         if trajectory_age < 0 or trajectory_age > max_age_steps:
@@ -2499,6 +2587,39 @@ def _write_latest_checkpoint_status(
         json.dump(status, f)
 
 
+def _ray_actor_call_with_transient_retry(
+    call: Callable[[], Any],
+    *,
+    operation_name: str,
+    max_attempts: int = 6,
+    retry_delay_s: float = 5.0,
+) -> Any:
+    """Retry a bounded idempotent actor RPC after transient Ray failures."""
+    timeout_s = float(os.environ.get("MOLT_CONTROL_RPC_TIMEOUT_S", "120"))
+    for attempt in range(1, max_attempts + 1):
+        ref = call()
+        try:
+            return ray.get(ref, timeout=timeout_s)
+        except (ray.exceptions.ActorUnavailableError, ray.exceptions.GetTimeoutError) as exc:
+            try:
+                ray.cancel(ref, force=False)
+            except Exception:
+                pass
+            if attempt == max_attempts:
+                raise RuntimeError(
+                    f"{operation_name} failed after {max_attempts} bounded attempts"
+                ) from exc
+            print(
+                f"⚠️ {operation_name} actor unavailable or exceeded "
+                f"{timeout_s:.0f}s; "
+                f"retrying in {retry_delay_s:.1f}s "
+                f"({attempt}/{max_attempts})",
+                flush=True,
+            )
+            time.sleep(retry_delay_s)
+    raise AssertionError("unreachable")
+
+
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
     """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
     if "nemo_gym" not in master_config.env:
@@ -2555,6 +2676,11 @@ def _create_advantage_estimator(master_config: MasterConfig):
     elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
+    elif adv_estimator_name == "reinforce_baseline":
+        adv_estimator = ReinforceBaselineAdvantageEstimator(
+            adv_estimator_config, loss_config
+        )
+        print("  ✓ Using Molt REINFORCE group-mean baseline")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
         adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
@@ -2623,6 +2749,22 @@ def refit_policy_generation(
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
+    refit_timeout_s = float(os.environ.get("MOLT_REFIT_RPC_TIMEOUT_S", "600"))
+    refit_deadline = time.monotonic() + refit_timeout_s
+
+    def _get_refit_refs(refs: Any, phase: str) -> Any:
+        remaining_s = max(0.0, refit_deadline - time.monotonic())
+        try:
+            return ray.get(refs, timeout=remaining_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            refs_to_cancel = refs if isinstance(refs, (list, tuple)) else [refs]
+            for ref in refs_to_cancel:
+                ray.cancel(ref, force=False)
+            raise RuntimeError(
+                f"Policy generation refit exceeded {refit_timeout_s:.0f}s "
+                f"during {phase}"
+            ) from exc
+
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.suspend_for_refit()
@@ -2647,7 +2789,7 @@ def refit_policy_generation(
     ):
         futures_train = policy.preinit_nvshmem()
         futures_inference = policy_generation.preinit_nvshmem_collective()
-        ray.get(futures_train + futures_inference)
+        _get_refit_refs(futures_train + futures_inference, "megatron reshard")
 
     # Create a context manager that does nothing when timer is None
     timer_context = (
@@ -2677,7 +2819,7 @@ def refit_policy_generation(
                     buffer_size_bytes=buffer_size_bytes,
                 )
                 # Wait for all workers to complete
-                ray.get(futures_train)
+                _get_refit_refs(futures_train, "SGLang HTTP weight stream")
                 update_success = True
             else:
                 # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
@@ -2690,8 +2832,10 @@ def refit_policy_generation(
                 )
                 futures_inference = policy_generation.update_weights_via_ipc_zmq()
                 # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
+                _get_refit_refs(futures_train, "CUDA IPC sender")
+                results = _get_refit_refs(
+                    futures_inference, "CUDA IPC inference receiver"
+                )
                 update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl (vLLM) or megatron reshard
@@ -2708,8 +2852,8 @@ def refit_policy_generation(
                 )
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
+            _get_refit_refs(futures_train, "NCCL sender")
+            results = _get_refit_refs(futures_inference, "NCCL inference receiver")
             update_success = all(result for result in results if result is not None)
 
         # check if update is successful
@@ -2733,6 +2877,95 @@ def refit_policy_generation(
         policy_generation.resume_after_refit()
 
     return {}
+
+
+def _prepare_async_generation_and_start_collection(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    trajectory_collector: Any,
+    dataloader: StatefulDataLoader,
+    *,
+    need_refit: bool,
+    generation_stale: bool,
+    colocated_inference: bool,
+    weight_version: int,
+) -> bool:
+    """Establish the startup barrier before the collector can reserve work."""
+    if need_refit and generation_stale:
+        refit_policy_generation(policy, policy_generation, colocated_inference)
+        generation_stale = False
+    else:
+        policy_generation.prepare_for_generation()
+
+    # Waiting is intentional: collection must not become runnable until
+    # generation is ready and the version visible to admitted work is published.
+    _ray_actor_call_with_transient_retry(
+        lambda: trajectory_collector.set_weight_version.remote(weight_version),
+        operation_name="initial_set_weight_version",
+    )
+    _ray_actor_call_with_transient_retry(
+        lambda: trajectory_collector.start_collection.remote(dataloader),
+        operation_name="start_collection",
+    )
+    return generation_stale
+
+
+def _refit_async_generation_safely(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    trajectory_collector: Any,
+    *,
+    colocated_inference: bool,
+    weight_version: int,
+) -> tuple[dict[str, float], int]:
+    """Refit behind collector and native-vLLM scheduling barriers."""
+    _ray_actor_call_with_transient_retry(
+        trajectory_collector.prepare_for_refit.remote,
+        operation_name="prepare_for_refit",
+    )
+    native_vllm_pause_attempted = False
+    cache_invalidated_before_resume = False
+    try:
+        if isinstance(policy_generation, VllmGeneration):
+            native_vllm_pause_attempted = True
+            policy_generation.pause_generation_for_refit()
+
+        refit_metrics = refit_policy_generation(
+            policy,
+            policy_generation,
+            colocated_inference,
+        )
+        if isinstance(policy_generation, VllmGeneration):
+            # Match Molt's refit ordering exactly: requests remain paused while
+            # reusable prefix/KV state from the old policy is invalidated.
+            # In-flight requests are preserved by pause(mode="keep") and resume
+            # after the new weights and cache state are both visible.
+            cache_invalidated_before_resume = policy_generation.invalidate_kv_cache()
+            if not cache_invalidated_before_resume:
+                print(
+                    "⚠️ vLLM refused to fully invalidate prefix/KV cache after "
+                    "refit; continuing with the backend warning visible.",
+                    flush=True,
+                )
+        weight_version += 1
+        _ray_actor_call_with_transient_retry(
+            lambda: trajectory_collector.set_weight_version.remote(weight_version),
+            operation_name="set_weight_version",
+        )
+        return refit_metrics, weight_version
+    finally:
+        try:
+            if native_vllm_pause_attempted:
+                # Also attempted when pause raised after partially reaching workers.
+                policy_generation.resume_generation_after_refit()
+        finally:
+            # Admission is the last gate reopened.
+            _ray_actor_call_with_transient_retry(
+                lambda: trajectory_collector.resume_after_refit.remote(
+                    cache_invalidated_before_resume
+                ),
+                operation_name="resume_after_refit",
+            )
 
 
 def _initial_policy_generation_stale(
@@ -2820,8 +3053,9 @@ def _resolve_logprob_skip_flags(
             "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
             "Computing prev_logprobs anyway for seq-level error masking."
         )
+    skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
     return (
-        opd_module._skip_prev_logprobs(master_config),
+        skip_prev_logprobs,
         master_config.grpo.skip_reference_policy_logprobs_calculation,
     )
 
@@ -3318,6 +3552,11 @@ def grpo_train(
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, master_config.grpo.reward_shaping
                     )
+                repeated_batch = clip_total_rewards(
+                    repeated_batch,
+                    low=master_config.grpo.reward_clip_low,
+                    high=master_config.grpo.reward_clip_high,
+                )
 
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
@@ -4265,6 +4504,15 @@ def validate(
                 break
 
             additional_metrics_to_report = dict()
+            num_val_generations = (
+                master_config.grpo.num_val_generations_per_prompt
+            )
+            if num_val_generations > 1:
+                val_batch = val_batch.repeat_interleave(num_val_generations)
+                _assign_context_compaction_generation_replica_indices(
+                    val_batch,
+                    num_generations_per_prompt=num_val_generations,
+                )
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
@@ -4330,9 +4578,22 @@ def validate(
 
         # Calculate validation metrics
         num_samples = len(total_rewards)
+        num_val_generations = master_config.grpo.num_val_generations_per_prompt
+        pass_at_k = None
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
             accuracy = rewards_t.mean().item()
+            if (
+                num_val_generations > 1
+                and num_samples % num_val_generations == 0
+            ):
+                pass_at_k = (
+                    rewards_t.reshape(-1, num_val_generations)
+                    .max(dim=1)
+                    .values
+                    .mean()
+                    .item()
+                )
         else:
             accuracy = 0.0
 
@@ -4345,6 +4606,8 @@ def validate(
             "avg_length": avg_length,
             **additional_metrics_to_report,
         }
+        if pass_at_k is not None:
+            val_metrics[f"pass@{num_val_generations}"] = pass_at_k
 
         # Print sample conversations only once at the end of validation
         try:
@@ -4368,6 +4631,8 @@ def validate(
     # Print summary of validation results
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
+    if pass_at_k is not None:
+        print(f"    • Pass@{num_val_generations}: {pass_at_k:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
@@ -4583,17 +4848,25 @@ def async_grpo_train(
         },
     }
 
-    # Calculate optimal buffer size based on generation limits to prevent length bias
-    # Each weight version generates exactly num_prompts_per_step trajectories
-    # With max_age_steps, we keep trajectories from multiple weight versions
     num_prompts_per_step = master_config.grpo.num_prompts_per_step
-    late_arrival_slack = 2
-    optimal_buffer_size = (
-        num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
+    async_queue_size = master_config.grpo.async_grpo.async_queue_size
+    optimal_buffer_size = num_prompts_per_step * async_queue_size
+    inflight_generation_capacity = _resolve_async_generation_batch_size(
+        master_config.grpo,
+        num_prompts_per_step=num_prompts_per_step,
     )
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
+        max_size=optimal_buffer_size,
+        max_reserved_slots=inflight_generation_capacity,
+    )
+    print(
+        "   - replay_buffer_finished_capacity: "
+        f"{optimal_buffer_size} prompt groups"
+    )
+    print(
+        "   - rollout_inflight_capacity: "
+        f"{inflight_generation_capacity} prompt groups"
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
@@ -4667,49 +4940,27 @@ def async_grpo_train(
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
         next_nemo_gym_task_index=next_nemo_gym_task_index,
+        pending_inputs=list((rollouts_state or {}).get("pending_inputs", [])),
+        completed_epochs=int((rollouts_state or {}).get("completed_epochs", 0)),
     )
-
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
 
     print("⏳ Preparing policy generation for training...", flush=True)
-    if NEED_REFIT and POLICY_GENERATION_STALE:
-        print("🔄 Refitting policy generation with actual model weights...", flush=True)
-        try:
-            refit_policy_generation(
-                policy,
-                policy_generation,
-                colocated_inference,
-            )
-            print("✅ Policy generation refit completed successfully", flush=True)
-            POLICY_GENERATION_STALE = False
-        except Exception as e:
-            print(f"❌ Policy generation refit failed: {e}")
-            import traceback
+    POLICY_GENERATION_STALE = _prepare_async_generation_and_start_collection(
+        policy,
+        policy_generation,
+        trajectory_collector,
+        dataloader,
+        need_refit=NEED_REFIT,
+        generation_stale=POLICY_GENERATION_STALE,
+        colocated_inference=colocated_inference,
+        weight_version=weight_version,
+    )
 
-            traceback.print_exc()
-            return
-    else:
-        print("🔄 Preparing policy generation for inference...")
-        try:
-            policy_generation.prepare_for_generation()
-            print("✅ Policy generation preparation completed successfully")
-        except Exception as e:
-            print(f"❌ Policy generation preparation failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return
-
+    print("📦 Started continuous background trajectory collection")
     print("✅ Policy generation setup complete, proceeding to validation...")
 
     # Run validation at start if configured
@@ -4775,61 +5026,27 @@ def async_grpo_train(
     if policy_generation is not None:
         policy_generation.clear_logger_metrics()
 
-    # Wait for initial buffer fill for the current training step.
-    print(
-        f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
-    )
+    # Wait for one complete FIFO training batch.
+    print("⏳ Waiting for replay FIFO to have one complete training batch...")
     timer.start("init/total")
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
-        current_step_ready = ray.get(
-            replay_buffer.has_complete_batch.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
-            )
-        )
+        current_step_ready = buffer_size_current >= num_prompts_per_step
 
         print(
             f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
-            f"step {step} ready={current_step_ready}"
+            f"batch_ready={current_step_ready}"
         )
 
         if current_step_ready:
-            # Keep the async pipeline one step ahead before entering training.
-
-            # A restored buffer may already contain `step`, allowing startup to
-            # consume it before the collector generates `step + 1`. After refit,
-            # the collector advances to targets starting at `step + 2`, leaving
-            # `step + 1` permanently missing. Wait for the initial collector,
-            # whose range includes both steps, to complete the lookahead first.
-            max_num_steps = master_config.grpo.max_num_steps
-            need_lookahead = max_trajectory_age_steps > 0 and step + 1 < max_num_steps
-            if need_lookahead:
-                next_step_ready = ray.get(
-                    replay_buffer.has_complete_batch.remote(
-                        step + 1, num_prompts_per_step, max_trajectory_age_steps
-                    )
-                )
-                if not next_step_ready:  # pragma: no cover
-                    print(
-                        f"  Pipeline barrier: step {step} ready but "
-                        f"step {step + 1} not yet — waiting for lookahead fill "
-                        f"to prevent resume deadlock"
-                    )
-                    wait_iterations += 1
-                    time.sleep(1.0)
-                    continue
             break
 
-        trajectories_needed = ray.get(
-            replay_buffer.get_trajectories_needed.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
-            )
-        )
-        if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
+        trajectories_needed = max(0, num_prompts_per_step - buffer_size_current)
+        if buffer_size_current >= min_trajectories_needed and trajectories_needed:
             print(
-                f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
-                f"trajectories for step {step}"
+                f"  ⏳ FIFO fill in progress: need {trajectories_needed} more "
+                "prompt groups"
             )
 
         collector_status = ray.get(trajectory_collector.get_status.remote())
@@ -4855,6 +5072,10 @@ def async_grpo_train(
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
+    # The first async buffer fill can take over an hour for OSWorld. Do not use
+    # initialization time as the predicted duration of every optimizer step,
+    # or TimeoutChecker will stop a fresh resume after its first checkpoint.
+    timeout.start_iterations()
 
     # Main training loop
     try:
@@ -5076,6 +5297,11 @@ def async_grpo_train(
                     del initial_prompt_message_logs
                     del prompt_batched_flat
 
+                    repeated_batch = clip_total_rewards(
+                        repeated_batch,
+                        low=master_config.grpo.reward_clip_low,
+                        high=master_config.grpo.reward_clip_high,
+                    )
                     rewards = repeated_batch["total_reward"]
 
                     print(
@@ -5394,10 +5620,7 @@ def async_grpo_train(
                 if NEED_REFIT:
                     timer.start("idle/refit_bubble")
 
-                    # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
-                    with timer.time("exposed_generation"):
-                        ray.get(trajectory_collector.prepare_for_refit.remote())
 
                     # Collect generation logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each worker
@@ -5409,17 +5632,16 @@ def async_grpo_train(
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
-                        refit_metrics = refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                        refit_metrics, weight_version = (
+                            _refit_async_generation_safely(
+                                policy,
+                                policy_generation,
+                                trajectory_collector,
+                                colocated_inference=colocated_inference,
+                                weight_version=weight_version,
+                            )
                         )
                         POLICY_GENERATION_STALE = False
-
-                        # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
-                        weight_version += 1
-                        trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
 
                     timer.stop("idle/refit_bubble")
 
@@ -5644,29 +5866,47 @@ def async_grpo_train(
                             ),
                             checkpointing_cfg=master_config.checkpointing,
                         )
-                        # Get dataloader state from trajectory collector
-                        actual_dataloader_state = ray.get(
-                            trajectory_collector.get_dataloader_state.remote()
-                        )
+                        # Freeze new FIFO admission while taking a bounded-time
+                        # snapshot. Do not drain admitted workers here: OSWorld
+                        # trajectories can run for 150 turns, and checkpoint-time
+                        # draining leaves trainer GPUs idle long enough for the
+                        # cluster job reaper to cancel an otherwise healthy run.
+                        #
+                        # In-flight groups that commit after this snapshot are
+                        # intentionally absent from it. The dataloader cursor and
+                        # replay FIFO therefore describe one conservative resume
+                        # boundary; at worst those groups are regenerated after a
+                        # restart rather than blocking every checkpoint.
+                        ray.get(trajectory_collector.pause.remote())
+                        try:
+                            collector_checkpoint_state = ray.get(
+                                trajectory_collector.get_checkpoint_state.remote()
+                            )
+                            actual_dataloader_state = collector_checkpoint_state[
+                                "dataloader"
+                            ]
+                            replay_buffer_state = collector_checkpoint_state[
+                                "replay_buffer"
+                            ]
+                            rollouts_state = collector_checkpoint_state["rollouts"]
+                        finally:
+                            ray.get(trajectory_collector.resume.remote())
+
                         torch.save(
                             actual_dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        print("📦 Saving replay buffer state...")
-                        replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
+                        print("📦 Saving replay FIFO state...")
                         torch.save(
                             replay_buffer_state,
                             os.path.join(checkpoint_path, "replay_buffer.pt"),
                         )
                         print(
-                            "✅ Saved replay buffer with "
+                            "✅ Saved replay FIFO with "
                             f"{len(replay_buffer_state['trajectories'])} trajectories"
                         )
-                        rollouts_state = ray.get(
-                            trajectory_collector.get_rollouts_state.remote()
-                        )
                         torch.save(
-                            rollouts_state,
+                            _detach_checkpoint_tensor_storage(rollouts_state),
                             os.path.join(checkpoint_path, "rollouts.pt"),
                         )
 
@@ -5855,6 +6095,7 @@ def async_grpo_train(
         import traceback
 
         traceback.print_exc()
+        raise
 
     finally:
         # Finalize any pending async checkpoint before tearing down workers.

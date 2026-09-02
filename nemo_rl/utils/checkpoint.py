@@ -368,7 +368,15 @@ class CheckpointManager:
         No-op if nothing is pending. Safe to call multiple times.
         """
         if self._finalize_thread is not None:
-            self._finalize_thread.join()
+            timeout_s = float(
+                os.environ.get("MOLT_CHECKPOINT_FINALIZE_TIMEOUT_S", "600")
+            )
+            self._finalize_thread.join(timeout=timeout_s)
+            if self._finalize_thread.is_alive():
+                raise RuntimeError(
+                    "Background checkpoint finalization exceeded "
+                    f"{timeout_s:.0f}s"
+                )
             self._finalize_thread = None
         if self._finalize_error is not None:
             err = self._finalize_error
