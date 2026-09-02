@@ -27,6 +27,11 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.config import (
+    NATIVE_LORA_ADAPTER_ID,
+    NativeLoraRefitSettings,
+    native_lora_refit_settings,
+)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -60,6 +65,12 @@ except ImportError:
 WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
 UnsupportedNativeRefitTransport = Literal["checkpoint_engine", "sparse_delta"]
 WeightUpdateFinalizer = Callable[[], None]
+
+
+@contextmanager
+def _noop_weight_update_lifecycle() -> Iterator[WeightUpdateFinalizer]:
+    """Provide the common lifecycle shape when only adapter tensors change."""
+    yield lambda: None
 
 
 def _format_refit_key_error(label: str, keys: set[str]) -> str:
@@ -262,6 +273,13 @@ class VllmInternalWorkerExtension:
     # None until init_collective builds it. Declared so a rebuild can release the
     # previous group without probing for the attribute's existence.
     model_update_group: Any = None
+
+    def _native_lora_refit_settings(self) -> NativeLoraRefitSettings | None:
+        """Return adapter settings when this worker is configured for native refit."""
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            return None
+        return native_lora_refit_settings(model_runner.vllm_config)
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -783,6 +801,131 @@ class VllmInternalWorkerExtension:
         # policy stream (no `draft.` prefix), so feed it the policy weights too.
         self._maybe_refit_mtp_drafter(policy_weights)
 
+    @torch.no_grad()
+    def _install_native_lora(self, lora_tensors: dict[str, torch.Tensor]) -> None:
+        """Replace the active in-memory vLLM adapter from factorized tensors."""
+        from vllm.lora.lora_model import LoRAModel
+        from vllm.lora.peft_helper import PEFTHelper
+
+        settings = self._native_lora_refit_settings()
+        if settings is None:
+            raise RuntimeError("Native LoRA settings are missing from vLLM config.")
+        if not lora_tensors:
+            raise RuntimeError("Native LoRA refit received no factor tensors.")
+
+        lora_a_modules = {
+            name.removesuffix(".lora_A.weight")
+            for name in lora_tensors
+            if name.endswith(".lora_A.weight")
+        }
+        lora_b_modules = {
+            name.removesuffix(".lora_B.weight")
+            for name in lora_tensors
+            if name.endswith(".lora_B.weight")
+        }
+        incomplete_source_modules = lora_a_modules ^ lora_b_modules
+        if incomplete_source_modules:
+            raise RuntimeError(
+                "Native LoRA refit received incomplete source A/B pairs: "
+                f"{sorted(incomplete_source_modules)[:8]}"
+            )
+
+        model_runner = self.model_runner
+        lora_manager = model_runner.lora_manager
+        adapter_manager = lora_manager._adapter_manager
+        # Use the model owned by vLLM's adapter manager. This mirrors vLLM's
+        # LoRA loader and avoids assuming that every model runner exposes the
+        # same public ``model`` attribute.
+        model = adapter_manager.model
+        weights_mapper = getattr(model, "hf_to_vllm_mapper", None)
+        if weights_mapper is not None:
+            weights_mapper = weights_mapper.get_unstacked_mapper()
+        skip_prefixes = getattr(model, "lora_skip_prefixes", None)
+        skipped_source_tensors = sorted(
+            name
+            for name in lora_tensors
+            if skip_prefixes
+            and any(
+                f".{prefix}" in name or name.startswith(prefix)
+                for prefix in skip_prefixes
+            )
+        )
+        if skipped_source_tensors:
+            raise RuntimeError(
+                "Native LoRA refit received trainable factors for modules that "
+                "vLLM is configured to skip: "
+                f"{skipped_source_tensors[:8]}"
+            )
+        peft_helper = PEFTHelper.from_dict(
+            {
+                "r": settings.rank,
+                "lora_alpha": settings.alpha,
+                "target_modules": [],
+            }
+        )
+        peft_helper.validate_legal(lora_manager.lora_config)
+        lora = LoRAModel.from_lora_tensors(
+            lora_model_id=NATIVE_LORA_ADAPTER_ID,
+            tensors=lora_tensors,
+            peft_helper=peft_helper,
+            # Mirror vLLM's standard loader: the registered adapter is the CPU
+            # cache, while activation copies it into the preallocated GPU slot.
+            device="cpu",
+            dtype=lora_manager.lora_config.lora_dtype,
+            model_vocab_size=lora_manager.vocab_size,
+            weights_mapper=weights_mapper,
+            skip_prefixes=skip_prefixes,
+        )
+        if not lora.loras:
+            raise RuntimeError(
+                "Native LoRA refit did not map any source tensors to vLLM modules."
+            )
+
+        runtime_input_modules = set(adapter_manager.modules)
+        for packed_inputs in adapter_manager.packed_modules.values():
+            runtime_input_modules.update(packed_inputs)
+        if adapter_manager.is_pooling_model:
+            runtime_input_modules.update(
+                name.removeprefix("model.") for name in runtime_input_modules
+            )
+        unexpected_runtime_modules = sorted(
+            name
+            for name in lora.loras
+            if name not in runtime_input_modules
+            and not (
+                name.endswith(".base_layer")
+                and name.removesuffix(".base_layer") in runtime_input_modules
+            )
+        )
+        if unexpected_runtime_modules:
+            raise RuntimeError(
+                "Native LoRA refit received modules that vLLM cannot apply: "
+                f"{unexpected_runtime_modules[:8]}"
+            )
+
+        incomplete_runtime_modules = sorted(
+            name
+            for name, weights in lora.loras.items()
+            if weights.lora_a is None or weights.lora_b is None
+        )
+        if incomplete_runtime_modules:
+            raise RuntimeError(
+                "Native LoRA refit produced incomplete vLLM A/B pairs: "
+                f"{incomplete_runtime_modules[:8]}"
+            )
+
+        adapter_manager.remove_adapter(NATIVE_LORA_ADAPTER_ID)
+        if not adapter_manager.add_adapter(lora):
+            raise RuntimeError("vLLM rejected the native LoRA adapter update.")
+        adapter_manager.activate_adapter(NATIVE_LORA_ADAPTER_ID)
+        torch.cuda.synchronize(self.device)
+        logger.info(
+            "Installed native LoRA adapter %d: %d source tensors -> %d runtime modules",
+            NATIVE_LORA_ADAPTER_ID,
+            len(lora_tensors),
+            len(lora.loras),
+        )
+
     def _get_sparse_delta_applier(self) -> Any:
         if self._sparse_delta_applier is None:
             # Avoid importing sparse-refit code for existing refit transports.
@@ -925,11 +1068,18 @@ class VllmInternalWorkerExtension:
         buffer = None
         weight = None
         weights = None
+        native_lora_tensors: dict[str, torch.Tensor] = {}
+        native_lora_refit = self._native_lora_refit_settings() is not None
 
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
-            with self._weight_update_lifecycle("ipc") as finalize:
+            lifecycle = (
+                _noop_weight_update_lifecycle()
+                if native_lora_refit
+                else self._weight_update_lifecycle("ipc")
+            )
+            with lifecycle as finalize:
                 while True:
                     # Blocking receive with timeout (this is the main operation)
                     payload = self.zmq_socket.recv_pyobj()
@@ -939,7 +1089,10 @@ class VllmInternalWorkerExtension:
                         # fails, otherwise the sender remains blocked until timeout.
                         try:
                             manifest.require_complete()
-                            finalize()
+                            if native_lora_refit:
+                                self._install_native_lora(native_lora_tensors)
+                            else:
+                                finalize()
                         finally:
                             self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                         break
@@ -976,7 +1129,13 @@ class VllmInternalWorkerExtension:
                             "inaccurate info like keys or cached dtype in "
                             "state_dict_info"
                         )
-                        self._load_weights(weights)
+                        if native_lora_refit:
+                            for name, tensor in weights:
+                                native_lora_tensors[name] = tensor.to(
+                                    device="cpu", copy=True
+                                )
+                        else:
+                            self._load_weights(weights)
                     except Exception as error:
                         batch_error = error
                         # The manifest only keeps the exception message; log
@@ -1015,7 +1174,7 @@ class VllmInternalWorkerExtension:
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            if self._weight_update_errors_are_fatal():
+            if native_lora_refit or self._weight_update_errors_are_fatal():
                 raise
             logger.exception(
                 "Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: %s",
@@ -1057,7 +1216,28 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
+        native_lora_refit = self._native_lora_refit_settings() is not None
+        native_lora_tensors: dict[str, torch.Tensor] = {}
+
+        def collect_native_lora(weights: list[tuple[str, torch.Tensor]]) -> None:
+            # Packed receive buffers are reused. Retain an independent CPU
+            # staging copy, matching vLLM's normal adapter-loading lifecycle.
+            for name, tensor in weights:
+                native_lora_tensors[name] = tensor.to(device="cpu", copy=True)
+
         try:
+            if native_lora_refit:
+                packed_broadcast_consumer(
+                    iterator=iter(self.state_dict_info.items()),
+                    group=self.model_update_group,
+                    src=0,
+                    post_unpack_func=collect_native_lora,
+                )
+                self._install_native_lora(native_lora_tensors)
+                gc.collect()
+                torch.cuda.empty_cache()
+                return True
+
             native_layerwise_refit = self._uses_native_layerwise_refit("collective")
             with self._weight_update_lifecycle("collective") as finalize:
                 packed_broadcast_consumer(
@@ -1073,7 +1253,7 @@ class VllmInternalWorkerExtension:
                 finalize()
 
         except Exception as e:
-            if self._weight_update_errors_are_fatal():
+            if native_lora_refit or self._weight_update_errors_are_fatal():
                 raise
             logger.exception(
                 "Error in VllmInternalWorkerExtension.update_weights_from_collective: %s",

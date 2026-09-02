@@ -43,6 +43,10 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
 )
 from nemo_rl.models.generation.vllm.config import (
+    NATIVE_LORA_ADAPTER_ID,
+    NATIVE_LORA_ADAPTER_NAME,
+    NATIVE_LORA_ADAPTER_PATH,
+    NATIVE_LORA_CONFIG_KEY,
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
     resolve_vllm_video_config,
@@ -209,8 +213,31 @@ def _log_effective_quantization_ignore_patterns(
     print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
 
 
+def _make_native_lora_request(config: VllmConfig) -> Any:
+    """Build the stable in-memory adapter request selected by native refit."""
+    vllm_kwargs = config.get("vllm_kwargs") or {}
+    additional_config = vllm_kwargs.get("additional_config") or {}
+    if (
+        config.get("lora_refit_mode") != "native"
+        or not vllm_kwargs.get("enable_lora")
+        or NATIVE_LORA_CONFIG_KEY not in additional_config
+    ):
+        return None
+
+    # Optional vLLM dependency: import only in the vLLM worker environment.
+    from vllm.lora.request import LoRARequest
+
+    return LoRARequest(
+        lora_name=NATIVE_LORA_ADAPTER_NAME,
+        lora_int_id=NATIVE_LORA_ADAPTER_ID,
+        lora_path=NATIVE_LORA_ADAPTER_PATH,
+    )
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
+    _native_lora_request: Any = None
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -433,6 +460,7 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
         self._extra_env_vars = extra_env_vars
+        self._native_lora_request: Any = None
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -473,6 +501,7 @@ class BaseVllmGenerationWorker:
             import vllm
 
             self.SamplingParams = vllm.SamplingParams
+            self._native_lora_request = _make_native_lora_request(self.cfg)
         except ImportError:
             raise ImportError(
                 "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -1043,7 +1072,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         # Convert inputs to vLLM format and generate outputs.
         prompts = format_prompt_for_vllm_generation(data)
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
-        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -1241,7 +1275,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
-        outputs = self.llm.generate(data["prompts"], sampling_params, use_tqdm=use_tqdm)
+        outputs = self.llm.generate(
+            data["prompts"],
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict

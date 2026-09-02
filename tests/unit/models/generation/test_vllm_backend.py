@@ -832,6 +832,305 @@ def test_update_weights_from_collective_processes_weights_after_loading(
 
 
 @pytest.mark.vllm
+def test_native_lora_collective_clones_buffers_and_installs_adapter(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.config import NATIVE_LORA_CONFIG_KEY
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = {
+        "model.layer.lora_A.weight": (torch.Size([2, 4]), torch.bfloat16),
+        "model.layer.lora_B.weight": (torch.Size([4, 2]), torch.bfloat16),
+    }
+    ext.model_update_group = object()
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        )
+    )
+    source_a = torch.randn(2, 4, dtype=torch.bfloat16)
+    source_b = torch.randn(4, 2, dtype=torch.bfloat16)
+    installed = {}
+
+    def packed_broadcast_consumer(*, post_unpack_func, **_kwargs):
+        post_unpack_func(
+            [
+                ("model.layer.lora_A.weight", source_a),
+                ("model.layer.lora_B.weight", source_b),
+            ]
+        )
+
+    ext._install_native_lora = lambda tensors: installed.update(tensors)
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+
+    assert ext._update_weights_from_collective() is True
+    assert set(installed) == set(ext.state_dict_info)
+    torch.testing.assert_close(installed["model.layer.lora_A.weight"], source_a)
+    torch.testing.assert_close(installed["model.layer.lora_B.weight"], source_b)
+    assert installed["model.layer.lora_A.weight"].data_ptr() != source_a.data_ptr()
+    assert installed["model.layer.lora_B.weight"].data_ptr() != source_b.data_ptr()
+
+
+@pytest.mark.vllm
+def test_install_native_lora_replaces_and_activates_stable_adapter(monkeypatch):
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.config import (
+        NATIVE_LORA_ADAPTER_ID,
+        NATIVE_LORA_CONFIG_KEY,
+    )
+
+    unstacked_mapper = object()
+    weights_mapper = MagicMock()
+    weights_mapper.get_unstacked_mapper.return_value = unstacked_mapper
+    model = SimpleNamespace(hf_to_vllm_mapper=weights_mapper)
+    adapter_manager = MagicMock()
+    adapter_manager.model = model
+    adapter_manager.modules = {"model.layer": object()}
+    adapter_manager.packed_modules = {}
+    adapter_manager.is_pooling_model = False
+    adapter_manager.add_adapter.return_value = True
+    lora_manager = SimpleNamespace(
+        _adapter_manager=adapter_manager,
+        lora_config=SimpleNamespace(lora_dtype=torch.bfloat16),
+        vocab_size=128,
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.model_runner = SimpleNamespace(
+        lora_manager=lora_manager,
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        ),
+    )
+    peft_helper = MagicMock()
+    lora = SimpleNamespace(
+        loras={
+            "model.layer": SimpleNamespace(
+                lora_a=torch.ones(2, 4), lora_b=torch.ones(4, 2)
+            )
+        }
+    )
+    from_dict = MagicMock(return_value=peft_helper)
+    from_lora_tensors = MagicMock(return_value=lora)
+    monkeypatch.setattr(PEFTHelper, "from_dict", from_dict)
+    monkeypatch.setattr(LoRAModel, "from_lora_tensors", from_lora_tensors)
+    synchronize = MagicMock()
+    monkeypatch.setattr(vllm_backend.torch.cuda, "synchronize", synchronize)
+    tensors = {
+        "model.layer.lora_A.weight": torch.ones(2, 4),
+        "model.layer.lora_B.weight": torch.ones(4, 2),
+    }
+
+    ext._install_native_lora(tensors)
+
+    from_dict.assert_called_once_with({"r": 2, "lora_alpha": 8, "target_modules": []})
+    peft_helper.validate_legal.assert_called_once_with(lora_manager.lora_config)
+    from_lora_tensors.assert_called_once()
+    assert from_lora_tensors.call_args.kwargs["device"] == "cpu"
+    assert from_lora_tensors.call_args.kwargs["weights_mapper"] is unstacked_mapper
+    weights_mapper.get_unstacked_mapper.assert_called_once_with()
+    adapter_manager.remove_adapter.assert_called_once_with(NATIVE_LORA_ADAPTER_ID)
+    adapter_manager.add_adapter.assert_called_once_with(lora)
+    adapter_manager.activate_adapter.assert_called_once_with(NATIVE_LORA_ADAPTER_ID)
+    synchronize.assert_called_once_with(ext.device)
+
+
+@pytest.mark.vllm
+def test_install_native_lora_rejects_unapplied_runtime_module(monkeypatch):
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.config import NATIVE_LORA_CONFIG_KEY
+
+    adapter_manager = MagicMock()
+    adapter_manager.model = SimpleNamespace(hf_to_vllm_mapper=None)
+    adapter_manager.modules = {"model.layer": object()}
+    adapter_manager.packed_modules = {}
+    adapter_manager.is_pooling_model = False
+    lora_manager = SimpleNamespace(
+        _adapter_manager=adapter_manager,
+        lora_config=SimpleNamespace(lora_dtype=torch.bfloat16),
+        vocab_size=128,
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.model_runner = SimpleNamespace(
+        lora_manager=lora_manager,
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        ),
+    )
+    peft_helper = MagicMock()
+    monkeypatch.setattr(PEFTHelper, "from_dict", MagicMock(return_value=peft_helper))
+    monkeypatch.setattr(
+        LoRAModel,
+        "from_lora_tensors",
+        MagicMock(
+            return_value=SimpleNamespace(
+                loras={
+                    "model.typo": SimpleNamespace(
+                        lora_a=torch.ones(2, 4), lora_b=torch.ones(4, 2)
+                    )
+                }
+            )
+        ),
+    )
+    tensors = {
+        "model.typo.lora_A.weight": torch.ones(2, 4),
+        "model.typo.lora_B.weight": torch.ones(4, 2),
+    }
+
+    with pytest.raises(RuntimeError, match="vLLM cannot apply"):
+        ext._install_native_lora(tensors)
+
+    adapter_manager.add_adapter.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_install_native_lora_rejects_trainable_skipped_module(monkeypatch):
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.config import NATIVE_LORA_CONFIG_KEY
+
+    adapter_manager = MagicMock()
+    adapter_manager.model = SimpleNamespace(
+        hf_to_vllm_mapper=None,
+        lora_skip_prefixes=["mtp."],
+    )
+    adapter_manager.modules = {"model.layer": object()}
+    adapter_manager.packed_modules = {}
+    adapter_manager.is_pooling_model = False
+    lora_manager = SimpleNamespace(
+        _adapter_manager=adapter_manager,
+        lora_config=SimpleNamespace(lora_dtype=torch.bfloat16),
+        vocab_size=128,
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.model_runner = SimpleNamespace(
+        lora_manager=lora_manager,
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        ),
+    )
+    from_lora_tensors = MagicMock()
+    monkeypatch.setattr(PEFTHelper, "from_dict", MagicMock())
+    monkeypatch.setattr(LoRAModel, "from_lora_tensors", from_lora_tensors)
+    tensors = {
+        "base_model.model.mtp.layer.lora_A.weight": torch.ones(2, 4),
+        "base_model.model.mtp.layer.lora_B.weight": torch.ones(4, 2),
+    }
+
+    with pytest.raises(RuntimeError, match="configured to skip"):
+        ext._install_native_lora(tensors)
+
+    from_lora_tensors.assert_not_called()
+    adapter_manager.remove_adapter.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_native_lora_ipc_clones_buffers_and_installs_adapter(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.config import NATIVE_LORA_CONFIG_KEY
+    from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
+
+    tensor_names = ["model.layer.lora_A.weight", "model.layer.lora_B.weight"]
+    state_dict_info = {
+        tensor_names[0]: (torch.Size([2, 4]), torch.bfloat16),
+        tensor_names[1]: (torch.Size([4, 2]), torch.bfloat16),
+    }
+    used_bytes = calculate_aligned_size(
+        torch.bfloat16.itemsize * torch.Size([2, 4]).numel()
+    )
+    backing_storage = torch.zeros(used_bytes, dtype=torch.uint8)
+    backing_values = backing_storage[: 2 * 4 * torch.bfloat16.itemsize].view(
+        dtype=torch.bfloat16
+    )
+    backing_values.fill_(1)
+    events = []
+
+    class FakeSocket:
+        def __init__(self):
+            self.payload_index = 0
+            self.sent = []
+
+        def recv_pyobj(self):
+            if self.payload_index == 0:
+                payload = (object(), [tensor_names[0]], used_bytes)
+            elif self.payload_index == 1:
+                # Simulate producer reuse immediately after the first data ACK.
+                backing_values.fill_(2)
+                payload = (object(), [tensor_names[1]], used_bytes)
+            else:
+                payload = IPCProtocol.COMPLETE
+            self.payload_index += 1
+            return payload
+
+        def send(self, payload):
+            events.append("ack")
+            self.sent.append(payload)
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = state_dict_info
+    ext.zmq_socket = FakeSocket()
+    ext.maybe_init_zmq = lambda: None
+    ext.device = SimpleNamespace(index=0)
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        )
+    )
+    installed = {}
+
+    def install_native_lora(tensors):
+        events.append("install")
+        installed.update(tensors)
+
+    ext._install_native_lora = install_native_lora
+    ext._synchronize_before_ipc_data_ack = lambda: events.append("sync")
+    monkeypatch.setattr(
+        vllm_backend,
+        "rebuild_cuda_tensor_from_ipc",
+        lambda _handle, _device: backing_storage,
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+
+    assert ext.update_weights_via_ipc_zmq() is True
+    assert set(installed) == set(state_dict_info)
+    torch.testing.assert_close(
+        installed[tensor_names[0]], torch.ones(2, 4, dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        installed[tensor_names[1]], torch.full((4, 2), 2, dtype=torch.bfloat16)
+    )
+    assert all(
+        tensor.data_ptr() != backing_storage.data_ptr() for tensor in installed.values()
+    )
+    assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * 3
+    assert events == ["sync", "ack", "sync", "ack", "install", "ack"]
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     "method_name",
     ["update_weights_via_ipc_zmq", "update_weights_from_collective"],

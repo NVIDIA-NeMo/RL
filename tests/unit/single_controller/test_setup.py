@@ -461,6 +461,43 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
+    def test_materializes_native_lora_before_build_factories(self, patched_factories):
+        mc = _make_master_config()
+        mc.policy.update(
+            {
+                "precision": "bfloat16",
+                "dtensor_cfg": {
+                    "enabled": True,
+                    "_v2": True,
+                    "automodel_kwargs": {"force_hf": True},
+                    "lora_cfg": {"enabled": True, "dim": 16, "alpha": 64},
+                },
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "lora_refit_mode": "native",
+                "refit_transport": None,
+                "vllm_cfg": {
+                    "async_engine": False,
+                    "precision": "bfloat16",
+                    "load_format": "dummy",
+                },
+                "vllm_kwargs": {},
+            }
+        )
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        generation_config = mc.policy["generation"]
+        assert generation_config["vllm_cfg"]["load_format"] == "auto"
+        assert generation_config["vllm_kwargs"]["enable_lora"] is True
+        assert generation_config["vllm_kwargs"]["additional_config"][
+            "nemo_rl_native_lora"
+        ] == {"rank": 16, "alpha": 64}
+        patched_factories["_build_generation"].assert_called_once()
+        patched_factories["_build_trainer"].assert_called_once()
+
     def test_reward_penalties_are_typed(self):
         assert isinstance(_make_master_config().reward_penalties, RewardPenaltyConfig)
 
