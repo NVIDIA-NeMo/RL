@@ -1592,7 +1592,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
             if self.llm is not None:
                 if self._use_internal_rollout_profiler:
-                    self.llm.collective_rpc("close_rollout_profiler", args=tuple())
+                    try:
+                        self.llm.collective_rpc("close_rollout_profiler", args=tuple())
+                    except Exception as error:
+                        profiler_error = error
                 # Clean up extension resources (e.g., ZMQ sockets)
                 self.llm.collective_rpc("cleanup", args=tuple())
 

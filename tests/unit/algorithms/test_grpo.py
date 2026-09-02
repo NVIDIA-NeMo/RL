@@ -230,6 +230,41 @@ def test_profile_sync_vllm_rollout_aborts_failed_attempt():
     policy_generation.finish_rollout_profile.assert_not_called()
 
 
+def test_profile_sync_vllm_rollout_aborts_partial_begin():
+    policy_generation = _mock_profiled_vllm_generation()
+    begin_error = RuntimeError("begin failed")
+    policy_generation.begin_rollout_profile.side_effect = begin_error
+
+    with (
+        pytest.raises(RuntimeError, match="begin failed") as exc_info,
+        _profile_sync_vllm_rollout(policy_generation, step_id=1),
+    ):
+        pass
+
+    assert exc_info.value is begin_error
+    policy_generation.abort_rollout_profile.assert_called_once_with(
+        reason="grpo_rollout_begin_error"
+    )
+    policy_generation.finish_rollout_profile.assert_not_called()
+
+
+def test_profile_sync_vllm_rollout_aborts_failed_finish():
+    policy_generation = _mock_profiled_vllm_generation()
+    finish_error = RuntimeError("finish failed")
+    policy_generation.finish_rollout_profile.side_effect = finish_error
+
+    with (
+        pytest.raises(RuntimeError, match="finish failed") as exc_info,
+        _profile_sync_vllm_rollout(policy_generation, step_id=1),
+    ):
+        pass
+
+    assert exc_info.value is finish_error
+    policy_generation.abort_rollout_profile.assert_called_once_with(
+        reason="grpo_rollout_finish_error"
+    )
+
+
 def test_profile_sync_vllm_rollout_is_inert_for_other_generation_backends():
     policy_generation = _mock_policy_generation()
 
