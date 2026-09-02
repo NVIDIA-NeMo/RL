@@ -137,10 +137,12 @@ git lfs pull
 git submodule update --init --recursive --depth=1
 
 # requirements.txt patches:
-#   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
+#   - relax any `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
-#     downgrading creates an unresolvable conflict in the venv.
-assert_patch_target requirements.txt 'setuptools<80'
+#     downgrading creates an unresolvable conflict in the venv. Not asserted:
+#     tekit de0cf4d8a ("Removed detailed version specification to avoid
+#     dependency misalignment") already ships `setuptools>=80`, so on current
+#     refs there is nothing left to rewrite.
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
 
 #   - drop PyNvVideoCodec. PyPI has no wheel in the pinned ~=2.1.0 range for
@@ -161,14 +163,19 @@ sed -i '/^PyNvVideoCodec/d' requirements.txt
 #     match.
 sed -i '/^nvidia-modelopt/d' requirements.txt
 
-# cutlass_kernels/CMakeLists.txt invokes `setup_library.py develop --user`,
-# which (a) requires a setup.py shim and (b) the `--user` flag is invalid
-# inside a venv. Rewrite the COMMAND to copy setup_library.py to setup.py
-# (so `develop` finds a buildable target) and drop `--user`.
-assert_patch_target cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt \
-    'COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user'
-sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND bash -c "cp -f setup_library.py setup.py \&\& \${Python3_EXECUTABLE} setup_library.py develop"|' \
-    cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
+# cutlass_kernels/CMakeLists.txt used to invoke `setup_library.py develop
+# --user`, which needed a setup.py shim and passed a flag that is invalid
+# inside a venv. tekit de0cf4d8a dropped that execute_process entirely and now
+# puts the cutlass python dir on PYTHONPATH for generate_kernels.py instead, so
+# the rewrite below is only needed on refs predating it. Guarded rather than
+# asserted: on current refs the target is legitimately absent.
+if grep -qF 'COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user' \
+        cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt; then
+    sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND bash -c "cp -f setup_library.py setup.py \&\& \${Python3_EXECUTABLE} setup_library.py develop"|' \
+        cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
+else
+    echo "[INFO] setup_library.py develop --user not present; ref already carries the PYTHONPATH fix"
+fi
 
 # nvshmem doesn't accept the 'f' suffix CMake >= 3.31 generates for Blackwell /
 # Rubin ('100f-real', '107f-real'). Substitute bare archs for the nvshmem cmake
