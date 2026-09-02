@@ -78,8 +78,10 @@ def test_tq_sink_source_passes_conformance(tq_client, staging_partition, fixture
     for record in records:
         assert sink.stage(record).ok
     snapshots = source.fetch([record.staging_key for record in records])
+    # The source returns extras-free base snapshots; every base field (all
+    # digest inputs) must round-trip byte-exactly.
     assert [snapshot.model_dump() for snapshot in snapshots] == [
-        record.model_dump() for record in records
+        record.model_dump(exclude={"extras"}) for record in records
     ]
 
 
@@ -115,6 +117,12 @@ def test_fetch_for_finalization_is_small_typed_and_identity_preserving(
     assert fetched[0].staging_key == records[0].staging_key
     assert fetched[0].snapshot.model_call_id == records[0].model_call_id
     assert fetched[0].routed_len == 0
+    assert fetched[0].fragment is None
+    # The snapshot is a normally validated base model, never model_construct'd.
+    from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+
+    assert type(fetched[0].snapshot) is StagedCallBaseSnapshot
+    assert not hasattr(fetched[0].snapshot, "extras")
 
 
 def test_fetch_for_finalization_rejects_duplicate_request_keys(

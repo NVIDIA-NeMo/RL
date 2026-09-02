@@ -21,7 +21,6 @@ from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
     RouteAssemblyPlan,
     RouteSpan,
-    classify_route_span,
     decode_route_plan,
     encode_route_plan,
 )
@@ -65,9 +64,20 @@ def test_route_plan_round_trip_is_strict_and_lossless() -> None:
     assert decode_route_plan(encode_route_plan(plan)) == plan
 
 
-def test_route_span_classification_uses_shared_length_table() -> None:
+def test_route_span_classification_uses_gyms_decision_table() -> None:
+    # The decision table is Gym-owned; RL applies it via span metadata.
+    pytest.importorskip("nemo_gym.token_id_capture.staging")
+    from nemo_gym.token_id_capture.staging.routes import classify_route_span
+
     spans = _plan().spans
-    assert [classify_route_span(span) for span in spans] == [
+    assert [
+        classify_route_span(
+            carry_len=span.carry_len,
+            generation_len=span.generation_len,
+            staged_route_len=span.staged_route_len,
+        )
+        for span in spans
+    ] == [
         "full",
         "tail",
         "sentinel",

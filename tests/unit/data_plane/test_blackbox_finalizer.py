@@ -158,13 +158,14 @@ def test_finalize_rollout_rejections(tq_client, partitions):
     missing = finalizer.finalize_rollout("rej_a", ghost, reward=0.0)
     assert (missing.rejection_reason or "").startswith("missing_staging_row")
 
-    # Digest corruption: break the manifest digest so recomputation misses.
+    # Digest corruption: break the manifest digest. Gym's verifier owns the
+    # comparison, so the rejection surfaces through rebuild_failed.
     corrupted = dict(receipt)
     corrupted["manifest"] = [
         {**entry, "digest": "0" * 64} for entry in receipt["manifest"]
     ]
     bad = finalizer.finalize_rollout("rej_a", corrupted, reward=0.0)
-    assert (bad.rejection_reason or "").startswith("digest_mismatch")
+    assert (bad.rejection_reason or "").startswith("rebuild_failed:wrong_digest")
 
 
 def test_mixed_weight_version_policy_reject(tq_client, partitions):
@@ -378,16 +379,6 @@ def _stage_fixture_with_routes(tq_client, name: str, *, rollout_id: str):
     return receipt.model_dump(), row, routes_by_call
 
 
-def _gym_linearize_supports_routes() -> bool:
-    from nemo_gym.token_id_capture.staging.rebuild import LinearizedRow
-
-    return "routed_experts" in getattr(LinearizedRow, "__dataclass_fields__", {})
-
-
-@pytest.mark.skipif(
-    not _gym_linearize_supports_routes(),
-    reason="Gym pin predates LinearizedRow.routed_experts (Gym PR #2278 R3 follow-up)",
-)
 def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
     group_id = "grpr3"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
@@ -438,10 +429,6 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
     assert bool(placeholder.eq(-1).all().item())
 
 
-@pytest.mark.skipif(
-    not _gym_linearize_supports_routes(),
-    reason="Gym pin predates LinearizedRow.routed_experts (Gym PR #2278 R3 follow-up)",
-)
 def test_finalize_group_router_replay_without_routes_fails_loudly(
     tq_client, r3_partitions
 ):
@@ -619,8 +606,8 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
     fetched[0] = dataclass_replace(fetched[0], routed_len=bad_routed_len)
 
     class _InjectedSource:
-        def fetch_for_finalization(self, staging_keys):
-            del staging_keys
+        def fetch_for_finalization(self, staging_keys, *, include_route_fragments=False):
+            del staging_keys, include_route_fragments
             return fetched
 
     finalizer._source = _InjectedSource()
@@ -628,3 +615,166 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
 
     assert not row.valid
     assert (row.rejection_reason or "").startswith("routed_len_mismatch")
+
+
+# ---------------------------------------------------------------------------
+# Unified flow: direct and deferred share one plan and one executor
+# ---------------------------------------------------------------------------
+
+
+def _mode_finalizer(tq_client, *, deferred: bool) -> BlackboxFinalizer:
+    return BlackboxFinalizer(
+        tq_client,
+        partition_id=_R3_DEFERRED_PARTITION,
+        staging_partition=_R3_DEFERRED_STAGING,
+        pad_token_id=PAD,
+        mixed_weight_version_policy="allow",
+        min_valid_fraction_per_group=None,
+        router_replay_enabled=True,
+        defer_routed_experts_to_policy=deferred,
+    )
+
+
+def test_direct_and_deferred_build_identical_plans_and_tensors(
+    tq_client, r3_deferred_partitions
+):
+    """Both modes construct byte-identical plans; the shared executor driven
+    from the worker's inputs reproduces the direct-mode tensor exactly."""
+    from nemo_rl.experience.route_assembly import execute_route_plan
+    from nemo_rl.experience.route_plan import encode_route_plan
+
+    rollout_id = "unified_g0"
+    receipt, expected, _ = _stage_deferred_fixture(tq_client, rollout_id=rollout_id)
+
+    direct_row = _mode_finalizer(tq_client, deferred=False).finalize_rollout(
+        rollout_id, receipt, reward=1.0
+    )
+    deferred_row = _mode_finalizer(tq_client, deferred=True).finalize_rollout(
+        rollout_id, receipt, reward=1.0
+    )
+    assert direct_row.valid, direct_row.rejection_reason
+    assert deferred_row.valid, deferred_row.rejection_reason
+
+    # Same canonical token row in both modes.
+    assert direct_row.token_ids == deferred_row.token_ids == expected.token_ids
+    assert direct_row.token_mask == deferred_row.token_mask
+    assert direct_row.logprobs == deferred_row.logprobs
+
+    # Byte-identical RouteAssemblyPlans.
+    assert direct_row.route_plan is not None and deferred_row.route_plan is not None
+    assert encode_route_plan(direct_row.route_plan) == encode_route_plan(
+        deferred_row.route_plan
+    )
+    # The plan carries exactly the receipt-bound extras commitments.
+    committed = {
+        entry["staging_key"]: entry["extras_digest"] for entry in receipt["manifest"]
+    }
+    for span in deferred_row.route_plan.spans:
+        assert span.extras_digest == committed[span.staging_key]
+
+    # Executor equivalence: driving the shared executor with worker-side
+    # fragments and the deferred plan reproduces the direct-mode tensor.
+    source = TQTokenSource(tq_client, staging_partition=_R3_DEFERRED_STAGING)
+    fetched = source.fetch_for_finalization(
+        list(deferred_row.route_plan.cleanup_staging_keys),
+        include_route_fragments=True,
+    )
+    fragments = {
+        item.staging_key: item.fragment for item in fetched if item.fragment is not None
+    }
+    tensor, reason = execute_route_plan(
+        deferred_row.route_plan,
+        fragments,
+        dims=(2, 2),
+        canonical_len=len(expected.token_ids),
+    )
+    assert reason is None
+    assert direct_row.routed_experts is not None
+    assert torch.equal(tensor, direct_row.routed_experts)
+
+
+def test_direct_extras_corruption_rejects_before_publication(
+    tq_client, r3_deferred_partitions
+):
+    from dataclasses import replace as dataclass_replace
+
+    rollout_id = "corrupt_direct_g0"
+    receipt, _, _ = _stage_deferred_fixture(tq_client, rollout_id=rollout_id)
+    finalizer = _mode_finalizer(tq_client, deferred=False)
+    fetched = finalizer._source.fetch_for_finalization(
+        [record["staging_key"] for record in receipt["manifest"]],
+        include_route_fragments=True,
+    )
+    tampered = fetched[0].fragment.routes.clone()
+    tampered[0, 0, 0] = 9999
+    fetched[0] = dataclass_replace(
+        fetched[0],
+        fragment=dataclass_replace(fetched[0].fragment, routes=tampered),
+    )
+
+    class _InjectedSource:
+        def fetch_for_finalization(self, staging_keys, *, include_route_fragments=False):
+            del staging_keys, include_route_fragments
+            return fetched
+
+    finalizer._source = _InjectedSource()
+    row = finalizer.finalize_rollout(rollout_id, receipt, reward=0.0)
+
+    assert not row.valid
+    assert row.rejection_reason == "route_assembly:fragment_integrity"
+
+
+def test_deferred_chain_hash_corruption_rejects_the_row(
+    tq_client, r3_deferred_partitions
+):
+    """The deferred path now recomputes parent-chain and cumulative hashes
+    (previously skipped by RL's local metadata-only linearizer)."""
+    from nemo_gym.token_id_capture.staging.digest import compute_chain_hash
+
+    from tests.unit.data_plane.token_capture_test_fixtures import (
+        _manifest,
+        _record,
+    )
+
+    rollout_id = "corrupt_chain_g0"
+    root = _record(
+        rollout_id=rollout_id,
+        model_call_id="c1",
+        parent_call_id=None,
+        prev_len=0,
+        token_ids=[10, 11, 12, 13],
+        token_mask=[0.0, 0.0, 1.0, 1.0],
+        logprobs=[0.0, 0.0, -0.1, -0.2],
+        weight_version=4,
+    )
+    # The child's chain hash extends a fabricated parent chain, with all
+    # digests self-consistent — only chain replay can catch it.
+    child = _record(
+        rollout_id=rollout_id,
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=root.cum_len,
+        token_ids=[20, 21, 22],
+        token_mask=[0.0, 1.0, 1.0],
+        logprobs=[0.0, -0.3, -0.4],
+        weight_version=4,
+        parent_chain_hash=compute_chain_hash(None, [99, 98]),
+        cumulative_prefix=root.token_ids_delta,
+    )
+    from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+    receipt = RolloutReceipt(
+        rollout_id=rollout_id,
+        terminal_model_call_id="c2",
+        manifest=[_manifest(root), _manifest(child)],
+        terminal_selection="declared",
+    )
+    sink = TQTokenSink(tq_client, staging_partition=_R3_DEFERRED_STAGING)
+    for record in (root, child):
+        assert sink.stage(record).ok
+
+    row = _mode_finalizer(tq_client, deferred=True).finalize_rollout(
+        rollout_id, receipt.model_dump(), reward=0.0
+    )
+    assert not row.valid
+    assert (row.rejection_reason or "").startswith("rebuild_failed:chain_hash_mismatch")
