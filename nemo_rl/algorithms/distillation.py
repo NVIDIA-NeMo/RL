@@ -68,6 +68,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    merge_hf_overrides,
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -513,8 +514,9 @@ def setup(
         generation_config = cast(VllmConfig, generation_config)
         if "vllm_cfg" in generation_config:
             ## make vllm hf overrides match the training policy
-            generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
-                "hf_config_overrides", {}
+            merge_hf_overrides(
+                generation_config.setdefault("vllm_kwargs", {}),
+                hf_config_overrides=policy_config.get("hf_config_overrides"),
             )
         if enable_nemo_gym:
             deferred_vllm = VllmGeneration(
