@@ -31,24 +31,30 @@ def test_empty_cache_guard_noops_without_expandable_segments(monkeypatch):
         torch.cuda.empty_cache = original
 
 
-def test_empty_cache_guard_swallows_variant_runtime_error(monkeypatch):
+def test_empty_cache_guard_skips_flush_entirely_under_es(monkeypatch):
+    """Under expandable_segments the guard must NOT invoke the real
+    empty_cache at all: the failing allocator call corrupts CUDA state even
+    when its exception is caught (observed as cudaErrorIllegalAddress shortly
+    after), so the only safe behavior is a warn-and-skip no-op."""
     from nemo_rl.models.policy.utils import (
         make_empty_cache_best_effort_under_expandable_segments,
     )
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     original = torch.cuda.empty_cache
+    calls = []
 
-    def _raises():
-        raise RuntimeError("std::get: wrong index for variant")
+    def _records():
+        calls.append(1)
 
     try:
-        torch.cuda.empty_cache = _raises
+        torch.cuda.empty_cache = _records
         make_empty_cache_best_effort_under_expandable_segments()
-        assert torch.cuda.empty_cache is not _raises
+        assert torch.cuda.empty_cache is not _records
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            torch.cuda.empty_cache()  # must not raise
+            torch.cuda.empty_cache()  # must not raise, must not call through
+        assert calls == []  # the real empty_cache must never run under ES
         assert any("expandable_segments" in str(w.message) for w in caught)
         # idempotent: re-applying must not double-wrap
         wrapped = torch.cuda.empty_cache
@@ -58,11 +64,9 @@ def test_empty_cache_guard_swallows_variant_runtime_error(monkeypatch):
         torch.cuda.empty_cache = original
 
 
-def test_empty_cache_guard_reraises_unrelated_runtime_errors(monkeypatch):
-    """Only the known expandable-segments allocator error is swallowed;
-    any other RuntimeError must propagate."""
-    import pytest
-
+def test_empty_cache_guard_never_touches_broken_allocator(monkeypatch):
+    """Even an empty_cache that would raise must never be invoked under ES —
+    the guard skips rather than probes."""
     from nemo_rl.models.policy.utils import (
         make_empty_cache_best_effort_under_expandable_segments,
     )
@@ -76,7 +80,6 @@ def test_empty_cache_guard_reraises_unrelated_runtime_errors(monkeypatch):
     try:
         torch.cuda.empty_cache = _raises_other
         make_empty_cache_best_effort_under_expandable_segments()
-        with pytest.raises(RuntimeError, match="illegal memory access"):
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()  # must not raise because it must not call through
     finally:
         torch.cuda.empty_cache = original

@@ -242,19 +242,20 @@ def make_empty_cache_best_effort_under_expandable_segments() -> None:
         return
 
     def _best_effort_empty_cache() -> None:
-        try:
-            original_empty_cache()
-        except RuntimeError as e:
-            msg = str(e)
-            # Only swallow the known expandable-segments allocator bug; any
-            # other RuntimeError is a real failure and must propagate.
-            if "wrong index for variant" not in msg:
-                raise
-            warnings.warn(
-                "torch.cuda.empty_cache() failed under expandable_segments; "
-                f"skipping cache flush: {msg}",
-                stacklevel=2,
-            )
+        # Do NOT attempt the flush under expandable segments. The failing
+        # _cuda_emptyCache ('std::get: wrong index for variant') does not just
+        # raise — it leaves the caching allocator corrupted, and the process
+        # dies of cudaErrorIllegalAddress in a later kernel (observed twice,
+        # different nodes, ~1-2 steps after checkpoint saves, each preceded by
+        # a burst of these failures). Catch-and-continue hides the exception
+        # but not the corruption, so the only safe behavior is to skip the
+        # call entirely: empty_cache is memory hygiene, and expandable
+        # segments already return freed blocks to the segment pool.
+        warnings.warn(
+            "torch.cuda.empty_cache() skipped under expandable_segments "
+            "(allocator-corrupting torch bug; see NRL empty_cache guard)",
+            stacklevel=2,
+        )
 
     _best_effort_empty_cache._nrl_best_effort = True  # type: ignore[attr-defined]
     torch.cuda.empty_cache = _best_effort_empty_cache
