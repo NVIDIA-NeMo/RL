@@ -1,10 +1,10 @@
-# Train with Single-Controller (Async GRPO and PPO)
+# Train with Single-Controller (Async GRPO, GDPO, and PPO)
 
 :::{warning}
 The Single-Controller path is a **beta feature** and still under active development. The API and configuration surface are not yet stable and may change without notice. Issues and feedback are welcome — please file them at [github.com/NVIDIA-NeMo/RL/issues](https://github.com/NVIDIA-NeMo/RL/issues).
 :::
 
-The Single-Controller (SC) path is an alternative async GRPO and PPO runtime that runs rollout generation and policy training as two independent *pumps* coordinated by a single Ray actor (`SingleControllerActor`) sitting over a shared TransferQueue (TQ) data plane. Compared to the legacy async GRPO in [async-grpo.md](./async-grpo.md), SC decouples per-prompt rollouts from the per-step batch boundary: producers push finished rollouts into `TQReplayBuffer` at group granularity, and a pluggable `StalenessSampler` decides which groups the trainer consumes on each step.
+The Single-Controller (SC) path is an alternative async GRPO, GDPO, and PPO runtime that runs rollout generation and policy training as two independent *pumps* coordinated by a single Ray actor (`SingleControllerActor`) sitting over a shared TransferQueue (TQ) data plane. Compared to the legacy async GRPO in [async-grpo.md](./async-grpo.md), SC decouples per-prompt rollouts from the per-step batch boundary: producers push finished rollouts into `TQReplayBuffer` at group granularity, and a pluggable `StalenessSampler` decides which groups the trainer consumes on each step.
 
 ## Configure the Single-Controller Path
 
@@ -85,6 +85,29 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
     ```
 
 6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
+
+### Multi-reward GDPO
+
+Set `grpo.adv_estimator.name: gdpo` to preserve named reward components through
+the SC rollout and TransferQueue path. Both native and NeMo-Gym environments are
+supported. A completion must expose at least two consistently named finite
+components; their sum remains `total_reward` for existing logging and filtering,
+while the estimator receives one `reward/<name>` tensor per component.
+
+```yaml
+grpo:
+  adv_estimator:
+    name: gdpo
+    reward_weights: [1.0, 0.5]  # optional; sorted reward-component order
+```
+
+Native environments return a `dict[str, Tensor]` reward from `step()`. NeMo-Gym
+environments return `reward_components` with each completion. Mixing scalar and
+component rewards within one rollout, changing component names between turns, or
+providing only one component raises an attributable error before training. See
+[Multi-reward support](./environments.md#multi-reward-support-gdpo) for the
+environment contract and [GDPO](./grpo.md#gdpo-group-reward-decoupled-normalization-policy-optimization-for-multi-reward-rl-optimization)
+for the estimator and weighting semantics.
 
 ## Checkpointing and Replay Recovery
 

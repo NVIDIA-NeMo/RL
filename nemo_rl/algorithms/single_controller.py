@@ -43,6 +43,7 @@ import asyncio
 import contextlib
 import hashlib
 import io
+import json
 import logging
 import math
 import os
@@ -107,6 +108,7 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
+    REWARD_COMPONENTS_TAG,
     ROLLOUT_METRICS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -220,6 +222,9 @@ class SingleControllerActor:
         self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
+        self._gdpo_enabled = (
+            not self._is_ppo and self._algo_cfg.adv_estimator.name == "gdpo"
+        )
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -3297,6 +3302,47 @@ class SingleControllerActor:
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
         }
+        if getattr(self, "_gdpo_enabled", False):
+            component_tags: list[str] = []
+            for tag in meta.tags or []:
+                encoded_components = tag.get(REWARD_COMPONENTS_TAG)
+                if not isinstance(encoded_components, str):
+                    raise ValueError(
+                        "GDPO rollout metadata is missing per-sample reward components"
+                    )
+                component_tags.append(encoded_components)
+            if len(component_tags) != len(meta.sample_ids):
+                raise ValueError(
+                    "GDPO rollout metadata is missing per-sample reward components"
+                )
+            try:
+                component_rows = [json.loads(tag) for tag in component_tags]
+            except (TypeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "GDPO reward component metadata is not valid JSON"
+                ) from error
+            if not all(
+                isinstance(row, dict)
+                and all(
+                    isinstance(name, str) and isinstance(value, (int, float))
+                    for name, value in row.items()
+                )
+                for row in component_rows
+            ):
+                raise ValueError(
+                    "GDPO reward component metadata must be numeric mappings"
+                )
+            component_names = sorted({name for row in component_rows for name in row})
+            if len(component_names) < 2:
+                raise ValueError(
+                    "GDPO requires at least two uniquely named reward components"
+                )
+            for name in component_names:
+                repeated_batch[f"reward/{name}"] = torch.tensor(
+                    [float(row.get(name, 0.0)) for row in component_rows],
+                    dtype=torch.float32,
+                    device=rewards.device,
+                )
         for field_name in adv_cfg.repeated_batch_fields:
             repeated_batch[field_name] = squeeze_trailing_unit_dim(
                 tensor_field(data, field_name)

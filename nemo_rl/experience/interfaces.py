@@ -46,6 +46,7 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
+    reward_components: Optional[dict[str, float]] = None
 
 
 @dataclass

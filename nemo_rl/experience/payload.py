@@ -14,6 +14,7 @@
 
 """Producer-side payload helpers for the async-RL TQ path."""
 
+import json
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -28,6 +29,7 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
+    REWARD_COMPONENTS_TAG,
     ROUTED_EXPERTS_FIELD,
     TRUNCATED,
 )
@@ -42,6 +44,7 @@ VIOLATION_TAG_KEYS = (
 # Per-row violation counts ride ``tags`` rather than the tensor fields, so this
 # key is carried on the train batch and consumed by pack_payload.
 _VIOLATION_COUNTS_KEY = "violation_counts"
+_REWARD_COMPONENTS_KEY = "_reward_components"
 
 
 def _violation_counts(
@@ -94,6 +97,7 @@ def record_to_train_batch(
     *,
     pad_value_dict: Mapping[str, int],
     include_message_violation_fields: bool,
+    require_reward_components: bool = False,
 ) -> BatchedDataDict[Any]:
     """Convert one prompt group's record into a packed BatchedDataDict of N rows.
 
@@ -102,6 +106,8 @@ def record_to_train_batch(
         pad_value_dict: Field-name → pad value used by batched_message_log_to_flat_message.
         include_message_violation_fields: Whether to tensorize message violation
             flags for configured advantage penalties.
+        require_reward_components: Require at least two named reward components,
+            as expected by GDPO.
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs,
@@ -152,6 +158,18 @@ def record_to_train_batch(
     total_reward = torch.tensor(
         [float(c.reward) for c in completions], dtype=torch.float32
     )
+    component_names = sorted(
+        {
+            name
+            for completion in completions
+            for name in (completion.reward_components or {})
+        }
+    )
+    if require_reward_components and len(component_names) < 2:
+        raise ValueError(
+            "GDPO requires at least two named reward components per prompt group; "
+            f"rollout produced {component_names or 'none'}"
+        )
     mask_sample = _mask_sample_flags(c.env_extras for c in completions)
     truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
     sample_mask = torch.ones(n, dtype=torch.float32)
@@ -168,6 +186,11 @@ def record_to_train_batch(
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
     }
+    if component_names:
+        train_data[_REWARD_COMPONENTS_KEY] = [
+            {name: float(value) for name, value in (c.reward_components or {}).items()}
+            for c in completions
+        ]
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
     if include_message_violation_fields:
@@ -208,11 +231,21 @@ def pack_payload(
     )
     sample_ids = [f"{group_id}_g{i}" for i in range(n)]
     violations = train_batch.get(_VIOLATION_COUNTS_KEY, [{}] * n)
+    reward_components = train_batch.get(_REWARD_COMPONENTS_KEY)
     tags = [
         {
             "weight_version": weight_version,
             "prompt_idx": prompt_idx,
             **violations[i],
+            **(
+                {
+                    REWARD_COMPONENTS_TAG: json.dumps(
+                        reward_components[i], sort_keys=True, separators=(",", ":")
+                    )
+                }
+                if reward_components is not None
+                else {}
+            ),
         }
         for i in range(n)
     ]

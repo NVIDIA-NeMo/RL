@@ -18,6 +18,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -211,3 +212,98 @@ def test_second_turn_overwrites_prefix_fallback_routes() -> None:
         torch.cat((_routes(1, start=107), _fallback_routes(1))),
     )
     assert torch.equal(final_env["routed_experts"], _fallback_routes(2))
+
+
+def test_single_rollout_accumulates_named_rewards_across_turns() -> None:
+    impl = _rollout_impl(
+        [
+            _generation_output(),
+            _generation_output((10, 11, 12, 20, 21, 31, 32, 40, 41), route_start=100),
+        ],
+        max_rollout_turns=2,
+    )
+    input_sample = {
+        "idx": 0,
+        "message_log": [
+            {
+                "role": "user",
+                "content": "prompt",
+                "token_ids": torch.tensor([10, 11, 12]),
+            }
+        ],
+        "extra_env_info": None,
+        "task_name": "test",
+    }
+    outputs = [
+        EnvironmentReturn(
+            observations=[{"role": "user", "content": "environment"}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards={"style": torch.tensor([0.5]), "correctness": torch.tensor([1.0])},
+            terminateds=torch.tensor([False]),
+            answers=[None],
+        ),
+        EnvironmentReturn(
+            observations=[{"role": "user", "content": "environment"}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards={"correctness": torch.tensor([2.0]), "style": torch.tensor([1.5])},
+            terminateds=torch.tensor([True]),
+            answers=[None],
+        ),
+    ]
+
+    with patch(
+        "nemo_rl.experience.rollout_manager.calculate_rewards", side_effect=outputs
+    ):
+        completion, _ = asyncio.run(impl._run_single_rollout(input_sample, traj_idx=0))
+
+    assert completion.reward == pytest.approx(5.0)
+    assert completion.reward_components == {"correctness": 3.0, "style": 2.0}
+
+
+def test_single_rollout_rejects_changing_reward_schema() -> None:
+    impl = _rollout_impl(
+        [
+            _generation_output(),
+            _generation_output((10, 11, 12, 20, 21, 31, 32, 40, 41), route_start=100),
+        ],
+        max_rollout_turns=2,
+    )
+    input_sample = {
+        "idx": 0,
+        "message_log": [
+            {
+                "role": "user",
+                "content": "prompt",
+                "token_ids": torch.tensor([10, 11, 12]),
+            }
+        ],
+        "extra_env_info": None,
+        "task_name": "test",
+    }
+    first = EnvironmentReturn(
+        observations=[{"role": "user", "content": "environment"}],
+        metadata=[None],
+        next_stop_strings=[None],
+        rewards={"correctness": torch.tensor([1.0]), "style": torch.tensor([0.0])},
+        terminateds=torch.tensor([False]),
+        answers=[None],
+    )
+    second = EnvironmentReturn(
+        observations=[{"role": "user", "content": "environment"}],
+        metadata=[None],
+        next_stop_strings=[None],
+        rewards={"correctness": torch.tensor([1.0]), "safety": torch.tensor([0.0])},
+        terminateds=torch.tensor([True]),
+        answers=[None],
+    )
+
+    with (
+        patch(
+            "nemo_rl.experience.rollout_manager.calculate_rewards",
+            side_effect=[first, second],
+        ),
+        pytest.raises(ValueError, match="component names changed"),
+    ):
+        asyncio.run(impl._run_single_rollout(input_sample, traj_idx=0))

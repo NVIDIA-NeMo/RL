@@ -2091,6 +2091,16 @@ def apply_reward_penalties(
         "unwanted_token": 0,
         "malformed_think_tag": 0,
     }
+
+    def zero_reward(result: dict) -> None:
+        """Keep scalar and named rewards consistent after a hard penalty."""
+        full_result = result["full_result"]
+        full_result["reward"] = 0.0
+        components = full_result.get("reward_components")
+        if components:
+            full_result["reward_components"] = {
+                name: 0.0 for name in components
+            }
     if not reward_penalty_config or not results:
         return counts
 
@@ -2138,7 +2148,7 @@ def apply_reward_penalties(
                     is_duplicated = True
                     break
             if is_duplicated:
-                result["full_result"]["reward"] = 0.0
+                zero_reward(result)
 
                 counts["duplicated_reasoning"] += 1
 
@@ -2165,7 +2175,7 @@ def apply_reward_penalties(
                     final_answer_text = content.strip()
                     break
             if final_answer_text is None or final_answer_text == "":
-                result["full_result"]["reward"] = 0.0
+                zero_reward(result)
 
                 counts["empty_final_answer"] += 1
 
@@ -2187,7 +2197,7 @@ def apply_reward_penalties(
                     has_unwanted_token = True
                     break
             if has_unwanted_token:
-                result["full_result"]["reward"] = 0.0
+                zero_reward(result)
 
                 counts["unwanted_token"] += 1
 
@@ -2273,7 +2283,7 @@ def apply_reward_penalties(
                         has_violation = True
                         break
             if has_violation:
-                result["full_result"]["reward"] = 0.0
+                zero_reward(result)
 
                 counts["malformed_think_tag"] += 1
 

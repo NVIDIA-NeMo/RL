@@ -626,6 +626,31 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+def test_result_to_completion_preserves_named_reward_components():
+    result = _mask_gate_result()
+    result["full_result"]["reward"] = 1.5
+    result["full_result"]["reward_components"] = {
+        "correctness": 1.0,
+        "style": 0.5,
+    }
+
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+
+    assert completion.reward == 1.5
+    assert completion.reward_components == {"correctness": 1.0, "style": 0.5}
+
+
+def test_result_to_completion_rejects_mismatched_component_sum():
+    result = _mask_gate_result()
+    result["full_result"]["reward_components"] = {
+        "correctness": 0.25,
+        "style": 0.25,
+    }
+
+    with pytest.raises(ValueError, match="reward_components sum"):
+        _nemo_gym_impl(True)._results_to_completions([result])
+
+
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
     assistant_message = {
         "role": "assistant",
