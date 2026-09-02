@@ -28,18 +28,37 @@ from pydantic import (
     model_validator,
 )
 
+from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
+from nemo_rl.algorithms.grpo import (
+    _REWARD_PENALTY_FLAGS,
+    GRPOConfig,
+    GRPOLoggerConfig,
+    RewardPenaltyConfig,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
-from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+)
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+    ClusterConfig,
+)
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
@@ -279,14 +298,48 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # nothing dispatches on this value, so accepting "round_robin" would silently give
     # the caller least_outstanding anyway.
     selection: Literal["least_outstanding"] = "least_outstanding"
-    # What to do once a shard is quarantined. Recovery modes arrive with the
-    # communicator rebuild.
+    # What to do once a shard is quarantined, for the case that cannot be recovered from.
+    #
+    # "Recovery modes arrive with the communicator rebuild" used to sit here as a forward
+    # reference. The rebuild has since landed, and recovery is not selected through this
+    # field at all: the reconcile rebuilds over the survivors whenever a shard becomes
+    # absent, whatever this says. A Literal of one for the same reason as selection above
+    # -- nothing dispatches on the value, so a second option would be a lie.
     on_dead_shard: Literal["fail_fast"] = "fail_fast"
     # Attempts to bring a shard back before retiring it permanently, counted across the
     # whole run rather than per incident.
     max_restart_attempts_per_shard: PositiveInt = 5
     # Serving shards below which the run cannot usefully continue.
     min_healthy_shards: PositiveInt = 1
+    # Deadline for one refit collective, after which each participating worker aborts its
+    # own communicator.
+    #
+    # With enabled=True the controller then rebuilds over the survivors and retries once.
+    # With enabled=False there is nothing to rebuild against, so the abort ends the run
+    # with RefitAborted -- still far better than hanging forever inside NCCL, but choose
+    # the deadline knowing there is no second chance.
+    #
+    # None disarms it: no watchdog thread is started and the refit path is byte-identical
+    # to before. Set it well above a healthy refit, because the cost of firing early is
+    # aborting a run that was merely slow, while the cost of firing late is only that a
+    # wedge lasts longer before it is broken.
+    #
+    # DEFAULTED, not None, because the deadline is what makes reactive recovery possible
+    # at all rather than a nicety on top of it. A Ray actor runs one task at a time
+    # (nothing here raises max_concurrency) and this group is a raw StatelessProcessGroup
+    # with no torch process-group watchdog behind it, so a shard dying mid-collective
+    # leaves every trainer blocked inside NCCL. The driver sees RayActorError and calls
+    # _recover_from_failed_refit, whose init_collective then queues behind the still-blocked
+    # task and never runs: the recovery itself wedges and the run ends on stall_timeout_s.
+    # Only the abort releases those ranks. With None as the default, a config that turned
+    # fleet health on got detection and quarantine but no refit recovery, silently.
+    #
+    # 300s is ~150x a healthy refit for a 1.5B model on GB200 (~1.9s measured), so it
+    # cannot fire on a merely-slow one at that scale. It is bandwidth-bound and roughly
+    # linear in parameter count, though: ~90s at 70B and ~500s at 405B on the same
+    # measurement, so a frontier-scale model needs this raised or it will abort a healthy
+    # refit. Set it explicitly there; set it to None to disarm the watchdog entirely.
+    refit_timeout_s: Optional[PositiveFloat] = 300.0
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "FleetHealthConfig":
@@ -315,11 +368,12 @@ class GenerationRouterConfig(BaseModel, extra="allow"):
 
     # When true, NeMo-Gym receives the router's URL instead of the raw backend URLs.
     enabled: bool = False
-    # Range the router reserves its fixed port from. Deliberately distinct from Gym
-    # (5000-5999) and vLLM (7000-8999). The port is fixed for the life of the run so the
-    # URL Gym holds never changes.
-    port_range_low: PositiveInt = 6000
-    port_range_high: PositiveInt = 6099
+    # Range the router reserves its fixed port from. It sits between Ray's client
+    # port (1201) and management ports (1301+) so it cannot collide with Gym,
+    # sandbox, or generation services. The port is fixed for the life of the run
+    # so the URL Gym holds never changes.
+    port_range_low: PositiveInt = DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+    port_range_high: PositiveInt = DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
     # Router -> backend deadline, covering the whole generation. This is the timeout
     # Gym's own client never sets.
     backend_timeout_s: PositiveFloat = 600.0
@@ -534,16 +588,59 @@ class AsyncRLConfig(BaseModel, extra="allow"):
 
 
 class MasterConfig(BaseModel, extra="allow"):
+    # algo configs
+    grpo: Optional[GRPOConfig] = None
+    ppo: Optional[PPOConfig] = None
     policy: PolicyConfig
+    value: Optional[ValueConfig] = None  # PPO extras
     loss_fn: ClippedPGLossConfig
+    value_loss_fn: Optional[MseValueLossConfig] = None  # PPO extras
+    # common configs
     env: dict[str, Any]
     data: DataConfig
-    grpo: GRPOConfig
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+    on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+
+    @model_validator(mode="after")
+    def validate_algorithm_block(self) -> "MasterConfig":
+        # Both are Optional so a PPO run can omit `grpo`; without this the
+        # entrypoint dereferences the absent block before validation runs.
+        if self.grpo is not None and self.ppo is not None:
+            raise ValueError(
+                "Only one algorithm block can be set, either `grpo` or `ppo`."
+            )
+        if self.grpo is None and self.ppo is None:
+            raise ValueError(
+                "At least one algorithm block must be set, either `grpo` or `ppo`."
+            )
+        return self
+
+
+def is_ppo_run(master_config: MasterConfig) -> bool:
+    """Whether this SingleController run trains a PPO critic alongside the policy.
+
+    Single source of truth for the flag: setup reads it to decide whether to
+    build the value model, and the controller reads it to decide whether the
+    train pump runs the critic stages. ``model_construct`` skips defaults, so
+    the attribute can genuinely be missing on a hand-built config.
+    """
+    return getattr(master_config, "ppo", None) is not None
+
+
+def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
+    """The active algorithm block: ``ppo`` on a PPO run, else ``grpo``.
+
+    Exactly one of the two is set; MasterConfig.validate_algorithm_block checks
+    that at construction.
+    """
+    if is_ppo_run(master_config):
+        return master_config.ppo  # type: ignore
+    return master_config.grpo  # type: ignore
 
 
 def validate_sampler_buffer_capacity(
@@ -639,7 +736,7 @@ def _validate_failure_settings(
         warnings.warn(
             f"async_rl.rollout_failure.min_step_batch_fraction="
             f"{failure_config.min_step_batch_fraction} gives a floor of {floor} of "
-            f"grpo.num_prompts_per_step={num_prompts_per_step}, so no prompt may be "
+            f"num_prompts_per_step={num_prompts_per_step}, so no prompt may be "
             f"dropped -- but max_skipped_prompts="
             f"{failure_config.max_skipped_prompts} / max_consecutive_dropped_prompts="
             f"{failure_config.max_consecutive_dropped_prompts} permit drops, and the "
@@ -666,7 +763,7 @@ def _validate_failure_settings(
         warnings.warn(
             f"async_rl.rollout_failure.replacement_reserve_prompts="
             f"{failure_config.replacement_reserve_prompts} exceeds "
-            f"grpo.num_prompts_per_step={num_prompts_per_step}. The pool is refilled "
+            f"num_prompts_per_step={num_prompts_per_step}. The pool is refilled "
             "by diverting one whole dataloader batch, so a mark above one batch "
             "diverts several in a row before any is admitted -- and diverting happens "
             "before admit(), outside the sampler gate and the buffer-capacity valve, "
@@ -675,19 +772,198 @@ def _validate_failure_settings(
         )
 
 
+def _validate_algo_settings(master_config: MasterConfig) -> None:
+    """Reject algorithm blocks the SingleController path cannot honour.
+
+    Both directions on the critic: one the PPO path needs and does not have, and
+    one a GRPO run carries and would never build. Plus the reward shaping and
+    filtering knobs SC reads on neither path.
+    """
+    algo_cfg = algo_config(master_config)
+
+    # None means no epoch bound. SC has no -1 convention though: the rollout pump
+    # gates on _current_epoch < max_num_epochs, so <= 0 trains nothing and exits 0.
+    if algo_cfg.max_num_epochs is not None and algo_cfg.max_num_epochs <= 0:
+        raise ValueError(
+            f"max_num_epochs={algo_cfg.max_num_epochs} trains zero steps on the "
+            "SingleController path, which does not use the -1 convention that v1 "
+            "async PPO requires. Set a positive max_num_epochs and bound the run "
+            "with max_num_steps."
+        )
+
+    # SC reads none of these on either path, so an enabled one describes shaping
+    # this run does not do. Async GRPO rejects three of them the same way.
+    unsupported = [
+        name
+        for name, enabled in (
+            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
+            ("reward_scaling", algo_cfg.reward_scaling.enabled),
+            ("reward_shaping", algo_cfg.reward_shaping.enabled),
+        )
+        if enabled
+    ]
+    if unsupported:
+        names = ", ".join(unsupported)
+        raise NotImplementedError(
+            f"{names} not supported on the SingleController path, which "
+            "implements none of them -- the run would silently skip the "
+            "shaping. Disable them."
+        )
+
+    if master_config.policy["generation"]["colocated"]["enabled"]:
+        raise ValueError(
+            "The SingleController path requires "
+            "policy.generation.colocated.enabled=false: SC drives rollout via "
+            "RolloutManager.generate_and_push, which is only supported on the "
+            "disaggregated async engine."
+        )
+
+    async_config = master_config.async_rl
+    # Capacity is sized from the peak window whatever the algorithm, so an inert
+    # setting still costs buffer and fails setup naming the wrong cause.
+    if (
+        getattr(async_config.sampler, "warmup_lookahead_versions", None) is not None
+        and getattr(algo_cfg, "policy_training_start_step", 0) == 0
+    ):
+        if is_ppo_run(master_config):
+            raise ValueError(
+                "async_rl.sampler.warmup_lookahead_versions requires "
+                "ppo.policy_training_start_step > 0; without critic warmup there is "
+                "no frozen-policy window to widen."
+            )
+        raise ValueError(
+            "async_rl.sampler.warmup_lookahead_versions is a PPO critic-warmup knob "
+            "and this run has no `ppo` block, so nothing ever widens the window -- "
+            "but max_buffered_rollouts is still validated against the wider one. "
+            "Remove it, or add a `ppo` block with policy_training_start_step > 0."
+        )
+
+    if not is_ppo_run(master_config):
+        # A value block without `ppo` is inert -- nothing builds the critic --
+        # and a config carrying one is asking for PPO by every reading except
+        # the one the code uses. Say so rather than training GRPO silently.
+        for name in ("value", "value_loss_fn"):
+            if getattr(master_config, name, None) is not None:
+                raise ValueError(
+                    f"{name} is set but the `ppo` block is absent, so this run "
+                    "trains GRPO and the value model would never be built. Add a "
+                    f"`ppo` block, or remove `{name}`."
+                )
+        return
+
+    for name in ("value", "value_loss_fn"):
+        if getattr(master_config, name, None) is None:
+            raise ValueError(
+                f"the `ppo` block selects the PPO path, which needs `{name}`. "
+                "See examples/configs/ppo_math_1B_megatron_single_controller.yaml."
+            )
+
+    # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
+    # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
+    # model already on GPU. ppo_math_1B.yaml ships dtensor_cfg.enabled=true.
+    value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
+    if not value_megatron_cfg.get("enabled"):
+        raise ValueError(
+            "PPO on the SingleController path requires a Megatron critic "
+            "(value.megatron_cfg.enabled=true). The DTensor value worker does not "
+            "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
+        )
+
+    # Each PPO epoch must consume the complete RL batch. Without this guard, every
+    # chunk would independently run the configured actor and critic optimizer steps.
+    if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
+        raise ValueError(
+            "PPO on the SingleController path requires "
+            "async_rl.min_groups_for_streaming_train "
+            f"({async_config.min_groups_for_streaming_train}) == "
+            f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
+            "step is assembled from a single chunk. Otherwise each chunk would "
+            "run ppo.critic_ppo_epochs critic optimizer steps and ppo.ppo_epochs "
+            "policy optimizer steps on only part of the RL batch. Streaming PPO "
+            "needs a split train API on the value workers, which they do not have "
+            "yet (#2625)."
+        )
+
+    failure_config = async_config.rollout_failure
+    drop_budget = (
+        failure_config.max_skipped_prompts
+        + failure_config.max_consecutive_dropped_prompts
+    )
+    if drop_budget > 0:
+        raise ValueError(
+            "PPO on the SingleController path requires "
+            "async_rl.rollout_failure.max_skipped_prompts=0 and "
+            "max_consecutive_dropped_prompts=0, but they sum to "
+            f"{drop_budget}. A drop shortens the step, and the critic shards that "
+            "step against the configured value.train_global_batch_size rather than "
+            "its actual size, so the first short step fails a divisibility assert "
+            "inside the value workers (#2625)."
+        )
+
+    policy_megatron_cfg = master_config.policy.get("megatron_cfg", {})  # type: ignore
+    if (
+        getattr(algo_cfg, "policy_training_start_step", 0) > 0
+        and master_config.checkpointing["enabled"]
+        and master_config.checkpointing["save_optimizer"]
+        and policy_megatron_cfg.get("enabled")
+        and policy_megatron_cfg.get("checkpoint", {}).get(
+            "ckpt_assume_constant_structure"
+        )
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
+            "is incompatible with PPO critic warmup when optimizer checkpointing "
+            "is enabled. Set ckpt_assume_constant_structure=false, "
+            "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
+        )
+
+    sampler_name = async_config.sampler.name
+    if sampler_name != "in_order":
+        raise ValueError(
+            "PPO on the SingleController path only supports "
+            f"async_rl.sampler.name='in_order', but got '{sampler_name}'. "
+            "Other samplers are not supported yet (in particular during critic "
+            "warmup) (#2625)."
+        )
+
+    rl_step_samples = (
+        algo_cfg.num_prompts_per_step * algo_cfg.num_generations_per_prompt
+    )
+    value_global_batch_size = master_config.value["train_global_batch_size"]  # type: ignore
+    if rl_step_samples != value_global_batch_size:
+        raise ValueError(
+            "num_prompts_per_step * num_generations_per_prompt "
+            f"({rl_step_samples}) must equal value.train_global_batch_size "
+            f"({value_global_batch_size}) so that each critic epoch consumes one "
+            "complete RL batch."
+        )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    _validate_algo_settings(master_config)
+
     async_config = master_config.async_rl
-    num_prompts_per_step = master_config.grpo.num_prompts_per_step
-    if num_prompts_per_step < async_config.min_groups_for_streaming_train:
+    algo_cfg = algo_config(master_config)
+
+    reward_penalties_enabled = any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    )
+    if reward_penalties_enabled and not master_config.env.get("should_use_nemo_gym"):
         raise ValueError(
-            f"grpo.num_prompts_per_step ({num_prompts_per_step}) "
+            "reward_penalties require the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true) on SingleController"
+        )
+
+    if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
+        raise ValueError(
+            f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) "
             f"must be >= async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train})"
         )
 
     rl_step_samples = (
-        num_prompts_per_step * master_config.grpo.num_generations_per_prompt
+        algo_cfg.num_prompts_per_step * algo_cfg.num_generations_per_prompt
     )
     train_global_batch_size = master_config.policy["train_global_batch_size"]
     if rl_step_samples != train_global_batch_size:
@@ -701,7 +977,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     required_capacity = required_buffer_capacity_for_config(
         async_config.sampler,
-        num_prompts_per_step,
+        algo_cfg.num_prompts_per_step,
     )
     validate_sampler_buffer_capacity(
         async_config,
@@ -745,33 +1021,110 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     reference_policy_kl_penalty = getattr(
         master_config.loss_fn, "reference_policy_kl_penalty", 0
     )
+
+    if reference_policy_kl_penalty < 0:
+        raise ValueError(
+            "loss_fn.reference_policy_kl_penalty="
+            f"{reference_policy_kl_penalty} must not be negative; "
+            "use 0 to disable the KL penalty."
+        )
+
     if (
         reference_policy_kl_penalty
-        and master_config.grpo.skip_reference_policy_logprobs_calculation
+        and algo_cfg.skip_reference_policy_logprobs_calculation
     ):
         raise ValueError(
             "loss_fn.reference_policy_kl_penalty="
             f"{reference_policy_kl_penalty} requires reference_policy_logprobs, "
-            "but grpo.skip_reference_policy_logprobs_calculation=true skips "
+            "but skip_reference_policy_logprobs_calculation=true skips "
             "computing them on the SingleController path. Set "
-            "grpo.skip_reference_policy_logprobs_calculation=false, or set "
+            "skip_reference_policy_logprobs_calculation=false, or set "
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
-    _validate_failure_settings(async_config, num_prompts_per_step)
+    if (
+        master_config.loss_fn.use_kl_in_reward
+        and reference_policy_kl_penalty > 0
+        and master_config.loss_fn.force_on_policy_ratio
+        and algo_cfg.seq_logprob_error_threshold is None
+    ):
+        raise ValueError(
+            "loss_fn.use_kl_in_reward=true with a nonzero "
+            "loss_fn.reference_policy_kl_penalty requires policy logprobs, but "
+            "loss_fn.force_on_policy_ratio=true without "
+            "seq_logprob_error_threshold skips them. Set "
+            "loss_fn.force_on_policy_ratio=false or configure "
+            "seq_logprob_error_threshold."
+        )
+
+    # ``env`` is required in production configs, but model_construct-based unit
+    # configs can omit it. Only apply rollout-path validation when it is present.
+    env_config = getattr(master_config, "env", None)
+
+    penalties_enabled = (
+        algo_cfg.invalid_tool_call_advantage is not None
+        or algo_cfg.malformed_thinking_advantage is not None
+    )
+    if penalties_enabled and not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "invalid_tool_call_advantage and malformed_thinking_advantage on the "
+            "active algorithm block require the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true) on SingleController."
+        )
+
+    opd_enabled = opd_module.is_opd_enabled(master_config)
+    if opd_enabled and is_ppo_run(master_config):
+        raise ValueError(
+            "on_policy_distillation is only supported with the `grpo` algorithm block."
+        )
+    if algo_cfg.adv_estimator.name == "opd" and not opd_enabled:
+        raise ValueError(
+            "grpo.adv_estimator.name='opd' requires "
+            "on_policy_distillation.enabled=true."
+        )
+    if opd_enabled:
+        opd_config = master_config.on_policy_distillation
+        assert opd_config is not None
+        if algo_cfg.adv_estimator.name != "opd":
+            raise ValueError(
+                "on_policy_distillation.enabled=true requires "
+                "grpo.adv_estimator.name='opd'."
+            )
+        if not opd_module.is_non_colocated_teachers_enabled(master_config):
+            raise ValueError(
+                "SingleController MOPD currently requires "
+                "on_policy_distillation.non_colocated_teachers.enabled=true."
+            )
+        if env_config is not None and not bool(env_config.get("should_use_nemo_gym")):
+            raise ValueError(
+                "on_policy_distillation requires env.should_use_nemo_gym=true: "
+                "teacher routing keys off the gym rollout path's per-agent "
+                "agent_ref."
+            )
+        if not opd_config.teacher_model_by_agent_name:
+            raise ValueError(
+                "on_policy_distillation.teacher_model_by_agent_name must contain "
+                "at least one teacher mapping."
+            )
+        opd_module.assert_prev_logprobs_available(master_config)
+
+    if (
+        reference_policy_kl_penalty == 0
+        and not algo_cfg.skip_reference_policy_logprobs_calculation
+    ):
+        print(
+            "Reference policy logprob calculation will be skipped since "
+            "`loss_fn.reference_policy_kl_penalty` is 0, so no reference "
+            "model was initialized."
+        )
+
+    _validate_failure_settings(async_config, algo_cfg.num_prompts_per_step)
 
     # Nesting says which knob applies to which path, but nothing stops an operator
     # filling in the block for the path this run is not taking -- and a populated
     # wrong-path block is still a silent no-op, which is the failure this whole
     # restructure exists to remove. Only a check at setup actually closes it.
     #
-    # ``env`` is a required field, so a run built the production way -- through
-    # MasterConfig(**cfg), which validates -- always carries it. model_construct
-    # skips validation and only fills fields that have defaults, so a config
-    # assembled that way can genuinely lack the attribute, and without it the
-    # rollout path is unknowable. This check only reads it to decide which half of
-    # the block is inert, so skip rather than fail a construction over it.
-    env_config = getattr(master_config, "env", None)
     if env_config is not None:
         use_nemo_gym = bool(env_config.get("should_use_nemo_gym"))
         unused_name = "native" if use_nemo_gym else "nemo_gym"
@@ -805,6 +1158,16 @@ class AdvantageConfig:
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
+    invalid_tool_call_mask_field: str = INVALID_TOOL_CALL_MASK
+    malformed_thinking_mask_field: str = MALFORMED_THINKING_MASK
+    mask_sample_field: str = "mask_sample"
+    truncated_field: str = "truncated"
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
+    generation_logprobs_field: str = "generation_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"
+    teacher_logprobs_field: str = "teacher_reference_logprobs"
+    # PPO only: the critic's pre-update prediction (input) and GAE's
+    # regression target for it (output).
+    values_field: str = "values"
+    returns_field: str = "returns"

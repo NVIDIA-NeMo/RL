@@ -53,7 +53,7 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
-    get_default_hf_config,
+    get_hf_config,
     get_theoretical_tflops,
 )
 from nemo_rl.utils.multimodal_payload_metrics import (
@@ -102,6 +102,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         processor: Optional[AutoProcessor] = None,
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
+        reserved_http_server_port: Optional[int] = None,
     ):
         self.debug_payload_metrics = False
         if weights_path:
@@ -124,17 +125,54 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        if reserved_http_server_port is not None and not megatron_enable:
+            raise ValueError(
+                "reserved_http_server_port is only supported by the Megatron "
+                "worker (policy.megatron_cfg.enabled=true)."
+            )
         if draft_enabled and not megatron_enable:
             raise ValueError(
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
-        if draft_enabled and bool(
-            config.get("sequence_packing", {}).get("enabled", False)
-        ):
+        if draft_enabled and config["megatron_cfg"]["context_parallel_size"] > 1:
+            # Sequence packing itself is supported with the draft; CP is not:
+            # the hidden-state capture and the per-segment shifts assume each
+            # packed sequence lives whole on one rank.
             raise ValueError(
-                "policy.draft.enabled=true does not support sequence packing yet. "
-                "Disable policy.sequence_packing.enabled or policy.draft."
+                "policy.draft.enabled=true does not support context parallelism "
+                "yet. Set policy.megatron_cfg.context_parallel_size=1 or disable "
+                "policy.draft."
+            )
+        if (
+            draft_enabled
+            # sequence_packing is NotRequired in PolicyConfig, so tolerate its
+            # absence; the parallel sizes are required megatron_cfg keys.
+            and bool(config.get("sequence_packing", {}).get("enabled", False))
+            and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+        ):
+            # The packed draft path re-embeds the per-segment-shifted token ids
+            # via the model's embedding, which MCore constructs only on the
+            # first pipeline stage while the draft runs on the last.
+            raise ValueError(
+                "policy.draft.enabled=true with sequence packing does not "
+                "support pipeline parallelism yet. Set "
+                "policy.megatron_cfg.pipeline_model_parallel_size=1, or disable "
+                "policy.sequence_packing or policy.draft."
+            )
+        if draft_enabled and bool(
+            # use_fused_linear_logprobs is NotRequired in MegatronConfig.
+            config["megatron_cfg"].get("use_fused_linear_logprobs", False)
+        ):
+            # The fused path returns per-token logprobs and never materializes
+            # the full next-token logits the draft's teacher distribution
+            # needs, in either the packed or the unpacked layout.
+            raise ValueError(
+                "policy.draft.enabled=true is not supported with "
+                "policy.megatron_cfg.use_fused_linear_logprobs=true: draft "
+                "training needs the full next-token logits for the teacher, "
+                "which the fused path never materializes. Disable one of the "
+                "two."
             )
         if megatron_enable:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
@@ -177,6 +215,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
                     is False
                 ), "LoRA is not supported for DTensorPolicyWorker V1"
+                if (config.get("generation") or {}).get("backend") == "sglang":
+                    raise ValueError(
+                        "policy.generation.backend='sglang' requires "
+                        "policy.dtensor_cfg._v2=true or policy.megatron_cfg.enabled=true; "
+                        "DTensorPolicyWorker V1 does not implement the SGLang refit path."
+                    )
                 if config["dtensor_cfg"].get("dp_replicate_size", 1) > 1:
                     raise ValueError(
                         "dp_replicate_size > 1 requires policy.dtensor_cfg._v2: true "
@@ -267,6 +311,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         if skip_weight_load:
             worker_kwargs["skip_weight_load"] = True
+        if reserved_http_server_port is not None:
+            worker_kwargs["reserved_http_server_port"] = reserved_http_server_port
 
         if use_v2:
             # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
@@ -332,7 +378,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # initialize FLOPs tracker
         try:
             self.flops_tracker = FLOPTracker.from_config(
-                config["model_name"], get_default_hf_config(config["model_name"])
+                config["model_name"],
+                get_hf_config(
+                    config["model_name"],
+                    **(config.get("hf_config_overrides") or {}),
+                ),
             )
         except ValueError as e:
             self.flops_tracker = None
@@ -1079,42 +1129,82 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         return futures
 
-    def stream_weights_via_http(
+    def connect_sglang_rollout_engines(
         self,
-        rollout_engine_urls: list[str],
-        buffer_size_bytes: int,
-    ) -> list[ray.ObjectRef]:
-        """Send the weights to colocated SGLang engines via CUDA IPC over HTTP.
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
+        """Set up the colocate Gloo gather topology for SGLang weight refit.
 
-        Args:
-            rollout_engine_urls: ``http://host:port`` base URLs of each
-                engine's ``node_rank=0`` SGLang HTTP server. The caller
-                resolves these once (via ``engine.get_base_url``) and passes
-                them in, so every FSDP rank doesn't redo the Ray RPC.
-            buffer_size_bytes: Max bucket size in bytes before flushing.
-
-        The rollout TP size is captured once via
-        ``set_rollout_num_gpus_per_engine`` and reused by each worker.
+        Called by the SGLang colocated refit drivers (Megatron and FSDP)
+        whenever engines are added or recovered.
         """
         futures = self.worker_group.run_all_workers_single_data(
-            "stream_weights_via_http",
-            rollout_engine_urls=rollout_engine_urls,
+            "connect_sglang_rollout_engines",
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
+        ray.get(futures)
+
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Send Megatron-restored HF tensors to colocated SGLang via Ray IPC."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_colocated",
+            rollout_engines=rollout_engines,
             buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
         )
         return futures
 
-    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
-        """Broadcast the rollout engine TP size to every policy worker."""
-        ray.get(
-            self.worker_group.run_all_workers_single_data(
-                "set_rollout_num_gpus_per_engine",
-                num_gpus_per_engine=num_gpus_per_engine,
-            )
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "connect_sglang_rollout_engines_distributed",
+            rollout_engines=rollout_engines,
+            engine_gpu_counts=engine_gpu_counts,
+            group_name=group_name,
         )
+        ray.get(futures)
+
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        rollout_engine_lock: ray.actor.ActorHandle,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Broadcast Megatron-restored HF tensors to SGLang via NCCL (rank 0 only)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_distributed",
+            rollout_engines=rollout_engines,
+            rollout_engine_lock=rollout_engine_lock,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+        )
+        return futures
 
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
@@ -1123,6 +1213,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
         )
@@ -1171,11 +1262,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         return results[0]
 
-    def nccl_reshard_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
+    def nccl_reshard_refit(
+        self, kv_scales=None, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Transfer weights to gen workers via nccl_reshard (xferdtensor)."""
         futures = self.worker_group.run_all_workers_single_data(
             "nccl_reshard_refit",
             kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
         )
         return futures
 

@@ -57,6 +57,34 @@ FP8 generations are recommended to be configured with the following settings:
                 pow2_activation_scaling_factors: False
 ```
 
+For MXFP8, `quantization_ignore_patterns` accepts exact module names,
+substrings, and `fnmatch` wildcards. Matching modules remain in BF16. For
+example, the following scope quantizes only Qwen3 routed experts while keeping
+attention, the router, and the language-model head in BF16:
+
+```
+    policy:
+        generation:
+            vllm_cfg:
+                precision: "fp8"
+                is_mx: true
+                quantization_ignore_patterns:
+                    - model.layers.*.self_attn.*
+                    - model.layers.*.mlp.gate
+```
+
+`lm_head` is always excluded from FP8 and MXFP8 quantization, even when it is
+not listed in `quantization_ignore_patterns` in the YAML configuration.
+Models with MTP layers must list their MTP module names explicitly, for example
+`mtp.*` and `language_model.mtp.*`. External speculative-decoding drafts use a
+separate vLLM model configuration and must configure their precision separately.
+
+`quantization_ignored_layer_kws` is deprecated for MXFP8 in NeMo RL 0.8; new
+MXFP8 configurations should use `quantization_ignore_patterns` instead.
+`quantization_ignore_patterns` requires `is_mx: true`. Non-MX FP8
+(`precision: "fp8"` without `is_mx`) has no pattern-based replacement yet and
+must continue to use `quantization_ignored_layer_kws`.
+
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```
@@ -64,9 +92,51 @@ To train with FP8, you need to set the Megatron path and configure it using the 
         megatron_cfg:
             fp8_cfg:
                 fp8: "hybrid"               # choices: [hybrid, e4m3]
-                fp8_recipe: "tensorwise"    # choices: [tensorwise, blockwise]
+                fp8_recipe: "tensorwise"    # choices: [tensorwise, blockwise, mxfp8]
                 fp8_param: false            # boolean value
 ```
+
+### Per-module Transformer Engine precision recipes
+
+For finer-grained Megatron training precision, point
+`policy.megatron_cfg.te_precision_config_file` at a Megatron-LM Transformer
+Engine precision recipe:
+
+```
+    policy:
+        megatron_cfg:
+            fp8_cfg:
+                enabled: true
+                fp8: "hybrid"
+                fp8_recipe: "mxfp8"
+                fp8_param: false
+            te_precision_config_file: "/path/to/te_precision.yaml"
+```
+
+A minimal recipe that applies MXFP8 training precision to all matched modules
+and keeps evaluation in BF16 looks like:
+
+```yaml
+configs:
+  mxfp8:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe: {fp8_quantization_recipe: mxfp8}
+    evaluation_recipe: {}
+matchers:
+  all: {config: mxfp8, type: glob, pattern: "*", enabled: true}
+```
+
+Each matcher must set `enabled: true`; omitted or false `enabled` values are
+parsed but do not match any modules. By default, a precision recipe by itself
+does not enable FP8 compute in the usual training path, so keep
+`fp8_cfg.enabled: true` when the matched modules should run under FP8 autocast.
+
+When both `fp8_cfg` and `te_precision_config_file` are set, matched modules use
+the recipe's per-module quantization config. NeMo RL still derives sequence
+padding and FP8 refit behavior from `fp8_cfg`, so matched FP8 recipes must use
+the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Recipe
+`training_recipe` and `evaluation_recipe` fields `fp8_param` and `fp4_param`
+are rejected; use `fp8_cfg.fp8_param` for supported FP8 parameter storage.
 
 ## Compatibility Note for DeepSeek-Style FP8 Training
 

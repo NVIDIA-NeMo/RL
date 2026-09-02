@@ -90,8 +90,9 @@ def filter_multimodal_kwargs_for_model(
 class ProcessedInputs:
     """Processed microbatch inputs ready for model forward pass.
 
-    This structure contains all necessary tensors and metadata for a forward pass,
-    including context parallel buffers and flash attention configuration.
+    This structure contains the canonical tensors and metadata needed to prepare
+    a model forward, including flash-attention configuration. Context-parallel
+    state is owned by Automodel's per-microbatch sharder.
     """
 
     # Core inputs (always present)
@@ -107,15 +108,6 @@ class ProcessedInputs:
 
     # Multimodal (VLM) inputs
     vlm_kwargs: dict[str, Any] = field(default_factory=dict)
-
-    # Context parallel support (cp_size > 1)
-    cp_buffers: list[torch.Tensor] = field(default_factory=list)
-    seq_index: Optional[torch.Tensor] = None
-
-    @property
-    def has_context_parallel(self) -> bool:
-        """Check if context parallel is enabled."""
-        return len(self.cp_buffers) > 0
 
     @property
     def has_flash_attention(self) -> bool:
@@ -156,7 +148,6 @@ def make_processed_microbatch_iterator(
     raw_iterator: Iterator[BatchedDataDict[Any]],
     tokenizer: AutoTokenizer,
     cfg: dict[str, Any],
-    cp_size: int,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -168,7 +159,6 @@ def make_processed_microbatch_iterator(
         raw_iterator: Iterator yielding raw BatchedDataDict microbatches
         tokenizer: Tokenizer for processing
         cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"]["enabled"])
-        cp_size: Context parallel size
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -187,7 +177,6 @@ def make_processed_microbatch_iterator(
             tokenizer,
             enable_seq_packing,
             cfg,
-            cp_size,
         )
 
         yield ProcessedMicrobatch(
@@ -204,7 +193,6 @@ def get_microbatch_iterator(
     mbs: int,
     dp_mesh: Any,  # noqa: ARG001
     tokenizer: AutoTokenizer,
-    cp_size: int = 1,
 ) -> tuple[Iterator[ProcessedMicrobatch], int]:
     """Create processed microbatch iterator based on batching strategy.
 
@@ -214,7 +202,6 @@ def get_microbatch_iterator(
         mbs: Microbatch size
         dp_mesh: Data parallel mesh
         tokenizer: Tokenizer for processing
-        cp_size: Context parallel size
 
     Returns:
         Tuple of (processed_microbatch_iterator, iterator_length)
@@ -249,7 +236,6 @@ def get_microbatch_iterator(
         itertools.chain(mb_iterator, dummy_iterator),
         tokenizer,
         cfg,
-        cp_size,
     )
     return processed_iterator, iterator_len
 
@@ -259,7 +245,6 @@ def process_microbatch(
     tokenizer: AutoTokenizer,
     enable_seq_packing: bool,
     cfg: dict[str, Any],
-    cp_size: int,
 ) -> ProcessedInputs:
     """Process a microbatch and prepare inputs for model forward.
 
@@ -268,7 +253,6 @@ def process_microbatch(
         tokenizer: Tokenizer for padding value
         enable_seq_packing: Whether sequence packing is enabled
         cfg: Configuration dictionary
-        cp_size: Context parallel size
 
     Returns:
         ProcessedInputs containing all tensors and metadata for forward pass
@@ -324,56 +308,12 @@ def process_microbatch(
             "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
         )
 
-    # Prepare context parallel buffers if needed
-    cp_buffers = []
-    seq_index = None
-    if cp_size > 1:
-        assert len(vlm_kwargs) == 0, (
-            f"multimodal kwargs={vlm_kwargs} are not supported for context parallel"
-        )
-        # CP doesn't support attention_mask — torch's CP SDPA handler requires
-        # is_causal=True (no explicit mask). Passing an unsplit mask causes a
-        # DTensor redistribution assertion because the mask isn't in cp_buffers
-        # and therefore keeps the full sequence length while Q/K/V are split.
-        # Matches Automodel's cp_utils.py which does batch.pop("attention_mask").
-        attention_mask = None
-        seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
-        cp_buffers = [input_ids, position_ids, seq_index]
-
-        # Cross-tokenizer distillation rides student-seq-aligned alignment /
-        # mask fields on the same mb. CP-shard the student-seq fields with
-        # the student cp_mesh so the loss sees matching seq dims against
-        # the redistributed student logits. Teacher-seq fields (T_t may
-        # differ from T_s) stay full; the loss slices them contiguously by
-        # student CP rank because the IPC consumer ships contiguous teacher
-        # slices (see FullLogitsPostProcessor un-interleave in train.py).
-        # There is one set of student-seq alignment fields per teacher:
-        # single-teacher uses the unprefixed ``alignment_student_*`` keys,
-        # multi-teacher uses ``alignment_{i}_student_*`` (the suffix match
-        # captures both and excludes teacher-seq ``*_teacher_*`` fields).
-        student_seq_alignment_fields = [
-            k
-            for k in mb
-            if k.startswith("alignment_")
-            and (
-                k.endswith("_student_chunk_id")
-                or k.endswith("_student_exact_partition_mask")
-            )
-        ]
-        if student_seq_alignment_fields:
-            if "token_mask" in mb:
-                cp_buffers.append(mb["token_mask"])
-            for student_seq_field in student_seq_alignment_fields:
-                cp_buffers.append(mb[student_seq_field])
-
     return ProcessedInputs(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         flash_attn_kwargs=flash_attn_kwargs,
         vlm_kwargs=vlm_kwargs,
-        cp_buffers=cp_buffers,
-        seq_index=seq_index,
         seq_len=seq_len,
     )
 
