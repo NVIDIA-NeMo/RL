@@ -46,11 +46,6 @@ from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 def test_compute_distributed_selected_logprobs(monkeypatch):
     """Selected-token path matches gathering a complete log-softmax tensor."""
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        torch.distributed.nn.functional,
-        "all_reduce",
-        lambda tensor, **kwargs: tensor,
-    )
 
     torch.manual_seed(42)
     logits = torch.randn(2, 5, 11, dtype=torch.float32)
@@ -98,15 +93,12 @@ def test_compute_distributed_selected_logprobs_tp_shards(monkeypatch):
         def fake_all_reduce(tensor, *, op, group):
             if op == torch.distributed.ReduceOp.MAX:
                 tensor.copy_(global_max)
+            elif tensor.shape == global_sum_exp.shape:
+                tensor.copy_(global_sum_exp)
             else:
                 tensor.add_(remote_selected_logprobs)
 
         monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
-        monkeypatch.setattr(
-            torch.distributed.nn.functional,
-            "all_reduce",
-            lambda tensor, **kwargs: global_sum_exp,
-        )
 
         actual = _compute_distributed_selected_logprobs(
             full_logits[..., vocab_start:vocab_end].contiguous(),
