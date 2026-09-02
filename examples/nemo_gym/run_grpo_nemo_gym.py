@@ -49,6 +49,7 @@ from nemo_rl.environments.nemo_gym import (
 from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
+from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -169,9 +170,7 @@ def main() -> None:
         assert config.policy["generation"] is not None, (
             "A generation config is required for GRPO"
         )
-        has_refit_draft_weights = (
-            "draft" in config.policy and config.policy["draft"].enabled
-        )
+        has_refit_draft_weights = draft_refit_enabled(config.policy.get("draft"))
         trains_mtp = (
             "megatron_cfg" in config.policy
             and config.policy["megatron_cfg"]["enabled"]
