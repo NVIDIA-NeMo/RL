@@ -306,6 +306,34 @@ def test_boundary_verification_is_pipeline_stage_local(nvfp4_module):
     )
 
 
+def test_boundary_verification_skips_a_stage_with_no_local_target(nvfp4_module):
+    """A pipeline stage holding only BF16 boundary layers has nothing to check."""
+    M = nvfp4_module
+    M.NvFp4PerTokenQuantizer._verify_boundary(
+        None, {}, {0: "model.layers.0.mlp.experts"}
+    )
+
+
+def test_unreadable_boundary_pattern_is_rejected(nvfp4_module):
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        boundary_layer_indices,
+    )
+
+    assert boundary_layer_indices(["*.layers.7.mlp.experts*"]) == {7}
+    with pytest.raises(ValueError, match="cannot read a layer index"):
+        boundary_layer_indices(["*.mlp.experts*"])
+
+
+def test_module_path_without_a_layer_index_is_rejected(nvfp4_module):
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        module_layer_index,
+    )
+
+    assert module_layer_index("model.layers.13.block_sparse_moe.experts") == 13
+    with pytest.raises(ValueError, match="layers.<index>"):
+        module_layer_index("model.experts")
+
+
 def test_boundary_excluding_a_layer_it_should_not_is_fatal(nvfp4_module):
     M = nvfp4_module
     with pytest.raises(RuntimeError, match="expected NVFP4"):
