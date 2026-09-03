@@ -33,6 +33,9 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.train_micro_batch_size=1 \
     policy.megatron_cfg.tensor_model_parallel_size=2 \
     policy.generation.backend=megatron \
+    policy.generation.refit_transport=mcore \
+    policy.generation.top_k=1 \
+    policy.generation.mcore_generation_config.logprobs_mode=raw_logprobs \
     ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
     policy.generation.mcore_generation_config.refit_backend=nccl \

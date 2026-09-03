@@ -1528,16 +1528,20 @@ def _create_megatron_config(
     # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
     # only valid when fp8 is enabled, fp8_param=True, and recipe is mxfp8. Mcore's
     # DDP __post_init__ asserts they remain in sync, so we centralize the derivation
-    # rather than exposing two redundant YAML knobs that can disagree.
+    # rather than exposing two redundant YAML knobs that can disagree. The optimizer
+    # fp8_recipe comes from the same canonical model config so it selects the
+    # matching main-parameter representation.
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-    reuse_grad_buf_for_mxfp8_param_ag = (
-        fp8_param_enabled and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    fp8_recipe = (
+        fp8_cfg.get("fp8_recipe") if fp8_cfg and fp8_cfg.get("enabled", False) else None
     )
+    reuse_grad_buf_for_mxfp8_param_ag = fp8_param_enabled and fp8_recipe == "mxfp8"
     overlap_param_gather = config["megatron_cfg"]["distributed_data_parallel_config"][
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
         **_resolve_optimizer_dtype_kwargs(config["megatron_cfg"]["optimizer"]),
+        "fp8_recipe": fp8_recipe,
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }

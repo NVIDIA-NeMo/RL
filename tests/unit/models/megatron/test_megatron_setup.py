@@ -2538,6 +2538,64 @@ class TestCreateMegatronConfigOptimizerFp8Recipe:
 
 
 @pytest.mark.mcore
+class TestCreateMegatronConfigFP8Buffers:
+    """Tests for MXFP8 parameter-buffer plumbing into optimizer and DDP."""
+
+    @staticmethod
+    def _subconfig_kwargs():
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {"use_distributed_optimizer": True},
+                "scheduler": {},
+                "distributed_data_parallel_config": {
+                    "overlap_param_gather": True,
+                    "grad_reduce_in_fp32": False,
+                    "overlap_grad_reduce": True,
+                    "data_parallel_sharding_strategy": "optim_grads_params",
+                },
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": True,
+                },
+                "train_iters": 10,
+            },
+            "train_global_batch_size": 8,
+        }
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig") as mock_optimizer,
+            patch(
+                "nemo_rl.models.megatron.setup.DistributedDataParallelConfig"
+            ) as mock_ddp,
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+                fp8_param_enabled=True,
+            )
+
+        return mock_optimizer.call_args.kwargs, mock_ddp.call_args.kwargs
+
+    def test_mxfp8_recipe_and_param_gather_are_forwarded(self):
+        optimizer_kwargs, ddp_kwargs = self._subconfig_kwargs()
+
+        assert optimizer_kwargs["fp8_recipe"] == "mxfp8"
+        assert optimizer_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is True
+        assert ddp_kwargs["fp8_param_gather"] is True
+        assert ddp_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is True
+
+
+@pytest.mark.mcore
 class TestCreateMegatronConfigOptimizerOffload:
     """Tests for optimizer CPU-offload plumbing into Megatron Core."""
 

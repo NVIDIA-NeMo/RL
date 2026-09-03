@@ -14,12 +14,21 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+# ``bridge_export`` preserves the universal refit contract: the source exports
+# an HF-named, backend-independent representation and each destination converts
+# it into local storage. ``logical_weights`` is an explicit Megatron-to-Megatron
+# exception: Megatron generation may assume a Megatron training source and ask
+# it to materialize logical weights. Megatron training must continue to use the
+# universal mode for other destinations (such as vLLM), and new backends should
+# not inherit this coupling implicitly.
+RefitPayloadMode = Literal["bridge_export", "logical_weights"]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -518,6 +527,10 @@ class GenerationInterface(ABC):
     def get_inference_world_size(self) -> int | None:
         """Return a backend-specific collective world size when required."""
         return None
+
+    def get_refit_payload_mode(self) -> RefitPayloadMode:
+        """Return the backend's required representation for transferred weights."""
+        return "bridge_export"
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""

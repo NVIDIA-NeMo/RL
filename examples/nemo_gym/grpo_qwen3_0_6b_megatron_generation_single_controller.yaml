@@ -41,6 +41,7 @@ policy:
 
   generation:
     backend: "megatron"
+    refit_transport: "mcore"
     mcore_generation_config:
       # NeMo-Gym drives rollouts through the engine's OpenAI server.
       expose_http_server: true

@@ -1,7 +1,7 @@
 # Weight Refit: Choosing a Transport
 
 Weight refit copies updated policy weights into the rollout model. Choose the
-topology first, then select one non-colocated transport with
+topology first, then select one transport with
 `policy.generation.refit_transport`.
 
 ## Pick a Transport
@@ -9,15 +9,19 @@ topology first, then select one non-colocated transport with
 | Topology | `refit_transport` | Transport | Use when |
 |---|---|---|---|
 | `colocated.enabled: true` | `null` | CUDA IPC | Policy and rollout workers share GPUs; vLLM uses ZMQ plus CUDA IPC handles and SGLang uses Ray CUDA IPC. |
-| `colocated.enabled: false` | `null` | NCCL broadcast | vLLM uses the default full-weight collective; SGLang uses its own weight-update group. |
+| `colocated.enabled: true` | `mcore` | MCore wake-reshard | Megatron policy and generation share GPUs. |
+| `colocated.enabled: false` | `null` | NCCL broadcast | vLLM and Megatron use the default full-weight collective; SGLang uses its own weight-update group. |
+| `colocated.enabled: false` | `mcore` | MCore native refit | Megatron policy sends directly to Megatron generation through an MCore copy service. |
 | `colocated.enabled: false` | `nccl_reshard` | NCCL reshard | Provides the best performance for large models (>100s B models). |
 | `colocated.enabled: false` | `vllm_zmq_sparse` | Sparse delta over ZeroMQ | The link is bandwidth-limited and workers can reach a relay over TCP. |
 | `colocated.enabled: false` | `vllm_s3_sparse` | Sparse delta through S3 | Workers communicate through shared object storage. |
 | `colocated.enabled: false` | `nixl` | NIXL checkpoint engine | The cluster has a fast UCX/RDMA fabric for full-weight refit. |
 
-`null` is the default. The sparse transports read only `refit_cfg.sparse`; NIXL
-reads only `refit_cfg.nixl`. Because one selector chooses the transport, sparse
-delta and NIXL cannot both be active.
+`null` is the default. For non-colocated Megatron generation it selects the
+packed collective; Megatron's native refit must be selected explicitly with
+`mcore`. The sparse transports read only `refit_cfg.sparse`; NIXL reads only
+`refit_cfg.nixl`. Because one selector chooses the transport, sparse delta and
+NIXL cannot both be active.
 
 ## Constraints
 
@@ -25,8 +29,9 @@ delta and NIXL cannot both be active.
 |---|---|---|---|
 | Colocated CUDA IPC | vLLM or SGLang | DTensor or Megatron | Uses the generation backend's standard loader. |
 | NCCL | vLLM or Megatron | DTensor or Megatron | Uses the standard full-weight loader. |
+| MCore native refit | Megatron | Megatron | Supports MCore's configured copy-service backend. |
 | SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
-| NCCL reshard | vLLM | Megatron | Requires matching BF16 or blockwise FP8 precision; Megatron ETP must be 1. Currently supporting Megatron+vLLM backends. |
+| NCCL reshard | vLLM or Megatron | Megatron | Supports BF16 and the documented FP8/MXFP8 combinations; see the [NCCL Reshard Refit design](../design-docs/nccl-reshard-refit.md). |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
 | NIXL, full weights | vLLM | DTensor or Megatron | Supports the standard full-weight FP8 loader. DTensor FP8 KV-cache scale transfer is not yet supported. |
 | NIXL, sharded experts | vLLM | DTensor or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
@@ -40,7 +45,7 @@ colocated generation.
 
 ## Minimal Configuration
 
-Colocated refit needs no transport configuration:
+Colocated vLLM and SGLang refit need no transport configuration:
 
 ```yaml
 policy:
@@ -58,6 +63,15 @@ policy:
     colocated:
       enabled: false
     refit_transport: null
+```
+
+For native MCore refit, select it explicitly:
+
+```yaml
+policy:
+  generation:
+    backend: megatron
+    refit_transport: mcore
 ```
 
 For NCCL reshard with Megatron policy training and vLLM generation:

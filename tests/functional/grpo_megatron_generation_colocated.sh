@@ -42,6 +42,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.logprob_batch_size=4 \
     policy.train_micro_batch_size=1 \
     policy.generation.backend=megatron \
+    policy.generation.refit_transport=mcore \
     cluster.gpus_per_node=2 \
     cluster.segment_size=1 \
     grpo.max_num_steps=2 \
