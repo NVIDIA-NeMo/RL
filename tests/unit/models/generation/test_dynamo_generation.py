@@ -404,6 +404,84 @@ def test_metrics_parser_and_sampler_aliases() -> None:
     assert "python_gc_objects_collected_total" not in parsed
 
 
+def _curated_sampler() -> DynamoMetricsSampler:
+    return DynamoMetricsSampler(
+        [{"instance_id": "a", "system_url": "http://worker:4000"}],
+        interval_s=1,
+        include_prefixes=None,
+        exclude_prefixes=None,
+    )
+
+
+def _curated_snapshot(exposition: str) -> dict[str, Any]:
+    """Sample one scrape of ``exposition`` through the curated prefixes."""
+    sampler = _curated_sampler()
+    parsed = parse_prometheus_metrics(
+        exposition,
+        sampler._include_prefixes,
+        sampler._exclude_prefixes,
+    )
+    sampler._samples = {name: {0: [value]} for name, value in parsed.items()}
+    return sampler.snapshot()
+
+
+def test_snapshot_consumes_every_source_of_an_alias() -> None:
+    """A managed worker exports the Dynamo gauge and the vLLM twin at once.
+
+    Only the source that supplied the value used to be deleted, which left the
+    twin in the dict to be plotted beside the alias it had already fed.
+    """
+    metrics = _curated_snapshot(
+        'dynamo_component_inflight_requests{instance="0"} 3\n'
+        'vllm:num_requests_running{model_name="model",engine="0"} 3\n'
+    )
+
+    # The Dynamo gauge leads the source list, so it supplies the value.
+    assert metrics["inflight_batch_sizes"] == {0: [3.0]}
+    assert "dynamo_component_inflight_requests" not in metrics
+    assert "vllm_num_requests_running" not in metrics
+
+
+def test_snapshot_folds_vllm_waiting_by_reason_into_the_pending_alias() -> None:
+    """``vllm:num_requests_waiting`` is a prefix, so it also matches vLLM's
+    ``vllm:num_requests_waiting_by_reason``. Summed over its labels that is the
+    same waiting count, which must not surface as a second pending series.
+    """
+    metrics = _curated_snapshot(
+        'vllm:num_requests_waiting{model_name="model",engine="0"} 5\n'
+        'vllm:num_requests_waiting_by_reason{reason="capacity"} 4\n'
+        'vllm:num_requests_waiting_by_reason{reason="deferred"} 1\n'
+    )
+
+    assert metrics["num_pending_samples"] == {0: [5.0]}
+    assert "vllm_num_requests_waiting_by_reason" not in metrics
+
+
+def test_curated_snapshot_leaves_no_alias_source_beside_its_alias() -> None:
+    """Every alias here has both of its sources scraped, as on a real worker."""
+    metrics = _curated_snapshot(
+        'dynamo_component_inflight_requests{instance="0"} 3\n'
+        'vllm:num_requests_running{model_name="model",engine="0"} 3\n'
+        'dynamo_work_handler_queue_depth{instance="0"} 2\n'
+        'vllm:num_requests_waiting{model_name="model",engine="0"} 2\n'
+        'vllm:num_requests_waiting_by_reason{reason="capacity"} 2\n'
+        'dynamo_component_gpu_cache_usage_percent{instance="0"} 0.4\n'
+        'vllm:kv_cache_usage_perc{model_name="model",engine="0"} 0.4\n'
+        'vllm:generation_tokens_total{model_name="model",engine="0"} 7\n'
+    )
+
+    every_source = {
+        source
+        for sources in metrics_module.CANONICAL_LOGGER_ALIASES.values()
+        for source in sources
+    }
+    assert every_source.isdisjoint(metrics)
+    assert metrics["inflight_batch_sizes"] == {0: [3.0]}
+    assert metrics["num_pending_samples"] == {0: [2.0]}
+    assert metrics["kv_cache_usage_perc"] == {0: [0.4]}
+    assert metrics["generation_tokens"] == {0: [7.0]}
+
+
 def test_metrics_http_errors_are_ignored(monkeypatch) -> None:
     monkeypatch.setattr(
         metrics_module.urllib.request,
