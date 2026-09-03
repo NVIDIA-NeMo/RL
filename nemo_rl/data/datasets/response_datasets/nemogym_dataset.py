@@ -12,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datasets import Dataset
-
 from nemo_rl.data.datasets.raw_dataset import RawDataset
+from nemo_rl.data.datasets.utils import load_dataset_from_path
 
 
 class NemoGymDataset(RawDataset):
     """Simple wrapper around the Nemo Gym dataset.
 
     Args:
-        data_path: Path to the dataset JSONL file
+        data_path: Path to a JSONL file or a pre-converted Arrow/Parquet dataset.
         repeat: Number of times to repeat the dataset, default is 1
     """
 
@@ -30,17 +29,25 @@ class NemoGymDataset(RawDataset):
         if self.task_name[0] == "-":
             self.task_name = self.task_name[1:]
 
-        # load raw line from jsonl
-        # will use `json.loads` to load to dict format at `nemo_gym_data_processor` later since `Dataset` cannot handle nested structure well
-        with open(data_path) as f:
-            self.dataset = [raw_line for raw_line in f]
-
-        # format the dataset
-        self.dataset = Dataset.from_dict(
-            {
-                "extra_env_info": self.dataset,
-                "task_name": [self.task_name] * len(self.dataset),
-            }
+        # Preserve JSONL records as raw strings because the NeMo-Gym processor
+        # intentionally parses the nested payload later. The Hugging Face text
+        # builder materializes a reusable Arrow cache instead of retaining the
+        # entire source file as a Python list of strings. Pre-converted Arrow,
+        # Parquet, and save_to_disk datasets are accepted as well.
+        self.dataset = load_dataset_from_path(data_path, preserve_jsonl_rows=True)
+        if "extra_env_info" in self.dataset.column_names:
+            self.dataset = self.dataset.select_columns(["extra_env_info"])
+        elif "text" in self.dataset.column_names:
+            self.dataset = self.dataset.select_columns(["text"]).rename_column(
+                "text", "extra_env_info"
+            )
+        else:
+            raise ValueError(
+                "A NeMo-Gym dataset must contain an 'extra_env_info' or 'text' "
+                f"column, but {data_path!r} contains {self.dataset.column_names}."
+            )
+        self.dataset = self.dataset.add_column(
+            "task_name", [self.task_name] * len(self.dataset)
         )
 
         # repeat the dataset
