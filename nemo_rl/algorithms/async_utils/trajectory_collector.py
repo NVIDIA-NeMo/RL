@@ -278,6 +278,10 @@ class AsyncTrajectoryCollector:
         # GPU worker. Async GRPO may run several rollout batches concurrently,
         # so one batch nonblockingly owns the interval while the others proceed.
         self._rollout_profile_lock: _threading.Lock = _threading.Lock()
+        self._rollout_profile_owner_state_lock: _threading.Lock = _threading.Lock()
+        self._rollout_profile_owner: (
+            tuple[asyncio.AbstractEventLoop, asyncio.Task[Any]] | None
+        ) = None
         self._draining_for_profiler_shutdown = _threading.Event()
         self._rollout_profile_drain_timed_out = _threading.Event()
 
@@ -1095,11 +1099,12 @@ class AsyncTrajectoryCollector:
         """Stop new async-GRPO batches and settle profiler ownership.
 
         The driver calls this before closing the vLLM workers. New batch starts
-        are stopped first, then this waits for only the rollout stream that owns
-        the process-wide profiler window. Replay-buffer enqueue is outside that
+        are stopped first, then an asynchronous owner is cancelled so it can
+        abort the open profiler window. Replay-buffer enqueue is outside that
         window and may be blocked after training stops consuming; clearing
         ``running`` after ownership settles releases those workers without
-        delaying profiler closure.
+        delaying profiler closure. The bounded wait remains a fail-closed guard
+        for profiler control calls or other work that cannot be cancelled.
         """
         if not self._profile_async_grpo_rollouts:
             return
@@ -1108,6 +1113,17 @@ class AsyncTrajectoryCollector:
         with self._threads_lock:
             self._draining_for_profiler_shutdown.set()
         self._wake_waits()
+
+        with self._rollout_profile_owner_state_lock:
+            profile_owner = self._rollout_profile_owner
+        if profile_owner is not None:
+            owner_loop, owner_task = profile_owner
+            try:
+                owner_loop.call_soon_threadsafe(owner_task.cancel)
+            except RuntimeError:
+                # The owner can close its loop immediately before this snapshot.
+                # It will release the profiler lock normally in that case.
+                pass
 
         owner_settled = self._rollout_profile_lock.acquire(
             timeout=_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S
@@ -1778,6 +1794,27 @@ class AsyncTrajectoryCollector:
             self._rollout_profile_lock.release()
             raise _RolloutProfilerDrainRequested
 
+        profile_owner: tuple[asyncio.AbstractEventLoop, asyncio.Task[Any]] | None = None
+        try:
+            owner_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Synchronous callers cannot be cooperatively cancelled. The drain
+            # timeout still protects shutdown if one of them blocks.
+            pass
+        else:
+            owner_task = asyncio.current_task()
+            if owner_task is not None:
+                profile_owner = (owner_loop, owner_task)
+                with self._rollout_profile_owner_state_lock:
+                    drain_raced_with_registration = (
+                        self._draining_for_profiler_shutdown.is_set()
+                    )
+                    if not drain_raced_with_registration:
+                        self._rollout_profile_owner = profile_owner
+                if drain_raced_with_registration:
+                    self._rollout_profile_lock.release()
+                    raise _RolloutProfilerDrainRequested
+
         try:
             try:
                 self.policy_generation.begin_rollout_profile(
@@ -1823,10 +1860,14 @@ class AsyncTrajectoryCollector:
             except BaseException as rollout_error:
                 if self._rollout_profile_drain_timed_out.is_set():
                     raise
+                drain_requested = self._draining_for_profiler_shutdown.is_set()
+                abort_reason = (
+                    "async_grpo_rollout_drain_requested"
+                    if drain_requested
+                    else "async_grpo_rollout_batch_error"
+                )
                 try:
-                    self.policy_generation.abort_rollout_profile(
-                        reason="async_grpo_rollout_batch_error"
-                    )
+                    self.policy_generation.abort_rollout_profile(reason=abort_reason)
                 except Exception as profiler_error:
                     rollout_error.add_note(
                         f"Rollout profiler abort also failed: {profiler_error!r}"
@@ -1836,6 +1877,8 @@ class AsyncTrajectoryCollector:
                     )
                     self._mark_rollout_profiler_failed(lifecycle_error)
                     raise lifecycle_error from rollout_error
+                if drain_requested:
+                    raise _RolloutProfilerDrainRequested from rollout_error
                 raise
 
             if self._rollout_profile_drain_timed_out.is_set():
@@ -1858,6 +1901,10 @@ class AsyncTrajectoryCollector:
                 self._mark_rollout_profiler_failed(lifecycle_error)
                 raise lifecycle_error from rollout_error
         finally:
+            if profile_owner is not None:
+                with self._rollout_profile_owner_state_lock:
+                    if self._rollout_profile_owner is profile_owner:
+                        self._rollout_profile_owner = None
             self._rollout_profile_lock.release()
 
     def _mark_rollout_profiler_failed(

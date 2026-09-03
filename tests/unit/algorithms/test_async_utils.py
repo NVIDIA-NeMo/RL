@@ -1543,6 +1543,110 @@ class TestAsyncTrajectoryCollector:
         assert collector.running is False
         collector.policy_generation.finish_rollout_profile.assert_called_once_with()
 
+    def test_rollout_profiler_drain_cancels_async_owner(self, monkeypatch):
+        collector = self.create_local_collector()
+        self._enable_rollout_profiler(collector)
+        collector.running = True
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
+            1.0,
+        )
+        owner_started = threading.Event()
+        stream_unwound = threading.Event()
+        owner_errors: list[BaseException] = []
+
+        async def own_profile_window():
+            try:
+                with collector._profile_rollout_batch(
+                    generation_weight_version=1,
+                    target_weight_version=2,
+                ):
+                    owner_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        stream_unwound.set()
+            except trajectory_collector_mod._RolloutProfilerDrainRequested:
+                pass
+
+        def run_owner():
+            try:
+                asyncio.run(own_profile_window())
+            except BaseException as error:
+                owner_errors.append(error)
+
+        worker = threading.Thread(target=run_owner, name="async-rollout-owner")
+        worker.start()
+        assert owner_started.wait(timeout=2.0)
+
+        collector.drain_for_rollout_profiler_shutdown()
+        worker.join(timeout=2.0)
+
+        assert not worker.is_alive()
+        assert stream_unwound.is_set()
+        assert owner_errors == []
+        assert collector.running is False
+        assert not collector._rollout_profile_drain_timed_out.is_set()
+        assert collector._fatal_error_message is None
+        assert collector._rollout_profile_owner is None
+        collector.policy_generation.abort_rollout_profile.assert_called_once_with(
+            reason="async_grpo_rollout_drain_requested"
+        )
+        collector.policy_generation.finish_rollout_profile.assert_not_called()
+        assert collector._rollout_profile_lock.acquire(blocking=False)
+        collector._rollout_profile_lock.release()
+
+    def test_rollout_profiler_drain_cancel_abort_failure_is_fatal(self, monkeypatch):
+        collector = self.create_local_collector()
+        self._enable_rollout_profiler(collector)
+        collector.running = True
+        collector.policy_generation.abort_rollout_profile.side_effect = RuntimeError(
+            "abort failed"
+        )
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
+            1.0,
+        )
+        owner_started = threading.Event()
+        owner_errors: list[BaseException] = []
+
+        async def own_profile_window():
+            with collector._profile_rollout_batch(
+                generation_weight_version=1,
+                target_weight_version=2,
+            ):
+                owner_started.set()
+                await asyncio.Event().wait()
+
+        def run_owner():
+            try:
+                asyncio.run(own_profile_window())
+            except BaseException as error:
+                owner_errors.append(error)
+
+        worker = threading.Thread(target=run_owner, name="failing-async-rollout-owner")
+        worker.start()
+        assert owner_started.wait(timeout=2.0)
+
+        with pytest.raises(RuntimeError, match="abort failed"):
+            collector.drain_for_rollout_profiler_shutdown()
+        worker.join(timeout=2.0)
+
+        assert not worker.is_alive()
+        assert len(owner_errors) == 1
+        assert isinstance(
+            owner_errors[0], trajectory_collector_mod._RolloutProfilerLifecycleError
+        )
+        assert collector.running is False
+        assert not collector._rollout_profile_drain_timed_out.is_set()
+        assert collector._rollout_profile_owner is None
+        collector.policy_generation.abort_rollout_profile.assert_called_once_with(
+            reason="async_grpo_rollout_drain_requested"
+        )
+        collector.policy_generation.finish_rollout_profile.assert_not_called()
+
     def test_rollout_profiler_drain_times_out_on_blocked_owner(self, monkeypatch):
         collector = self.create_local_collector()
         self._enable_rollout_profiler(collector)
