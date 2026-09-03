@@ -419,12 +419,12 @@ def test_sequence_packing_fusion_vs_baseline_with_sampling_params(
 
 
 # ---------------------------------------------------------------------------
-# _pack_input_ids: bin-fill padding regression tests
+# _pack_sequence_tensor: bin-fill padding regression tests
 #
 # The Megatron packer rounds each packed bin's total length up to a kernel
 # alignment (e.g. 128 * cp*2 * tp for hybridep) and absorbs the deficit into
 # the LAST sequence's effective length in cu_seqlens. Those phantom positions
-# exceed the unpacked [B, S] row width; _pack_input_ids must copy only real
+# exceed the unpacked [B, S] row width; _pack_sequence_tensor must copy only real
 # tokens and leave the tail zero (it is masked at the loss by token_mask).
 # Regression test for the tiny-Ultra smoke crash:
 #   RuntimeError: The expanded size of the tensor (9472) must match the
@@ -442,14 +442,16 @@ def _rolled_padded_seq(row, actual_len, padded_len, roll_shift):
 
 def test_pack_input_ids_last_seq_inflated_beyond_row_width():
     """cu_seqlens' last entry exceeds input_ids width (bin-fill deficit)."""
-    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+    from nemo_rl.algorithms.loss.utils import _pack_sequence_tensor
 
     row_width = 7040
     inflated_len = 9472  # 7040 real tokens + 2432 bin-fill deficit
     input_ids = torch.arange(2 * row_width).reshape(2, row_width)
     cu = torch.tensor([0, row_width, row_width + inflated_len])
 
-    packed = _pack_input_ids(input_ids, cu, cu, cp_rank=0, cp_size=1, roll_shift=-1)
+    packed = _pack_sequence_tensor(
+        input_ids, cu, cu, cp_rank=0, cp_size=1, roll_shift=-1
+    )
 
     assert packed.shape == (1, row_width + inflated_len)
     expected_seq0 = _rolled_padded_seq(input_ids[0], row_width, row_width, -1)
@@ -463,7 +465,7 @@ def test_pack_input_ids_last_seq_inflated_beyond_row_width():
 @pytest.mark.parametrize("cp_size", [2, 8])
 def test_pack_input_ids_inflated_last_seq_cp_sharded(cp_size):
     """CP sharding of the inflated last sequence conserves the real tokens."""
-    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+    from nemo_rl.algorithms.loss.utils import _pack_sequence_tensor
 
     row_width = 64
     inflated_len = 96  # deficit of 32 absorbed into the last sequence
@@ -472,7 +474,9 @@ def test_pack_input_ids_inflated_last_seq_cp_sharded(cp_size):
     total = row_width + inflated_len
 
     shards = [
-        _pack_input_ids(input_ids, cu, cu, cp_rank=r, cp_size=cp_size, roll_shift=0)
+        _pack_sequence_tensor(
+            input_ids, cu, cu, cp_rank=r, cp_size=cp_size, roll_shift=0
+        )
         for r in range(cp_size)
     ]
     for shard in shards:
@@ -496,13 +500,15 @@ def test_pack_input_ids_inflated_last_seq_cp_sharded(cp_size):
 
 def test_pack_input_ids_in_bounds_lengths_unchanged():
     """Sequences within the row width behave as before the clamp."""
-    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+    from nemo_rl.algorithms.loss.utils import _pack_sequence_tensor
 
     input_ids = torch.arange(2 * 64).reshape(2, 64)
     cu_q = torch.tensor([0, 40, 40 + 64])  # real lengths 40, 64
     cu_qp = torch.tensor([0, 48, 48 + 64])  # per-seq alignment padding only
 
-    packed = _pack_input_ids(input_ids, cu_q, cu_qp, cp_rank=0, cp_size=1, roll_shift=0)
+    packed = _pack_sequence_tensor(
+        input_ids, cu_q, cu_qp, cp_rank=0, cp_size=1, roll_shift=0
+    )
 
     assert packed.shape == (1, 48 + 64)
     assert torch.equal(packed[0, :40], input_ids[0, :40])

@@ -24,11 +24,11 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from typing import Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import ray
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
 
 from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
@@ -38,6 +38,19 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.experience.interfaces import PromptGroupRecord
+
+TopkSource = Literal["student", "teacher"]
+
+
+def _normalize_teacher_precision(value: Any) -> Any:
+    """Normalize the legacy bf16 spelling to the Megatron precision name."""
+    return "bfloat16" if value == "bf16" else value
+
+
+TeacherPrecision = Annotated[
+    Literal["float32", "bfloat16", "float16"],
+    BeforeValidator(_normalize_teacher_precision),
+]
 
 # ---------------------------------------------------------------------------
 # Config schemas
@@ -54,12 +67,36 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     context_parallel_size: int = 1
+    expert_tensor_parallel_size: int = 1
     expert_model_parallel_size: int = 1
     num_nodes: int = 1
     gpus_per_node: int = 8
-    precision: str = "bf16"
+    segment_size: Annotated[Optional[int], Field(ge=1)] = None
+    precision: TeacherPrecision = "bfloat16"
     micro_batch_size: int = 4
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class TeacherResourceOverrideConfig(BaseModel, extra="allow"):
+    """Sparse per-teacher patch applied over ``default_teacher_cfg``.
+
+    ``None`` means inherit the default teacher value. ``_opd_cfg`` serializes
+    with ``exclude_none=True``, preserving only explicitly supplied overrides.
+    ``megatron_cfg_overrides`` is merged by key over the default map; an empty
+    map inherits all default Megatron overrides rather than clearing them.
+    """
+
+    tensor_model_parallel_size: Optional[int] = None
+    pipeline_model_parallel_size: Optional[int] = None
+    context_parallel_size: Optional[int] = None
+    expert_tensor_parallel_size: Optional[int] = None
+    expert_model_parallel_size: Optional[int] = None
+    num_nodes: Optional[int] = None
+    gpus_per_node: Optional[int] = None
+    segment_size: Annotated[Optional[int], Field(ge=1)] = None
+    precision: Optional[TeacherPrecision] = None
+    micro_batch_size: Optional[int] = None
+    megatron_cfg_overrides: Optional[dict[str, Any]] = None
 
 
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
@@ -69,18 +106,29 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     default_teacher_cfg: TeacherResourceConfig = Field(
         default_factory=TeacherResourceConfig
     )
-    teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
+    teacher_overrides: dict[str, TeacherResourceOverrideConfig] = Field(
+        default_factory=dict
+    )
 
 
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
     enabled: bool = False
+    student_topk: Annotated[Optional[int], Field(ge=1)] = None
+    teacher_topk: Annotated[Optional[int], Field(ge=1)] = None
     teacher_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
     default_teacher_alias: Optional[str] = None
     strict_agent_name_match: bool = False
     deduplicate_shared_teacher_checkpoints: bool = True
     non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
+
+    @model_validator(mode="after")
+    def validate_topk_selector(self) -> "OnPolicyDistillationConfig":
+        """Require at most one model to select the OPD support."""
+        if self.student_topk is not None and self.teacher_topk is not None:
+            raise ValueError("student_topk and teacher_topk are mutually exclusive")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +166,119 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
     return bool(
         _opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False)
     )
+
+
+def get_student_topk(master_config: Any) -> Optional[int]:
+    """Return the configured student-selected OPD support size, if any."""
+    topk = _opd_cfg(master_config).get("student_topk")
+    if topk is None:
+        return None
+    topk = int(topk)
+    if topk < 1:
+        raise ValueError(
+            f"on_policy_distillation.student_topk must be at least 1, got {topk}."
+        )
+    return topk
+
+
+def get_teacher_topk(master_config: Any) -> Optional[int]:
+    """Return the configured teacher-selected OPD support size, if any."""
+    topk = _opd_cfg(master_config).get("teacher_topk")
+    if topk is None:
+        return None
+    topk = int(topk)
+    if topk < 1:
+        raise ValueError(
+            f"on_policy_distillation.teacher_topk must be at least 1, got {topk}."
+        )
+    return topk
+
+
+def get_topk_support_config(
+    master_config: Any,
+) -> tuple[Optional[int], Optional[TopkSource]]:
+    """Return the OPD support size and selector (``student`` or ``teacher``)."""
+    student_topk = get_student_topk(master_config)
+    teacher_topk = get_teacher_topk(master_config)
+    if student_topk is not None and teacher_topk is not None:
+        raise ValueError(
+            "on_policy_distillation.student_topk and teacher_topk are mutually exclusive."
+        )
+    if student_topk is not None:
+        return student_topk, "student"
+    if teacher_topk is not None:
+        return teacher_topk, "teacher"
+    return None, None
+
+
+def topk_reverse_kl_loss(
+    *,
+    student_support_logprobs: torch.Tensor,
+    teacher_support_logprobs: torch.Tensor,
+    student_target_logprobs: torch.Tensor,
+    teacher_target_logprobs: torch.Tensor,
+    target_in_support: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the per-token top-k-support reverse-KL estimator.
+
+    The exact reverse-KL contribution is used for a selected top-k support.
+    When the sampled target is outside that support, its score-function
+    contribution estimates the remaining vocabulary tail without transferring
+    full-vocabulary teacher logits.
+
+    All log-probabilities must be normalized against their model's full
+    vocabulary. Support selection and teacher values are treated as constants;
+    gradients flow only through the current student log-probabilities.
+
+    Note:
+        The tail term is a score-function estimator evaluated with the current
+        student's log-probability at the sampled target token. It is unbiased
+        only when that token is sampled from the current student policy. Top-k
+        OPD currently requires async GRPO and rejects truncated importance
+        sampling, so no importance ratio corrects the stale-policy sampling
+        mismatch. Keep ``grpo.async_grpo.max_trajectory_age_steps`` at 1 to
+        minimize the supported replay lag and treat the residual bias as an
+        async-training trade-off. Requiring ``disable_ppo_ratio=True`` avoids
+        applying a policy-gradient ratio to this reverse-KL loss, but does not
+        compensate for replay staleness.
+    """
+    if student_support_logprobs.shape != teacher_support_logprobs.shape:
+        raise ValueError(
+            "student and teacher support logprobs must have the same shape, "
+            f"got {student_support_logprobs.shape} and "
+            f"{teacher_support_logprobs.shape}."
+        )
+    if student_support_logprobs.ndim < 1:
+        raise ValueError("support logprobs must have a top-k dimension.")
+    token_shape = student_support_logprobs.shape[:-1]
+    for name, value in (
+        ("student_target_logprobs", student_target_logprobs),
+        ("teacher_target_logprobs", teacher_target_logprobs),
+        ("target_in_support", target_in_support),
+    ):
+        if value.shape != token_shape:
+            raise ValueError(
+                f"{name} must have shape {token_shape}, got {value.shape}."
+            )
+
+    teacher_support_logprobs = teacher_support_logprobs.to(
+        device=student_support_logprobs.device,
+        dtype=student_support_logprobs.dtype,
+    ).detach()
+    teacher_target_logprobs = teacher_target_logprobs.to(
+        device=student_target_logprobs.device,
+        dtype=student_target_logprobs.dtype,
+    ).detach()
+
+    support_loss = (
+        student_support_logprobs.exp()
+        * (student_support_logprobs - teacher_support_logprobs)
+    ).sum(dim=-1)
+    tail_advantage = (teacher_target_logprobs - student_target_logprobs).detach()
+    # The score-function coefficient includes +1 from differentiating the
+    # student-probability prefactor in p_s * (log p_s - log p_t).
+    tail_loss = (1.0 - tail_advantage) * student_target_logprobs
+    return support_loss + tail_loss * (~target_in_support.bool()).to(tail_loss.dtype)
 
 
 def _skip_prev_logprobs(master_config: Any) -> bool:
@@ -492,7 +653,6 @@ def _validate_default_teacher_alias(opd_cfg: dict[str, Any]) -> None:
 def reserve_teacher_clusters(
     master_config: Any,
     *,
-    segment_size: Optional[int] = None,
     teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None,
 ) -> dict[str, RayVirtualCluster]:
     """Create and reserve topology-aware clusters for non-colocated teachers.
@@ -504,10 +664,9 @@ def reserve_teacher_clusters(
 
     Args:
         master_config: Full training configuration containing the OPD settings.
-        segment_size: NVLink-domain segment size from the cluster config. When
-            set, every teacher is constrained to one NVLink domain.
         teacher_segment_topology: Topology remaining after policy and inference
-            placement.
+            placement. It is consulted only when a teacher explicitly sets
+            ``segment_size`` in its resource config.
 
     Returns:
         A mapping from each deduplicated teacher alias to its reserved cluster.
@@ -541,18 +700,19 @@ def reserve_teacher_clusters(
             num_nodes = teacher_config.num_nodes
             gpus_per_node = teacher_config.gpus_per_node
 
-            # Pin each teacher within one NVLink domain (its whole node span is
-            # one segment) so its TP/PP/CP collectives stay on NVLink.
-            teacher_segment_size = None
+            # Teacher topology is explicitly opt-in. In particular, do not
+            # derive it from cluster.segment_size or from the teacher's node
+            # count: doing so can turn a valid small cluster segment into an
+            # impossible whole-teacher single-domain request.
+            teacher_segment_size = teacher_config.segment_size
             node_resource_constraints = None
-            if segment_size is not None:
-                teacher_segment_size = num_nodes
+            if teacher_segment_size is not None:
                 (
                     node_resource_constraints,
                     remaining_ids,
                     _,
                 ) = prepare_segment_topology(
-                    num_nodes,
+                    teacher_segment_size,
                     num_nodes,
                     topology=running_topology,
                     role=f"teacher:{alias}",
@@ -672,12 +832,18 @@ def create_teacher_worker_groups(
         teacher_worker_groups, policy_config["make_sequence_length_divisible_by"]
     )
 
-    # Build alias -> group_alias mapping for deduplication
-    alias_to_group_alias: dict[str, str] = {}
-    model_to_primary: dict[str, str] = {}
-    for teacher_config in teacher_configs:
-        model_to_primary[teacher_config.model_name] = teacher_config.alias
-    for alias, model_name in teacher_model_by_agent_name.items():
-        alias_to_group_alias[alias] = model_to_primary.get(model_name, alias)
+    # Build alias -> group alias mapping. Without deduplication, aliases sharing
+    # a checkpoint still own separate groups and must not be remapped by model.
+    if opd_cfg.get("deduplicate_shared_teacher_checkpoints", True):
+        model_to_primary = {
+            teacher_config.model_name: teacher_config.alias
+            for teacher_config in teacher_configs
+        }
+        alias_to_group_alias = {
+            alias: model_to_primary[model_name]
+            for alias, model_name in teacher_model_by_agent_name.items()
+        }
+    else:
+        alias_to_group_alias = {alias: alias for alias in teacher_model_by_agent_name}
 
     return teacher_worker_groups, alias_to_group_alias

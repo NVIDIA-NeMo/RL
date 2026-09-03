@@ -32,6 +32,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
+    gather_vocab_parallel_logprobs_at_indices,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -40,6 +41,90 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+
+
+def test_gather_vocab_parallel_logprobs_at_indices_chunks_and_keeps_gradients(
+    monkeypatch,
+):
+    from nemo_rl.distributed.model_utils import vocab_parallel_log_softmax
+
+    chunk_seq_lens = []
+
+    def _recording_log_softmax(logits, **kwargs):
+        chunk_seq_lens.append(logits.shape[1])
+        return vocab_parallel_log_softmax(logits, **kwargs)
+
+    monkeypatch.setattr(
+        "nemo_rl.distributed.model_utils.vocab_parallel_log_softmax",
+        _recording_log_softmax,
+    )
+    logits = torch.tensor(
+        [
+            [
+                [1.0, 2.0, 3.0, 4.0],
+                [4.0, 3.0, 2.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [2.0, -1.0, 0.0, 3.0],
+                [-2.0, 0.0, 2.0, 1.0],
+            ]
+        ],
+        requires_grad=True,
+    )
+    indices = torch.tensor([[[3, 1], [0, 2], [1, 3], [3, 0], [2, 1]]], dtype=torch.long)
+
+    actual = gather_vocab_parallel_logprobs_at_indices(
+        logits,
+        indices,
+        vocab_start_index=0,
+        vocab_end_index=4,
+        chunk_size=2,
+    )
+    expected = logits.log_softmax(dim=-1).gather(-1, indices)
+
+    assert chunk_seq_lens == [2, 2, 1]
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_gather_vocab_parallel_logprobs_at_indices_restores_each_packed_cp_sequence(
+    monkeypatch,
+):
+    cp_group = object()
+    gathered_sequences = [
+        torch.tensor([[[10.0], [11.0], [12.0], [13.0]]]),
+        torch.tensor([[[20.0], [21.0], [22.0], [23.0]]]),
+    ]
+    local_slices = []
+
+    monkeypatch.setattr(
+        "nemo_rl.distributed.model_utils.torch.distributed.get_world_size",
+        lambda group: 2 if group is cp_group else 1,
+    )
+
+    def fake_allgather(local, group, seq_dim):
+        assert group is cp_group
+        assert seq_dim == 1
+        local_slices.append(local)
+        return gathered_sequences[len(local_slices) - 1]
+
+    monkeypatch.setattr(
+        "nemo_rl.distributed.model_utils.allgather_cp_sharded_tensor",
+        fake_allgather,
+    )
+
+    actual = gather_vocab_parallel_logprobs_at_indices(
+        torch.randn(1, 4, 3),
+        torch.zeros(1, 4, 1, dtype=torch.long),
+        vocab_start_index=0,
+        vocab_end_index=3,
+        cp_group=cp_group,
+        cu_seqlens_padded=torch.tensor([0, 4, 8]),
+    )
+
+    assert [local.shape for local in local_slices] == [(1, 2, 1), (1, 2, 1)]
+    torch.testing.assert_close(actual, torch.cat(gathered_sequences, dim=1))
 
 
 @ray.remote(num_gpus=1)
@@ -254,12 +339,12 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
 def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_size):
     """Test from_parallel_logits_to_logprobs_packed_sequences with coverage.
 
-    Uses _pack_input_ids to build packed targets and compares:
+    Uses _pack_sequence_tensor to build packed targets and compares:
       1. target_is_pre_rolled=False against the unpacked baseline (CP=1 only)
       2. target_is_pre_rolled=True against target_is_pre_rolled=False
     with variable-length sequences.
     """
-    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+    from nemo_rl.algorithms.loss.utils import _pack_sequence_tensor
 
     # Build 2-D process groups: inner=TP, outer=CP
     tp_groups = []
@@ -333,8 +418,8 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
             packed_logits[:, offset : offset + psl, :] = padded_seq
 
     # --- Path 1: target_is_pre_rolled=False ---
-    # Pack raw (unrolled) input_ids to [1, T_padded] using _pack_input_ids.
-    packed_target_raw = _pack_input_ids(input_ids, cu_seqlens, cu_seqlens_padded)
+    # Pack raw (unrolled) input_ids to [1, T_padded].
+    packed_target_raw = _pack_sequence_tensor(input_ids, cu_seqlens, cu_seqlens_padded)
 
     logprobs_not_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
         packed_logits,
@@ -350,7 +435,7 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
     )
 
     # --- Path 2: target_is_pre_rolled=True ---
-    packed_target_pre_rolled = _pack_input_ids(
+    packed_target_pre_rolled = _pack_sequence_tensor(
         input_ids,
         cu_seqlens,
         cu_seqlens_padded,

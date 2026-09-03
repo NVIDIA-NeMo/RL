@@ -42,10 +42,18 @@ class ScoreOutputSpec(TypedDict):
 
 
 class TopkLogitsOutputSpec(TypedDict):
-    """Per-position top-k logits and corresponding global token indices."""
+    """Per-position top-k values and corresponding global token indices."""
 
     topk_logits: torch.Tensor
     topk_indices: torch.Tensor
+
+
+class TopkLogprobsOutputSpec(TypedDict):
+    """Teacher target logprobs plus selected support indices and logprobs."""
+
+    reference_logprobs: torch.Tensor
+    topk_indices: torch.Tensor
+    topk_logprobs: torch.Tensor
 
 
 class PolicyInterface(ABC):

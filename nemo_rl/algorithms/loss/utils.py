@@ -29,6 +29,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     from_parallel_logits_to_logprobs_packed_sequences,
+    gather_vocab_parallel_logprobs_at_indices,
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
@@ -214,6 +215,58 @@ def prepare_loss_input(
 
         loss_input = {"next_token_logprobs": logprobs}
 
+    elif loss_fn.input_type == LossInputType.OPD_TOPK:
+        if (
+            context_parallel_group is not None
+            and torch.distributed.get_world_size(context_parallel_group) > 1
+        ):
+            raise NotImplementedError(
+                "Top-k OPD loss preparation does not yet support context parallelism."
+            )
+        if "opd_support_indices" not in data:
+            raise ValueError("Top-k OPD requires data['opd_support_indices'].")
+        support_indices = data["opd_support_indices"].to(
+            device=logits.device, dtype=torch.long
+        )
+        if support_indices.shape[:2] != logits.shape[:2]:
+            raise ValueError(
+                "opd_support_indices must match logits batch and sequence dimensions, "
+                f"got {support_indices.shape[:2]} and {logits.shape[:2]}."
+            )
+
+        active_tp_group = vocab_parallel_group
+        if active_tp_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank is required with vocab_parallel_group"
+            )
+            vocab_shard_size = logits.shape[-1]
+            vocab_start_index = vocab_parallel_rank * vocab_shard_size
+            vocab_end_index = vocab_start_index + vocab_shard_size
+        else:
+            vocab_start_index = 0
+            vocab_end_index = logits.shape[-1]
+
+        target_indices = (
+            data["input_ids"]
+            .roll(shifts=-1, dims=-1)
+            .to(device=logits.device, dtype=torch.long)
+            .unsqueeze(-1)
+        )
+        selected_indices = torch.cat([support_indices, target_indices], dim=-1)
+        selected_logprobs = gather_vocab_parallel_logprobs_at_indices(
+            logits,
+            selected_indices,
+            tp_group=active_tp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            chunk_size=chunk_size,
+        )
+        support_size = support_indices.shape[-1]
+        loss_input = {
+            "next_token_logprobs": selected_logprobs[:, :-1, support_size],
+            "current_support_logprobs": selected_logprobs[:, :-1, :support_size],
+        }
+
     elif loss_fn.input_type == LossInputType.DISTILLATION:
         calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
         student_topk_logprobs, teacher_topk_logprobs, H_all = (
@@ -343,15 +396,15 @@ def prepare_loss_input(
     return loss_input, data
 
 
-def _pack_input_ids(
-    input_ids: torch.Tensor,
+def _pack_sequence_tensor(
+    unpacked: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_q_padded: torch.Tensor,
     cp_rank: int = 0,
     cp_size: int = 1,
     roll_shift: int = 0,
 ) -> torch.Tensor:
-    """Pack input_ids from [B, S] to [1, T_packed // CP] using sequence boundaries.
+    """Pack ``[B, S, ...]`` data to ``[1, T_packed // CP, ...]``.
 
     Each sequence is individually padded to its padded length (from
     cu_seqlens_q_padded), optionally rolled, and CP-sharded at that padded
@@ -359,7 +412,7 @@ def _pack_input_ids(
     Megatron packs and CP-shards sequences in _pack_sequences_for_megatron.
 
     Args:
-        input_ids: Unpacked input IDs [B, S].
+        unpacked: Unpacked sequence tensor ``[B, S, ...]``.
         cu_seqlens_q: Unpadded cumulative sequence lengths [B+1].
         cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1].
         cp_rank: Context parallelism rank.
@@ -368,22 +421,29 @@ def _pack_input_ids(
             before CP-sharding.  Use -1 to build shifted targets for
             next-token prediction.
     """
-    batch_size = input_ids.shape[0]
+    batch_size = unpacked.shape[0]
+    trailing_shape = unpacked.shape[2:]
     total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
     packed = torch.zeros(
-        total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+        (total_packed_len, *trailing_shape),
+        dtype=unpacked.dtype,
+        device=unpacked.device,
     )
     for i in range(batch_size):
         actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
         padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
         packed_start = int(cu_seqlens_q_padded[i].item())
-        seq = torch.zeros(padded_len, dtype=input_ids.dtype, device=input_ids.device)
+        seq = torch.zeros(
+            (padded_len, *trailing_shape),
+            dtype=unpacked.dtype,
+            device=unpacked.device,
+        )
         # The packer absorbs bin-level alignment padding into the last
         # sequence's effective length (see _get_pack_sequence_parameters_for_megatron),
         # so cu_seqlens can exceed the unpacked row width. Copy only real
         # tokens; the tail stays zero and is excluded from the loss by token_mask.
-        copy_len = min(actual_len, input_ids.shape[1])
-        seq[:copy_len] = input_ids[i, :copy_len]
+        copy_len = min(actual_len, unpacked.shape[1])
+        seq[:copy_len] = unpacked[i, :copy_len]
         if roll_shift != 0:
             seq = seq.roll(shifts=roll_shift, dims=0)
         sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
@@ -391,6 +451,29 @@ def _pack_input_ids(
             sharded
         )
     return packed.unsqueeze(0)
+
+
+def _unpack_packed_next_token_values(
+    packed: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_q_padded: torch.Tensor,
+    unpacked_seqlen: int,
+) -> torch.Tensor:
+    """Restore packed logit-position values to unpacked next-token positions."""
+    batch_size = cu_seqlens_q.shape[0] - 1
+    trailing_shape = packed.shape[2:]
+    unpacked = packed.new_zeros((batch_size, unpacked_seqlen - 1, *trailing_shape))
+    for sample_idx in range(batch_size):
+        packed_start = int(cu_seqlens_q_padded[sample_idx].item())
+        actual_len = int(
+            (cu_seqlens_q[sample_idx + 1] - cu_seqlens_q[sample_idx]).item()
+        )
+        copy_len = min(max(actual_len - 1, 0), unpacked_seqlen - 1)
+        if copy_len > 0:
+            unpacked[sample_idx, :copy_len] = packed[
+                0, packed_start : packed_start + copy_len
+            ]
+    return unpacked
 
 
 def prepare_packed_loss_input(
@@ -411,12 +494,12 @@ def prepare_packed_loss_input(
     this function computes log probabilities from packed logits across all
     sequences at once using from_parallel_logits_to_logprobs_packed_sequences.
 
-    Currently only supports LossInputType.LOGPROB.
+    Supports ordinary logprob losses and packed top-k OPD.
 
     Args:
         logits: Packed logits from the model [1, T_packed // CP, V // TP].
         data: Microbatch data (unpacked, [B, S]).
-        loss_fn: Loss function (must have input_type == LossInputType.LOGPROB).
+        loss_fn: Loss function using LOGPROB or OPD_TOPK input.
         cu_seqlens_q: Unpadded cumulative sequence lengths [B+1].
         cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1].
         vocab_parallel_rank: Vocab parallel rank.
@@ -430,9 +513,10 @@ def prepare_packed_loss_input(
     Returns:
         tuple(loss_input, maybe_updated_data)
     """
-    if loss_fn.input_type != LossInputType.LOGPROB:
+    if loss_fn.input_type not in {LossInputType.LOGPROB, LossInputType.OPD_TOPK}:
         raise ValueError(
-            f"prepare_packed_loss_input only supports LossInputType.LOGPROB, "
+            "prepare_packed_loss_input only supports LossInputType.LOGPROB or "
+            "LossInputType.OPD_TOPK, "
             f"got {loss_fn.input_type}. Use SequencePackingLossWrapper with "
             f"prepare_loss_input for other types."
         )
@@ -456,7 +540,7 @@ def prepare_packed_loss_input(
         else torch.distributed.get_rank(context_parallel_group)
     )
 
-    packed_rolled_targets = _pack_input_ids(
+    packed_rolled_targets = _pack_sequence_tensor(
         input_ids,
         cu_seqlens_q,
         cu_seqlens_q_padded,
@@ -464,6 +548,59 @@ def prepare_packed_loss_input(
         cp_size=cp_size,
         roll_shift=-1,
     )
+
+    if loss_fn.input_type == LossInputType.OPD_TOPK:
+        if "opd_support_indices" not in data:
+            raise ValueError("Top-k OPD requires data['opd_support_indices'].")
+        support_indices = data["opd_support_indices"].to(
+            device=logits.device, dtype=torch.long
+        )
+        if support_indices.shape[:2] != input_ids.shape:
+            raise ValueError(
+                "opd_support_indices must match input_ids batch and sequence "
+                f"dimensions, got {support_indices.shape[:2]} and "
+                f"{input_ids.shape}."
+            )
+        packed_support_indices = _pack_sequence_tensor(
+            support_indices,
+            cu_seqlens_q,
+            cu_seqlens_q_padded,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+        )
+        selected_indices = torch.cat(
+            [packed_support_indices, packed_rolled_targets.unsqueeze(-1)], dim=-1
+        )
+        selected_logprobs = gather_vocab_parallel_logprobs_at_indices(
+            logits,
+            selected_indices,
+            vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+            vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+            tp_group=vocab_parallel_group,
+            cp_group=context_parallel_group,
+            cu_seqlens_padded=cu_seqlens_q_padded,
+            chunk_size=chunk_size,
+        )
+        support_size = packed_support_indices.shape[-1]
+        packed_support_logprobs = selected_logprobs[..., :support_size]
+        packed_target_logprobs = selected_logprobs[..., support_size]
+        return (
+            {
+                "next_token_logprobs": _unpack_packed_next_token_values(
+                    packed_target_logprobs,
+                    cu_seqlens_q,
+                    cu_seqlens_q_padded,
+                    unpacked_seqlen,
+                ),
+                "current_support_logprobs": _unpack_packed_next_token_values(
+                    packed_support_logprobs,
+                    cu_seqlens_q,
+                    cu_seqlens_q_padded,
+                    unpacked_seqlen,
+                ),
+            },
+            data,
+        )
 
     # With chunking, keep logits in their original dtype: the chunked logprob
     # kernel casts each chunk to float32 internally.

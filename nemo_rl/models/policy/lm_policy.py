@@ -709,7 +709,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
-        """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        """Dispatch top-k evaluation to workers.
+
+        Args:
+            data: Tokenized model inputs.
+            k: Number of vocabulary entries to return per position.
+            micro_batch_size: Optional inference microbatch size.
+            timer: Optional timing collector.
+
+        Returns:
+            Top-k logits and global vocabulary indices.
+        """
         with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
 
@@ -732,7 +742,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+                common_kwargs={
+                    "k": k,
+                    "micro_batch_size": micro_batch_size,
+                },
             )
 
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
@@ -743,7 +756,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
         stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
         stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
-
         if unsorted_data_indices is not None:
             stacked.reorder_data(unsorted_data_indices)
 

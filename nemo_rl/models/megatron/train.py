@@ -49,10 +49,12 @@ from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    gather_vocab_parallel_logprobs_at_indices,
 )
 from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
@@ -70,6 +72,7 @@ from nemo_rl.models.policy import PolicyConfig
 PostProcessingFunction = Union[
     "LossPostProcessor",
     "LogprobsPostProcessor",
+    "SupportLogprobsPostProcessor",
     "TopkLogitsPostProcessor",
 ]
 
@@ -349,7 +352,12 @@ def forward_with_post_processing_fn(
     # Loss computation should use unscaled logits.
     if isinstance(
         post_processing_fn,
-        (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
+        (
+            LossPostProcessor,
+            LogprobsPostProcessor,
+            SupportLogprobsPostProcessor,
+            TopkLogitsPostProcessor,
+        ),
     ):
         # Temperature scaling is element-wise, directly applying it here.
         # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
@@ -379,6 +387,8 @@ def forward_with_post_processing_fn(
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
         )
+    elif isinstance(post_processing_fn, SupportLogprobsPostProcessor):
+        post_processing_fn_wrapped = post_processing_fn(data_dict=data_dict)
     else:
         raise TypeError(
             f"Unknown post-processing function type: {type(post_processing_fn)}"
@@ -733,9 +743,10 @@ class LogprobsPostProcessor:
 
 
 class TopkLogitsPostProcessor:
-    def __init__(self, cfg: PolicyConfig, k: int):
+    def __init__(self, cfg: PolicyConfig, k: int, return_logprobs: bool = False):
         self.cfg = cfg
         self.k = k
+        self.return_logprobs = return_logprobs
 
     def __call__(
         self,
@@ -755,8 +766,13 @@ class TopkLogitsPostProcessor:
             original_seq_length: Sequence width before dense padding was applied
 
         Returns:
-            Callable: Function that takes output tensor and returns
-                      (dummy_loss, {"topk_logits": values, "topk_indices": indices})
+            Callable: Function that takes output tensor and returns a dummy loss
+            plus top-k logits/indices. With ``return_logprobs=True``, the result
+            also contains normalized ``topk_logprobs`` and sampled-token
+            ``logprobs``.
+
+        Raises:
+            RuntimeError: If context parallelism is enabled without packing.
         """
         pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
@@ -781,7 +797,64 @@ class TopkLogitsPostProcessor:
                 vocab_end_index=vocab_start_index + vocab_shard_size,
                 chunk_size=chunk_size,
             )
+            support_logprobs_full = None
+            target_logprobs_full = None
+            if self.return_logprobs:
+                if pack:
+                    packed_targets = output_tensor.new_zeros(
+                        output_tensor.shape[:2], dtype=torch.long
+                    )
+                    cp_rank = (
+                        torch.distributed.get_rank(get_context_parallel_group())
+                        if cp_size > 1
+                        else 0
+                    )
+                    for sample_idx in range(data_dict["input_ids"].shape[0]):
+                        start = int(cu_seqlens_padded[sample_idx].item())
+                        end = int(cu_seqlens_padded[sample_idx + 1].item())
+                        padded_len = end - start
+                        sequence = torch.zeros(
+                            padded_len,
+                            dtype=torch.long,
+                            device=output_tensor.device,
+                        )
+                        input_len = min(
+                            int(seq_lengths[sample_idx].item()),
+                            data_dict["input_ids"].shape[1],
+                        )
+                        sequence[:input_len] = data_dict["input_ids"][
+                            sample_idx, :input_len
+                        ].to(device=output_tensor.device, dtype=torch.long)
+                        sequence = sequence.roll(shifts=-1, dims=0)
+                        local_sequence = _get_tokens_on_this_cp_rank(
+                            sequence, cp_rank, cp_size, seq_dim=0
+                        )
+                        packed_targets[:, start // cp_size : end // cp_size] = (
+                            local_sequence
+                        )
+                    target_indices_local = packed_targets
+                else:
+                    target_indices_local = (
+                        data_dict["input_ids"]
+                        .to(device=output_tensor.device, dtype=torch.long)
+                        .roll(shifts=-1, dims=1)
+                    )
 
+                selected_indices = torch.cat(
+                    [topk_idx_local, target_indices_local.unsqueeze(-1)], dim=-1
+                )
+                selected_logprobs = gather_vocab_parallel_logprobs_at_indices(
+                    output_tensor,
+                    selected_indices,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_start_index + vocab_shard_size,
+                    tp_group=tp_grp,
+                    cp_group=(get_context_parallel_group() if cp_size > 1 else None),
+                    cu_seqlens_padded=(cu_seqlens_padded if pack else None),
+                    chunk_size=chunk_size,
+                )
+                support_logprobs_full = selected_logprobs[..., : self.k]
+                target_logprobs_full = selected_logprobs[..., self.k]
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
@@ -799,7 +872,6 @@ class TopkLogitsPostProcessor:
                         dtype=topk_idx_local.dtype,
                         device=topk_idx_local.device,
                     )
-
                     for i in range(batch_size):
                         start_idx = int(cu_seqlens_padded[i].item())
                         end_idx = int(cu_seqlens_padded[i + 1].item())
@@ -856,6 +928,21 @@ class TopkLogitsPostProcessor:
                     dtype=topk_idx_full.dtype,
                     device=topk_idx_full.device,
                 )
+                out_logprobs = None
+                out_targets = None
+                if self.return_logprobs:
+                    assert support_logprobs_full is not None
+                    assert target_logprobs_full is not None
+                    out_logprobs = torch.zeros(
+                        (batch_size, unpacked_seqlen, self.k),
+                        dtype=support_logprobs_full.dtype,
+                        device=support_logprobs_full.device,
+                    )
+                    out_targets = torch.zeros(
+                        (batch_size, unpacked_seqlen),
+                        dtype=target_logprobs_full.dtype,
+                        device=target_logprobs_full.device,
+                    )
                 for i in range(batch_size):
                     seq_len = int(seq_lengths[i].item())
                     start_idx = int(cu_seqlens_padded[i].item())
@@ -866,15 +953,104 @@ class TopkLogitsPostProcessor:
                         out_idx[i, :seq_len, :] = topk_idx_full[
                             0, start_idx : start_idx + seq_len, :
                         ]
-                return output_tensor.new_zeros(()), {
+                        if self.return_logprobs:
+                            assert out_logprobs is not None
+                            assert out_targets is not None
+                            out_logprobs[i, :seq_len, :] = support_logprobs_full[
+                                0, start_idx : start_idx + seq_len, :
+                            ]
+                            next_token_len = max(seq_len - 1, 0)
+                            if next_token_len > 0:
+                                out_targets[i, 1:seq_len] = target_logprobs_full[
+                                    0, start_idx : start_idx + next_token_len
+                                ]
+                result = {
                     "topk_logits": out_vals,
                     "topk_indices": out_idx,
                 }
+                if self.return_logprobs:
+                    assert out_logprobs is not None
+                    assert out_targets is not None
+                    result["topk_logprobs"] = out_logprobs
+                    result["logprobs"] = out_targets
+                return output_tensor.new_zeros(()), result
             else:
-                return output_tensor.new_zeros(()), {
+                result = {
                     "topk_logits": topk_vals_full[:, :original_seq_length],
                     "topk_indices": topk_idx_full[:, :original_seq_length],
                 }
+                if self.return_logprobs:
+                    assert support_logprobs_full is not None
+                    assert target_logprobs_full is not None
+                    result["topk_logprobs"] = support_logprobs_full[
+                        :, :original_seq_length
+                    ]
+                    result["logprobs"] = torch.cat(
+                        [
+                            torch.zeros_like(target_logprobs_full[:, :1]),
+                            target_logprobs_full[:, :-1],
+                        ],
+                        dim=1,
+                    )[:, :original_seq_length]
+                return output_tensor.new_zeros(()), result
+
+        return processor_fn_inner
+
+
+class SupportLogprobsPostProcessor:
+    """Gather full-vocabulary-normalized logprobs on caller-provided support."""
+
+    def __init__(self, cfg: PolicyConfig):
+        self.cfg = cfg
+
+    def __call__(
+        self,
+        data_dict: BatchedDataDict[Any],
+    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """Create a function that gathers normalized log-probabilities.
+
+        Args:
+            data_dict: Model inputs containing ``topk_indices`` with shape
+                ``[batch, sequence, k]``.
+
+        Returns:
+            Function returning ``support_logprobs`` at the requested indices.
+        """
+        if self.cfg["sequence_packing"]["enabled"]:
+            raise NotImplementedError(
+                "Support logprob gathering does not yet support sequence packing."
+            )
+        if self.cfg["megatron_cfg"]["context_parallel_size"] != 1:
+            raise NotImplementedError(
+                "Support logprob gathering does not yet support context parallelism."
+            )
+        support_indices = data_dict["topk_indices"]
+        if support_indices.ndim != 3 or support_indices.shape[-1] < 1:
+            raise ValueError(
+                "topk_indices must have shape [batch, sequence, k] with k >= 1, "
+                f"got {support_indices.shape}."
+            )
+
+        def processor_fn_inner(output_tensor):
+            if support_indices.shape[:2] != output_tensor.shape[:2]:
+                raise ValueError(
+                    "topk_indices must match model output batch and sequence dimensions, "
+                    f"got {support_indices.shape[:2]} and {output_tensor.shape[:2]}."
+                )
+            tp_grp = get_tensor_model_parallel_group()
+            tp_rank = get_tensor_model_parallel_rank()
+            vocab_shard_size = output_tensor.shape[-1]
+            vocab_start_index = tp_rank * vocab_shard_size
+            active_tp_grp = tp_grp if torch.distributed.is_initialized() else None
+            support_logprobs = gather_vocab_parallel_logprobs_at_indices(
+                output_tensor,
+                support_indices.to(device=output_tensor.device, dtype=torch.long),
+                tp_group=active_tp_grp,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_start_index + vocab_shard_size,
+                chunk_size=self.cfg.get("logprob_chunk_size", None),
+            )
+            return output_tensor.new_zeros(()), {"support_logprobs": support_logprobs}
 
         return processor_fn_inner
 

@@ -1084,7 +1084,6 @@ def setup_single_controller(
         t0 = time.perf_counter()
         teacher_clusters = opd_module.reserve_teacher_clusters(
             master_config,
-            segment_size=segment_size,
             teacher_segment_topology=teacher_segment_topology,
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0

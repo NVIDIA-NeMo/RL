@@ -52,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
+    _validate_topk_opd_config,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -65,6 +66,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -271,6 +273,203 @@ def test_initial_policy_generation_stale() -> None:
 
     generation.weight_synchronizer.is_stale = True
     assert _initial_policy_generation_stale(generation, completed_steps=0)
+
+
+def _enable_valid_topk(master_config: MasterConfig, source: str = "student") -> None:
+    topk_kwargs = {f"{source}_topk": 8}
+    master_config.on_policy_distillation = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"default_teacher": "teacher-model"},
+        default_teacher_alias="default_teacher",
+        non_colocated_teachers={
+            "enabled": True,
+            "default_teacher_cfg": {"context_parallel_size": 1},
+        },
+        **topk_kwargs,
+    )
+    master_config.grpo.async_grpo.enabled = True
+    master_config.grpo.adv_estimator.name = "opd"
+    master_config.loss_fn.reference_policy_kl_penalty = 0
+    master_config.policy["sequence_packing"] = {
+        "enabled": False,
+        "fuse_loss": False,
+    }
+    master_config.policy["megatron_cfg"] = {
+        "enabled": True,
+        "context_parallel_size": 1,
+    }
+    master_config.policy["generation"]["top_k"] = None
+    master_config.policy["generation"]["top_p"] = 1.0
+    master_config.policy["generation"]["temperature"] = 1.0
+
+
+@pytest.mark.parametrize("source", ["student", "teacher"])
+def test_validate_topk_opd_config_accepts_supported_settings(
+    mock_grpo_components, source
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, source)
+    master_config.policy["generation"]["temperature"] = 0.7
+
+    _validate_topk_opd_config(master_config, opd_topk=8, topk_source=source)
+
+
+@pytest.mark.parametrize(
+    ("invalid_setting", "error_type", "message"),
+    [
+        ("opd_disabled", ValueError, "requires on_policy_distillation.enabled=true"),
+        ("sync_grpo", NotImplementedError, "only grpo.async_grpo.enabled=true"),
+        ("sequence_packing", NotImplementedError, "sequence packing"),
+        ("context_parallel", NotImplementedError, "context parallelism"),
+        ("non_megatron", NotImplementedError, "Megatron policy backend"),
+        ("filtered_sampling", NotImplementedError, "unfiltered training distributions"),
+        ("reference_kl", ValueError, "reference_policy_kl_penalty=0"),
+        ("adv_estimator", ValueError, "adv_estimator.name='opd'"),
+    ],
+)
+def test_validate_topk_opd_config_rejects_unsupported_settings(
+    mock_grpo_components, invalid_setting, error_type, message
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config)
+
+    if invalid_setting == "opd_disabled":
+        master_config.on_policy_distillation.enabled = False
+    elif invalid_setting == "sync_grpo":
+        master_config.grpo.async_grpo.enabled = False
+    elif invalid_setting == "sequence_packing":
+        master_config.policy["sequence_packing"]["enabled"] = True
+    elif invalid_setting == "context_parallel":
+        master_config.policy["megatron_cfg"]["context_parallel_size"] = 2
+    elif invalid_setting == "non_megatron":
+        master_config.policy["megatron_cfg"]["enabled"] = False
+    elif invalid_setting == "filtered_sampling":
+        master_config.policy["generation"]["top_k"] = 16
+    elif invalid_setting == "reference_kl":
+        master_config.loss_fn.reference_policy_kl_penalty = 0.01
+    elif invalid_setting == "adv_estimator":
+        master_config.grpo.adv_estimator.name = "grpo"
+
+    with pytest.raises(error_type, match=message):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="student")
+
+
+def test_validate_teacher_topk_accepts_packing_and_context_parallelism(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["sequence_packing"] = {
+        "enabled": True,
+        "fuse_loss": True,
+    }
+    master_config.on_policy_distillation.non_colocated_teachers.default_teacher_cfg.context_parallel_size = 2
+
+    _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+@pytest.mark.parametrize(
+    ("packing_enabled", "fuse_loss", "teacher_cp_size", "message"),
+    [
+        (False, False, 2, "requires sequence packing"),
+        (True, False, 1, "fuse_loss=true"),
+    ],
+)
+def test_validate_teacher_topk_rejects_incomplete_packed_configuration(
+    mock_grpo_components,
+    packing_enabled,
+    fuse_loss,
+    teacher_cp_size,
+    message,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["sequence_packing"] = {
+        "enabled": packing_enabled,
+        "fuse_loss": fuse_loss,
+    }
+    master_config.on_policy_distillation.non_colocated_teachers.default_teacher_cfg.context_parallel_size = teacher_cp_size
+
+    with pytest.raises(NotImplementedError, match=message):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+def test_validate_teacher_topk_missing_fuse_loss_is_an_unsupported_config(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["sequence_packing"] = {"enabled": True}
+
+    with pytest.raises(NotImplementedError, match="fuse_loss=true"):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+def test_validate_teacher_topk_requires_packing_for_student_cp(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["megatron_cfg"]["context_parallel_size"] = 2
+
+    with pytest.raises(NotImplementedError, match="student policy"):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+def test_validate_teacher_topk_checks_effective_teacher_override_cp(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    opd_config = master_config.on_policy_distillation.model_dump()
+    opd_config["teacher_model_by_agent_name"] = {"large_teacher": "teacher-model"}
+    opd_config["non_colocated_teachers"]["teacher_overrides"] = {
+        "large_teacher": {"megatron_cfg_overrides": {"context_parallel_size": 2}}
+    }
+    master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
+        opd_config
+    )
+
+    with pytest.raises(NotImplementedError, match="large_teacher"):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+def test_validate_teacher_topk_preserves_default_cp_with_unrelated_alias_override(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    opd_config = master_config.on_policy_distillation.model_dump()
+    opd_config["teacher_model_by_agent_name"] = {"large_teacher": "teacher-model"}
+    opd_config["non_colocated_teachers"]["default_teacher_cfg"][
+        "context_parallel_size"
+    ] = 1
+    opd_config["non_colocated_teachers"]["default_teacher_cfg"][
+        "megatron_cfg_overrides"
+    ] = {"context_parallel_size": 2}
+    opd_config["non_colocated_teachers"]["teacher_overrides"] = {
+        "large_teacher": {
+            "num_nodes": 2,
+            "megatron_cfg_overrides": {"sequence_parallel": True},
+        }
+    }
+    master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
+        opd_config
+    )
+
+    with pytest.raises(NotImplementedError, match="large_teacher"):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+def test_validate_teacher_topk_rejects_disabled_megatron_before_parallelism_access(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["megatron_cfg"] = {"enabled": False}
+
+    with pytest.raises(NotImplementedError, match="Megatron policy backend"):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
 
 
 @pytest.fixture

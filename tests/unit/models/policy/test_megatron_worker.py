@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -44,6 +44,161 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
+
+
+def test_get_topk_logits_can_return_normalized_logprobs():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {"logprob_batch_size": 2}
+    worker.model = MagicMock()
+    worker.mcore_state = SimpleNamespace(straggler_timer=MagicMock())
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.defer_fp32_logits = False
+    worker.sampling_params = MagicMock()
+    worker.media_placeholder_token_id = None
+    data = BatchedDataDict({"input_ids": torch.zeros(2, 3, dtype=torch.long)})
+    first_indices = torch.tensor([[[1, 2], [3, 4]]])
+    second_indices = torch.tensor([[[5, 6], [7, 8]]])
+    first_logits = torch.tensor([[[2.0, 1.0], [4.0, 3.0]]])
+    second_logits = torch.tensor([[[6.0, 5.0], [8.0, 7.0]]])
+    first_logprobs = torch.tensor([[[-0.1, -1.1], [-0.2, -1.2]]])
+    second_logprobs = torch.tensor([[[-0.3, -1.3], [-0.4, -1.4]]])
+    first_targets = torch.tensor([[0.0, -0.5]])
+    second_targets = torch.tensor([[0.0, -0.7]])
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.get_microbatch_iterator",
+            return_value=(iter(()), 2, 1, 3, 4),
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.megatron_forward_backward",
+            return_value=[
+                {
+                    "topk_logits": first_logits,
+                    "topk_indices": first_indices,
+                    "topk_logprobs": first_logprobs,
+                    "logprobs": first_targets,
+                },
+                {
+                    "topk_logits": second_logits,
+                    "topk_indices": second_indices,
+                    "topk_logprobs": second_logprobs,
+                    "logprobs": second_targets,
+                },
+            ],
+        ) as forward_backward,
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.is_pipeline_last_stage",
+            return_value=True,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.broadcast_tensors_from_last_stage",
+            side_effect=lambda tensors: tensors,
+        ),
+    ):
+        result = MegatronPolicyWorkerImpl.get_topk_logits(
+            worker,
+            data=data,
+            k=2,
+            micro_batch_size=1,
+            return_logprobs=True,
+        )
+
+    assert result["topk_indices"].shape == (2, 3, 2)
+    assert result["topk_logprobs"].shape == (2, 3, 2)
+    assert result["logprobs"].shape == (2, 3)
+    torch.testing.assert_close(
+        result["topk_indices"],
+        torch.tensor([[[1, 2], [3, 4], [0, 0]], [[5, 6], [7, 8], [0, 0]]]),
+    )
+    torch.testing.assert_close(
+        result["topk_logprobs"],
+        torch.tensor(
+            [
+                [[-0.1, -1.1], [-0.2, -1.2], [0.0, 0.0]],
+                [[-0.3, -1.3], [-0.4, -1.4], [0.0, 0.0]],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        result["logprobs"], torch.tensor([[0.0, -0.5, 0.0], [0.0, -0.7, 0.0]])
+    )
+    postprocessor = forward_backward.call_args.kwargs["post_processing_fn"]
+    assert postprocessor.return_logprobs is True
+
+
+def test_get_logprobs_on_support_runs_forward_and_restores_sequence_shape():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {
+        "sequence_packing": {"enabled": False},
+        "megatron_cfg": {"context_parallel_size": 1},
+        "logprob_batch_size": 2,
+    }
+    worker.model = MagicMock()
+    worker.mcore_state = SimpleNamespace(straggler_timer=MagicMock())
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.defer_fp32_logits = False
+    worker.sampling_params = MagicMock()
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(2, 3, dtype=torch.long),
+            "topk_indices": torch.zeros(2, 3, 2, dtype=torch.long),
+        }
+    )
+    first = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    second = torch.tensor([[[5.0, 6.0], [7.0, 8.0]]])
+    expected = torch.cat(
+        (
+            torch.nn.functional.pad(first, (0, 0, 0, 1)),
+            torch.nn.functional.pad(second, (0, 0, 0, 1)),
+        ),
+        dim=0,
+    )
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.get_microbatch_iterator",
+            return_value=(iter(()), 2, 1, 3, 4),
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.megatron_forward_backward",
+            return_value=[
+                {"support_logprobs": first},
+                {"support_logprobs": second},
+            ],
+        ) as forward_backward,
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.is_pipeline_last_stage",
+            return_value=True,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.broadcast_tensors_from_last_stage",
+            side_effect=lambda tensors: tensors,
+        ) as broadcast,
+    ):
+        result = MegatronPolicyWorkerImpl.get_logprobs_on_support(
+            worker, data=data, micro_batch_size=1
+        )
+
+    worker.model.eval.assert_called_once_with()
+    torch.testing.assert_close(result["support_logprobs"], expected)
+    torch.testing.assert_close(
+        broadcast.call_args.args[0]["support_logprobs"], expected
+    )
+    assert forward_backward.call_args.kwargs["forward_only"] is True
+    assert forward_backward.call_args.kwargs["post_processing_fn"].cfg is worker.cfg
 
 
 def test_model_owned_packing_capability_is_detected():

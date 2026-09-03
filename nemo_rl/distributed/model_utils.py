@@ -1582,6 +1582,108 @@ def vocab_parallel_log_softmax(
     return torch.log_softmax(scaled, dim=-1)
 
 
+def gather_vocab_parallel_logprobs_at_indices(
+    vocab_parallel_logits: torch.Tensor,
+    global_indices: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
+    chunk_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Normalize and gather selected logprobs in sequence chunks.
+
+    ``vocab_parallel_logits`` and ``global_indices`` must already have the same
+    CP-local sequence layout. During inference, each chunk bounds the live fp32
+    vocabulary working set. Under autograd, softmax buffers from every chunk may
+    be retained until backward, so this is not a rematerializing memory bound.
+    Selected values are TP-reduced and restored to contiguous full-sequence
+    order across CP ranks.
+
+    Args:
+        vocab_parallel_logits: CP/TP-local logits ``[B, S_local, V_local]``.
+        global_indices: Global vocabulary ids ``[B, S_local, K]``.
+        vocab_start_index: Inclusive vocabulary offset for this TP rank.
+        vocab_end_index: Exclusive vocabulary offset for this TP rank.
+        tp_group: Tensor-parallel process group.
+        cp_group: Context-parallel process group.
+        cu_seqlens_padded: Packed sequence boundaries. When supplied with CP,
+            each sequence is gathered independently to preserve Megatron's
+            per-sequence zigzag layout.
+        chunk_size: Optional sequence chunk size.
+
+    Returns:
+        Selected normalized logprobs in contiguous full-sequence order,
+        shaped ``[B, S_full, K]``.
+
+    Raises:
+        ValueError: If layouts differ or packed boundaries are absent with CP.
+    """
+    if global_indices.ndim != vocab_parallel_logits.ndim:
+        raise ValueError(
+            "global_indices must add a selected-index dimension in place of the "
+            f"logits vocabulary dimension; got {global_indices.shape} and "
+            f"{vocab_parallel_logits.shape}."
+        )
+    if global_indices.shape[:-1] != vocab_parallel_logits.shape[:-1]:
+        raise ValueError(
+            "global_indices must match logits batch and local sequence dimensions; "
+            f"got {global_indices.shape[:-1]} and "
+            f"{vocab_parallel_logits.shape[:-1]}."
+        )
+
+    seq_len = vocab_parallel_logits.shape[1]
+    effective_chunk_size = seq_len if chunk_size is None else chunk_size
+    if effective_chunk_size < 1:
+        raise ValueError(f"chunk_size must be positive, got {effective_chunk_size}.")
+
+    selected_chunks: list[torch.Tensor] = []
+    for start in range(0, seq_len, effective_chunk_size):
+        end = min(seq_len, start + effective_chunk_size)
+        local_logprobs = vocab_parallel_log_softmax(
+            vocab_parallel_logits[:, start:end],
+            temperature=1.0,
+            tp_group=tp_group,
+        )
+        selected_chunks.append(
+            gather_logits_at_global_indices(
+                local_logprobs,
+                global_indices[:, start:end],
+                tp_group=tp_group,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+            )
+        )
+
+    selected = (
+        torch.cat(selected_chunks, dim=1)
+        if len(selected_chunks) > 1
+        else selected_chunks[0]
+    )
+    if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+        if cu_seqlens_padded is None:
+            raise ValueError("cu_seqlens_padded is required with context parallelism.")
+        cp_size = torch.distributed.get_world_size(cp_group)
+        total_packed_len = int(cu_seqlens_padded[-1].item())
+        gathered_selected = selected.new_zeros(
+            (selected.shape[0], total_packed_len, selected.shape[-1])
+        )
+        for sample_idx in range(cu_seqlens_padded.shape[0] - 1):
+            start = int(cu_seqlens_padded[sample_idx].item())
+            end = int(cu_seqlens_padded[sample_idx + 1].item())
+            if end <= start:
+                continue
+            local = selected[:, start // cp_size : end // cp_size]
+            gathered = allgather_cp_sharded_tensor(local, cp_group, seq_dim=1)
+            gathered_selected[:, start:end] = gathered.reshape(
+                selected.shape[0], end - start, selected.shape[-1]
+            )
+        selected = gathered_selected
+    return selected
+
+
 def vocab_parallel_full_log_softmax(
     logits: torch.Tensor,
     temperature: float,

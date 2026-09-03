@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,8 +15,131 @@
 import pytest
 import torch
 
+from nemo_rl.algorithms.opd import (
+    OnPolicyDistillationConfig,
+    get_student_topk,
+    get_teacher_topk,
+    get_topk_support_config,
+    topk_reverse_kl_loss,
+)
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+# ---------------------------------------------------------------------------
+# Student-top-k estimator tests
+# ---------------------------------------------------------------------------
+
+
+def test_student_topk_config_validation():
+    cfg = OnPolicyDistillationConfig(enabled=True, student_topk=32)
+    assert get_student_topk({"on_policy_distillation": cfg}) == 32
+
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        OnPolicyDistillationConfig(enabled=True, student_topk=0)
+
+
+def test_teacher_topk_config_validation_and_selection():
+    cfg = OnPolicyDistillationConfig(enabled=True, teacher_topk=16)
+    master_config = {"on_policy_distillation": cfg}
+
+    assert get_teacher_topk(master_config) == 16
+    assert get_topk_support_config(master_config) == (16, "teacher")
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        OnPolicyDistillationConfig(enabled=True, student_topk=8, teacher_topk=16)
+
+
+def test_student_topk_full_support_matches_exact_reverse_kl():
+    student_logits = torch.tensor([[0.1, 0.7, -0.4]], requires_grad=True)
+    teacher_logits = torch.tensor([[0.5, -0.2, 0.3]])
+    student_logprobs = student_logits.log_softmax(dim=-1)
+    teacher_logprobs = teacher_logits.log_softmax(dim=-1)
+
+    estimated = topk_reverse_kl_loss(
+        student_support_logprobs=student_logprobs,
+        teacher_support_logprobs=teacher_logprobs,
+        student_target_logprobs=student_logprobs[:, 0],
+        teacher_target_logprobs=teacher_logprobs[:, 0],
+        target_in_support=torch.ones(1, dtype=torch.bool),
+    )
+    exact = (student_logprobs.exp() * (student_logprobs - teacher_logprobs)).sum(dim=-1)
+
+    torch.testing.assert_close(estimated, exact)
+    estimated.sum().backward()
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
+
+
+def test_student_topk_adds_sampled_tail_only_outside_support():
+    student_support = torch.log(torch.tensor([[0.6]]))
+    teacher_support = torch.log(torch.tensor([[0.5]]))
+    student_target = torch.log(torch.tensor([0.1], requires_grad=True))
+    teacher_target = torch.log(torch.tensor([0.2]))
+
+    outside_loss = topk_reverse_kl_loss(
+        student_support_logprobs=student_support,
+        teacher_support_logprobs=teacher_support,
+        student_target_logprobs=student_target,
+        teacher_target_logprobs=teacher_target,
+        target_in_support=torch.tensor([False]),
+    )
+    inside_loss = topk_reverse_kl_loss(
+        student_support_logprobs=student_support,
+        teacher_support_logprobs=teacher_support,
+        student_target_logprobs=student_target,
+        teacher_target_logprobs=teacher_target,
+        target_in_support=torch.tensor([True]),
+    )
+
+    expected_tail = (1.0 - (teacher_target - student_target).detach()) * student_target
+    torch.testing.assert_close(outside_loss - inside_loss, expected_tail)
+
+
+def test_student_topk_tail_gradient_is_unbiased():
+    """Enumerating sampled tail tokens recovers the exact reverse-KL gradient."""
+    student_logits = torch.tensor(
+        [[0.4, -0.3, 0.8, -0.7]], dtype=torch.float64, requires_grad=True
+    )
+    teacher_logits = torch.tensor([[-0.2, 0.6, 0.1, -0.4]], dtype=torch.float64)
+    student_logprobs = student_logits.log_softmax(dim=-1)
+    teacher_logprobs = teacher_logits.log_softmax(dim=-1)
+    support_indices = torch.tensor([2, 0])
+    tail_indices = torch.tensor([1, 3])
+
+    exact_reverse_kl = (
+        student_logprobs.exp() * (student_logprobs - teacher_logprobs)
+    ).sum()
+    exact_grad = torch.autograd.grad(
+        exact_reverse_kl, student_logits, retain_graph=True
+    )[0]
+
+    expected_estimator = student_logits.new_zeros(())
+    sampling_probs = student_logprobs.exp().detach()
+    for target_index in tail_indices:
+        sampled_loss = topk_reverse_kl_loss(
+            student_support_logprobs=student_logprobs[:, support_indices],
+            teacher_support_logprobs=teacher_logprobs[:, support_indices],
+            student_target_logprobs=student_logprobs[:, target_index],
+            teacher_target_logprobs=teacher_logprobs[:, target_index],
+            target_in_support=torch.tensor([False]),
+        )
+        expected_estimator = (
+            expected_estimator + sampling_probs[:, target_index] * sampled_loss.sum()
+        )
+
+    # Samples inside the support contribute the exact head term as well. Their
+    # probabilities complete the expectation over the student's vocabulary.
+    support_loss = (
+        student_logprobs[:, support_indices].exp()
+        * (student_logprobs[:, support_indices] - teacher_logprobs[:, support_indices])
+    ).sum()
+    expected_estimator = (
+        expected_estimator + sampling_probs[:, support_indices].sum() * support_loss
+    )
+    estimator_grad = torch.autograd.grad(expected_estimator, student_logits)[0]
+
+    torch.testing.assert_close(estimator_grad, exact_grad)
+
 
 # ---------------------------------------------------------------------------
 # Mock teacher worker group for _compute_teacher_logprobs tests
@@ -36,9 +159,10 @@ class _MockShardingAnnotations:
 class _MockTeacherWorkerGroup:
     """Returns logprobs filled with a constant; validates DP-divisible batch."""
 
-    def __init__(self, fill_value=1.0, dp_size=4):
+    def __init__(self, fill_value=1.0, dp_size=4, include_input_ids=False):
         self._fill_value = fill_value
         self.sharding_annotations = _MockShardingAnnotations(dp_size)
+        self._include_input_ids = include_input_ids
         self.use_sequence_packing = False
         self.sequence_length_pad_multiple = 1
 
@@ -52,6 +176,39 @@ class _MockTeacherWorkerGroup:
         )
         return BatchedDataDict(
             {"reference_logprobs": torch.full((B, S), self._fill_value)}
+        )
+
+    def get_logprobs_on_support(self, data):
+        input_ids = data["input_ids"]
+        topk_indices = data["topk_indices"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        assert input_ids.shape[0] % dp_size == 0
+        support_logprobs = torch.full(
+            topk_indices.shape, self._fill_value, dtype=torch.float32
+        )
+        if self._include_input_ids:
+            support_logprobs = support_logprobs + input_ids.unsqueeze(-1)
+        return BatchedDataDict({"support_logprobs": support_logprobs})
+
+    def get_topk_logprobs(self, data, k):
+        input_ids = data["input_ids"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        assert input_ids.shape[0] % dp_size == 0
+        offsets = torch.arange(k).view(1, 1, k)
+        topk_indices = input_ids.unsqueeze(-1) * 10 + offsets
+        topk_logprobs = torch.full(
+            topk_indices.shape, self._fill_value, dtype=torch.float32
+        )
+        if self._include_input_ids:
+            topk_logprobs = topk_logprobs + input_ids.unsqueeze(-1)
+        return BatchedDataDict(
+            {
+                "reference_logprobs": torch.full(
+                    input_ids.shape, self._fill_value, dtype=torch.float32
+                ),
+                "topk_indices": topk_indices,
+                "topk_logprobs": topk_logprobs,
+            }
         )
 
 
@@ -125,6 +282,10 @@ class _RecordingTeacherWorkerGroup(_MockTeacherWorkerGroup):
     def get_logprobs(self, data):
         self.received = data
         return super().get_logprobs(data)
+
+    def get_topk_logprobs(self, data, k):
+        self.received = data
+        return super().get_topk_logprobs(data, k)
 
 
 def _row_marked_packed_tensor(markers):
@@ -273,6 +434,143 @@ def test_compute_teacher_logprobs_routes_to_correct_teacher():
     assert torch.allclose(result[1], torch.tensor(2.0))
     assert torch.allclose(result[2], torch.tensor(1.0))
     assert torch.allclose(result[3], torch.tensor(2.0))
+
+
+def test_compute_teacher_support_logprobs_routes_and_trims_dp_padding():
+    math_twg = _MockTeacherWorkerGroup(
+        fill_value=-1.0, dp_size=4, include_input_ids=True
+    )
+    code_twg = _MockTeacherWorkerGroup(
+        fill_value=-2.0, dp_size=2, include_input_ids=True
+    )
+    collector = _make_collector(
+        teacher_worker_groups={"math": math_twg, "code": code_twg},
+        alias_to_group_alias={"math": "math", "code": "code"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "math": "/ckpt/math",
+                "code": "/ckpt/code",
+            },
+        },
+        _has_distillation_teachers=True,
+    )
+    input_ids = torch.arange(15).reshape(3, 5)
+    topk_indices = torch.zeros(3, 5, 2, dtype=torch.long)
+    agent_refs = [{"name": "math"}, {"name": "code"}, {"name": "math"}]
+
+    result, _ = collector._compute_teacher_support_logprobs(
+        input_ids,
+        topk_indices,
+        agent_refs,
+        input_lengths=torch.tensor([5, 4, 3]),
+    )
+
+    assert result.shape == (3, 5, 2)
+    torch.testing.assert_close(
+        result[0], input_ids[0].unsqueeze(-1).expand(-1, 2) - 1.0
+    )
+    torch.testing.assert_close(
+        result[1], input_ids[1].unsqueeze(-1).expand(-1, 2) - 2.0
+    )
+    torch.testing.assert_close(
+        result[2], input_ids[2].unsqueeze(-1).expand(-1, 2) - 1.0
+    )
+
+
+def test_compute_teacher_topk_logprobs_routes_and_trims_dp_padding():
+    math_twg = _MockTeacherWorkerGroup(
+        fill_value=-1.0, dp_size=4, include_input_ids=True
+    )
+    code_twg = _MockTeacherWorkerGroup(
+        fill_value=-2.0, dp_size=2, include_input_ids=True
+    )
+    collector = _make_collector(
+        teacher_worker_groups={"math": math_twg, "code": code_twg},
+        alias_to_group_alias={"math": "math", "code": "code"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "math": "/ckpt/math",
+                "code": "/ckpt/code",
+            },
+        },
+        _has_distillation_teachers=True,
+    )
+    input_ids = torch.arange(15).reshape(3, 5)
+    agent_refs = [{"name": "math"}, {"name": "code"}, {"name": "math"}]
+
+    target_logprobs, indices, logprobs, _ = collector._compute_teacher_topk_logprobs(
+        input_ids,
+        topk=2,
+        agent_refs=agent_refs,
+        input_lengths=torch.tensor([5, 4, 3]),
+    )
+
+    expected_indices = input_ids.unsqueeze(-1) * 10 + torch.arange(2).view(1, 1, 2)
+    torch.testing.assert_close(indices, expected_indices)
+    torch.testing.assert_close(
+        target_logprobs,
+        torch.tensor([[-1.0] * 5, [-2.0] * 5, [-1.0] * 5]),
+    )
+    torch.testing.assert_close(
+        logprobs[0], input_ids[0].unsqueeze(-1).expand(-1, 2) - 1.0
+    )
+    torch.testing.assert_close(
+        logprobs[1], input_ids[1].unsqueeze(-1).expand(-1, 2) - 2.0
+    )
+    torch.testing.assert_close(
+        logprobs[2], input_ids[2].unsqueeze(-1).expand(-1, 2) - 1.0
+    )
+
+
+def test_compute_teacher_topk_logprobs_routes_multimodal_rows_with_dp_padding():
+    """Teacher top-k keeps media aligned through routing and DP padding."""
+    vision_twg = _RecordingTeacherWorkerGroup(fill_value=-1.0, dp_size=4)
+    text_twg = _RecordingTeacherWorkerGroup(fill_value=-2.0, dp_size=2)
+    collector = _make_collector(
+        teacher_worker_groups={"vision": vision_twg, "text": text_twg},
+        alias_to_group_alias={"vision_agent": "vision", "text_agent": "text"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "vision_agent": "/ckpt/vision",
+                "text_agent": "/ckpt/text",
+            },
+        },
+        _has_distillation_teachers=True,
+    )
+
+    collector._compute_teacher_topk_logprobs(
+        torch.arange(15).reshape(3, 5),
+        topk=2,
+        agent_refs=[
+            {"name": "vision_agent"},
+            {"name": "text_agent"},
+            {"name": "vision_agent"},
+        ],
+        input_lengths=torch.tensor([5, 4, 3]),
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([0, None, 2]),
+            "imgs_sizes": _row_marked_packed_tensor([10, None, 12]),
+        },
+    )
+
+    assert vision_twg.received is not None
+    assert text_twg.received is not None
+    assert vision_twg.received["input_ids"].shape[0] == 4
+    assert _received_row_markers(vision_twg.received["pixel_values"]) == [
+        0.0,
+        2.0,
+        2.0,
+        2.0,
+    ]
+    assert _received_row_markers(vision_twg.received["imgs_sizes"]) == [
+        10.0,
+        12.0,
+        12.0,
+        12.0,
+    ]
+    assert text_twg.received["input_ids"].shape[0] == 2
+    assert "pixel_values" not in text_twg.received
+    assert "imgs_sizes" not in text_twg.received
 
 
 def test_compute_teacher_logprobs_deduplication():
@@ -1028,7 +1326,7 @@ def _teacher_setup_config():
 
 
 def test_reserve_teacher_clusters_claims_each_topology_segment(monkeypatch):
-    """Every teacher placement group is claimed before planning the next one."""
+    """An explicit teacher segment is claimed before planning the next one."""
     from nemo_rl.algorithms import opd
 
     events = []
@@ -1058,9 +1356,12 @@ def test_reserve_teacher_clusters_claims_each_topology_segment(monkeypatch):
     monkeypatch.setattr(opd, "prepare_segment_topology", fake_prepare_segment_topology)
 
     topology = {f"node_{index}": ("nvlink_domain_0", index) for index in range(4)}
+    config = _teacher_setup_config()
+    config["on_policy_distillation"]["non_colocated_teachers"]["default_teacher_cfg"][
+        "segment_size"
+    ] = 2
     clusters = opd.reserve_teacher_clusters(
-        _teacher_setup_config(),
-        segment_size=16,
+        config,
         teacher_segment_topology=topology,
     )
 
@@ -1085,7 +1386,7 @@ def test_reserve_teacher_clusters_claims_each_topology_segment(monkeypatch):
 
 
 def test_reserve_teacher_clusters_claims_without_topology_constraints(monkeypatch):
-    """Teachers are claimed before Gym even when segment topology is disabled."""
+    """Available topology does not implicitly constrain teacher placement."""
     from nemo_rl.algorithms import opd
 
     events = []
@@ -1109,7 +1410,10 @@ def test_reserve_teacher_clusters_claims_without_topology_constraints(monkeypatc
     monkeypatch.setattr(opd, "RayVirtualCluster", FakeRayVirtualCluster)
     monkeypatch.setattr(opd, "prepare_segment_topology", fail_if_topology_is_prepared)
 
-    clusters = opd.reserve_teacher_clusters(_teacher_setup_config())
+    topology = {f"node_{index}": ("nvlink_domain_0", index) for index in range(4)}
+    clusters = opd.reserve_teacher_clusters(
+        _teacher_setup_config(), teacher_segment_topology=topology
+    )
 
     assert events == [
         ("create", "teacher_math"),
@@ -1167,6 +1471,43 @@ def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
     assert alias_to_group_alias == {"math": "math", "code": "code"}
 
 
+def test_create_teacher_worker_groups_keeps_shared_checkpoint_aliases_without_dedup(
+    monkeypatch,
+):
+    """Distinct groups sharing a checkpoint retain their own routing aliases."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms import opd
+    from nemo_rl.models.policy import teacher_worker_group
+
+    class FakeTeacherWorkerGroup:
+        def __init__(self, *, teacher_cfg, cluster, policy_config, tokenizer):
+            self.worker_group = SimpleNamespace(workers=[])
+            self.use_sequence_packing = True
+            self.sequence_length_pad_multiple = 1
+
+    monkeypatch.setattr(
+        teacher_worker_group, "TeacherWorkerGroup", FakeTeacherWorkerGroup
+    )
+    monkeypatch.setattr(opd.ray, "get", lambda refs, timeout: [])
+    config = _teacher_setup_config()
+    config["on_policy_distillation"]["teacher_model_by_agent_name"] = {
+        "math": "/checkpoints/shared",
+        "code": "/checkpoints/shared",
+    }
+    config["on_policy_distillation"]["deduplicate_shared_teacher_checkpoints"] = False
+
+    worker_groups, alias_to_group_alias = opd.create_teacher_worker_groups(
+        config,
+        {"make_sequence_length_divisible_by": 8},
+        tokenizer=object(),
+        teacher_clusters={"math": object(), "code": object()},
+    )
+
+    assert list(worker_groups) == ["math", "code"]
+    assert alias_to_group_alias == {"math": "math", "code": "code"}
+
+
 # ---------------------------------------------------------------------------
 # Teacher-logprob seq-length padding + the "opd" advantage-estimator branch
 # ---------------------------------------------------------------------------
@@ -1181,9 +1522,50 @@ def test_pad_teacher_logprobs():
     assert (padded[:, :3] == 1).all() and (padded[:, 3:] == 0).all()
     # teacher_S == train_S -> unchanged
     assert _pad_teacher_logprobs(torch.ones(2, 4), 4).shape == (2, 4)
+
+    padded_support = _pad_teacher_logprobs(torch.ones(2, 3, 4), 5)
+    assert padded_support.shape == (2, 5, 4)
+    torch.testing.assert_close(padded_support[:, :3], torch.ones(2, 3, 4))
+    torch.testing.assert_close(padded_support[:, 3:], torch.zeros(2, 2, 4))
     # teacher_S > train_S -> raises
     with pytest.raises(ValueError, match="seq length"):
         _pad_teacher_logprobs(torch.ones(2, 6), 4)
+
+
+def test_attach_teacher_topk_from_replay_validates_pads_and_assigns_support():
+    from nemo_rl.algorithms.grpo import _attach_teacher_topk_from_replay
+
+    indices = torch.tensor([[[5, 6], [7, 8]]], dtype=torch.long)
+    logprobs = torch.tensor([[[-0.1, -0.2], [-0.3, -0.4]]])
+    train_data = BatchedDataDict({"input_ids": torch.ones(1, 4, dtype=torch.long)})
+
+    _attach_teacher_topk_from_replay(
+        train_data=train_data,
+        support_indices=indices,
+        support_logprobs=logprobs,
+    )
+
+    padded_indices = train_data["opd_support_indices"]
+    padded_logprobs = train_data["teacher_support_logprobs"]
+    assert padded_indices.dtype == torch.long
+    torch.testing.assert_close(padded_indices[:, :2], indices)
+    torch.testing.assert_close(padded_indices[:, 2:], torch.zeros(1, 2, 2).long())
+    torch.testing.assert_close(padded_logprobs[:, :2], logprobs)
+    torch.testing.assert_close(padded_logprobs[:, 2:], torch.zeros(1, 2, 2))
+
+    with pytest.raises(ValueError, match="collection-time teacher support"):
+        _attach_teacher_topk_from_replay(
+            train_data=train_data,
+            support_indices=None,
+            support_logprobs=logprobs,
+        )
+
+    with pytest.raises(ValueError, match="matching shapes"):
+        _attach_teacher_topk_from_replay(
+            train_data=train_data,
+            support_indices=indices,
+            support_logprobs=logprobs[..., :1],
+        )
 
 
 def test_create_advantage_estimator_opd_branch():

@@ -216,6 +216,9 @@ class SequencePackingConfig(TypedDict):
     # Preserve the packer's order (or omit for backward compatibility), or
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
+    # Compute supported losses once over the fused packed batch. Disabled in
+    # the exemplar; packed teacher-top-k OPD requires this to be true.
+    fuse_loss: NotRequired[bool]
 
 
 class RewardModelConfig(TypedDict):
