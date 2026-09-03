@@ -38,6 +38,28 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
+def validate_release_grads_before_refit(
+    *,
+    enabled: bool,
+    megatron_enabled: bool,
+    generation_backend: str,
+    colocated: bool,
+    refit_transport: Optional[str],
+) -> None:
+    """Validate the topology supported by trainer memory release."""
+    if not enabled:
+        return
+    if not megatron_enabled:
+        raise ValueError(
+            "release_grads_before_refit requires the Megatron policy backend."
+        )
+    if colocated or generation_backend != VLLM_BACKEND or refit_transport is not None:
+        raise ValueError(
+            "release_grads_before_refit is supported only by the default "
+            "non-colocated vLLM collective refit transport."
+        )
+
+
 def create_weight_synchronizer(
     policy: Any,
     generation: Any,
@@ -83,6 +105,17 @@ def create_weight_synchronizer(
             f"Unknown generation backend {generation_backend!r}. "
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
+
+    release_grads_before_refit = policy.cfg.get("release_grads_before_refit") is True
+    validate_release_grads_before_refit(
+        enabled=release_grads_before_refit,
+        megatron_enabled=bool(
+            (policy.cfg.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=generation_backend,
+        colocated=colocated,
+        refit_transport=generation.cfg.get("refit_transport"),
+    )
 
     checkpoint_engine_config = checkpoint_engine_refit_config(generation.cfg)
     if checkpoint_engine_config is not None:
@@ -186,6 +219,7 @@ def create_weight_synchronizer(
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
             refit_timeout_s=refit_timeout_s,
+            release_grads_before_refit=release_grads_before_refit,
         )
 
     from nemo_rl.weight_sync.ipc_weight_synchronizer import (
