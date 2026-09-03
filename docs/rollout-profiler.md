@@ -1,9 +1,10 @@
 # Profile vLLM rollouts with a plugin
 
-NeMo RL can drive an optional profiler plugin around complete vLLM rollout
-attempts. One profiled attempt includes every generation turn and
-`finish_generation()`. Reward processing, policy scoring, validation rollouts,
-and policy training are outside this lifecycle.
+NeMo RL can drive an optional profiler plugin around complete synchronous vLLM
+rollout attempts or continuous async-GRPO rollout batches. One synchronous
+attempt includes every generation turn and `finish_generation()`. Reward
+processing, policy scoring, validation rollouts, and policy training are outside
+this lifecycle.
 
 The integration supports `tensor_parallel_size>=1`,
 `pipeline_parallel_size=1`, and either `expert_parallel_size=1` or
@@ -65,6 +66,19 @@ The legacy and TransferQueue synchronous GRPO trainers invoke
 attempt. The `step_id` has the form `stepN/attemptM`. Failures invoke
 `abort_rollout()` without masking the original rollout error, and orderly worker
 shutdown invokes `close()`.
+
+For continuous async GRPO, the trajectory collector gives one batch at a time
+nonblocking ownership of the process-wide profiler lifecycle. Overlapping
+non-owner batches continue normally and their GPU work can appear in the
+owner's time window. In-flight refit, KV-cache reset, and NCCL work can also
+appear because profiling does not serialize the async-GRPO pipeline. The
+owner's CPU transfer, teacher inference, and replay-buffer enqueue begin only
+after its profiler window finishes or aborts. The `step_id` has the form
+`generationN/targetM/attemptK`. Shutdown stops new batch starts and boundedly
+waits for the owner stream to finish or abort before generation workers are
+closed. A drain timeout fails the run; any artifact from that lifecycle is
+untrusted and may be partial. Continuous async-PPO rollout profiling is rejected
+because its teardown does not yet provide this drain contract.
 
 ## Install the plugin
 

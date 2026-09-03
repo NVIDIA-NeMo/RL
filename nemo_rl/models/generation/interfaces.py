@@ -476,6 +476,23 @@ class GenerationInterface(ABC):
         """Shut down generation resources; repeated calls must be safe."""
         pass
 
+    @property
+    def rollout_profiler_enabled(self) -> bool:
+        """Whether this backend has an active rollout-profiler lifecycle."""
+        return False
+
+    def begin_rollout_profile(self, *, step_id: int | str) -> None:
+        """Open one rollout-profiler window when supported by the backend."""
+        raise NotImplementedError
+
+    def finish_rollout_profile(self) -> None:
+        """Finish the open rollout-profiler window."""
+        raise NotImplementedError
+
+    def abort_rollout_profile(self, *, reason: str) -> None:
+        """Abort the open rollout-profiler window."""
+        raise NotImplementedError
+
     def pause_generation(self, mode: str) -> None:
         """Pause in-flight generation on the backend."""
         raise NotImplementedError
