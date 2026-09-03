@@ -616,8 +616,12 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
 
 
 @dataclass(frozen=True)
-class ResolvedRolloutRecovery:
-    """Policy coordinates stamped on one newly reserved ledger group."""
+class RecoveryGranularityResolution:
+    """Recovery granularity selected for a prompt-group reservation.
+
+    ``agent_name`` is copied from the prompt when present. ``granularity`` is
+    selected from an agent override, task override, or the global default.
+    """
 
     agent_name: Optional[str]
     granularity: RecoveryGranularity
@@ -649,7 +653,9 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         default_factory=dict
     )
 
-    def resolve_for_prompt(self, prompt: Mapping[str, Any]) -> ResolvedRolloutRecovery:
+    def resolve_for_prompt(
+        self, prompt: Mapping[str, Any]
+    ) -> RecoveryGranularityResolution:
         """Resolve one new group using agent, then task, then the global default."""
         extra_env_info = prompt.get("extra_env_info")
         agent_name: Optional[str] = None
@@ -665,7 +671,7 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         if agent_name is not None:
             override = self.agent_granularity_overrides.get(agent_name)
             if override is not None:
-                return ResolvedRolloutRecovery(agent_name, override)
+                return RecoveryGranularityResolution(agent_name, override)
 
         task_name = prompt.get("task_name")
         if task_name is not None and not isinstance(task_name, str):
@@ -673,8 +679,8 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         if task_name is not None:
             override = self.task_granularity_overrides.get(task_name)
             if override is not None:
-                return ResolvedRolloutRecovery(agent_name, override)
-        return ResolvedRolloutRecovery(agent_name, self.default_granularity)
+                return RecoveryGranularityResolution(agent_name, override)
+        return RecoveryGranularityResolution(agent_name, self.default_granularity)
 
 
 class MasterConfig(BaseModel, extra="allow"):
