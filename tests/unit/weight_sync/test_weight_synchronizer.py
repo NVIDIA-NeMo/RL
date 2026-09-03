@@ -864,6 +864,19 @@ class TestMegatronWeightSynchronizer:
 
 
 class TestFactory:
+    def test_missing_policy_config_defaults_refit_memory_release_to_disabled(self):
+        class LegacyPolicy:
+            pass
+
+        sync = create_weight_synchronizer(
+            policy=LegacyPolicy(),
+            generation=_mock_generation(),
+            generation_backend=VLLM_BACKEND,
+            colocated=True,
+        )
+
+        assert isinstance(sync, IPCWeightSynchronizer)
+
     def test_disabled_refit_memory_release_allows_missing_megatron_config(self):
         policy = _mock_policy()
         del policy.cfg["megatron_cfg"]

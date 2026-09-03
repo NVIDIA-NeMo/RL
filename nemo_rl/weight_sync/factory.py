@@ -106,11 +106,12 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
-    release_grads_before_refit = policy.cfg.get("release_grads_before_refit") is True
+    policy_cfg = getattr(policy, "cfg", {})
+    release_grads_before_refit = policy_cfg.get("release_grads_before_refit") is True
     validate_release_grads_before_refit(
         enabled=release_grads_before_refit,
         megatron_enabled=bool(
-            (policy.cfg.get("megatron_cfg") or {}).get("enabled", False)
+            (policy_cfg.get("megatron_cfg") or {}).get("enabled", False)
         ),
         generation_backend=generation_backend,
         colocated=colocated,
