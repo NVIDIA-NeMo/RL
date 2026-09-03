@@ -15,15 +15,16 @@
 """Controller-owned lineage for recoverable token-capture prompt groups.
 
 The ledger deliberately contains control-plane metadata only. Token tensors and
-router-replay payloads remain in TQ. Persistence is added by a later change; the
-versioned ``state_dict`` boundary lives here so that change does not have to
-invent a second lifecycle model.
+router-replay payloads remain in TQ. The versioned ``state_dict`` boundary here is
+what the controller writes into ``rollout_recovery.pt`` at each checkpoint and
+reads back on restore.
 """
 
 from __future__ import annotations
 
 import copy
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
@@ -36,6 +37,50 @@ ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
 _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
+
+_LEDGER_STATE_FIELDS = frozenset({"schema_version", "groups"})
+_SIDECAR_STATE_FIELDS = frozenset(
+    {
+        *_LEDGER_STATE_FIELDS,
+        "batch_shortfall",
+        "sampler_stamps_target_steps",
+    }
+)
+_GROUP_STATE_FIELDS = frozenset(
+    {
+        "group_id",
+        "admission_id",
+        "prompt_id",
+        "prompt_ref",
+        "agent_name",
+        "recovery_granularity",
+        "expected_generations",
+        "target_step",
+        "start_weight_version",
+        "status",
+        "phase",
+        "siblings",
+    }
+)
+_PROMPT_REF_STATE_FIELDS = frozenset({"sample_id", "task_name"})
+_SIBLING_STATE_FIELDS = frozenset({"generation_index", "attempts"})
+_ATTEMPT_STATE_FIELDS = frozenset(
+    {"attempt_uuid", "status", "receipt", "reward", "staging_keys"}
+)
+
+
+def _reject_unknown_fields(
+    mapping: Mapping[Any, Any],
+    *,
+    expected: frozenset[str],
+    context: str,
+) -> None:
+    """Reject fields that are not part of the current versioned schema."""
+    unknown = set(mapping) - expected
+    if unknown:
+        raise ValueError(
+            f"{context} contains unknown fields: {sorted(unknown, key=repr)!r}"
+        )
 
 
 class PromptGroupPhase(StrEnum):
@@ -382,8 +427,7 @@ class RolloutRecoveryLedger:
                 else:
                     self.abandon_unsealed(cut, record.group_id)
 
-    @staticmethod
-    def _abandon_entire_group(record: PromptGroupRecoveryRecord) -> None:
+    def _abandon_entire_group(self, record: PromptGroupRecoveryRecord) -> None:
         """Discard every current sibling when an incomplete group is atomic.
 
         Sealed staging rows become unreferenced here. The controller's restore
@@ -750,7 +794,7 @@ class RolloutRecoveryLedger:
         return isinstance(group_id, str) and group_id in self._groups
 
     def state_dict(self) -> dict[str, Any]:
-        """Return the versioned metadata envelope used by later persistence."""
+        """Return the versioned metadata persisted in ``rollout_recovery.pt``."""
         self.assert_checkpoint_safe()
         groups = []
         for record in self._groups.values():
@@ -812,6 +856,11 @@ class RolloutRecoveryLedger:
                 "rollout recovery state must be a dictionary, got "
                 f"{type(state).__name__}"
             )
+        _reject_unknown_fields(
+            state,
+            expected=_LEDGER_STATE_FIELDS,
+            context="rollout recovery state",
+        )
         schema_version = state.get("schema_version")
         if (
             isinstance(schema_version, bool)
@@ -870,6 +919,11 @@ class RolloutRecoveryLedger:
     ) -> PromptGroupRecoveryRecord:
         if not isinstance(raw_group, dict):
             raise ValueError("rollout-recovery group must be a mapping")
+        _reject_unknown_fields(
+            raw_group,
+            expected=_GROUP_STATE_FIELDS,
+            context="rollout-recovery group",
+        )
         group_id = raw_group.get("group_id")
         admission_id = raw_group.get("admission_id")
         prompt_id = raw_group.get("prompt_id")
@@ -922,6 +976,11 @@ class RolloutRecoveryLedger:
         for generation_index, sibling_state in enumerate(siblings_state):
             if not isinstance(sibling_state, dict):
                 raise ValueError("rollout-recovery sibling must be a mapping")
+            _reject_unknown_fields(
+                sibling_state,
+                expected=_SIBLING_STATE_FIELDS,
+                context="rollout-recovery sibling",
+            )
             if sibling_state.get("generation_index") != generation_index:
                 raise ValueError("generation indices must be contiguous")
             logical_id = f"{group_id}_g{generation_index}"
@@ -932,6 +991,11 @@ class RolloutRecoveryLedger:
             for attempt_state in attempts_state:
                 if not isinstance(attempt_state, dict):
                     raise ValueError("rollout-recovery attempt must be a mapping")
+                _reject_unknown_fields(
+                    attempt_state,
+                    expected=_ATTEMPT_STATE_FIELDS,
+                    context="rollout-recovery attempt",
+                )
                 raw_attempt_uuid = attempt_state.get("attempt_uuid")
                 if (
                     not isinstance(raw_attempt_uuid, bytes)
@@ -999,6 +1063,11 @@ class RolloutRecoveryLedger:
         raw_prompt_ref = raw_group.get("prompt_ref")
         if not isinstance(raw_prompt_ref, dict):
             raise ValueError("prompt_ref must be a mapping")
+        _reject_unknown_fields(
+            raw_prompt_ref,
+            expected=_PROMPT_REF_STATE_FIELDS,
+            context="rollout-recovery prompt_ref",
+        )
         sample_id = raw_prompt_ref.get("sample_id")
         task_name = raw_prompt_ref.get("task_name")
         if not isinstance(sample_id, str) or not sample_id:
@@ -1141,6 +1210,11 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
             "rollout recovery sidecar must contain a dictionary, got "
             f"{type(state).__name__}"
         )
+    _reject_unknown_fields(
+        state,
+        expected=_SIDECAR_STATE_FIELDS,
+        context="rollout recovery sidecar",
+    )
     schema_version = state.get("schema_version")
     if (
         isinstance(schema_version, bool)

@@ -224,8 +224,18 @@ token_capture:
 # over task overrides.
 rollout_recovery:
   default_granularity: sibling
+  # Per-Gym-agent override, keyed on extra_env_info.agent_ref.name. Wins over
+  # the task map below.
+  #   agent_granularity_overrides: {genrm_agent: prompt_group}
   agent_granularity_overrides: {}
+  # Per-dataset-task override, keyed on the prompt's task_name.
+  #   task_granularity_overrides: {math: prompt_group}
   task_granularity_overrides: {}
+
+# Leaving either map above non-empty requires token capture, which is a separate
+# top-level section (not in this file, and off by default):
+# token_capture:
+#   enabled: true
 
 cluster:
   # Master ports inherit the shared 1400-1999 band from ppo_math_1B.yaml.

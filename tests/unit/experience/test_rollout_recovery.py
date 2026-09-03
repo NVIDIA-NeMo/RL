@@ -127,6 +127,42 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
     assert restored.get_group("g7").phase is PromptGroupPhase.ADMITTED
 
 
+@pytest.mark.parametrize(
+    ("path", "context"),
+    [
+        ((), "rollout recovery state"),
+        (("groups", 0), "rollout-recovery group"),
+        (("groups", 0, "prompt_ref"), "rollout-recovery prompt_ref"),
+        (("groups", 0, "siblings", 0), "rollout-recovery sibling"),
+        (("groups", 0, "siblings", 0, "attempts", 0), "rollout-recovery attempt"),
+    ],
+)
+def test_ledger_restore_rejects_unknown_fields(
+    path: tuple[object, ...], context: str
+) -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+    target: Any = state
+    for component in path:
+        target = target[component]
+    assert isinstance(target, dict)
+    target["unexpected"] = True
+
+    with pytest.raises(ValueError, match=rf"{context} contains unknown fields"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
 def test_checkpoint_state_round_trip_preserves_controller_and_ledger_state() -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
@@ -153,6 +189,20 @@ def test_checkpoint_state_round_trip_preserves_controller_and_ledger_state() -> 
     assert [group.group_id for group in restored.groups()] == ["g7"]
     assert parsed.batch_shortfall == {7: 1}
     assert parsed.sampler_stamps_target_steps is True
+
+
+def test_checkpoint_parser_rejects_unknown_sidecar_fields() -> None:
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        sampler_stamps_target_steps=True,
+    )
+    state["unexpected"] = True
+
+    with pytest.raises(
+        ValueError, match="rollout recovery sidecar contains unknown fields"
+    ):
+        parse_rollout_recovery_state(state)
 
 
 def test_checkpoint_parser_defaults_fields_absent_from_older_state() -> None:
@@ -627,6 +677,8 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
     _mutate(lambda cut: restored.prepare_for_restart(cut))
     recovered = restored.get_group("g7")
 
+    assert recovered.agent_name == "genrm_agent"
+    assert recovered.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
     assert [sibling.current_attempt.status for sibling in recovered.siblings] == [
         RolloutAttemptStatus.ABANDONED,
         RolloutAttemptStatus.ABANDONED,
@@ -669,7 +721,12 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
         )
     _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", results))
 
-    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    state = ledger.state_dict()
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    _bind(restored, "g7", _prompt())
+
+    assert restored.state_dict() == state
+
     _mutate(lambda cut: restored.prepare_for_restart(cut))
 
     assert restored.get_group("g7").sealed_generation_indices == [0, 1]
