@@ -1068,6 +1068,43 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
             assert DummyVllmGeneration.collective_calls
 
 
+def test_distillation_setup_rejects_nemo_gym_truncation_with_router_replay():
+    master_config = MasterConfig.model_construct(
+        policy={
+            "model_name": "test-policy",
+            "router_replay": {"enabled": True},
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "expose_http_server": True,
+                },
+            },
+        },
+        teacher={},
+        loss_fn={},
+        env={
+            "should_use_nemo_gym": True,
+            "nemo_gym": {"truncate_noncontiguous_episodes": True},
+        },
+        data={},
+        distillation=DistillationConfig(),
+        logger={},
+        cluster={},
+        checkpointing={},
+    )
+
+    with (
+        patch.object(distil_mod, "VllmGeneration") as mock_vllm,
+        patch.object(distil_mod, "NemoGym") as mock_nemo_gym,
+        pytest.raises(ValueError, match="not compatible with router replay"),
+    ):
+        distil_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+    mock_vllm.assert_not_called()
+    mock_nemo_gym.options.assert_not_called()
+
+
 @pytest.mark.parametrize(
     (
         "configured_uv_cache_dir",
@@ -1103,6 +1140,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         "num_gpu_nodes": 1,
         "invalid_tool_call_patterns": ["bad_call"],
         "thinking_tags": ["<think>"],
+        "truncate_noncontiguous_episodes": True,
         "config_paths": ["gym.yaml"],
     }
     if configured_uv_cache_dir is not None:
@@ -1273,6 +1311,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
     assert nemo_gym_cfg["base_urls"] == ["http://reserved-vllm"]
     assert nemo_gym_cfg["invalid_tool_call_patterns"] == ["bad_call"]
     assert nemo_gym_cfg["thinking_tags"] == ["<think>"]
+    assert nemo_gym_cfg["truncate_noncontiguous_episodes"] is True
     assert nemo_gym_cfg["initial_global_config_dict"] == {
         "num_gpu_nodes": 1,
         "config_paths": ["gym.yaml"],

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel, ConfigDict
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
@@ -71,6 +72,39 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+class NemoGymRuntimeOptions(BaseModel):
+    """NeMo-RL-owned options nested under ``env.nemo_gym``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    invalid_tool_call_patterns: list[str] | None = None
+    thinking_tags: list[str] | None = None
+    truncate_noncontiguous_episodes: bool = False
+
+
+def split_nemo_gym_runtime_options(
+    config: dict[str, Any],
+) -> tuple[NemoGymRuntimeOptions, dict[str, Any]]:
+    """Split NeMo-RL runtime options from the config forwarded to NeMo Gym."""
+    options = NemoGymRuntimeOptions.model_validate(config)
+    gym_global_config = dict(config)
+    for key in NemoGymRuntimeOptions.model_fields:
+        gym_global_config.pop(key, None)
+    return options, gym_global_config
+
+
+def validate_nemo_gym_runtime_options(
+    options: NemoGymRuntimeOptions, *, enable_router_replay: bool
+) -> None:
+    """Reject incompatible NeMo-RL-owned Gym options."""
+    if options.truncate_noncontiguous_episodes and enable_router_replay:
+        raise ValueError(
+            "truncate_noncontiguous_episodes is not compatible with router replay: "
+            "the next contiguous prompt is required to repair the retained prefix's "
+            "final route."
+        )
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -218,6 +252,9 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
+    # Opt-in recovery for token-prefix discontinuities in multi-turn rollouts.
+    # The default is supplied by NemoGymRuntimeOptions.
+    truncate_noncontiguous_episodes: bool
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -663,10 +700,32 @@ Depending on your data shape, you may want to change these values."""
             if not _is_trainable_output_item(output_item_dict):
                 continue
 
-            assert (
+            is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            )
+            if not is_contiguous and self.cfg["truncate_noncontiguous_episodes"]:
+                retained_prefix_has_routes = any(
+                    message.get("routed_experts") is not None
+                    for message in nemo_rl_message_log
+                )
+                if (
+                    self.cfg.get("require_routed_experts")
+                    or retained_prefix_has_routes
+                    or output_item_dict.get("routed_experts") is not None
+                ):
+                    raise ValueError(
+                        "Cannot truncate a non-contiguous NeMo Gym episode when "
+                        "routed-expert data is enabled: the next contiguous prompt "
+                        "is required to repair the retained prefix's final route."
+                    )
+                print(
+                    "[nemo_gym] WARNING: non-contiguous turn; truncating episode "
+                    f"at {len(nemo_rl_message_log)} messages "
+                    f"(seen={len(seen_token_ids)} tokens); dropping corrupted tail."
+                )
+                break
+            assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
@@ -980,7 +1039,7 @@ def spinup_nemo_gym_actor(
     Args:
         env_configs: The master_config.env mapping; env_configs["nemo_gym"] supplies
             the Gym global config plus NeMo-RL detection knobs (invalid_tool_call_patterns,
-            thinking_tags, num_gpu_nodes).
+            thinking_tags, truncate_noncontiguous_episodes, num_gpu_nodes).
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
         tokenizer: Installed on the actor once, here, rather than passed per
@@ -995,12 +1054,15 @@ def spinup_nemo_gym_actor(
     Returns:
         The spun-up NemoGym Ray actor handle (_spinup already awaited).
     """
-    nemo_gym_dict = dict(env_configs["nemo_gym"])
+    runtime_options, nemo_gym_dict = split_nemo_gym_runtime_options(
+        dict(env_configs["nemo_gym"])
+    )
+    validate_nemo_gym_runtime_options(
+        runtime_options, enable_router_replay=enable_router_replay
+    )
 
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
-    invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
-    thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
     # top-level fields, so populate them here instead of leaving the actor to
@@ -1023,12 +1085,15 @@ def spinup_nemo_gym_actor(
     nemo_gym_cfg = NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
-        invalid_tool_call_patterns=invalid_tool_call_patterns,
-        thinking_tags=thinking_tags,
+        invalid_tool_call_patterns=runtime_options.invalid_tool_call_patterns,
+        thinking_tags=runtime_options.thinking_tags,
         tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        truncate_noncontiguous_episodes=(
+            runtime_options.truncate_noncontiguous_episodes
+        ),
         initial_global_config_dict=nemo_gym_dict,
         **multimodal_flags,
     )

@@ -34,6 +34,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGymConfig,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    split_nemo_gym_runtime_options,
 )
 from nemo_rl.utils.config import load_config
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
@@ -68,7 +69,9 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
             config = load_config(config_path)
             config = OmegaConf.to_container(config, resolve=True)
 
-            nemo_gym_dict = dict(config["env"]["nemo_gym"])
+            runtime_options, nemo_gym_dict = split_nemo_gym_runtime_options(
+                dict(config["env"]["nemo_gym"])
+            )
             nemo_gym_dict["dry_run"] = True
             uv_cache_dir = get_nemo_gym_uv_cache_dir()
             if uv_cache_dir is not None:
@@ -85,7 +88,11 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
                 ray_num_gpus_per_node=0,
                 ray_namespace=None,
                 initial_global_config_dict=nemo_gym_dict,
-                invalid_tool_call_patterns=None,
+                invalid_tool_call_patterns=(runtime_options.invalid_tool_call_patterns),
+                thinking_tags=runtime_options.thinking_tags,
+                truncate_noncontiguous_episodes=(
+                    runtime_options.truncate_noncontiguous_episodes
+                ),
             )
 
             nemo_gym_opts = {
