@@ -374,21 +374,39 @@ def process_nemotron_video_frames(
 # and force the training-side processor to reproduce them exactly.
 
 
+def image_placeholder_token_ids_from_tokenizer(
+    tokenizer: Any,
+    *,
+    image_token: str = "<image>",
+    image_start_token: str = "<img>",
+    image_end_token: str = "</img>",
+) -> "tuple[int, int, int] | None":
+    """(image_token_id, image_start_id, image_end_id), or None if unavailable."""
+    if tokenizer is not None and not hasattr(tokenizer, "convert_tokens_to_ids"):
+        # Callers sometimes hold a processor rather than a bare tokenizer.
+        tokenizer = getattr(tokenizer, "tokenizer", None)
+    if tokenizer is None or not hasattr(tokenizer, "convert_tokens_to_ids"):
+        return None
+    ids = tokenizer.convert_tokens_to_ids(
+        [image_token, image_start_token, image_end_token]
+    )
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if any(i is None or (unk_id is not None and i == unk_id) for i in ids):
+        return None
+    return int(ids[0]), int(ids[1]), int(ids[2])
+
+
 def get_image_placeholder_token_ids(processor: Any) -> "tuple[int, int, int] | None":
     """(image_token_id, image_start_id, image_end_id), or None if unavailable."""
     tokenizer = getattr(processor, "tokenizer", None)
     if tokenizer is None or not uses_image_placeholder(processor):
         return None
-    tokens = [
-        getattr(processor, "image_token", "<image>"),
-        getattr(processor, "image_start_token", "<img>"),
-        getattr(processor, "image_end_token", "</img>"),
-    ]
-    ids = tokenizer.convert_tokens_to_ids(tokens)
-    unk_id = getattr(tokenizer, "unk_token_id", None)
-    if any(i is None or (unk_id is not None and i == unk_id) for i in ids):
-        return None
-    return int(ids[0]), int(ids[1]), int(ids[2])
+    return image_placeholder_token_ids_from_tokenizer(
+        tokenizer,
+        image_token=getattr(processor, "image_token", "<image>"),
+        image_start_token=getattr(processor, "image_start_token", "<img>"),
+        image_end_token=getattr(processor, "image_end_token", "</img>"),
+    )
 
 
 def supports_image_placeholder_run_parity(processor: Any) -> bool:
@@ -411,6 +429,14 @@ def count_image_placeholder_runs(
             f"{type(processor).__name__} does not expose image placeholder "
             "tokens; cannot count image placeholder runs."
         )
+    return placeholder_runs_from_token_ids(token_ids, placeholder_ids)
+
+
+def placeholder_runs_from_token_ids(
+    token_ids: "Sequence[int] | torch.Tensor",
+    placeholder_ids: "tuple[int, int, int]",
+) -> list[int]:
+    """Per-media placeholder run lengths from token ids, in order."""
     image_id, start_id, end_id = placeholder_ids
     if isinstance(token_ids, torch.Tensor):
         token_ids = token_ids.tolist()
@@ -436,6 +462,91 @@ def count_image_placeholder_runs(
     if current is not None:
         raise ValueError("Unterminated <img> region in rollout tokens.")
     return runs
+
+
+def _is_static_video_turn(message: dict[str, Any]) -> bool:
+    """Whether a source user turn carries a statically-preprocessed video.
+
+    Still-image turns also carry ``num_frames`` (one ``1`` per image, added by
+    the image attach path); a video turn is the one whose frame count exceeds 1.
+    """
+    num_frames = message.get("num_frames")
+    tensors = getattr(num_frames, "tensors", None)
+    if tensors is None:
+        return False
+    return any(
+        tensor is not None and bool((tensor > 1).any()) for tensor in tensors
+    )
+
+
+def verify_static_video_media_alignment(
+    source_message: dict[str, Any],
+    target_message: dict[str, Any],
+    tokenizer: Any,
+) -> None:
+    """Verify rollout tokens match the static video tensors before attach.
+
+    The static video datum expands its video to one ``<img><image>*k</img>``
+    run per tubelet, and its tensors project exactly ``sum(k)`` features. The
+    rollout engine performs its own expansion; if the two disagree, training
+    would crash deep in Megatron with an unattributable "media alignment
+    failed". Compare the run structures here and raise a diagnostic that names
+    the mismatch (tubelet count vs per-tubelet token count) instead.
+
+    A no-op for non-video turns or when placeholder ids cannot be resolved.
+    """
+    if not _is_static_video_turn(source_message):
+        return
+    placeholder_ids = image_placeholder_token_ids_from_tokenizer(tokenizer)
+    if placeholder_ids is None:
+        return
+    source_token_ids = source_message.get("token_ids")
+    target_token_ids = target_message.get("token_ids")
+    if source_token_ids is None or target_token_ids is None:
+        return
+    source_runs = placeholder_runs_from_token_ids(source_token_ids, placeholder_ids)
+    target_runs = placeholder_runs_from_token_ids(target_token_ids, placeholder_ids)
+    if source_runs == target_runs:
+        return
+    first_mismatch = next(
+        (
+            i
+            for i, (s, t) in enumerate(zip(source_runs, target_runs))
+            if s != t
+        ),
+        min(len(source_runs), len(target_runs)),
+    )
+    num_frames = source_message.get("num_frames")
+    frame_counts = [
+        tensor.tolist()
+        for tensor in getattr(num_frames, "tensors", [])
+        if tensor is not None
+    ]
+    imgs_sizes = source_message.get("imgs_sizes")
+    frame_sizes = [
+        tensor[0].tolist() if len(tensor) else None
+        for tensor in getattr(imgs_sizes, "tensors", [])
+        if tensor is not None
+    ]
+    raise ValueError(
+        "Rollout/video media alignment failed: the rollout's placeholder "
+        "expansion disagrees with the statically-preprocessed video tensors "
+        "about to be attached for training. "
+        f"static: {len(source_runs)} tubelet runs, "
+        f"{sum(source_runs)} placeholder tokens total, "
+        f"run lengths {sorted(set(source_runs))}; "
+        f"rollout: {len(target_runs)} tubelet runs, "
+        f"{sum(target_runs)} placeholder tokens total, "
+        f"run lengths {sorted(set(target_runs))}; "
+        f"first mismatching run index {first_mismatch} "
+        f"(static {source_runs[first_mismatch] if first_mismatch < len(source_runs) else 'absent'} "
+        f"vs rollout {target_runs[first_mismatch] if first_mismatch < len(target_runs) else 'absent'}); "
+        f"num_frames={frame_counts}, frame size (h, w)={frame_sizes}. "
+        "Equal run counts with different lengths mean vLLM resolved a "
+        "different per-frame token grid (target_num_patches / aspect-ratio "
+        "settings); different run counts mean a frame/tubelet sampling "
+        "mismatch. Refusing to train on misaligned media."
+    )
 
 
 def predicted_static_image_num_tokens(
