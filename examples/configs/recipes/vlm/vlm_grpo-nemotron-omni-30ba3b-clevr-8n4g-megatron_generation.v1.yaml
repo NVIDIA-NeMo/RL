@@ -37,6 +37,7 @@ policy:
       store_param_remainders: true
   generation:
     backend: megatron
+    refit_transport: mcore
     max_new_tokens: 2048
     bad_words: null
     mcore_generation_config:

@@ -34,6 +34,7 @@ policy:
     activation_checkpointing: true
   generation:
     backend: megatron
+    refit_transport: mcore
     bad_words: null
     mcore_generation_config:
       expose_http_server: true

@@ -17,6 +17,7 @@ policy:
     context_parallel_size: 2
   generation:
     backend: megatron
+    refit_transport: mcore
     mcore_generation_config:
       expert_model_parallel_size: 4
     colocated:

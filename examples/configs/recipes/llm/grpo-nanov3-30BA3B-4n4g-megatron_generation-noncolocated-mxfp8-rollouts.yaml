@@ -28,6 +28,7 @@ policy:
     enabled: false
   generation:
     backend: megatron
+    refit_transport: mcore
     mcore_generation_config:
       transformer_impl: inference_optimized
       inference_grouped_gemm_backend: "torch"

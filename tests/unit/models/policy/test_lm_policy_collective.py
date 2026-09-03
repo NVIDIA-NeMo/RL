@@ -47,10 +47,91 @@ def test_policy_forwards_nccl_peer_to_workers():
                 "port": 1234,
                 "world_size": 4,
                 "train_world_size": 2,
+                "rank_offset": 0,
                 "nccl_peer": "vllm",
             },
         )
     ]
+
+
+def test_policy_forwards_rank_offset_to_workers():
+    """Megatron M-to-N generation ranks join the group after the training ranks."""
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+
+    policy.init_collective(
+        "127.0.0.1",
+        1234,
+        6,
+        train_world_size=4,
+        rank_offset=4,
+        nccl_peer="nemo",
+    )
+
+    assert calls == [
+        (
+            "init_collective",
+            {
+                "ip": "127.0.0.1",
+                "port": 1234,
+                "world_size": 6,
+                "train_world_size": 4,
+                "rank_offset": 4,
+                "nccl_peer": "nemo",
+            },
+        )
+    ]
+
+
+def test_policy_worker_offsets_its_rank_in_the_collective(monkeypatch):
+    """A non-zero rank_offset shifts the worker's rank within the shared group."""
+    calls = []
+
+    class ProcessGroup:
+        def __init__(self, **kwargs):
+            calls.append(("create", kwargs))
+
+        def init_nccl_communicator(self, **kwargs):
+            calls.append(("init", kwargs))
+
+    monkeypatch.setattr(
+        "nemo_rl.distributed.stateless_process_group.StatelessProcessGroup",
+        ProcessGroup,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.base_policy_worker.torch.cuda.current_device",
+        lambda: 0,
+    )
+
+    worker = AbstractPolicyWorker.__new__(AbstractPolicyWorker)
+    worker.rank = 1
+    worker.init_collective(
+        "127.0.0.1",
+        1234,
+        6,
+        train_world_size=4,
+        rank_offset=4,
+    )
+
+    assert calls[0] == (
+        "create",
+        {
+            "master_address": "127.0.0.1",
+            "port": 1234,
+            "rank": 5,
+            "world_size": 6,
+        },
+    )
 
 
 def test_policy_worker_initializes_requested_nccl_peer(monkeypatch):

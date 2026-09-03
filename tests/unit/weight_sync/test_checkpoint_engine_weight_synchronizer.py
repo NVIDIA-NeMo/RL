@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from nemo_rl.models.generation.constants import (
-    MEGATRON_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
@@ -321,7 +320,6 @@ class TestCheckpointEngineFactory:
             (VLLM_BACKEND, False, CheckpointEngineWeightSynchronizer),
             (VLLM_BACKEND, True, ValueError),
             (SGLANG_BACKEND, False, NotImplementedError),
-            (MEGATRON_BACKEND, False, NotImplementedError),
         ],
     )
     def test_checkpoint_engine_factory_routing(self, backend, colocated, expected):

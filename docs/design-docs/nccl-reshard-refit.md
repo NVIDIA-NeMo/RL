@@ -28,20 +28,63 @@ single `ValueError` listing every violation. The current requirements are:
   path uses IPC and is unaffected by this feature.
 * **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the DTensor
   training backend is not supported yet.).
-* **vLLM generation backend** — `policy.generation.backend=vllm` (SGLang and TRTLLM
-  backend is not supported yet.).
-* Megatron `expert_tensor_parallel_size` (i.e., ETP) must be 1; custom PP layouts
-  (`pipeline_model_parallel_layout`, virtual PP > 1, embedding/loss pipeline-split
-  accounting) are not supported yet.
-* **Precision** must match end to end for BF16 train ↔ BF16 gen and blockwise-FP8
-  train (`fp8_param=true` + blockwise recipe) ↔ FP8 gen
-  (`vllm_cfg.precision=fp8`). BF16 train → MXFP8 gen is also supported with
-  `vllm_cfg.precision=fp8` and `vllm_cfg.is_mx=true`; the generation ranks
-  quantize each received BF16 shard before installing it. Blockwise-FP8 train →
+* **vLLM or Megatron generation backend** — `policy.generation.backend` must be
+  `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
+* Training-side Megatron supports expert tensor parallelism. Custom PP layouts
+  (`pipeline_model_parallel_layout`, virtual PP > 1,
+  embedding/loss pipeline-split accounting) are not supported yet.
+* **Generation-side ETP is pinned to 1.** MCore's `inference_optimized` MoE
+  layers do not implement expert tensor parallelism and raise whenever the
+  *resolved* ETP exceeds 1 — and an omitted ETP resolves to TP, not 1. So
+  `merged_inference_megatron_cfg` pins generation-side
+  `expert_tensor_parallel_size` to 1, which is what lets generation-side TP > 1
+  work; the reshard then handles the train-ETP → gen-ETP=1 gather. An explicitly
+  requested generation-side ETP > 1 is rejected by config key name rather than
+  surfacing as a raw MCore assert at model build.
+* **Precision** for vLLM supports BF16 train ↔ BF16 gen, blockwise-FP8 train
+  (`fp8_param=true` + blockwise recipe) ↔ FP8 gen, and BF16 train → MXFP8 gen
+  (`vllm_cfg.precision=fp8`, `vllm_cfg.is_mx=true`). Blockwise-FP8 train →
   MXFP8 gen is not supported.
+* Megatron generation accepts BF16 or supported Transformer Engine FP8 training
+  parameter storage, including blockwise FP8 and MXFP8 with `fp8_param=true`.
+  Quantized sources are materialized as logical BF16 for transport; the
+  destination either stores BF16 or quantizes each complete local weight into
+  MXFP8. When MXFP8 parameter all-gather reuses the gradient buffer, that
+  aliased allocation stays GPU-resident across refit so
+  persistent DDP/autograd views remain valid; ordinary gradient buffers and
+  optimizer state are still offloaded.
+* **The wire format is always BF16, even for MXFP8 train → MXFP8 gen.** This is
+  forced by the upstream API, not a shortcut, and is worth stating because it
+  means an MXFP8 trainer does *not* get a smaller refit (expect ~2x the
+  theoretical MXFP8 wire size, plus a dequantize on the source and a re-quantize
+  on the destination). Three reasons it cannot currently be otherwise:
+  * TE MXFP8 and MCore MXFP8 are not byte-compatible. MCore itself dequantizes
+    and re-quantizes when converting between them, deliberately, "to avoid any
+    numerical differences between TE and mcore MXFP8 formats"
+    (`megatron/core/inference/quantization/utils.py`).
+  * `MXFP8Tensor`'s only data constructor is `from_bf16`; `copy_` delegates to
+    `quantize_`, which calls `from_bf16`. There is no relayout entry point.
+  * MCore stores *swizzled* scales, padded to multiples of 128 rows and 4
+    columns, so a shard of the swizzled scales is not a shard of the logical
+    scales. An alignment-aware MXFP8 transport would have to unswizzle,
+    re-slice, and re-swizzle — most of the cost of a requantize anyway.
+  The benefit of this path is capability (M-to-N reshard into a Megatron
+  engine), not bandwidth.
 * vLLM expert parallelism is supported with the NeMo RL convention
-  `expert_parallel_size == tensor_parallel_size`. 
-* Generation-side, PP > 1 is not supported. 
+  `expert_parallel_size == tensor_parallel_size`.
+* Megatron generation supports expert parallelism and expert tensor
+  parallelism, including using both together.
+* Megatron generation uses the same top-level selector as other backends:
+  `refit_transport=null` selects NeMo-RL's packed collective,
+  `refit_transport=mcore` selects Megatron Core's native refit, and
+  `refit_transport=nccl_reshard` selects M-to-N. `refit_backend` is consulted
+  only for `refit_transport=mcore`. Colocated Megatron generation requires
+  `refit_transport=mcore`, because its refit is carried by the in-place
+  wake-reshard; the other transports are rejected rather than silently ignored.
+* **Generation-side PP > 1 is not supported by this refit transport yet.**
+  Megatron-Core and vLLM can run generation with PP, and training-side Megatron
+  PP is supported here; the missing piece is generation-stage-aware destination
+  routing in `nccl_reshard`.
 * **No ModelOpt real quantization** — `policy.generation.real_quant=false`. Real-quant
   rollouts refit through vLLM's layerwise-reload weight loaders, which the bulk
   `xferdtensor` writes bypass.
@@ -80,15 +123,28 @@ nccl-reshard-refit implementation:
   `model_update_group` and are loaded on the generation side through the backend's
   regular `load_weights` machinery.
 
-The feature is integrated into the `nemo_rl/weight_sync/` framework:
-`create_weight_synchronizer(..., nccl_reshard_refit=True)` returns a
-`NcclReshardWeightSynchronizer` whose `init_communicator()` performs the one-time setup
-and whose `sync_weights()` runs one refit.
+The feature is integrated into the `nemo_rl/weight_sync/` framework. For vLLM,
+`create_weight_synchronizer(...)` returns an `NcclReshardWeightSynchronizer` directly.
+For Megatron generation, the existing `MegatronWeightSynchronizer` retains ownership of
+the inference-engine lifecycle and delegates only the transfer to an
+`NcclReshardWeightSynchronizer`.
 
 ### Execution Flow: Setup Time
 
 `NcclReshardWeightSynchronizer.init_communicator()` runs three steps once, before
 training starts:
+
+The generation backend declares whether it needs Bridge's physical export or logical
+weights. The synchronizer passes that payload requirement to the source worker; the
+source worker does not inspect or branch on the destination backend's name. Requesting
+logical weights is a Megatron-inference-specific exception: vLLM keeps the universal
+Bridge-export representation, while Megatron inference requests logical weights because
+its destination storage is built by MCore rather than Bridge. Megatron workers are assigned
+an explicit `source` or `destination` refit role and expose the same
+`prepare_refit_info`, `build_hf_to_local_param_map`,
+`prepare_nccl_reshard_refit_info`, and `nccl_reshard_refit` entry points in either
+role. The older generation-specific method names remain compatibility aliases for
+external callers.
 
 1. **`init_collective()`** — creates the `model_update_group`, a NCCL group spanning all
    training and generation ranks. The bulk path does not use it; it carries the misc
@@ -202,17 +258,22 @@ generation side maps those HF names onto whatever its own storage layout is.
   deliberately **shape-driven** so the same code handles generation TP and generation
   EP; the comm bootstrap methods; the `nccl_reshard_refit()` receive loop; the misc
   consumer feeding `load_weights`.
+* **Megatron generation side** (`megatron_worker.py`): mapping the same canonical
+  HF FFN shards to local fused dense/expert views. BF16 destinations receive in
+  place; MXFP8 destinations use short-lived BF16 staging buffers and quantize into
+  their persistent MCore storage. Misc weights continue through Megatron Bridge's
+  packed-broadcast import path.
 
-**To extend to a new backend**, the only piece with genuinely new logic is
-`build_hf_to_local_param_map`. Everything else is boilerplate that follows a fixed
-contract and can be copied from the existing backend almost verbatim.
+**To extend to a new backend**, provide a destination map from canonical HF weights
+to that backend's local storage. vLLM implements this as
+`build_hf_to_local_param_map`; Megatron derives it from Bridge conversion tasks.
+Everything else follows the fixed transport contract.
 
-**The one backend-specific implementation — `build_hf_to_local_param_map`:** resolve
-each bulk HF name to your local storage as a `LocalParamSpec` — `base` for tensors
-sent/received as-is, and `pre`/`post` hooks wherever your layout requires staging
-(fused/merged tensors, layout conversions, grouped-expert stacking). This is the *only*
-place your backend's parameter layout is encoded; all cross-mesh byte movement is
-already handled by the shared metadata and `xferdtensor`.
+**The backend-specific destination map:** resolve each bulk HF name to local storage
+as a `LocalParamSpec` — `base` for tensors sent/received as-is, and `pre`/`post` hooks
+wherever the layout requires staging (fused/merged tensors, layout conversions,
+grouped-expert stacking). This is the only place the backend's parameter layout is
+encoded; shared metadata and `xferdtensor` handle the cross-mesh byte movement.
 
 (A new *training* backend additionally has to produce the HF-named metadata — names,
 global shapes, dtypes, and the parallelism description the agnostic builder consumes —

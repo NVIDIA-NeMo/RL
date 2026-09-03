@@ -18,6 +18,7 @@ import torch
 import zmq
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -39,6 +40,7 @@ class AbstractPolicyWorker:
         world_size: int,
         *,
         train_world_size: int,
+        rank_offset: int = 0,
         nccl_peer: str = "nemo",
     ) -> None:
         """Initialize the collective communication.
@@ -48,6 +50,7 @@ class AbstractPolicyWorker:
             port: Port for the process group
             world_size: Total world size (train_world_size + inference_world_size)
             train_world_size: Number of training workers (used in inference cluster)
+            rank_offset: Offset added to this worker group's local rank.
             nccl_peer: NCCL initialization protocol used by the inference workers
         """
         from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
@@ -59,9 +62,9 @@ class AbstractPolicyWorker:
         # about which port to use. rank 0 is a trainer and is this store's master.
         print(
             f"  refit: collective rendezvous [train] addr={ip}:{port} "
-            f"rank={self.rank} world_size={world_size} "
+            f"rank={self.rank + rank_offset} world_size={world_size} "
             f"train_world_size={train_world_size} peer={nccl_peer} "
-            f"master={self.rank == 0}",
+            f"master={self.rank + rank_offset == 0}",
             flush=True,
         )
 
@@ -72,7 +75,10 @@ class AbstractPolicyWorker:
         old_group, self.model_update_group = (
             self.model_update_group,
             StatelessProcessGroup(
-                master_address=ip, port=port, rank=self.rank, world_size=world_size
+                master_address=ip,
+                port=port,
+                rank=self.rank + rank_offset,
+                world_size=world_size,
             ),
         )
         # Rebuilding is the recovery path for a dead generation rank, so this runs more
@@ -152,6 +158,8 @@ class AbstractPolicyWorker:
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
+        *,
+        refit_payload_mode: Optional[RefitPayloadMode] = None,
     ) -> dict[str, Any]:
         """Prepare parameter metadata for NCCL reshard refit."""
         # This is a placeholder implementation.
