@@ -443,7 +443,7 @@ class MegatronPolicyWorkerImpl(
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
-        reserved_http_server_port: Optional[int] = None,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -484,11 +484,8 @@ class MegatronPolicyWorkerImpl(
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
         # Store the reserved HTTP server port for inference server initialization.
-        # Megatron-LLM's inference server lives on Rank 0 only.
-        # TODO: Multiple inference servers for each MP coordinator.
-        self._reserved_http_server_port = (
-            reserved_http_server_port if self.rank == 0 else None
-        )
+        # Megatron-LLM's inference servers live on MP coordinator ranks, one per DP rank.
+        self._reserved_http_server_port = (reserved_http_server_ports or {}).get(self.rank)
 
         # Step 1: Setup distributed
         setup_distributed(config)

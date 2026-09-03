@@ -3411,10 +3411,10 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
         dp_openai_server_base_urls=[],
     )
     generation_cls = MagicMock(return_value=generation)
-    generation_cls.reserve_http_server_address.return_value = (
-        reserved_url,
-        1234,
-        port_holder,
+    generation_cls.reserve_http_server_addresses.return_value = (
+        [reserved_url],
+        {0: 1234},
+        [port_holder],
     )
 
     synchronizer = MagicMock()
@@ -3499,8 +3499,8 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     result = grpo_mod.setup(master_config, MagicMock(), dataset, None)
 
     assert generation_cls.call_args.kwargs["skip_weight_load"] is True
-    assert generation_cls.call_args.kwargs["reserved_http_server_port"] == 1234
-    assert "reserved_http_server_port" not in policy_cls.call_args.kwargs
+    assert generation_cls.call_args.kwargs["reserved_http_server_ports"] == {0: 1234}
+    assert "reserved_http_server_ports" not in policy_cls.call_args.kwargs
     assert events.index("init") < events.index("sync")
     assert events.index("gym_started") < events.index("sync")
     assert events.index("sync") < events.index("gym_ready")

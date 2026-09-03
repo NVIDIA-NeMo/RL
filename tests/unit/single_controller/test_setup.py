@@ -1891,15 +1891,15 @@ class TestSetup:
             patch.object(sc_setup_mod, "ray") as mock_ray,
             router_patch,
         ):
-            mock_megatron.reserve_http_server_address.return_value = (
-                reserved_url,
-                5555,
-                port_holder,
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                [reserved_url],
+                {0: 5555},
+                [port_holder],
             )
             # Wire the real check through the class mock so the
             # served-vs-reserved legs exercise the genuine logic.
-            mock_megatron.verify_served_address = (
-                MegatronGeneration.verify_served_address
+            mock_megatron.verify_served_addresses = (
+                MegatronGeneration.verify_served_addresses
             )
             mock_megatron.return_value.dp_openai_server_base_urls = [served_url]
             if error_match is None:
@@ -1913,16 +1913,13 @@ class TestSetup:
         # Reservation + holder lifecycle exist on the gym legs only; every gym
         # leg — success or either failure — reaps the holder exactly once.
         if gym:
-            # Always the inference cluster: when colocated, _build_clusters
-            # returns the train cluster twice, so the two are the same object
-            # in production (the mocked distinction here is not).
-            mock_megatron.reserve_http_server_address.assert_called_once_with(
+            mock_megatron.reserve_http_server_addresses.assert_called_once_with(
                 inference_cluster,
                 mc.policy,
             )
             mock_ray.kill.assert_called_once_with(port_holder)
         else:
-            mock_megatron.reserve_http_server_address.assert_not_called()
+            mock_megatron.reserve_http_server_addresses.assert_not_called()
             mock_ray.kill.assert_not_called()
 
         if scenario == "gym_router_failure":
@@ -1939,8 +1936,8 @@ class TestSetup:
         # port adopted by the engine (gym) or absent (native).
         patched_factories["_build_trainer"].assert_called_once()
         _, trainer_kwargs = patched_factories["_build_trainer"].call_args
-        assert trainer_kwargs["reserved_http_server_port"] == (
-            5555 if colocated and gym else None
+        assert trainer_kwargs["reserved_http_server_ports"] == (
+            {0: 5555} if colocated and gym else None
         )
         if colocated:
             patched_factories["_build_generation"].assert_not_called()
@@ -1956,7 +1953,7 @@ class TestSetup:
                 config=mc.policy,
                 tokenizer=tokenizer,
                 cluster=inference_cluster,
-                reserved_http_server_port=5555 if gym else None,
+                reserved_http_server_ports={0: 5555} if gym else None,
                 processor=None,
                 skip_weight_load=True,
             )

@@ -42,11 +42,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
         Literal["exponential", "linear", "hybrid"]
     ]
     cuda_graph_max_tokens: NotRequired[int]
-    # Inference CUDA-graph scope. Options:
-    # - 'none': inference runs in eager mode (no CUDA graphs).
-    # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
-    # - 'block': graphs are owned at the enclosing block (TransformerBlock / HybridBlock).
-    # Only meaningful when cuda_graph_impl='local'.
     inference_cuda_graph_scope: NotRequired[str]
     # Required for EP>1 + inference CUDA graphs, except when using the
     # `inference_optimized` transformer implementation.
@@ -74,10 +69,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
         Literal["load_balanced", "longest_prefix", "first_prefix_block"]
     ]
     prefix_cache_ttl_seconds: NotRequired[float]
-    prefix_caching_cost_policy: NotRequired[
-        Literal["simple_multiplicative", "load_aware"]
-    ]
-    prefix_caching_load_beta: NotRequired[float]
+    prefix_caching_routing_alpha: NotRequired[float]
 
     # Raw media preprocessing corresponding with Megatron's
     # ImageProcessingConfig / VideoProcessingConfig.
