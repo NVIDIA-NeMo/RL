@@ -430,6 +430,7 @@ class MegatronPolicyWorkerImpl(
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
         init_reference_model: bool = True,
+        processor: Optional[Any] = None,
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
@@ -523,6 +524,7 @@ class MegatronPolicyWorkerImpl(
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.processor = processor
 
         # Step 3: Setup model configuration
         runtime_config = validate_and_set_config(
