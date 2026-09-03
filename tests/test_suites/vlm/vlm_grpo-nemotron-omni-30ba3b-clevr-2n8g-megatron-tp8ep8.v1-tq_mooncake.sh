@@ -2,8 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
-# Mirrors vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.sh (delegated
-# base) except NUM_NODES -- see cluster.num_nodes in the matching yaml.
+# Mirrors vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.sh, the
+# delegated base, which common-tq.env derives by stripping -tq_mooncake.
 NUM_NODES=2
 GPUS_PER_NODE=8
 STEPS_PER_RUN=10
