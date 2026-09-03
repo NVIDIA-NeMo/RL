@@ -23,13 +23,19 @@ MICRO_BATCH_INDICES = "micro_batch_indices"
 MICRO_BATCH_LENGTHS = "micro_batch_lengths"
 ELEM_COUNTS_PER_GB = "elem_counts_per_gb"
 GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
-# Per-group rollout metadata retained until the group is selected for training.
+
+# Per-prompt-group rollout metrics: a list of one metrics dict per group.
+# Unlike the packing keys above, this is not copied to each shard: the train
+# pump pops it off the meta before dispatch. sync_rollout_actor.py writes the
+# same string with a flat-dict shape, so this constant is not a drop-in there.
 ROLLOUT_METRICS = "rollout_metrics"
 
 # Skeleton field names from `shard_meta_for_dp`.
 INPUT_IDS = "input_ids"
 INPUT_LENGTHS = "input_lengths"
 SAMPLE_MASK = "sample_mask"
+MASK_SAMPLE = "mask_sample"
+TRUNCATED = "truncated"
 META_IDX = "meta_idx"
 
 # Token-aligned message-violation fields consumed by SingleController advantages.
@@ -57,6 +63,8 @@ DP_TRAIN_FIELDS = (
 # TransferQueue's lazy field-name registration race.
 SC_ROLLOUT_SCHEMA_FIELDS = (
     *DP_TRAIN_FIELDS,
+    MASK_SAMPLE,
+    TRUNCATED,
     "prompt_ids_for_adv",
     "total_reward",
     "values",
@@ -119,8 +127,10 @@ ROUTED_EXPERTS_FIELD = "routed_experts"
 PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
     {
         INPUT_LENGTHS,
+        MASK_SAMPLE,
         "total_reward",
         SAMPLE_MASK,
+        TRUNCATED,
     }
 )
 

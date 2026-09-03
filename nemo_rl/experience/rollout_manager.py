@@ -726,16 +726,10 @@ class AsyncRolloutImpl:
         }
 
         if "per_worker_token_counts" in all_sample_metrics[0]:
-            # Worker IDs are metric labels. Keep their keys JSON-compatible so
-            # buffered rollout metrics can participate in native TQ checkpoint
-            # manifests without weakening the manifest's strict key validation.
-            per_worker_token_counts: dict[str, int] = {}
+            per_worker_token_counts: dict[int, int] = {}
             for m in all_sample_metrics:
                 for k, v in m["per_worker_token_counts"].items():
-                    worker_key = str(k)
-                    per_worker_token_counts[worker_key] = (
-                        per_worker_token_counts.get(worker_key, 0) + v
-                    )
+                    per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
         # Per-turn token histograms (flat across all turns, distinct from the

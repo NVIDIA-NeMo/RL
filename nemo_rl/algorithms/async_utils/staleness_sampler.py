@@ -279,17 +279,13 @@ class BaseSampler(abc.ABC):
             return None, 0
         requested_groups = min(len(valid_idxs), max_prompt_groups)
         selected_idxs = valid_idxs[:requested_groups]
-        selected_metas: list[KVBatchMeta] = []
-        for i in selected_idxs:
-            meta = self._buffer.meta_list[i]
-            assert meta is not None  # ready=True is published after commit sets meta
-            selected_metas.append(meta)
+        selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
         selected_rollout_metrics = [
             metrics
             for meta in selected_metas
-            for metrics in meta.extra_info.get(ROLLOUT_METRICS, [])
+            for metrics in meta.extra_info.get(ROLLOUT_METRICS, [])  # type: ignore[union-attr]
         ]
-        selected_meta = selected_metas[0].concat(*selected_metas[1:])
+        selected_meta = selected_metas[0].concat(*selected_metas[1:])  # type: ignore[union-attr]
         selected_meta.extra_info[ROLLOUT_METRICS] = selected_rollout_metrics
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
         return selected_meta, len(selected_idxs)

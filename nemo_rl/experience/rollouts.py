@@ -21,7 +21,7 @@ import json
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -47,8 +47,10 @@ from nemo_rl.data.multimodal_utils import (
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
     attach_image_model_inputs_to_message,
-    extract_input_images_from_responses_messages,
+    extract_input_media_sources_from_responses_messages,
+    resolve_to_image,
 )
+from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -125,7 +127,14 @@ def attach_initial_nemo_gym_image_payloads(
         initial_messages = extra_env_info.get("responses_create_params", {}).get(
             "input", []
         )
-        images = extract_input_images_from_responses_messages(initial_messages)
+        # Load images from Responses-API input messages in encounter order.
+        images = [
+            resolve_to_image(source)
+            for media_type, source in extract_input_media_sources_from_responses_messages(
+                initial_messages
+            )
+            if media_type == "image"
+        ]
         if not images:
             continue
         if processor is None or getattr(processor, "image_processor", None) is None:
@@ -279,16 +288,12 @@ def _add_r3_fallback_metrics(
     )
 
 
-def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
+def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
         [
-            bool(
-                (result["full_result"].get("instance_config") or {}).get(
-                    "mask_sample", False
-                )
-            )
-            for result in results
+            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
+            for extra in extras
         ],
         dtype=torch.bool,
     )
@@ -2848,10 +2853,12 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
-    # Env/agent mask flag: flagged samples are dropped from the loss but still
-    # count for advantages. env.should_mask_flagged_samples=false skips this.
+    # Carry the raw env/agent flag downstream; the advantage stage composes it
+    # into sample_mask. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:
-        final_batch["mask_sample"] = _extract_mask_sample_flags(results)
+        final_batch[MASK_SAMPLE] = _mask_sample_flags(
+            result["full_result"] for result in results
+        )
 
     rollout_metrics.update(_effort_shaping_metrics(shaping))
 
