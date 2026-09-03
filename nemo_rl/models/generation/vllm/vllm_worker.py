@@ -588,7 +588,7 @@ class BaseVllmGenerationWorker:
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 
             fp8_kwargs = init_fp8(
-                self.cfg["vllm_cfg"], self.model_name, model_parallel_size
+                self.cfg["vllm_cfg"], self.model_name, model_parallel_size, vllm_kwargs
             )
 
             # Merge (rather than replace) so fp8's quantization_config coexists

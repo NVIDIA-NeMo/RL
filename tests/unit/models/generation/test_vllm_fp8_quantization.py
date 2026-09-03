@@ -503,6 +503,88 @@ def test_init_fp8_rejects_mxfp8_without_fp8_precision(
         )
 
 
+def test_init_fp8_warns_on_explicit_non_trtllm_moe_backend_with_mxfp8(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+    warnings = []
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            num_hidden_layers=4, num_experts=8
+        ),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _cfg: None)
+    monkeypatch.setattr(
+        fp8.logger, "warning", lambda msg, *args: warnings.append(msg % args)
+    )
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+        vllm_kwargs={"moe_backend": "triton"},
+    )
+
+    moe_warnings = [w for w in warnings if "moe_backend" in w]
+    assert len(moe_warnings) == 1
+    assert "flashinfer_trtllm" in moe_warnings[0]
+    assert "'triton'" in moe_warnings[0]
+
+
+@pytest.mark.parametrize(
+    "config_extra, vllm_kwargs",
+    [
+        # MoE model with the correct explicit backend (235B recipes).
+        ({"num_experts": 8}, {"moe_backend": "flashinfer_trtllm"}),
+        # MoE model relying on vLLM auto-select (30B-A3B recipes).
+        ({"num_experts": 8}, None),
+        # Explicit "auto" behaves exactly like unset in vLLM 0.25.1.
+        ({"num_experts": 8}, {"moe_backend": "auto"}),
+        # Dense model: moe_backend is irrelevant (32B recipes).
+        ({}, {"moe_backend": "triton"}),
+    ],
+)
+def test_init_fp8_moe_backend_warning_not_spurious(
+    fp8_module, monkeypatch, config_extra, vllm_kwargs
+):
+    fp8 = fp8_module
+    warnings = []
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            num_hidden_layers=4, **config_extra
+        ),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _cfg: None)
+    monkeypatch.setattr(
+        fp8.logger, "warning", lambda msg, *args: warnings.append(msg % args)
+    )
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+        vllm_kwargs=vllm_kwargs,
+    )
+
+    assert not any("moe_backend" in w for w in warnings)
+
+
 def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeypatch):
     fp8 = fp8_module
     weight = torch.zeros(2, 3, 32, dtype=torch.bfloat16)

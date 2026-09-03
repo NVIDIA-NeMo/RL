@@ -31,6 +31,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.interfaces import get_num_routed_experts
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
@@ -212,7 +213,7 @@ def apply_fp8_patches(self, fp8_config):
     fp8_patches_applied = True
 
 
-def init_fp8(vllm_cfg, model_name, model_parallel_size):
+def init_fp8(vllm_cfg, model_name, model_parallel_size, vllm_kwargs=None):
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
@@ -233,6 +234,29 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
             "FP8 KV cache can only be used together with FP8 model weights."
         )
+
+    # MXFP8-quantized MoE layers only load through the FLASHINFER_TRTLLM layout
+    # (process_weights_after_loading_mxfp8_moe rejects everything else), and
+    # vLLM's auto-select already prefers it. An explicit non-trtllm override is
+    # otherwise caught only at weight load with an opaque error, so surface it
+    # here with remediation. Warn rather than raise: quantization_ignored_layer_kws
+    # can exclude MoE layers from MXFP8, which makes other backends legal.
+    if vllm_cfg.get("is_mx"):
+        has_moe_experts = get_num_routed_experts(config) is not None
+        moe_backend = (vllm_kwargs or {}).get("moe_backend")
+        if has_moe_experts and moe_backend not in (
+            None,
+            "auto",
+            "flashinfer_trtllm",
+        ):
+            logger.warning(
+                "MXFP8 MoE requires moe_backend='flashinfer_trtllm', but "
+                "vllm_kwargs.moe_backend=%r. Weight processing will fail at load "
+                "for MXFP8-quantized MoE layers. Set "
+                "policy.generation.vllm_kwargs.moe_backend='flashinfer_trtllm' "
+                "or leave it unset to use vLLM's auto-select.",
+                moe_backend,
+            )
 
     if use_fp8_weights:
         is_mx = bool(vllm_cfg.get("is_mx"))
@@ -368,13 +392,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         )
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
-    vllm_kwargs = {
+    fp8_kwargs = {
         "quantization": "fp8",
         "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
 
-    return vllm_kwargs
+    return fp8_kwargs
 
 
 def is_fp8_model(vllm_config):
