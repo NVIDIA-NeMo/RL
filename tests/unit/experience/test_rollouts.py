@@ -2214,6 +2214,62 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
+    assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
+
+
+def test_postprocess_nemo_gym_group_reports_per_agent_truncation_rate():
+    agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
+    is_truncated = [True, False, True, True]
+    rows = [{"agent_ref": {"name": name}} for name in agent_names]
+    results = []
+    for index, truncated in enumerate(is_truncated):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        assistant_token_count = 2 if truncated else 1
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2] * assistant_token_count),
+                        "generation_logprobs": torch.tensor(
+                            [-0.1] * assistant_token_count
+                        ),
+                    },
+                ],
+                "full_result": {"reward": float(index)},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 3}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(4)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+    )
+
+    assert rollout_result.rollout_metrics["truncation_rate"] == pytest.approx(0.75)
+    assert rollout_result.rollout_metrics["agent-a/truncation_rate"] == pytest.approx(
+        0.5
+    )
+    assert rollout_result.rollout_metrics["agent-b/truncation_rate"] == pytest.approx(
+        1.0
+    )
+    assert rollout_result.final_batch["truncated"].tolist() == is_truncated
 
 
 def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
@@ -2545,6 +2601,7 @@ def test_run_async_nemo_gym_rollout(
             "example_multi_step_simple_agent/reward/median": 0.0,
             "example_multi_step_simple_agent/reward/min": 0.0,
             "example_multi_step_simple_agent/reward/stddev": 0.0,
+            "example_multi_step_simple_agent/truncation_rate": 0.0,
             "example_multi_step_simple_agent/set_overlap/histogram": None,
             "example_multi_step_simple_agent/set_overlap/max": 0.0,
             "example_multi_step_simple_agent/set_overlap/mean": 0.0,

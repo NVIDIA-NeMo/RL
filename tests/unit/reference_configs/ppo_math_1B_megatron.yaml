@@ -164,6 +164,8 @@ policy:
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    fp32_lm_head: False
+    fp32_residual_connection: False
     moe_per_layer_logging: False
 
     optimizer:
@@ -342,6 +344,8 @@ value:
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    fp32_lm_head: False
+    fp32_residual_connection: False
     moe_per_layer_logging: False
 
     optimizer:

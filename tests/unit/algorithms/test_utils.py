@@ -24,6 +24,8 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
+    build_rollout_group_ids,
+    build_rollout_group_ids_from_sample_ids,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
     maybe_pad_last_batch,
@@ -32,6 +34,57 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_rollout_group_ids_keep_identical_multimodal_prompts_separate():
+    """Different media states must not share a GRPO reward baseline."""
+    group_ids = build_rollout_group_ids(batch_size=32, group_size=16)
+    rewards = torch.cat((torch.ones(16), torch.zeros(16)))
+    valid_mask = torch.ones_like(rewards)
+
+    baseline, _ = calculate_baseline_and_std_per_prompt(group_ids, rewards, valid_mask)
+
+    assert torch.equal(baseline, rewards)
+
+
+def test_rollout_group_ids_support_namespacing_across_cached_batches():
+    assert torch.equal(
+        build_rollout_group_ids(batch_size=4, group_size=2, start_group_id=3),
+        torch.tensor([[3], [3], [4], [4]]),
+    )
+
+
+def test_rollout_group_ids_from_tq_sample_ids():
+    sample_ids = ["prompt-a_g0", "prompt-a_g1", "prompt-b_g0", "prompt-b_g1"]
+
+    assert torch.equal(
+        build_rollout_group_ids_from_sample_ids(sample_ids, expected_group_size=2),
+        torch.tensor([[0], [0], [1], [1]]),
+    )
+
+
+@pytest.mark.parametrize(
+    "sample_ids",
+    [
+        ["prompt-a_g0", "prompt-a_g0"],
+        ["prompt-a_g1", "prompt-a_g2"],
+        ["prompt-a_g-1", "prompt-a_g0"],
+    ],
+)
+def test_rollout_group_ids_reject_malformed_or_partial_groups(sample_ids):
+    with pytest.raises(ValueError):
+        build_rollout_group_ids_from_sample_ids(sample_ids, expected_group_size=2)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "group_size", "start_group_id"),
+    [(31, 16, 0), (32, 0, 0), (-1, 1, 0), (32, 16, -1)],
+)
+def test_rollout_group_ids_reject_invalid_shapes(
+    batch_size, group_size, start_group_id
+):
+    with pytest.raises(ValueError):
+        build_rollout_group_ids(batch_size, group_size, start_group_id=start_group_id)
 
 
 @pytest.fixture

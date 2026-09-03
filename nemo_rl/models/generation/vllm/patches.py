@@ -14,7 +14,29 @@
 
 import os
 from contextlib import contextmanager
+from functools import wraps
 from importlib.util import find_spec
+from typing import Any
+
+G_FLASHINFER_TRTLLM_W13_KERNEL_ATTR = "_nrl_flashinfer_trtllm_w13_weight"
+G_FLASHINFER_TRTLLM_W2_KERNEL_ATTR = "_nrl_flashinfer_trtllm_w2_weight"
+G_FLASHINFER_TRTLLM_PATCH_ATTR = "_nrl_flashinfer_trtllm_refit_patch_applied"
+G_FLASHINFER_TRTLLM_INTERMEDIATE_ALIGNMENT = 128
+G_FLASHINFER_TRTLLM_ENGINE_CORE_PATCH_ATTR = (
+    "_nrl_flashinfer_trtllm_refit_engine_core_patch_applied"
+)
+G_FLASHINFER_TRTLLM_ENGINE_CORE_ORIGINAL_ATTR = "_nrl_original_run_engine_core"
+G_FLASHINFER_TRTLLM_RAY_WORKER_PATCH_ATTR = (
+    "_nrl_flashinfer_trtllm_refit_ray_worker_patch_applied"
+)
+G_FLASHINFER_TRTLLM_RAY_WORKER_ORIGINAL_ATTR = "_nrl_original_initialize_worker"
+G_FLASHINFER_TRTLLM_RAY_EXECUTOR_PATCH_ATTR = (
+    "_nrl_flashinfer_trtllm_refit_ray_executor_patch_applied"
+)
+G_FLASHINFER_TRTLLM_RAY_EXECUTOR_ORIGINAL_ATTR = "_nrl_original_collective_rpc"
+G_FLASHINFER_TRTLLM_RAY_EXECUTOR_WORKERS_PATCHED_ATTR = (
+    "_nrl_flashinfer_trtllm_refit_workers_patched"
+)
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -566,6 +588,545 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     logger.info("Successfully patched vLLM RADIO LayerScale loading.")
 
 
+def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:
+    """Compute NemotronH logits with an fp32 LM head (MiniMax-M1-style).
+
+    bf16 rounding of the logits GEMM output is the dominant contributor to
+    generation/training logprob mismatch (train/token_mult_prob_error). With
+    this patch the sampled-token logprobs come from fp32 logits, matching a
+    trainer that enables megatron_cfg.fp32_lm_head.
+
+    This must be a source patch (not a monkeypatch): the model executes in
+    vLLM's EngineCore worker subprocesses, which import vllm independently of
+    this process. The patched code is opt-in at runtime via
+    NRL_VLLM_FP32_LM_HEAD=1 (set it through policy.generation.vllm_cfg.env_vars
+    so worker processes inherit it). Costs one fp32 copy of the vocab-sharded
+    head weight per rank.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/nemotron_h.py")
+    except RuntimeError:
+        logger.warning("Could not locate nemotron_h.py for the fp32 LM head patch.")
+        return
+
+    old_snippet = """        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits"""
+    new_snippet = """        import os as _os
+
+        if _os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1":
+            # NeMo-RL patch: fp32 LM head (MiniMax-M1-style). bf16 rounding of
+            # the logits is the dominant gen/train logprob mismatch source.
+            _fp32_head = getattr(self, "_nrl_lm_head_fp32", None)
+            if _fp32_head is None and not torch.cuda.is_current_stream_capturing():
+                # Skipped under graph capture: an allocation there lives in the
+                # graph's memory pool and is not valid for later eager replays.
+                # Capture output is discarded anyway, so bf16 is fine for it.
+                import copy as _copy
+
+                _fp32_head = _copy.deepcopy(self.lm_head).float()
+                # object.__setattr__ bypasses nn.Module.__setattr__: registering
+                # this as a submodule would add a vocab-sized parameter to
+                # named_parameters(), which the refit weight mapping is built from.
+                object.__setattr__(self, "_nrl_lm_head_fp32", _fp32_head)
+                self._nrl_lm_head_fp32_dirty = False
+                print(
+                    "[fp32_lm_head] built fp32 head in forward shape=%s"
+                    % (tuple(_fp32_head.weight.shape),),
+                    flush=True,
+                )
+            elif _fp32_head is not None and getattr(
+                self, "_nrl_lm_head_fp32_dirty", False
+            ):
+                # Refreshed in place: replacing the module would leave any
+                # captured CUDA graph pointing at the old storage.
+                _fp32_head.weight.data.copy_(self.lm_head.weight)
+                if getattr(_fp32_head, "bias", None) is not None:
+                    _fp32_head.bias.data.copy_(self.lm_head.bias)
+                self._nrl_lm_head_fp32_dirty = False
+                print("[fp32_lm_head] refreshed cached head in forward", flush=True)
+            if _fp32_head is not None:
+                return self.logits_processor(_fp32_head, hidden_states.float())
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if "NRL_VLLM_FP32_LM_HEAD" in content:
+            logger.info("NemotronH fp32 LM head patch already present.")
+            return
+        if content.count(old_snippet) != 1:
+            logger.warning(
+                "NemotronH fp32 LM head patch anchor not found exactly once "
+                "in %s; patch not applied.",
+                file_to_patch,
+            )
+            return
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Applied NemotronH fp32 LM head source patch.")
+def _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch(
+    logger: Any | None = None,
+) -> None:
+    """Keep FlashInfer TRTLLM MoE kernel weights stable across vLLM refits.
+
+    vLLM 0.25.1 converts unquantized FlashInfer TRTLLM MoE weights from the
+    canonical loader shape to the kernel's block layout by replacing
+    ``layer.w13_weight`` and ``layer.w2_weight``. NeMo-RL later refits by
+    calling vLLM's HF loader again, which expects those parameters to still
+    have the canonical 3D expert-weight shapes. Keep the registered
+    Parameters as canonical views for loading, and store the converted
+    block-layout tensors separately for the kernels.
+    """
+    # These imports require vLLM, so keep them out of module import time.
+    import torch
+    from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+        UnquantizedMoeBackend,
+        convert_to_unquantized_kernel_format,
+        make_unquantized_moe_kernel,
+    )
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    if logger is None:
+        from vllm.logger import init_logger
+
+        logger = init_logger("vllm_patch")
+
+    if getattr(UnquantizedFusedMoEMethod, G_FLASHINFER_TRTLLM_PATCH_ATTR, False):
+        logger.info("vLLM FlashInfer TRTLLM refit buffer patch already applied.")
+        return
+
+    original_setup_kernel = UnquantizedFusedMoEMethod._setup_kernel
+    original_forward_native = UnquantizedFusedMoEMethod.forward_native
+    original_apply_monolithic = UnquantizedFusedMoEMethod.apply_monolithic
+
+    def _load_shape_numel(load_shape: tuple[int, ...]) -> int:
+        numel = 1
+        for dim in load_shape:
+            numel *= dim
+        return numel
+
+    def _raise_if_unsupported_flashinfer_trtllm_padding(
+        layer: Any,
+        w2: torch.Tensor,
+    ) -> None:
+        moe_config = getattr(layer, "moe_config", None)
+        if getattr(moe_config, "is_act_and_mul", None) is not False:
+            return
+
+        intermediate_size_per_partition = getattr(
+            moe_config, "intermediate_size_per_partition", None
+        )
+        if intermediate_size_per_partition is None and w2.dim() >= 3:
+            intermediate_size_per_partition = w2.shape[-1]
+        if intermediate_size_per_partition is None:
+            return
+
+        intermediate_size_per_partition = int(intermediate_size_per_partition)
+        remainder = (
+            intermediate_size_per_partition % G_FLASHINFER_TRTLLM_INTERMEDIATE_ALIGNMENT
+        )
+        if remainder == 0:
+            return
+
+        padded_intermediate_size = (
+            intermediate_size_per_partition
+            + G_FLASHINFER_TRTLLM_INTERMEDIATE_ALIGNMENT
+            - remainder
+        )
+        raise ValueError(
+            "NeMo-RL's FlashInfer TRTLLM refit patch does not support "
+            "padded non-gated MoE layouts. "
+            f"intermediate_size_per_partition={intermediate_size_per_partition} "
+            "is not divisible by "
+            f"{G_FLASHINFER_TRTLLM_INTERMEDIATE_ALIGNMENT}, so vLLM pads it "
+            f"to {padded_intermediate_size} before converting weights. "
+            "The padded kernel tensor has more elements than the load-layout "
+            "tensor, which requires a dedicated padded-layout refit path. "
+            "Use expert_parallel_size to avoid the MoE TP split, or choose a "
+            "backend that does not expand the MoE weights."
+        )
+
+    def _ensure_kernel_weight(
+        layer: Any,
+        *,
+        weight_name: str,
+        kernel_attr: str,
+        kernel_weight: torch.Tensor,
+        load_shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        load_numel = _load_shape_numel(load_shape)
+        if kernel_weight.numel() != load_numel:
+            raise ValueError(
+                "NeMo-RL's FlashInfer TRTLLM refit patch currently supports "
+                "only conversions that preserve the number of elements. "
+                f"{weight_name} load shape is {load_shape} "
+                f"({load_numel} elements), but the kernel layout has shape "
+                f"{tuple(kernel_weight.shape)} ({kernel_weight.numel()} elements). "
+                "This is likely a padded or otherwise expanded MoE shape."
+            )
+
+        existing_kernel_weight = getattr(layer, kernel_attr, None)
+        if existing_kernel_weight is None:
+            stable_kernel_weight = kernel_weight.contiguous()
+            setattr(layer, kernel_attr, stable_kernel_weight)
+        else:
+            if existing_kernel_weight.shape != kernel_weight.shape:
+                raise ValueError(
+                    "NeMo-RL's FlashInfer TRTLLM refit patch cannot preserve "
+                    f"CUDA graph addresses for {weight_name}: existing kernel "
+                    f"shape is {tuple(existing_kernel_weight.shape)}, but the "
+                    f"new kernel shape is {tuple(kernel_weight.shape)}."
+                )
+            if existing_kernel_weight.dtype != kernel_weight.dtype:
+                raise ValueError(
+                    "NeMo-RL's FlashInfer TRTLLM refit patch cannot preserve "
+                    f"CUDA graph addresses for {weight_name}: existing kernel "
+                    f"dtype is {existing_kernel_weight.dtype}, but the new "
+                    f"kernel dtype is {kernel_weight.dtype}."
+                )
+            if existing_kernel_weight.device != kernel_weight.device:
+                raise ValueError(
+                    "NeMo-RL's FlashInfer TRTLLM refit patch cannot preserve "
+                    f"CUDA graph addresses for {weight_name}: existing kernel "
+                    f"device is {existing_kernel_weight.device}, but the new "
+                    f"kernel device is {kernel_weight.device}."
+                )
+            stable_kernel_weight = existing_kernel_weight
+            with torch.no_grad():
+                stable_kernel_weight.copy_(kernel_weight)
+
+        getattr(layer, weight_name).data = stable_kernel_weight.view(load_shape)
+        return stable_kernel_weight
+
+    def _flashinfer_trtllm_kernel_weights(
+        layer: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            return (
+                getattr(layer, G_FLASHINFER_TRTLLM_W13_KERNEL_ATTR),
+                getattr(layer, G_FLASHINFER_TRTLLM_W2_KERNEL_ATTR),
+            )
+        except AttributeError as error:
+            raise RuntimeError(
+                "NeMo-RL's FlashInfer TRTLLM refit patch did not find the "
+                "separate kernel-layout MoE weights. "
+                "process_weights_after_loading must run before inference."
+            ) from error
+
+    @wraps(original_setup_kernel)
+    def patched_setup_kernel(
+        self: Any,
+        layer: Any,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+    ) -> None:
+        if self.unquantized_backend != UnquantizedMoeBackend.FLASHINFER_TRTLLM:
+            return original_setup_kernel(self, layer, w13, w2)
+
+        _raise_if_unsupported_flashinfer_trtllm_padding(layer, w2)
+
+        w13_load_shape = tuple(w13.shape)
+        w2_load_shape = tuple(w2.shape)
+        w13_new, w2_new = convert_to_unquantized_kernel_format(
+            self.unquantized_backend,
+            moe_config=layer.moe_config,
+            w13_weight=w13,
+            w2_weight=w2,
+        )
+
+        _ensure_kernel_weight(
+            layer,
+            weight_name="w13_weight",
+            kernel_attr=G_FLASHINFER_TRTLLM_W13_KERNEL_ATTR,
+            kernel_weight=w13_new,
+            load_shape=w13_load_shape,
+        )
+        _ensure_kernel_weight(
+            layer,
+            weight_name="w2_weight",
+            kernel_attr=G_FLASHINFER_TRTLLM_W2_KERNEL_ATTR,
+            kernel_weight=w2_new,
+            load_shape=w2_load_shape,
+        )
+
+        if self.moe_kernel is None:
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.moe_quant_config is not None
+            assert self.experts_cls is not None
+            self.moe_kernel = make_unquantized_moe_kernel(
+                quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                backend=self.unquantized_backend,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+            )
+
+    @wraps(original_forward_native)
+    def patched_forward_native(
+        self: Any,
+        layer: Any,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: Any,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.unquantized_backend != UnquantizedMoeBackend.FLASHINFER_TRTLLM:
+            return original_forward_native(
+                self,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+            )
+
+        assert self.moe_kernel is not None
+        w13_kernel, w2_kernel = _flashinfer_trtllm_kernel_weights(layer)
+        return self.moe_kernel.apply(
+            hidden_states=x,
+            w1=w13_kernel,
+            w2=w2_kernel,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+        )
+
+    @wraps(original_apply_monolithic)
+    def patched_apply_monolithic(
+        self: Any,
+        layer: Any,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.unquantized_backend != UnquantizedMoeBackend.FLASHINFER_TRTLLM:
+            return original_apply_monolithic(self, layer, x, router_logits, input_ids)
+
+        assert self.is_monolithic
+        assert self.moe_kernel is not None
+        w13_kernel, w2_kernel = _flashinfer_trtllm_kernel_weights(layer)
+        return self.moe_kernel.apply_monolithic(
+            x,
+            w13_kernel,
+            w2_kernel,
+            router_logits,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            routed_scaling_factor=layer.routed_scaling_factor,
+        )
+
+    UnquantizedFusedMoEMethod._nrl_original_setup_kernel = original_setup_kernel
+    UnquantizedFusedMoEMethod._nrl_original_forward_native = original_forward_native
+    UnquantizedFusedMoEMethod._nrl_original_apply_monolithic = original_apply_monolithic
+    UnquantizedFusedMoEMethod._setup_kernel = patched_setup_kernel
+    UnquantizedFusedMoEMethod.forward_native = patched_forward_native
+    UnquantizedFusedMoEMethod.apply_monolithic = patched_apply_monolithic
+    setattr(UnquantizedFusedMoEMethod, G_FLASHINFER_TRTLLM_PATCH_ATTR, True)
+    logger.info("Successfully patched vLLM FlashInfer TRTLLM MoE refit buffers.")
+
+
+def _run_engine_core_with_flashinfer_trtllm_refit_patch(
+    *args: Any, **kwargs: Any
+) -> Any:
+    """Apply the refit patch inside EngineCore before model construction."""
+    _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch()
+    _patch_vllm_flashinfer_trtllm_refit_from_collective_rpc()
+
+    # Import here because this function is also the multiprocessing target for
+    # spawned EngineCore processes, where module import state is rebuilt.
+    from vllm.v1.engine.core import EngineCoreProc
+
+    original_run_engine_core = getattr(
+        EngineCoreProc, G_FLASHINFER_TRTLLM_ENGINE_CORE_ORIGINAL_ATTR, None
+    )
+    if original_run_engine_core is None:
+        original_run_engine_core = EngineCoreProc.run_engine_core
+    if original_run_engine_core is _run_engine_core_with_flashinfer_trtllm_refit_patch:
+        raise RuntimeError(
+            "NeMo-RL's FlashInfer TRTLLM refit EngineCore entrypoint patch "
+            "could not find the original vLLM EngineCoreProc.run_engine_core."
+        )
+    return original_run_engine_core(*args, **kwargs)
+
+
+def _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch_on_worker(
+    _worker: Any | None = None,
+) -> None:
+    """Adapter for vLLM v1 Ray workers that pass their worker as arg 0."""
+    del _worker
+    _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch()
+
+
+def _ray_worker_initialize_with_flashinfer_trtllm_refit_patch(
+    self: Any, *args: Any, **kwargs: Any
+) -> Any:
+    """Apply the refit patch before RayExecutorV2 initializes a worker model."""
+    _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch()
+
+    original_initialize_worker = getattr(
+        type(self), G_FLASHINFER_TRTLLM_RAY_WORKER_ORIGINAL_ATTR, None
+    )
+    if original_initialize_worker is None:
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+        original_initialize_worker = RayWorkerProc.initialize_worker
+    if (
+        original_initialize_worker
+        is _ray_worker_initialize_with_flashinfer_trtllm_refit_patch
+    ):
+        raise RuntimeError(
+            "NeMo-RL's FlashInfer TRTLLM refit RayExecutorV2 worker patch could "
+            "not find the original vLLM RayWorkerProc.initialize_worker."
+        )
+    return original_initialize_worker(self, *args, **kwargs)
+
+
+def _collective_rpc_with_flashinfer_trtllm_refit_patch(
+    self: Any, *args: Any, **kwargs: Any
+) -> Any:
+    """Patch vLLM v1 Ray workers before their first collective RPC."""
+    original_collective_rpc = getattr(
+        type(self), G_FLASHINFER_TRTLLM_RAY_EXECUTOR_ORIGINAL_ATTR, None
+    )
+    if original_collective_rpc is None:
+        from vllm.v1.executor.ray_executor import RayDistributedExecutor
+
+        original_collective_rpc = RayDistributedExecutor.collective_rpc
+    if original_collective_rpc is _collective_rpc_with_flashinfer_trtllm_refit_patch:
+        raise RuntimeError(
+            "NeMo-RL's FlashInfer TRTLLM refit Ray executor patch could not "
+            "find the original vLLM RayDistributedExecutor.collective_rpc."
+        )
+
+    if not getattr(self, G_FLASHINFER_TRTLLM_RAY_EXECUTOR_WORKERS_PATCHED_ATTR, False):
+        from vllm.v1.executor.ray_utils import ray
+
+        futures = [
+            worker.execute_method.remote(
+                _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch_on_worker
+            )
+            for worker in self.workers
+        ]
+        ray.get(futures)
+        setattr(self, G_FLASHINFER_TRTLLM_RAY_EXECUTOR_WORKERS_PATCHED_ATTR, True)
+
+    return original_collective_rpc(self, *args, **kwargs)
+
+
+def _patch_vllm_flashinfer_trtllm_refit_from_collective_rpc(
+    logger: Any | None = None,
+) -> None:
+    """Patch vLLM process entrypoints that can construct the model."""
+    if logger is None:
+        from vllm.logger import init_logger
+
+        logger = init_logger("vllm_patch")
+
+    try:
+        from vllm.v1.engine.core import EngineCoreProc
+    except (AttributeError, ImportError) as error:
+        logger.warning(
+            "Could not patch vLLM EngineCoreProc for FlashInfer TRTLLM refits: %s",
+            error,
+        )
+    else:
+        if getattr(EngineCoreProc, G_FLASHINFER_TRTLLM_ENGINE_CORE_PATCH_ATTR, False):
+            logger.info(
+                "vLLM EngineCoreProc FlashInfer TRTLLM refit patch already applied."
+            )
+        else:
+            setattr(
+                EngineCoreProc,
+                G_FLASHINFER_TRTLLM_ENGINE_CORE_ORIGINAL_ATTR,
+                EngineCoreProc.run_engine_core,
+            )
+            EngineCoreProc.run_engine_core = staticmethod(
+                _run_engine_core_with_flashinfer_trtllm_refit_patch
+            )
+            setattr(EngineCoreProc, G_FLASHINFER_TRTLLM_ENGINE_CORE_PATCH_ATTR, True)
+            logger.info(
+                "Successfully patched vLLM EngineCoreProc for FlashInfer TRTLLM refits."
+            )
+
+    try:
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+    except (AttributeError, ImportError) as error:
+        logger.info(
+            "Skipping RayExecutorV2 FlashInfer TRTLLM refit worker patch: %s",
+            error,
+        )
+    else:
+        if getattr(RayWorkerProc, G_FLASHINFER_TRTLLM_RAY_WORKER_PATCH_ATTR, False):
+            logger.info(
+                "vLLM RayWorkerProc FlashInfer TRTLLM refit patch already applied."
+            )
+        else:
+            setattr(
+                RayWorkerProc,
+                G_FLASHINFER_TRTLLM_RAY_WORKER_ORIGINAL_ATTR,
+                RayWorkerProc.initialize_worker,
+            )
+            RayWorkerProc.initialize_worker = (
+                _ray_worker_initialize_with_flashinfer_trtllm_refit_patch
+            )
+            setattr(RayWorkerProc, G_FLASHINFER_TRTLLM_RAY_WORKER_PATCH_ATTR, True)
+            logger.info(
+                "Successfully patched vLLM RayWorkerProc for FlashInfer TRTLLM refits."
+            )
+
+    try:
+        from vllm.v1.executor.ray_executor import RayDistributedExecutor
+    except (AttributeError, ImportError) as error:
+        logger.info(
+            "Skipping vLLM v1 Ray executor FlashInfer TRTLLM refit patch: %s",
+            error,
+        )
+    else:
+        if getattr(
+            RayDistributedExecutor, G_FLASHINFER_TRTLLM_RAY_EXECUTOR_PATCH_ATTR, False
+        ):
+            logger.info(
+                "vLLM RayDistributedExecutor FlashInfer TRTLLM refit patch "
+                "already applied."
+            )
+        else:
+            patched_collective_rpc = _collective_rpc_with_flashinfer_trtllm_refit_patch
+            setattr(
+                RayDistributedExecutor,
+                G_FLASHINFER_TRTLLM_RAY_EXECUTOR_ORIGINAL_ATTR,
+                RayDistributedExecutor.collective_rpc,
+            )
+            RayDistributedExecutor.collective_rpc = patched_collective_rpc
+            setattr(
+                RayDistributedExecutor,
+                G_FLASHINFER_TRTLLM_RAY_EXECUTOR_PATCH_ATTR,
+                True,
+            )
+            logger.info(
+                "Successfully patched vLLM RayDistributedExecutor for "
+                "FlashInfer TRTLLM refits."
+            )
+
+
+def _patch_vllm_flashinfer_trtllm_refit_buffers(logger: Any) -> None:
+    """Patch current and child vLLM processes for FlashInfer TRTLLM refits."""
+    _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch(logger)
+    _patch_vllm_flashinfer_trtllm_refit_from_collective_rpc(logger)
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -580,6 +1141,21 @@ def ensure_vllm_source_compat() -> None:
     patch_logger = init_logger("vllm_patch")
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+
+
+def _apply_external_vllm_patches() -> None:
+    """Apply only compatibility patches required by external vLLM servers.
+
+    External Gym model servers are inference-only. Keep this list explicit so
+    policy-specific runtime patches, such as refit support, are not installed
+    in their vLLM engine processes.
+    """
+    from vllm.logger import init_logger
+
+    patch_logger = init_logger("vllm_patch")
+    _patch_vllm_tool_parser_namespace_tool(patch_logger)
+    _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
+    _patch_vllm_shm_broadcast_bind_retry(patch_logger)
 
 
 def _apply_vllm_patches(
@@ -634,3 +1210,5 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_nemotron_h_fp32_lm_head(patch_logger)
+    _patch_vllm_flashinfer_trtllm_refit_buffers(patch_logger)

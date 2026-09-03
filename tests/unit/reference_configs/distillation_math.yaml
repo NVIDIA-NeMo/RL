@@ -119,6 +119,8 @@ policy: &POLICY_BASE
         apply_rope_fusion: True
         bias_activation_fusion: True
         defer_fp32_logits: False
+        fp32_lm_head: False
+        fp32_residual_connection: False
         moe_per_layer_logging: False
         moe_enable_deepep: false
         moe_token_dispatcher_type: "alltoall"
