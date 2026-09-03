@@ -93,7 +93,11 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutTimeouts,
 )
-from nemo_rl.experience.rollouts import should_mask_flagged_samples
+from nemo_rl.experience.rollouts import (
+    get_nemo_gym_thinking_tags,
+    resolve_reward_penalty_config,
+    should_mask_flagged_samples,
+)
 from nemo_rl.models.generation import resolve_generation_class
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
@@ -708,23 +712,33 @@ def _clamp_max_num_steps(
 def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     """Set train_iters from max_num_steps after its dataloader clamp."""
     algo_cfg = algo_config(master_config)
-    is_ppo = is_ppo_run(master_config)
-    # train_iters is a scheduler-tick budget, and each PPO epoch steps both
-    # optimizers once, so the configured warmup/decay horizon has to be scaled.
-    ppo_epochs = algo_cfg.ppo_epochs if is_ppo else 1
-    train_iters = algo_cfg.max_num_steps * ppo_epochs
+    ppo_config = master_config.ppo if is_ppo_run(master_config) else None
+    # train_iters is a scheduler-tick budget. Policy and value need separate
+    # budgets when their epoch counts or training start steps differ.
+    policy_epochs = ppo_config.ppo_epochs if ppo_config is not None else 1
+    policy_training_steps = algo_cfg.max_num_steps
+    if ppo_config is not None:
+        policy_training_steps = max(
+            policy_training_steps - ppo_config.policy_training_start_step,
+            0,
+        )
+    # Megatron-Bridge requires a positive scheduler horizon at setup. A PPO
+    # policy scheduler is never advanced when critic warmup spans the whole run.
+    policy_train_iters = max(policy_training_steps * policy_epochs, 1)
 
     # policy
     policy_config = master_config.policy
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = train_iters
+        policy_config["megatron_cfg"]["train_iters"] = policy_train_iters
 
     # value
-    if not is_ppo:
+    if ppo_config is None:
         return
     value_config = master_config.value
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = train_iters  # type: ignore[index]
+        value_config["megatron_cfg"]["train_iters"] = (  # type: ignore[index]
+            algo_cfg.max_num_steps * ppo_config.critic_ppo_epochs
+        )
 
 
 def _maybe_attach_fleet_health(
@@ -881,6 +895,11 @@ def setup_single_controller(
         logged by the SC actor).
     """
     validate_single_controller_config(master_config)
+    resolved_reward_penalty_config = resolve_reward_penalty_config(
+        master_config.reward_penalties,
+        tokenizer,
+        thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+    )
 
     # short names for config sections
     algo_cfg = algo_config(master_config)
@@ -1393,6 +1412,10 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
+        include_message_violation_fields=(
+            algo_cfg.invalid_tool_call_advantage is not None
+            or algo_cfg.malformed_thinking_advantage is not None
+        ),
         require_routed_experts=router_replay_enabled(policy_config),
     )
     rollout_manager = RolloutManager(
@@ -1405,6 +1428,7 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,

@@ -32,6 +32,7 @@ from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
     PackedTensor,
     image_to_data_url,
+    video_path_to_data_url,
 )
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -45,12 +46,16 @@ from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
 )
-from nemo_rl.environments.nemo_gym_video import (
+from nemo_rl.environments.nemo_gym_multimodal import (
     _extract_static_video_messages,
     _inject_vllm_mm_processor_kwargs,
-    _metadata_extra_body,
     nemo_gym_example_to_video_datum_spec,
-    normalize_video_urls_in_examples,
+    normalize_media_in_examples,
+)
+from nemo_rl.environments.nemo_gym_request import (
+    _chat_template_kwargs_for_processor,
+    _deep_merge_dict,
+    _metadata_extra_body,
 )
 from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
@@ -184,7 +189,7 @@ def test_extract_static_video_message_ignores_still_image_only_row():
     assert _extract_static_video_messages(example) is None
 
 
-def test_gym_local_video_path_is_normalized_to_file_url(tmp_path):
+def test_gym_local_video_path_is_inlined_as_data_url(tmp_path):
     video_path = tmp_path / "clip with spaces.mp4"
     video_path.write_bytes(b"test")
     examples = [
@@ -205,14 +210,37 @@ def test_gym_local_video_path_is_normalized_to_file_url(tmp_path):
         }
     ]
 
-    normalize_video_urls_in_examples(examples)
+    normalize_media_in_examples(examples)
 
-    assert (
-        examples[0]["responses_create_params"]["input"][0]["content"][0]["video_url"][
-            "url"
-        ]
-        == video_path.resolve().as_uri()
-    )
+    video_url = examples[0]["responses_create_params"]["input"][0]["content"][0][
+        "video_url"
+    ]
+    assert video_url.startswith("data:video/mp4;base64,")
+
+
+def test_video_path_to_data_url_rejects_unsupported_and_missing_paths(tmp_path):
+    """Bad local video sources must fail loudly rather than inline garbage."""
+    unsupported = tmp_path / "clip.gif"
+    unsupported.write_bytes(b"test")
+    with pytest.raises(ValueError, match="Unsupported video extension"):
+        video_path_to_data_url(str(unsupported))
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        video_path_to_data_url(str(tmp_path / "missing.mp4"))
+
+
+def test_video_path_to_data_url_passes_through_data_urls_and_accepts_file_scheme(
+    tmp_path,
+):
+    already_inlined = "data:video/mp4;base64,dG95"
+    assert video_path_to_data_url(already_inlined) == already_inlined
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"toy-video")
+    from_plain = video_path_to_data_url(str(video_path))
+    from_scheme = video_path_to_data_url(f"file://{video_path}")
+    assert from_plain.startswith("data:video/mp4;base64,")
+    assert from_plain == from_scheme
 
 
 def test_extract_static_video_message_rejects_multiple_videos(tmp_path):
@@ -319,6 +347,52 @@ def test_video_metadata_rejects_invalid_extra_body(extra_body):
         _metadata_extra_body(example)
 
 
+@pytest.mark.parametrize(
+    "chat_template_kwargs",
+    [
+        {"enable_thinking": False},
+        '{"enable_thinking": false}',
+    ],
+)
+def test_chat_template_kwargs_for_processor_accepts_mapping_or_json(
+    chat_template_kwargs,
+):
+    example = {
+        "responses_create_params": {
+            "metadata": {"chat_template_kwargs": chat_template_kwargs}
+        }
+    }
+
+    assert _chat_template_kwargs_for_processor(example) == {
+        "chat_template_kwargs": {"enable_thinking": False},
+        "enable_thinking": False,
+    }
+
+
+def test_chat_template_kwargs_for_processor_defaults_to_empty():
+    assert _chat_template_kwargs_for_processor({}) == {}
+
+
+def test_chat_template_kwargs_for_processor_rejects_invalid_json():
+    example = {
+        "responses_create_params": {"metadata": {"chat_template_kwargs": "not-json"}}
+    }
+
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        _chat_template_kwargs_for_processor(example)
+
+
+def test_deep_merge_dict_merges_nested_values_without_mutating_inputs():
+    base = {"nested": {"left": 1}, "unchanged": [1]}
+    update = {"nested": {"right": 2}, "unchanged": [2]}
+
+    merged = _deep_merge_dict(base, update)
+
+    assert merged == {"nested": {"left": 1, "right": 2}, "unchanged": [2]}
+    assert base == {"nested": {"left": 1}, "unchanged": [1]}
+    assert update == {"nested": {"right": 2}, "unchanged": [2]}
+
+
 def test_video_metadata_canonicalizes_mapping_extra_body_to_json_string():
     example = {
         "responses_create_params": {
@@ -380,7 +454,7 @@ def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
 
     frames = np.zeros((4, 8, 8, 3), dtype=np.uint8)
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.load_video_frames_with_metadata",
+        "nemo_rl.environments.nemo_gym_multimodal.load_video_frames_with_metadata",
         lambda *args, **kwargs: (
             frames,
             {"frames_indices": [0, 3, 6, 9], "fps": 3.0},
@@ -513,7 +587,7 @@ def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_pa
         }
 
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.nemo_gym_example_to_video_datum_spec",
+        "nemo_rl.environments.nemo_gym_multimodal.nemo_gym_example_to_video_datum_spec",
         fake_video_processor,
     )
     processor = SimpleNamespace(
@@ -574,7 +648,7 @@ def test_video_datum_uses_cached_frames_without_decoding_video(monkeypatch, tmp_
         }
     }
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video._video_to_image_content",
+        "nemo_rl.environments.nemo_gym_multimodal._video_to_image_content",
         lambda *args, **kwargs: pytest.fail("cached frames must not decode the video"),
     )
 
@@ -661,7 +735,7 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
     }
     frames = np.zeros((4, 8, 16, 3), dtype=np.uint8)
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.load_video_frames_with_metadata",
+        "nemo_rl.environments.nemo_gym_multimodal.load_video_frames_with_metadata",
         lambda *args, **kwargs: (
             frames,
             {"frames_indices": [0, 3, 6, 9], "fps": 3.0},
@@ -819,11 +893,11 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
         return "data:video/x-nemo-rl-cached-frames;base64,dGVzdA=="
 
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.build_cached_video_frame_data_url",
+        "nemo_rl.environments.nemo_gym_multimodal.build_cached_video_frame_data_url",
         fake_manifest_builder,
     )
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.process_nemotron_video_frames",
+        "nemo_rl.environments.nemo_gym_multimodal.process_nemotron_video_frames",
         lambda *args, **kwargs: {
             "input_ids": torch.tensor([[7, 18, 18, 9]]),
             "pixel_values": torch.ones(4, 3, 8, 8),
@@ -1480,7 +1554,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             def run_examples(self, examples, head_server_config):
                 del head_server_config
                 content = examples[0]["responses_create_params"]["input"][0]["content"]
-                assert content[0]["video_url"] == video_path.resolve().as_uri()
+                assert content[0]["video_url"].startswith("data:video/mp4;base64,")
                 assert content[1]["image_url"].startswith("data:image/png;base64,")
 
                 async def _completed_result():
@@ -1526,6 +1600,116 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         assert postprocess_calls == [(nemo_gym_row, nemo_gym_result, tokenizer, True)]
         assert streamed_results[0][0] == 7
         assert streamed_results[0][1] == {"message_log": []}
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
+    """Round-trip normalized media and a mocked Megatron HTTP response through Gym."""
+
+    async def _run():
+        if modality == "image":
+            media_path = tmp_path / "clevr.png"
+            Image.new("RGB", (2, 2), color="red").save(media_path)
+            media_part = {"type": "input_image", "image_url": str(media_path)}
+            expected_prefix = "data:image/png;base64,"
+        else:
+            media_path = tmp_path / "vstat.mp4"
+            media_path.write_bytes(b"toy-video")
+            media_part = {"type": "input_video", "video_url": str(media_path)}
+            expected_prefix = "data:video/mp4;base64,"
+
+        row = {
+            "_rowidx": 3,
+            "agent_ref": {"name": "mock-megatron-agent"},
+            "responses_create_params": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            media_part,
+                            {"type": "input_text", "text": "What is shown?"},
+                        ],
+                    }
+                ]
+            },
+        }
+
+        class _Tokenizer:
+            def batch_decode(self, batches):
+                return [" ".join(map(str, token_ids)) for token_ids in batches]
+
+        class _RolloutCollectionHelper:
+            def run_examples(self, examples, head_server_config):
+                assert head_server_config.backend == "megatron"
+                dispatched_row = examples[0]
+                dispatched_part = dispatched_row["responses_create_params"]["input"][0][
+                    "content"
+                ][0]
+                media_url = dispatched_part[f"{modality}_url"]
+                assert media_url.startswith(expected_prefix)
+
+                mocked_result = {
+                    "responses_create_params": {
+                        "input": deepcopy(
+                            dispatched_row["responses_create_params"]["input"]
+                        )
+                    },
+                    "response": {
+                        "agent_input": deepcopy(
+                            dispatched_row["responses_create_params"]["input"]
+                        ),
+                        "output": [
+                            {
+                                "type": "message",
+                                "prompt_token_ids": [10, 99, 20],
+                                "generation_token_ids": [71, 72],
+                                "generation_log_probs": [-0.25, -0.5],
+                            }
+                        ],
+                    },
+                }
+
+                async def _completed_result():
+                    return dispatched_row, mocked_result
+
+                return [_completed_result()]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = SimpleNamespace(backend="megatron")
+            _tokenizer = _Tokenizer()
+            _processor = None
+            # Bind the real postprocess: the assertions below are about its
+            # message_log output, not about run_rollouts' dispatch alone.
+            _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
+
+            def _require_spinup(self):
+                pass
+
+        streamed = []
+        async for item in NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), [row], "test"
+        ):
+            streamed.append(item)
+
+        row_index, result, _metrics = streamed[0]
+        assert row_index == 3
+        assert [message["role"] for message in result["message_log"]] == [
+            "user",
+            "assistant",
+        ]
+        assert result["message_log"][0]["token_ids"].tolist() == [10, 99, 20]
+        assert result["message_log"][1]["token_ids"].tolist() == [71, 72]
+        assert result["message_log"][1]["generation_logprobs"].tolist() == [
+            -0.25,
+            -0.5,
+        ]
+        assert result["full_result"]["response"]["output"][0]["generation_str"] == (
+            "71 72"
+        )
 
     asyncio.run(_run())
 

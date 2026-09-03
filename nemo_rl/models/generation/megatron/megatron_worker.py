@@ -14,15 +14,17 @@
 
 import asyncio
 import gc
+import importlib
 import os
 import threading
 import time
 import warnings
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import requests
 import torch
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -53,6 +55,7 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import unwrap_model
 
+from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -60,8 +63,12 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.megatron.utils import (
+    build_image_preprocessing_config,
+    build_prompt_and_multimodal_data,
+    build_video_preprocessing_config,
     log_gpu_memory,
     resolve_torch_dtype,
+    sample_vision_tensors,
 )
 from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
@@ -81,12 +88,14 @@ class MegatronGenerationMixin:
      - rank: global rank (used for logging).
      - tokenizer: HF tokenizer.
      - megatron_tokenizer: tokenizer for inference.
+     - processor: optional multimodal processor.
      - is_generation_colocated: Whether colocated or distributed.
      - _reserved_http_server_socket: driver-reserved server socket, or None.
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here
     # (see MegatronPolicyWorkerImpl._build_colocated_inference_model).
+    processor: Optional[Any] = None
     inference_model = None
     _colocated_reshard_plan = None
 
@@ -111,6 +120,89 @@ class MegatronGenerationMixin:
         )
         self._inference_loop = None
         self._inference_thread = None
+
+    def _get_megatron_inference_wrapper_cls(self) -> Optional[type]:
+        """Resolve the configured Megatron inference wrapper, if any.
+
+        Returns:
+            The wrapper class, or None when no wrapper is configured.
+        """
+        class_path = self.cfg["generation"]["mcore_generation_config"].get(
+            "megatron_inference_wrapper"
+        )
+        if class_path is None:
+            return None
+        # Resolved once per worker: this is called per sample during generation.
+        cached = getattr(self, "_megatron_inference_wrapper_cls", None)
+        if cached is not None:
+            return cached
+        module_name, _, class_name = class_path.rpartition(".")
+        if not module_name:
+            raise ValueError(
+                "megatron_inference_wrapper must be a fully qualified class name, "
+                f"got {class_path!r}."
+            )
+        try:
+            wrapper_cls = getattr(importlib.import_module(module_name), class_name)
+        except (ImportError, AttributeError) as e:
+            raise ValueError(
+                f"Could not resolve megatron_inference_wrapper {class_path!r} "
+                f"(from policy.generation.mcore_generation_config): {e}"
+            ) from e
+        self._megatron_inference_wrapper_cls = wrapper_cls
+        return wrapper_cls
+
+    @staticmethod
+    def _wrapper_supports_modality(
+        inference_wrapper_cls: Optional[type], modality: str
+    ) -> bool:
+        """Whether the configured inference wrapper advertises `modality` support."""
+        return bool(
+            inference_wrapper_cls is not None
+            and getattr(inference_wrapper_cls, f"supports_{modality}", False)
+        )
+
+    def _inference_model_and_media_parts(self, inference_wrapper_cls=None):
+        """Return the language model and its optional multimodal parent."""
+        model = unwrap_model(self._gen_model())
+        if isinstance(model, (list, tuple)):
+            if len(model) != 1:
+                raise NotImplementedError("Virtual pipeline models are not supported.")
+            model = model[0]
+        if inference_wrapper_cls is None:
+            inference_wrapper_cls = self._get_megatron_inference_wrapper_cls()
+        if not any(
+            self._wrapper_supports_modality(inference_wrapper_cls, modality)
+            for modality in ("image", "video", "audio")
+        ):
+            return model, None
+        return model.language_model, model
+
+    def _build_image_preprocessing_config(self, generation_config: dict[str, Any]):
+        """Build raw-image preprocessing settings."""
+        inference_wrapper_cls = self._get_megatron_inference_wrapper_cls()
+        if not self._wrapper_supports_modality(inference_wrapper_cls, "image"):
+            return None
+        processor = self.processor
+        if processor is None:
+            raise ValueError(
+                "Megatron multimodal generation requires the policy processor."
+            )
+        # Omit absent keys entirely so MCore's own dataclass defaults apply;
+        # passing None would override them (these fields are `bool`, not `Optional`).
+        image_kwargs: dict[str, Any] = {}
+        if "image_dynamic_resolution" in generation_config:
+            image_kwargs["dynamic_resolution"] = bool(
+                generation_config["image_dynamic_resolution"]
+            )
+        if "vision_model_type" in generation_config:
+            image_kwargs["vision_model_type"] = str(
+                generation_config["vision_model_type"]
+            )
+        return build_image_preprocessing_config(
+            processor.image_processor,
+            **image_kwargs,
+        )
 
     def _setup_colocated_cuda_graph_managers(self) -> None:
         """Create inference CUDA-graph managers for shared-model colocated generation.
@@ -223,8 +315,13 @@ class MegatronGenerationMixin:
         )
         from megatron.core.utils import get_attr_wrapped_model
 
-        gen_model = self._gen_model()
-        pg_collection = get_attr_wrapped_model(gen_model, "pg_collection")
+        inference_wrapper_cls = self._get_megatron_inference_wrapper_cls()
+        inference_model, media_model = self._inference_model_and_media_parts(
+            inference_wrapper_cls
+        )
+        engine_model = media_model if media_model is not None else self._gen_model()
+        pg_collection = get_attr_wrapped_model(self._gen_model(), "pg_collection")
+        model_config = inference_model.config
 
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
@@ -245,7 +342,9 @@ class MegatronGenerationMixin:
         num_speculative_tokens = mcore_generation_config["num_speculative_tokens"]
         max_requests = mcore_generation_config.get("max_requests")
 
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(gen_model)
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(
+            inference_model
+        )
         is_hybrid_model = mamba_inference_state_config is not None
         if is_hybrid_model:
             if (
@@ -270,10 +369,35 @@ class MegatronGenerationMixin:
             logging_step_interval = 0
 
         # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
-        use_flashinfer_fused_rope = gen_model.config.params_dtype in (
+        use_flashinfer_fused_rope = model_config.params_dtype in (
             torch.float16,
             torch.bfloat16,
         )
+
+        image_preprocessing_config = self._build_image_preprocessing_config(
+            mcore_generation_config
+        )
+        video_preprocessing_config = build_video_preprocessing_config(
+            image_preprocessing_config,
+            mcore_generation_config,
+            frame_manifest_magic=CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
+        )
+
+        # Only forward keys the config actually sets, so MCore's InferenceConfig
+        # defaults stay the single source of truth for the ones it omits.
+        inference_overrides: dict[str, Any] = {}
+        if "async_sched_mode" in mcore_generation_config:
+            inference_overrides["async_sched_mode"] = AsyncScheduleMode(
+                mcore_generation_config["async_sched_mode"]
+            )
+        if "vision_embedding_cache_max_bytes" in mcore_generation_config:
+            inference_overrides["vision_embedding_cache_max_bytes"] = int(
+                mcore_generation_config["vision_embedding_cache_max_bytes"]
+            )
+        if "allow_stale_multimodal_embeddings" in mcore_generation_config:
+            inference_overrides["allow_stale_multimodal_embeddings"] = bool(
+                mcore_generation_config["allow_stale_multimodal_embeddings"]
+            )
 
         inference_config = InferenceConfig(
             block_size_tokens=block_size_tokens,
@@ -290,6 +414,7 @@ class MegatronGenerationMixin:
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_prefix_caching=mcore_generation_config["enable_prefix_caching"],
+            **inference_overrides,
             prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
                 "first_prefix_block"
             ),
@@ -303,19 +428,30 @@ class MegatronGenerationMixin:
             num_speculative_tokens=num_speculative_tokens,
             logprobs_mode=mcore_generation_config["logprobs_mode"],
             max_requests=max_requests,
+            image_preprocessing_config=image_preprocessing_config,
+            video_preprocessing_config=video_preprocessing_config,
         )
 
         if "inference_cuda_graph_scope" in mcore_generation_config:
-            gen_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
+            engine_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
                 mcore_generation_config["inference_cuda_graph_scope"]
             ]
 
         self.inference_context = DynamicInferenceContext(
-            gen_model.config, inference_config
+            engine_model.config, inference_config
         )
-        self.inference_wrapped_model = GPTInferenceWrapper(
-            gen_model, self.inference_context
-        )
+        if media_model is None:
+            self.inference_wrapped_model = GPTInferenceWrapper(
+                engine_model, self.inference_context
+            )
+        else:
+            if inference_wrapper_cls is None:
+                raise ValueError(
+                    "Multimodal inference requires megatron_inference_wrapper."
+                )
+            self.inference_wrapped_model = inference_wrapper_cls(
+                engine_model, self.inference_context
+            )
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=self.inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
@@ -432,6 +568,7 @@ class MegatronGenerationMixin:
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
             sock=reserved_socket,
+            multimodal_prompt_config=self.inference_wrapped_model.multimodal_prompt_config,
         )
 
         base_url = f"http://{ip}:{server_port}/v1"
@@ -495,7 +632,11 @@ class MegatronGenerationMixin:
         print(f"[Rank {self.rank}] finishing generation", flush=True)
         log_gpu_memory("finish_generation START")
 
-        lang_module = unwrap_model(self._gen_model())
+        inference_model, media_model = self._inference_model_and_media_parts()
+        lang_module = unwrap_model(inference_model)
+        graph_module = unwrap_model(
+            media_model if media_model is not None else inference_model
+        )
 
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
@@ -504,7 +645,8 @@ class MegatronGenerationMixin:
                 "cuda_graph_impl"
             ]
             if cuda_graph_impl != "none":
-                toggle_cuda_graphs(lang_module, set_to="none")
+                # Restore the same full model tree cached during worker setup.
+                toggle_cuda_graphs(graph_module, set_to="none")
                 # Need to turn off padding before training.
                 # Gains nightly MoE coverage once #2884 and #3570 merge.
                 set_decode_expert_padding(lang_module, set_to=False)
@@ -552,10 +694,6 @@ class MegatronGenerationMixin:
         if self._colocated_reshard_plan is not None:
             self._build_colocated_inference_model(self.cfg)
 
-        gen_model = self._gen_model()
-        # `flash_decode` selects Megatron Inference's deprecated static-batching decode path,
-        # which would cause an assertion error if taken.
-        gen_model.config.flash_decode = False
         if self.is_generation_colocated and self.inference_model is None:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
@@ -568,13 +706,19 @@ class MegatronGenerationMixin:
                 and self._forward_pre_hook_enabled()
             ):
                 self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
-            gen_model = self.model
 
         # Colocated reshard (hosts without a dedicated inference model skip it).
         if self.inference_model is not None:
             self._reshard_into_inference_model()
 
-        lang_module = unwrap_model(gen_model)
+        inference_model, media_model = self._inference_model_and_media_parts()
+        # `flash_decode` selects Megatron Inference's deprecated static-batching decode path,
+        # which would cause an assertion error if taken.
+        inference_model.config.flash_decode = False
+        lang_module = unwrap_model(inference_model)
+        graph_module = unwrap_model(
+            media_model if media_model is not None else inference_model
+        )
         lang_module.eval()
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
@@ -585,7 +729,9 @@ class MegatronGenerationMixin:
 
         cuda_graph_impl = mcore_generation_config["cuda_graph_impl"]
         if cuda_graph_impl != "none":
-            toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
+            # Use the same root object as _setup_colocated_cuda_graph_managers;
+            # CUDA-graph manager caches are keyed by model identity.
+            toggle_cuda_graphs(graph_module, set_to=cuda_graph_impl)
 
         # tags=["weights"] means we are inside refit_policy_generation between
         # suspend_for_refit and the weight transfer — the engine was intentionally
@@ -606,7 +752,11 @@ class MegatronGenerationMixin:
         return self.base_url
 
     def _build_sampling_params(
-        self, greedy: bool, stop_words: Optional[list[str]]
+        self,
+        greedy: bool,
+        stop_words: Optional[list[str]],
+        *,
+        return_prompt_tokens: bool = False,
     ) -> SamplingParams:
         """Build mcore SamplingParams for a single request."""
         top_k_cfg = self.cfg["generation"]["top_k"]
@@ -626,6 +776,7 @@ class MegatronGenerationMixin:
             num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
             termination_id=self.megatron_tokenizer.eod,
             stop_words=stop_words,
+            return_prompt_tokens=return_prompt_tokens,
         )
 
     def _merge_stop_strings(
@@ -641,10 +792,26 @@ class MegatronGenerationMixin:
                     stop_set.update(sample_ss)
         return list(stop_set) if stop_set else None
 
+    def _sample_vision_tensors(self, data, index: int):
+        """Return one sample's vision tensors from RL PackedTensors."""
+        return sample_vision_tensors(data, index)
+
+    def _build_prompt_and_multimodal_data(self, data, index: int):
+        """Build one pre-expanded token prompt and optional MCore media payload."""
+        return build_prompt_and_multimodal_data(
+            data,
+            index,
+            sample_tensors=self._sample_vision_tensors,
+            supports_modality=lambda modality: self._wrapper_supports_modality(
+                self._get_megatron_inference_wrapper_cls(),
+                modality,
+            ),
+        )
+
     def _prepare_data_for_generation(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, list[SamplingParams]]:
-        """Build the prompt tensors and a per-request SamplingParams for each sample."""
+    ) -> tuple[list[list[int]], list[Optional[Any]], list[SamplingParams]]:
+        """Build prompts, optional media payloads, and sampling parameters."""
         if data is not None:
             assert isinstance(data, BatchedDataDict), (
                 f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -657,21 +824,29 @@ class MegatronGenerationMixin:
                     f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
                 )
 
-        prompt_tokens_tensor = data["input_ids"].cuda()
-        prompt_lengths_tensor = data["input_lengths"]
-
         batch_stop_strings = data.get("stop_strings", [])
+        prompts: list[list[int]] = []
+        multi_modal_data_list: list[Optional[Any]] = []
         sampling_params = []
-        for i in range(prompt_tokens_tensor.size(0)):
+        for i in range(data.size):
+            prompt, multi_modal_data = self._build_prompt_and_multimodal_data(data, i)
             sample_stop_strings = (
                 batch_stop_strings[i] if i < len(batch_stop_strings) else None
             )
             stop_words = self._merge_stop_strings(
                 [sample_stop_strings] if sample_stop_strings else None
             )
-            sampling_params.append(self._build_sampling_params(greedy, stop_words))
+            prompts.append(prompt)
+            multi_modal_data_list.append(multi_modal_data)
+            sampling_params.append(
+                self._build_sampling_params(
+                    greedy,
+                    stop_words,
+                    return_prompt_tokens=multi_modal_data is not None,
+                )
+            )
 
-        return prompt_tokens_tensor, prompt_lengths_tensor, sampling_params
+        return prompts, multi_modal_data_list, sampling_params
 
     def _parse_result_to_batched_data_dict(
         self,
@@ -684,6 +859,22 @@ class MegatronGenerationMixin:
         batch_size = input_ids.size(0)
         max_gen_seq_len = max(len(x.generated_tokens) for x in result)
         padded_input_length = input_ids.size(1)
+
+        expected_prompt_lengths = [int(length) for length in input_lengths.tolist()]
+        inference_prompt_lengths = [
+            len(x.prompt_tokens)
+            if getattr(x, "prompt_tokens", None) is not None
+            else expected_prompt_lengths[i]
+            for i, x in enumerate(result)
+        ]
+        if any(getattr(x, "prompt_tokens", None) is not None for x in result):
+            if inference_prompt_lengths != expected_prompt_lengths:
+                raise RuntimeError(
+                    "Megatron inference prompt lengths do not match the training "
+                    "processor input lengths: "
+                    f"inference={inference_prompt_lengths}, "
+                    f"training={expected_prompt_lengths}."
+                )
 
         max_seq_len = padded_input_length + max_gen_seq_len
         output_ids_padded = torch.full(
@@ -707,9 +898,10 @@ class MegatronGenerationMixin:
         )
         for i in range(batch_size):
             # Take the prompt from the request we submitted rather than from the
-            # engine's reply: mcore only echoes prompt_tokens back when
-            # SamplingParams.return_prompt_tokens is set, and asking for them would
-            # ship the whole prompt over ZMQ for data we already hold.
+            # engine's reply. Multimodal requests do set
+            # SamplingParams.return_prompt_tokens, but only so the echoed tokens
+            # can be length-checked below; the padded output is still built from
+            # the prompt we already hold rather than shipped back over ZMQ.
             prompt_len = input_lengths[i].item()
             generated_tokens = result[i].generated_tokens
             seq_len = prompt_len + len(generated_tokens)
@@ -754,7 +946,7 @@ class MegatronGenerationMixin:
                 - generation_lengths: Lengths of each response
                 - unpadded_sequence_lengths: Lengths of each input + generated sequence
         """
-        prompt_tokens_tensor, prompt_lengths_tensor, sampling_params = (
+        prompts, multi_modal_data_list, sampling_params = (
             self._prepare_data_for_generation(data, greedy)
         )
         if self._inference_loop is None:
@@ -763,8 +955,8 @@ class MegatronGenerationMixin:
             )
         future = asyncio.run_coroutine_threadsafe(
             self._generate_with_persistent_engine(
-                prompt_tokens_tensor,
-                prompt_lengths_tensor,
+                prompts,
+                multi_modal_data_list,
                 sampling_params,
             ),
             self._inference_loop,
@@ -794,13 +986,13 @@ class MegatronGenerationMixin:
             index: int,
         ) -> tuple[int, BatchedDataDict[GenerationOutputSpec]]:
             datum = data.get_batch(index, 1)
-            prompt_tokens_tensor, prompt_lengths_tensor, sampling_params = (
+            prompts, multi_modal_data_list, sampling_params = (
                 self._prepare_data_for_generation(datum, greedy)
             )
             future = asyncio.run_coroutine_threadsafe(
                 self._generate_with_persistent_engine(
-                    prompt_tokens_tensor,
-                    prompt_lengths_tensor,
+                    prompts,
+                    multi_modal_data_list,
                     sampling_params,
                 ),
                 self._inference_loop,
@@ -817,8 +1009,8 @@ class MegatronGenerationMixin:
 
     async def _generate_with_persistent_engine(
         self,
-        prompt_tokens_tensor: torch.Tensor,
-        prompt_lengths_tensor: torch.Tensor,
+        prompts: list[list[int]],
+        multi_modal_data_list: list[Optional[Any]],
         sampling_params: list[SamplingParams],
     ) -> list:
         """Submit requests through the persistent inference client (rank 0 only)."""
@@ -829,17 +1021,18 @@ class MegatronGenerationMixin:
             "Only rank 0 creates a client to communicate with the coordinator"
         )
 
-        print(
-            f"[Rank {dist_rank}] Submitting {prompt_tokens_tensor.size(0)} requests to coordinator"
-        )
+        print(f"[Rank {dist_rank}] Submitting {len(prompts)} requests to coordinator")
 
         futures = []
-        for prompt_tokens, prompt_len, request_sampling_params in zip(
-            prompt_tokens_tensor, prompt_lengths_tensor, sampling_params, strict=True
+        for prompt, multi_modal_data, request_sampling_params in zip(
+            prompts, multi_modal_data_list, sampling_params, strict=True
         ):
-            prompt = prompt_tokens[: prompt_len.item()].tolist()
             futures.append(
-                self.inference_client.add_request(prompt, request_sampling_params)
+                self.inference_client.add_request(
+                    prompt,
+                    request_sampling_params,
+                    multi_modal_data=multi_modal_data,
+                )
             )
 
         results: list[DynamicInferenceRequest] = await asyncio.gather(*futures)

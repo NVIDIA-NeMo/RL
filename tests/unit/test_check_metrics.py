@@ -21,7 +21,15 @@ import pytest
 tests_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(tests_dir))
 
-from check_metrics import evaluate_check, max, mean, median, min, ratio_above
+from check_metrics import (
+    all_finite,
+    evaluate_check,
+    max,
+    mean,
+    median,
+    min,
+    ratio_above,
+)
 
 
 class TestMeanFunction:
@@ -158,6 +166,18 @@ class TestMinMaxFunctions:
         data = {"1": "5.5", "2": "2.2", "3": "8.8"}
         result = max(data)
         assert result == 8.8
+
+
+class TestAllFiniteFunction:
+    def test_requires_at_least_one_value(self):
+        assert all_finite({}) is False
+
+    @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+    def test_rejects_non_finite_values(self, invalid):
+        assert all_finite({"1": 1.0, "2": invalid}) is False
+
+    def test_accepts_finite_numeric_strings(self):
+        assert all_finite({"1": "1.0", "2": "-2.5"}) is True
 
 
 class TestRatioAboveFunction:
@@ -305,6 +325,14 @@ class TestEvaluateCheck:
         passed, _, value = evaluate_check(data, "ratio_above(data['error'], 1.5) < 0.3")
         assert passed is False
         assert value == 0.4
+
+    def test_evaluate_check_with_all_finite(self):
+        passed, _, value = evaluate_check(
+            {"loss": {"1": 1.0, "2": 0.5}},
+            'all_finite(data["loss"])',
+        )
+        assert passed is True
+        assert value is True
 
 
 class TestRealWorldScenarios:
