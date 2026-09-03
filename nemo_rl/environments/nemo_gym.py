@@ -232,13 +232,6 @@ class NemoGymConfig(TypedDict):
 # model call, so the TQ sample id IS the capture key end to end.
 _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
-# Gym's ``RolloutCollectionHelper.run_examples`` stamps every raw ``/run`` result
-# with its wall-clock latency under this private key (Gym #2790). Gym's own
-# config-driven collection path pops it again (``_attach_ng_perf``) before a
-# result is surfaced; NeMo-RL consumes the low-level iterator, so it must do
-# the same or the stamp is aggregated into a nondeterministic
-# ``<agent>/_ng_rollout_latency_ms/*`` metric family.
-_NG_ROLLOUT_LATENCY_MS_KEY = "_ng_rollout_latency_ms"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 # Mirrors nemo_gym.token_id_capture.staging.records.UNCOMMITTED_CALL_REASON:
@@ -246,15 +239,6 @@ _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 # reason for an admitted call that finished without worker coordinates (no
 # completion was ever served for it).
 _UNCOMMITTED_CALL_REASON = "request_finished_without_staged_coordinates"
-
-
-def drop_gym_private_result_keys(result: dict[str, Any]) -> None:
-    """Remove Gym-internal bookkeeping stamps from a raw ``/run`` result.
-
-    Mutates ``result`` in place. Only ``_ng_rollout_latency_ms`` is dropped; the
-    other ``_ng_*`` keys are protocol fields NeMo-RL reads on purpose.
-    """
-    result.pop(_NG_ROLLOUT_LATENCY_MS_KEY, None)
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -671,8 +655,6 @@ Depending on your data shape, you may want to change these values."""
                         # the whole point. The status and message are already in `detail`.
                         raise typed from None
                     raise
-
-            drop_gym_private_result_keys(nemo_gym_result)
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 if self._token_capture_enabled:
