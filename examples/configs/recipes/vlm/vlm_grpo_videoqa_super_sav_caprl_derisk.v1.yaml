@@ -81,7 +81,11 @@ policy:
   hf_config_overrides:
     video_temporal_patch_size: 2
     video_target_num_patches: 1024
-    video_maintain_aspect_ratio: true
+    # vLLM's video preprocessing resolves the square isqrt grid regardless of
+    # this flag (verified: 672x384 frames rolled out at 256 tokens/tubelet =
+    # 16x16, while aspect-preserving static preprocessing produced 252 =
+    # 21x12). Rollout tokens are the trajectory, so match them.
+    video_maintain_aspect_ratio: false
   tokenizer:
     name: ${policy.model_name}
     chat_template: default
@@ -188,7 +192,8 @@ data:
   default:
     num_frames: 64
     video_target_num_patches: 1024
-    video_maintain_aspect_ratio: true
+    # Must match vLLM's actual grid; see policy.hf_config_overrides note.
+    video_maintain_aspect_ratio: false
 
 env:
   should_log_nemo_gym_responses: false
