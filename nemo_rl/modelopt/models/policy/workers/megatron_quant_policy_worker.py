@@ -20,6 +20,7 @@ import os
 import warnings
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import ray
@@ -152,6 +153,39 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             self.zmq_socket.setsockopt(zmq.SNDTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
             self.zmq_socket.setsockopt(zmq.RCVTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
 
+    def _iter_synchronized_real_quant_refit_params(self, kv_scales=None):
+        """Keep policy ranks aligned before each collective export advance."""
+        params = iter(self._iter_params_with_optional_kv_scales(kv_scales))
+        while True:
+            if self._real_quant_refit_sync_group is not None:
+                torch.distributed.monitored_barrier(
+                    group=self._real_quant_refit_sync_group,
+                    timeout=timedelta(milliseconds=MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS),
+                    wait_all_ranks=True,
+                )
+            try:
+                yield next(params)
+            except StopIteration:
+                return
+
+    @torch.no_grad()
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes=0, kv_scales=None) -> None:
+        """Synchronize lazy real-quant export independently of IPC batches."""
+        if not self._use_real_quant_refit():
+            return super().stream_weights_via_ipc_zmq(buffer_size_bytes, kv_scales)
+
+        self.maybe_init_zmq()
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=self._iter_synchronized_real_quant_refit_params(kv_scales),
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self),
+        )
+
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""
         megatron_cfg = config.get("megatron_cfg", {}) or {}
@@ -182,6 +216,18 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         )
         self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
         super().__init__(config, *args, **kwargs)
+
+        # ModelOpt export is lazy and enters model-parallel NCCL collectives.
+        # IPC backpressure is rank-local, so synchronize exporter advancement
+        # on CPU before any rank can enter the next collective.
+        self._real_quant_refit_sync_group = (
+            torch.distributed.new_group(
+                backend="gloo",
+                timeout=timedelta(milliseconds=MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS),
+            )
+            if self._use_real_quant_refit() and torch.distributed.get_world_size() > 1
+            else None
+        )
 
         if hasattr(self, "reference_state_dict"):
             for name, item in self.model.state_dict().items():

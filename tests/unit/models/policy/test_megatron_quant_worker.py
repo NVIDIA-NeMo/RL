@@ -461,11 +461,14 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
 def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
     monkeypatch,
 ):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
     from nemo_rl.models.policy import utils as policy_utils
 
     worker = _make_real_quant_worker()
     worker.zmq_socket = object()
+    worker._real_quant_refit_sync_group = object()
     calls = []
+    events = []
 
     monkeypatch.setattr(worker, "maybe_init_zmq", lambda: calls.append("init_zmq"))
 
@@ -473,6 +476,22 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
         raise AssertionError("stream_weights_via_ipc_zmq should not move the model")
 
     monkeypatch.setattr(worker, "move_model", fail_move_model)
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker.torch.distributed,
+        "monitored_barrier",
+        lambda **kwargs: events.append(("barrier", kwargs)),
+    )
+
+    def export_params(kv_scales=None):
+        events.append(("export", "weight"))
+        yield "model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)
+
+    monkeypatch.setattr(
+        worker,
+        "_iter_params_with_optional_kv_scales",
+        export_params,
+    )
 
     def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
         calls.append(kwargs)
@@ -492,6 +511,7 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
     assert calls[1]["buffer_size_bytes"] == 123
     assert calls[1]["zmq_socket"] is worker.zmq_socket
     assert calls[1]["rank"] == 0
+    assert [event[0] for event in events] == ["barrier", "export", "barrier"]
 
 
 @requires_weight_folding
