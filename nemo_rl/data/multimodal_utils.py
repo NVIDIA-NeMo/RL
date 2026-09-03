@@ -19,9 +19,9 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Optional, Union
 
 import requests
@@ -40,7 +40,6 @@ AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
     {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
-NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
@@ -51,6 +50,8 @@ MEDIA_TAGS = {
     "video-audio": "<video-audio>",
 }
 MEDIA_TAGS_REVERSED = {v: k for k, v in MEDIA_TAGS.items()}
+CACHED_VIDEO_FRAME_MANIFEST_MAGIC = b"NEMO_RL_CACHED_VIDEO_FRAMES_V1\n"
+CACHED_VIDEO_FRAME_MANIFEST_MIME = "video/x-nemo-rl-cached-frames"
 
 DEFAULT_MEDIA_EXTENSIONS = {
     "image": ["png", "jpeg", "jpg", "img"],
@@ -890,24 +891,25 @@ def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{encoded}"
 
 
-def _encode_single_image_source(source: str) -> str:
-    """Resolve and encode one image source."""
-    image = resolve_to_image(source)
-    try:
-        data_url = image_to_data_url(image)
-    finally:
-        image.close()
-    return data_url
+def get_responses_content_part_url(part: dict[str, Any], *keys: str) -> str:
+    """Return a string media source from a Responses/Chat content part."""
+    for key in keys:
+        value = part.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("path")
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
-def extract_input_image_sources_from_responses_messages(
+def extract_input_media_sources_from_responses_messages(
     messages: Any,
-) -> list[str | Image.Image]:
-    """Extract image sources from Responses-API messages in encounter order."""
+) -> list[tuple[str, Any]]:
+    """Extract tagged image and video sources in encounter order."""
     if not isinstance(messages, list):
         return []
 
-    sources: list[str | Image.Image] = []
+    sources: list[tuple[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -917,24 +919,37 @@ def extract_input_image_sources_from_responses_messages(
         for part in content:
             if not isinstance(part, dict):
                 continue
-            if part.get("type") not in ("input_image", "image", "image_url"):
+            part_type = part.get("type")
+            if part_type in IMAGE_CONTENT_TYPES:
+                media_type = "image"
+                source = part.get("image") or part.get("image_url") or part.get("url")
+            elif part_type in VIDEO_CONTENT_TYPES:
+                media_type = "video"
+                source = part.get("video") or part.get("video_url") or part.get("url")
+            else:
                 continue
-            source = part.get("image") or part.get("image_url") or part.get("url")
             if isinstance(source, dict):
-                source = source.get("url")
+                source = source.get("url") or source.get("path")
+            # Skip non-str/non-Image sources: callers hand these straight to
+            # `resolve_to_image`, which would raise on e.g. an int `image_url`.
             if isinstance(source, (str, Image.Image)):
-                sources.append(source)
+                sources.append((media_type, source))
     return sources
 
 
-def extract_input_images_from_responses_messages(
-    messages: Any,
-) -> list[Image.Image]:
-    """Load images from Responses-API input messages in encounter order."""
-    return [
-        resolve_to_image(source)
-        for source in extract_input_image_sources_from_responses_messages(messages)
-    ]
+def media_sources_equal(
+    left: tuple[str, Any],
+    right: tuple[str, Any],
+) -> bool:
+    """Compare tagged media by string value or object identity."""
+    if left[0] != right[0]:
+        return False
+    left_source, right_source = left[1], right[1]
+    return (
+        left_source == right_source
+        if isinstance(left_source, str) and isinstance(right_source, str)
+        else left_source is right_source
+    )
 
 
 def _materialize_ragged_pixel_values(
@@ -1042,82 +1057,41 @@ def attach_image_model_inputs_to_message(
     )
 
 
-def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
-    """Replace local image paths in NeMo Gym examples with base64 data URLs.
+_VIDEO_EXT_TO_MIME = {
+    ".mp4": "mp4",
+    ".m4v": "mp4",
+    ".mov": "quicktime",
+    ".webm": "webm",
+    ".mkv": "x-matroska",
+    ".avi": "x-msvideo",
+}
 
-    Walks each example's ``responses_create_params.input[].content[]`` items,
-    collects local image references, encodes each unique source once using a
-    bounded thread pool, and rewrites every corresponding image part with the
-    resulting base64 ``data:`` URL. Parts whose URL already starts with
-    ``http://``, ``https://``, or ``data:`` are left untouched. Malformed items
-    (non-dict entries, missing/empty URLs, non-list ``input``/``content``) are
-    skipped without raising.
 
-    The examples are mutated in place; the same list is also returned for
-    convenience so callers can chain the call.
+def video_path_to_data_url(video_path: str) -> str:
+    """Inline a local or ``file://`` video as a base64 data URL."""
+    if video_path.startswith("data:"):
+        return video_path
 
-    Args:
-        nemo_gym_examples: List of NeMo Gym example dicts. Each example is
-            expected to contain a ``responses_create_params`` mapping with an
-            ``input`` list of Responses API messages.
+    resolved = (
+        video_path.removeprefix("file://")
+        if video_path.startswith("file://")
+        else str(Path(video_path).expanduser().resolve())
+    )
+    path = Path(resolved)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Video path resolved to {resolved!r}, which does not exist."
+        )
 
-    Returns:
-        The same ``nemo_gym_examples`` list, with local image references
-        rewritten to base64 data URLs in place.
-    """
-    targets_by_source: dict[str, list[tuple[dict, str]]] = {}
-
-    for example in nemo_gym_examples:
-        input_items = example.get("responses_create_params", {}).get("input", [])
-        if not isinstance(input_items, list):
-            continue
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if (
-                    not isinstance(part, dict)
-                    or part.get("type") not in IMAGE_CONTENT_TYPES
-                ):
-                    continue
-                media_key = next(
-                    (key for key in ("image_url", "image", "url") if key in part),
-                    None,
-                )
-                if media_key is None:
-                    continue
-                url = part.get(media_key)
-                if isinstance(url, dict):
-                    url = url.get("url") or url.get("path") or ""
-                if not isinstance(url, str) or not url:
-                    continue
-                if url.startswith(("http://", "https://", "data:")):
-                    continue
-                targets_by_source.setdefault(url, []).append((part, media_key))
-
-    sources = list(targets_by_source)
-    if sources:
-        with ThreadPoolExecutor(
-            max_workers=NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
-        ) as executor:
-            encoded_by_source = dict(
-                zip(
-                    sources,
-                    executor.map(_encode_single_image_source, sources),
-                    strict=True,
-                )
-            )
-
-        # Keep payload mutation on the caller thread after worker-owned images
-        # have been closed and every unique source has been encoded.
-        for source, targets in targets_by_source.items():
-            data_url = encoded_by_source[source]
-            for part, media_key in targets:
-                part[media_key] = data_url
-    return nemo_gym_examples
+    ext = path.suffix.lower()
+    mime = _VIDEO_EXT_TO_MIME.get(ext)
+    if mime is None:
+        raise ValueError(
+            f"Unsupported video extension {ext!r} for {resolved!r}. "
+            f"Supported: {sorted(_VIDEO_EXT_TO_MIME)}."
+        )
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:video/{mime};base64,{encoded}"
 
 
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:

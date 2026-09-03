@@ -163,6 +163,7 @@ fi
 # Port layout (all below ephemeral floor at 9000). Python port-range bounds
 # are half-open: [low, high).
 #   1200-1201    Ray GCS + client server (head only)
+#   [1202, 1300) SingleController generation router (driver-local allocation)
 #   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
 #   1313-1399    Dynamo etcd/NATS control plane (driver-local allocation)
 #   1400-1999    Master address / TCPStore (cluster.master_port_range_low/high)
