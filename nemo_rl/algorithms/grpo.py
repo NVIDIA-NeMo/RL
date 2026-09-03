@@ -461,9 +461,11 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
             "grpo.deduplicate_multimodal_data=true is currently qualified "
             "only with policy.generation.backend=vllm."
         )
-    # The data plane carries deduplicated payloads: ``PackedTensor.to_wire``
-    # emits one wire row per *logical* row and walks segments under dedup, so
-    # the wire format itself is not the constraint. The one gap is NeMo-Gym:
+    # The data plane accepts deduplicated payloads, so the wire format is not
+    # the constraint -- but note what dedup buys there. ``to_wire`` emits one
+    # row per *logical* row, so a shared segment is concatenated once per
+    # generation: the saving is in driver RAM (the deepcopy memo), not in wire
+    # or TQ-storage bytes, which stay O(G x images). The one gap is NeMo-Gym:
     # ``grpo_train_sync`` does not call
     # ``attach_initial_nemo_gym_image_payloads``, which supplies the initial
     # image tensors a Gym dataset omits from ``extra_env_info``. That helper is

@@ -128,27 +128,32 @@ def _assert_rows_equal(got: list, want: list[torch.Tensor]) -> None:
 
 
 # --------------------------------------------------------------------------
-# No backend needed: pin why we do not hand torch.nested a ragged field.
+# No backend needed: pin the torch.nested constraint that makes ``to_wire``
+# flatten each segment to 1-D before building the jagged value.
 # --------------------------------------------------------------------------
 
 
 def test_jagged_rejects_nonuniform_trailing_dims() -> None:
-    """The single constraint that forces ``pad_to_max_shape``.
+    """Why ``to_wire`` flattens rather than handing rows over as-is.
 
-    ``torch.jagged`` allows exactly one ragged dim; every other dim must
-    agree across rows. ``PackedTensor.to_wire`` pads H/W up to the
-    batch max purely to satisfy this -- padding that then travels over
-    the wire and into the store.
+    ``torch.jagged`` allows exactly one ragged dim; every other dim must agree
+    across rows, so these rows cannot be a nested value in their natural shape.
+    Flattening each segment to 1-D moves all the variation onto dim 0, which is
+    what makes the encoding total -- and it is why nothing has to be padded to
+    satisfy the container. ``test_arbitrary_shape_rows_roundtrip[ragged_trailing]``
+    is the same rows going through the real encoder.
     """
     with pytest.raises((RuntimeError, TypeError)):
         torch.nested.as_nested_tensor(ROWS_RAGGED_TRAILING, layout=torch.jagged)
 
 
 def test_jagged_rejects_mixed_rank() -> None:
-    """Why ``to_wire`` raises on mixed rank rather than padding.
+    """Same constraint, the case padding could never have solved.
 
-    No amount of padding reconciles rank 2 with rank 3, which is why
-    image-beside-video in one field is currently unrepresentable.
+    No amount of padding reconciles rank 2 with rank 3, so image-beside-video in
+    one field is unrepresentable in a nested value built from natural shapes.
+    ``to_wire`` carries it anyway because 1-D rows have no rank to disagree on
+    -- see ``test_to_wire_carries_mixed_rank_rows``.
     """
     with pytest.raises((RuntimeError, TypeError)):
         torch.nested.as_nested_tensor(ROWS_MIXED_RANK, layout=torch.jagged)
