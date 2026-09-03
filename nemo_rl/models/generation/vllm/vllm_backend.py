@@ -1739,8 +1739,9 @@ class VllmInternalWorkerExtension:
         # Finalize post-load weight processing: dense Linear + attention/MLA,
         # the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that the
         # canonical [gate; up] bulk write above defers to here, and the MTP
-        # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
-        # are finalized by the lifecycle on exit.
+        # drafter's mirror of the same. The BF16 TRTLLM nccl_reshard path
+        # rejects FP8 KV cache above because its static scales are outside this
+        # targeted MoE lifecycle.
         finalize()
 
         torch.cuda.empty_cache()
