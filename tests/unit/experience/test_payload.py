@@ -14,11 +14,13 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
+    REWARD_COMPONENTS_TAG,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
@@ -44,6 +46,7 @@ def _completion(
     with_routes: bool = True,
     mask_sample: bool | None = None,
     truncated: bool = False,
+    reward_components: dict[str, float] | None = None,
 ) -> Completion:
     message_log = [
         {
@@ -79,6 +82,7 @@ def _completion(
         env_extras=env_extras,
         truncated=truncated,
         reward=reward,
+        reward_components=reward_components,
     )
 
 
@@ -216,6 +220,64 @@ def test_record_to_train_batch_preserves_clean_masks_when_enabled() -> None:
 
     assert not train_batch[INVALID_TOOL_CALL_MASK].any()
     assert not train_batch[MALFORMED_THINKING_MASK].any()
+
+
+def test_record_to_train_batch_packs_named_reward_components() -> None:
+    train_batch = record_to_train_batch(
+        _record(
+            [
+                _completion(
+                    route_start=10,
+                    reward=3.0,
+                    reward_components={"style": 2.0, "correctness": 1.0},
+                ),
+                _completion(
+                    route_start=30,
+                    reward=4.0,
+                    reward_components={"correctness": 4.0},
+                ),
+            ]
+        ),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+        require_reward_components=True,
+    )
+
+    _, fields, tags = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+    assert "reward_components" not in fields
+    assert [tag[REWARD_COMPONENTS_TAG] for tag in tags] == [
+        '{"correctness":1.0,"style":2.0}',
+        '{"correctness":4.0}',
+    ]
+
+
+@pytest.mark.parametrize(
+    "reward_components",
+    [None, {"correctness": 1.0}],
+)
+def test_record_to_train_batch_rejects_insufficient_gdpo_components(
+    reward_components: dict[str, float] | None,
+) -> None:
+    with pytest.raises(ValueError, match="at least two named reward components"):
+        record_to_train_batch(
+            _record(
+                [
+                    _completion(
+                        route_start=10,
+                        reward=1.0,
+                        reward_components=reward_components,
+                    )
+                ]
+            ),
+            pad_value_dict={"token_ids": 0, "input_ids": 0},
+            include_message_violation_fields=False,
+            require_reward_components=True,
+        )
 
 
 def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:

@@ -46,8 +46,14 @@ def _stub_record_to_train_batch(
     *,
     pad_value_dict: Any,
     include_message_violation_fields: bool,
+    require_reward_components: bool,
 ) -> BatchedDataDict[Any]:
-    del record, pad_value_dict, include_message_violation_fields
+    del (
+        record,
+        pad_value_dict,
+        include_message_violation_fields,
+        require_reward_components,
+    )
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),

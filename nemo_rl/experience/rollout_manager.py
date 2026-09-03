@@ -449,6 +449,8 @@ class AsyncRolloutImpl:
         task_name = input_sample["task_name"]
 
         total_reward = 0.0
+        reward_components: dict[str, float] | None = None
+        scalar_reward_seen = False
         turn_count = 0
         # token statistics
         total_token_count = 0
@@ -535,11 +537,37 @@ class AsyncRolloutImpl:
                     calculate_rewards, sample_batch, self._task_to_env
                 )
 
-            # Update reward and termination statistics
-            # Multi-reward isn't supported in RolloutManager now, see
-            # https://github.com/NVIDIA-NeMo/RL/issues/2625 for more details.
-            assert isinstance(env_output.rewards, torch.Tensor)
-            total_reward += float(env_output.rewards[0].item())
+            # Update reward and termination statistics. Keep component identity
+            # across turns so GDPO can standardize every objective separately.
+            if isinstance(env_output.rewards, dict):
+                if not env_output.rewards:
+                    raise ValueError("multi-reward environment returned no components")
+                if scalar_reward_seen:
+                    raise ValueError(
+                        "environment mixed scalar and component rewards across turns"
+                    )
+                turn_components = {
+                    name: float(value[0].item())
+                    for name, value in env_output.rewards.items()
+                }
+                if reward_components is None:
+                    reward_components = {name: 0.0 for name in sorted(turn_components)}
+                elif set(turn_components) != set(reward_components):
+                    raise ValueError(
+                        "multi-reward component names changed across turns: "
+                        f"expected {sorted(reward_components)}, got {sorted(turn_components)}"
+                    )
+                assert reward_components is not None
+                for name, value in turn_components.items():
+                    reward_components[name] = reward_components.get(name, 0.0) + value
+                total_reward += sum(turn_components.values())
+            else:
+                if reward_components is not None:
+                    raise ValueError(
+                        "environment mixed component and scalar rewards across turns"
+                    )
+                scalar_reward_seen = True
+                total_reward += float(env_output.rewards[0].item())
             terminated = env_output.terminateds[0].item()
             env_obs_content = env_output.observations[0]["content"]
             tokenized_obs = self._tokenizer(
@@ -591,6 +619,7 @@ class AsyncRolloutImpl:
             env_extras=current_extra_env_info,
             truncated=truncated,
             reward=total_reward,
+            reward_components=reward_components,
         )
         sample_metrics = {
             "turn_count": turn_count,
@@ -1049,6 +1078,11 @@ class AsyncNemoGymRolloutImpl:
         self, results: list[dict]
     ) -> tuple[list[Completion], dict[str, int]]:
         """Apply configured penalties and convert a Gym result batch."""
+        from nemo_rl.environments.nemo_gym import (
+            extract_reward_components,
+            validate_reward_components_match_scalar,
+        )
+
         for result in results:
             _tensorize_by_key(result["message_log"], "token_ids")
             _tensorize_by_key(
@@ -1064,6 +1098,9 @@ class AsyncNemoGymRolloutImpl:
                 )
 
         penalty_counts = apply_reward_penalties(results, self._reward_penalty_config)
+        validate_reward_components_match_scalar(
+            [result["full_result"] for result in results]
+        )
         completions = []
         for result in results:
             truncated = (
@@ -1076,6 +1113,7 @@ class AsyncNemoGymRolloutImpl:
                     env_extras=result["full_result"],
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
+                    reward_components=extract_reward_components(result["full_result"]),
                 )
             )
         return completions, penalty_counts

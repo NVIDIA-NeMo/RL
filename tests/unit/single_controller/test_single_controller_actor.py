@@ -41,7 +41,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+from nemo_rl.data_plane.schema import REWARD_COMPONENTS_TAG, ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -1074,6 +1074,76 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     )
     logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
     torch.testing.assert_close(logged, torch.full((4,), 0.1))
+
+
+def test_gdpo_advantage_stage_reconstructs_named_reward_columns() -> None:
+    batch_size, sequence_length = 2, 3
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([1.5, 2.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    captured_repeated_batch: dict[str, torch.Tensor] = {}
+
+    class _GDPORecordingEstimator:
+        def compute_advantage(self, *, repeated_batch, mask, **kwargs):
+            del kwargs
+            captured_repeated_batch.update(repeated_batch)
+            return torch.zeros_like(mask)
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = _GDPORecordingEstimator()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._gdpo_enabled = True
+    ctrl._algo_cfg = SimpleNamespace(
+        seq_logprob_error_threshold=None,
+        overlong_filtering=False,
+    )
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "num_mask_sample_filtered": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a", "b"],
+        fields=list(data.keys()),
+        tags=[
+            {REWARD_COMPONENTS_TAG: '{"correctness":1.0,"style":0.5}'},
+            {REWARD_COMPONENTS_TAG: '{"correctness":2.0}'},
+        ],
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    assert data_plane.selected_fields is not None
+    assert "reward_components" not in data_plane.selected_fields
+    assert torch.equal(
+        captured_repeated_batch["reward/correctness"], torch.tensor([1.0, 2.0])
+    )
+    assert torch.equal(
+        captured_repeated_batch["reward/style"], torch.tensor([0.5, 0.0])
+    )
+    assert torch.equal(
+        captured_repeated_batch["total_reward"], torch.tensor([1.5, 2.0])
+    )
 
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:

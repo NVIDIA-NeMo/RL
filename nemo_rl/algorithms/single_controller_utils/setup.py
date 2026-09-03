@@ -1417,6 +1417,9 @@ def setup_single_controller(
             or algo_cfg.malformed_thinking_advantage is not None
         ),
         require_routed_experts=router_replay_enabled(policy_config),
+        require_reward_components=(
+            not is_ppo_run(master_config) and algo_cfg.adv_estimator.name == "gdpo"
+        ),
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,

@@ -903,6 +903,7 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
+        assert actor_args.tq_buffer._require_reward_components is False
         actor_args.dp_client.register_partition.assert_called_once()
         warmup = actor_args.dp_client.register_partition.call_args.kwargs
         assert warmup["partition_id"] == "rollout_data"
@@ -992,6 +993,14 @@ class TestSetup:
         actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.tq_buffer._require_routed_experts is True
+
+    def test_gdpo_requires_reward_components_in_tq_buffer(self, patched_factories):
+        mc = _make_master_config()
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.tq_buffer._require_reward_components is True
 
     def test_env_handles_sourced_from_setup_response_data(self, patched_factories):
         """setup_response_data receives master_config.env and supplies env handles."""
