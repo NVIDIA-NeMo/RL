@@ -48,6 +48,19 @@ class TopkLogitsOutputSpec(TypedDict):
     topk_indices: torch.Tensor
 
 
+class TeacherFullPayloadOutputSpec(TypedDict):
+    """Sampled-token logprobs plus the full-vocabulary MOPD teacher payload.
+
+    ``teacher_full_payload`` is ``[B, S, hidden_size]`` or ``[B, S, vocab_size]``
+    depending on ``on_policy_distillation.full.teacher_payload``. It is ``None``
+    off the last pipeline stage: the payload is far too large to broadcast, so
+    only the stage that produced it writes it back.
+    """
+
+    logprobs: torch.Tensor
+    teacher_full_payload: Optional[torch.Tensor]
+
+
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 

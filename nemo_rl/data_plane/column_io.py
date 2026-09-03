@@ -41,6 +41,7 @@ from nemo_rl.data_plane.schema import (
     GLOBAL_FORWARD_PAD_SEQLEN,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
+    OPD_FULL_FIELDS,
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -52,6 +53,7 @@ TOKEN_ALIGNED_FIELDS = frozenset(
         "prev_logprobs",
         "reference_policy_logprobs",
         "teacher_reference_logprobs",
+        *OPD_FULL_FIELDS,
         "advantages",
         "returns",
         "values",
