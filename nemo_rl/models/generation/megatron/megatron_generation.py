@@ -155,8 +155,8 @@ class MegatronGeneration(GenerationInterface):
         ):
             raise ValueError(
                 "policy.generation.backend='megatron' requires the Megatron trainer "
-                "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron reshard "
-                "collective from the Megatron trainer."
+                "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron reshard; "
+                "colocated generation shares the training policy's worker group."
             )
 
         mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[

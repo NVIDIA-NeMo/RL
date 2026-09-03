@@ -46,6 +46,7 @@ from nemo_rl.experience.failures import (
 )
 from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
+    RequestDeadlineRegistry,
     RolloutManager,
     RolloutRetryPolicy,
     RolloutStats,
@@ -147,6 +148,7 @@ def _make_impl(
     impl._max_rollout_turns = max_turns
     impl._policy_generation = generation
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
+    impl._deadline_registry = None
     return impl
 
 
@@ -531,6 +533,7 @@ def _make_gym_impl(
     impl._max_seq_len = 128
     impl._max_rollout_turns = 1
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
+    impl._deadline_registry = None
     impl._max_gym_row_attempts = row_attempts
     # Real counters by default so row-level re-dispatches are observable; production
     # shares the owning RolloutManager's instance.
@@ -807,3 +810,46 @@ class TestClassifyGenerationFailure:
         for exc in (ConnectionResetError("x"), AssertionError("y")):
             out = _classify_generation_failure(exc, prompt_idx=0, traj_idx=0)
             assert isinstance(out, RolloutFailure)
+
+
+def test_request_deadlines_pause_while_the_engine_is_stood_down():
+    """One flow through the stand-down credit's whole contract: suspend banks
+    each live deadline's remaining budget and disarms it; a deadline entered
+    mid-suspension starts disarmed with its full budget banked; a disabled
+    (None) deadline is untouched; resume re-arms every clock at now + banked.
+    Then the counter-case: the credit pauses expiry, it never disables it."""
+    registry = RequestDeadlineRegistry()
+
+    async def credit_flow() -> None:
+        loop = asyncio.get_running_loop()
+        async with _Deadline(1.0, "generation turn", registry=registry) as live:
+            await asyncio.sleep(0.2)
+            registry.suspend()
+            assert live._timeout is not None and live._timeout.when() is None
+            banked = live._remaining
+            assert banked is not None and 0.0 < banked <= 0.8
+            async with _Deadline(0.2, "generation turn", registry=registry) as late:
+                # Entered while suspended: disarmed, full budget banked.
+                assert late._timeout is not None and late._timeout.when() is None
+                assert late._remaining == pytest.approx(0.2, abs=0.05)
+                async with _Deadline(None, "generation turn", registry=registry) as off:
+                    assert off._remaining is None  # disabled: nothing to bank
+                # Wall clock far past both budgets: nothing fires while frozen.
+                await asyncio.sleep(1.2)
+                registry.resume()
+                assert live._timeout.when() == pytest.approx(
+                    loop.time() + banked, abs=0.05
+                )
+                await asyncio.sleep(0.05)  # well inside both banked budgets
+
+    asyncio.run(credit_flow())
+
+    async def expiry_still_fires() -> None:
+        async with _Deadline(0.2, "generation turn", registry=registry):
+            registry.suspend()
+            await asyncio.sleep(0.4)  # frozen: outlives the whole budget
+            registry.resume()
+            await asyncio.sleep(0.6)  # burns through the banked ~0.2s
+
+    with pytest.raises(RolloutTimeout, match="generation turn exceeded"):
+        asyncio.run(expiry_still_fires())

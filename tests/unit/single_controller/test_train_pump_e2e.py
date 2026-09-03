@@ -301,12 +301,15 @@ def test_train_pump_drives_mcore_training_step(
             sync_weights=lambda *, kv_scales=None: None,
         )
         adv_est = _FakeAdvEstimator()
-        # Rollout manager stub — SC.__init__ only touches ._tq_buffer.
+        # Rollout manager stub — SC.__init__ only touches ._tq_buffer; the pump
+        # additionally publishes versions and resumes request-deadline clocks.
         rollout_manager = SimpleNamespace(
             _tq_buffer=None,
             set_weight_version=lambda v: ray.get(
                 log.record.remote("set_weight_version", {"version": int(v)})
             ),
+            suspend_request_deadlines=lambda: None,
+            resume_request_deadlines=lambda: None,
         )
 
         master_config = MasterConfig.model_construct(
@@ -353,7 +356,13 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         actor_args = SingleControllerActorArgs(
-            gen_handle=None,
+            # Continuous-serving stub: the pump asks blocks_training() before
+            # every step's trainer GPU work.
+            gen_handle=SimpleNamespace(
+                blocks_training=lambda: False,
+                snapshot_step_metrics=lambda: None,
+                get_step_metrics=lambda: {},
+            ),  # type: ignore[arg-type]
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,  # type: ignore[arg-type]

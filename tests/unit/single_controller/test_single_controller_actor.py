@@ -466,6 +466,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=False,
@@ -493,6 +494,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=True,
@@ -1065,23 +1067,31 @@ class _FullStepSampler(_OneThenEmptySampler):
 
 
 class _ChunkedSampler(_EmptySampler):
-    """Assembles one step out of several single-group chunks, then goes empty.
+    """Assembles one step out of ``chunks`` selects, then goes empty.
 
-    This is the shape the streaming path actually produces and the reason
-    ``keep_train_buffers`` exists: every chunk after the first runs against an
-    already-open train step.
+    Single-group chunks are the shape the streaming path actually produces and
+    the reason ``keep_train_buffers`` exists: every chunk after the first runs
+    against an already-open train step. ``groups_per_chunk`` covers the blocking
+    (colocated) shape, where the whole step arrives as one multi-group chunk.
+    ``select_bounds`` records the (min, max) the pump asked for on each select.
     """
 
-    def __init__(self, meta: KVBatchMeta, chunks: int) -> None:
+    def __init__(
+        self, meta: KVBatchMeta, chunks: int, groups_per_chunk: int = 1
+    ) -> None:
         self._meta = meta
         self._remaining = chunks
+        self._groups_per_chunk = groups_per_chunk
+        self.select_bounds: list[tuple[int, int]] = []
 
     async def select(self, **kwargs):
-        del kwargs
+        self.select_bounds.append(
+            (kwargs["min_prompt_groups"], kwargs["max_prompt_groups"])
+        )
         if self._remaining == 0:
             return None, 0
         self._remaining -= 1
-        return self._meta, 1
+        return self._meta, self._groups_per_chunk
 
 
 class _SequenceSampler(_EmptySampler):
@@ -1126,13 +1136,28 @@ class _NoOpTrainer:
 
 
 class _LpRecordingTrainer(_NoOpTrainer):
-    """Records the ``keep_train_buffers`` flag the pump passes on each chunk."""
+    """Records ``keep_train_buffers`` flags and the per-chunk call order.
 
-    def __init__(self) -> None:
+    ``calls`` may be shared with other doubles so a test can assert the
+    interleaving (e.g. the engine stand-down against trainer GPU work).
+    """
+
+    def __init__(self, calls: list[object] | None = None) -> None:
         self.keep_train_buffers_calls: list[bool] = []
+        self.calls: list[object] = [] if calls is None else calls
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         self.keep_train_buffers_calls.append(keep_train_buffers)
+        self.calls.append("lp_inference_prep")
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("prepare_for_training")
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
+        self.calls.append("train")
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         del meta
@@ -1232,6 +1257,9 @@ class _StepMetricRecordingGeneration:
         if method == self._dies_in:
             raise ActorDiedError()
 
+    def blocks_training(self) -> bool:
+        return False
+
     def snapshot_step_metrics(self) -> None:
         self._record("snapshot_step_metrics")
 
@@ -1292,12 +1320,18 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
     ctrl._value_loss_fn = None
+    # Continuous-serving default; the pump asks before every step's trainer work.
     ctrl._gen = SimpleNamespace(
         requires_kv_scale_sync=False,
+        blocks_training=lambda: False,
         snapshot_step_metrics=lambda: None,
         get_step_metrics=lambda: {},
     )
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=MagicMock(),
+        suspend_request_deadlines=MagicMock(),
+        resume_request_deadlines=MagicMock(),
+    )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
@@ -1739,13 +1773,26 @@ def test_train_pump_skips_generation_metrics_without_generation_handle(
     assert "vllm/spec_acceptance_rate" not in train_metrics
 
 
-def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
-    """The logprob detour between chunks must not offload the trainer's grad
-    buffers, because mcore's offload frees the gradients the earlier chunks of
-    this step accumulated rather than copying them out.
+@pytest.mark.parametrize(
+    "engine_blocks_training", [False, True], ids=["streaming", "blocking"]
+)
+def test_train_pump_chunked_step_by_engine_regime(
+    monkeypatch, engine_blocks_training
+) -> None:
+    """One step, observed under both engine regimes.
 
-    First chunk: no step open yet, nothing to preserve, so the offload is still
-    worth taking. Every later chunk: step open, buffers must stay resident.
+    Streaming: the step arrives as two single-group chunks. The engine is
+    never stood down, the rollout gate stays open, and the configured
+    streaming minimum reaches the sampler. The logprob detour between chunks
+    must not offload the trainer's grad buffers — mcore's offload frees the
+    gradients earlier chunks accumulated rather than copying them out. First
+    chunk: no step open, the offload is worth taking; later chunks: buffers
+    stay resident.
+
+    Blocking (colocated Megatron): setup pins min_groups_for_streaming_train
+    == num_prompts_per_step, so the pump demands the whole step from the
+    sampler (min == max) and it arrives as one chunk; the gate is closed and
+    the engine slept exactly once, before any trainer GPU work.
     """
     meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -1755,20 +1802,59 @@ def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> No
         sequence_lengths=[1],
         tags=[{"weight_version": 0}],
     )
-    # num_prompts_per_step is 2 in the harness, so two single-group chunks close
-    # the step.
-    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    # num_prompts_per_step is 2 in the harness: two single-group chunks close
+    # the streaming step, one two-group chunk the blocking one.
+    sampler = (
+        _ChunkedSampler(meta, chunks=1, groups_per_chunk=2)
+        if engine_blocks_training
+        else _ChunkedSampler(meta, chunks=2)
+    )
+    ctrl = _train_pump_controller(sampler=sampler)
+    if engine_blocks_training:
+        # Mirror the colocated setup invariant the config validator enforces.
+        ctrl._async_cfg.min_groups_for_streaming_train = 2
     ctrl._policy_logprobs_required = True
-    trainer = _LpRecordingTrainer()
+    calls: list[object] = []
+
+    def _finish_generation() -> None:
+        calls.append(("finish_generation", ctrl._rollout_permitted.is_set()))
+
+    trainer = _LpRecordingTrainer(calls)
     ctrl._trainer = trainer
-    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        blocks_training=lambda: engine_blocks_training,
+        finish_generation=_finish_generation,
+        snapshot_step_metrics=lambda: None,
+        get_step_metrics=lambda: {},
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._train_steps == 1
-    assert trainer.keep_train_buffers_calls == [False, True]
+    chunk = ["lp_inference_prep", "prepare_for_training", "train"]
+    if engine_blocks_training:
+        # Stood down exactly once, with the gate already closed, before the
+        # trainer touched the GPUs; the whole step then ran as one chunk. The
+        # (mocked) post-step _sync_weights reopens the gate.
+        assert calls == [("finish_generation", False)] + chunk
+        assert trainer.keep_train_buffers_calls == [False]
+        assert not ctrl._rollout_permitted.is_set()
+        assert sampler.select_bounds == [(2, 2)]
+        # Frozen requests' deadline clocks pause with the engine.
+        ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
+    else:
+        assert calls == chunk * 2
+        assert trainer.keep_train_buffers_calls == [False, True]
+        assert ctrl._rollout_permitted.is_set()
+        assert sampler.select_bounds[0] == (1, 2)
+        ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
 
 
 def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
@@ -1989,12 +2075,18 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("ppo_epochs", [1, 2])
+@pytest.mark.parametrize(
+    "engine_blocks_training", [False, True], ids=["streaming", "blocking"]
+)
 def test_train_pump_freezes_the_policy_during_critic_warmup(
-    monkeypatch, capsys, ppo_epochs
+    monkeypatch, capsys, ppo_epochs, engine_blocks_training
 ) -> None:
     """Below policy_training_start_step the critic trains alone: no optimizer
     step, and no weight transfer to generation either. The frozen policy does
-    not shorten the critic's own epoch loop."""
+    not shorten the critic's own epoch loop. A blocking (colocated) engine is
+    the one exception on the sync: it was stood down at step start and its
+    wake rides the sync, so the sync runs for the wake alone -- a reshard of
+    the frozen weights."""
     critic_ppo_epochs = 3
     meta = _single_group_meta()
     ctrl, value = _ppo_train_pump_controller(
@@ -2003,6 +2095,20 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
         ppo_epochs=ppo_epochs,
         critic_ppo_epochs=critic_ppo_epochs,
     )
+    stand_downs: list[bool] = []
+    if engine_blocks_training:
+        ctrl._gen = SimpleNamespace(
+            requires_kv_scale_sync=False,
+            blocks_training=lambda: True,
+            wake_carries_weight_updates=lambda: True,
+            finish_generation=lambda: stand_downs.append(
+                ctrl._rollout_permitted.is_set()
+            ),
+            snapshot_step_metrics=lambda: None,
+            get_step_metrics=lambda: {},
+        )
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
     trainer = MagicMock(spec=_NoOpTrainer)
     ctrl._trainer = trainer
     ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
@@ -2014,7 +2120,15 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
-    ctrl._sync_weights.assert_not_awaited()
+    if engine_blocks_training:
+        # Stood down once per step (not per epoch), with the gate already
+        # closed; the sync (mocked -- the real one reopens the gate) is the wake.
+        assert stand_downs == [False]
+        ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
+        ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    else:
+        ctrl._sync_weights.assert_not_awaited()
+        ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
     # The step still closed and published the new version, so staleness
     # accounting keeps working through the warmup.
     assert ctrl._train_steps == 1

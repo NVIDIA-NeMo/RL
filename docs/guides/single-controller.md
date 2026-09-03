@@ -25,7 +25,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       enabled: true
     ```
 
-2. **Pick a generation backend** and **disable colocated inference** (setup rejects `colocated.enabled: true`). With vLLM, enable the async engine (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
+2. **Pick a generation backend**. With vLLM, **disable colocated inference** (setup rejects `colocated.enabled: true` for every backend except Megatron) and enable the async engine (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
 
     ```yaml
     policy:
@@ -40,7 +40,8 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 4  # inference GPUs; remainder go to training
     ```
 
-    Megatron generation is also supported, non-colocated only. It requires the Megatron trainer (`policy.megatron_cfg.enabled: true`) and NeMo-Gym rollouts additionally require `policy.generation.mcore_generation_config.expose_http_server: true`. The exemplar — a NeMo-Gym run with the OpenAI server exposed — lives at [examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml](../../examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml):
+    Megatron generation is also supported, colocated or non-colocated. It requires the Megatron trainer (`policy.megatron_cfg.enabled: true`) and NeMo-Gym rollouts additionally require `policy.generation.mcore_generation_config.expose_http_server: true`. Colocated (`colocated.enabled: true`) additionally requires `async_rl.min_groups_for_streaming_train == num_prompts_per_step`: the engine stands down for the whole train step, so each step must be assembled as one full batch before training takes the GPUs. Per-request deadlines (`generation_timeout_s`, `rollout_timeout_s`) exclude the time the engine is stood down: in-flight requests freeze with their clocks suspended, and the clocks resume on the post-step wake.
+    The non-colocated exemplar — a NeMo-Gym run with the OpenAI server exposed — lives at [examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml](../../examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml); the colocated exemplar at [examples/configs/grpo_math_1B_megatron_generation_colocated_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_generation_colocated_single_controller.yaml):
 
     ```yaml
     policy:
@@ -51,7 +52,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
         mcore_generation_config:
           expose_http_server: true  # required for NeMo-Gym rollouts
         colocated:
-          enabled: false
+          enabled: false  # set true for colocated (no resources split needed)
           resources:
             num_nodes: 1
             gpus_per_node: 1  # inference GPUs; remainder go to training
@@ -238,7 +239,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: vLLM and Megatron generation are supported; SGLang and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes); SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported.

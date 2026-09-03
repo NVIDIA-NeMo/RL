@@ -5,6 +5,10 @@ logger:
     name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron_generation-noncolocated-single-controller-sync
 checkpointing:
   checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron_generation-noncolocated-single-controller-sync
+async_rl:
+  sampler:
+    max_lookahead_versions: 4
+  max_buffered_rollouts: 160
 policy:
   generation:
     backend: megatron

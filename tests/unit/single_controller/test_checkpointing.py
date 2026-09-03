@@ -103,18 +103,6 @@ _PARTITION_ID = "rollout_data"
 # ── fakes ────────────────────────────────────────────────────────────────────
 
 
-class _FakeGeneration:
-    """Generation stand-in for train-pump tests that do not run rollouts."""
-
-    requires_kv_scale_sync = False
-
-    def snapshot_step_metrics(self) -> None:
-        pass
-
-    def get_step_metrics(self) -> dict[str, float]:
-        return {}
-
-
 class _FakeTrainer:
     """TQPolicy stand-in: train methods are no-ops, save_checkpoint records calls."""
 
@@ -355,10 +343,42 @@ class _BlockingDPClient(_FakeDPClient):
         super().save_checkpoint(checkpoint_dir, metadata=metadata)
 
 
+class _FakeGeneration:
+    """Generation stand-in. Continuous-serving by default; given an ``events``
+    list it plays the colocated engine: blocks training, records the
+    stand-down/wake choreography, and its wake carries the weight update."""
+
+    requires_kv_scale_sync = False
+
+    def __init__(self, events: Optional[list[str]] = None) -> None:
+        self._events = events
+
+    def blocks_training(self) -> bool:
+        return self._events is not None
+
+    def snapshot_step_metrics(self) -> None:
+        pass
+
+    def get_step_metrics(self) -> dict[str, float]:
+        return {}
+
+    def wake_carries_weight_updates(self) -> bool:
+        return True
+
+    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        self._events.append("finish_generation")  # type: ignore[union-attr]
+        return True
+
+    def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
+        self._events.append("wake")  # type: ignore[union-attr]
+        return True
+
+
 class _FakeWeightSynchronizer:
-    def __init__(self) -> None:
+    def __init__(self, events: Optional[list[str]] = None) -> None:
         self.sync_count = 0
         self.shutdown_count = 0
+        self._events = events
 
     @property
     def is_stale(self) -> bool:
@@ -366,20 +386,56 @@ class _FakeWeightSynchronizer:
         return self.sync_count == 0
 
     def sync_weights(self, *, kv_scales: Any = None) -> None:
+        if self._events is not None:
+            self._events.append("sync")
         self.sync_count += 1
 
     def shutdown(self) -> None:
         self.shutdown_count += 1
 
 
+class _RefitRecordingTrainer(_FakeTrainer):
+    """Records the offload calls the deferred-wake save path makes."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+        self.gate_open_during_save: list[bool] = []
+        self._gate_probe: Optional[Callable[[], bool]] = None
+
+    def set_gate_probe(self, probe: Callable[[], bool]) -> None:
+        self._gate_probe = probe
+
+    def offload_before_refit(self) -> None:
+        self._events.append("offload_before_refit")
+
+    def offload_after_refit(self) -> None:
+        self._events.append("offload_after_refit")
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        self._events.append("save")
+        if self._gate_probe is not None:
+            self.gate_open_during_save.append(self._gate_probe())
+        super().save_checkpoint(**kwargs)
+
+
 class _FakeRolloutManager:
-    def __init__(self) -> None:
+    def __init__(self, events: Optional[list[str]] = None) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
         self.recovery_ledger = RolloutRecoveryLedger()
+        self._events = events
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def suspend_request_deadlines(self) -> None:
+        if self._events is not None:
+            self._events.append("suspend_deadlines")
+
+    def resume_request_deadlines(self) -> None:
+        if self._events is not None:
+            self._events.append("resume_deadlines")
 
 
 class _FakeTQBuffer:
@@ -547,6 +603,9 @@ def _actor_master_config(
 def _make_actor_args(
     *,
     trainer: Optional[_FakeTrainer] = None,
+    gen: Optional[Any] = None,
+    weight_synchronizer: Optional[_FakeWeightSynchronizer] = None,
+    rollout_manager: Optional[Any] = None,
     save_state: Optional[GRPOSaveState] = None,
     dataloader: Optional[_FakeDataloader] = None,
     tq_buffer: Optional[_FakeTQBuffer] = None,
@@ -555,17 +614,23 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
-        gen_handle=_FakeGeneration(),
+        gen_handle=gen if gen is not None else _FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]
         inference_cluster=None,  # type: ignore[arg-type]
         dp_client=dp_client if dp_client is not None else _FakeDPClient(),
         dataloader=dataloader if dataloader is not None else _FakeDataloader(),
-        weight_synchronizer=_FakeWeightSynchronizer(),  # type: ignore[arg-type]
+        weight_synchronizer=(  # type: ignore[arg-type]
+            weight_synchronizer
+            if weight_synchronizer is not None
+            else _FakeWeightSynchronizer()
+        ),
         advantage_estimator=None,
         loss_fn=object(),  # type: ignore[arg-type]
-        rollout_manager=_FakeRolloutManager(),  # type: ignore[arg-type]
+        rollout_manager=(  # type: ignore[arg-type]
+            rollout_manager if rollout_manager is not None else _FakeRolloutManager()
+        ),
         tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),  # type: ignore[arg-type]
         partition_id=_PARTITION_ID,
         save_state=(
@@ -875,6 +940,105 @@ class TestSaveTrigger:
         assert (ckpt_dir / "step_2" / "policy" / "weights").is_dir()
         assert (ckpt_dir / "step_2" / "policy" / "optimizer").is_dir()
         assert (ckpt_dir / "step_4" / "policy" / "tokenizer").is_dir()
+
+    @pytest.mark.parametrize(
+        ("mc_kwargs", "expected_steps", "expected_dirs", "expected_events"),
+        [
+            pytest.param(
+                dict(max_num_steps=4, save_period=2),
+                4,
+                {"step_2", "step_4"},
+                [
+                    # step 1: freeze the request clocks, then stand down; the
+                    # plain wake inside _sync_weights resumes the clocks at its
+                    # tail.
+                    "suspend_deadlines",
+                    "finish_generation",
+                    "sync",
+                    "resume_deadlines",
+                    # step 2: save-bound — no sync; the wake is deferred past the save.
+                    "suspend_deadlines",
+                    "finish_generation",
+                    "offload_before_refit",
+                    "save",
+                    "offload_after_refit",
+                    "wake",
+                    "resume_deadlines",
+                    # step 3: back to the plain shape.
+                    "suspend_deadlines",
+                    "finish_generation",
+                    "sync",
+                    "resume_deadlines",
+                    # step 4: save on the last step — no wake; the clocks stay
+                    # suspended into teardown.
+                    "suspend_deadlines",
+                    "finish_generation",
+                    "offload_before_refit",
+                    "save",
+                ],
+                id="periodic_saves",
+            ),
+            pytest.param(
+                dict(
+                    max_num_steps=4,
+                    save_period=100,
+                    checkpoint_must_save_by="00:00:00:00",
+                ),
+                1,
+                {"step_1"},
+                # The timeout latch fires on step 1: stood-down save, no wake.
+                [
+                    "suspend_deadlines",
+                    "finish_generation",
+                    "offload_before_refit",
+                    "save",
+                ],
+                id="timeout_save_exits",
+            ),
+        ],
+    )
+    def test_blocking_engine_stays_down_through_saves(
+        self, tmp_path, mc_kwargs, expected_steps, expected_dirs, expected_events
+    ):
+        """Save-bound steps defer the blocking engine's wake past the save.
+
+        periodic_saves: four steps, save_period=2. Non-save steps wake through
+        the synchronizer as usual; the step-2 save runs against a stood-down
+        engine and a closed gate (offload_before_refit replaces the sync, and
+        offload_after_refit + wake follow the save); the step-4 save is on the
+        last step, so the wake is skipped and the gate stays closed for
+        teardown.
+
+        timeout_save_exits: checkpoint_must_save_by fires the one-shot timeout
+        latch on step 1. The save runs stood-down like any deferred save, the
+        wake is skipped because the loop is about to exit, and the loop really
+        does exit -- pinning that loop_will_exit's timeout arm agrees with the
+        loop's actual break.
+        """
+        mc = _actor_master_config(tmp_path, **mc_kwargs)
+        events: list[str] = []
+        trainer = _RefitRecordingTrainer(events)
+        gen = _FakeGeneration(events)
+        synchronizer = _FakeWeightSynchronizer(events)
+
+        actor = _run_train_pump(
+            mc,
+            _make_actor_args(
+                trainer=trainer,
+                gen=gen,
+                weight_synchronizer=synchronizer,
+                rollout_manager=_FakeRolloutManager(events),
+            ),
+            seed=lambda actor: trainer.set_gate_probe(actor._rollout_permitted.is_set),
+        )
+
+        assert actor._train_steps == expected_steps
+        assert _step_dir_names(tmp_path / "checkpoints") == expected_dirs
+        assert events == expected_events
+        # The gate was closed during every save and never reopened after the
+        # final one (run()'s teardown cancels the pumps, so nothing hangs).
+        assert trainer.gate_open_during_save == [False] * len(expected_dirs)
+        assert not actor._rollout_permitted.is_set()
 
     def test_last_step_saves_off_period_boundary(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=3, save_period=2)

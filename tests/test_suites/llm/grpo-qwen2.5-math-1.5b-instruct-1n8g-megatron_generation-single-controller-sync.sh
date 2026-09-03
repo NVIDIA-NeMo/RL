@@ -4,8 +4,8 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-# Megatron Inference decodes slower than the vLLM twin (which runs 450 steps
-# in 240 minutes); size like the classic megatron_generation nightlies.
+# Colocated twin of the non-colocated SC Megatron-generation nightly; sized
+# identically (training and generation alternate on the same 8 GPUs).
 STEPS_PER_RUN=50
 MAX_STEPS=50
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up

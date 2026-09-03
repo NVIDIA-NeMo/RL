@@ -2204,6 +2204,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     manager = object.__new__(AsyncNemoGymRolloutImpl)
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
+    manager._deadline_registry = None
     manager._max_gym_row_attempts = 1
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
@@ -2282,6 +2283,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
     manager = object.__new__(AsyncNemoGymRolloutImpl)
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
+    manager._deadline_registry = None
     manager._max_gym_row_attempts = 1
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
