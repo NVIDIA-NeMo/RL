@@ -1774,6 +1774,83 @@ def test_native_rollout_groups_match_whole_batch(monkeypatch):
     )
 
 
+def test_run_async_nemo_gym_rollout_cancels_blocked_remote_stream(monkeypatch):
+    stream_started = asyncio.Event()
+    cancelled_streams = []
+
+    class _BlockingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            stream_started.set()
+            await asyncio.Event().wait()
+
+    rollout_stream = _BlockingStream()
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, rows, timer_prefix, deduplicate_multimodal_data):
+            del rows, timer_prefix, deduplicate_multimodal_data
+            return rollout_stream
+
+    class _PolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 128}}
+
+    monkeypatch.setattr(rollouts_mod.ray, "cancel", cancelled_streams.append)
+
+    async def _cancel_blocked_rollout():
+        async def _consume():
+            async for _ in run_async_nemo_gym_rollout(
+                policy_generation=_PolicyGeneration(),
+                input_batch=BatchedDataDict(
+                    {
+                        "extra_env_info": [
+                            {
+                                "agent_ref": {"name": "agent"},
+                                "responses_create_params": {},
+                            }
+                        ]
+                    }
+                ),
+                tokenizer=None,
+                task_to_env={
+                    "nemo_gym": type(
+                        "_Environment",
+                        (),
+                        {"run_rollouts": _RunRolloutsRemote()},
+                    )()
+                },
+                generation_config={
+                    "stop_strings": [],
+                    "stop_token_ids": [],
+                    "top_k": None,
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
+                    "max_new_tokens": 32,
+                },
+                num_generations=1,
+                log_full_result_tables=False,
+            ):
+                pytest.fail("blocked rollout unexpectedly yielded")
+
+        task = asyncio.create_task(_consume())
+        await asyncio.wait_for(stream_started.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_cancel_blocked_rollout())
+
+    assert cancelled_streams == [rollout_stream]
+
+
 def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     """Prompt groups are yielded in completion order using async iteration."""
 
