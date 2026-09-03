@@ -1817,7 +1817,13 @@ class SingleControllerActor:
                         )
 
                     if groups_dispatched == 0 and self._gen is not None:
-                        await asyncio.to_thread(self._gen.snapshot_step_metrics)
+                        # Raise here for observability.
+                        try:
+                            await asyncio.to_thread(self._gen.snapshot_step_metrics)
+                        except RayActorError as error:
+                            log.warning(
+                                "Skipping generation snapshot metrics: %s", error
+                            )
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
@@ -2032,9 +2038,12 @@ class SingleControllerActor:
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
                 if self._gen is not None:
-                    step_metrics.update(
-                        await asyncio.to_thread(self._gen.get_step_metrics)
-                    )
+                    try:
+                        step_metrics.update(
+                            await asyncio.to_thread(self._gen.get_step_metrics)
+                        )
+                    except RayActorError as error:
+                        log.warning("Skipping generation step metrics: %s", error)
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
