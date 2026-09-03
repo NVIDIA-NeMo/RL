@@ -18,19 +18,13 @@ source "$SCRIPT_DIR/common-tq.env"
 export EXP_NAME="$TQ_EXP_NAME"
 bash "$SCRIPT_DIR/$BASE_RECIPE.sh" "$@"
 
-# TQ-specific gate, on top of the base recipe's own reward check.
+# No TQ-specific gate: turning the data plane on must not change what the recipe
+# is held to, so this wrapper passes exactly when the base recipe's own
+# max(train/reward) > 0.5 passes.
 #
-# token_mult_prob_error compares rollout logprobs against prev_logprobs, both
-# computed over the images, so it detects a wire round-trip that alters pixel
-# data. Measured 1.0129-1.0155 on the automodel sibling across nine runs
-# spanning the legacy (data_plane.enabled=false) path, both backends and four
-# wire formats -- a 0.0026 spread, which is why the 1.02 bound is loose enough
-# not to flake and tight enough to catch corruption.
-#
-# probs_ratio is NOT gated here: this recipe takes several inner steps per
-# rollout, so the ratio measures policy drift rather than data fidelity. Its max
-# ranged 2.32-29.21 across runs of identical code, with the no-data-plane
-# control in the same spread.
-source "$SCRIPT_DIR/common.env"
-uv run tests/check_metrics.py "$JSON_METRICS" \
-    'max(data["train/token_mult_prob_error"]) < 1.02'
+# An earlier version added 'max(train/token_mult_prob_error) < 1.02', a bound
+# taken from the automodel sibling (measured 1.0129-1.0155 there). It does not
+# transfer to this recipe: the legacy control -- same node count, same sequence
+# length, data_plane.enabled=false -- measured 1.035-1.063 across nine steps
+# (job 17686235), so the gate would fail the no-data-plane path too. A check
+# that the control cannot pass is testing the backend, not the data plane.
