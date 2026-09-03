@@ -335,7 +335,11 @@ def validate_and_prepare_config(
     # compute dtype instead. See https://github.com/NVIDIA-NeMo/RL/issues/2865.
     optimizer_cfg = config.get("optimizer") or {}
     optimizer_kwargs = optimizer_cfg.get("kwargs") or {}
-    optimizer_keeps_fp32_master = bool(optimizer_kwargs.get("master_weights", False))
+    optimizer_keeps_fp32_master = (
+        optimizer_cfg.get("name")
+        == "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam"
+        and optimizer_kwargs.get("master_weights") is True
+    )
     model_load_dtype = dtype if optimizer_keeps_fp32_master else torch.float32
 
     # Load model config
