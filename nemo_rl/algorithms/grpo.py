@@ -4447,7 +4447,7 @@ def _raise_if_collector_stopped(
         else "collector errored"
     )
     recovery_advice = (
-        "Increase data.train.max_num_epochs or use a larger dataset."
+        "Increase grpo.max_num_epochs or use a larger dataset."
         if collector_status["data_exhausted"]
         else "Inspect the preceding trajectory collector error."
     )
