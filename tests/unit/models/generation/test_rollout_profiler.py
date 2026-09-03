@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
+from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.profiling import load_rollout_profiler
 
 
@@ -47,6 +48,23 @@ class _FakeRolloutProfiler:
         pass
 
 
+class _NonProfilingGeneration(GenerationInterface):
+    def init_collective(self, *args, **kwargs):
+        return []
+
+    def generate(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def prepare_for_generation(self, *args, **kwargs):
+        return True
+
+    def finish_generation(self, *args, **kwargs):
+        return True
+
+    def shutdown(self):
+        return True
+
+
 @pytest.fixture
 def fake_profiler_module():
     module_name = "nemo_rl_test_rollout_profiler"
@@ -68,6 +86,14 @@ def test_rollout_profiler_is_disabled_without_class_path():
         assert load_rollout_profiler(rank=3) is None
 
     importer.assert_not_called()
+
+
+def test_generation_backend_has_explicit_disabled_profiler_capability():
+    generation = _NonProfilingGeneration()
+
+    assert generation.rollout_profiler_enabled is False
+    with pytest.raises(NotImplementedError):
+        generation.begin_rollout_profile(step_id=1)
 
 
 def test_rollout_profiler_loads_class_with_generation_rank(fake_profiler_module):

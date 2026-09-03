@@ -229,7 +229,7 @@ async def test_async_outer_worker_awaits_internal_profiler_lifecycle():
 )
 def test_generation_selects_engine_specific_profiler_rpc(async_engine, expected_method):
     generation = VllmGeneration.__new__(VllmGeneration)
-    generation.rollout_profiler_enabled = True
+    generation._rollout_profiler_enabled = True
     generation.cfg = {"vllm_cfg": {"async_engine": async_engine}}
     generation.worker_group = MagicMock()
     generation.shutdown = MagicMock()
