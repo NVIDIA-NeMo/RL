@@ -1,0 +1,77 @@
+defaults: ../../vlm_grpo_3B_megatron.yaml
+grpo:
+  num_prompts_per_step: 12
+  num_generations_per_prompt: 8
+  val_at_start: true
+  val_at_end: true
+  val_batch_size: 64
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/nemo-rl-omni/nemotron-omni-clevr-megatron-8n4g
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  is_vlm: true
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    env_vars:
+      TORCH_CUDA_ARCH_LIST: '10.0'
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    bias_activation_fusion: false
+    activation_checkpointing: true
+    optimizer:
+      exp_avg_dtype: bfloat16
+      exp_avg_sq_dtype: bfloat16
+      store_param_remainders: true
+  generation:
+    backend: megatron
+    max_new_tokens: 2048
+    bad_words: null
+    mcore_generation_config:
+      buffer_size_gb: 8
+      async_sched_mode: async
+      num_cuda_graphs: -1
+      use_cuda_graphs_for_non_decode_steps: false
+      max_tokens: ${policy.max_total_sequence_length}
+      transformer_impl: inference_optimized
+      activation_checkpointing: false
+      tensor_model_parallel_size: 8
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+      context_parallel_size: 1
+      sequence_parallel: true
+      moe_router_dtype: fp32
+      moe_pad_experts_for_cuda_graph_inference: false
+      mamba_inference_ssm_states_dtype: float32
+      mamba_inference_conv_states_dtype: float32
+      image_dynamic_resolution: true
+      logprobs_mode: raw_logprobs
+      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 6
+data:
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
+logger:
+  tensorboard_enabled: false
+  wandb:
+    project: nemo-rl-omni
+    name: nemotron-omni-clevr-megatron-8n4g
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

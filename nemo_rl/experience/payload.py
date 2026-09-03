@@ -27,7 +27,9 @@ from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
+    MASK_SAMPLE,
     ROUTED_EXPERTS_FIELD,
+    TRUNCATED,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
@@ -102,8 +104,9 @@ def record_to_train_batch(
             flags for configured advantage penalties.
 
     Returns:
-        BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
-        sample_mask, prompt_ids_for_adv, total_reward, violation counts, and optional
+        BatchedDataDict with input_ids, input_lengths, generation_logprobs,
+        token_mask, an all-ones sample_mask, the raw mask_sample and truncated
+        flags, prompt_ids_for_adv, total_reward, violation counts, and optional
         routed experts and message-violation masks.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
@@ -113,7 +116,10 @@ def record_to_train_batch(
         extract_initial_prompt_messages,
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-    from nemo_rl.experience.rollouts import backfill_missing_routed_experts
+    from nemo_rl.experience.rollouts import (
+        _mask_sample_flags,
+        backfill_missing_routed_experts,
+    )
 
     completions = record.completions
     n = len(completions)
@@ -146,6 +152,8 @@ def record_to_train_batch(
     total_reward = torch.tensor(
         [float(c.reward) for c in completions], dtype=torch.float32
     )
+    mask_sample = _mask_sample_flags(c.env_extras for c in completions)
+    truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
     sample_mask = torch.ones(n, dtype=torch.float32)
 
     train_data: dict[str, Any] = {
@@ -155,6 +163,8 @@ def record_to_train_batch(
         "token_mask": flat["token_loss_mask"],
         "sample_mask": sample_mask,
         "prompt_ids_for_adv": prompt_flat["token_ids"],
+        MASK_SAMPLE: mask_sample,
+        TRUNCATED: truncated,
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
     }
