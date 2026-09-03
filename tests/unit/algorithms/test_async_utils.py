@@ -1597,6 +1597,71 @@ class TestAsyncTrajectoryCollector:
         assert collector._rollout_profile_lock.acquire(blocking=False)
         collector._rollout_profile_lock.release()
 
+    def test_rollout_profiler_drain_does_not_cancel_settled_async_owner(
+        self, monkeypatch
+    ):
+        collector = self.create_local_collector()
+        self._enable_rollout_profiler(collector)
+        collector.running = True
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
+            1.0,
+        )
+        finish_started = threading.Event()
+        release_finish = threading.Event()
+        post_profile_work_completed = threading.Event()
+        owner_errors: list[BaseException] = []
+        drain_errors: list[BaseException] = []
+
+        def blocked_finish():
+            finish_started.set()
+            assert release_finish.wait(timeout=2.0)
+
+        collector.policy_generation.finish_rollout_profile.side_effect = blocked_finish
+
+        async def own_profile_window():
+            with collector._profile_rollout_batch(
+                generation_weight_version=1,
+                target_weight_version=2,
+            ):
+                pass
+            # Yield after releasing ownership. A stale queued cancellation must
+            # not escape the profile context and cancel this post-profile work.
+            await asyncio.sleep(0)
+            post_profile_work_completed.set()
+
+        def run_owner():
+            try:
+                asyncio.run(own_profile_window())
+            except BaseException as error:
+                owner_errors.append(error)
+
+        def drain():
+            try:
+                collector.drain_for_rollout_profiler_shutdown()
+            except BaseException as error:
+                drain_errors.append(error)
+
+        worker = threading.Thread(target=run_owner, name="settling-async-owner")
+        worker.start()
+        assert finish_started.wait(timeout=2.0)
+
+        drain_thread = threading.Thread(target=drain, name="profile-drain")
+        drain_thread.start()
+        assert collector._draining_for_profiler_shutdown.wait(timeout=2.0)
+        release_finish.set()
+        worker.join(timeout=2.0)
+        drain_thread.join(timeout=2.0)
+
+        assert not worker.is_alive()
+        assert not drain_thread.is_alive()
+        assert owner_errors == []
+        assert drain_errors == []
+        assert post_profile_work_completed.is_set()
+        collector.policy_generation.finish_rollout_profile.assert_called_once_with()
+        collector.policy_generation.abort_rollout_profile.assert_not_called()
+
     def test_rollout_profiler_drain_cancel_abort_failure_is_fatal(self, monkeypatch):
         collector = self.create_local_collector()
         self._enable_rollout_profiler(collector)
