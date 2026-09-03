@@ -779,6 +779,9 @@ def test_nemo_gym_reward_penalty_metrics_compute_fractional_rate():
 
 # ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
+# ---------------------------------------------------------------------------
+
+
 @pytest.fixture(scope="function")
 def single_multi_step_calculator_input_sample(rollout_tokenizer):  # noqa: F811
     """Returns a single DatumSpec prompt dict (problem 0) for AsyncRolloutManager tests."""

@@ -37,7 +37,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
@@ -987,17 +988,37 @@ class TestTQReplayBufferStateDict:
 
     def test_checkpoint_serialization_preserves_full_result_table(self):
         """Opt-in NeMo Gym tables remain usable after the torch checkpoint round trip."""
-        buf = _make_buffer(FakeDataPlaneClient())
-        _add_group(
-            buf,
-            weight=1,
-            rollout_metrics={
-                "agent/full_result": Table(
-                    columns=["Full result"],
-                    data=[['{"reward":1.0,"status":"completed"}']],
-                )
+        gym_impl = AsyncNemoGymRolloutImpl(
+            tokenizer=None,
+            task_to_env={},
+            num_generations_per_prompt=1,
+            max_seq_len=16,
+            max_rollout_turns=1,
+            generation_config={
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
             },
+            log_full_result_tables=True,
         )
+        rollout_metrics = gym_impl._compute_rollout_metrics(
+            [
+                Completion(
+                    message_log=[
+                        {"role": "user", "token_ids": [1]},
+                        {"role": "assistant", "token_ids": [2]},
+                    ],
+                    env_extras={"reward": 1.0, "status": "completed"},
+                    truncated=False,
+                    reward=1.0,
+                )
+            ],
+            "agent",
+        )
+        assert isinstance(rollout_metrics["agent/full_result"], Table)
+
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=1, rollout_metrics=rollout_metrics)
 
         payload = io.BytesIO()
         torch.save(buf.metadata_state_dict(saved_capacity=8), payload)
