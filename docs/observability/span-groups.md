@@ -89,7 +89,7 @@ The controlling group is shown for each; a span is only emitted when its group i
 | **Startup** (all algorithms) | `rl.startup` and, under it, `rl.setup.ray_init`, `rl.setup.tokenizer`, `rl.setup.data`, `rl.setup.nemo_gym_config`, `rl.setup.workers` — `setup` group; see [Startup](#startup-what-happens-before-the-first-step) |
 | **GRPO** (sync + async) | `rl.grpo.job`, `rl.grpo.step`, `rl.grpo.data_processing`, `rl.grpo.generation`, `rl.grpo.reward_calculation`, `rl.grpo.policy_and_reference_logprobs`, `rl.grpo.advantage_calculation`, `rl.grpo.policy_training`, `rl.grpo.checkpointing`, `rl.grpo.evaluate` |
 | **GRPO** (async only) | `rl.idle.buffer_starvation`, `rl.idle.refit_bubble` (driver) and `rl.idle.refit_event_wait`, `rl.idle.generation_limit_pause` (collector actor) — `efficiency` group; named after the `Timer` category, not the algorithm |
-| **GRPO** (async only) | `rl.grpo.generation` — `rollout` group, emitted by the collector actor, one span per rollout batch |
+| **GRPO / PPO** (async only) | `rl.grpo.generation` / `rl.ppo.generation` — `rollout` group, emitted by the collector actor, one span per rollout batch; the name follows the algorithm the collector was built for |
 | **PPO** | `rl.ppo.job`, `rl.ppo.step`, `rl.ppo.data_processing`, `rl.ppo.generation`, `rl.ppo.reward_calculation`, `rl.ppo.policy_and_reference_logprobs`, `rl.ppo.advantage_calculation`, `rl.ppo.policy_training`, `rl.ppo.value_training`, `rl.ppo.checkpointing`, `rl.ppo.evaluate` |
 | **SFT** | `rl.sft.job`, `rl.sft.step`, `rl.sft.data_processing`, `rl.sft.policy_training`, `rl.sft.checkpointing`, `rl.sft.evaluate` |
 | **DPO** | `rl.dpo.job`, `rl.dpo.step`, `rl.dpo.policy_training`, `rl.dpo.checkpointing`, `rl.dpo.evaluate` |
