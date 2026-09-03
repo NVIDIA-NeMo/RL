@@ -159,6 +159,18 @@ def split_nemo_gym_runtime_options(
     return options, gym_global_config
 
 
+def validate_nemo_gym_runtime_options(
+    options: NemoGymRuntimeOptions, *, enable_router_replay: bool
+) -> None:
+    """Reject incompatible NeMo-RL-owned Gym options."""
+    if options.truncate_noncontiguous_episodes and enable_router_replay:
+        raise ValueError(
+            "truncate_noncontiguous_episodes is not compatible with router replay: "
+            "the next contiguous prompt is required to repair the retained prefix's "
+            "final route."
+        )
+
+
 class NemoGymCompatibleConfig(Protocol):
     """Configuration fields required to select the NeMo Gym rollout path."""
 
@@ -1095,13 +1107,13 @@ Depending on your data shape, you may want to change these values."""
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
             )
-            if not is_contiguous and self.cfg.get("truncate_noncontiguous_episodes"):
+            if not is_contiguous and self.cfg["truncate_noncontiguous_episodes"]:
                 retained_prefix_has_routes = any(
                     message.get("routed_experts") is not None
                     for message in nemo_rl_message_log
                 )
                 if (
-                    self.cfg.get("require_routed_experts", False)
+                    self.cfg.get("require_routed_experts")
                     or retained_prefix_has_routes
                     or output_item_dict.get("routed_experts") is not None
                 ):
@@ -1458,12 +1470,9 @@ def build_nemo_gym_config(
     runtime_options, nemo_gym_dict = split_nemo_gym_runtime_options(
         dict(env_configs["nemo_gym"])
     )
-    if runtime_options.truncate_noncontiguous_episodes and enable_router_replay:
-        raise ValueError(
-            "truncate_noncontiguous_episodes is not compatible with router replay: "
-            "the next contiguous prompt is required to repair the retained prefix's "
-            "final route."
-        )
+    validate_nemo_gym_runtime_options(
+        runtime_options, enable_router_replay=enable_router_replay
+    )
 
     # Validate the shards block even though only single-actor creation is wired
     # up so far, so a malformed or premature sharded config fails at setup with
