@@ -176,7 +176,7 @@ class VllmGeneration(GenerationInterface):
             pipeline_parallel_size=self.pp_size,
             expert_parallel_size=self.ep_size,
         )
-        self.rollout_profiler_enabled = bool(rollout_profiler_class)
+        self._rollout_profiler_enabled = bool(rollout_profiler_class)
 
         assert cluster.world_size() % self.model_parallel_size == 0, (
             "World size must be a multiple of model parallel size. "
@@ -640,6 +640,11 @@ class VllmGeneration(GenerationInterface):
     def begin_rollout_profile(self, *, step_id: int | str) -> None:
         """Open one complete rollout on profiled workers."""
         self._run_rollout_profiler_rpc("begin_rollout_profile", step_id=step_id)
+
+    @property
+    def rollout_profiler_enabled(self) -> bool:
+        """Whether rollout profiling was selected for these vLLM workers."""
+        return self._rollout_profiler_enabled
 
     def finish_rollout_profile(self) -> None:
         """Close the current rollout on profiled workers."""

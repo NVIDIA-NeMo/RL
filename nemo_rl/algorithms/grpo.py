@@ -14,6 +14,7 @@
 import gc
 import json
 import os
+import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -167,6 +168,9 @@ from nemo_rl.weight_sync.factory import create_weight_synchronizer
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+# The collector's in-actor drain uses 30 seconds. Allow RPC scheduling and
+# serialization margin while ensuring a timeout returns before worker cleanup.
+_ASYNC_ROLLOUT_PROFILER_DRAIN_RPC_TIMEOUT_S = 40.0
 
 
 def _maybe_restore_async_replay_buffer_checkpoint(
@@ -2324,9 +2328,7 @@ def _profile_sync_vllm_rollout(
         policy_generation.begin_rollout_profile(step_id=step_id)
     except BaseException as rollout_error:
         try:
-            policy_generation.abort_rollout_profile(
-                reason="grpo_rollout_begin_error"
-            )
+            policy_generation.abort_rollout_profile(reason="grpo_rollout_begin_error")
         except Exception as profiler_error:
             rollout_error.add_note(
                 f"Rollout profiler abort also failed: {profiler_error!r}"
@@ -2347,14 +2349,44 @@ def _profile_sync_vllm_rollout(
         policy_generation.finish_rollout_profile()
     except BaseException as rollout_error:
         try:
-            policy_generation.abort_rollout_profile(
-                reason="grpo_rollout_finish_error"
-            )
+            policy_generation.abort_rollout_profile(reason="grpo_rollout_finish_error")
         except Exception as profiler_error:
             rollout_error.add_note(
                 f"Rollout profiler abort also failed: {profiler_error!r}"
             )
         raise
+
+
+def _shutdown_async_trajectory_collector(
+    trajectory_collector: Any,
+    policy_generation: GenerationInterface,
+    *,
+    flush_telemetry: Callable[[], None],
+) -> None:
+    """Settle async-GRPO profiling, flush telemetry, then reap the actor."""
+    drain_error: Exception | None = None
+    try:
+        if policy_generation.rollout_profiler_enabled:
+            ray.get(
+                trajectory_collector.drain_for_rollout_profiler_shutdown.remote(),
+                timeout=_ASYNC_ROLLOUT_PROFILER_DRAIN_RPC_TIMEOUT_S,
+            )
+    except Exception as error:
+        drain_error = error
+        print(f"Error draining trajectory collector: {error}")
+
+    try:
+        flush_telemetry()
+    except Exception as error:
+        print(f"Error flushing trajectory collector telemetry: {error}")
+    finally:
+        try:
+            ray.kill(trajectory_collector)
+        except Exception as error:
+            print(f"Error stopping trajectory collector: {error}")
+
+    if drain_error is not None:
+        raise drain_error
 
 
 def _preserve_router_replay_routed_experts(
@@ -4764,6 +4796,7 @@ def async_grpo_train(
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
         processor=processor,
         trace_carrier=_tc_trace_carrier,
+        enable_rollout_profile_windows=True,
         **collector_start_kwargs,
     )
 
@@ -4891,15 +4924,17 @@ def async_grpo_train(
             # generation; the remaining actors are reaped when the driver
             # exits right after this return.
             checkpointer.shutdown()
-            _flush_collector_telemetry()
             try:
-                ray.kill(trajectory_collector)
-            except Exception as e:
-                print(f"Error stopping trajectory collector: {e}")
-            try:
-                ray.kill(replay_buffer)
-            except Exception as e:
-                print(f"Error stopping replay buffer: {e}")
+                _shutdown_async_trajectory_collector(
+                    trajectory_collector,
+                    policy_generation,
+                    flush_telemetry=_flush_collector_telemetry,
+                )
+            finally:
+                try:
+                    ray.kill(replay_buffer)
+                except Exception as e:
+                    print(f"Error stopping replay buffer: {e}")
             return
 
     print("✅ All setup complete, starting buffer wait...")
@@ -5991,6 +6026,8 @@ def async_grpo_train(
         raise
 
     finally:
+        active_error = sys.exception()
+        collector_shutdown_error: Exception | None = None
         # Finalize any pending async checkpoint before tearing down workers.
         try:
             checkpointer.shutdown()
@@ -5998,11 +6035,14 @@ def async_grpo_train(
             print(f"Error finalizing pending checkpoint: {e}")
 
         print("🛑 Stopping trajectory collection...")
-        _flush_collector_telemetry()
         try:
-            ray.kill(trajectory_collector)
+            _shutdown_async_trajectory_collector(
+                trajectory_collector,
+                policy_generation,
+                flush_telemetry=_flush_collector_telemetry,
+            )
         except Exception as e:
-            print(f"Error stopping trajectory collector: {e}")
+            collector_shutdown_error = e
 
         try:
             ray.kill(replay_buffer)
@@ -6026,3 +6066,11 @@ def async_grpo_train(
                 print(f"Error shutting down policy workers: {e}")
 
         print("Async GRPO training complete!")
+        if collector_shutdown_error is not None:
+            if active_error is not None:
+                active_error.add_note(
+                    "Async trajectory collector shutdown also failed: "
+                    f"{collector_shutdown_error!r}"
+                )
+            else:
+                raise collector_shutdown_error
