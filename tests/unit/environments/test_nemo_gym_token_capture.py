@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from unittest.mock import AsyncMock
 
 import pytest
@@ -31,6 +32,10 @@ def _capture_env() -> NemoGym:
     return object.__new__(env_cls)
 
 
+def _digest(label: str) -> str:
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
 def _manifest_record(
     call_id: str,
     *,
@@ -38,6 +43,9 @@ def _manifest_record(
     parent: str | None = None,
     cumulative_hash: str | None = None,
 ) -> dict:
+    # CallRecord requires both chain digests (Gym e5780688); derive distinct
+    # placeholders per call so identical-content collapsing stays off unless a
+    # test opts in by passing the same cumulative_hash twice.
     prev_len = 0 if parent is None else 900
     return {
         "model_call_id": call_id,
@@ -51,11 +59,14 @@ def _manifest_record(
         "staging_key": f"r0/{call_id}",
         "mode": "text" if parent is None else "token_in",
         "response_id": response_id or f"resp-{call_id}",
-        "cumulative_hash": cumulative_hash,
+        "chain_hash": _digest(f"chain:{call_id}"),
+        "cumulative_hash": cumulative_hash or _digest(f"cumulative:{call_id}"),
     }
 
 
-def test_receipt_postprocess_without_a_terminal_logical_id_uses_the_heuristic() -> None:
+def test_receipt_postprocess_without_a_terminal_response_id_uses_the_heuristic() -> (
+    None
+):
     env = _capture_env()
     records = [
         _manifest_record("c1"),
@@ -92,7 +103,7 @@ def test_receipt_postprocess_fetches_manifest_and_selects_terminal_row() -> None
     result = asyncio.run(
         env._postprocess_receipt_mode(
             {"_ng_rollout_id": "r0"},
-            {"reward": 1.0, "terminal_logical_request_id": "resp-c2"},
+            {"reward": 1.0, "terminal_response_id": "resp-c2"},
         )
     )
 
@@ -119,7 +130,7 @@ def test_receipt_assembly_poisons_on_failure_rows() -> None:
         "failures": [{"model_call_id": "c2", "reason": "worker_capture_failed"}],
     }
     receipt = env._assemble_receipt(
-        "r0", manifest, terminal_logical_request_id="resp-c1", reward=0.0
+        "r0", manifest, terminal_response_id="resp-c1", reward=0.0
     )
     assert receipt["capture_poisoned"] is True
     assert receipt["failure_reason"] == "worker_capture_failed"
@@ -147,7 +158,7 @@ def test_receipt_assembly_ignores_uncommitted_call_failures_off_the_terminal_cha
         ],
     }
     receipt = env._assemble_receipt(
-        "r0", manifest, terminal_logical_request_id="resp-c2", reward=1.0
+        "r0", manifest, terminal_response_id="resp-c2", reward=1.0
     )
     assert receipt["capture_poisoned"] is False
     assert receipt["failure_reason"] is None
@@ -171,7 +182,7 @@ def test_receipt_assembly_still_poisons_when_the_terminal_call_died_uncommitted(
         ],
     }
     receipt = env._assemble_receipt(
-        "r0", manifest, terminal_logical_request_id="resp-c2", reward=0.0
+        "r0", manifest, terminal_response_id="resp-c2", reward=0.0
     )
     assert receipt["capture_poisoned"] is True
     assert receipt["failure_reason"] == "missing_terminal_row"
@@ -185,7 +196,7 @@ def test_receipt_assembly_poisons_when_the_terminal_row_is_missing() -> None:
         "failures": [],
     }
     receipt = env._assemble_receipt(
-        "r0", manifest, terminal_logical_request_id="resp-lost", reward=0.0
+        "r0", manifest, terminal_response_id="resp-lost", reward=0.0
     )
     assert receipt["capture_poisoned"] is True
     assert receipt["failure_reason"] == "missing_terminal_row"
@@ -205,7 +216,7 @@ def test_receipt_assembly_heuristic_eliminates_abandoned_retry() -> None:
     ]
     manifest = {"rollout_id": "r0", "records": records, "failures": []}
     receipt = env._assemble_receipt(
-        "r0", manifest, terminal_logical_request_id=None, reward=1.0
+        "r0", manifest, terminal_response_id=None, reward=1.0
     )
     assert receipt["terminal_model_call_id"] == "c3"
     assert receipt["terminal_selection"] == "heuristic"
@@ -221,7 +232,7 @@ def test_receipt_assembly_heuristic_masks_a_final_call_retry() -> None:
     ]
     manifest = {"rollout_id": "r0", "records": records, "failures": []}
     receipt = env._assemble_receipt(
-        "r0", manifest, terminal_logical_request_id=None, reward=0.0
+        "r0", manifest, terminal_response_id=None, reward=0.0
     )
     assert receipt["terminal_model_call_id"] is None
     assert receipt["capture_poisoned"] is True
@@ -232,7 +243,7 @@ def test_receipt_assembly_heuristic_masks_an_empty_manifest() -> None:
     env = _capture_env()
     manifest = {"rollout_id": "r0", "records": [], "failures": []}
     receipt = env._assemble_receipt(
-        "r0", manifest, terminal_logical_request_id=None, reward=0.0
+        "r0", manifest, terminal_response_id=None, reward=0.0
     )
     assert receipt["terminal_model_call_id"] is None
     assert receipt["capture_poisoned"] is True
@@ -245,7 +256,7 @@ def test_receipt_assembly_heuristic_masks_invalid_manifest_rows() -> None:
     bad["delta_len"] = 0  # violates the CallRecord length contract
     manifest = {"rollout_id": "r0", "records": [bad], "failures": []}
     receipt = env._assemble_receipt(
-        "r0", manifest, terminal_logical_request_id=None, reward=0.0
+        "r0", manifest, terminal_response_id=None, reward=0.0
     )
     assert receipt["terminal_model_call_id"] is None
     assert receipt["capture_poisoned"] is True
@@ -263,7 +274,7 @@ def test_receipt_assembly_keeps_dead_branch_siblings_in_the_manifest() -> None:
     ]
     manifest = {"rollout_id": "r0", "records": records, "failures": []}
     receipt = env._assemble_receipt(
-        "r0", manifest, terminal_logical_request_id="resp-c2r", reward=1.0
+        "r0", manifest, terminal_response_id="resp-c2r", reward=1.0
     )
     assert receipt["terminal_model_call_id"] == "c2r"
     assert receipt["capture_poisoned"] is False
@@ -277,7 +288,7 @@ def test_receipt_postprocess_returns_placeholder_on_fetch_failure() -> None:
     result = asyncio.run(
         env._postprocess_receipt_mode(
             {"_ng_rollout_id": "r0"},
-            {"reward": 1.0, "terminal_logical_request_id": "resp-c1"},
+            {"reward": 1.0, "terminal_response_id": "resp-c1"},
         )
     )
     assert result["receipt"] is None
@@ -296,7 +307,7 @@ def test_response_id_witness_resolves_a_final_call_retry() -> None:
     receipt = env._assemble_receipt(
         "r0",
         manifest,
-        terminal_logical_request_id=None,
+        terminal_response_id=None,
         scored_response={"id": "resp-c2r", "output": []},
         reward=1.0,
     )
@@ -315,7 +326,7 @@ def test_unattributed_scored_response_falls_back_to_the_heuristic() -> None:
     receipt = env._assemble_receipt(
         "r0",
         manifest,
-        terminal_logical_request_id=None,
+        terminal_response_id=None,
         scored_response={"id": "resp-unknown", "output": []},
         reward=1.0,
     )
@@ -334,7 +345,7 @@ def test_declared_and_response_id_witnesses_corroborate() -> None:
     receipt = env._assemble_receipt(
         "r0",
         manifest,
-        terminal_logical_request_id="resp-c2",
+        terminal_response_id="resp-c2",
         scored_response={"id": "resp-c2", "output": []},
         reward=1.0,
     )
@@ -359,7 +370,7 @@ def test_witness_disagreement_masks_a_retry_instead_of_guessing() -> None:
     receipt = env._assemble_receipt(
         "r0",
         manifest,
-        terminal_logical_request_id="resp-c2",
+        terminal_response_id="resp-c2",
         scored_response={"id": "resp-c2r", "output": []},
         reward=1.0,
     )

@@ -737,14 +737,14 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
         rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
-        terminal_logical_request_id = nemo_gym_result.get("terminal_logical_request_id")
-        if not (
-            isinstance(terminal_logical_request_id, str) and terminal_logical_request_id
-        ):
+        # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the
+        # harness kept (``response.id``), not the logical-request header.
+        terminal_response_id = nemo_gym_result.get("terminal_response_id")
+        if not (isinstance(terminal_response_id, str) and terminal_response_id):
             # A harness that reports no terminal id still gets its manifest
             # fetched; receipt assembly attributes the terminal from the
             # scored response, falling back to heuristic selection.
-            terminal_logical_request_id = None
+            terminal_response_id = None
         scored_response = nemo_gym_result.get("response")
         if not isinstance(scored_response, dict):
             scored_response = None
@@ -757,7 +757,7 @@ Depending on your data shape, you may want to change these values."""
             receipt = self._assemble_receipt(
                 rollout_id,
                 manifest,
-                terminal_logical_request_id=terminal_logical_request_id,
+                terminal_response_id=terminal_response_id,
                 scored_response=scored_response,
                 reward=float(nemo_gym_result.get("reward") or 0.0),
             )
@@ -777,16 +777,21 @@ Depending on your data shape, you may want to change these values."""
         rollout_id: str,
         manifest: dict,
         *,
-        terminal_logical_request_id: Optional[str],
+        terminal_response_id: Optional[str],
         scored_response: Optional[dict] = None,
         reward: float,
     ) -> dict:
         """Build the token-free RolloutReceipt payload from a ledger manifest.
 
+        ``terminal_response_id`` is the served response envelope id the
+        harness reports for the completion it kept (Gym's
+        ``terminal_response_id`` result key), forwarded to ``resolve_terminal``
+        as ``declared_response_id``. It is not the logical-request header.
+
         Terminal selection is staged, fail-closed at every stage:
 
         1. Witness attribution (``resolve_terminal``): the declared response
-           id (``terminal_logical_request_id``), the scored response's
+           id (``terminal_response_id``), the scored response's
            envelope id, and its content fingerprints each independently name
            a manifest row through ``CallRecord.response_id`` and the recorded
            fingerprints. Agreeing witnesses attribute; a declared id that
@@ -843,13 +848,13 @@ Depending on your data shape, you may want to change these values."""
             attribution = resolve_terminal(
                 parsed_records,
                 scored_response,
-                declared_response_id=terminal_logical_request_id,
+                declared_response_id=terminal_response_id,
             )
             attribution_reason = attribution.reason or None
             if attribution.attributed:
                 terminal_selection = attribution.method
                 terminal_record = deduped[attribution.model_call_id]
-            elif terminal_logical_request_id is not None:
+            elif terminal_response_id is not None:
                 # A declaration is authoritative: a declared id the ledger
                 # cannot confirm masks and never falls back to the heuristic.
                 terminal_selection = "declared"
