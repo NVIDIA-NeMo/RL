@@ -443,8 +443,13 @@ def _patch_scalar_field_schema() -> None:
 
     _assert_tq_stores_scalar_rows_0d()
 
+    # Bound to a fresh name after the ``None`` check: a type checker does not
+    # carry narrowing of ``orig`` into the closure below, since a closure can
+    # run after its captured names change.
+    upstream = orig
+
     def extract_field_schema(data):  # type: ignore[no-untyped-def]
-        schema = orig(data)
+        schema = upstream(data)
         for name in data.keys():
             value = data.get(name)
             if (
