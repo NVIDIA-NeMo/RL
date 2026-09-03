@@ -1,0 +1,306 @@
+digraph custody_spine {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    bgcolor="#fbfbfd",
+    pad="0.35",
+    nodesep="0.62",
+    ranksep="0.72",
+    splines=line,
+    fontname="Helvetica",
+    labelloc="t",
+    label="Where rollout data goes — Megatron vs vLLM",
+    fontsize=25
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fillcolor="white",
+    color="#475569",
+    penwidth=1.4,
+    fontname="Helvetica",
+    fontsize=10,
+    margin="0.14,0.10"
+  ];
+
+  edge [
+    color="#475569",
+    penwidth=1.7,
+    arrowsize=0.8,
+    fontname="Helvetica",
+    fontsize=9
+  ];
+
+  legend [
+    shape=note,
+    fillcolor="#f1f5f9",
+    color="#94a3b8",
+    label="FOLLOW ONE COMPLETE ROUTE\nMEGATRON: M1–M4 → B1–B2 → M5–M8 → B3–B5\nvLLM: V1–V6 → B1–B5\n\nOrange M = Megatron only · Purple V = vLLM only\nBlue B = BOTH backends; blue is required, not a separate path.\n\nDashed boxes show the backend worker's /v1/chat/completions.\nThe capture handler runs after that backend request returns."
+  ];
+
+  sample [
+    shape=note,
+    fillcolor="#e0f2fe",
+    color="#0284c7",
+    label="GENERATION RECORD USED IN EVERY BOX\nREQUEST: prompt token IDs [10,11]\nRESPONSE: text \"done\" · token IDs [12] · log probability -0.20\nROLLOUT ID: rollout-0\nMODEL CALL ID: call-1 (the agent's first model call)\nREWARD: 1.0"
+  ];
+
+  rule [
+    shape=note,
+    fillcolor="#fefce8",
+    color="#ca8a04",
+    label="THE ONE IMPORTANT DIFFERENCE\nvLLM: the generation record reaches TQ BEFORE the agent sees \"done\".\nMegatron: the agent sees \"done\" while the record is in MInf;\nit is copied to TQ AFTER the rollout."
+  ];
+
+  { rank=same; legend; sample; rule; }
+
+  meg_hdr [
+    group="left",
+    color="#ea580c",
+    fillcolor="#ffedd5",
+    penwidth=2.2,
+    fontsize=18,
+    label="MEGATRON"
+  ];
+
+  store_hdr [
+    group="center",
+    color="#475569",
+    fillcolor="#f8fafc",
+    penwidth=2.2,
+    fontsize=18,
+    label="SHARED STORAGE"
+  ];
+
+  vllm_hdr [
+    group="right",
+    color="#7c3aed",
+    fillcolor="#ede9fe",
+    penwidth=2.2,
+    fontsize=18,
+    label="vLLM"
+  ];
+
+  // ── Megatron processes: left column ──────────────────────────────────
+  m_engine [
+    group="left",
+    color="#ea580c",
+    fillcolor="#ffedd5",
+    label="1. GENERATE THE ANSWER\nCreates the generation record:\nREQUEST: prompt token IDs [10,11]\nRESPONSE: text \"done\" · token IDs [12] · log probability -0.20\n\nSaves the record in MInf.\nSends the response text + token IDs to the capture handler.\n\nDynamicInferenceEngine"
+  ];
+
+  m_handler [
+    group="left",
+    color="#ea580c",
+    fillcolor="#ffedd5",
+    label="AFTER THE MEGATRON WORKER RETURNS\n2. RECORD WHERE THE TOKENS ARE\nReceives \"done\" + token IDs.\nWrites a pointer to Gym:\n  \"tokens are in the temporary MInf row for call-1\"\nRemoves token IDs before returning the answer.\n\nMegatronLedgerCaptureHandler"
+  ];
+
+  m_agent [
+    group="left",
+    color="#16a34a",
+    fillcolor="#dcfce7",
+    penwidth=2.0,
+    label="3. GYM RETURNS TO THE AGENT\nAgent receives \"done\" with no private token fields.\nThe generation record is still in MInf.\nNothing has been written to TQ yet."
+  ];
+
+  m_flush [
+    group="left",
+    color="#ea580c",
+    fillcolor="#ffedd5",
+    label="MEGATRON-ONLY DETOUR AFTER B2\nM5 IN: pending receipt points to MInf\nM6: load the request/response generation record from MInf\nM7: save the record in TQ; delete the temporary MInf copy\nM8 OUT: updated receipt now points to TQ\n\nMegatronGeneration / MegatronPolicyWorker"
+  ];
+
+  // ── Central custody spine ─────────────────────────────────────────────
+  minf [
+    group="center",
+    shape=cylinder,
+    style="filled",
+    color="#ea580c",
+    fillcolor="#fed7aa",
+    penwidth=2.2,
+    label="MInf — TEMPORARY GENERATION-RECORD STORE\nUsed only by Megatron.\n\nCOMES IN\nGeneration record for model call-1:\nREQUEST: prompt token IDs [10,11]\nRESPONSE: text \"done\" · token IDs [12] · log probability -0.20\n\nGOES OUT\nThe same request/response record, loaded after the rollout.\nThe row is deleted once TQ confirms its copy is safe."
+  ];
+
+  tq_stage [
+    group="center",
+    shape=cylinder,
+    style="filled",
+    color="#0f766e",
+    fillcolor="#99f6e4",
+    penwidth=2.2,
+    label="TQ STAGING — DURABLE GENERATION-RECORD STORE\nOne saved row per model call.\n\nCOMES IN\nREQUEST: prompt token IDs [10,11]\nRESPONSE: text \"done\" · token IDs [12] · log probability -0.20\nStored as tokens [10,11,12], answer mask [0,0,1],\nand aligned log probabilities [0,0,-0.20].\n\nGOES OUT\nPointer rollout-0/call-1, confirming the save succeeded.\nThe pointer format is: rollout ID / model-call ID.\nLater, the finalizer loads this row."
+  ];
+
+  gym [
+    group="center",
+    shape=cylinder,
+    style="filled",
+    color="#2563eb",
+    fillcolor="#dbeafe",
+    penwidth=2.2,
+    label="GYM LEDGER — THE INDEX\nGym stores pointers, not token arrays.\n\nCOMES IN\nvLLM: \"call-1 → TQ row rollout-0/call-1\"\nMegatron: \"call-1 → its temporary row in MInf\"\nAlso stores call identity, lengths, and integrity checks.\n\nGOES OUT\nThe list of pointers for every model call in the rollout."
+  ];
+
+  nemo_gym [
+    group="center",
+    color="#2563eb",
+    fillcolor="#dbeafe",
+    label="BOTH BACKENDS MEET HERE\nAfter the agent finishes, read every model-call pointer from Gym.\nBundle those pointers into one receipt for the rollout.\n\nNemoGym"
+  ];
+
+  receipt [
+    group="center",
+    shape=note,
+    color="#0f766e",
+    fillcolor="#ecfeff",
+    penwidth=2.0,
+    label="ROLLOUT RECEIPT — ROUTING POINT\nContains pointers, not token arrays.\n\nvLLM: already points to TQ → continue directly to B3\nMegatron: still points to MInf → take detour M5–M8\nAfter M8, Megatron returns here with a TQ pointer.\n\nOnly a receipt whose model calls all point to TQ may continue to B3."
+  ];
+
+  finalizer [
+    group="center",
+    color="#0369a1",
+    fillcolor="#e0f2fe",
+    penwidth=1.8,
+    label="FINALIZER — BUILD ONE TRAINING SAMPLE\n1. Read the TQ pointer from the receipt.\n2. Load the request/response generation record from TQ staging.\n3. Check it, attach reward 1.0, and make tensors.\n4. Save the completed sample in TQ replay.\n\nBlackboxFinalizer / TQTokenSource"
+  ];
+
+  tq_replay [
+    group="center",
+    shape=cylinder,
+    style="filled",
+    color="#0369a1",
+    fillcolor="#bae6fd",
+    penwidth=2.2,
+    label="TQ REPLAY — READY FOR TRAINING\n\nCOMES IN\nThe completed sample:\ntokens [10,11,12] · answer mask [0,0,1]\nlog probabilities [0,0,-0.20] · reward 1.0\n\nGOES OUT\nA model-ready rollout batch for the training step."
+  ];
+
+  sampler [
+    group="center",
+    color="#0369a1",
+    fillcolor="#e0f2fe",
+    label="ROLLOUT IS RETURNED\nThe replay buffer marks the sample ready.\nThe sampler returns it as part of the rollout batch.\n\nTQReplayBuffer / BaseSampler"
+  ];
+
+  // ── vLLM processes: right column ─────────────────────────────────────
+  v_worker [
+    group="right",
+    color="#7c3aed",
+    fillcolor="#ede9fe",
+    label="1. GENERATE THE ANSWER\nCreates the generation record:\nREQUEST: prompt token IDs [10,11]\nRESPONSE: text \"done\" · token IDs [12] · log probability -0.20\n\nVllmAsyncGenerationWorker"
+  ];
+
+  v_capture [
+    group="right",
+    color="#7c3aed",
+    fillcolor="#ede9fe",
+    label="2. SAVE THE RECORD BEFORE RETURNING\nWrites the request/response generation record directly to TQ.\nWaits until TQ confirms it is stored at rollout-0/call-1.\nOnly then may the HTTP response continue.\n\nRolloutTokenCapture / TQTokenSink"
+  ];
+
+  v_handler [
+    group="right",
+    color="#7c3aed",
+    fillcolor="#ede9fe",
+    label="AFTER THE vLLM WORKER RETURNS\n3. RECORD WHERE THE TOKENS ARE\nReceives \"done\" + the TQ pointer rollout-0/call-1.\nWrites to Gym: \"call-1 → TQ row rollout-0/call-1\".\nRemoves the private pointer before returning the answer.\n\nVLLMWorkerCaptureHandler"
+  ];
+
+  v_agent [
+    group="right",
+    color="#16a34a",
+    fillcolor="#dcfce7",
+    penwidth=2.0,
+    label="4. GYM RETURNS TO THE AGENT\nAgent receives response text \"done\" with no private token fields.\nThe request/response generation record is already safely stored in TQ."
+  ];
+
+  // Dashed boundaries show only the downstream generation-worker HTTP call.
+  // The Gym-side capture handlers intentionally remain outside these clusters.
+  subgraph cluster_megatron_worker_endpoint {
+    label="INSIDE MEGATRON GENERATION WORKER\nbackend /v1/chat/completions\nM1 writes MInf before the HTTP response returns";
+    labelloc="t";
+    labeljust="l";
+    color="#f97316";
+    fontcolor="#c2410c";
+    fontname="Helvetica";
+    fontsize=11;
+    penwidth=2.0;
+    style="rounded,dashed";
+    margin=18;
+    m_engine;
+  }
+
+  subgraph cluster_vllm_worker_endpoint {
+    label="INSIDE vLLM GENERATION WORKER\nbackend /v1/chat/completions\nV2 waits for TQ before the HTTP response returns";
+    labelloc="t";
+    labeljust="l";
+    color="#8b5cf6";
+    fontcolor="#6d28d9";
+    fontname="Helvetica";
+    fontsize=11;
+    penwidth=2.0;
+    style="rounded,dashed";
+    margin=18;
+    v_worker;
+    v_capture;
+  }
+
+  // Invisible routing points keep the two late Megatron transfers in the
+  // open channel between the Megatron and shared-storage columns.
+  m4_mid [shape=point, width=0.01, height=0.01, label="", style=invis];
+  m5_mid [shape=point, width=0.01, height=0.01, label="", style=invis];
+
+  // ── Visible data transfers (constraint=false: grid owns placement) ───
+  m_engine:e -> minf:w [color="#ea580c", fontcolor="#c2410c", constraint=false, label="M1  save request/response generation record temporarily"];
+  m_handler:e -> gym:w [color="#ea580c", fontcolor="#c2410c", constraint=false, label="M2  save pointer to call-1's temporary MInf row"];
+  m_handler:s -> m_agent:n [color="#ea580c", fontcolor="#c2410c", constraint=false, headlabel="M3  clean answer: \"done\"", labeldistance=3.5, labelangle=25];
+  m_agent:e -> nemo_gym:w [color="#ea580c", fontcolor="#c2410c", constraint=false, label="M4  rollout finished"];
+  receipt:w -> m_flush:e [color="#ea580c", fontcolor="#c2410c", constraint=false, dir=both, arrowtail=normal, label="M5  pending receipt / M8  updated receipt"];
+  minf:sw -> m4_mid:n [color="#ea580c", fontcolor="#c2410c", constraint=false, arrowhead=none, label="M6  load generation record from MInf"];
+  m4_mid:s -> m_flush:n [color="#ea580c", constraint=false];
+  m_flush:n -> m5_mid:s [color="#ea580c", fontcolor="#c2410c", constraint=false, arrowhead=none, label="M7  save durable copy in TQ"];
+  m5_mid:n -> tq_stage:sw [color="#ea580c", constraint=false];
+
+  v_worker:s -> v_capture:n [color="#7c3aed", fontcolor="#6d28d9", constraint=false, label="V1  request/response generation record"];
+  v_capture:w -> tq_stage:e [color="#7c3aed", fontcolor="#6d28d9", constraint=false, label="V2  save generation record; wait for confirmation"];
+  tq_stage:e -> v_handler:w [color="#7c3aed", fontcolor="#6d28d9", constraint=false, headlabel="V3  answer + TQ pointer rollout-0/call-1", labeldistance=4.0, labelangle=20];
+  v_handler:w -> gym:e [color="#7c3aed", fontcolor="#6d28d9", constraint=false, label="V4  save pointer to TQ row rollout-0/call-1"];
+  v_handler:s -> v_agent:n [color="#7c3aed", fontcolor="#6d28d9", constraint=false, headlabel="V5  clean answer: \"done\"", labeldistance=3.5, labelangle=-25];
+  v_agent:w -> nemo_gym:e [color="#7c3aed", fontcolor="#6d28d9", constraint=false, label="V6  rollout finished"];
+
+  gym:s -> nemo_gym:n [color="#2563eb", fontcolor="#1d4ed8", constraint=false, taillabel="B1  BOTH", labeldistance=3.5, labelangle=-25];
+  nemo_gym:s -> receipt:n [color="#2563eb", fontcolor="#1d4ed8", constraint=false, label="B2  BOTH: build rollout receipt"];
+  receipt:s -> finalizer:n [color="#0369a1", fontcolor="#0369a1", constraint=false, label="B3  BOTH: receipt is ready; all calls point to TQ"];
+  finalizer:s -> tq_replay:n [color="#0369a1", fontcolor="#0369a1", constraint=false, label="B4  BOTH: save completed training sample"];
+  tq_replay:s -> sampler:n [color="#0369a1", fontcolor="#0369a1", constraint=false, label="B5  BOTH: return model-ready rollout batch"];
+
+  // ── Invisible placement grid: strictly Megatron | stores | vLLM ─────
+  node [shape=point, width=0.01, height=0.01, label="", style=invis];
+  l2 [group="left"]; l5 [group="left"]; l6 [group="left"]; l8 [group="left"];
+  r5 [group="right"]; r6 [group="right"]; r8 [group="right"];
+  node [shape=box, style="rounded,filled", width=0, height=0];
+
+  { rank=same; meg_hdr; store_hdr; vllm_hdr; }
+  { rank=same; m_engine; minf; v_worker; }
+  { rank=same; l2; tq_stage; v_capture; }
+  { rank=same; m_handler; gym; v_handler; }
+  { rank=same; m_agent; m4_mid; m5_mid; nemo_gym; v_agent; }
+  { rank=same; m_flush; receipt; r5; }
+  { rank=same; l6; finalizer; r6; }
+  { rank=same; l8; tq_replay; r8; }
+
+  meg_hdr -> store_hdr -> vllm_hdr [style=invis, weight=1000];
+  m_engine -> minf -> v_worker [style=invis, weight=1000];
+  l2 -> tq_stage -> v_capture [style=invis, weight=1000];
+  m_handler -> gym -> v_handler [style=invis, weight=1000];
+  m_agent -> m4_mid -> m5_mid -> nemo_gym -> v_agent [style=invis, weight=1000];
+  m_flush -> receipt -> r5 [style=invis, weight=1000];
+  l6 -> finalizer -> r6 [style=invis, weight=1000];
+  l8 -> tq_replay -> r8 [style=invis, weight=1000];
+
+  meg_hdr -> m_engine -> l2 -> m_handler -> m_agent -> m_flush -> l6 -> l8 [style=invis, weight=1000];
+  store_hdr -> minf -> tq_stage -> gym -> nemo_gym -> receipt -> finalizer -> tq_replay -> sampler [style=invis, weight=1000];
+  vllm_hdr -> v_worker -> v_capture -> v_handler -> v_agent -> r5 -> r6 -> r8 [style=invis, weight=1000];
+
+  sample -> store_hdr [style=invis, weight=1000];
+}

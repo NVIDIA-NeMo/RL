@@ -237,6 +237,19 @@ _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 _UNCOMMITTED_CALL_REASON = "request_finished_without_staged_coordinates"
 
 
+def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
+    """Map the setup-derived generation backend to Gym's capture backend."""
+    generation_backend = token_capture.get("generation_backend")
+    if generation_backend == "vllm":
+        return "vllm_worker"
+    if generation_backend == "megatron":
+        return "megatron_ledger"
+    raise ValueError(
+        "token_capture.enabled requires setup-derived generation_backend to be "
+        f"'vllm' or 'megatron'; got {generation_backend!r}"
+    )
+
+
 def _detect_invalid_tool_call_and_malformed_thinking(
     output_item_dict: dict[str, Any],
     invalid_tool_call_patterns: list[str] | None = None,
@@ -653,6 +666,7 @@ Depending on your data shape, you may want to change these values."""
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
+            assert token_capture is not None
             if self.rollout_max_attempts_to_avoid_lp_nan != 1:
                 raise ValueError(
                     "token_capture.enabled requires "
@@ -678,6 +692,7 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
+                "external_staging_backend": _external_staging_backend(token_capture),
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -975,13 +990,24 @@ Depending on your data shape, you may want to change these values."""
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.attribution import resolve_terminal
-        from nemo_gym.token_id_capture.staging.records import CallRecord
+        from nemo_gym.token_id_capture.staging.records import (
+            CallRecord,
+            PendingCallRecord,
+        )
         from nemo_gym.token_id_capture.staging.terminal import select_terminal_call
 
         records = [dict(record) for record in manifest.get("records") or []]
+        pending_records = [
+            dict(record) for record in manifest.get("pending_records") or []
+        ]
+        if records and pending_records:
+            raise ValueError(
+                "capture manifest cannot mix staged and pending call records"
+            )
+        receipt_records = pending_records or records
         failures = list(manifest.get("failures") or [])
         deduped: dict[str, dict] = {}
-        for record in records:
+        for record in receipt_records:
             deduped.setdefault(str(record.get("model_call_id")), record)
         terminal_record = None
         selection_reason = None
@@ -989,32 +1015,54 @@ Depending on your data shape, you may want to change these values."""
         terminal_selection = "heuristic"
         parsed_records = None
         try:
+            record_type = PendingCallRecord if pending_records else CallRecord
             parsed_records = [
-                CallRecord.model_validate(record) for record in deduped.values()
+                record_type.model_validate(record) for record in deduped.values()
             ]
         except ValueError:
             selection_reason = "invalid_manifest_row"
         if parsed_records is not None:
-            attribution = resolve_terminal(
-                parsed_records,
-                scored_response,
-                declared_response_id=terminal_logical_request_id,
-            )
-            attribution_reason = attribution.reason or None
-            if attribution.attributed:
-                terminal_selection = attribution.method
-                terminal_record = deduped[attribution.model_call_id]
-            elif terminal_logical_request_id is not None:
-                # A declaration is authoritative: a declared id the ledger
-                # cannot confirm masks and never falls back to the heuristic.
-                terminal_selection = "declared"
-                selection_reason = None
-            else:
-                selection = select_terminal_call(parsed_records)
-                if selection.terminal_model_call_id is not None:
-                    terminal_record = deduped[selection.terminal_model_call_id]
+            if pending_records:
+                # Pending MInf rows do not carry the content-fingerprint fields
+                # consumed by resolve_terminal. Prefer the explicit correlation
+                # id, then use the strict lineage heuristic when none was given.
+                if terminal_logical_request_id is not None:
+                    terminal_selection = "declared"
+                    matches = [
+                        record
+                        for record in parsed_records
+                        if record.logical_request_id == terminal_logical_request_id
+                        or record.response_id == terminal_logical_request_id
+                    ]
+                    if len(matches) == 1:
+                        terminal_record = deduped[matches[0].model_call_id]
                 else:
-                    selection_reason = selection.reason
+                    selection = select_terminal_call(parsed_records)
+                    if selection.terminal_model_call_id is not None:
+                        terminal_record = deduped[selection.terminal_model_call_id]
+                    else:
+                        selection_reason = selection.reason
+            else:
+                attribution = resolve_terminal(
+                    parsed_records,
+                    scored_response,
+                    declared_response_id=terminal_logical_request_id,
+                )
+                attribution_reason = attribution.reason or None
+                if attribution.attributed:
+                    terminal_selection = attribution.method
+                    terminal_record = deduped[attribution.model_call_id]
+                elif terminal_logical_request_id is not None:
+                    # A declaration is authoritative: a declared id the ledger
+                    # cannot confirm masks and never falls back to the heuristic.
+                    terminal_selection = "declared"
+                    selection_reason = None
+                else:
+                    selection = select_terminal_call(parsed_records)
+                    if selection.terminal_model_call_id is not None:
+                        terminal_record = deduped[selection.terminal_model_call_id]
+                    else:
+                        selection_reason = selection.reason
         poisoning_failures = [
             failure
             for failure in failures
@@ -1027,7 +1075,7 @@ Depending on your data shape, you may want to change these values."""
             )
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
-        return {
+        receipt = {
             "rollout_id": rollout_id,
             "reward": reward,
             "terminal_model_call_id": (
@@ -1035,12 +1083,15 @@ Depending on your data shape, you may want to change these values."""
                 if terminal_record is not None
                 else None
             ),
-            "manifest": list(deduped.values()),
+            "manifest": [] if pending_records else list(deduped.values()),
             "capture_poisoned": failure_reason is not None,
             "failure_reason": failure_reason,
             "terminal_selection": terminal_selection,
             "terminal_attribution_reason": attribution_reason,
         }
+        if pending_records:
+            receipt["pending_manifest"] = list(deduped.values())
+        return receipt
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
@@ -1415,9 +1466,18 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    # Enable the backend's OpenAI-compatible server.
+    if generation_config["backend"] == "vllm":
+        generation_config["vllm_cfg"]["async_engine"] = True
+        generation_config["vllm_cfg"]["expose_http_server"] = True
+    elif generation_config["backend"] == "megatron":
+        generation_config["mcore_generation_config"]["async_engine"] = True
+        generation_config["mcore_generation_config"]["expose_http_server"] = True
+    else:
+        raise ValueError(
+            "NeMo-Gym setup supports vllm or megatron generation; got "
+            f"{generation_config['backend']!r}"
+        )
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None

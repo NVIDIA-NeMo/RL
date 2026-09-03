@@ -1735,10 +1735,8 @@ class RolloutManager:
             # succeeded on a retry also counts -- the fleet recovered either way.
             self._consecutive_infra_drops = 0
             if lineage_group_id is not None:
-                async with (
-                    self._tq_buffer.data_plane_checkpoint_barrier.mutation(
-                        "group_removals"
-                    )
+                async with self._tq_buffer.data_plane_checkpoint_barrier.mutation(
+                    "group_removals"
                 ) as cut:
                     self._recovery_ledger.discard_group(cut, lineage_group_id)
             return RolloutOutcome.COMMITTED
@@ -1904,9 +1902,7 @@ class RolloutManager:
                     "token-capture completion must contain environment extras"
                 )
             if "ng_receipt" not in env_extras:
-                raise ValueError(
-                    "token-capture completion must contain ng_receipt"
-                )
+                raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
@@ -1936,10 +1932,22 @@ class RolloutManager:
                     f"expected={gate_rollout_id!r}"
                 )
 
-            if (
-                recovery_group.recovery_granularity
-                is RecoveryGranularity.PROMPT_GROUP
-            ):
+            async def _flush_receipt(candidate: Optional[dict[str, Any]]) -> None:
+                if candidate is None or not candidate.get("pending_manifest"):
+                    return
+                if self._policy_generation is None:
+                    raise RuntimeError(
+                        "deferred token capture requires a generation backend"
+                    )
+                finalized = await asyncio.to_thread(
+                    self._policy_generation.flush_token_capture, candidate
+                )
+                # The completion and recovery ledger retain this mapping. Mutate
+                # it only after the whole ledger batch is durable.
+                candidate.clear()
+                candidate.update(finalized)
+
+            if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
                     gate_rollout_id=gate_rollout_id,
                     receipt=receipt,
@@ -1957,6 +1965,8 @@ class RolloutManager:
                 if len(pending_group_results) < recovery_group.expected_generations:
                     return
                 async with self._recovery_mutation("sibling_seals") as cut:
+                    for sibling_result in pending_group_results.values():
+                        await _flush_receipt(sibling_result.receipt)
                     self._recovery_ledger.mark_group_sealed(
                         cut,
                         group_id,
@@ -1965,6 +1975,7 @@ class RolloutManager:
                 return
 
             async with self._recovery_mutation("sibling_seals") as cut:
+                await _flush_receipt(receipt)
                 self._recovery_ledger.mark_sibling_sealed(
                     cut,
                     group_id,
