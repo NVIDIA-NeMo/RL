@@ -193,6 +193,13 @@ class VllmAsyncGenerationWorkerImpl(
                 )
             llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
 
+        if isinstance(llm_kwargs.get("kv_transfer_config"), dict):
+            from vllm.config import KVTransferConfig
+
+            llm_kwargs["kv_transfer_config"] = KVTransferConfig(
+                **llm_kwargs["kv_transfer_config"]
+            )
+
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.stat_loggers = (
             [PrometheusStatLogger]
@@ -1598,7 +1605,7 @@ class VllmAsyncGenerationWorkerImpl(
                 "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
             )
 
-        await self.llm.reset_prefix_cache()
+        await self.llm.reset_prefix_cache(reset_connector=True)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1642,7 +1649,7 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
-        await self.llm.reset_prefix_cache()
+        await self.llm.reset_prefix_cache(reset_connector=True)
         # Reset the multimodal processor cache (sender side) so it stays in
         # sync with the receiver cache that vLLM clears internally during
         # sleep.  Without this, the sender thinks images are already cached on
