@@ -347,14 +347,10 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
-    @pytest.mark.parametrize(
-        "make_config",
-        [_make_master_config, _ppo_master_config],
-        ids=["grpo", "ppo"],
-    )
-    def test_accepts_overlong_filtering(self, make_config):
-        mc = make_config()
-        algo_config(mc).overlong_filtering = True
+    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+    def test_accepts_overlong_filtering(self, algorithm: str):
+        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
+        getattr(mc, algorithm).overlong_filtering = True
 
         validate_single_controller_config(mc)
 

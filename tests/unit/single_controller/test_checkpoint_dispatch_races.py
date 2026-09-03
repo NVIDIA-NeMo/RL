@@ -679,7 +679,6 @@ def test_commit_contending_with_checkpoint_has_exactly_one_saved_owner(
             dp_client,
             partition_id="rollout_data",
             pad_value_dict={"input_ids": 0},
-            overlong_filtering=False,
             include_message_violation_fields=False,
             require_routed_experts=False,
         )
@@ -784,7 +783,6 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
             dp_client,
             partition_id="rollout_data",
             pad_value_dict={"input_ids": 0},
-            overlong_filtering=False,
             include_message_violation_fields=False,
             require_routed_experts=False,
         )

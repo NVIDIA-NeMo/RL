@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from nemo_rl.data_plane.schema import (
@@ -43,6 +42,7 @@ def _completion(
     *,
     env_token_ids: tuple[int, ...] = (30,),
     with_routes: bool = True,
+    mask_sample: bool | None = None,
     truncated: bool = False,
 ) -> Completion:
     message_log = [
@@ -69,9 +69,14 @@ def _completion(
     if not with_routes:
         for message in message_log:
             message.pop("routed_experts")
+    env_extras = (
+        None
+        if mask_sample is None
+        else {"instance_config": {"mask_sample": mask_sample}}
+    )
     return Completion(
         message_log=message_log,
-        env_extras=None,
+        env_extras=env_extras,
         truncated=truncated,
         reward=reward,
     )
@@ -109,7 +114,6 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
-        overlong_filtering=False,
         include_message_violation_fields=False,
     )
 
@@ -166,7 +170,6 @@ def test_record_to_train_batch_preserves_message_violation_masks() -> None:
     train_batch = record_to_train_batch(
         _record([invalid, malformed]),
         pad_value_dict={"token_ids": 0, "input_ids": 0},
-        overlong_filtering=False,
         include_message_violation_fields=True,
     )
 
@@ -208,7 +211,6 @@ def test_record_to_train_batch_preserves_clean_masks_when_enabled() -> None:
     train_batch = record_to_train_batch(
         _record([_completion(route_start=10, reward=1.0)]),
         pad_value_dict={"token_ids": 0, "input_ids": 0},
-        overlong_filtering=False,
         include_message_violation_fields=True,
     )
 
@@ -225,7 +227,6 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
-        overlong_filtering=False,
         include_message_violation_fields=False,
     )
     assert "routed_experts" not in train_batch
@@ -241,21 +242,20 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
     assert "routed_experts" not in fields
 
 
-@pytest.mark.parametrize(
-    ("overlong_filtering", "expected_sample_mask"),
-    [
-        (False, [1.0, 1.0, 1.0]),
-        (True, [1.0, 0.0, 1.0]),
-    ],
-)
-def test_record_to_train_batch_masks_truncated_completions_when_enabled(
-    overlong_filtering: bool,
-    expected_sample_mask: list[float],
-) -> None:
+def test_record_to_train_batch_carries_raw_masks_without_applying_them() -> None:
     record = _record(
         [
-            _completion(route_start=10, reward=1.0),
-            _completion(route_start=30, reward=2.0, truncated=True),
+            _completion(
+                route_start=10,
+                reward=1.0,
+                mask_sample=True,
+            ),
+            _completion(
+                route_start=30,
+                reward=2.0,
+                mask_sample=False,
+                truncated=True,
+            ),
             _completion(route_start=50, reward=3.0),
         ]
     )
@@ -263,12 +263,27 @@ def test_record_to_train_batch_masks_truncated_completions_when_enabled(
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
-        overlong_filtering=overlong_filtering,
         include_message_violation_fields=False,
     )
 
-    assert train_batch["sample_mask"].dtype == torch.float32
-    assert train_batch["sample_mask"].tolist() == expected_sample_mask
+    assert torch.equal(train_batch["sample_mask"], torch.ones(3))
+    assert torch.equal(
+        train_batch["mask_sample"],
+        torch.tensor([True, False, False]),
+    )
+    assert torch.equal(
+        train_batch["truncated"],
+        torch.tensor([False, True, False]),
+    )
+
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+    assert torch.equal(fields["mask_sample"], train_batch["mask_sample"])
+    assert torch.equal(fields["truncated"], train_batch["truncated"])
 
 
 def _failed_completion() -> Completion:
@@ -294,7 +309,6 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
-        overlong_filtering=False,
         include_message_violation_fields=False,
     )
 
@@ -331,7 +345,6 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
     train_batch = record_to_train_batch(
         _record(completions),
         pad_value_dict={"token_ids": 0, "input_ids": 0},
-        overlong_filtering=False,
         include_message_violation_fields=False,
     )
     _, fields, tags = pack_payload(

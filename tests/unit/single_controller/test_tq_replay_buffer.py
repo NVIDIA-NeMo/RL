@@ -45,10 +45,9 @@ def _stub_record_to_train_batch(
     record: PromptGroupRecord,
     *,
     pad_value_dict: Any,
-    overlong_filtering: bool,
     include_message_violation_fields: bool,
 ) -> BatchedDataDict[Any]:
-    del record, pad_value_dict, overlong_filtering, include_message_violation_fields
+    del record, pad_value_dict, include_message_violation_fields
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
@@ -185,7 +184,6 @@ def _make_record(
 def _make_buffer(
     dp: FakeDataPlaneClient,
     *,
-    overlong_filtering: bool = False,
     require_routed_experts: bool = False,
     checkpoint_barrier: DataPlaneCheckpointBarrier | None = None,
 ) -> TQReplayBuffer:
@@ -193,7 +191,6 @@ def _make_buffer(
         dp,
         partition_id="rollout_data",
         pad_value_dict={"token_ids": 0},
-        overlong_filtering=overlong_filtering,
         include_message_violation_fields=False,
         require_routed_experts=require_routed_experts,
     )
@@ -323,36 +320,6 @@ class TestDataPlaneCheckpointBarrier:
 
 
 class TestTQReplayBufferReserveCommit:
-    def test_commit_forwards_overlong_filtering_to_payload_builder(self, monkeypatch):
-        received: list[bool] = []
-
-        def capture_config(
-            record: PromptGroupRecord,
-            *,
-            pad_value_dict: Any,
-            overlong_filtering: bool,
-            include_message_violation_fields: bool,
-        ) -> BatchedDataDict[Any]:
-            del include_message_violation_fields
-            received.append(overlong_filtering)
-            return _stub_record_to_train_batch(
-                record,
-                pad_value_dict=pad_value_dict,
-                overlong_filtering=overlong_filtering,
-                include_message_violation_fields=False,
-            )
-
-        monkeypatch.setattr(
-            _replay_buffer_module,
-            "record_to_train_batch",
-            capture_config,
-        )
-        buf = _make_buffer(FakeDataPlaneClient(), overlong_filtering=True)
-
-        _add_group(buf, weight=3)
-
-        assert received == [True]
-
     def test_commit_waits_for_active_checkpoint(self):
         async def exercise() -> None:
             dp = FakeDataPlaneClient()
@@ -631,7 +598,6 @@ class TestTQReplayBufferRemove:
             dp,
             partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
-            overlong_filtering=False,
             include_message_violation_fields=False,
         )
 

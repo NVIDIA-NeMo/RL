@@ -201,10 +201,9 @@ def _stub_converter(
     record: PromptGroupRecord,
     *,
     pad_value_dict: Any,
-    overlong_filtering: bool,
     include_message_violation_fields: bool,
 ):
-    del record, pad_value_dict, overlong_filtering, include_message_violation_fields
+    del record, pad_value_dict, include_message_violation_fields
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((ROLLOUTS_PER_GROUP, 3), dtype=torch.long),
@@ -236,7 +235,6 @@ def _new_buffer(dp: NoOpDataPlaneClient) -> TQReplayBuffer:
         dp,
         partition_id=PARTITION,
         pad_value_dict={"input_ids": 0},
-        overlong_filtering=False,
         include_message_violation_fields=False,
         require_routed_experts=False,
     )

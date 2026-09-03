@@ -1412,7 +1412,6 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
-        overlong_filtering=algo_cfg.overlong_filtering,
         include_message_violation_fields=(
             algo_cfg.invalid_tool_call_advantage is not None
             or algo_cfg.malformed_thinking_advantage is not None
