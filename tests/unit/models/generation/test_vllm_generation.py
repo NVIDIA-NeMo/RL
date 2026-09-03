@@ -197,6 +197,7 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
         model_config = "model-config"
         renderer = "renderer"
         input_processor = "input-processor"
+        vllm_config = "vllm-config"
 
         @property
         def errored(self):
@@ -228,6 +229,12 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
             calls.append(("abort", asyncio.get_running_loop(), threading.get_ident()))
 
     client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    assert (
+        await client._run_on_engine_loop(
+            lambda: asyncio.sleep(0, result="same-loop-result")
+        )
+        == "same-loop-result"
+    )
 
     def use_client_from_http_thread():
         async def use_client():
@@ -256,6 +263,8 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     assert client.model_config == "model-config"
     assert client.renderer == "renderer"
     assert client.input_processor == "input-processor"
+    assert client.vllm_config == "vllm-config"
+    assert str(client.dead_error) == "engine dead"
     assert not hasattr(client, "check_health")
     assert http_loop is not engine_loop
     assert http_thread != engine_thread
@@ -269,8 +278,16 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     assert calls[2][1:] == (http_loop, http_thread)
 
 
+@pytest.mark.parametrize(
+    "abort_error",
+    [None, RuntimeError("abort failed")],
+    ids=["success", "failure"],
+)
 @pytest.mark.asyncio
-async def test_async_vllm_http_client_aborts_cancelled_generation() -> None:
+async def test_async_vllm_http_client_aborts_cancelled_generation(
+    abort_error: RuntimeError | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     engine_loop = asyncio.get_running_loop()
     started = threading.Event()
     aborts = []
@@ -279,6 +296,7 @@ async def test_async_vllm_http_client_aborts_cancelled_generation() -> None:
         model_config = None
         renderer = None
         input_processor = None
+        vllm_config = None
 
         async def generate(self, *args, **kwargs):
             started.set()
@@ -287,6 +305,8 @@ async def test_async_vllm_http_client_aborts_cancelled_generation() -> None:
 
         async def abort(self, request_id):
             aborts.append((request_id, asyncio.get_running_loop()))
+            if abort_error is not None:
+                raise abort_error
 
     client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
 
@@ -307,6 +327,54 @@ async def test_async_vllm_http_client_aborts_cancelled_generation() -> None:
     await asyncio.to_thread(cancel_from_http_thread)
 
     assert aborts == [("cancelled-request", engine_loop)]
+    if abort_error is not None:
+        assert "Failed to abort vLLM request cancelled-request" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_worker_stops_http_server_before_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class ServerThread:
+        def join(self) -> None:
+            calls.append("server")
+
+    class SparseRefitReceiver:
+        def shutdown(self) -> None:
+            calls.append("sparse-refit")
+
+    class Engine:
+        async def collective_rpc(self, *args, **kwargs) -> None:
+            calls.append("engine-cleanup")
+
+        def shutdown(self) -> None:
+            calls.append("engine-shutdown")
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.server_thread = ServerThread()
+    worker.http_server = MagicMock()
+    worker._sparse_refit_receiver = SparseRefitReceiver()
+    worker.llm = Engine()
+    worker.tokenizer = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.gc.collect", lambda: None
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
+        lambda: None,
+    )
+
+    assert await worker.shutdown()
+    assert calls == ["server", "sparse-refit", "engine-cleanup", "engine-shutdown"]
+    assert worker.http_server.should_exit is True
+    assert worker.server_thread is None
+    assert worker.llm is None
 
 
 def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
