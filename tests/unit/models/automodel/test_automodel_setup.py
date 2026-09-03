@@ -122,6 +122,91 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_dtype_fp32_for_plain_adamw(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        validate_and_prepare_config(config=mock_config, processor=None, rank=0)
+
+        call_kwargs = mock_autoconfig_class.from_pretrained.call_args.kwargs
+        assert call_kwargs["torch_dtype"] == torch.float32
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_dtype_compute_when_optimizer_holds_master(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["optimizer"] = {
+            "name": "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam",
+            "kwargs": {"lr": 1e-4, "master_weights": True},
+        }
+
+        validate_and_prepare_config(config=mock_config, processor=None, rank=0)
+
+        call_kwargs = mock_autoconfig_class.from_pretrained.call_args.kwargs
+        assert call_kwargs["torch_dtype"] == torch.bfloat16
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_dtype_fp32_for_non_te_optimizer_master_flag(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["optimizer"] = {
+            "name": "custom.optim.Adam",
+            "kwargs": {"lr": 1e-4, "master_weights": True},
+        }
+
+        validate_and_prepare_config(config=mock_config, processor=None, rank=0)
+
+        call_kwargs = mock_autoconfig_class.from_pretrained.call_args.kwargs
+        assert call_kwargs["torch_dtype"] == torch.float32
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_dtype_fp32_when_optimizer_absent(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config.pop("optimizer", None)
+
+        validate_and_prepare_config(config=mock_config, processor=None, rank=0)
+
+        call_kwargs = mock_autoconfig_class.from_pretrained.call_args.kwargs
+        assert call_kwargs["torch_dtype"] == torch.float32
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     def test_precision_validation_invalid(
         self,
         mock_dynamo,
@@ -900,6 +985,17 @@ class TestSetupDistributed:
 class TestSetupModelAndOptimizer:
     """Test suite for setup_model_and_optimizer function."""
 
+    @pytest.fixture(autouse=True)
+    def mock_optimizer_builder(self):
+        """Keep model-setup tests focused while exercising the builder contract."""
+        with patch(
+            "nemo_rl.models.automodel.setup.build_optimizer_config"
+        ) as mock_builder:
+            optimizer_config = MagicMock()
+            optimizer_config.build.return_value = [MagicMock()]
+            mock_builder.return_value = optimizer_config
+            yield mock_builder
+
     @pytest.fixture
     def mock_runtime_config(self, mock_autoconfig):
         """Create a mock RuntimeConfig for testing."""
@@ -959,6 +1055,7 @@ class TestSetupModelAndOptimizer:
         mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
+        mock_optimizer_builder,
     ):
         """Test basic model and optimizer setup."""
         mock_get_rank.return_value = 0
@@ -972,10 +1069,6 @@ class TestSetupModelAndOptimizer:
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
 
-        # Setup mock optimizer
-        mock_optimizer = MagicMock()
-        mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
-
         result = setup_model_and_optimizer(
             config=mock_config,
             tokenizer=mock_tokenizer,
@@ -987,6 +1080,18 @@ class TestSetupModelAndOptimizer:
         )
 
         assert isinstance(result, ModelAndOptimizerState)
+        mock_optimizer_builder.assert_called_once_with(
+            "torch.optim.AdamW", {"lr": 1e-4}
+        )
+        mock_optimizer_builder.return_value.build.assert_called_once_with(
+            mock_model,
+            device_mesh=mock_distributed_context.device_mesh,
+            is_peft=False,
+        )
+        assert (
+            result.optimizer
+            is mock_optimizer_builder.return_value.build.return_value[0]
+        )
         # Automodel r0.6.0 requires the distributed topology + policies to arrive as a
         # single DistributedSetup; the separate kwargs are rejected with a TypeError.
         mock_runtime_config.model_class.from_pretrained.assert_called_once()
