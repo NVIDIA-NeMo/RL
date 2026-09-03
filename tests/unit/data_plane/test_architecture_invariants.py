@@ -13,107 +13,89 @@
 # limitations under the License.
 """Minimal behavioral invariants for the data-plane wiring.
 
-* ``examples/run_grpo._select_trainer`` dispatches the legacy trainer
-  when ``data_plane`` is absent and the sync trainer when enabled.
-* Both launchers' policy-factory blocks agree, so trainer choice and
-  policy choice cannot drift apart.
+* ``factory.select_sync_trainer`` dispatches the legacy trainer when
+  ``data_plane`` is absent and the sync trainer when enabled.
+* Every launcher picks trainer *and* policy through those shared helpers,
+  so the two choices cannot drift apart.
 * The ``DataPlaneClient`` ABC carries every method adapters depend on.
 """
 
 from __future__ import annotations
 
 import pathlib
-import textwrap
 
 import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 
-
-def _policy_factory_block(launcher: str) -> str:
-    """The launcher's policy-factory block, dedented for comparison.
-
-    Both launchers build this inline inside ``main()``, so it cannot be
-    imported and called; the source is what the test can pin.
-    """
-    source = (REPO / "examples" / launcher).read_text()
-    marker = source.index("# Pick the policy factory at the launcher level")
-    # Back up to the start of the line so ``dedent`` sees the block's own
-    # indentation on every line — the two launchers nest it at different
-    # depths, which is not drift.
-    start = source.rindex("\n", 0, marker) + 1
-    end = source.index('with rl_init_timer.time("setup")', start)
-    return textwrap.dedent(source[start:end]).strip()
+LAUNCHERS = ["run_grpo.py", "run_vlm_grpo.py"]
 
 
-def test_run_grpo_dispatches_both_trainers():
-    """``examples/run_grpo._select_trainer`` returns the TQ-mediated
-    ``grpo_train_sync`` iff ``data_plane.enabled`` is true, and the
-    legacy ``grpo_train`` otherwise."""
-    import sys
-
-    sys.path.insert(0, str(REPO / "examples"))
-    try:
-        from run_grpo import _select_trainer
-    finally:
-        sys.path.pop(0)
+def test_select_sync_trainer_dispatches_both_trainers():
+    """Returns the TQ-mediated ``grpo_train_sync`` iff ``data_plane.enabled``
+    is true, and the legacy ``grpo_train`` otherwise."""
     from nemo_rl.algorithms.grpo import MasterConfig, grpo_train
     from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+    from nemo_rl.data_plane.factory import select_sync_trainer
 
     cfg_legacy = MasterConfig.model_construct(data_plane=None)
-    assert _select_trainer(cfg_legacy) is grpo_train
+    assert select_sync_trainer(cfg_legacy) is grpo_train
 
     cfg_sync = MasterConfig.model_construct(data_plane={"enabled": True})
-    assert _select_trainer(cfg_sync) is grpo_train_sync
+    assert select_sync_trainer(cfg_sync) is grpo_train_sync
 
 
-def test_run_vlm_grpo_dispatches_both_trainers():
-    """Same invariant for the VLM launcher's copy of the dispatch.
-
-    ``run_vlm_grpo`` duplicates ``run_grpo``'s ``_select_trainer`` verbatim,
-    and only the ``run_grpo`` copy was pinned — so the VLM dispatch could
-    drift silently. That is not hypothetical: this launcher is the one that
-    shipped the ``processor=`` TypeError.
-    """
-    import sys
-
-    sys.path.insert(0, str(REPO / "examples"))
-    try:
-        from run_vlm_grpo import _select_trainer
-    finally:
-        sys.path.pop(0)
-    from nemo_rl.algorithms.grpo import MasterConfig, grpo_train
-    from nemo_rl.algorithms.grpo_sync import grpo_train_sync
-
-    cfg_legacy = MasterConfig.model_construct(data_plane=None)
-    assert _select_trainer(cfg_legacy) is grpo_train
-
-    cfg_sync = MasterConfig.model_construct(data_plane={"enabled": True})
-    assert _select_trainer(cfg_sync) is grpo_train_sync
-
-
-def test_run_vlm_grpo_policy_factory_matches_run_grpo():
-    """The other half of the dispatch, pinned the same way as the trainer half.
+def test_make_policy_factory_pairs_tq_policy_with_the_sync_trainer():
+    """The other half of the dispatch.
 
     Turning the data plane on means picking *two* things that have to agree:
-    ``grpo_train_sync`` (covered above) and a ``TQPolicy`` factory. Only the
-    first was pinned, so a launcher could end up running the sync trainer
-    against a plain ``Policy`` — which fails only after a full model load.
-
-    Both launchers clone this block verbatim, so equality is the invariant.
+    ``grpo_train_sync`` (covered above) and a ``TQPolicy`` factory. A launcher
+    that picked only one would run the sync trainer against a plain ``Policy``
+    — which fails only after a full model load.
     """
-    vlm = _policy_factory_block("run_vlm_grpo.py")
-    llm = _policy_factory_block("run_grpo.py")
+    from nemo_rl.data_plane.factory import make_policy_factory
 
-    assert vlm == llm, (
-        "examples/run_vlm_grpo.py and examples/run_grpo.py have drifted in "
-        "how they pick the policy factory. They must agree: the data-plane "
-        "dispatch chooses the sync trainer and TQPolicy together."
+    assert make_policy_factory(None) is None
+    assert make_policy_factory({"enabled": False}) is None
+
+    dp_cfg = {"enabled": True}
+    factory = make_policy_factory(dp_cfg)
+    assert factory is not None
+
+    captured = {}
+
+    class _FakeTQPolicy:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import nemo_rl.models.policy.tq_policy as tq_policy_module
+
+    real = tq_policy_module.TQPolicy
+    tq_policy_module.TQPolicy = _FakeTQPolicy
+    try:
+        make_policy_factory(dp_cfg)(cluster="c")
+    finally:
+        tq_policy_module.TQPolicy = real
+
+    assert captured == {"cluster": "c", "dp_cfg": dp_cfg}
+
+
+@pytest.mark.parametrize("launcher", LAUNCHERS)
+def test_launchers_dispatch_through_the_shared_helpers(launcher: str):
+    """A launcher that re-implements the dispatch inline can drift from the
+    helpers the two tests above pin. Cheaper to require the call than to
+    diff two copies of the source."""
+    source = (REPO / "examples" / launcher).read_text()
+
+    assert "select_sync_trainer(" in source, (
+        f"examples/{launcher} does not route its sync-trainer choice through "
+        "nemo_rl.data_plane.factory.select_sync_trainer."
     )
-    # Guard the comparison itself: two identically *wrong* blocks would pass.
-    assert 'if _dp_cfg.get("enabled", False):' in vlm
-    assert "return TQPolicy(**kwargs, dp_cfg=_dp_cfg)" in vlm
-    assert "_policy_factory = None" in vlm
+    assert "make_policy_factory(" in source, (
+        f"examples/{launcher} does not route its policy choice through "
+        "nemo_rl.data_plane.factory.make_policy_factory, so it can run the "
+        "sync trainer against a plain Policy."
+    )
 
 
 def test_sync_trainer_is_call_compatible_with_legacy_trainer():

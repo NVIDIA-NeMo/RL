@@ -331,8 +331,9 @@ class SyncRolloutActor:
             as_tensors=False, pixel_dtype=_policy_dtype(cfg.policy)
         )
         for k, v in multimodal.items():
-            for wk, wv in encode_multimodal_for_wire(k, v):
-                bulk_batch[wk] = wv
+            wire_value = encode_multimodal_for_wire(k, v)
+            if wire_value is not None:
+                bulk_batch[k] = wire_value
         # ``content`` (raw assistant text per sample) — rides TQ as a
         # NonTensorStack so the driver can fetch it back at jsonl time
         # (kv_first_write wraps it via NonTensorStack).

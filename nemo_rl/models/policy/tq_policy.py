@@ -38,7 +38,6 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -218,9 +217,9 @@ class TQPolicy(TQDriverMixin, Policy):
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
         Logprob workers fetch ``LP_SEED_FIELDS`` plus the multimodal
-        columns the rollout actually wrote (:func:`nemo_rl.data.multimodal_utils.present_multimodal_fields`),
-        so prev/ref logprobs see the same model inputs as the training
-        forward — ``train_from_meta`` ships that same set. Narrowing the
+        columns ``_isolated_meta`` unions in, so prev/ref logprobs see the
+        same model inputs as the training forward, which is narrowed through
+        the same helper. Narrowing the
         meta's field list still keeps rollout-only payload (message-log
         bulk, ``content``) in TQ. The same shape is used for both prev_lp
         and ref_lp. Workers compute the per-token tensor and commit it to
@@ -229,15 +228,14 @@ class TQPolicy(TQDriverMixin, Policy):
         completion.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
-        # Narrow the fetch to LP_SEED_FIELDS + any multimodal fields
-        # the rollout actually wrote + optional routed_experts under R3
-        # replay. ``train_from_meta`` ships the same multimodal set, so
-        # the prev/ref logprobs and the training forward see identical
-        # model inputs.
+        # Narrow the fetch to LP_SEED_FIELDS + optional routed_experts under
+        # R3 replay. ``_isolated_meta`` unions in the multimodal columns the
+        # rollout wrote, for this dispatch and the training one alike, so the
+        # prev/ref logprobs and the training forward see identical model inputs.
         lp_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                [*LP_SEED_FIELDS, *present_multimodal_fields(meta)],
+                LP_SEED_FIELDS,
                 enabled=self._router_replay_enabled and include_router_replay,
             ),
             task_name=task_name,
@@ -341,13 +339,13 @@ class TQPolicy(TQDriverMixin, Policy):
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
-        # The multimodal add-on is per-batch, not part of the static schema:
-        # without it a VLM training forward runs image-blind while the logprob
-        # forwards saw the images.
+        # The multimodal columns are per-batch, not part of the static schema,
+        # so ``_isolated_meta`` unions them in — without them a VLM training
+        # forward would run image-blind while the logprob forwards saw images.
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                [*train_fields, *present_multimodal_fields(meta)],
+                train_fields,
                 enabled=self._router_replay_enabled,
             ),
             task_name="train",
@@ -477,7 +475,7 @@ class TQPolicy(TQDriverMixin, Policy):
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                [*train_fields, *present_multimodal_fields(meta)],
+                train_fields,
                 enabled=self._router_replay_enabled,
             ),
             task_name="train",

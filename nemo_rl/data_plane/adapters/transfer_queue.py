@@ -46,7 +46,6 @@ import torch
 import transfer_queue as tq
 from tensordict import TensorDict
 
-from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -355,11 +354,21 @@ def _assert_tq_stores_scalar_rows_0d() -> None:
     corrupt reads rather than an import error.
 
     So ask TQ directly rather than trusting the pin.
+
+    Raises rather than skipping when the storage module is gone: the caller
+    reached here only after importing ``transfer_queue.metadata``, so "TQ isn't
+    installed" is no longer a live explanation — a missing module means the
+    layout moved, which is exactly what this guard exists to catch.
     """
     try:
         from transfer_queue.storage.managers.base import KVStorageManager
-    except ImportError:
-        return
+    except ImportError as e:
+        raise _tq_shape_drift_error(
+            "storage.managers.base is no longer importable",
+            "the dense-1-D storage layout the scalar schema patch assumes "
+            "cannot be verified, and a wrong assumption corrupts reads",
+            "probe",
+        ) from e
 
     generate = getattr(KVStorageManager, "_generate_values", None)
     if generate is None:
@@ -720,6 +729,12 @@ def _from_wire(td: TensorDict) -> TensorDict:
     # NonTensorData / NonTensorStack leaves are only visible via td.keys(),
     # not keys(leaves_only=True) — iterating the latter would silently drop
     # them from the rebuilt dict.
+    # Deferred: ``multimodal_utils`` pulls PIL, requests and a few hundred
+    # transformers submodules, and this adapter is imported by every process
+    # that constructs a TQ client. ``codec.materialize`` defers the same import
+    # for the same reason.
+    from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+
     new_dict: dict[str, Any] = {}
     changed = False
     for k in td.keys():

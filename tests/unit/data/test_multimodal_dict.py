@@ -729,7 +729,7 @@ def test_from_wire_rejects_dense_input():
     """A dense value here means ``materialize`` padded the field, which
     silently loses the row boundaries. Fail loud instead."""
     with pytest.raises(TypeError, match="expects the nested value"):
-        PackedTensor.from_wire(torch.zeros(3, 2, 4))
+        PackedTensor.from_wire(torch.zeros(3, 2, 4), [])
 
 
 def test_from_wire_empty_rows_match_legacy_none_semantics():
@@ -740,7 +740,9 @@ def test_from_wire_empty_rows_match_legacy_none_semantics():
         [torch.zeros(0, 3, 4), torch.zeros(0, 3, 4)], layout=torch.jagged
     )
 
-    restored = PackedTensor.from_wire(nested)
+    # An empty row contributes no segments, so its shapes entry is empty too
+    # — what ``to_wire`` mints for an all-``None`` row.
+    restored = PackedTensor.from_wire(nested, [[], []])
     assert restored.as_tensor() is None
     assert restored.logical_segment_counts_by_row() == [0, 0]
 
@@ -772,13 +774,24 @@ def test_to_wire_does_not_materialize_pad_to_max_shape():
     )
 
 
-def test_get_multimodal_dict_rejects_padded_wire_field():
-    """A dense wire value means ``codec.materialize`` padded the field and
-    the row boundaries are gone. Fail loud with a wire-contract error, not
-    a silent mis-shaped forward."""
-    data = BatchedDataDict({"pixel_values": torch.zeros(2, 3, 4, 4)})
-    with pytest.raises(TypeError, match="expects the nested value"):
-        data.get_multimodal_dict(as_tensors=False)
+def test_get_multimodal_dict_rejects_wire_form_field():
+    """Either wire form reaching here is unrecoverable, so both fail loud.
+
+    Dense means ``codec.materialize`` padded the field and the row boundaries
+    are gone; nested means the shapes companion on ``KVBatchMeta.tags`` was
+    never applied, and taking the flat rows as-is would train image-blind.
+    Neither is reconstructible from inside ``get_multimodal_dict``.
+    """
+    dense = BatchedDataDict({"pixel_values": torch.zeros(2, 3, 4, 4)})
+    with pytest.raises(ValueError, match=r"wire form \(dense\)"):
+        dense.get_multimodal_dict(as_tensors=False)
+
+    nested_value, _ = PackedTensor(
+        [torch.ones(3, 4), torch.ones(1, 4)], dim_to_pack=0
+    ).to_wire()
+    nested = BatchedDataDict({"pixel_values": nested_value})
+    with pytest.raises(ValueError, match=r"wire form \(nested\)"):
+        nested.get_multimodal_dict(as_tensors=False)
 
 
 def test_image_free_shard_emits_no_wire_field_and_reads_back_empty():
@@ -792,7 +805,7 @@ def test_image_free_shard_emits_no_wire_field_and_reads_back_empty():
     """
     packed = PackedTensor([None, None], dim_to_pack=0)
 
-    assert list(encode_multimodal_for_wire("pixel_values", packed)) == []
+    assert encode_multimodal_for_wire("pixel_values", packed) is None
 
     # What the trainer actually receives for an image-free shard.
     data = BatchedDataDict({"input_ids": torch.zeros(2, 4, dtype=torch.long)})
@@ -808,12 +821,12 @@ def test_encode_multimodal_for_wire_packed_emits_single_nested_entry():
         dim_to_pack=0,
     )
 
-    emitted = list(encode_multimodal_for_wire("pixel_values", packed))
+    # One wire value under the field's own key: the payload. Shapes ride on
+    # ``KVBatchMeta.tags``, not as a companion column, so the field count on
+    # the wire is unchanged.
+    value = encode_multimodal_for_wire("pixel_values", packed)
 
-    # Exactly one wire entry: the payload. Shapes ride on ``KVBatchMeta.tags``,
-    # not as a companion column, so the field count on the wire is unchanged.
-    assert [key for key, _ in emitted] == ["pixel_values"]
-    _, value = emitted[0]
+    assert value is not None
     assert value.is_nested
     # Flattened rows: 3*4 and 1*4 elements.
     assert [t.numel() for t in value.unbind()] == [12, 4]
@@ -884,11 +897,7 @@ def test_encode_multimodal_for_wire_per_token_passes_through():
     tensors, not nested ones."""
     ids = torch.ones((2, 6), dtype=torch.long)
 
-    pairs = list(encode_multimodal_for_wire("mm_token_type_ids", ids))
-
-    assert len(pairs) == 1
-    assert pairs[0][0] == "mm_token_type_ids"
-    assert pairs[0][1] is ids
+    assert encode_multimodal_for_wire("mm_token_type_ids", ids) is ids
 
 
 def test_pixel_dtype_cast_survives_to_the_wire_and_spares_integers():
@@ -911,11 +920,7 @@ def test_pixel_dtype_cast_survives_to_the_wire_and_spares_integers():
     )
 
     multimodal = batch.get_multimodal_dict(as_tensors=False, pixel_dtype=torch.bfloat16)
-    wire = {
-        wk: wv
-        for k, v in multimodal.items()
-        for wk, wv in encode_multimodal_for_wire(k, v)
-    }
+    wire = {k: encode_multimodal_for_wire(k, v) for k, v in multimodal.items()}
 
     assert wire["pixel_values"].dtype == torch.bfloat16
     assert wire["image_grid_thw"].dtype == torch.int64
@@ -925,14 +930,14 @@ def test_encode_multimodal_for_wire_skips_all_empty_packed():
     """An all-``None`` packed field has nothing to ship at all."""
     packed = PackedTensor([None, None], dim_to_pack=0)
 
-    assert list(encode_multimodal_for_wire("pixel_values", packed)) == []
+    assert encode_multimodal_for_wire("pixel_values", packed) is None
 
 
 def test_encode_multimodal_for_wire_rejects_unregistered_field():
     """A new modality added to ``get_multimodal_dict`` without a registry
     entry must fail loud here — the silent-drop class this PR fixes."""
     with pytest.raises(KeyError, match="unregistered multimodal field"):
-        list(encode_multimodal_for_wire("audio_values", torch.zeros(2, 4)))
+        encode_multimodal_for_wire("audio_values", torch.zeros(2, 4))
 
 
 def test_encode_multimodal_for_wire_rejects_unregistered_packed_field():
@@ -951,7 +956,7 @@ def test_encode_multimodal_for_wire_rejects_unregistered_packed_field():
     packed = PackedTensor([torch.ones(2, 4), torch.ones(3, 4)], dim_to_pack=0)
 
     with pytest.raises(KeyError, match="unregistered multimodal field"):
-        list(encode_multimodal_for_wire("pixel_attention_mask", packed))
+        encode_multimodal_for_wire("pixel_attention_mask", packed)
 
 
 def test_unregistered_packed_field_survives_get_multimodal_dict_then_raises():
@@ -976,20 +981,18 @@ def test_unregistered_packed_field_survives_get_multimodal_dict_then_raises():
 
     with pytest.raises(KeyError, match="unregistered multimodal field"):
         for k, v in mm.items():
-            list(encode_multimodal_for_wire(k, v))
+            encode_multimodal_for_wire(k, v)
 
 
 def test_encode_multimodal_for_wire_rejects_wrong_type_per_registry():
     """Registry membership decides the branch, so a mismatched value type
     is a contract break, not something to coerce."""
     with pytest.raises(AssertionError, match="expected PackedTensor"):
-        list(encode_multimodal_for_wire("pixel_values", torch.zeros(2, 4)))
+        encode_multimodal_for_wire("pixel_values", torch.zeros(2, 4))
 
     with pytest.raises(AssertionError, match="expected Tensor"):
-        list(
-            encode_multimodal_for_wire(
-                "mm_token_type_ids", PackedTensor([torch.ones(2, 3)], dim_to_pack=0)
-            )
+        encode_multimodal_for_wire(
+            "mm_token_type_ids", PackedTensor([torch.ones(2, 3)], dim_to_pack=0)
         )
 
 

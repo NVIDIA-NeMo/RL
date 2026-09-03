@@ -122,8 +122,9 @@ def _sync_rollout_write_loop(fb: BatchedDataDict, bulk_batch: BatchedDataDict) -
 
     multimodal = fb.get_multimodal_dict(as_tensors=False)
     for k, v in multimodal.items():
-        for wk, wv in encode_multimodal_for_wire(k, v):
-            bulk_batch[wk] = wv
+        wire_value = encode_multimodal_for_wire(k, v)
+        if wire_value is not None:
+            bulk_batch[k] = wire_value
 
 
 def test_vlm_wire_roundtrip_through_noop_data_plane():
@@ -495,8 +496,9 @@ def test_from_wire_keeps_packed_multimodal_fields_nested():
     ``codec.materialize``, so it is never reassembled, and reaches
     ``get_multimodal_dict`` as a dense tensor::
 
-        TypeError: from_wire expects the nested value produced by to_wire,
-        got a dense tensor of shape (3, 1, 3)
+        ValueError: 'image_grid_thw' is still in data-plane wire form (dense).
+        Packed multimodal fields must be rebuilt by
+        multimodal_utils.reassemble_packed_multimodal ...
 
     That killed a Qwen3.5 VLM GRPO run on a batch where every sample had
     exactly one image.

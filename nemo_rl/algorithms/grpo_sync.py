@@ -395,7 +395,7 @@ def grpo_train_sync(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     # Unused here, and present only so the shared VLM launcher can pass one
-    # fixed kwarg set to whichever trainer ``_select_trainer`` returns.
+    # fixed kwarg set to whichever trainer ``select_sync_trainer`` returns.
     # ``grpo_train``'s sole use of it is
     # ``attach_initial_nemo_gym_image_payloads``, gated on
     # ``grpo.deduplicate_multimodal_data`` *and* ``should_use_nemo_gym`` — the

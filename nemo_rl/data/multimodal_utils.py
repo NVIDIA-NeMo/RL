@@ -18,7 +18,7 @@ import logging
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
@@ -162,6 +162,13 @@ def row_shapes_key(field: str) -> str:
     return field + ROW_SHAPES_SUFFIX
 
 
+# Keys inside the :func:`row_shapes_key` tag value. Kept a plain dict rather
+# than a record because ``tags`` is TQ's own per-sample channel and rides its
+# serializer; both halves are read back by name, never defaulted.
+ROW_GEOMETRY_SHAPES = "shapes"
+ROW_GEOMETRY_PAD = "pad"
+
+
 # Include-list of multimodal fields every forward-running dispatch (logprob
 # *and* train) must ship so the trainer's forward matches the rollout. One wire
 # field per logical field: ``PACKED`` fields travel as a single nested tensor
@@ -181,7 +188,9 @@ def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
     return sorted(WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
 
 
-def multimodal_row_tags(multimodal: dict, sample_count: int) -> "list[dict[str, Any]]":
+def multimodal_row_tags(
+    multimodal: dict, sample_count: int
+) -> "Optional[list[dict[str, Any]]]":
     """Per-sample tag rows carrying what ``to_wire``'s flattening removes.
 
     ``KVBatchMeta.tags`` is the transport's channel for per-sample primitives:
@@ -218,10 +227,13 @@ def multimodal_row_tags(multimodal: dict, sample_count: int) -> "list[dict[str, 
         pad = value.pad_to_max_shape
         for row, row_shapes in enumerate(shapes):
             tags[row][row_shapes_key(key)] = {
-                "shapes": row_shapes,
-                "pad": pad,
+                ROW_GEOMETRY_SHAPES: row_shapes,
+                ROW_GEOMETRY_PAD: pad,
             }
-    return tags
+    # ``None`` rather than ``B`` empty dicts: a text-only run has no packed
+    # field, and an all-empty tags list would still be pickled on every
+    # dispatch and re-sliced per DP rank in ``shard_meta_for_dp``.
+    return tags if any(tags) else None
 
 
 def reassemble_packed_multimodal(
@@ -261,15 +273,17 @@ def reassemble_packed_multimodal(
                 + ". to_wire flattens each row, so without the companion the "
                 "true per-segment shapes are unrecoverable."
             )
-        rebuilt = PackedTensor.from_wire(
+        # ``from_wire`` returns ``None`` only for a zero-row value, which the
+        # guard above already excludes: a non-empty ``present`` means at least
+        # one tag row, and a row-count disagreement raises inside ``from_wire``.
+        # Indexed, not ``.get``-with-default: a producer-side rename of either
+        # key must fail here rather than silently restore ``pad=False``, which
+        # changes what ``as_tensor`` hands the vision encoder.
+        fields[key] = PackedTensor.from_wire(
             value,
-            [(r or {}).get("shapes", []) for r in rows],  # type: ignore[union-attr]
-            pad_to_max_shape=bool(present[0].get("pad", False)),
+            [[] if r is None else r[ROW_GEOMETRY_SHAPES] for r in rows],  # type: ignore[union-attr]
+            pad_to_max_shape=bool(present[0][ROW_GEOMETRY_PAD]),
         )
-        if rebuilt is None:
-            del fields[key]
-        else:
-            fields[key] = rebuilt
 
 
 class PackedTensor:
@@ -853,14 +867,11 @@ class PackedTensor:
     # ``to_wire`` / ``from_wire`` are the single boundary between the two
     # representations.
     #
-    # No companion length field: TransferQueue stores one entry per row
-    # (``storage/managers/base.py::_generate_values`` unbinds nested
-    # fields) and records their shapes on the controller
-    # (``metadata.py::extract_field_schema`` -> ``per_sample_shapes``), so
-    # the value handed back on read already carries the true per-row
-    # shapes. The old ``<key>__lengths`` companion existed only to undo
-    # ``codec.materialize``'s ``to_padded_tensor``, which no longer runs
-    # for these fields.
+    # The geometry rides on ``KVBatchMeta.tags``, not as a companion column:
+    # ``to_wire`` flattens each row, so the shapes TQ records on the
+    # controller (``metadata.py::extract_field_schema`` -> ``per_sample_shapes``)
+    # are the flat lengths, not the true per-segment shapes. See
+    # :func:`multimodal_row_tags`.
 
     def _row_segments(self) -> list[list[torch.Tensor]]:
         """Per logical row, its non-empty physical segments.
@@ -885,14 +896,22 @@ class PackedTensor:
             row_segments.append(segments)
         return row_segments
 
+    @staticmethod
+    def _shapes_of(row_segments: list[list[torch.Tensor]]) -> list[list[list[int]]]:
+        """``shapes[row][segment]`` for an already-walked row/segment list.
+
+        Shared by :meth:`row_shapes` and :meth:`to_wire` so the shape encoding
+        cannot drift between the tag minter and the payload encoder.
+        """
+        return [[list(t.shape) for t in segs] for segs in row_segments]
+
     def row_shapes(self) -> list[list[list[int]]]:
         """The ``shapes`` half of :meth:`to_wire`, without encoding the payload.
 
-        ``shapes[row][segment]`` is that segment's true shape. Callers that
-        only need the geometry -- :func:`multimodal_row_tags` -- use this so
-        they do not pay ``to_wire``'s ``torch.cat`` a second time.
+        Callers that only need the geometry -- :func:`multimodal_row_tags` --
+        use this so they do not pay ``to_wire``'s ``torch.cat`` a second time.
         """
-        return [[list(t.shape) for t in segs] for segs in self._row_segments()]
+        return self._shapes_of(self._row_segments())
 
     def to_wire(
         self,
@@ -942,9 +961,7 @@ class PackedTensor:
         # handed: give it flat rows and it records flat lengths. Padding still
         # happens for ``pad_to_max_shape`` values, but in worker memory at use
         # time via :meth:`as_tensor`, not on the wire.
-        shapes: list[list[list[int]]] = [
-            [list(t.shape) for t in segs] for segs in row_segments
-        ]
+        shapes = self._shapes_of(row_segments)
         # ``reshape(-1)`` on contiguous processor output is a view, so the
         # single-segment row -- one image per sample, the overwhelmingly common
         # case -- costs nothing here. That is per-row only: the
@@ -977,7 +994,7 @@ class PackedTensor:
     def from_wire(
         cls,
         nested: torch.Tensor,
-        shapes: Optional[list[list[list[int]]]] = None,
+        shapes: list[list[list[int]]],
         *,
         pad_to_max_shape: bool = False,
     ) -> Optional["PackedTensor"]:
@@ -989,13 +1006,9 @@ class PackedTensor:
 
         ``shapes`` is the companion returned by :meth:`to_wire`, carried on
         ``KVBatchMeta.tags`` (see :func:`multimodal_row_tags`). Each flat row is
-        split by segment ``numel`` and reshaped back to its true shape.
-
-        ``shapes=None`` is an explicit opt-out that takes the flat rows as-is,
-        yielding 1-D segments. No production caller uses it --
-        :func:`reassemble_packed_multimodal` raises rather than reach it, since
-        1-D pixels train image-blind without erroring. It exists for tests that
-        hold a wire value with no batch metadata.
+        split by segment ``numel`` and reshaped back to its true shape. It is
+        required, not optional: reconstructing without it yields 1-D segments,
+        which train image-blind without erroring.
 
         A zero-length row means the sample had no media -- it becomes
         ``None`` (not a ``(0, ...)`` tensor) so an image-free shard
@@ -1020,10 +1033,6 @@ class PackedTensor:
         if not unbound:
             return None
 
-        if shapes is None:
-            rows = [None if t.shape[0] == 0 else t for t in unbound]
-            return cls(rows, dim_to_pack=0, pad_to_max_shape=pad_to_max_shape)  # type: ignore[arg-type]
-
         if len(shapes) != len(unbound):
             raise ValueError(
                 f"from_wire got {len(unbound)} wire rows but {len(shapes)} shape "
@@ -1039,11 +1048,14 @@ class PackedTensor:
         segments_flat: list[torch.Tensor] = []
         row_offsets: list[int] = [0]
         for flat, row_shapes in zip(unbound, shapes):
-            offset = 0
-            for shape in row_shapes:
-                numel = torch.Size(shape).numel()
-                segments_flat.append(flat[offset : offset + numel].reshape(shape))
-                offset += numel
+            # ``torch.split`` cuts the whole row in one dispatch; slicing each
+            # segment individually costs O(segments) Python-level ops per row,
+            # and this runs per packed field on every fetch.
+            numels = [torch.Size(shape).numel() for shape in row_shapes]
+            segments_flat.extend(
+                view.reshape(shape)
+                for view, shape in zip(torch.split(flat, numels), row_shapes)
+            )
             row_offsets.append(len(segments_flat))
         return cls(
             segments_flat,  # type: ignore[arg-type]
@@ -1056,8 +1068,12 @@ class PackedTensor:
 
 def encode_multimodal_for_wire(
     k: str, v: Union["PackedTensor", torch.Tensor]
-) -> Iterator[tuple[str, Any]]:
-    """Yield ``(wire_key, wire_value)`` pairs. Dispatched by registry membership.
+) -> Optional[torch.Tensor]:
+    """The wire value for one multimodal field. Dispatched by registry membership.
+
+    Returns ``None`` when the field has nothing to ship (an all-empty packed
+    batch), in which case the caller omits the column entirely. The wire key is
+    always ``k``: one wire field per logical field.
 
     Payload only. Per-token fields ride rectangular; packed fields ride as one
     flattened ``torch.jagged`` value. The geometry :meth:`PackedTensor.from_wire`
@@ -1071,15 +1087,13 @@ def encode_multimodal_for_wire(
         assert isinstance(v, PackedTensor), (
             f"{k!r}: expected PackedTensor, got {type(v).__name__}"
         )
-        nested, shapes = v.to_wire()
-        if nested is None:
-            return  # all-None batch
-        yield k, nested
+        nested, _shapes = v.to_wire()
+        return nested  # None for an all-empty batch
     elif k in PER_TOKEN_MULTIMODAL_FIELDS:
         assert isinstance(v, torch.Tensor), (
             f"{k!r}: expected Tensor, got {type(v).__name__}"
         )
-        yield k, v
+        return v
     else:
         raise KeyError(
             f"unregistered multimodal field {k!r} — add to PACKED_/PER_TOKEN_MULTIMODAL_FIELDS"
