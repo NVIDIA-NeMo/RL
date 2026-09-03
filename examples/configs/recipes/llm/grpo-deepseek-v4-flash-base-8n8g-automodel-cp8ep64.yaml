@@ -114,6 +114,8 @@ policy:
       # defaults to RayExecutorV2, while FP8 worker patching currently uses V1.
       env_vars:
         VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
+        # DeepSeek V4 block-wise FP8 uses UE8M0 scales.
+        VLLM_USE_DEEP_GEMM_E8M0: "1"
       use_deep_gemm: true
       pow2_weight_scaling_factors: true
       tensor_parallel_size: 8
