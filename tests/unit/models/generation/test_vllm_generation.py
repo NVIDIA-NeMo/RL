@@ -353,10 +353,23 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class VLLMValidationError(Exception):
-        def __init__(self, message="", parameter=None):
+    class VLLMValidationError(ValueError):
+        def __init__(self, message, *, parameter=None, value=None):
             super().__init__(message)
             self.parameter = parameter
+            self.value = value
+
+        def __str__(self):
+            base = super().__str__()
+            extras = [
+                f"{name}={value}"
+                for name, value in (
+                    ("parameter", self.parameter),
+                    ("value", self.value),
+                )
+                if value is not None
+            ]
+            return f"{base} ({', '.join(extras)})" if extras else base
 
     class ToolParserManager:
         import_tool_parser = MagicMock()
