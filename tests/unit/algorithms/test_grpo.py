@@ -52,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
+    _validate_training_bounds,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -829,6 +830,26 @@ def test_raise_if_message_level_advantage_penalties_enabled_raises_when_set(
     master_config.grpo.invalid_tool_call_advantage = -5.0
     with pytest.raises(NotImplementedError, match="data_plane.enabled=true"):
         _raise_if_message_level_advantage_penalties_enabled(master_config)
+
+
+def test_training_bounds_reject_non_positive_epochs(mock_grpo_components):
+    grpo_config = mock_grpo_components["master_config"].grpo
+
+    for epochs in (0, -1):
+        grpo_config.max_num_epochs = epochs
+        with pytest.raises(ValueError, match="trains zero steps"):
+            _validate_training_bounds(grpo_config, train_sample_count=10)
+
+    grpo_config.max_num_epochs = 1
+    _validate_training_bounds(grpo_config, train_sample_count=10)
+
+
+def test_training_bounds_reject_an_empty_dataloader(mock_grpo_components):
+    grpo_config = mock_grpo_components["master_config"].grpo
+    grpo_config.max_num_epochs = 1
+
+    with pytest.raises(ValueError, match="yields 0 batches"):
+        _validate_training_bounds(grpo_config, train_sample_count=0)
 
 
 def test_multimodal_dedup_rejects_unqualified_transfer_paths(
@@ -4757,7 +4778,9 @@ def test_async_grpo_exit_on_max_epochs(mock_grpo_components, tmp_path):
     ] == [20]
     assert grpo_save_state.current_step == 20
     assert grpo_save_state.total_steps == 20
-    assert master_config.grpo.max_num_steps == 20
+    # The bound is the loop's, not the config's: master_config is written into
+    # every checkpoint and logged, so the derived value must not leak into it.
+    assert master_config.grpo.max_num_steps == 100
     cycling_dataloader_cls.assert_called_once_with(
         mock_grpo_components["train_dataloader"]
     )
