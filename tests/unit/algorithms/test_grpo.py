@@ -862,6 +862,15 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
     master_config.data_plane = {"enabled": False}
     _validate_multimodal_dedup_capability(master_config)
 
+    # And with dedup off, nothing is gated — the guard returns before it looks
+    # at the backend or at NeMo-Gym, so a text-only sync GRPO + Gym run is not
+    # blocked by a multimodal validator.
+    master_config.grpo.deduplicate_multimodal_data = False
+    master_config.policy["generation"]["backend"] = "sglang"
+    master_config.data_plane = {"enabled": True}
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        _validate_multimodal_dedup_capability(master_config)
+
 
 def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
     from nemo_rl.algorithms import grpo_sync as grpo_sync_mod

@@ -28,10 +28,12 @@ Three escalating cases, matching what real VLM fields look like:
   B. non-uniform trailing dims, same rank  -- dynamic-resolution ``[n, 3, H_i, W_i]``
   C. differing rank per row                -- image ``[p, D]`` beside video ``[T, p, D]``
 
-Case A works today. B and C are what ``PackedTensor.to_wire``
-cannot express: B is why ``pad_to_max_shape`` materializes padding up to
-the batch max, and C is rejected outright by its
-``if len(ranks) != 1: raise ValueError``.
+All three work today. ``PackedTensor.to_wire`` flattens each row to 1-D
+before handing it to ``torch.jagged``, so rows differ only in dim 0 and B and
+C encode as easily as A -- see ``test_to_wire_carries_mixed_rank_rows``. The
+true shapes ride beside the payload on ``KVBatchMeta.tags``. What
+``pad_to_max_shape`` still materializes is applied in worker memory by
+``as_tensor``, never on the wire, and mixed rank is rejected only there.
 
 The ``test_jagged_rejects_*`` cases need no backend and never skip. They
 pin *why* the padding exists, so the workaround can be deleted with

@@ -36,10 +36,10 @@ import torch
 
 from nemo_rl.data.multimodal_utils import (
     PACKED_MULTIMODAL_FIELDS,
-    multimodal_row_tags,
     PER_TOKEN_MULTIMODAL_FIELDS,
     PackedTensor,
     encode_multimodal_for_wire,
+    multimodal_row_tags,
 )
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns

@@ -38,10 +38,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data.multimodal_utils import (
-    PACKED_MULTIMODAL_FIELDS,
-    PER_TOKEN_MULTIMODAL_FIELDS,
-)
+from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -50,29 +47,9 @@ from nemo_rl.data_plane.schema import (
     LP_SEED_FIELDS,
     fields_with_optional_routed_experts,
 )
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
-
-# Include-list of multimodal fields every forward-running dispatch
-# (logprob *and* train) must ship so the trainer's forward matches the
-# rollout. One wire field per logical field: ``PACKED`` fields travel as
-# a single nested tensor whose rows carry their own shapes, and per-token
-# fields are rectangular and travel as plain tensors.
-_WIRE_MULTIMODAL_FIELDS = PER_TOKEN_MULTIMODAL_FIELDS | PACKED_MULTIMODAL_FIELDS
-
-
-def _present_multimodal_fields(meta: KVBatchMeta) -> list[str]:
-    """Multimodal wire fields the rollout actually wrote for this batch.
-
-    Intersecting with ``meta.fields`` is required, not defensive: the
-    noop adapter and the TQ contract both raise on a fetch for a field
-    that was never written, and text-only runs write none of these.
-    Sorted for a deterministic field list across ranks.
-    """
-    return sorted(_WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # Per-stage aggregators that assemble per-rank worker results into the
@@ -241,7 +218,7 @@ class TQPolicy(TQDriverMixin, Policy):
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
         Logprob workers fetch ``LP_SEED_FIELDS`` plus the multimodal
-        columns the rollout actually wrote (:func:`_present_multimodal_fields`),
+        columns the rollout actually wrote (:func:`nemo_rl.data.multimodal_utils.present_multimodal_fields`),
         so prev/ref logprobs see the same model inputs as the training
         forward — ``train_from_meta`` ships that same set. Narrowing the
         meta's field list still keeps rollout-only payload (message-log
@@ -260,7 +237,7 @@ class TQPolicy(TQDriverMixin, Policy):
         lp_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                [*LP_SEED_FIELDS, *_present_multimodal_fields(meta)],
+                [*LP_SEED_FIELDS, *present_multimodal_fields(meta)],
                 enabled=self._router_replay_enabled and include_router_replay,
             ),
             task_name=task_name,
@@ -370,7 +347,7 @@ class TQPolicy(TQDriverMixin, Policy):
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                [*train_fields, *_present_multimodal_fields(meta)],
+                [*train_fields, *present_multimodal_fields(meta)],
                 enabled=self._router_replay_enabled,
             ),
             task_name="train",
@@ -500,7 +477,7 @@ class TQPolicy(TQDriverMixin, Policy):
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                [*train_fields, *_present_multimodal_fields(meta)],
+                [*train_fields, *present_multimodal_fields(meta)],
                 enabled=self._router_replay_enabled,
             ),
             task_name="train",

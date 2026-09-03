@@ -24,6 +24,7 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     encode_multimodal_for_wire,
     multimodal_row_tags,
+    reassemble_packed_multimodal,
 )
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
@@ -695,7 +696,7 @@ def test_to_wire_emits_one_row_per_logical_row_under_dedup():
     )
 
 
-def test_to_wire_pads_segments_before_concat_under_dedup():
+def test_to_wire_does_not_pad_segments_before_concat_under_dedup():
     """A dedup row spanning segments of differing trailing dims.
 
     ``to_wire`` flattens each segment, so the per-row concat is 1-D and cannot
@@ -825,6 +826,59 @@ def test_encode_multimodal_for_wire_packed_emits_single_nested_entry():
     assert tags[0]["pixel_values__row_shapes"]["pad"] is False
 
 
+def test_multimodal_row_tags_does_not_encode_the_payload():
+    """``multimodal_row_tags`` needs geometry only, and must not pay for bytes.
+
+    It used to call ``to_wire``, whose ``torch.cat`` copies the whole column,
+    and then throw the nested value away — a full copy of the largest field in
+    the batch, discarded, once per rollout step.
+    """
+    packed = PackedTensor([torch.ones(3, 4), torch.ones(1, 4)], dim_to_pack=0)
+    calls = []
+    packed.to_wire = lambda: calls.append(1)  # type: ignore[method-assign]
+
+    tags = multimodal_row_tags({"pixel_values": packed}, len(packed))
+
+    assert calls == [], "multimodal_row_tags must not call to_wire()"
+    assert [t["pixel_values__row_shapes"]["shapes"] for t in tags] == [
+        [[3, 4]],
+        [[1, 4]],
+    ]
+
+
+def test_multimodal_row_tags_rejects_row_count_disagreement():
+    """A tags list shorter than the batch would leave a trailing sample with no
+    companion, which the read side then cannot distinguish from a lost one."""
+    packed = PackedTensor([torch.ones(3, 4), torch.ones(1, 4)], dim_to_pack=0)
+
+    with pytest.raises(ValueError, match="logical rows but the batch has"):
+        multimodal_row_tags({"pixel_values": packed}, 3)
+
+
+def test_reassemble_packed_multimodal_raises_without_companion():
+    """No companion means the true shapes are gone; reconstructing anyway
+    yields 1-D pixels and trains image-blind with no error."""
+    packed = PackedTensor([torch.ones(3, 4), torch.ones(1, 4)], dim_to_pack=0)
+    nested, _ = packed.to_wire()
+
+    with pytest.raises(ValueError, match="tags=None"):
+        reassemble_packed_multimodal({"pixel_values": nested}, None)
+
+    with pytest.raises(ValueError, match="checked 2 tag rows"):
+        reassemble_packed_multimodal({"pixel_values": nested}, [{}, {}])
+
+
+def test_reassemble_packed_multimodal_round_trips_with_companion():
+    packed = PackedTensor([torch.ones(3, 4), torch.ones(1, 4)], dim_to_pack=0)
+    nested, _ = packed.to_wire()
+    tags = multimodal_row_tags({"pixel_values": packed}, len(packed))
+
+    fields = {"pixel_values": nested}
+    reassemble_packed_multimodal(fields, tags)
+
+    assert torch.equal(fields["pixel_values"].as_tensor(), packed.as_tensor())
+
+
 def test_encode_multimodal_for_wire_per_token_passes_through():
     """Per-token fields are rectangular ``[B, S]`` — they ride as plain
     tensors, not nested ones."""
@@ -835,6 +889,36 @@ def test_encode_multimodal_for_wire_per_token_passes_through():
     assert len(pairs) == 1
     assert pairs[0][0] == "mm_token_type_ids"
     assert pairs[0][1] is ids
+
+
+def test_pixel_dtype_cast_survives_to_the_wire_and_spares_integers():
+    """The rollout casts pixels once, at ``get_multimodal_dict``.
+
+    No worker re-applies it, so if the cast did not survive
+    ``encode_multimodal_for_wire`` the largest column would cross the wire in
+    fp32 where the legacy path shipped bf16 — a silent 2x on the dominant
+    field. Integer geometry must not be dragged along with it.
+    """
+    batch = BatchedDataDict(
+        {
+            "pixel_values": PackedTensor(
+                [torch.ones(3, 4), torch.ones(1, 4)], dim_to_pack=0
+            ),
+            "image_grid_thw": PackedTensor(
+                [torch.ones(1, 3, dtype=torch.long)] * 2, dim_to_pack=0
+            ),
+        }
+    )
+
+    multimodal = batch.get_multimodal_dict(as_tensors=False, pixel_dtype=torch.bfloat16)
+    wire = {
+        wk: wv
+        for k, v in multimodal.items()
+        for wk, wv in encode_multimodal_for_wire(k, v)
+    }
+
+    assert wire["pixel_values"].dtype == torch.bfloat16
+    assert wire["image_grid_thw"].dtype == torch.int64
 
 
 def test_encode_multimodal_for_wire_skips_all_empty_packed():

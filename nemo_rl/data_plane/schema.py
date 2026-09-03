@@ -106,10 +106,10 @@ VALUE_SEED_FIELDS = LP_SEED_FIELDS
 # calibration only handles seq-dim tensor inputs, so we name them
 # explicitly. Train-side deltas (logprobs/advantages/masks) and
 # wire-only message-log bulk fields are skipped by virtue of not being
-# in this list. ``multi_modal_inputs`` covers VLM extras (pixel values,
-# grid metadata, etc.) when present; it's harmlessly absent for
-# text-only models so the filter skips it on those.
-DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
+# in this list. VLM extras are not named here — they are per-batch, so
+# callers add the ones actually present via
+# ``multimodal_utils.present_multimodal_fields``.
+DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
 

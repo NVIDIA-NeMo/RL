@@ -19,11 +19,10 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import requests
 import torch
@@ -32,6 +31,11 @@ from PIL import Image
 from transformers import PreTrainedTokenizerBase
 from transformers.audio_utils import load_audio
 from transformers.video_utils import load_video
+
+if TYPE_CHECKING:
+    # Type-only: importing the data plane at module scope here would make
+    # ``nemo_rl.data_plane`` and ``nemo_rl.data`` mutually importing.
+    from nemo_rl.data_plane.interfaces import KVBatchMeta
 
 VLLM_MULTIMODAL_DATA_KEYS = frozenset({"vllm_images", "vllm_videos", "vllm_audios"})
 NATIVE_MULTIMODAL_KEYS = frozenset({"vllm_content", *VLLM_MULTIMODAL_DATA_KEYS})
@@ -130,8 +134,12 @@ PACKED_MULTIMODAL_FIELDS = frozenset(
         "pixel_values_videos",
         "image_grid_thw",
         "video_grid_thw",
-        "second_per_grid_ts",
+        "second_per_grid_ts",  # transformers 4.x spelling; kept for old pins
         "input_features",
+        # qwen2.5/3-omni: ``Qwen2_5OmniProcessor.model_input_names`` appends
+        # both of these unconditionally, so any omni recipe emits them.
+        "feature_attention_mask",
+        "video_second_per_grid",
         # nemotron-omni: per-image [H, W] and the RADIO temporal-patching
         # frame count. Coupled with pixel_values (see
         # ``batched_data_dict._COUPLED_MULTIMODAL_KEYS``); both pack on dim 0.
@@ -141,17 +149,36 @@ PACKED_MULTIMODAL_FIELDS = frozenset(
 )
 
 
-# Companion column carrying what ``to_wire``'s flattening removes from the
-# payload. It rides as a plain per-row object array -- the same opaque column
-# mechanism ``content`` uses -- so the data plane transports and slices it
-# without knowing what a pad shape is. Reassembly lives here, in the layer that
-# owns ``PackedTensor``.
+# Suffix for the per-sample tag key carrying what ``to_wire``'s flattening
+# removes from the payload. The shapes ride inside ``KVBatchMeta.tags`` --
+# per-sample dicts the data plane transports and projects without knowing what
+# a pad shape is. Reassembly lives here, in the layer that owns
+# ``PackedTensor``.
 ROW_SHAPES_SUFFIX = "__row_shapes"
 
 
 def row_shapes_key(field: str) -> str:
-    """Companion column name carrying per-row shapes for ``field``."""
+    """Companion tag key carrying per-row shapes for ``field``."""
     return field + ROW_SHAPES_SUFFIX
+
+
+# Include-list of multimodal fields every forward-running dispatch (logprob
+# *and* train) must ship so the trainer's forward matches the rollout. One wire
+# field per logical field: ``PACKED`` fields travel as a single nested tensor
+# whose rows carry their own shapes, and per-token fields are rectangular and
+# travel as plain tensors.
+WIRE_MULTIMODAL_FIELDS = PER_TOKEN_MULTIMODAL_FIELDS | PACKED_MULTIMODAL_FIELDS
+
+
+def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
+    """Multimodal wire fields the rollout actually wrote for this batch.
+
+    Intersecting with ``meta.fields`` is required, not defensive: the noop
+    adapter and the TQ contract both raise on a fetch for a field that was
+    never written, and text-only runs write none of these. Sorted for a
+    deterministic field list across ranks.
+    """
+    return sorted(WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
 
 
 def multimodal_row_tags(multimodal: dict, sample_count: int) -> "list[dict[str, Any]]":
@@ -174,9 +201,20 @@ def multimodal_row_tags(multimodal: dict, sample_count: int) -> "list[dict[str, 
     for key, value in multimodal.items():
         if key not in PACKED_MULTIMODAL_FIELDS or not isinstance(value, PackedTensor):
             continue
-        nested, shapes = value.to_wire()
-        if nested is None:
-            continue
+        # ``row_shapes()`` rather than ``to_wire()``: the payload is encoded
+        # separately by ``encode_multimodal_for_wire``, and ``to_wire``'s
+        # ``torch.cat`` would copy the whole column a second time only for it
+        # to be discarded here.
+        shapes = value.row_shapes()
+        if all(not row_shapes for row_shapes in shapes):
+            continue  # every logical row empty -- to_wire skips the field too
+        if len(shapes) != sample_count:
+            raise ValueError(
+                f"{key!r}: PackedTensor holds {len(shapes)} logical rows but the "
+                f"batch has {sample_count} samples. Tags are aligned 1:1 with "
+                "sample_ids, so a disagreement here would pair one sample's "
+                "pixels with another's shapes."
+            )
         pad = value.pad_to_max_shape
         for row, row_shapes in enumerate(shapes):
             tags[row][row_shapes_key(key)] = {
@@ -194,6 +232,14 @@ def reassemble_packed_multimodal(
     Called by the read path once its columns are materialized. Leaves anything
     that is not a wire-form packed field untouched, so it is safe to call on any
     column dict.
+
+    Raises:
+        ValueError: A packed field arrived without its shapes companion. Every
+            producer mints the two together (``multimodal_row_tags`` beside
+            ``encode_multimodal_for_wire``) and every ``KVBatchMeta`` transform
+            projects ``tags`` alongside ``sample_ids``, so a missing companion
+            means the transport dropped it. Reconstructing anyway would hand
+            the model 1-D pixels and train image-blind without an error.
     """
     for key in list(fields):
         if key not in PACKED_MULTIMODAL_FIELDS:
@@ -203,10 +249,22 @@ def reassemble_packed_multimodal(
             continue
         rows = [t.get(row_shapes_key(key)) for t in tags] if tags is not None else None
         present = [r for r in rows if r] if rows else []
+        if not present:
+            raise ValueError(
+                f"{key!r} arrived as a nested wire value but no sample carries a "
+                f"{row_shapes_key(key)!r} tag"
+                + (
+                    " (tags=None)"
+                    if tags is None
+                    else f" (checked {len(tags)} tag rows)"
+                )
+                + ". to_wire flattens each row, so without the companion the "
+                "true per-segment shapes are unrecoverable."
+            )
         rebuilt = PackedTensor.from_wire(
             value,
-            [(r or {}).get("shapes", []) for r in rows] if rows else None,
-            pad_to_max_shape=bool(present[0].get("pad", False)) if present else False,
+            [(r or {}).get("shapes", []) for r in rows],  # type: ignore[union-attr]
+            pad_to_max_shape=bool(present[0].get("pad", False)),
         )
         if rebuilt is None:
             del fields[key]
@@ -441,7 +499,15 @@ class PackedTensor:
                 raise IndexError(
                     f"dim_to_pack={self.dim_to_pack} is invalid for tensors with rank {rank}"
                 )
-            max_shape = self.global_pad_shape() or [
+            # Computed locally, never transported. Two shards padding to
+            # different widths is harmless because the width is scratch the
+            # model discards: mcore crops it via ``imgs_sizes`` before
+            # patchification (see
+            # ``test_dynamic_resolution_padding_is_cropped_before_radio_patchification``),
+            # and the AutoModel path rejects mixed-resolution batches outright,
+            # so every image there is already the same size. Keeping this local
+            # is what lets the data plane stay ignorant of padding.
+            max_shape = [
                 max(tensor.shape[dim] for tensor in non_none_tensors)
                 for dim in range(rank)
             ]
@@ -796,30 +862,37 @@ class PackedTensor:
     # ``codec.materialize``'s ``to_padded_tensor``, which no longer runs
     # for these fields.
 
-    def global_pad_shape(self) -> Optional[list[int]]:
-        """Max trailing dims over the rows this value holds.
+    def _row_segments(self) -> list[list[torch.Tensor]]:
+        """Per logical row, its non-empty physical segments.
 
-        Computed locally, never transported. Two shards padding to different
-        widths is harmless because the width is scratch the model discards:
-        mcore crops it via ``imgs_sizes`` before patchification (see
-        ``test_dynamic_resolution_padding_is_cropped_before_radio_patchification``),
-        and the AutoModel path rejects mixed-resolution batches outright, so
-        every image there is already the same size. Keeping this local is what
-        lets the data plane stay ignorant of padding.
-
-        ``None`` when the field is not ``pad_to_max_shape``, is empty, or has
-        mixed rank -- the last is left for ``as_tensor`` to reject.
+        One entry per *logical* row. Under deduplication a logical row maps to
+        several shared physical segments (``_row_offsets`` /
+        ``_segment_indices``), so iterating ``self.tensors`` directly would
+        yield the physical segment count instead of the batch size.
+        ``_row_segment_indices`` degrades to ``[row]`` for the legacy
+        one-tensor-per-row layout.
         """
-        if not self.pad_to_max_shape:
-            return None
-        present = [t for t in self.tensors if t is not None]
-        if not present:
-            return None
-        ranks = {t.ndim for t in present}
-        if len(ranks) != 1:
-            return None
-        rank = ranks.pop()
-        return [max(t.shape[d] for t in present) for d in range(rank)]
+        # Built with an explicit loop rather than a comprehension: the
+        # ``is not None`` filter does not narrow ``Optional[Tensor]`` inside a
+        # comprehension, so the result would type as ``list[list[Tensor | None]]``.
+        row_segments: list[list[torch.Tensor]] = []
+        for row in range(len(self)):
+            segments: list[torch.Tensor] = []
+            for i in self._row_segment_indices(row):
+                segment = self.tensors[i]
+                if segment is not None:
+                    segments.append(segment)
+            row_segments.append(segments)
+        return row_segments
+
+    def row_shapes(self) -> list[list[list[int]]]:
+        """The ``shapes`` half of :meth:`to_wire`, without encoding the payload.
+
+        ``shapes[row][segment]`` is that segment's true shape. Callers that
+        only need the geometry -- :func:`multimodal_row_tags` -- use this so
+        they do not pay ``to_wire``'s ``torch.cat`` a second time.
+        """
+        return [[list(t.shape) for t in segs] for segs in self._row_segments()]
 
     def to_wire(
         self,
@@ -837,8 +910,8 @@ class PackedTensor:
           * ``shapes`` — ``shapes[row][segment]`` is that segment's true shape.
             Required because TQ derives ``per_sample_shapes`` from the value it
             is handed, so flat rows make it record flat lengths. The caller
-            ships this via ``BatchMeta.extra_info``; see
-            :func:`nemo_rl.data_plane.schema.MULTIMODAL_ROW_SHAPES`.
+            ships this on ``KVBatchMeta.tags``; see
+            :func:`nemo_rl.data.multimodal_utils.multimodal_row_tags`.
 
         Only ``dim_to_pack=0`` is supported today; other values would
         need ``ragged_idx`` on the nested tensor and a matching
@@ -851,23 +924,7 @@ class PackedTensor:
                 "threading in torch.nested and a matching transpose "
                 "on the read side."
             )
-        # One wire row per *logical* row. Under deduplication a logical
-        # row maps to several shared physical segments (``_row_offsets`` /
-        # ``_segment_indices``), so iterating ``self.tensors`` directly
-        # would emit the physical segment count instead of the batch
-        # size. ``_row_segment_indices`` degrades to ``[row]`` for the
-        # legacy one-tensor-per-row layout.
-        # Built with an explicit loop rather than a comprehension: the
-        # ``is not None`` filter does not narrow ``Optional[Tensor]`` inside a
-        # comprehension, so the result would type as ``list[list[Tensor | None]]``.
-        row_segments: list[list[torch.Tensor]] = []
-        for row in range(len(self)):
-            segments: list[torch.Tensor] = []
-            for i in self._row_segment_indices(row):
-                segment = self.tensors[i]
-                if segment is not None:
-                    segments.append(segment)
-            row_segments.append(segments)
+        row_segments = self._row_segments()
 
         # Each segment is flattened to 1-D and the row is the 1-D concat of its
         # segments. Two consequences, both deliberate:
@@ -890,8 +947,10 @@ class PackedTensor:
         ]
         # ``reshape(-1)`` on contiguous processor output is a view, so the
         # single-segment row -- one image per sample, the overwhelmingly common
-        # case -- stays zero-copy as it was before flattening. Only deduplicated
-        # multi-segment rows pay a concat.
+        # case -- costs nothing here. That is per-row only: the
+        # ``as_nested_tensor`` below routes to ``jagged_from_list``, which
+        # ``torch.cat``s every row into one values buffer, so no row is
+        # zero-copy end to end. One copy of the column is the floor.
         rows: list[Optional[torch.Tensor]] = [
             None
             if not segs
@@ -929,10 +988,14 @@ class PackedTensor:
         ``PackedTensor``.
 
         ``shapes`` is the companion returned by :meth:`to_wire`, carried on
-        ``BatchMeta.extra_info``. Each flat row is split by segment ``numel``
-        and reshaped back to its true shape. When ``shapes`` is ``None`` the
-        rows are taken as-is -- the pre-flattening encoding, still used by
-        callers that hold a wire value without the batch metadata.
+        ``KVBatchMeta.tags`` (see :func:`multimodal_row_tags`). Each flat row is
+        split by segment ``numel`` and reshaped back to its true shape.
+
+        ``shapes=None`` is an explicit opt-out that takes the flat rows as-is,
+        yielding 1-D segments. No production caller uses it --
+        :func:`reassemble_packed_multimodal` raises rather than reach it, since
+        1-D pixels train image-blind without erroring. It exists for tests that
+        hold a wire value with no batch metadata.
 
         A zero-length row means the sample had no media -- it becomes
         ``None`` (not a ``(0, ...)`` tensor) so an image-free shard
@@ -996,12 +1059,13 @@ def encode_multimodal_for_wire(
 ) -> Iterator[tuple[str, Any]]:
     """Yield ``(wire_key, wire_value)`` pairs. Dispatched by registry membership.
 
-    ``row_meta`` is ``None`` for per-token fields, which ride rectangular. For
-    packed fields it carries the per-row segment shapes and the
-    ``pad_to_max_shape`` flag, both of which :meth:`PackedTensor.from_wire`
-    needs to undo the flattening. The caller ships it on
-    ``BatchMeta.extra_info`` -- TQ cannot derive it, because it reads
-    ``per_sample_shapes`` off the flattened rows it is handed.
+    Payload only. Per-token fields ride rectangular; packed fields ride as one
+    flattened ``torch.jagged`` value. The geometry :meth:`PackedTensor.from_wire`
+    needs to undo that flattening -- per-row segment shapes plus the
+    ``pad_to_max_shape`` flag -- is minted separately by
+    :func:`multimodal_row_tags` and shipped on ``KVBatchMeta.tags``. TQ cannot
+    derive it, because it reads ``per_sample_shapes`` off the flattened rows it
+    is handed.
     """
     if k in PACKED_MULTIMODAL_FIELDS:
         assert isinstance(v, PackedTensor), (

@@ -193,14 +193,22 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # Plain per-token tensor: emit as-is.
                 result[k] = v
             elif k in PACKED_MULTIMODAL_FIELDS:
-                # Data-plane wire form: a nested value that reached here
-                # without ``codec.materialize`` reassembling it. Its live
-                # purpose is the fail-loud guard below -- a *dense* value
-                # means the field was padded and the row boundaries are
-                # gone, which ``from_wire`` rejects with a wire-contract
-                # TypeError. A nested value with no shapes companion
-                # reconstructs 1-D rows, because ``to_wire`` flattens: only
-                # the companion carries the true per-segment shapes.
+                # Data-plane wire form: a value that reached here without
+                # ``codec.materialize`` reassembling it. This branch is a
+                # fail-loud guard, not a reconstruction path. A *dense* value
+                # means the field was padded and the row boundaries are gone;
+                # a *nested* value still needs the shapes companion, which
+                # only lives on ``KVBatchMeta.tags`` and is not reachable from
+                # here -- taking the flat rows as-is would emit 1-D pixels and
+                # train image-blind. ``from_wire`` rejects the dense case with
+                # a wire-contract TypeError; the nested case is rejected here.
+                if isinstance(v, torch.Tensor) and v.is_nested:
+                    raise ValueError(
+                        f"{k!r} is still in data-plane wire form (nested). Its "
+                        "per-segment shapes ride on KVBatchMeta.tags, so it must "
+                        "be rebuilt by multimodal_utils.reassemble_packed_multimodal "
+                        "(which codec.materialize calls) before get_multimodal_dict."
+                    )
                 packed = PackedTensor.from_wire(v)
                 if packed is None:
                     continue  # empty batch (0 rows); nothing to emit

@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -40,12 +41,27 @@ def _worker(rank: int, world_size: int, tmp_init_file: str, q):
         world_size=world_size,
     )
     try:
+        # ``pixel_values`` is the case that mattered: a PackedTensor is not a
+        # torch.Tensor, so before the ``packed_wire`` branch it rode the object
+        # list and ``broadcast_object_list`` pickled the pixels into device
+        # memory (26.25 GiB on a real VLM batch). Rows differ in their trailing
+        # dims and one sample has no media, which is what the format exists for.
+        pixel_rows = [
+            torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4),
+            torch.arange(1 * 5 * 4, dtype=torch.float32).reshape(1, 5, 4) + 100,
+            None,
+        ]
         if rank == 0:
             data = BatchedDataDict(
                 {
                     "input_ids": torch.arange(12, dtype=torch.long).reshape(3, 4),
                     "input_lengths": torch.tensor([4, 3, 2], dtype=torch.int32),
                     "scalar_meta": "step_42",
+                    "pixel_values": PackedTensor(
+                        [r.clone() if r is not None else None for r in pixel_rows],
+                        dim_to_pack=0,
+                        pad_to_max_shape=True,
+                    ),
                 }
             )
         else:
@@ -62,6 +78,25 @@ def _worker(rank: int, world_size: int, tmp_init_file: str, q):
             out["input_lengths"], torch.tensor([4, 3, 2], dtype=torch.int32)
         )
         assert out["scalar_meta"] == "step_42"
+
+        packed = out["pixel_values"]
+        assert isinstance(packed, PackedTensor), type(packed).__name__
+        # Compare on logical rows, not ``.tensors``: ``from_wire`` returns
+        # segments flat with a CSR row map, so an empty row contributes no
+        # entry there. Per-row segment counts are what the model uses to match
+        # media against placeholder tokens -- densifying before the wire
+        # collapses them and misaligns the forward.
+        expected = PackedTensor(
+            [r.clone() if r is not None else None for r in pixel_rows],
+            dim_to_pack=0,
+            pad_to_max_shape=True,
+        )
+        assert (
+            packed.logical_segment_counts_by_row()
+            == expected.logical_segment_counts_by_row()
+            == [1, 1, 0]
+        )
+        assert torch.equal(packed.as_tensor(), expected.as_tensor())
         q.put((rank, "ok"))
     except Exception as e:  # pragma: no cover — surface failures to parent
         q.put((rank, f"err: {type(e).__name__}: {e}"))

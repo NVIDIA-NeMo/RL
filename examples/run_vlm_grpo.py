@@ -210,21 +210,25 @@ def main() -> None:
     else:
         # ``_select_trainer`` prints which sync trainer it picked.
         trainer = _select_trainer(master_config)
-        trainer(
-            policy,
-            policy_generation,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-            processor=processor,
-        )
+        # grpo_train_sync defers checkpoint finalization to the checkpointer's
+        # background threads; the context manager guarantees they are flushed on
+        # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
+        with checkpointer:
+            trainer(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+                processor=processor,
+            )
 
 
 if __name__ == "__main__":

@@ -41,12 +41,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
 
-from nemo_rl.data.multimodal_utils import (
-    PACKED_MULTIMODAL_FIELDS,
-    reassemble_packed_multimodal,
-)
 from nemo_rl.data_plane.schema import Layout
-
 
 if TYPE_CHECKING:
     # Type-only import. At runtime, BatchedDataDict is loaded lazily
@@ -267,10 +262,10 @@ def materialize(
     Trainer/worker code expects rectangular tensors — this is the
     bridge from the on-wire nested format.
 
-    The lazy ``BatchedDataDict`` import keeps
+    The lazy ``BatchedDataDict`` / ``multimodal_utils`` imports keep
     ``import nemo_rl.data_plane`` cheap for unit tests that don't
-    actually call this function (``BatchedDataDict`` transitively
-    pulls multimodal deps like torchvision / torchaudio).
+    actually call this function — both transitively pull PIL,
+    ``requests`` and a few hundred ``transformers`` submodules.
 
     Args:
         td: Wire TensorDict to materialize.
@@ -295,6 +290,10 @@ def materialize(
     """
     from tensordict import NonTensorData, NonTensorStack
 
+    from nemo_rl.data.multimodal_utils import (
+        PACKED_MULTIMODAL_FIELDS,
+        reassemble_packed_multimodal,
+    )
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
     pads = pad_value_dict or {}

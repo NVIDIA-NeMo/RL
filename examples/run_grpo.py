@@ -144,7 +144,7 @@ def main() -> None:
 
         # Pick the policy factory at the launcher level so the legacy trainer
         # stays data-plane-agnostic (architectural invariant — see
-        # tests/data_plane/unit/test_architecture_invariants.py).
+        # tests/unit/data_plane/test_architecture_invariants.py).
         _dp_cfg = config.data_plane or {}
         if _dp_cfg.get("enabled", False):
             from nemo_rl.models.policy.tq_policy import TQPolicy

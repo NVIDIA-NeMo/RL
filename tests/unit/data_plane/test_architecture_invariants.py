@@ -15,16 +15,35 @@
 
 * ``examples/run_grpo._select_trainer`` dispatches the legacy trainer
   when ``data_plane`` is absent and the sync trainer when enabled.
+* Both launchers' policy-factory blocks agree, so trainer choice and
+  policy choice cannot drift apart.
 * The ``DataPlaneClient`` ABC carries every method adapters depend on.
 """
 
 from __future__ import annotations
 
 import pathlib
+import textwrap
 
 import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
+
+
+def _policy_factory_block(launcher: str) -> str:
+    """The launcher's policy-factory block, dedented for comparison.
+
+    Both launchers build this inline inside ``main()``, so it cannot be
+    imported and called; the source is what the test can pin.
+    """
+    source = (REPO / "examples" / launcher).read_text()
+    marker = source.index("# Pick the policy factory at the launcher level")
+    # Back up to the start of the line so ``dedent`` sees the block's own
+    # indentation on every line — the two launchers nest it at different
+    # depths, which is not drift.
+    start = source.rindex("\n", 0, marker) + 1
+    end = source.index('with rl_init_timer.time("setup")', start)
+    return textwrap.dedent(source[start:end]).strip()
 
 
 def test_run_grpo_dispatches_both_trainers():
@@ -73,6 +92,30 @@ def test_run_vlm_grpo_dispatches_both_trainers():
     assert _select_trainer(cfg_sync) is grpo_train_sync
 
 
+def test_run_vlm_grpo_policy_factory_matches_run_grpo():
+    """The other half of the dispatch, pinned the same way as the trainer half.
+
+    Turning the data plane on means picking *two* things that have to agree:
+    ``grpo_train_sync`` (covered above) and a ``TQPolicy`` factory. Only the
+    first was pinned, so a launcher could end up running the sync trainer
+    against a plain ``Policy`` — which fails only after a full model load.
+
+    Both launchers clone this block verbatim, so equality is the invariant.
+    """
+    vlm = _policy_factory_block("run_vlm_grpo.py")
+    llm = _policy_factory_block("run_grpo.py")
+
+    assert vlm == llm, (
+        "examples/run_vlm_grpo.py and examples/run_grpo.py have drifted in "
+        "how they pick the policy factory. They must agree: the data-plane "
+        "dispatch chooses the sync trainer and TQPolicy together."
+    )
+    # Guard the comparison itself: two identically *wrong* blocks would pass.
+    assert 'if _dp_cfg.get("enabled", False):' in vlm
+    assert "return TQPolicy(**kwargs, dp_cfg=_dp_cfg)" in vlm
+    assert "_policy_factory = None" in vlm
+
+
 def test_sync_trainer_is_call_compatible_with_legacy_trainer():
     """Both trainers must accept the same call, because the VLM launcher
     picks one at runtime and passes a single fixed kwarg set.
@@ -108,6 +151,29 @@ def test_sync_trainer_is_call_compatible_with_legacy_trainer():
                 f"same launcher call, or the data_plane dispatch fails at "
                 f"runtime after a full model load."
             ) from e
+
+
+def test_both_trainers_wire_deduplicate_multimodal_data_into_repeat_interleave():
+    """``deduplicate_multimodal_data`` must not become a silent no-op.
+
+    ``enable_deduplication`` is reached only through
+    ``BatchedDataDict.repeat_interleave(..., share_immutable_media=True)``. A
+    trainer that omits the kwarg makes the flag do nothing: provenance is never
+    assigned, the deepcopy runs with an empty memo, and the user gets G
+    independent copies of every image in driver RAM with no warning.
+    """
+    import inspect
+
+    from nemo_rl.algorithms import grpo, grpo_sync
+
+    for module in (grpo, grpo_sync):
+        source = inspect.getsource(module)
+        assert "share_immutable_media=" in source, (
+            f"{module.__name__} calls repeat_interleave without "
+            "share_immutable_media, so grpo.deduplicate_multimodal_data is a "
+            "silent no-op on that trainer."
+        )
+        assert "deduplicate_multimodal_data" in source
 
 
 def test_sync_trainer_rejects_message_level_advantage_penalties():
