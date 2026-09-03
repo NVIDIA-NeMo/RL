@@ -388,6 +388,27 @@ class _BlockingDPClient(_FakeDPClient):
         super().save_checkpoint(checkpoint_dir, metadata=metadata)
 
 
+class _FakeGeneration:
+    """Continuous-serving stand-in used by actor startup and refit tests."""
+
+    requires_kv_scale_sync = False
+
+    def __init__(self) -> None:
+        self.rollout_weight_versions: list[int] = []
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        self.rollout_weight_versions.append(version)
+
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        return {}
+
+    def blocks_training(self) -> bool:
+        return False
+
+    def wake_carries_weight_updates(self) -> bool:
+        return False
+
+
 class _BlockingGeneration:
     """Colocated stand-in: blocks training, and its wake carries the update."""
 
@@ -419,12 +440,6 @@ class _FakeWeightSynchronizer:
 
     def shutdown(self) -> None:
         self.shutdown_count += 1
-
-    def blocks_training(self) -> bool:
-        return False
-
-    def wake_carries_weight_updates(self) -> bool:
-        return False
 
 
 class _EventRecordingSynchronizer(_FakeWeightSynchronizer):
@@ -581,9 +596,6 @@ class _FakeTQBuffer:
             }
         )
         return self.load_return
-
-    def __len__(self) -> int:
-        return self._num_groups
 
 
 # Default position sentinel the fake dataloader reports via state_dict().

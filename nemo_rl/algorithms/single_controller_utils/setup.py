@@ -1431,7 +1431,9 @@ def setup_single_controller(
     # is disabled or NeMo-Gym is not in play -- it is Gym that needs one stable URL.
     generation_router = None
 
-    def _build_trainer_and_value() -> tuple[Any, Optional[TQValue], dict[str, float]]:
+    def _build_trainer_and_value(
+        *, trainer_http_server_port: Optional[int] = None
+    ) -> tuple[Any, Optional[TQValue], dict[str, float]]:
         """Build the trainer, then the critic when this is a PPO run.
 
         Serial, and with the trainer offloaded in between, because both worker
@@ -1444,13 +1446,18 @@ def setup_single_controller(
             times keyed as "trainer_time" and "value_time").
         """
         time_metrics: dict[str, float] = {}
+        trainer_kwargs: dict[str, Any] = {
+            "weights_path": weights_path,
+            "optimizer_path": optimizer_path,
+        }
+        if trainer_http_server_port is not None:
+            trainer_kwargs["reserved_http_server_port"] = trainer_http_server_port
         trainer, time_metrics["trainer_time"] = _build_trainer(
             train_cluster,
             master_config,
             tokenizer,
             processor,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
+            **trainer_kwargs,
         )
         if not is_ppo_run(master_config):
             return trainer, None, time_metrics
@@ -1475,6 +1482,32 @@ def setup_single_controller(
     if megatron_backend:
         # Normally set inside _build_generation, which megatron skips.
         generation_config["model_name"] = master_config.policy["model_name"]
+
+    def _build_megatron_generation_and_train_side() -> tuple[
+        Any, Any, Optional[TQValue], dict[str, float]
+    ]:
+        """Build trainer/critic, then wrap or create Megatron generation."""
+        trainer_port, generation_port = (
+            (reserved_http_server_port, None)
+            if colocated
+            else (None, reserved_http_server_port)
+        )
+        trainer, value, time_metrics = _build_trainer_and_value(
+            trainer_http_server_port=trainer_port
+        )
+        t0 = time.perf_counter()
+        generation = MegatronGeneration(
+            config=master_config.policy,
+            tokenizer=tokenizer,
+            cluster=None if colocated else inference_cluster,
+            policy=trainer if colocated else None,
+            processor=processor,
+            weights_path=weights_path,
+            skip_weight_load=not colocated,
+            reserved_http_server_port=generation_port,
+        )
+        time_metrics["gen_time"] = time.perf_counter() - t0
+        return generation, trainer, value, time_metrics
 
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
@@ -1566,17 +1599,7 @@ def setup_single_controller(
         # Serial trainer-first in both modes:
         # colocated generation is constructed from the trainer's policy;
         # non-colocated waits for the trainer's checkpoint conversion.
-        build_tasks["generation_trainer"] = partial(
-            _build_trainer_then_megatron_generation,
-            train_cluster,
-            master_config,
-            tokenizer,
-            processor,
-            inference_cluster=None if colocated else inference_cluster,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            reserved_http_server_port=reserved_http_server_port,
-        )
+        build_tasks["generation_trainer"] = _build_megatron_generation_and_train_side
     elif colocated:
         # Colocated: vLLM prefers a clean GPU at load time, so generation comes up before the trainer.
         build_tasks["generation_trainer"] = partial(
@@ -1610,11 +1633,7 @@ def setup_single_controller(
             ray.kill(megatron_port_holder)
 
     if "generation_trainer" in results:
-        if megatron_backend:
-            generation, trainer, time_metrics = results["generation_trainer"]
-            value = None
-        else:
-            generation, trainer, value, time_metrics = results["generation_trainer"]
+        generation, trainer, value, time_metrics = results["generation_trainer"]
         gen_load_time = time_metrics["gen_time"]
     else:
         generation, gen_load_time = results["generation"]
