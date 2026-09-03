@@ -146,6 +146,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  # Free completed gradient buffers before non-colocated NCCL collective refit.
+  release_grads_before_refit: false
+  # Also move optimizer state to CPU whenever the refit offload lifecycle runs.
+  offload_optimizer_for_refit: true
 
   dtensor_cfg:
     _v2: true

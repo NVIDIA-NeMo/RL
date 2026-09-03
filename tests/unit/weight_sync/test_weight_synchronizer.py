@@ -28,7 +28,10 @@ from nemo_rl.models.generation.interfaces import CollectiveSenderSpec
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_release_grads_before_refit,
+)
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
@@ -514,6 +517,57 @@ class TestSGLangDisaggregatedWeightSynchronizer:
 
 class TestCollectiveWeightSynchronizer:
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_sync_weights_releases_trainer_memory_before_export(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        events = []
+        policy = _mock_policy()
+        gen = _mock_generation()
+        policy.offload_before_refit.side_effect = lambda: events.append(
+            "offload_before_refit"
+        )
+        gen.get_collective_sender_spec.side_effect = lambda: (
+            events.append("get_collective_sender_spec") or CollectiveSenderSpec()
+        )
+        policy.broadcast_weights_for_collective.side_effect = lambda **_: (
+            events.append("broadcast_weights_for_collective") or [MagicMock()]
+        )
+        sync = CollectiveWeightSynchronizer(
+            policy,
+            gen,
+            _mock_cluster(),
+            _mock_cluster(),
+            release_grads_before_refit=True,
+        )
+
+        sync.sync_weights()
+        sync.sync_weights()
+
+        assert events == [
+            "offload_before_refit",
+            "get_collective_sender_spec",
+            "broadcast_weights_for_collective",
+            "offload_before_refit",
+            "get_collective_sender_spec",
+            "broadcast_weights_for_collective",
+        ]
+
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_sync_weights_keeps_trainer_memory_when_release_is_disabled(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        sync = CollectiveWeightSynchronizer(
+            policy,
+            _mock_generation(),
+            _mock_cluster(),
+            _mock_cluster(),
+            release_grads_before_refit=False,
+        )
+
+        sync.sync_weights()
+
+        policy.offload_before_refit.assert_not_called()
+
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_sync_weights_calls_broadcast_and_receive(self, mock_ray):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
@@ -810,6 +864,55 @@ class TestMegatronWeightSynchronizer:
 
 
 class TestFactory:
+    def test_missing_policy_config_defaults_refit_memory_release_to_disabled(self):
+        class LegacyPolicy:
+            pass
+
+        sync = create_weight_synchronizer(
+            policy=LegacyPolicy(),
+            generation=_mock_generation(),
+            generation_backend=VLLM_BACKEND,
+            colocated=True,
+        )
+
+        assert isinstance(sync, IPCWeightSynchronizer)
+
+    def test_disabled_refit_memory_release_allows_missing_megatron_config(self):
+        policy = _mock_policy()
+        del policy.cfg["megatron_cfg"]
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=_mock_generation(),
+            generation_backend=VLLM_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    @pytest.mark.parametrize(
+        ("enabled", "megatron_enabled", "backend", "colocated", "transport"),
+        [
+            (True, True, VLLM_BACKEND, True, None),
+            (True, True, VLLM_BACKEND, False, "http"),
+            (True, True, MEGATRON_BACKEND, False, None),
+            (True, False, VLLM_BACKEND, False, None),
+        ],
+    )
+    def test_refit_memory_release_config_rejects_unsupported_setup(
+        self, enabled, megatron_enabled, backend, colocated, transport
+    ):
+        with pytest.raises(ValueError, match="release_grads_before_refit"):
+            validate_release_grads_before_refit(
+                enabled=enabled,
+                megatron_enabled=megatron_enabled,
+                generation_backend=backend,
+                colocated=colocated,
+                refit_transport=transport,
+            )
+
     def test_colocated_vllm_returns_ipc(self):
         policy = _mock_policy()
         gen = _mock_generation()
@@ -868,6 +971,72 @@ class TestFactory:
             inference_cluster=_mock_cluster(),
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    @pytest.mark.parametrize(
+        ("configured", "expected_calls"), [(None, 0), (False, 0), (True, 1)]
+    )
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_non_colocated_vllm_propagates_refit_memory_release(
+        self, mock_ray, configured, expected_calls
+    ):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        policy.cfg["megatron_cfg"]["enabled"] = True
+        if configured is not None:
+            policy.cfg["release_grads_before_refit"] = configured
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=_mock_generation(),
+            generation_backend=VLLM_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        sync.sync_weights()
+
+        assert policy.offload_before_refit.call_count == expected_calls
+
+    def test_refit_memory_release_rejects_dtensor_policy(self):
+        policy = _mock_policy()
+        policy.cfg["release_grads_before_refit"] = True
+
+        with pytest.raises(ValueError, match="Megatron policy backend"):
+            create_weight_synchronizer(
+                policy=policy,
+                generation=_mock_generation(),
+                generation_backend=VLLM_BACKEND,
+                colocated=False,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
+            )
+
+    @pytest.mark.parametrize(
+        ("generation_backend", "colocated", "refit_transport"),
+        [
+            (VLLM_BACKEND, True, None),
+            (VLLM_BACKEND, False, "nccl_reshard"),
+            (MEGATRON_BACKEND, False, None),
+        ],
+    )
+    def test_refit_memory_release_rejects_unsupported_transport(
+        self, generation_backend, colocated, refit_transport
+    ):
+        policy = _mock_policy()
+        policy.cfg["megatron_cfg"]["enabled"] = True
+        policy.cfg["release_grads_before_refit"] = True
+        generation = _mock_generation()
+        generation.cfg["refit_transport"] = refit_transport
+
+        with pytest.raises(ValueError, match="non-colocated vLLM collective"):
+            create_weight_synchronizer(
+                policy=policy,
+                generation=generation,
+                generation_backend=generation_backend,
+                colocated=colocated,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
+            )
 
     def test_non_colocated_dynamo_returns_collective(self):
         sync = create_weight_synchronizer(
