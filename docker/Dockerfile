@@ -235,17 +235,17 @@ fi
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
-UV_LINK_MODE=hardlink uv sync --package nemo-rl --frozen --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --package nemo-rl --frozen --extra vllm --no-install-project
+    UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --package nemo-rl --frozen --extra sglang --no-install-project
+    UV_LINK_MODE=hardlink uv sync --frozen --extra sglang --no-install-project
 fi
-uv sync --package nemo-rl --link-mode symlink --frozen --extra mcore --no-install-project
-uv sync --package nemo-rl --link-mode symlink --frozen --extra automodel --no-install-project
-uv sync --package nemo-rl --link-mode symlink --frozen --extra modelopt --no-install-project
-uv sync --package nemo-rl --link-mode symlink --frozen --all-groups --no-install-project
+uv sync --link-mode symlink --frozen --extra mcore --no-install-project
+uv sync --link-mode symlink --frozen --extra automodel --no-install-project
+uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
+uv sync --link-mode symlink --frozen --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
