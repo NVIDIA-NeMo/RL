@@ -612,7 +612,7 @@ def test_real_quant_model_detection_uses_native_vllm_method(
     assert extension._is_real_quant_model() is expected
 
 
-def test_real_quant_load_owns_weights_before_canonical_hf_loader(monkeypatch):
+def test_real_quant_load_uses_canonical_hf_loader(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.device = torch.device("cpu")
@@ -635,10 +635,8 @@ def test_real_quant_load_owns_weights_before_canonical_hf_loader(monkeypatch):
     assert [name for name, _ in loaded] == ["model.weight"]
     torch.testing.assert_close(loaded[0][1], source)
     assert (
-        loaded[0][1].untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+        loaded[0][1].untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
     )
-    source.zero_()
-    torch.testing.assert_close(loaded[0][1], torch.tensor([1.0, 2.0]))
 
 
 def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatch):
