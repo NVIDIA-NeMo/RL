@@ -1200,15 +1200,25 @@ def test_non_real_quant_ipc_delegates(monkeypatch):
 def test_weight_snapshot_returns_cpu_clone_and_missing_name_raises(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
-    model = torch.nn.Linear(2, 1, bias=False)
+    model = torch.nn.Module()
+    model.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.tensor([[1.0, -1.0]], dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        ),
+    )
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(model=model)
 
     snapshot = extension.get_weight_snapshot("weight")
-    model.weight.data.add_(1.0)
+    model.weight.data.zero_()
 
     assert snapshot.device.type == "cpu"
-    assert not torch.equal(snapshot, model.weight.detach().cpu())
+    assert snapshot.dtype == torch.float32
+    assert not torch.equal(
+        snapshot, model.weight.detach().to(device="cpu", dtype=torch.float32)
+    )
     with pytest.raises(KeyError, match="missing"):
         extension.get_weight_snapshot("missing")
 
