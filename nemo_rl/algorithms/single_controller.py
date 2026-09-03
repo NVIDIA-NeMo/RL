@@ -701,6 +701,7 @@ class SingleControllerActor:
             recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
             if self._master_config.token_capture.enabled:
                 await self._validate_rollout_recovery_inventory(
+                    cut,
                     replay_metadata=canonical_state,
                     clear_unreferenced=True,
                 )
@@ -987,11 +988,13 @@ class SingleControllerActor:
 
     async def _validate_rollout_recovery_inventory(
         self,
+        cut: DataPlaneMutationCut,
         *,
         replay_metadata: Optional[TQReplayMetadataState],
         clear_unreferenced: bool,
     ) -> None:
-        """Require every unfinished receipt or deferred route to retain staging."""
+        """Validate staging ownership while the caller holds a stable cut."""
+        cut.require_live()
         expected_staging_keys = self._rollout_recovery_ledger.expected_staging_keys()
         if replay_metadata is not None:
             for group in replay_metadata["groups"]:
@@ -1337,6 +1340,7 @@ class SingleControllerActor:
                 else:
                     try:
                         await self._buffer.commit_finalized(
+                            cut,
                             request.group_id,
                             finalized.meta,
                             finalized.group_min_wv,
@@ -3192,7 +3196,7 @@ class SingleControllerActor:
         # controller artifact under the exclusive side so the checkpoint cannot
         # contain a cursor without its prompt owner, or two durable owners for one
         # canonical group.
-        async with self._data_plane_checkpoint_barrier.checkpoint():
+        async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
             save_state.current_step = self._train_steps
             save_state.total_steps = self._train_steps
             save_state.trainer_version = self._trainer_version
@@ -3249,6 +3253,7 @@ class SingleControllerActor:
 
                 if self._master_config.token_capture.enabled:
                     await self._validate_rollout_recovery_inventory(
+                        cut,
                         replay_metadata=replay_metadata,
                         clear_unreferenced=False,
                     )

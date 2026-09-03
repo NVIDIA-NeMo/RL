@@ -626,6 +626,15 @@ class ResolvedRolloutRecovery:
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """Retry and restore policy for unfinished token-capture prompt groups.
 
+    ``sibling`` (the default) preserves completed generations and retries only
+    the missing ones. Prefer it when reusing work and avoiding repeated long-tail
+    generations matters more than keeping a group on one policy version.
+
+    ``prompt_group`` discards and regenerates every sibling when any generation
+    is unfinished. It costs a full group per recovery, but keeps the regenerated
+    group on the policy weights live at redispatch instead of mixing those results
+    with older sealed siblings.
+
     The resolved value is persisted on each ledger group, so restoring a saved
     group does not reinterpret it using a newer configuration. The same
     granularity governs failures handled in-process and after a process restart.

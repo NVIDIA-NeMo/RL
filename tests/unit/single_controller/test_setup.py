@@ -432,7 +432,7 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
     )
 
 
-def test_sibling_recovery_functional_config_resolves_to_runtime_contract(
+def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     tmp_path: Path,
 ) -> None:
     """The two-phase Gym recovery fixture must pass SC config validation."""
@@ -480,7 +480,7 @@ def test_sibling_recovery_functional_config_resolves_to_runtime_contract(
         "++data_plane.simple.num_storage_units=2",
         "++data_plane.claim_meta_poll_interval_s=0.5",
         "++token_capture.enabled=true",
-        "++rollout_recovery.default_granularity=sibling",
+        "++rollout_recovery.default_granularity=prompt_group",
         "++async_rl.sampler.name=in_order",
         "++async_rl.sampler.max_lookahead_versions=1",
         "++async_rl.min_groups_for_streaming_train=4",
@@ -505,7 +505,7 @@ def test_sibling_recovery_functional_config_resolves_to_runtime_contract(
     assert master_config.token_capture.enabled is True
     assert (
         master_config.rollout_recovery.default_granularity
-        is RecoveryGranularity.SIBLING
+        is RecoveryGranularity.PROMPT_GROUP
     )
     assert master_config.async_rl.rollout_failure.native.generation_timeout_s is None
     assert master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s == 120

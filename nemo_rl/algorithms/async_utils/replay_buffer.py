@@ -215,40 +215,18 @@ class DataPlaneCheckpointBarrier:
         self._condition = asyncio.Condition()
         self._checkpoint_active = False
         self._active_mutations = 0
-        self._mutation_depth_by_task: dict[asyncio.Task[Any], int] = {}
-        self._mutation_cut_by_task: dict[asyncio.Task[Any], DataPlaneMutationCut] = {}
 
     @asynccontextmanager
     async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
-        """Yield one task-local live cut after any active checkpoint exits."""
-        task = asyncio.current_task()
-        if task is None:
-            raise RuntimeError("data-plane mutation must run inside an asyncio task")
-        depth = self._mutation_depth_by_task.get(task, 0)
-        if depth:
-            # Replay-buffer helpers may join a controller-owned mutation. Do not
-            # wait behind a checkpoint that is already waiting for this outer
-            # mutation, or the two tasks deadlock.
-            self._mutation_depth_by_task[task] = depth + 1
-            cut = self._mutation_cut_by_task[task]
-            cut.require_live()
-            try:
-                yield cut
-            finally:
-                self._mutation_depth_by_task[task] -= 1
-            return
+        """Yield a live cut after any active checkpoint exits."""
         async with self._condition:
             await self._condition.wait_for(lambda: not self._checkpoint_active)
             self._active_mutations += 1
-            self._mutation_depth_by_task[task] = 1
             cut = DataPlaneMutationCut(self)
-            self._mutation_cut_by_task[task] = cut
         try:
             yield cut
         finally:
             cut._invalidate()
-            del self._mutation_cut_by_task[task]
-            del self._mutation_depth_by_task[task]
             async with self._condition:
                 self._active_mutations -= 1
                 if self._active_mutations == 0:
@@ -1236,13 +1214,18 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before removing a group"
             )
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
             return await self._remove_groups_unlocked(
-                [group_id], clear_data_plane=remove_in_dp
+                cut, [group_id], clear_data_plane=remove_in_dp
             )
 
-    async def clear_staging_keys(self, staging_keys: list[str]) -> None:
-        """Clear known token-capture staging rows under the checkpoint barrier."""
+    async def clear_staging_keys(
+        self,
+        cut: DataPlaneMutationCut,
+        staging_keys: list[str],
+    ) -> None:
+        """Clear known token-capture staging rows under a caller-owned cut."""
+        cut.require_live()
         if not staging_keys:
             return
         if self._staging_partition_id is None:
@@ -1255,17 +1238,17 @@ class TQReplayBuffer:
                 "checkpoint barrier before clearing staging samples"
             )
         unique_keys = list(dict.fromkeys(staging_keys))
-        async with self._data_plane_checkpoint_barrier.mutation():
-            await call_data_plane(
-                self._dp_client,
-                "clear_samples",
-                offload_sync=True,
-                sample_ids=unique_keys,
-                partition_id=self._staging_partition_id,
-            )
+        await call_data_plane(
+            self._dp_client,
+            "clear_samples",
+            offload_sync=True,
+            sample_ids=unique_keys,
+            partition_id=self._staging_partition_id,
+        )
 
     async def commit_finalized(
         self,
+        cut: DataPlaneMutationCut,
         group_id: str,
         meta: KVBatchMeta,
         group_min_wv: int,
@@ -1282,6 +1265,7 @@ class TQReplayBuffer:
         rollout straddles a refit.
 
         Args:
+            cut: Live cut acquired by the owner coordinating finalization.
             group_id: group_id returned by the matching reserve call.
             meta: KVBatchMeta the finalizer built over its published rows.
             group_min_wv: Oldest weight version any call in the group used.
@@ -1292,6 +1276,7 @@ class TQReplayBuffer:
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
         """
+        cut.require_live()
         try:
             idx = self._group_ids.index(group_id)
         except ValueError:
@@ -1400,20 +1385,23 @@ class TQReplayBuffer:
         # removal may shift every list index while this task waits for the barrier
         # or for DataPlane cleanup.
         drop_group_ids = [self._group_ids[i] for i in drop_idxs]
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
             return await self._remove_groups_unlocked(
-                drop_group_ids, clear_data_plane=remove_in_dp
+                cut, drop_group_ids, clear_data_plane=remove_in_dp
             )
 
     async def _remove_groups_unlocked(
-        self, group_ids: list[str], *, clear_data_plane: bool
+        self,
+        cut: DataPlaneMutationCut,
+        group_ids: list[str],
+        *,
+        clear_data_plane: bool,
     ) -> int:
-        """Remove stable groups while the caller owns a mutation slot."""
+        """Remove stable groups while the caller owns a live mutation cut."""
+        cut.require_live()
         if len(group_ids) != len(set(group_ids)):
             raise ValueError("replay removal contains duplicate group IDs")
-        index_by_group_id = {
-            group_id: i for i, group_id in enumerate(self._group_ids)
-        }
+        index_by_group_id = {group_id: i for i, group_id in enumerate(self._group_ids)}
         if len(index_by_group_id) != len(self._group_ids):
             raise RuntimeError("replay buffer contains duplicate live group IDs")
         missing_group_ids = [

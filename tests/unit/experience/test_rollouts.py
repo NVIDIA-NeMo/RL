@@ -2285,6 +2285,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
+    manager._effort_config = None
 
     with pytest.raises(ValueError, match="duplicate row index 0"):
         asyncio.run(

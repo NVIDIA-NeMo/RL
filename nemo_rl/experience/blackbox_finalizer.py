@@ -603,12 +603,18 @@ class BlackboxFinalizer:
                     flush=True,
                 )
 
-        group_min_wv = min(
-            (r.min_wv for r in valid_rows), default=fallback_weight_version
-        )
-        group_max_wv = max(
-            (r.max_wv for r in valid_rows), default=fallback_weight_version
-        )
+        min_weight_versions = [
+            row.min_wv for row in valid_rows if row.min_wv is not None
+        ]
+        max_weight_versions = [
+            row.max_wv for row in valid_rows if row.max_wv is not None
+        ]
+        if len(min_weight_versions) != len(valid_rows) or len(
+            max_weight_versions
+        ) != len(valid_rows):
+            raise RuntimeError("valid finalized rows must carry weight versions")
+        group_min_wv = min(min_weight_versions, default=fallback_weight_version)
+        group_max_wv = max(max_weight_versions, default=fallback_weight_version)
 
         valid_fraction = len(valid_rows) / len(rows)
         if (
