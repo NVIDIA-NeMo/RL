@@ -67,6 +67,38 @@ def test_compute_distributed_selected_logprobs(monkeypatch):
     torch.testing.assert_close(actual, expected)
 
 
+def test_compute_distributed_selected_logprobs_without_output_reduce(monkeypatch):
+    """The caller can own the final selected-logprob reduction."""
+    reduce_ops = []
+
+    def fake_all_reduce(tensor, *, op, group):
+        reduce_ops.append(op)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    torch.manual_seed(42)
+    logits = torch.randn(2, 5, 11, dtype=torch.float32)
+    target = torch.randint(0, logits.shape[-1], (2, 5))
+    target_mask = torch.zeros_like(target, dtype=torch.bool)
+
+    actual = _compute_distributed_selected_logprobs(
+        logits,
+        masked_target=target,
+        target_mask=target_mask,
+        group=None,
+        reduce_output=False,
+    )
+    expected = (
+        torch.log_softmax(logits, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert reduce_ops == [
+        torch.distributed.ReduceOp.MAX,
+        torch.distributed.ReduceOp.SUM,
+    ]
+
+
 def test_compute_distributed_selected_logprobs_tp_shards(monkeypatch):
     """TP-local selected values reduce to full-vocabulary token logprobs."""
     torch.manual_seed(123)
