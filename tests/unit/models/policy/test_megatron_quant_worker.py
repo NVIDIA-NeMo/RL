@@ -484,8 +484,10 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
     )
 
     def export_params(kv_scales=None):
-        events.append(("export", "weight"))
+        events.append(("export", "weight_0"))
         yield "model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)
+        events.append(("export", "weight_1"))
+        yield "model.layers.1.mlp.down_proj.weight", torch.ones(2, 2)
 
     monkeypatch.setattr(
         worker,
@@ -495,9 +497,11 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
 
     def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
         calls.append(kwargs)
-        assert list(kwargs["params_generator"])[0][0] == (
-            "model.layers.0.mlp.down_proj.weight"
-        )
+        params = iter(kwargs["params_generator"])
+        assert next(params)[0] == "model.layers.0.mlp.down_proj.weight"
+        events.append(("ack_wait", None))
+        assert next(params)[0] == "model.layers.1.mlp.down_proj.weight"
+        assert list(params) == []
 
     monkeypatch.setattr(
         policy_utils,
@@ -511,7 +515,28 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
     assert calls[1]["buffer_size_bytes"] == 123
     assert calls[1]["zmq_socket"] is worker.zmq_socket
     assert calls[1]["rank"] == 0
-    assert [event[0] for event in events] == ["barrier", "export", "barrier"]
+    assert [event[0] for event in events] == [
+        "barrier",
+        "export",
+        "ack_wait",
+        "barrier",
+        "export",
+        "barrier",
+    ]
+    barrier_kwargs = [event[1] for event in events if event[0] == "barrier"]
+    assert (
+        barrier_kwargs
+        == [
+            {
+                "group": worker._real_quant_refit_sync_group,
+                "timeout": megatron_quant_policy_worker.timedelta(
+                    milliseconds=megatron_quant_policy_worker.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
+                ),
+                "wait_all_ranks": True,
+            }
+        ]
+        * 3
+    )
 
 
 @requires_weight_folding
