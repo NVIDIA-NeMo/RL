@@ -1213,6 +1213,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
         base_urls=["http://reserved-vllm"],
         model_name="test-policy",
         tokenizer=tokenizer,
+        enable_router_replay=False,
         use_fastokens=False,
     )
     assert master_config.env["nemo_gym"] == nemo_gym_env_before

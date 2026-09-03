@@ -49,7 +49,10 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
-from nemo_rl.models.generation.interfaces import should_use_async_rollouts
+from nemo_rl.models.generation.interfaces import (
+    resolve_routed_experts_dtype_name_for_model,
+    should_use_async_rollouts,
+)
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
@@ -965,10 +968,10 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
 def build_nemo_gym_config(
     env_configs: dict[str, Any],
     *,
-    base_urls: list[Optional[str]],
+    base_urls: list[str],
     model_name: str,
-    enable_router_replay: bool = False,
-    use_fastokens: bool = False,
+    enable_router_replay: bool,
+    use_fastokens: bool,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a NeMo-Gym actor.
 
@@ -986,6 +989,11 @@ def build_nemo_gym_config(
             routed-experts carry dtype ("int8"/"int16"/"int32") for the model.
         use_fastokens: Forwarded from ``policy.tokenizer.use_fastokens`` so the
             actor patches its tokenizer the same way the driver does.
+
+    Returns:
+        A ``NemoGymConfig`` with NeMo-RL fields at the top level and the
+        remaining ``env_configs["nemo_gym"]`` keys under
+        ``initial_global_config_dict``. The caller's ``env_configs`` is not mutated.
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
 
@@ -1012,14 +1020,11 @@ def build_nemo_gym_config(
     if uv_venv_dir is not None:
         nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
 
-    routed_experts_dtype = "int16"
-    if enable_router_replay:
-        # Deferred so the actor module stays free of generation-package imports.
-        from nemo_rl.models.generation.interfaces import (
-            resolve_routed_experts_dtype_name_for_model,
-        )
-
-        routed_experts_dtype = resolve_routed_experts_dtype_name_for_model(model_name)
+    routed_experts_dtype = (
+        resolve_routed_experts_dtype_name_for_model(model_name)
+        if enable_router_replay
+        else "int16"
+    )
 
     return NemoGymConfig(
         model_name=model_name,
@@ -1038,11 +1043,11 @@ def build_nemo_gym_config(
 def spinup_nemo_gym_actor(
     env_configs: dict[str, Any],
     *,
-    base_urls: list[Optional[str]],
+    base_urls: list[str],
     model_name: str,
     tokenizer: PreTrainedTokenizerBase,
-    enable_router_replay: bool = False,
-    use_fastokens: bool = False,
+    enable_router_replay: bool,
+    use_fastokens: bool,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 

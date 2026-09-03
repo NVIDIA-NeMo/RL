@@ -642,7 +642,7 @@ def _build_value(
 
 def _spinup_gym(
     master_config: MasterConfig,
-    base_urls: list[Optional[str]],
+    base_urls: list[str],
     tokenizer: PreTrainedTokenizerBase,
 ) -> tuple[Any, float]:
     """Spin up the NeMo-Gym actor against the reserved vLLM URLs.
@@ -1224,7 +1224,7 @@ def setup_single_controller(
         build_tasks["nemo_gym"] = partial(
             _spinup_gym,
             master_config=master_config,
-            base_urls=gym_spinup_base_urls,
+            base_urls=cast(list[str], gym_spinup_base_urls),
             tokenizer=tokenizer,
         )
 

@@ -115,6 +115,8 @@ def _env_configs(**overrides):
         "num_gpu_nodes": 1,
         "invalid_tool_call_patterns": ["bad_call"],
         "thinking_tags": ["<think>"],
+        "tokenizer_config": {"name": "test-tokenizer"},
+        "pad_dynamic_image_shapes": True,
         "config_paths": ["gym.yaml"],
     }
     nemo_gym.update(overrides)
@@ -141,12 +143,16 @@ def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
         env_configs,
         base_urls=["http://vllm-0"],
         model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
     )
 
     assert cfg["model_name"] == "test-model"
     assert cfg["base_urls"] == ["http://vllm-0"]
     assert cfg["invalid_tool_call_patterns"] == ["bad_call"]
     assert cfg["thinking_tags"] == ["<think>"]
+    assert cfg["tokenizer_config"] == {"name": "test-tokenizer"}
+    assert cfg["pad_dynamic_image_shapes"] is True
     assert cfg["initial_global_config_dict"] == {
         "num_gpu_nodes": 1,
         "config_paths": ["gym.yaml"],
@@ -173,20 +179,29 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
         _env_configs(**configured),
         base_urls=[],
         model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
     )
     global_config = cfg["initial_global_config_dict"]
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
 
 
 def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
-    cfg = build_nemo_gym_config(_env_configs(), base_urls=[], model_name="test-model")
+    cfg = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
     assert cfg["require_routed_experts"] is False
     assert cfg["routed_experts_dtype"] == "int16"
 
 
 def test_build_nemo_gym_config_router_replay_resolves_dtype(detected_uv_dirs):
-    with patch(
-        "nemo_rl.models.generation.interfaces.resolve_routed_experts_dtype_name_for_model",
+    with patch.object(
+        nemo_gym_mod,
+        "resolve_routed_experts_dtype_name_for_model",
         return_value="int8",
     ) as mock_resolve:
         cfg = build_nemo_gym_config(
@@ -194,6 +209,7 @@ def test_build_nemo_gym_config_router_replay_resolves_dtype(detected_uv_dirs):
             base_urls=[],
             model_name="test-model",
             enable_router_replay=True,
+            use_fastokens=False,
         )
 
     mock_resolve.assert_called_once_with("test-model")
@@ -226,6 +242,7 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
             base_urls=["http://vllm-0"],
             model_name="test-model",
             tokenizer=tokenizer,
+            enable_router_replay=False,
             use_fastokens=True,
         )
 
