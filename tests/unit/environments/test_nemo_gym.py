@@ -42,6 +42,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
     build_reward_component_columns,
+    drop_gym_private_result_keys,
     extract_reward_components,
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
@@ -75,6 +76,22 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_drop_gym_private_result_keys_strips_only_the_latency_stamp():
+    result = {
+        "reward": 1.0,
+        "_ng_rollout_latency_ms": 218.5,
+        "_ng_task_index": 3,
+        "_ng_failure_terminal": False,
+    }
+
+    drop_gym_private_result_keys(result)
+
+    assert result == {"reward": 1.0, "_ng_task_index": 3, "_ng_failure_terminal": False}
+    # Idempotent on results Gym already stripped.
+    drop_gym_private_result_keys(result)
+    assert "_ng_rollout_latency_ms" not in result
 
 
 def test_multimodal_content_types_cover_responses_media_aliases():
