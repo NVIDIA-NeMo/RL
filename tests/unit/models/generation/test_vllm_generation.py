@@ -538,6 +538,8 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
 
     response_content = response.body.decode()
     assert response.status_code == 400
+    assert "maximum context length" in response_content
+    assert "(parameter=max_tokens)" in response_content
     assert _nemo_gym_recognizes_context_overflow(
         status=response.status_code,
         response_content=response_content,
