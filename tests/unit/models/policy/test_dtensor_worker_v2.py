@@ -14,6 +14,7 @@
 
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -119,6 +120,174 @@ def test_dtensor_v2_prepare_for_lp_inference_keep_train_buffers(
 
     assert model.eval_called
     assert offloaded_devices == ([] if keep_train_buffers else ["cpu"])
+
+
+@pytest.mark.parametrize(
+    ("env_value", "eval_mode", "cpu_offload", "has_optimizer", "expected"),
+    [
+        ("1", False, False, True, True),
+        ("0", False, False, True, False),
+        ("1", True, False, True, False),
+        ("1", False, True, True, False),
+        ("1", False, False, False, False),
+    ],
+)
+def test_dtensor_v2_maybe_offload_optimizer_for_train(
+    monkeypatch,
+    env_value,
+    eval_mode,
+    cpu_offload,
+    has_optimizer,
+    expected,
+):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    moved_devices = []
+
+    worker.cpu_offload = cpu_offload
+    worker.optimizer = object() if has_optimizer else None
+    worker.move_optimizer_to_device = lambda device: moved_devices.append(device)
+    monkeypatch.setenv("NRL_OFFLOAD_OPTIMIZER_FOR_TRAIN", env_value)
+
+    offloaded = DTensorPolicyWorkerV2Impl._maybe_offload_optimizer_for_train(
+        worker, eval_mode
+    )
+
+    assert offloaded is expected
+    assert moved_devices == (["cpu"] if expected else [])
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_train_offload_restores_optimizer_after_failure(monkeypatch):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    moved_devices = []
+    worker.cpu_offload = False
+    worker.optimizer = object()
+    worker.move_optimizer_to_device = lambda device: moved_devices.append(device)
+    monkeypatch.setenv("NRL_OFFLOAD_OPTIMIZER_FOR_TRAIN", "1")
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        with worker._temporarily_offload_optimizer_for_train(eval_mode=False):
+            raise RuntimeError("forward failed")
+
+    assert moved_devices == ["cpu", "cuda"]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_checkpoint_temporarily_offloads_cuda_optimizer(monkeypatch):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    events = []
+
+    worker.optimizer = MagicMock(spec=[])
+    worker.cpu_offload = False
+    worker._requires_synchronous_checkpoint = True
+    worker._optimizer_state_is_cuda = lambda: True
+    worker.move_optimizer_to_device = lambda device: events.append(device)
+    worker.checkpoint_manager = MagicMock()
+
+    def save_checkpoint(**_kwargs):
+        events.append("save")
+
+    worker.checkpoint_manager.save_checkpoint.side_effect = save_checkpoint
+    worker.model = object()
+    worker.scheduler = object()
+    worker.tokenizer = object()
+    worker.lora_enabled = False
+    worker.peft_config = None
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.gc.collect",
+        lambda: None,
+    )
+
+    DTensorPolicyWorkerV2Impl.save_checkpoint(
+        worker,
+        weights_path="weights",
+        optimizer_path="optimizer",
+    )
+
+    assert events == ["cpu", "save", "cuda"]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_checkpoint_restores_optimizer_after_failure(monkeypatch):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    moved_devices = []
+
+    worker.optimizer = MagicMock(spec=[])
+    worker.cpu_offload = False
+    worker._requires_synchronous_checkpoint = True
+    worker._optimizer_state_is_cuda = lambda: True
+    worker.move_optimizer_to_device = lambda device: moved_devices.append(device)
+    worker.checkpoint_manager = MagicMock()
+    worker.checkpoint_manager.save_checkpoint.side_effect = RuntimeError("save failed")
+    worker.model = object()
+    worker.scheduler = object()
+    worker.tokenizer = object()
+    worker.lora_enabled = False
+    worker.peft_config = None
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.gc.collect",
+        lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match="save failed"):
+        DTensorPolicyWorkerV2Impl.save_checkpoint(
+            worker,
+            weights_path="weights",
+            optimizer_path="optimizer",
+        )
+
+    assert moved_devices == ["cpu", "cuda"]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize(
+    ("optimizer_path", "cpu_offload", "state_is_cuda"),
+    [
+        (None, False, True),
+        ("optimizer", True, True),
+        ("optimizer", False, False),
+    ],
+)
+def test_dtensor_v2_checkpoint_skips_unneeded_optimizer_movement(
+    monkeypatch, optimizer_path, cpu_offload, state_is_cuda
+):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    moved_devices = []
+
+    worker.optimizer = MagicMock(spec=[])
+    worker.cpu_offload = cpu_offload
+    worker._requires_synchronous_checkpoint = True
+    worker._optimizer_state_is_cuda = lambda: state_is_cuda
+    worker.move_optimizer_to_device = lambda device: moved_devices.append(device)
+    worker.checkpoint_manager = MagicMock()
+
+    worker.model = object()
+    worker.scheduler = object()
+    worker.tokenizer = object()
+    worker.lora_enabled = False
+    worker.peft_config = None
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.gc.collect",
+        lambda: None,
+    )
+
+    DTensorPolicyWorkerV2Impl.save_checkpoint(
+        worker,
+        weights_path="weights",
+        optimizer_path=optimizer_path,
+    )
+
+    assert moved_devices == []
 
 
 @pytest.mark.automodel
@@ -938,7 +1107,12 @@ class TestAutocastContext:
 
 
 def _init_v2_worker_mocked(
-    monkeypatch, *, init_reference_model, weights_path, optimizer_path
+    monkeypatch,
+    *,
+    init_reference_model,
+    weights_path,
+    optimizer_path,
+    model_type=None,
 ):
     """Run DTensorPolicyWorkerV2Impl.__init__ with all heavy deps mocked.
 
@@ -959,7 +1133,7 @@ def _init_v2_worker_mocked(
     # Unpacked as runtime config at the end of __init__.
     runtime_config = RuntimeConfig(
         model_class="model_class",
-        model_config="model_config",
+        model_config=SimpleNamespace(model_type=model_type),
         hf_config_overrides={},
         allow_flash_attn_args=False,
         attn_impl="attn_impl",
@@ -986,6 +1160,7 @@ def _init_v2_worker_mocked(
     )
 
     def fake_init_checkpoint_manager(self, config_updates=None, checkpoint_root=None):
+        self._test_checkpoint_config_updates = config_updates
         self.checkpoint_manager = MagicMock()
         self.checkpoint_manager.load_checkpoint = load_checkpoint_mock
 
@@ -1039,6 +1214,26 @@ def _init_v2_worker_mocked(
         init_reference_model=init_reference_model,
     )
     return worker, call_log, setup_mock, load_checkpoint_mock
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize(
+    ("model_type", "expected_async"),
+    [("deepseek_v4", False), ("deepseek_v3", True)],
+)
+def test_dtensor_v2_scopes_synchronous_checkpointing_to_dsv4(
+    monkeypatch, model_type, expected_async
+):
+    worker, *_ = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=False,
+        weights_path=None,
+        optimizer_path=None,
+        model_type=model_type,
+    )
+
+    assert worker._test_checkpoint_config_updates["is_async"] is expected_async
 
 
 @pytest.mark.automodel
