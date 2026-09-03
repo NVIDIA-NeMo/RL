@@ -392,10 +392,10 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.18",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cudnn-frontend==1.26.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
@@ -636,12 +636,23 @@ requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.15.0+42b8400"
-requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
+version = "2.18.0+27486e03"
+requires-dist = [
+  "pydantic<2.14",
+  "importlib-metadata>=1.0",
+  "packaging",
+  "torch>=2.1",
+  "einops",
+  "onnxscript",
+  "onnx",
+  "nvdlfw-inspect",
+  "nvidia-cudnn-frontend>=1.25.0",
+]
+provides-extras = ["core-cu13", "pytorch"]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.15.0+42b8400"
+version = "2.18.0+27486e03"
 requires-dist = ["torch", "transformer-engine"]
 
 [[tool.uv.dependency-metadata]]
