@@ -1826,19 +1826,14 @@ class SingleControllerActor:
                                 "Skipping generation snapshot metrics: %s", error
                             )
 
-                    # Whole steps are assembled for colocated engines so the loop closes after this.
-                    # In-flight requests freeze, then continue on fresh weights.
-                    # The post-step `_sync_weights` wake reopens the gate,
-                    # except on save-bound steps, where the wake is deferred until after the save.
+                    # Safe mid-loop: colocated steps are assembled whole, so the loop closes after this.
+                    # The gate reopens at the post-step _sync_weights wake, or after the save on save-bound steps.
                     if self._gen is not None and self._gen.blocks_training():
                         self._rollout_permitted.clear()
-                        await asyncio.to_thread(self._gen.finish_generation)
-                        # Deadline clocks are meant to be in terms of the inference clock-time.
-                        # However, naively, we measure them against wall clock-time.
-                        # This is incorrect in colocated. Every time we switch to training,
-                        # we unfairly penalize the deadline clocks.
-                        # Instead, freeze the deadline clocks while we are training.
+                        # Deadline clocks measure inference service time, not wall clock:
+                        # the switch to training must not tick them down.
                         self._rollout_manager.suspend_request_deadlines()
+                        await asyncio.to_thread(self._gen.finish_generation)
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
@@ -2131,8 +2126,10 @@ class SingleControllerActor:
                 will_save_checkpoint = self._master_config.checkpointing[
                     "enabled"
                 ] and (should_save_by_step or should_save_by_timeout)
-                # A save-bound colocated step defers the wake until after the save.
-                defer_wake_for_save = (
+                # A colocated Megatron wake is itself the refit (prepare_for_generation reshards or
+                # shares the trainer's tensors), so a save-bound step skips _sync_weights and
+                # splits it: offload before the save, wake after it.
+                defer_refit_for_save = (
                     will_save_checkpoint
                     and self._gen.blocks_training()
                     and self._gen.wake_carries_weight_updates()
@@ -2143,8 +2140,8 @@ class SingleControllerActor:
                 # But a colocated engine that was stood down still needs to be woken up via reshard.
                 aborted_stale_inflight_groups = 0
                 if is_policy_training_step or self._gen.blocks_training():
-                    if defer_wake_for_save:
-                        # Wake-deferral (colocated): the engine is about to be saved; let it sleep.
+                    if defer_refit_for_save:
+                        # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
                         # Record `weight_sync` for consistency in reports.
                         with self._timer.time("weight_sync"):
                             pass
@@ -2192,7 +2189,7 @@ class SingleControllerActor:
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
                         )
-                    if defer_wake_for_save:
+                    if defer_refit_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.
                         # Deliberately a bare wake, not `_sync_weights`.
                         loop_will_exit = is_last_step or should_save_by_timeout

@@ -762,6 +762,7 @@ class TestSetup:
                 ValueError,
                 "min_groups_for_streaming_train",
             ),
+            ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
         ],
     )
@@ -806,6 +807,9 @@ class TestSetup:
             mc.async_rl.min_groups_for_streaming_train = (
                 mc.grpo.num_prompts_per_step - 1
             )
+        elif invalid_case == "colocated_vllm":
+            # Colocated generation is rejected for every backend but megatron.
+            mc = _make_master_config(colocated=True)
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=False, backend="sglang")
         else:  # pragma: no cover

@@ -949,30 +949,30 @@ class TestSaveTrigger:
                 4,
                 {"step_2", "step_4"},
                 [
-                    # step 1: stand down (request clocks suspended with the
-                    # engine), then the plain wake inside _sync_weights, whose
-                    # tail resumes the clocks.
-                    "finish_generation",
+                    # step 1: freeze the request clocks, then stand down; the
+                    # plain wake inside _sync_weights resumes the clocks at its
+                    # tail.
                     "suspend_deadlines",
+                    "finish_generation",
                     "sync",
                     "resume_deadlines",
                     # step 2: save-bound — no sync; the wake is deferred past the save.
-                    "finish_generation",
                     "suspend_deadlines",
+                    "finish_generation",
                     "offload_before_refit",
                     "save",
                     "offload_after_refit",
                     "wake",
                     "resume_deadlines",
                     # step 3: back to the plain shape.
-                    "finish_generation",
                     "suspend_deadlines",
+                    "finish_generation",
                     "sync",
                     "resume_deadlines",
                     # step 4: save on the last step — no wake; the clocks stay
                     # suspended into teardown.
-                    "finish_generation",
                     "suspend_deadlines",
+                    "finish_generation",
                     "offload_before_refit",
                     "save",
                 ],
@@ -988,8 +988,8 @@ class TestSaveTrigger:
                 {"step_1"},
                 # The timeout latch fires on step 1: stood-down save, no wake.
                 [
-                    "finish_generation",
                     "suspend_deadlines",
+                    "finish_generation",
                     "offload_before_refit",
                     "save",
                 ],
