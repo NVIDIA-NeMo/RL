@@ -124,6 +124,7 @@ def _context_leg_response(
     disagg_params: Any,
     arrival_ts_us: "int | None" = None,
     tokens_per_block: "int | None" = None,
+    request_output: Any = None,
 ) -> Any:
     """Reply to a ``context_only`` request.
 
@@ -199,6 +200,17 @@ def _context_leg_response(
             cached = _tl_cached_tokens(gen, tokens_per_block)
         if isinstance(cached, int) and cached >= 0:
             response["nemo_ctx_cached_tokens"] = cached
+        # Lives on the RequestOutput, not the per-choice CompletionOutput
+        # (which only forwards cached_tokens).
+        computed = getattr(request_output, "ctx_computed_tokens", None)
+        if isinstance(computed, int) and computed > 0:
+            response["nemo_ctx_computed_tokens"] = computed
+        first_begin = getattr(request_output, "ctx_first_begin", None)
+        if isinstance(first_begin, int) and first_begin >= 0:
+            response["nemo_ctx_first_begin"] = first_begin
+        num_chunks = getattr(request_output, "ctx_num_chunks", None)
+        if isinstance(num_chunks, int) and num_chunks > 0:
+            response["nemo_ctx_num_chunks"] = num_chunks
 
     return JSONResponse(content=response)
 
@@ -509,6 +521,11 @@ def create_app(
         # -- carrying the handshake between the two. The wire model differs from
         # the engine one (opaque_state is bytes in the engine, base64 on the
         # wire), so use TRT-LLM's own converter rather than reproducing it.
+        # Conversation identity for rank-affine ADP routing: canonical body
+        # conversation_params, else the id the disagg service stamps onto
+        # disaggregated_params for its ctx/gen legs. None = no affinity.
+        _conv_id = ((body.get("conversation_params") or {}).get("conversation_id")
+                    or (body.get("disaggregated_params") or {}).get("conversation_id"))
         disagg_params = None
         if body.get("disaggregated_params") is not None:
             from tensorrt_llm.serve.openai_protocol import (
@@ -671,10 +688,16 @@ def create_app(
             pass
 
         try:
+            _conv_params = None
+            if _conv_id:
+                from tensorrt_llm.conversation_params import ConversationParams
+
+                _conv_params = ConversationParams(conversation_id=str(_conv_id))
             output = await llm.generate_async(
                 {"prompt_token_ids": adj_prompt},
                 sampling_params=sampling,
                 disaggregated_params=disagg_params,
+                conversation_params=_conv_params,
             )
         except RequestError as e:
             err = str(e)
@@ -696,6 +719,7 @@ def create_app(
                 model_name, adj_prompt, gen, disagg_params,
                 arrival_ts_us=_tl_arrival_ts_us,
                 tokens_per_block=_tl_tpb,
+                request_output=output,
             )
 
         gen_token_ids = list(gen.token_ids)
