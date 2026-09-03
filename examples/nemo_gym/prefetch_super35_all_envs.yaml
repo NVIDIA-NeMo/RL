@@ -144,7 +144,12 @@ env:
     # model at a bbh_hypotest_judge_model server the bundled config does not define. The recipe
     # routes it to nl2bash_judge_model, but that server is defined in the recipe, not in any
     # bundled Gym config, so here the judge ref points at the dummy judge_model client above and
-    # the rubric model_list is replaced so its interpolation resolves. Dummies satisfy the dry run.
+    # the rubric model_list is replaced so its interpolation resolves. The dry run constructs the
+    # server, and hypotest reads problem_jsonl at construction: it must be an existing regular
+    # file (a device like /dev/null fails is_file()), and an empty file yields zero problems,
+    # which is accepted. prefetch_empty_problems.jsonl is shipped next to this file for that;
+    # the path is the container location of the NeMo RL source. mounted_capsule_root only has to
+    # be a non-blank absolute path.
     bbh_hypotest_aviary_resources_server:
       resources_servers:
         bbh_hypotest:
@@ -152,7 +157,7 @@ env:
             type: responses_api_models
             name: judge_model
           dataset:
-            problem_jsonl: /dev/null
+            problem_jsonl: /opt/nemo-rl/examples/nemo_gym/prefetch_empty_problems.jsonl
             rubric_model: openai/judge_model
             rubric_model_config:
               model_list:
@@ -166,4 +171,4 @@ env:
                     max_tokens: 32768
                     temperature: 0.7
             opensandbox_spec:
-              mounted_capsule_root: /dev/null
+              mounted_capsule_root: /tmp
