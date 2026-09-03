@@ -466,14 +466,18 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
-        self._extra_env_vars = extra_env_vars
+        configured_env_vars = self.cfg["vllm_cfg"].get("env_vars") or {}
+        nested_worker_env_vars = list(
+            dict.fromkeys([*(extra_env_vars or []), *configured_env_vars])
+        )
+        self._extra_env_vars = nested_worker_env_vars or None
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
         _apply_vllm_patches(
             self.py_executable,
-            extra_env_vars=extra_env_vars,
+            extra_env_vars=self._extra_env_vars,
         )
 
         # Skip model loading if we're not the model owner
