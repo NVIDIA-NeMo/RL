@@ -1320,47 +1320,84 @@ def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_weight_update_lifecycle_prepares_fp8_once_before_stream(monkeypatch):
+def test_weight_update_lifecycle_uses_native_reload_for_dsv4(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8, fp8
+    from vllm.model_executor.model_loader import reload as layerwise_reload
+    from vllm.model_executor.model_loader.reload import meta
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(model_type="deepseek_v4")
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
     ext.model_config = object()
-    ext.device = object()
+    ext.device = torch.device("cpu")
     call_order = []
 
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
-    monkeypatch.setattr(
-        fp8,
-        "prepare_fp8_model_for_refit",
-        lambda runner: call_order.append(("prepare", runner)),
-    )
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config",
         lambda _config: contextlib.nullcontext(),
     )
     monkeypatch.setattr(
-        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
-        lambda *_args: call_order.append(("post_load", None)),
+        layerwise_reload,
+        "initialize_layerwise_reload",
+        lambda loaded_model: call_order.append(("initialize", loaded_model)),
+    )
+    monkeypatch.setattr(
+        layerwise_reload,
+        "finalize_layerwise_reload",
+        lambda loaded_model, config: call_order.append(
+            ("finalize", loaded_model, config)
+        ),
+    )
+    monkeypatch.setattr(meta, "SKIP_TENSORS", set())
+
+    def prepare_refit(loaded_model):
+        call_order.append(("prepare_experts", loaded_model))
+        meta.SKIP_TENSORS.add("attn_sink")
+        return {"attn_sink"}
+
+    def restore_refit(added):
+        call_order.append(("restore_experts", added))
+        meta.SKIP_TENSORS.difference_update(added)
+
+    monkeypatch.setattr(deepseek_v4_fp8, "prepare_refit", prepare_refit)
+    monkeypatch.setattr(deepseek_v4_fp8, "restore_refit", restore_refit)
+    monkeypatch.setattr(
+        deepseek_v4_fp8,
+        "finalize_refit",
+        lambda loaded_model: call_order.append(("finalize_experts", loaded_model)),
     )
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append(
         ("mtp", None)
     )
-    ext._maybe_process_fp8_kv_cache = lambda: call_order.append(("kv", None))
+    monkeypatch.setattr(
+        vllm_backend,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda loaded_model: call_order.append(("hpc", loaded_model)),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: call_order.append(("sync", None))
+    )
 
     with ext._weight_update_lifecycle("collective") as finalize:
         call_order.append(("stream", None))
         finalize()
 
+    assert meta.SKIP_TENSORS == set()
     assert call_order == [
-        ("prepare", ext.model_runner),
+        ("prepare_experts", model),
+        ("initialize", model),
         ("stream", None),
-        ("post_load", None),
+        ("finalize", model, ext.model_config),
+        ("finalize_experts", model),
+        ("hpc", model),
         ("mtp", None),
-        ("kv", None),
+        ("sync", None),
+        ("restore_experts", {"attn_sink"}),
     ]
 
 
