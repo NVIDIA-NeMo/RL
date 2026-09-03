@@ -1,0 +1,168 @@
+# Prefetch config: every NeMo Gym environment used by the Nemotron 3.5 Super RLVR blend28
+# recipe (pipeline: RLVR/nemotron-3.5-super/configs/grpo_superv3_5_rlvr_blend28-oci-hsg-20260902-r1.yaml).
+# Pass to the docker build to bake every Gym server venv into the image so no server has to
+# create its venv at job start:
+#   docker buildx build -f docker/Dockerfile \
+#     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_super35_all_envs.yaml" .
+# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy values below satisfy the bundled
+# configs' interpolations and mandatory fields during the dry run. Venvs are created per server
+# directory and skipped when already present, so this file can be combined with
+# prefetch_ultra_all_envs.yaml (adds swe_agents) at no extra cost for the shared servers.
+# terminal_pivot is deprecated in the recipe and omitted here.
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+
+    # Dummy interpolation values for the bundled configs (unused in the dry run).
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+    judge_model_name: dummy-judge
+    judge_base_url: http://localhost:8000/v1
+    judge_api_key: dummy
+    genrm_model_name: dummy-genrm
+    anthropic_model_name: dummy-anthropic
+    anthropic_base_url: http://localhost:8000/v1
+    anthropic_api_key: dummy
+
+    invalid_tool_call_patterns:
+      - "<tool_call>"
+      - "</tool_call>"
+      - "<function_call>"
+      - "</function_call>"
+    thinking_tags:
+      - "<think>"
+      - "</think>"
+
+    # Same order as the recipe's config_paths.
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/scicode/configs/scicode.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/code_gen/configs/code_gen.yaml
+    - resources_servers/competitive_coding_challenges/configs/competitive_coding_challenges.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    - resources_servers/finance_sec_search/configs/finance_sec_search.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+    - resources_servers/equivalence_llm_judge/configs/lc_judge.yaml
+    - resources_servers/calendar/configs/calendar.yaml
+    - resources_servers/genrm_compare/configs/genrm_compare.yaml
+    - resources_servers/equivalence_llm_judge/configs/nl2bash-equivalency.yaml
+    - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+    - resources_servers/terminus_judge/configs/terminus_judge_string_only.yaml
+    - resources_servers/ns_tools/configs/ns_tools.yaml
+    - resources_servers/bbh_hypotest/configs/bbh_hypotest_opensandbox.yaml
+    - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
+    - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
+    - resources_servers/over_refusal_detection/configs/over_refusal_detection_nemotron_tp8.yaml
+    - resources_servers/multichallenge/configs/multichallenge.yaml
+    - resources_servers/inverse_if/configs/inverse_if.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/toolcall_schema_single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/droid_pivot_single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/abstention/configs/abstention.yaml
+    - resources_servers/nvarc/configs/inductive.yaml
+    - resources_servers/nvarc/configs/transductive.yaml
+    - resources_servers/equivalence_rule/configs/lc.yaml
+    - resources_servers/ether0/configs/ether0.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json_yaml_xml_v1.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_v3.yaml
+    - resources_servers/format_verification/configs/freeform_formatting.yaml
+    - resources_servers/format_verification/configs/citation_format.yaml
+    - resources_servers/litmus_agent/configs/litmus_agent.yaml
+    - resources_servers/indirect_prompt_injection/configs/indirect_prompt_injection.yaml
+    - resources_servers/swe_pivot/configs/swe_pivot.yaml
+    - resources_servers/terminal_multi_harness/configs/terminal_multi_harness_stirrup.yaml
+    - resources_servers/terminal_multi_harness/configs/terminal_multi_harness_agent006.yaml
+    - resources_servers/terminal_multi_harness/configs/terminal_multi_harness_opencode.yaml
+    - resources_servers/terminal_multi_harness/configs/terminal_multi_harness_codex.yaml
+
+    # Recipe data still names the removed rdkit_chemistry agent. This alias keeps
+    # that data compatible while prefetching the replacement Litmus environment.
+    rdkit_chemistry_agent:
+      _inherit_from: litmus_agent_agent
+
+    # Thin vllm_model clients for the judge refs the bundled configs expect (so refs resolve and
+    # the vllm_model venv builds). genrm_model is already defined by the bundled genrm_compare.yaml.
+    # return_token_id_information/uses_reasoning_parser have no defaults in Gym's VLLMModelConfig,
+    # so they must be set even here: Gym launches a process for every block carrying an
+    # entrypoint, and the dry run exits before serving rather than skipping validation.
+    safety_judge_model:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: http://localhost:8000/v1
+          api_key: dummy
+          model: dummy-judge
+          return_token_id_information: false
+          uses_reasoning_parser: false
+    judge_model:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: http://localhost:8000/v1
+          api_key: dummy
+          model: dummy-judge
+          return_token_id_information: false
+          uses_reasoning_parser: false
+    # Thin client for the *_reasoning_off agent refs.
+    policy_model_reasoning_off:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: http://localhost:8000/v1
+          api_key: dummy
+          model: dummy-model
+          return_token_id_information: false
+          uses_reasoning_parser: false
+    # Standalone server defined only to bake the local_vllm_model venv (the runtime GPU judges
+    # use this type). dry_run builds the venv without loading a model.
+    # LocalVLLMModelConfig extends VLLMModelConfig, so it needs the two fields above plus a
+    # vllm_serve_env_vars mapping (also default-less).
+    prefetch_local_vllm_model:
+      responses_api_models:
+        local_vllm_model:
+          entrypoint: app.py
+          model: dummy-model
+          return_token_id_information: false
+          uses_reasoning_parser: false
+          vllm_serve_kwargs:
+            tensor_parallel_size: 1
+            data_parallel_size: 1
+            pipeline_parallel_size: 1
+          vllm_serve_env_vars: {}
+
+    # bbh_hypotest marks problem_jsonl and mounted_capsule_root mandatory and points its rubric
+    # model at a bbh_hypotest_judge_model server the bundled config does not define. Mirror the
+    # recipe: route the judge to nl2bash_judge_model (defined by nl2bash-equivalency.yaml) and
+    # replace the model_list so the interpolation resolves. Dummies satisfy the dry run.
+    bbh_hypotest_aviary_resources_server:
+      resources_servers:
+        bbh_hypotest:
+          judge_model_server:
+            type: responses_api_models
+            name: nl2bash_judge_model
+          dataset:
+            problem_jsonl: /dev/null
+            rubric_model: openai/nl2bash_judge_model
+            rubric_model_config:
+              model_list:
+                - model_name: openai/nl2bash_judge_model
+                  litellm_params:
+                    model: openai/model
+                    api_key: dummy
+                    base_url: http://localhost:8000/v1
+                    num_retries: 0
+                    timeout: 1800
+                    max_tokens: 32768
+                    temperature: 0.7
+            opensandbox_spec:
+              mounted_capsule_root: /dev/null
