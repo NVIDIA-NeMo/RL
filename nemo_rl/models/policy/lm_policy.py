@@ -38,6 +38,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -142,6 +143,32 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Disable policy.sequence_packing.enabled or policy.draft."
             )
         if megatron_enable:
+            if (
+                (
+                    config["megatron_cfg"].get("batch_invariant_mode")
+                    or config["megatron_cfg"].get("zero_train_gen_mismatch")
+                )
+                and not config["sequence_packing"]["enabled"]
+            ):
+                # Native TE kernels are invariant when eager policy scoring uses
+                # the same aligned token dimension as MCore generation buckets.
+                # Sequence packing aligns its total token count in megatron.data.
+                # Also key off zero_train_gen_mismatch: the driver constructs
+                # Policy before workers call enable_zero_train_gen_kl().
+                tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
+                config["make_sequence_length_divisible_by"] = (
+                    batch_invariant_token_multiple(
+                        config["make_sequence_length_divisible_by"], tp_size
+                    )
+                )
+                if config["dynamic_batching"]["enabled"]:
+                    config["dynamic_batching"]["sequence_length_round"] = (
+                        batch_invariant_token_multiple(
+                            config["dynamic_batching"]["sequence_length_round"],
+                            tp_size,
+                        )
+                    )
+
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
                 config,
