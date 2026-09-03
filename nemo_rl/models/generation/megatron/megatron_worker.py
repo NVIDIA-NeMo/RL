@@ -1081,6 +1081,18 @@ class MegatronGenerationRefitMixin:
         Returns:
             True on success.
         """
+        # Distributed optimizer + overlap_param_gather finishes the post-step
+        # param all-gather lazily via training forward pre-hooks. Refit can
+        # otherwise read param.data first and ship a mix of theta_k and
+        # theta_{k-1} to the gen model (step-0 KL ~0, then a persistent
+        # floor). Same gather as colocated _reshard_into_inference_model.
+        if (
+            is_source
+            and getattr(self, "should_disable_forward_pre_hook", False)
+            and self._forward_pre_hook_enabled()
+        ):
+            self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
+
         src_model = self.model if is_source else None
         dst_model = None if is_source else self.model
 

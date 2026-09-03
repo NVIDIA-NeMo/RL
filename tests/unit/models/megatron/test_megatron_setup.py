@@ -1330,6 +1330,35 @@ class TestApplyPerformanceConfig:
         assert model_cfg.batch_invariant_collective == "multimem"
         assert model_cfg.flash_attention_version == 3
 
+    def test_inference_optimized_assigns_gpt_layer_spec_hook(self):
+        """transformer_impl=inference_optimized overrides Bridge's TE-only layer spec."""
+        from nemo_rl.models.megatron.setup import (
+            _apply_performance_config,
+            _inference_optimized_gpt_layer_spec,
+        )
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config()
+        config["megatron_cfg"]["transformer_impl"] = "inference_optimized"
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.transformer_impl == "inference_optimized"
+        assert model_cfg.transformer_layer_spec is _inference_optimized_gpt_layer_spec
+
+    def test_transformer_engine_impl_does_not_assign_infopt_layer_spec(self):
+        """TE transformer_impl leaves the provider layer spec untouched."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config()
+        config["megatron_cfg"]["transformer_impl"] = "transformer_engine"
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.transformer_impl == "transformer_engine"
+        assert not hasattr(model_cfg, "transformer_layer_spec")
+
     def test_omitted_cuda_graph_training_values_preserve_model_config(self):
         """Omitted training CUDA Graph settings retain Megatron-Core values."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
