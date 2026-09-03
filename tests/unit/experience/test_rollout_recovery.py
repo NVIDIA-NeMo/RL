@@ -302,7 +302,9 @@ def test_recovery_config_resolves_agent_then_task_then_default() -> None:
 
     assert agent_policy.agent_name == "genrm_agent"
     assert agent_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert task_policy.agent_name is None
     assert task_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert default_policy.agent_name is None
     assert default_policy.granularity is RecoveryGranularity.SIBLING
 
 
