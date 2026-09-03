@@ -240,6 +240,19 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             f"kv_cache_dtype must be one of {supported_kv_cache_dtypes}, but got {kv_cache_dtype}"
         )
 
+    # Sparse MLA canonicalizes every quantized cache to fp8_ds_mla inside the
+    # worker. Reject spellings that would make the driver try to synchronize
+    # per-tensor k/v scales that the realized DeepSeek V4 cache cannot consume.
+    if (
+        getattr(config, "model_type", None) == "deepseek_v4"
+        and kv_cache_dtype.startswith("fp8")
+        and kv_cache_dtype != "fp8_ds_mla"
+    ):
+        raise ValueError(
+            "DeepSeek V4 requires kv_cache_dtype='fp8_ds_mla' when using an "
+            f"FP8 KV cache, but got {kv_cache_dtype!r}."
+        )
+
     # Validate configuration: kv_cache_dtype=fp8 requires precision=fp8
     if kv_cache_dtype.startswith("fp8") and not use_fp8_weights:
         raise ValueError(
@@ -295,10 +308,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         )
     global_fp8_config = FP8Config(**fp8_config_kwargs)
 
-    # Preserve checkpoint scale metadata below and let vLLM select its
-    # architecture-specific DeepGEMM scale format.
+    # Keep existing DeepGEMM behavior unless a recipe explicitly opts into E8M0.
     if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+        os.environ.setdefault("VLLM_USE_DEEP_GEMM_E8M0", "0")
 
     if vllm_cfg["async_engine"]:
         EngineCoreProc.run_engine_core = my_run_engine_core
@@ -312,10 +325,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     if global_fp8_config.is_mx:
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
-        fp8_block_quant_kwargs = {
-            **(getattr(config, "quantization_config", None) or {}),
-            **FP8_BLOCK_QUANT_KWARGS,
-        }
+        fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
 
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
@@ -455,8 +465,6 @@ def _get_module_from_param_name(
     model: torch.nn.Module, name: str
 ) -> torch.nn.Module | None:
     name = deepseek_v4_fp8.map_checkpoint_name(model, name)
-    if name is None:
-        return None
 
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)

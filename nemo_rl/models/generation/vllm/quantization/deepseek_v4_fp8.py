@@ -30,23 +30,15 @@ _EXPERT_WEIGHT_RE = re.compile(
 
 
 def is_model(model: torch.nn.Module) -> bool:
-    config = getattr(model, "config", None)
-    return getattr(config, "model_type", None) == "deepseek_v4" or (
-        type(model).__name__.lower() == "deepseekv4forcausallm"
-    )
+    """Return whether a constructed vLLM model is a DeepSeek V4 causal LM."""
+    return model.config.model_type == "deepseek_v4"
 
 
-def map_checkpoint_name(model: torch.nn.Module, name: str) -> str | None:
+def map_checkpoint_name(model: torch.nn.Module, name: str) -> str:
     """Apply DeepSeek V4's regex and suffix-aware HF-to-vLLM mapping."""
     if not is_model(model):
         return name
-
-    mapper = getattr(model, "hf_to_vllm_mapper", None)
-    if mapper is None or not hasattr(mapper, "apply_list"):
-        return name
-
-    mapped_names = mapper.apply_list([name])
-    return mapped_names[0] if mapped_names else None
+    return model.hf_to_vllm_mapper.apply_list([name])[0]
 
 
 def remap_packed_module_path(
@@ -75,9 +67,8 @@ def get_exported_expert_id(model: torch.nn.Module, name: str) -> int | None:
 
 def is_nonlocal_expert(module: torch.nn.Module | None, expert_id: int) -> bool:
     """Return whether a routed-expert module does not own an exported expert."""
-    return isinstance(module, RoutedExperts) and (
-        module._map_global_expert_id_to_local_expert_id(expert_id) == -1
-    )
+    assert isinstance(module, RoutedExperts)
+    return module._map_global_expert_id_to_local_expert_id(expert_id) == -1
 
 
 def _reset_routed_experts_for_refit(model: torch.nn.Module) -> None:
@@ -85,9 +76,7 @@ def _reset_routed_experts_for_refit(model: torch.nn.Module) -> None:
     for layer in model.modules():
         if not isinstance(layer, RoutedExperts):
             continue
-        weight_block_size = getattr(layer, "weight_block_size", None)
-        if weight_block_size is None:
-            continue
+        weight_block_size = layer.weight_block_size
 
         raw_weight_shapes = {
             "w13": (
@@ -102,10 +91,8 @@ def _reset_routed_experts_for_refit(model: torch.nn.Module) -> None:
             ),
         }
         for prefix, raw_shape in raw_weight_shapes.items():
-            weight = getattr(layer, f"{prefix}_weight", None)
-            if weight is not None and (
-                weight.shape != raw_shape or weight.dtype != torch.float8_e4m3fn
-            ):
+            weight = getattr(layer, f"{prefix}_weight")
+            if weight.shape != raw_shape or weight.dtype != torch.float8_e4m3fn:
                 weight.data = torch.empty(
                     raw_shape,
                     dtype=torch.float8_e4m3fn,
@@ -114,18 +101,14 @@ def _reset_routed_experts_for_refit(model: torch.nn.Module) -> None:
 
         block_m, block_n = (int(size) for size in weight_block_size)
         for prefix in ("w13", "w2"):
-            weight = getattr(layer, f"{prefix}_weight", None)
-            if weight is None:
-                continue
+            weight = getattr(layer, f"{prefix}_weight")
             raw_scale_shape = (
                 weight.shape[0],
                 (weight.shape[1] + block_m - 1) // block_m,
                 (weight.shape[2] + block_n - 1) // block_n,
             )
-            scale = getattr(layer, f"{prefix}_weight_scale_inv", None)
-            if scale is not None and (
-                scale.shape != raw_scale_shape or scale.dtype != torch.float32
-            ):
+            scale = getattr(layer, f"{prefix}_weight_scale_inv")
+            if scale.shape != raw_scale_shape or scale.dtype != torch.float32:
                 scale.data = torch.empty(
                     raw_scale_shape,
                     dtype=torch.float32,
@@ -133,24 +116,41 @@ def _reset_routed_experts_for_refit(model: torch.nn.Module) -> None:
                 )
 
 
-def prepare_refit(model: torch.nn.Module) -> None:
-    """Prepare DeepSeek V4 parameters for layerwise FP8 refit."""
+def prepare_refit(model: torch.nn.Module) -> set[str]:
+    """Prepare DeepSeek V4 parameters for layerwise FP8 refit.
+
+    Returns the process-global skip names added by this invocation. The caller
+    must pass them to :func:`restore_refit` after the layerwise lifecycle,
+    including on failure.
+    """
     from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
 
     # DeepSeek V4 loads attn_sink with a direct copy_ instead of its Parameter
     # weight_loader. Keep its kernel storage materialized during reload.
-    SKIP_TENSORS.add("attn_sink")
+    required_skip_tensors = {"attn_sink"}
 
     for layer in model.modules():
         if not isinstance(layer, RoutedExperts):
             continue
-        if getattr(layer, "weight_block_size", None) is None:
-            continue
         # Load local experts immediately instead of retaining every source
         # expert in layerwise reload until the fused parameter is complete.
-        SKIP_TENSORS.update(layer._parameters)
+        required_skip_tensors.update(layer._parameters)
 
-    _reset_routed_experts_for_refit(model)
+    added_skip_tensors = required_skip_tensors - SKIP_TENSORS
+    SKIP_TENSORS.update(required_skip_tensors)
+    try:
+        _reset_routed_experts_for_refit(model)
+    except Exception:
+        SKIP_TENSORS.difference_update(added_skip_tensors)
+        raise
+    return added_skip_tensors
+
+
+def restore_refit(added_skip_tensors: set[str]) -> None:
+    """Remove process-global layerwise skip names added for one refit."""
+    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+
+    SKIP_TENSORS.difference_update(added_skip_tensors)
 
 
 @torch.no_grad()
@@ -158,8 +158,6 @@ def finalize_refit(model: torch.nn.Module) -> None:
     """Convert immediately loaded expert tensors back to their kernel layout."""
     for layer in model.modules():
         if not isinstance(layer, RoutedExperts):
-            continue
-        if getattr(layer, "weight_block_size", None) is None:
             continue
         layer.quant_method.process_weights_after_loading(layer)
         if layer.w13_weight.is_cuda:
