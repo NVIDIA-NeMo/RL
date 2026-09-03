@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 import warnings
 from collections.abc import Sequence
@@ -566,10 +567,9 @@ def load_weights(weights, model_runner):
                 and experts_module.w2_weight.dtype == torch.float8_e4m3fn
             ):
                 if global_fp8_config.is_mx:
-                    raise NotImplementedError(
-                        "MXFP8 refit does not support grouped MoE expert weights."
-                    )
-                weights_quantized.extend(_expand_grouped_moe_expert_to_fp8(k, v))
+                    weights_quantized.extend(_expand_grouped_moe_expert_to_mxfp8(k, v))
+                else:
+                    weights_quantized.extend(_expand_grouped_moe_expert_to_fp8(k, v))
             else:
                 weights_quantized.append((k, v))
             continue
@@ -729,6 +729,22 @@ def _quantize_grouped_experts_blockwise(grouped_moe_expert):
     return weight_fp8, scale_inv
 
 
+def _grouped_moe_expert_shards(
+    key: str, weight: torch.Tensor
+) -> tuple[str, tuple[tuple[str, torch.Tensor], ...]]:
+    """Split a grouped expert slab into named projection slabs."""
+    base, proj = key.rsplit(".", 1)
+    if proj == "gate_up_proj":
+        intermediate = weight.shape[1] // 2
+        shards = (
+            ("gate_proj", weight[:, :intermediate, :]),
+            ("up_proj", weight[:, intermediate:, :]),
+        )
+    else:
+        shards = (("down_proj", weight),)
+    return base, shards
+
+
 def _expand_grouped_moe_expert_to_fp8(key, weight):
     """Expand a grouped Qwen3.5 MoE expert slab into per-expert FP8 weights.
 
@@ -754,15 +770,7 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
         A list of ``(name, tensor)`` pairs: for every expert, the FP8 weight and
         its ``_scale_inv`` for each unfused projection.
     """
-    base, proj = key.rsplit(".", 1)
-    if proj == "gate_up_proj":
-        intermediate = weight.shape[1] // 2
-        shards = (
-            ("gate_proj", weight[:, :intermediate, :]),
-            ("up_proj", weight[:, intermediate:, :]),
-        )
-    else:
-        shards = (("down_proj", weight),)
+    base, shards = _grouped_moe_expert_shards(key, weight)
 
     entries = []
     # gate/up are dim-1 slices; feed the views directly — per-expert rows stay
@@ -774,6 +782,20 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
             name = f"{base}.{expert_id}.{shard_name}.weight"
             entries.append((name, weight_fp8[expert_id]))
             entries.append((name + "_scale_inv", scale_inv[expert_id]))
+    return entries
+
+
+def _expand_grouped_moe_expert_to_mxfp8(key, weight):
+    """Expand a grouped Qwen3.5 MoE slab into per-expert MXFP8 entries."""
+    base, shards = _grouped_moe_expert_shards(key, weight)
+
+    entries = []
+    for shard_name, grouped_moe_expert in shards:
+        for expert_id, expert_weight in enumerate(grouped_moe_expert):
+            value, scale = quantize_mxfp8_weight(expert_weight.contiguous())
+            name = f"{base}.{expert_id}.{shard_name}.weight"
+            entries.append((name, value))
+            entries.append((name + "_scale_from_checkpoint", scale))
     return entries
 
 
@@ -1058,6 +1080,32 @@ def create_weights_mxfp8_moe(
     )
 
 
+def _make_fp8_moe_kernel_compat(make_fp8_moe_kernel, layer, **kwargs):
+    """Call vLLM's make_fp8_moe_kernel across the 0.25/0.28 signature change.
+
+    vLLM 0.25 accepts a ``layer`` kwarg, consumed only when fp8_backend is
+    HUMMING; vLLM 0.28 removed both the kwarg and that backend branch, so
+    passing ``layer`` there raises TypeError. Forwarding it conditionally
+    reproduces each version's own upstream call site exactly: with ``layer``
+    on 0.25 (keeping HUMMING working) and without it on 0.28+ (where nothing
+    consumes it).
+
+    Signature inspection is deliberate over ``try/except TypeError``: a broad
+    except would also swallow unrelated argument mismatches from future vLLM
+    signature changes, hiding real breakage instead of failing loud. A
+    ``**kwargs``-style callee (e.g. a test double) counts as accepting
+    ``layer``.
+    """
+    parameters = inspect.signature(make_fp8_moe_kernel).parameters
+    accepts_layer = "layer" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_layer:
+        kwargs["layer"] = layer
+    return make_fp8_moe_kernel(**kwargs)
+
+
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
@@ -1107,13 +1155,14 @@ def process_weights_after_loading_moe(self, layer) -> None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
         assert self.experts_cls is not None
-        self.moe_kernel = make_fp8_moe_kernel(
+        self.moe_kernel = _make_fp8_moe_kernel_compat(
+            make_fp8_moe_kernel,
+            layer,
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1355,13 +1404,14 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
         assert self.experts_cls is not None
-        self.moe_kernel = make_fp8_moe_kernel(
+        self.moe_kernel = _make_fp8_moe_kernel_compat(
+            make_fp8_moe_kernel,
+            layer,
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
