@@ -14,8 +14,9 @@
 
 import gc
 import warnings
+from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, Optional
+from typing import Any, Generator, Iterable, Literal, Optional
 
 import ray
 import torch
@@ -92,6 +93,90 @@ def _refit_tensor_dtype(
     if is_router_correction_bias and tensor.dtype == torch.float32:
         return tensor.dtype
     return default_dtype
+
+
+def _native_lora_factor_names(
+    model: nn.Module, state_dict: Mapping[str, torch.Tensor]
+) -> frozenset[str]:
+    """Validate and return the complete factorized adapter tensor names."""
+    dynamic_router_modules = sorted(
+        name
+        for name, module in model.named_modules()
+        if float(getattr(module, "bias_update_factor", 0.0)) > 0
+    )
+    if dynamic_router_modules:
+        raise RuntimeError(
+            "Native LoRA refit cannot synchronize dynamically updated MoE router "
+            "buffers; nonzero bias_update_factor found in modules: "
+            f"{dynamic_router_modules[:8]}. Use merged refit for this policy."
+        )
+
+    state_names = set(state_dict)
+    lora_a_modules = {
+        name.removesuffix(".lora_A.weight")
+        for name in state_names
+        if name.endswith(".lora_A.weight")
+    }
+    lora_b_modules = {
+        name.removesuffix(".lora_B.weight")
+        for name in state_names
+        if name.endswith(".lora_B.weight")
+    }
+    if not lora_a_modules and not lora_b_modules:
+        raise RuntimeError("Native LoRA refit found no LoRA A/B tensors.")
+
+    incomplete_modules = lora_a_modules ^ lora_b_modules
+    if incomplete_modules:
+        raise RuntimeError(
+            "Native LoRA refit requires complete A/B pairs; incomplete modules: "
+            f"{sorted(incomplete_modules)[:8]}"
+        )
+
+    factor_names = {
+        name
+        for name in state_names
+        if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight")
+    }
+    unexpected_trainable = sorted(
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and name not in factor_names
+    )
+    if unexpected_trainable:
+        raise RuntimeError(
+            "Native LoRA refit synchronizes only LoRA A/B tensors, but found "
+            "other trainable parameters: "
+            f"{unexpected_trainable[:8]}. Use merged refit for this policy."
+        )
+    return frozenset(factor_names)
+
+
+def dtensor_lora_params_generator(
+    model: nn.Module, target_dtype: torch.dtype
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield factorized LoRA A/B tensors for vLLM's native adapter runtime."""
+    state_dict = model.state_dict()
+    factor_names = _native_lora_factor_names(model, state_dict)
+    for name, tensor in state_dict.items():
+        if name not in factor_names:
+            continue
+        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        yield (
+            name,
+            full_tensor.to(target_dtype, non_blocking=True).contiguous(),
+        )
+
+
+def dtensor_refit_params_generator(
+    model: nn.Module,
+    target_dtype: torch.dtype,
+    lora_refit_mode: Literal["native", "merged"],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield the configured factorized or merged vLLM refit representation."""
+    if lora_refit_mode == "native":
+        yield from dtensor_lora_params_generator(model, target_dtype)
+        return
+    yield from dtensor_params_generator(model, target_dtype)
 
 
 def dtensor_params_generator(
@@ -252,6 +337,20 @@ class DTensorPolicyWorkerV2Impl(
         self.lora_enabled = (
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
+        self.lora_refit_mode: Literal["native", "merged"] = "merged"
+        generation_config = config.get("generation")
+        if (
+            self.lora_enabled
+            and generation_config is not None
+            and generation_config["backend"] == "vllm"
+        ):
+            configured_mode = generation_config.get("lora_refit_mode")
+            if configured_mode not in ("native", "merged"):
+                raise ValueError(
+                    "LoRA training with vLLM requires "
+                    "policy.generation.lora_refit_mode to be 'native' or 'merged'."
+                )
+            self.lora_refit_mode = configured_mode
 
         print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
 
@@ -1043,6 +1142,15 @@ class DTensorPolicyWorkerV2Impl(
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        if self.lora_refit_mode == "native":
+            state_dict = self.model.state_dict()
+            factor_names = _native_lora_factor_names(self.model, state_dict)
+            return {
+                name: (tensor.shape, self.dtype)
+                for name, tensor in state_dict.items()
+                if name in factor_names
+            }
+
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
@@ -1097,7 +1205,9 @@ class DTensorPolicyWorkerV2Impl(
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
+            params_generator=dtensor_refit_params_generator(
+                self.model, self.dtype, self.lora_refit_mode
+            ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1210,7 +1320,9 @@ class DTensorPolicyWorkerV2Impl(
         dtensor_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=dtensor_params_generator(self.model, self.dtype),
+            iterator=dtensor_refit_params_generator(
+                self.model, self.dtype, self.lora_refit_mode
+            ),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,

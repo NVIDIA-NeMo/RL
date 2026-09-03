@@ -223,6 +223,8 @@ policy: &POLICY_BASE
         val_top_k: ${.top_k}
         stop_token_ids: null
         stop_strings: null
+        # LoRA refit representation for vLLM. Use merged only as an explicit opt-in.
+        lora_refit_mode: native
         vllm_cfg:
             async_engine: false
             precision: ${...precision}

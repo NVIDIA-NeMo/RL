@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
 from pydantic import (
@@ -28,6 +30,34 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
+LoraRefitMode = Literal["native", "merged"]
+
+NATIVE_LORA_ADAPTER_ID = 1
+NATIVE_LORA_ADAPTER_NAME = "nemo-rl-online"
+NATIVE_LORA_ADAPTER_PATH = "/nemo-rl/in-memory-online-lora"
+NATIVE_LORA_CONFIG_KEY = "nemo_rl_native_lora"
+
+
+@dataclass(frozen=True)
+class NativeLoraRefitSettings:
+    """Internal native-LoRA settings forwarded to each vLLM worker."""
+
+    rank: int
+    alpha: int
+
+
+def native_lora_refit_settings(vllm_config: Any) -> NativeLoraRefitSettings | None:
+    """Read native-LoRA settings from a realized vLLM worker config."""
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional_config, dict):
+        return None
+    raw_settings = additional_config.get(NATIVE_LORA_CONFIG_KEY)
+    if raw_settings is None:
+        return None
+    return NativeLoraRefitSettings(
+        rank=int(raw_settings["rank"]),
+        alpha=int(raw_settings["alpha"]),
+    )
 
 
 # TODO(rohitrango): Move model-specific video fields behind ProcessorInterface.
@@ -178,6 +208,9 @@ class VllmConfig(GenerationConfig):
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
     refit_transport: NotRequired[VllmRefitSelector | str | None]
     refit_cfg: NotRequired[VllmRefitConfig | None]
+    # LoRA policies use vLLM's factorized adapter runtime by default. Set to
+    # ``merged`` to opt into materializing and refitting full ``W + BA`` weights.
+    lora_refit_mode: LoraRefitMode
 
     # quantization config
     quant_cfg: NotRequired[str | None]
@@ -304,3 +337,169 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         VllmCheckpointEnginePluginConfig.model_validate(plugin_config)
     config["refit_cfg"] = refit_config
     return refit_config
+
+
+def configure_vllm_lora_refit(policy_config: Mapping[str, Any]) -> None:
+    """Validate and materialize vLLM's LoRA refit representation.
+
+    Exemplar configs select native refit for LoRA training; merged full-weight
+    materialization must be selected explicitly.
+
+    Args:
+        policy_config: Complete policy config containing training and generation
+            backend settings.
+
+    Raises:
+        KeyError: If LoRA is enabled but ``lora_refit_mode`` is missing.
+        ValueError: If native refit is selected for an unsupported policy,
+            transport, engine mode, precision, or vLLM LoRA configuration.
+    """
+    generation_config = cast(VllmConfig, policy_config["generation"])
+
+    dtensor_config = policy_config.get("dtensor_cfg") or {"enabled": False}
+    dtensor_lora_config = (
+        dtensor_config.get("lora_cfg") if dtensor_config["enabled"] else None
+    )
+    dtensor_lora_enabled = bool(
+        dtensor_lora_config is not None and dtensor_lora_config["enabled"]
+    )
+
+    megatron_config = policy_config.get("megatron_cfg")
+    megatron_lora_config = (
+        megatron_config.get("peft")
+        if megatron_config is not None and megatron_config["enabled"]
+        else None
+    )
+    megatron_lora_enabled = bool(
+        megatron_lora_config is not None and megatron_lora_config["enabled"]
+    )
+
+    if not dtensor_lora_enabled and not megatron_lora_enabled:
+        return
+
+    mode = generation_config["lora_refit_mode"]
+    if mode not in ("native", "merged"):
+        raise ValueError(
+            "LoRA training with vLLM requires "
+            "policy.generation.lora_refit_mode to be 'native' or 'merged'."
+        )
+    if mode == "merged":
+        return
+
+    if generation_config["backend"] != "vllm":
+        raise ValueError("Native LoRA refit is currently supported only by vLLM.")
+    if not dtensor_lora_enabled or megatron_lora_enabled:
+        raise ValueError(
+            "Native LoRA refit currently requires the DTensor v2 LoRA policy. "
+            "Set policy.generation.lora_refit_mode=merged for Megatron LoRA."
+        )
+    if not dtensor_config.get("_v2"):
+        raise ValueError("Native LoRA refit requires policy.dtensor_cfg._v2=true.")
+    if dtensor_lora_config.get("use_dora"):
+        raise ValueError(
+            "Native LoRA refit does not support use_dora=true because vLLM "
+            "cannot apply the additional trainable magnitude vector."
+        )
+    if dtensor_lora_config.get("moe_rank_scaling"):
+        raise ValueError(
+            "Native LoRA refit does not support moe_rank_scaling=true because "
+            "vLLM currently accepts one adapter rank and scaling factor."
+        )
+
+    automodel_kwargs = dtensor_config.get("automodel_kwargs")
+    if automodel_kwargs is None or not automodel_kwargs.get("force_hf"):
+        raise ValueError(
+            "Native LoRA refit currently requires "
+            "policy.dtensor_cfg.automodel_kwargs.force_hf=true so trainer LoRA "
+            "tensor names follow the Hugging Face schema consumed by vLLM."
+        )
+
+    if generation_config.get("refit_transport") is not None:
+        raise ValueError(
+            "Native LoRA refit currently supports only the topology-default "
+            "collective/non-colocated or CUDA-IPC/colocated transport. Set "
+            "policy.generation.refit_transport=null, or opt into merged refit."
+        )
+    if generation_config["vllm_cfg"]["async_engine"]:
+        raise ValueError(
+            "Native LoRA refit does not yet support vllm_cfg.async_engine=true."
+        )
+    if generation_config["vllm_cfg"].get("expose_http_server"):
+        raise ValueError(
+            "Native LoRA refit does not yet support vLLM's exposed HTTP server "
+            "because every request must carry the in-memory LoRARequest."
+        )
+    if generation_config.get("real_quant") or generation_config.get("quant_cfg"):
+        raise ValueError(
+            "Native LoRA refit does not yet support quantized rollout models."
+        )
+
+    vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+    speculative_config = vllm_kwargs.get("speculative_config")
+    speculative_decoding_enabled = speculative_config is not None and not (
+        isinstance(speculative_config, Mapping)
+        and int(speculative_config.get("num_speculative_tokens", 0)) == 0
+    )
+    if speculative_decoding_enabled:
+        raise ValueError("Native LoRA refit does not yet support speculative decoding.")
+    if vllm_kwargs.get("enable_lora") is False:
+        raise ValueError(
+            "Native LoRA refit requires policy.generation.vllm_kwargs.enable_lora=true."
+        )
+
+    assert dtensor_lora_config is not None
+    rank = int(dtensor_lora_config["dim"])
+    alpha = int(dtensor_lora_config["alpha"])
+    max_lora_rank = vllm_kwargs.get("max_lora_rank")
+    if max_lora_rank is not None and int(max_lora_rank) < rank:
+        raise ValueError(
+            f"vllm_kwargs.max_lora_rank={max_lora_rank} is smaller than the "
+            f"trainer LoRA rank {rank}."
+        )
+
+    precision = policy_config["precision"]
+    lora_dtype_by_precision = {
+        "bfloat16": "bfloat16",
+        "bf16": "bfloat16",
+        "float16": "float16",
+        "fp16": "float16",
+    }
+    lora_dtype = lora_dtype_by_precision.get(precision)
+    if lora_dtype is None:
+        raise ValueError(
+            "Native LoRA refit currently supports bfloat16 or float16 policy "
+            f"precision, got {precision!r}."
+        )
+    rollout_precision = generation_config["vllm_cfg"].get("precision")
+    if (
+        not isinstance(rollout_precision, str)
+        or lora_dtype_by_precision.get(rollout_precision) != lora_dtype
+    ):
+        raise ValueError(
+            "Native LoRA refit requires matching policy and vLLM precision, got "
+            f"policy={precision!r} and vLLM={rollout_precision!r}."
+        )
+    configured_lora_dtype = vllm_kwargs.get("lora_dtype")
+    if configured_lora_dtype not in (None, "auto", lora_dtype):
+        raise ValueError(
+            f"vllm_kwargs.lora_dtype={configured_lora_dtype!r} does not match "
+            f"policy precision {precision!r}."
+        )
+
+    vllm_kwargs["enable_lora"] = True
+    vllm_kwargs.setdefault("max_lora_rank", rank)
+    max_loras = int(vllm_kwargs.setdefault("max_loras", 1))
+    if max_loras < 1:
+        raise ValueError("vllm_kwargs.max_loras must be at least 1 for native LoRA.")
+    max_cpu_loras = int(vllm_kwargs.setdefault("max_cpu_loras", max_loras))
+    if max_cpu_loras < max_loras:
+        raise ValueError(
+            "vllm_kwargs.max_cpu_loras must be greater than or equal to "
+            "vllm_kwargs.max_loras."
+        )
+    vllm_kwargs.setdefault("lora_dtype", lora_dtype)
+    additional_config = dict(vllm_kwargs.get("additional_config") or {})
+    additional_config[NATIVE_LORA_CONFIG_KEY] = {"rank": rank, "alpha": alpha}
+    vllm_kwargs["additional_config"] = additional_config
+
+    generation_config["vllm_cfg"]["load_format"] = "auto"
