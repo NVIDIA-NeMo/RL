@@ -38,19 +38,19 @@ Defined in `nemo_rl/telemetry/span_groups.py`. Extends lens's base `SpanGroup` w
 |---|---|---|
 | `job` | base | the whole-run root span (`rl.<algo>.job`) |
 | `setup` | RL | startup, before the first step: `rl.startup` and the `rl.setup.*` phases under it |
-| `checkpoint` | base | `rl.<algo>.save_checkpoint` |
+| `checkpoint` | base | `rl.<algo>.checkpointing` |
 | `evaluate` | base | `rl.<algo>.evaluate` |
 | `model_init` | base | `rl.vllm.load_model` (generation worker), `rl.policy.load_model` / `rl.value.load_model` (training workers) |
 | `load_checkpoint` | base | *reserved — bucketed, but no site emits it yet* |
 | `step` | base | `rl.<algo>.step` (one per training step) |
 | `forward_backward` | base | *reserved — bucketed, but no site emits it yet* |
 | `optimizer` | base | *reserved — bucketed, but no site emits it yet* |
-| `rollout` | RL | `rl.<algo>.collect_rollouts` |
+| `rollout` | RL | `rl.<algo>.generation` |
 | `generation` | RL | the driver-side `rl.vllm.generate` / `rl.vllm.generate_text` spans |
-| `logprob` | RL | `rl.<algo>.compute_logprobs` |
-| `reward` | RL | `rl.<algo>.compute_rewards` |
-| `advantage` | RL | `rl.<algo>.compute_advantages` |
-| `policy_update` | RL | `rl.<algo>.policy_update` (and `value_update` for PPO) |
+| `logprob` | RL | `rl.<algo>.policy_and_reference_logprobs`, and `rl.distillation.teacher_logprob_inference` on the distillation path |
+| `reward` | RL | `rl.<algo>.reward_calculation` |
+| `advantage` | RL | `rl.<algo>.advantage_calculation` |
+| `policy_update` | RL | `rl.<algo>.policy_training` (and `rl.ppo.value_training` for PPO) |
 | `reference_policy` | RL | *reserved — bucketed, but no site emits it yet* |
 | `data_processing` | RL | `rl.<algo>.data_processing` |
 | `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation (`put`, `get`, `claim_meta`, `clear`, …) from a batch-shaped caller |

@@ -12,7 +12,7 @@ Generation is where most of an RL step's wall-clock goes, so NeMo-RL instruments
 
 ## Layer 1 — RL-side generation spans (default)
 
-`VllmGeneration.generate` / `generate_text` on the driver are wrapped with `trace_fn(RLSpanGroup.GENERATION, ...)`, emitting `rl.vllm.generate` and `rl.vllm.generate_text` spans. These nest under the active `rl.<algo>.collect_rollouts` span, so a rollout waterfall shows exactly how long generation took and how it fits inside the step. They also emit the `gen_ai.*` token/latency metrics (see [Metrics](metrics.md)).
+`VllmGeneration.generate` / `generate_text` on the driver are wrapped with `trace_fn(RLSpanGroup.GENERATION, ...)`, emitting `rl.vllm.generate` and `rl.vllm.generate_text` spans. These nest under the active `rl.<algo>.generation` span, so a rollout waterfall shows exactly how long generation took and how it fits inside the step. They also emit the `gen_ai.*` token/latency metrics (see [Metrics](metrics.md)).
 
 Because these are ordinary lens spans, they travel the same OTLP transport as everything else — including a direct-to-backend `http/protobuf` export path. **Nothing extra is required**: enable the `generation` group (it is in the `per_step` and `all` presets) and they appear.
 

@@ -75,6 +75,8 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    Bucket,
+    bucket_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -1262,6 +1264,13 @@ def validate(
             tracer=_tracer,
             **{"rl.step": step},
         ),
+        # Validation generates through the same path as training rollouts, but
+        # its tokens are scored and thrown away — no weights advance. Without
+        # this the generate spans below land in productive and a validation
+        # pass reads as goodput. Same reasoning as the bucket_scope in
+        # grpo.validate, including that it only bites on the sync rollout path
+        # where those spans exist.
+        bucket_scope(Bucket.OVERHEAD),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
