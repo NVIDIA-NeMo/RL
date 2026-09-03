@@ -777,6 +777,7 @@ class MegatronGenerationMixin:
             termination_id=self.megatron_tokenizer.eod,
             stop_words=stop_words,
             return_prompt_tokens=return_prompt_tokens,
+            detokenize_stop_sequence=True,
         )
 
     def _merge_stop_strings(
