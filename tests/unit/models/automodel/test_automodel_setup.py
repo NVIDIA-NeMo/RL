@@ -1979,6 +1979,7 @@ class TestGetTokenizer:
             {
                 "name": "deepseek-ai/DeepSeek-V4-Flash-Base",
                 "chat_template": "deepseek_v4",
+                "chat_template_kwargs": {"enable_thinking": True},
             }
         )
 
@@ -1986,10 +1987,11 @@ class TestGetTokenizer:
         mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
             "deepseek-ai/DeepSeek-V4-Flash-Base", trust_remote_code=True
         )
-        mock_get_deepseek_v4_tokenizer.assert_called_once_with(base_tokenizer)
+        mock_get_deepseek_v4_tokenizer.assert_called_once_with(
+            base_tokenizer, {"enable_thinking": True}
+        )
         assert (
-            "Using vLLM 0.25.1's DeepSeek V4 chat renderer"
-            in capsys.readouterr().out
+            "Using vLLM 0.25.1's DeepSeek V4 chat renderer" in capsys.readouterr().out
         )
 
     @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")

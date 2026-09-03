@@ -25,9 +25,12 @@ def should_use_deepseek_v4_chat_template(tokenizer_config: dict[str, Any]) -> bo
     return tokenizer_config.get("chat_template") == DEEPSEEK_V4_CHAT_TEMPLATE
 
 
-def get_deepseek_v4_tokenizer(tokenizer: Any) -> Any:
+def get_deepseek_v4_tokenizer(
+    tokenizer: Any, chat_template_kwargs: dict[str, Any] | None = None
+) -> Any:
     """Wrap a fast tokenizer with vLLM 0.25.1's DeepSeek V4 encoder."""
     dsv4_tokenizer = copy.copy(tokenizer)
+    default_chat_template_kwargs = dict(chat_template_kwargs or {})
     added_vocab = tokenizer.get_added_vocab()
     added_vocab_size = len(added_vocab)
     tokenizer_vocab_size = tokenizer.vocab_size
@@ -35,16 +38,16 @@ def get_deepseek_v4_tokenizer(tokenizer: Any) -> Any:
     class _DeepseekV4Tokenizer(tokenizer.__class__):  # type: ignore
         def apply_chat_template(
             self,
-            messages: list[dict[str, Any]],
+            conversation: list[dict[str, Any]],
             tools: list[dict[str, Any]] | None = None,
             **kwargs: Any,
         ) -> str | list[int]:
+            kwargs = {**default_chat_template_kwargs, **kwargs}
             thinking = kwargs.get("thinking", False) or kwargs.get(
                 "enable_thinking", False
             )
             thinking_mode = "thinking" if thinking else "chat"
 
-            conversation = kwargs.get("conversation", messages)
             deepseek_messages = list(conversation)
             if tools:
                 deepseek_messages.insert(0, {"role": "system", "tools": tools})
@@ -86,8 +89,11 @@ def get_deepseek_v4_tokenizer(tokenizer: Any) -> Any:
         def get_added_vocab(self) -> dict[str, int]:
             return added_vocab.copy()
 
-        def __reduce__(self) -> tuple[Any, tuple[Any]]:
-            return get_deepseek_v4_tokenizer, (tokenizer,)
+        def __reduce__(self) -> tuple[Any, tuple[Any, dict[str, Any]]]:
+            return get_deepseek_v4_tokenizer, (
+                tokenizer,
+                default_chat_template_kwargs,
+            )
 
     _DeepseekV4Tokenizer.__name__ = f"DSV4{tokenizer.__class__.__name__}"
     dsv4_tokenizer.__class__ = _DeepseekV4Tokenizer

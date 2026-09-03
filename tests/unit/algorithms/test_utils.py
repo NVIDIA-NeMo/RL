@@ -201,6 +201,7 @@ def test_get_tokenizer_uses_vllm_deepseek_v4_renderer(
         {
             "name": "deepseek-ai/DeepSeek-V4-Flash-Base",
             "chat_template": "deepseek_v4",
+            "chat_template_kwargs": {"enable_thinking": True},
         }
     )
 
@@ -208,7 +209,9 @@ def test_get_tokenizer_uses_vllm_deepseek_v4_renderer(
     mock_auto_tokenizer.from_pretrained.assert_called_once_with(
         "deepseek-ai/DeepSeek-V4-Flash-Base", trust_remote_code=True
     )
-    mock_get_deepseek_v4_tokenizer.assert_called_once_with(base_tokenizer)
+    mock_get_deepseek_v4_tokenizer.assert_called_once_with(
+        base_tokenizer, {"enable_thinking": True}
+    )
     assert "Using vLLM 0.25.1's DeepSeek V4 chat renderer" in capsys.readouterr().out
 
 
@@ -233,8 +236,7 @@ def test_deepseek_v4_renderer_matches_single_turn_chat_format():
     )
 
     assert (
-        prompt
-        == "<｜begin▁of▁sentence｜><｜User｜>Solve 1+1.<｜Assistant｜></think>"
+        prompt == "<｜begin▁of▁sentence｜><｜User｜>Solve 1+1.<｜Assistant｜></think>"
     )
 
 
