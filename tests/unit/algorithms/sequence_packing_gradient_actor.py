@@ -30,6 +30,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.utils import prepare_loss_input
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 
 @ray.remote(num_gpus=1)
@@ -180,7 +181,7 @@ class SequencePackingGradientTestActor:
             cu_seqlens_padded,
         ) = _pack_sequences_for_megatron(
             input_ids,
-            seq_lengths,
+            to_cpu_int_tuple(seq_lengths),
             pad_individual_seqs_to_multiple_of=pad_to_multiple,
             pad_packed_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
             cp_rank=rank,
@@ -216,8 +217,8 @@ class SequencePackingGradientTestActor:
         wrapper = SequencePackingLossWrapper(
             loss_fn=base_loss_fn,
             prepare_fn=prepare_loss_input,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_q=to_cpu_int_tuple(cu_seqlens),
+            cu_seqlens_q_padded=to_cpu_int_tuple(cu_seqlens_padded),
             vocab_parallel_rank=0,
             vocab_parallel_group=tp_group,
             context_parallel_group=cp_group,

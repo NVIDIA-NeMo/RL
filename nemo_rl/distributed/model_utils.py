@@ -23,6 +23,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 if TYPE_CHECKING:
     # megatron-core (optional "mcore" extra) is imported lazily below so this
@@ -1177,7 +1178,7 @@ def from_parallel_logits_to_logprobs(
 def from_parallel_logits_to_logprobs_packed_sequences(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
+    cu_seqlens_padded: CpuIntTuple,
     unpacked_seqlen: int,
     vocab_start_index: int,
     vocab_end_index: int,
@@ -1196,9 +1197,10 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         target (torch.Tensor): Packed target token indices.
             If target_is_pre_rolled=False: shape [1, T] — unmodified targets, rolled internally.
             If target_is_pre_rolled=True: shape [1, T // CP] — pre-rolled and pre-CP-sharded.
-        cu_seqlens_padded (torch.Tensor): Cumulative sequence lengths tensor with shape [batch_size + 1].
+        cu_seqlens_padded: Cumulative sequence lengths with shape [batch_size + 1].
             cu_seqlens_padded[i] indicates the start position of sequence i in the packed format
-            (full, not CP-adjusted).
+            (full, not CP-adjusted). CPU-resident values avoid synchronization in
+            the host-side packing loops.
         unpacked_seqlen (int): The length of the unpacked sequence tensor.
         vocab_start_index (int): Starting vocabulary index for this worker's partition.
         vocab_end_index (int): Ending vocabulary index for this worker's partition.
@@ -1214,7 +1216,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         torch.Tensor: Unpacked log probabilities tensor with shape [batch_size, unpacked_seqlen-1].
             The total length is reduced by batch_size due to target shifting (one token per sequence).
     """
-    batch_size = cu_seqlens_padded.shape[0] - 1
+    batch_size = len(cu_seqlens_padded) - 1
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
     if not target_is_pre_rolled:
@@ -1228,8 +1230,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
             target.shape[0] // cp_size, dtype=target.dtype, device=target.device
         )
         for i in range(batch_size):
-            start_idx = cu_seqlens_padded[i].item()
-            end_idx = cu_seqlens_padded[i + 1].item()
+            start_idx = cu_seqlens_padded[i]
+            end_idx = cu_seqlens_padded[i + 1]
 
             seq_targets = target[start_idx:end_idx]
             rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
@@ -1298,8 +1300,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         # per-sequence cp_allgather
         final_probs = torch.zeros(probs.shape[0] * cp_size, device=probs.device)
         for i in range(batch_size):
-            start_idx = cu_seqlens_padded[i].item()
-            end_idx = cu_seqlens_padded[i + 1].item()
+            start_idx = cu_seqlens_padded[i]
+            end_idx = cu_seqlens_padded[i + 1]
             final_probs[start_idx:end_idx] = allgather_cp_sharded_tensor(
                 probs[start_idx // cp_size : end_idx // cp_size], cp_group, seq_dim=0
             )
@@ -1310,8 +1312,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     )
     # Filter out the last token of each sequence
     for i in range(batch_size):
-        start_idx = cu_seqlens_padded[i].item()
-        end_idx = cu_seqlens_padded[i + 1].item()
+        start_idx = cu_seqlens_padded[i]
+        end_idx = cu_seqlens_padded[i + 1]
 
         # Exclude the last position (which has the rolled target from position 0)
         if end_idx - start_idx > 0:

@@ -37,6 +37,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 from tests.unit.models.megatron.megatron_data_actors import (
     GetPackSequenceParametersTestActor,
     PackSequencesTestActor,
@@ -78,6 +79,38 @@ class TestProcessedMicrobatchDataclass:
         assert torch.equal(microbatch.cu_seqlens_padded, mock_cu_seqlens_padded)
         assert microbatch.routed_experts is None
         assert microbatch.routed_experts_cp_sharded is None
+        assert microbatch.packed_sequence_metadata is None
+
+
+def test_build_packed_sequence_metadata_preserves_cpu_boundaries():
+    """Packed CPU metadata mirrors individual and bin-level padding."""
+    from nemo_rl.models.megatron.data import _build_packed_sequence_metadata
+
+    metadata = _build_packed_sequence_metadata(
+        (5, 9, 7),
+        pad_individual_seqs_to_multiple_of=8,
+        pad_packed_seq_to_multiple_of=32,
+        pad_full_seq_to=None,
+    )
+
+    assert metadata.cu_seqlens == (0, 5, 14, 21)
+    assert metadata.cu_seqlens_padded == (0, 8, 24, 32)
+
+
+def test_build_vlm_packed_sequence_metadata_uses_padded_boundaries():
+    """Self-packing VLM metadata matches its padded PackedSeqParams layout."""
+    from nemo_rl.models.megatron.data import _build_packed_sequence_metadata
+
+    metadata = _build_packed_sequence_metadata(
+        (5, 9),
+        pad_individual_seqs_to_multiple_of=8,
+        pad_packed_seq_to_multiple_of=1,
+        pad_full_seq_to=32,
+        use_padded_boundaries_for_unpadded=True,
+    )
+
+    assert metadata.cu_seqlens == (0, 8, 32)
+    assert metadata.cu_seqlens_padded == (0, 8, 32)
 
 
 @pytest.mark.mcore
@@ -558,7 +591,7 @@ class TestProcessMicrobatch:
             cu_seqlens_padded,
         ) = _pack_sequences_for_megatron(
             input_ids,
-            seq_lengths,
+            to_cpu_int_tuple(seq_lengths),
             pad_individual_seqs_to_multiple_of=4,
             cp_size=1,
         )
@@ -1748,7 +1781,7 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
         cu_seqlens_padded,
     ) = _pack_sequences_for_megatron(
         input_ids,
-        seq_lengths,
+        to_cpu_int_tuple(seq_lengths),
         pad_individual_seqs_to_multiple_of=pad_to_multiple,
         cp_rank=0,
         cp_size=cp_size,

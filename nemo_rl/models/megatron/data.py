@@ -15,7 +15,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass
 from math import lcm
-from typing import Any, Iterator, Optional, Tuple
+from typing import Any, Iterator, Optional, Sequence, Tuple
 
 import torch
 from megatron.bridge.training.utils.packed_seq_utils import (
@@ -36,6 +36,15 @@ from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
+from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
+
+
+@dataclass(frozen=True)
+class PackedSequenceMetadata:
+    """CPU sequence boundaries retained for loss post-processing."""
+
+    cu_seqlens: tuple[int, ...]
+    cu_seqlens_padded: tuple[int, ...]
 
 
 @dataclass
@@ -53,6 +62,7 @@ class ProcessedInputs:
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
+    packed_sequence_metadata: Optional[PackedSequenceMetadata] = None
 
 
 @dataclass
@@ -78,6 +88,8 @@ class ProcessedMicrobatch:
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, in the model's own token layout. None when the
             batch needs no correction and the model should derive its own.
+        packed_sequence_metadata: CPU cumulative boundaries retained so loss
+            post-processing does not read CUDA scalars after the model forward.
     """
 
     data_dict: BatchedDataDict[Any]
@@ -92,6 +104,43 @@ class ProcessedMicrobatch:
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
+    packed_sequence_metadata: Optional[PackedSequenceMetadata] = None
+
+
+def _build_packed_sequence_metadata(
+    seq_lengths: CpuIntTuple,
+    *,
+    pad_individual_seqs_to_multiple_of: int,
+    pad_packed_seq_to_multiple_of: int,
+    pad_full_seq_to: Optional[int],
+    use_padded_boundaries_for_unpadded: bool = False,
+) -> PackedSequenceMetadata:
+    """Build the CPU cumulative boundaries used by packed loss preparation."""
+
+    def _cumulative(lengths: CpuIntTuple) -> tuple[int, ...]:
+        values = [0]
+        for length in lengths:
+            values.append(values[-1] + length)
+        return tuple(values)
+
+    unpadded = _cumulative(seq_lengths)
+    padded_lengths = [
+        _round_up_to_multiple(length, pad_individual_seqs_to_multiple_of)
+        for length in seq_lengths
+    ]
+    padded = list(_cumulative(padded_lengths))
+    if padded:
+        if pad_full_seq_to is not None:
+            padded[-1] = pad_full_seq_to
+        elif pad_packed_seq_to_multiple_of > 1:
+            padded[-1] = _round_up_to_multiple(
+                padded[-1], pad_packed_seq_to_multiple_of
+            )
+    padded_tuple = tuple(padded)
+    return PackedSequenceMetadata(
+        cu_seqlens=(padded_tuple if use_padded_boundaries_for_unpadded else unpadded),
+        cu_seqlens_padded=padded_tuple,
+    )
 
 
 def make_processed_microbatch_iterator(
@@ -126,6 +175,11 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
+        seq_lengths_cpu = None
+        if pack_sequences:
+            assert seq_length_key is not None
+            seq_lengths_cpu = to_cpu_int_tuple(data_dict[seq_length_key])
+
         # Move to GPU
         data_dict = data_dict.to("cuda")
 
@@ -141,6 +195,7 @@ def make_processed_microbatch_iterator(
             delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             straggler_timer=straggler_timer,
+            seq_lengths_cpu=seq_lengths_cpu,
         )
 
         yield ProcessedMicrobatch(
@@ -156,6 +211,7 @@ def make_processed_microbatch_iterator(
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
             original_seq_length=processed_inputs.original_seq_length,
             media_token_validity_mask=processed_inputs.media_token_validity_mask,
+            packed_sequence_metadata=processed_inputs.packed_sequence_metadata,
         )
 
 
@@ -334,6 +390,7 @@ def process_microbatch(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    seq_lengths_cpu: Optional[CpuIntTuple] = None,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
@@ -363,6 +420,7 @@ def process_microbatch(
         cu_seqlens_padded = None
         mtp_loss_mask = None
         media_token_validity_mask = None
+        packed_sequence_metadata = None
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -375,6 +433,8 @@ def process_microbatch(
 
             # Get sequence lengths and context parallel size
             seq_lengths = data_dict[seq_length_key]
+            if seq_lengths_cpu is None:
+                seq_lengths_cpu = to_cpu_int_tuple(seq_lengths)
 
             if delegate_pack_to_model:
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
@@ -417,9 +477,16 @@ def process_microbatch(
                     cu_seqlens_padded,
                 ) = _prepare_vlm_batch_for_megatron(
                     input_ids,
-                    seq_lengths,
+                    seq_lengths_cpu,
                     pad_individual_seqs_to_multiple_of,
                     pad_full_seq_to=pad_full_seq_to,
+                )
+                packed_sequence_metadata = _build_packed_sequence_metadata(
+                    seq_lengths_cpu,
+                    pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of=1,
+                    pad_full_seq_to=pad_full_seq_to,
+                    use_padded_boundaries_for_unpadded=True,
                 )
                 if has_mtp_loss_mask:
                     source_mtp_loss_mask = data_dict["mtp_loss_mask"]
@@ -457,12 +524,24 @@ def process_microbatch(
                     cu_seqlens_padded,
                 ) = _pack_sequences_for_megatron(
                     input_ids,
-                    seq_lengths,
+                    seq_lengths_cpu,
                     pad_individual_seqs_to_multiple_of,
                     pad_packed_seq_to_multiple_of,
                     pad_full_seq_to,
                     cp_rank=get_context_parallel_rank(),
                     cp_size=get_context_parallel_world_size(),
+                )
+                packed_sequence_metadata = _build_packed_sequence_metadata(
+                    seq_lengths_cpu,
+                    pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                    pad_full_seq_to=pad_full_seq_to,
+                    # The default Megatron packer exposes padded boundaries as
+                    # cu_seqlens_q. Models that slice CP themselves replace
+                    # that field with the true, unpadded boundaries below.
+                    use_padded_boundaries_for_unpadded=(
+                        not model_slices_context_parallel_inputs
+                    ),
                 )
                 if model_slices_context_parallel_inputs:
                     packed_seq_params = PackedSeqParams(
@@ -571,7 +650,7 @@ def process_microbatch(
                         _,
                     ) = _pack_sequences_for_megatron(
                         data_dict["mtp_loss_mask"],
-                        seq_lengths,
+                        seq_lengths_cpu,
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
                         pad_full_seq_to,
@@ -610,7 +689,7 @@ def process_microbatch(
                         data_dict["media_token_validity_mask"].to(
                             data_dict["input_ids"].dtype
                         ),
-                        seq_lengths,
+                        seq_lengths_cpu,
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
                         pad_full_seq_to,
@@ -693,6 +772,7 @@ def process_microbatch(
         routed_experts_cp_sharded=routed_experts_cp_sharded,
         original_seq_length=original_seq_length,
         media_token_validity_mask=media_token_validity_mask,
+        packed_sequence_metadata=packed_sequence_metadata,
     )
 
 
@@ -901,7 +981,7 @@ def process_global_batch(
 
 def _prepare_vlm_batch_for_megatron(
     input_ids: torch.Tensor,
-    seq_lengths: torch.Tensor,
+    seq_lengths: torch.Tensor | Sequence[int],
     pad_individual_seqs_to_multiple_of: int,
     pad_full_seq_to: Optional[int] = None,
 ) -> tuple[
@@ -940,12 +1020,9 @@ def _prepare_vlm_batch_for_megatron(
     device = input_ids.device
     align = max(1, pad_individual_seqs_to_multiple_of)
 
-    # One CPU-GPU sync per call via .tolist(); per-seq arithmetic runs on CPU
-    # ints (fast) instead of .item() in a loop (which sync'd per seq).
-    if torch.is_tensor(seq_lengths):
-        lengths_list = seq_lengths.tolist()
-    else:
-        lengths_list = list(seq_lengths)
+    # The production iterator supplies CPU integers captured before H2D. Direct
+    # callers with a tensor pay at most one .tolist() transfer here.
+    lengths_list = list(to_cpu_int_tuple(seq_lengths))
     padded_lens = [_round_up_to_multiple(L, align) for L in lengths_list]
 
     # PP>1: force sum(padded_lens) to a fixed value so every microbatch produces
@@ -1030,7 +1107,7 @@ def _prepare_vlm_batch_for_megatron(
 
 def _pack_sequences_for_megatron(
     input_ids: torch.Tensor,
-    seq_lengths: torch.Tensor,
+    seq_lengths: torch.Tensor | Sequence[int],
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_packed_seq_to_multiple_of: int = 1,
     pad_packed_seq_to: Optional[int] = None,
@@ -1057,6 +1134,7 @@ def _pack_sequences_for_megatron(
         - cu_seqlens_padded: Padded cumulative sequence lengths
     """
     batch_size = input_ids.shape[0]
+    seq_lengths_cpu = to_cpu_int_tuple(seq_lengths)
 
     # Build cumulative sequence lengths (cu_seqlens) and extract valid tokens
     needs_padding = (
@@ -1077,9 +1155,7 @@ def _pack_sequences_for_megatron(
     pad_factor = pad_individual_seqs_to_multiple_of
 
     for b in range(batch_size):
-        seq_len = (
-            seq_lengths[b].item() if torch.is_tensor(seq_lengths[b]) else seq_lengths[b]
-        )
+        seq_len = seq_lengths_cpu[b]
 
         # Extract valid tokens for this sequence
         valid_tokens.append(input_ids[b, :seq_len])
@@ -1122,11 +1198,7 @@ def _pack_sequences_for_megatron(
         all_input_ids = []
         padded_tokens = []
         for b in range(batch_size):
-            seq_len = (
-                seq_lengths[b].item()
-                if torch.is_tensor(seq_lengths[b])
-                else seq_lengths[b]
-            )
+            seq_len = seq_lengths_cpu[b]
             # if last element, pad to the max sequence length
             if b == batch_size - 1 and needs_padding:
                 if pad_packed_seq_to is not None:
@@ -1408,9 +1480,9 @@ def _get_pack_sequence_parameters_for_megatron(
 
 def _unpack_sequences_from_megatron(
     output_tensor: torch.Tensor,
-    seq_lengths: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_padded: Optional[torch.Tensor],
+    seq_lengths: torch.Tensor | Sequence[int],
+    cu_seqlens: torch.Tensor | Sequence[int],
+    cu_seqlens_padded: Optional[torch.Tensor | Sequence[int]],
     original_batch_size: int,
     original_seq_length: int,
 ) -> torch.Tensor:
@@ -1429,6 +1501,11 @@ def _unpack_sequences_from_megatron(
     """
     # Remove the batch dimension to get [T, vocab_size]
     output_tensor = output_tensor.squeeze(0)
+    seq_lengths_cpu = to_cpu_int_tuple(seq_lengths)
+    cu_seqlens_cpu = to_cpu_int_tuple(cu_seqlens)
+    cu_seqlens_padded_cpu = (
+        to_cpu_int_tuple(cu_seqlens_padded) if cu_seqlens_padded is not None else None
+    )
 
     # Create a padded output tensor with original shape
     vocab_size = output_tensor.shape[-1]
@@ -1444,16 +1521,14 @@ def _unpack_sequences_from_megatron(
     # Fill in the unpacked output tensor with valid tokens
     for b in range(original_batch_size):
         # Get actual sequence length for this sample
-        seq_len = (
-            seq_lengths[b].item() if torch.is_tensor(seq_lengths[b]) else seq_lengths[b]
-        )
+        seq_len = seq_lengths_cpu[b]
 
-        if cp_size > 1 and cu_seqlens_padded is not None:
+        if cp_size > 1 and cu_seqlens_padded_cpu is not None:
             # When using CP, we need to account for padding
             # Calculate the padded sequence boundaries
             pad_factor = cp_size * 2
             padded_seq_len = ((seq_len + pad_factor - 1) // pad_factor) * pad_factor
-            start_idx = cu_seqlens_padded[b].item()
+            start_idx = cu_seqlens_padded_cpu[b]
 
             # Only copy the valid tokens (not the padding)
             unpacked_output[b, :seq_len] = output_tensor[
@@ -1461,8 +1536,8 @@ def _unpack_sequences_from_megatron(
             ]
         else:
             # No CP, use regular cu_seqlens
-            start_idx = cu_seqlens[b].item()
-            end_idx = cu_seqlens[b + 1].item()
+            start_idx = cu_seqlens_cpu[b]
+            end_idx = cu_seqlens_cpu[b + 1]
 
             # Copy the valid tokens to the unpacked tensor
             unpacked_output[b, :seq_len] = output_tensor[start_idx:end_idx]

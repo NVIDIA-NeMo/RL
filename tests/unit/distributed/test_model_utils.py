@@ -40,6 +40,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 
 @ray.remote(num_gpus=1)
@@ -137,7 +138,7 @@ class ModelUtilsTestActor:
         actual_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
             packed_logits,
             packed_target_ids,
-            cu_seqlens,
+            to_cpu_int_tuple(cu_seqlens),
             seq_len,  # unpacked_seqlen
             vocab_start_index,
             vocab_end_index,
@@ -304,6 +305,8 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
         cu_seqlens_padded[i + 1] = cu_seqlens_padded[i] + padded_seq_lengths[i]
 
     total_padded = int(cu_seqlens_padded[-1].item())
+    cu_seqlens_cpu = to_cpu_int_tuple(cu_seqlens)
+    cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
 
     torch.manual_seed(42)
     unpacked_logits_full = torch.randn(
@@ -334,12 +337,14 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
 
     # --- Path 1: target_is_pre_rolled=False ---
     # Pack raw (unrolled) input_ids to [1, T_padded] using _pack_input_ids.
-    packed_target_raw = _pack_input_ids(input_ids, cu_seqlens, cu_seqlens_padded)
+    packed_target_raw = _pack_input_ids(
+        input_ids, cu_seqlens_cpu, cu_seqlens_padded_cpu
+    )
 
     logprobs_not_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
         packed_logits,
         packed_target_raw,
-        cu_seqlens_padded,
+        cu_seqlens_padded_cpu,
         max_seq_len,
         vocab_start_index,
         vocab_end_index,
@@ -352,8 +357,8 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
     # --- Path 2: target_is_pre_rolled=True ---
     packed_target_pre_rolled = _pack_input_ids(
         input_ids,
-        cu_seqlens,
-        cu_seqlens_padded,
+        cu_seqlens_cpu,
+        cu_seqlens_padded_cpu,
         cp_rank=my_cp_rank_val,
         cp_size=cp_size,
         roll_shift=-1,
@@ -362,7 +367,7 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
     logprobs_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
         packed_logits,
         packed_target_pre_rolled,
-        cu_seqlens_padded,
+        cu_seqlens_padded_cpu,
         max_seq_len,
         vocab_start_index,
         vocab_end_index,
