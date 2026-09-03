@@ -129,11 +129,12 @@ def test_zero_draft_count_has_zero_scale_and_finite_metrics() -> None:
     assert state.normalize_metric(torch.tensor(0.0)).item() == 0.0
 
 
-def test_active_state_rejects_untagged_draft_parameters() -> None:
-    """An active payload without a tagged parameter means tagging never ran.
+def test_active_state_leaves_untagged_parameters_alone() -> None:
+    """``active`` is job-wide, not rank-local.
 
-    Silently matching nothing would leave the draft grads on the policy
-    denominator, which has no runtime symptom.
+    The payload is broadcast to every pipeline rank while the draft module is
+    attached only to the post-process chunk, so a rank holding no tagged
+    parameter is the expected case and must not be treated as an error.
     """
     state = DraftStepState()
     state.accumulate(state.metric_payload(_stats(12.0, 4.0)))
@@ -141,10 +142,9 @@ def test_active_state_rejects_untagged_draft_parameters() -> None:
     untagged = torch.nn.Parameter(torch.tensor(1.0))
     untagged.main_grad = torch.tensor(3.0)
 
-    with pytest.raises(RuntimeError, match="grad_norm_group"):
-        state.correct_main_grads(
-            [untagged], policy_normalization_count=torch.tensor(16.0)
-        )
+    state.correct_main_grads([untagged], policy_normalization_count=torch.tensor(16.0))
+
+    assert untagged.main_grad.item() == 3.0
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

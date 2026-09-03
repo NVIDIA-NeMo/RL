@@ -136,23 +136,19 @@ class DraftStepState:
         *,
         policy_normalization_count: torch.Tensor,
     ) -> None:
-        """Correct draft-tagged main grads after policy normalization."""
+        """Correct draft-tagged main grads after policy normalization.
+
+        ``active`` is a job-wide predicate: the payload reaches every pipeline
+        rank through ``broadcast_loss_metrics_from_last_stage``, while the draft
+        module is attached only to the post-process chunk. Ranks that hold no
+        draft-tagged parameter are therefore expected and must no-op here.
+        """
         policy_count = float(policy_normalization_count.detach().item())
         draft_scale = self._normalization_scale()
         correction = policy_count * draft_scale if policy_count > 0 else 0.0
-        matched = 0
         for param in parameters:
             if getattr(param, "grad_norm_group", None) != "draft":
                 continue
-            matched += 1
             main_grad = getattr(param, "main_grad", None)
             if main_grad is not None:
                 main_grad.mul_(correction)
-        if self.active and matched == 0:
-            # An accumulated payload means draft params took part in the step,
-            # so tagging must have run. A zero match silently leaves the draft
-            # grads on the policy denominator.
-            raise RuntimeError(
-                "draft step state is active but no parameter carries "
-                "grad_norm_group='draft'; draft parameter tagging did not run."
-            )
