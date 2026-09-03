@@ -1308,7 +1308,7 @@ class AsyncNemoGymRolloutImpl:
             # (cum_len of the deepest chain; delta sums as the generation
             # proxy) instead of a message_log walk.
             manifests = [
-                ((c.env_extras.get("ng_receipt") or {}).get("manifest") or [])
+                (((c.env_extras or {}).get("ng_receipt") or {}).get("manifest") or [])
                 for c in completions
             ]
             # .get with 0: _assemble_receipt ships raw ledger rows unvalidated
@@ -1382,7 +1382,7 @@ class AsyncNemoGymRolloutImpl:
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
         agent_extras = [
-            {k: v for k, v in c.env_extras.items() if k not in ("ng_receipt",)}
+            {k: v for k, v in (c.env_extras or {}).items() if k not in ("ng_receipt",)}
             for c in completions
         ]
         for key in agent_extras[0].keys():
@@ -1895,10 +1895,16 @@ class RolloutManager:
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
         lineage_group_id: Optional[str] = None,
     ) -> Optional["ReassemblyRequest"]:
-        """Capture siblings with stable lineage and configured retry granularity."""
+        """Capture siblings with stable lineage and configured retry granularity.
+
+        Returns ``None`` when infrastructure retries are exhausted within the
+        configured drop budget. The caller then owns the backpressure permit and
+        target-step shortfall.
+        """
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
+        owns_recovery_group = lineage_group_id is None
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:
             async with self._recovery_mutation() as cut:
@@ -1954,6 +1960,12 @@ class RolloutManager:
         assert last_infra_error is not None
         reason = type(last_infra_error).__name__
         self._consecutive_infra_drops += 1
+        if owns_recovery_group:
+            # Without controller-owned recovery lineage, nobody above this method
+            # knows the temporary group ID. Clean its known staging ownership before
+            # dropping the only record that names those rows.
+            async with self._recovery_mutation() as cut:
+                await self.discard_recovery_group(cut, recovery_group_id)
         if self._consecutive_infra_drops > policy.max_consecutive_dropped_prompts:
             raise RolloutRedispatchExhausted(
                 f"prompt idx={input_sample['idx']} exhausted its infrastructure "
@@ -1964,6 +1976,14 @@ class RolloutManager:
                 f"{reason}: {last_infra_error}"
             ) from last_infra_error
         self._stats.record_infra_drop(reason, self._consecutive_infra_drops)
+        print(
+            f"dropping capture prompt idx={input_sample['idx']} after "
+            f"{infra_attempts} infrastructure failure(s) ({reason}: "
+            f"{last_infra_error}) [consecutive drop "
+            f"{self._consecutive_infra_drops}/"
+            f"{policy.max_consecutive_dropped_prompts}]",
+            flush=True,
+        )
         self._stats.skipped += 1
         return None
 
@@ -2173,5 +2193,5 @@ class RolloutManager:
             for sibling in group.siblings
             for key in sibling.current_attempt.staging_keys
         ]
-        await self._tq_buffer.clear_staging_keys(staging_keys)
+        await self._tq_buffer.clear_staging_keys(cut, staging_keys)
         self._recovery_ledger.discard_group(cut, group_id)

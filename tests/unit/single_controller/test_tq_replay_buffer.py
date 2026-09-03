@@ -192,6 +192,28 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+async def _commit_finalized(
+    buffer: TQReplayBuffer,
+    group_id: str,
+    meta: KVBatchMeta,
+    group_min_wv: int,
+    group_max_wv: int,
+    *,
+    staging_keys: list[str] | None = None,
+) -> KVBatchMeta:
+    barrier = buffer._data_plane_checkpoint_barrier
+    assert barrier is not None
+    async with barrier.mutation() as cut:
+        return await buffer.commit_finalized(
+            cut,
+            group_id,
+            meta,
+            group_min_wv,
+            group_max_wv,
+            staging_keys=staging_keys,
+        )
+
+
 def _make_record(
     rollout_metrics: dict[str, Any] | None = None,
     *,
@@ -316,36 +338,31 @@ class TestDataPlaneCheckpointBarrier:
 
         asyncio.run(exercise())
 
-    def test_nested_mutation_does_not_deadlock_with_waiting_checkpoint(self):
+    def test_cancelled_mutation_releases_waiting_checkpoint(self):
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()
-            outer_entered = asyncio.Event()
-            allow_nested = asyncio.Event()
-            nested_entered = asyncio.Event()
+            mutation_entered = asyncio.Event()
             checkpoint_entered = asyncio.Event()
 
             async def mutate() -> None:
                 async with barrier.mutation():
-                    outer_entered.set()
-                    await allow_nested.wait()
-                    async with barrier.mutation():
-                        nested_entered.set()
+                    mutation_entered.set()
+                    await asyncio.Event().wait()
 
             async def checkpoint() -> None:
                 async with barrier.checkpoint():
                     checkpoint_entered.set()
 
             mutation_task = asyncio.create_task(mutate())
-            await outer_entered.wait()
+            await mutation_entered.wait()
             checkpoint_task = asyncio.create_task(checkpoint())
             await asyncio.sleep(0)
-            allow_nested.set()
-
-            await asyncio.wait_for(nested_entered.wait(), timeout=5.0)
             assert not checkpoint_entered.is_set()
-            await asyncio.wait_for(
-                asyncio.gather(mutation_task, checkpoint_task), timeout=5.0
-            )
+
+            mutation_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await mutation_task
+            await asyncio.wait_for(checkpoint_task, timeout=5.0)
             assert checkpoint_entered.is_set()
 
         asyncio.run(exercise())
@@ -1431,6 +1448,36 @@ class TestTQReplayBufferTokenCaptureMode:
         buf.reserve(weight_version=1)
         assert buf._rollout_ids_list[1] is None
 
+    def test_mutating_helpers_reject_expired_cut(self):
+        buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
+        group_id = buf.reserve(weight_version=1, rollout_ids=["r0"])
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name=None,
+            sample_ids=[f"{group_id}_g0"],
+            fields=None,
+        )
+
+        async def get_expired_cut():
+            barrier = buf._data_plane_checkpoint_barrier
+            assert barrier is not None
+            async with barrier.mutation() as cut:
+                return cut
+
+        cut = _run(get_expired_cut())
+        with pytest.raises(RuntimeError, match="no longer active"):
+            _run(buf.clear_staging_keys(cut, []))
+        with pytest.raises(RuntimeError, match="no longer active"):
+            _run(buf.commit_finalized(cut, group_id, meta, 1, 1))
+        with pytest.raises(RuntimeError, match="no longer active"):
+            _run(
+                buf._remove_groups_unlocked(
+                    cut,
+                    [group_id],
+                    clear_data_plane=False,
+                )
+            )
+
     def test_commit_finalized_fills_slot_with_group_min_wv(self):
         dp = MultiPartitionFakeDataPlaneClient()
         buf = self._make_capture_buffer(dp)
@@ -1443,7 +1490,8 @@ class TestTQReplayBufferTokenCaptureMode:
             fields=None,
         )
         _run(
-            buf.commit_finalized(
+            _commit_finalized(
+                buf,
                 group_id,
                 meta,
                 group_min_wv=3,
@@ -1465,7 +1513,7 @@ class TestTQReplayBufferTokenCaptureMode:
             partition_id="rollout_data", task_name=None, sample_ids=[], fields=None
         )
         with pytest.raises(ValueError, match="no live slot"):
-            _run(buf.commit_finalized("ghost", meta, group_min_wv=0, group_max_wv=0))
+            _run(_commit_finalized(buf, "ghost", meta, 0, 0))
 
     def test_commit_finalized_verifies_full_plan_manifest_ownership(self):
         dp = MultiPartitionFakeDataPlaneClient()
@@ -1490,7 +1538,8 @@ class TestTQReplayBufferTokenCaptureMode:
 
         with pytest.raises(ValueError, match="ownership does not match"):
             _run(
-                buf.commit_finalized(
+                _commit_finalized(
+                    buf,
                     group_id,
                     meta,
                     group_min_wv=1,
@@ -1533,7 +1582,8 @@ class TestTQReplayBufferTokenCaptureMode:
             fields=None,
         )
         _run(
-            buf.commit_finalized(
+            _commit_finalized(
+                buf,
                 group_id,
                 meta,
                 group_min_wv=1,
@@ -1562,7 +1612,7 @@ class TestTQReplayBufferTokenCaptureMode:
             sample_ids=[f"{group_id}_g0"],
             fields=None,
         )
-        _run(buf.commit_finalized(group_id, meta, group_min_wv=1, group_max_wv=1))
+        _run(_commit_finalized(buf, group_id, meta, 1, 1))
         _run(buf.remove([0], remove_in_dp=True))
         partitions_cleared = {p for p, _ in dp.clear_calls_by_partition}
         assert partitions_cleared == {"rollout_data"}
@@ -1584,7 +1634,8 @@ class TestTQReplayBufferTokenCaptureMode:
             fields=None,
         )
         _run(
-            buf.commit_finalized(
+            _commit_finalized(
+                buf,
                 group_id,
                 meta,
                 group_min_wv=1,

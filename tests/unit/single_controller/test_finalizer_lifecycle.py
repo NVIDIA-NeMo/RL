@@ -20,7 +20,7 @@ import asyncio
 import threading
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -148,6 +148,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
     assert ctrl._active_finalizers == 0
     assert ctrl._finalizer_unknown_outcomes == 0
     ctrl._buffer.commit_finalized.assert_awaited_once_with(
+        ANY,
         "group",
         meta,
         3,
