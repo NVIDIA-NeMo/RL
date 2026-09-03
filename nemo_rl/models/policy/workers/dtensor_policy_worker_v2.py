@@ -102,10 +102,14 @@ _MERGED_EXPERT_PARAM_SUFFIXES = (
 )
 
 
-def _is_ep_sharded_merged_expert(name: str, tensor: torch.Tensor) -> bool:
+def _is_ep_sharded_merged_expert(
+    model: nn.Module, name: str, tensor: torch.Tensor
+) -> bool:
     """Return whether an adapter can split this DTensor before EP gathering."""
-    if not isinstance(tensor, DTensor) or not name.endswith(
-        _MERGED_EXPERT_PARAM_SUFFIXES
+    if (
+        getattr(model, "state_dict_adapter", None) is None
+        or not isinstance(tensor, DTensor)
+        or not name.endswith(_MERGED_EXPERT_PARAM_SUFFIXES)
     ):
         return False
 
@@ -135,13 +139,20 @@ def _iter_ep_sharded_expert_tensors(
     ep_mesh = tensor.device_mesh["ep"]
     ep_group = ep_mesh.get_group()
     ep_size = ep_mesh.size()
-    for local_name, local_tensor in local_tensors:
+
+    local_names = [local_name for local_name, _ in local_tensors]
+    gathered_name_lists: list[Optional[list[str]]] = [None] * ep_size
+    dist.all_gather_object(gathered_name_lists, local_names, group=ep_group)
+    if any(
+        gathered_names is None or len(gathered_names) != len(local_tensors)
+        for gathered_names in gathered_name_lists
+    ):
+        raise RuntimeError("EP expert refit gathered inconsistent parameter names")
+
+    for local_index, (_, local_tensor) in enumerate(local_tensors):
         if isinstance(local_tensor, DTensor):
             local_tensor = local_tensor.full_tensor()
         local_tensor = local_tensor.to(target_dtype, non_blocking=True).contiguous()
-
-        gathered_names: list[Optional[str]] = [None] * ep_size
-        dist.all_gather_object(gathered_names, local_name, group=ep_group)
 
         gathered_shape = (ep_size * local_tensor.shape[0], *local_tensor.shape[1:])
         gathered_tensor = torch.empty(
@@ -155,12 +166,11 @@ def _iter_ep_sharded_expert_tensors(
             group=ep_group,
         )
 
-        for gathered_name, expert_tensor in zip(
-            gathered_names, gathered_tensor.chunk(ep_size, dim=0)
+        for rank_names, expert_tensor in zip(
+            gathered_name_lists, gathered_tensor.chunk(ep_size, dim=0)
         ):
-            if gathered_name is None:
-                raise RuntimeError("EP expert refit gathered an empty parameter name")
-            yield gathered_name, expert_tensor
+            assert rank_names is not None
+            yield rank_names[local_index], expert_tensor
 
         del gathered_tensor
         del local_tensor
@@ -184,7 +194,7 @@ def dtensor_params_generator(
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
-        if _is_ep_sharded_merged_expert(name, tensor):
+        if _is_ep_sharded_merged_expert(model, name, tensor):
             yield from _iter_ep_sharded_expert_tensors(
                 model,
                 name,
