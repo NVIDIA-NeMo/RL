@@ -141,11 +141,11 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             return super()._load_weights(remapped_weights)
 
     def get_weight_snapshot(self, name: str) -> torch.Tensor:
-        """Return a CPU copy of a named parameter for before/after comparison."""
+        """Return a Ray-serializable CPU copy for before/after comparison."""
         model = self.model_runner.model
         for parameter_name, parameter in model.named_parameters():
             if parameter_name == name:
-                return parameter.detach().cpu().clone()
+                return parameter.detach().to(device="cpu", dtype=torch.float32).clone()
         raise KeyError(f"Parameter '{name}' not found in model")
 
     def get_quantizer_stats(self) -> dict:
