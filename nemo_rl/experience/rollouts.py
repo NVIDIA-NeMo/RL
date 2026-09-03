@@ -501,7 +501,8 @@ def _apply_effort_shaping(
         # Token-capture receipt rows with no resolvable terminal length are
         # skipped fail-closed: shaping a length we do not have would award the
         # maximum shortness bonus to a row that may be arbitrarily long.
-        if lengths[i] is None:
+        length = lengths[i]
+        if length is None:
             continue
         prompt = next(
             (
@@ -516,7 +517,7 @@ def _apply_effort_shaping(
         if effort_config.low_string in prompt:
             length_reward = min(
                 1.0,
-                effort_config.low_weight * (1.0 - lengths[i] / effort_config.low_ub),
+                effort_config.low_weight * (1.0 - length / effort_config.low_ub),
             )
             new_reward = (
                 orig_rewards[i]
@@ -526,9 +527,9 @@ def _apply_effort_shaping(
             result["full_result"]["reward"] = new_reward
             length_rewards_low.append(length_reward)
             rewards_low.append(new_reward)
-            low_lengths.append(lengths[i])
+            low_lengths.append(length)
         else:
-            high_lengths.append(lengths[i])
+            high_lengths.append(length)
 
     return _EffortShapingMetrics(
         length_rewards_low, rewards_low, low_lengths, high_lengths

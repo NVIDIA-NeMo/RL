@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import ray
 import torch
@@ -458,7 +458,8 @@ def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
     """
     row: dict[str, torch.Tensor] = {}
     for field in rows.keys():
-        row[str(field)] = rows.get(field)[index].unsqueeze(0)
+        leaf = cast(torch.Tensor, rows.get(field))
+        row[str(field)] = leaf[index].unsqueeze(0)
     return row
 
 

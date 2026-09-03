@@ -492,78 +492,27 @@ constraint-dependencies = [
 exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
-  [
-    { extra = "fsdp" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "automodel" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "mcore" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "vllm" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "automodel" },
-    { extra = "fsdp" },
-  ],
-  [
-    { extra = "automodel" },
-    { extra = "mcore" },
-  ],
-  [
-    { extra = "automodel" },
-    { extra = "vllm" },
-  ],
-  [
-    { extra = "vllm" },
-    { extra = "mcore" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "vllm" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "automodel" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "mcore" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "fsdp" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "modelopt" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "nvrx" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "nemo_gym" },
-  ],
+  [{ extra = "fsdp" }, { extra = "sglang" }],
+  [{ extra = "automodel" }, { extra = "sglang" }],
+  [{ extra = "mcore" }, { extra = "sglang" }],
+  [{ extra = "vllm" }, { extra = "sglang" }],
+  [{ extra = "automodel" }, { extra = "fsdp" }],
+  [{ extra = "automodel" }, { extra = "mcore" }],
+  [{ extra = "automodel" }, { extra = "vllm" }],
+  [{ extra = "vllm" }, { extra = "mcore" }],
+  [{ extra = "trtllm" }, { extra = "vllm" }],
+  [{ extra = "trtllm" }, { extra = "sglang" }],
+  [{ extra = "trtllm" }, { extra = "automodel" }],
+  [{ extra = "trtllm" }, { extra = "mcore" }],
+  [{ extra = "trtllm" }, { extra = "fsdp" }],
+  [{ extra = "trtllm" }, { extra = "modelopt" }],
+  [{ extra = "trtllm" }, { extra = "nvrx" }],
+  [{ extra = "trtllm" }, { extra = "nemo_gym" }],
   # Gym pins openai==2.44.0 (rebased PR #2872 tree) while sglang==0.5.12.post1
   # pins openai==2.6.1; no environment installs both extras together.
   # Spelled nemo_gym (the raw extras-table key): uv < 0.12 compares conflict
   # entries against unnormalized extra names and rejects "nemo-gym".
-  [
-    { extra = "nemo_gym" },
-    { extra = "sglang" },
-  ],
+  [{ extra = "nemo_gym" }, { extra = "sglang" }],
 ]
 
 

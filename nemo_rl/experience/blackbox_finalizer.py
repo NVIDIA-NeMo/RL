@@ -449,10 +449,12 @@ class BlackboxFinalizer:
                 )
 
         group_min_wv = min(
-            (r.min_wv for r in valid_rows), default=fallback_weight_version
+            (r.min_wv for r in valid_rows if r.min_wv is not None),
+            default=fallback_weight_version,
         )
         group_max_wv = max(
-            (r.max_wv for r in valid_rows), default=fallback_weight_version
+            (r.max_wv for r in valid_rows if r.max_wv is not None),
+            default=fallback_weight_version,
         )
 
         valid_fraction = len(valid_rows) / len(rows)

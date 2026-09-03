@@ -841,7 +841,9 @@ class AsyncNemoGymRolloutImpl:
         # canonical row (and any media it needs) is rebuilt by the finalizer
         # from the capture ledger, so there is nothing here to attach media to
         # and the fewer-user-turns guard would reject every receipt group.
-        receipt_mode = bool(completions) and "ng_receipt" in completions[0].env_extras
+        receipt_mode = bool(completions) and "ng_receipt" in (
+            completions[0].env_extras or {}
+        )
         if not receipt_mode:
             source_message_log = input_sample["message_log"]
             attach_static_multimodal_payload(prompt_message_log, source_message_log)
@@ -1178,7 +1180,9 @@ class AsyncNemoGymRolloutImpl:
         """Aggregate per-sample and per-agent metrics."""
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
-        receipt_mode = bool(completions) and "ng_receipt" in completions[0].env_extras
+        receipt_mode = bool(completions) and "ng_receipt" in (
+            completions[0].env_extras or {}
+        )
         if receipt_mode:
             # Token-free receipts: token accounting comes from the manifest
             # (cum_len of the deepest chain; delta sums as the generation

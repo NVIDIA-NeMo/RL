@@ -1020,7 +1020,8 @@ def setup_single_controller(
                 "token_capture.enabled supports the vllm backend only; got "
                 f"{generation_config['backend']!r}"
             )
-        if not generation_config["vllm_cfg"]["async_engine"]:
+        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
+        if not vllm_cfg["async_engine"]:
             raise ValueError(
                 "token_capture.enabled requires "
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
