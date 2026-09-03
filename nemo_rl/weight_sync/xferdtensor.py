@@ -239,17 +239,21 @@ def _compute_shard_slices(global_shape, mesh_shape, mesh_coords, placements):
         strides.reverse()
 
         # linear_index = this rank's flat chunk number among num_chunks.
+        # (example: tp coord 2 * stride 1 -> linear_index = 2.)
         linear_index = 0
         for (mesh_dim, size, coord), stride in zip(shard_info, strides):
             if coord >= size:
                 raise ValueError(f"Invalid mesh coord {coord} for mesh dim {mesh_dim}.")
             linear_index += coord * stride
 
+        # This rank owns chunk `linear_index`; its slice starts past every
+        # earlier chunk. (example: start = 64+64 = 128, end = 192 -> [128:192].)
         start = sum(sizes[:linear_index])
         end = start + sizes[linear_index]
         slices[tensor_dim] = slice(start, end)
 
     return slices
+
 
 def xferdtensor_golden(
     src_tensor,
