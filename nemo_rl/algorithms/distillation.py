@@ -56,6 +56,7 @@ from nemo_rl.environments.nemo_gym import (
     get_nemo_gym_venv_dir,
     should_use_nemo_gym,
     split_nemo_gym_runtime_options,
+    validate_nemo_gym_runtime_options,
 )
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -71,6 +72,7 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_vllm_refit_config,
 )
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -256,6 +258,15 @@ def setup(
             )
         checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
 
+    enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
+    nemo_gym_runtime = None
+    if enable_nemo_gym:
+        nemo_gym_runtime = split_nemo_gym_runtime_options(dict(env_configs["nemo_gym"]))
+        validate_nemo_gym_runtime_options(
+            nemo_gym_runtime[0],
+            enable_router_replay=router_replay_enabled(policy_config),
+        )
+
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
@@ -340,7 +351,6 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
     nemo_gym_actor: Optional[EnvironmentInterface] = None
     if enable_nemo_gym:
         nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
@@ -518,6 +528,8 @@ def setup(
                 "hf_config_overrides", {}
             )
         if enable_nemo_gym:
+            assert nemo_gym_runtime is not None
+            runtime_options, nemo_gym_global_config = nemo_gym_runtime
             deferred_vllm = VllmGeneration(
                 cluster=inference_cluster,
                 config=generation_config,
@@ -530,9 +542,7 @@ def setup(
                 return deferred_vllm
 
             def init_nemo_gym():
-                runtime_options, nemo_gym_dict = split_nemo_gym_runtime_options(
-                    dict(env_configs["nemo_gym"])
-                )
+                nemo_gym_dict = dict(nemo_gym_global_config)
                 # These are NeMo-RL-side fields consumed by NemoGymConfig, not
                 # NeMo-Gym global config entries.
                 # Pass prebuilt cache + venv dirs through the global config so the

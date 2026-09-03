@@ -1287,9 +1287,9 @@ class _JoinTokenizer:
         return [" ".join(map(str, token_ids)) for token_ids in batch]
 
 
-def test_nemo_gym_postprocess_noncontiguous_asserts_by_default():
+def test_nemo_gym_postprocess_noncontiguous_asserts_when_truncation_disabled():
     class _MockSelf:
-        cfg = {}
+        cfg = {"truncate_noncontiguous_episodes": False}
 
     with pytest.raises(AssertionError, match="Non-contiguous messages found"):
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(

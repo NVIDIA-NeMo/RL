@@ -29,6 +29,7 @@ policy:
 env:
   should_use_nemo_gym: true       # Enables NeMo Gym integration
   nemo_gym:
+    truncate_noncontiguous_episodes: false
     # NeMo Gym config paths and settings
     config_paths:
       - resources_servers/math/configs/math.yaml
@@ -40,6 +41,13 @@ logger:
     # result payloads can produce many large W&B Table artifacts.
     log_nemo_gym_full_result_tables: false
 ```
+
+`env.nemo_gym.truncate_noncontiguous_episodes` defaults to `false`, so a
+token-prefix discontinuity raises an error. When set to `true`, NeMo RL stops
+at the first trainable turn whose prompt does not preserve the tokens already
+seen, drops that turn and the remaining tail, and keeps the preceding
+contiguous prefix with the episode reward. This option cannot be used with
+`policy.router_replay.enabled: true`.
 
 When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
 the per-agent `full_result` Tables. This prevents those payloads from entering
