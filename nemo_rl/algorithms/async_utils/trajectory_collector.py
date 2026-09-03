@@ -1118,8 +1118,14 @@ class AsyncTrajectoryCollector:
             profile_owner = self._rollout_profile_owner
         if profile_owner is not None:
             owner_loop, owner_task = profile_owner
+
+            def cancel_if_still_owner() -> None:
+                with self._rollout_profile_owner_state_lock:
+                    if self._rollout_profile_owner is profile_owner:
+                        owner_task.cancel()
+
             try:
-                owner_loop.call_soon_threadsafe(owner_task.cancel)
+                owner_loop.call_soon_threadsafe(cancel_if_still_owner)
             except RuntimeError:
                 # The owner can close its loop immediately before this snapshot.
                 # It will release the profiler lock normally in that case.
