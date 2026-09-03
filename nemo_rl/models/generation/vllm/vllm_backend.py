@@ -861,6 +861,13 @@ class VllmInternalWorkerExtension:
             return
 
         if transport == "nccl_reshard":
+            if self._uses_fp8_kv_cache():
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit does not "
+                    "support an FP8 KV cache because its static scales are "
+                    "outside the targeted MoE reload lifecycle"
+                )
+
             realized_placements = set()
             for module in _unquantized_flashinfer_trtllm_modules(
                 self.model_runner.model
@@ -1215,6 +1222,7 @@ class VllmInternalWorkerExtension:
 
         def _trtllm_grouped_expert_spec(
             param_info: dict[str, Any],
+            vllm_param: torch.Tensor,
         ) -> LocalParamSpec:
             from torch.distributed._tensor import Shard
 
@@ -1257,7 +1265,18 @@ class VllmInternalWorkerExtension:
                 )
 
             pp_stage = param_info.get("pp_stage", 0)
-            rank = self.pp_comm_groups[pp_stage].rank
+            pp_comm_groups = self.pp_comm_groups
+            if pp_comm_groups is None:
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit mapping was built "
+                    "before the per-PP-stage groups were initialized"
+                )
+            if pp_stage not in pp_comm_groups:
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit has no "
+                    f"communicator for PP stage {pp_stage}"
+                )
+            rank = pp_comm_groups[pp_stage].rank
             local_slices = _local_shard_slices(param_info, rank)
             local_shape = tuple(
                 global_size
@@ -1270,12 +1289,16 @@ class VllmInternalWorkerExtension:
             expert_start = 0 if local_slices[0].start is None else local_slices[0].start
             grouped_proj = param_info["grouped_expert_proj"]
             expert_prefix = param_info["name"].rsplit(f".{grouped_proj}.weight", 1)[0]
-            fused_param = (
-                "w13_weight"
-                if grouped_proj in ("gate_proj", "up_proj")
-                else "w2_weight"
-            )
-            expected_loaded_name = f"{expert_prefix}.{fused_param}"
+            registered_vllm_name = vllm_names_by_id.get(id(vllm_param))
+            if registered_vllm_name is None:
+                raise ValueError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit resolved an "
+                    f"unregistered vLLM parameter for {param_info['name']!r}"
+                )
+            expected_loaded_names = {
+                registered_vllm_name,
+                registered_vllm_name.replace(".routed_experts.", "."),
+            }
             dtype_value = param_info.get("dtype")
             dtype = _STR_TO_DTYPE.get(str(dtype_value))
             if dtype is None:
@@ -1302,13 +1325,13 @@ class VllmInternalWorkerExtension:
                 loaded_names = self._load_full_hf_weights(weights)
                 # AutoWeightsLoader reports the fused destination parameter,
                 # not each per-expert HF source name.
-                if (
-                    loaded_names is not None
-                    and expected_loaded_name not in loaded_names
+                if loaded_names is not None and expected_loaded_names.isdisjoint(
+                    loaded_names
                 ):
                     raise RuntimeError(
                         "BF16 FlashInfer TRTLLM nccl_reshard refit failed to "
-                        f"load fused expert destination {expected_loaded_name!r}; "
+                        "load fused expert destination; expected one of "
+                        f"{sorted(expected_loaded_names)!r}, "
                         f"vLLM reported {sorted(loaded_names)!r}"
                     )
 
@@ -1360,7 +1383,7 @@ class VllmInternalWorkerExtension:
         for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
             param_info = param_info_by_name[hf_name]
             if use_trtllm_staging and param_info.get("grouped_expert_proj"):
-                specs[hf_name] = _trtllm_grouped_expert_spec(param_info)
+                specs[hf_name] = _trtllm_grouped_expert_spec(param_info, vllm_param)
                 continue
 
             wire_dtype_value = param_info.get("dtype")

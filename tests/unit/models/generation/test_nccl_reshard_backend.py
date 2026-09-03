@@ -367,7 +367,7 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
     ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
     ext._load_full_hf_weights = MagicMock(
-        return_value={"model.layers.0.mlp.experts.w13_weight"}
+        return_value={"model.layers.0.mlp.experts.routed_experts.w13_weight"}
     )
 
     spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
@@ -392,6 +392,81 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
         loaded_weights[1][1], torch.full((P, H), 3.0, dtype=torch.bfloat16)
     )
     torch.testing.assert_close(packed_w13, torch.full_like(packed_w13, 7.0))
+
+
+def test_build_hf_to_local_param_map_stages_qwen35_wrapped_experts():
+    """Qwen3.5 wrapper prefixes and RoutedExperts names survive staged reload."""
+    hidden_size, num_experts, intermediate_size = 16, 4, 32
+    hf_prefix = "model.language_model.layers.0.mlp.experts"
+    runtime_prefix = "language_model.model.layers.0.mlp.experts"
+    expert_name = f"{hf_prefix}.down_proj.weight"
+    runtime_name = f"{runtime_prefix}.routed_experts.w2_weight"
+    refit_info = {
+        "gen_tp_size": 2,
+        "layer_names": ["model.language_model.layers.0"],
+        "per_layer_params": {
+            "model.language_model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [
+                        num_experts,
+                        hidden_size,
+                        intermediate_size,
+                    ],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "down_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    packed_w2 = torch.full((128, 16, 24, 64), 7.0)
+    ext = _make_ext({runtime_name: packed_w2})
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._load_full_hf_weights = MagicMock(return_value={f"{runtime_prefix}.w2_weight"})
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+    spec.post(spec.pre(spec.base))
+
+    loaded_weights = ext._load_full_hf_weights.call_args.args[0]
+    assert [name for name, _ in loaded_weights] == [
+        f"{hf_prefix}.2.down_proj.weight",
+        f"{hf_prefix}.3.down_proj.weight",
+    ]
+
+
+def test_build_hf_to_local_param_map_requires_pp_groups_for_trtllm_staging():
+    """A missing NCCL communicator fails before staged expert placement."""
+    expert_name = "model.layers.0.mlp.experts.down_proj.weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [2, 16, 32],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "down_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    ext = _make_ext(
+        {"model.layers.0.mlp.experts.routed_experts.w2_weight": torch.empty(2, 16, 32)}
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = None
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+
+    with pytest.raises(RuntimeError, match="before.*per-PP-stage groups"):
+        ext.build_hf_to_local_param_map(refit_info)
 
 
 def test_build_hf_to_local_param_map_rejects_missing_trtllm_destination():
@@ -496,6 +571,25 @@ def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypat
     assert not hasattr(ext, "nccl_reshard_refit_info")
 
 
+def test_nccl_reshard_trtllm_refit_rejects_fp8_kv_cache(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=object())
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._uses_fp8_kv_cache = lambda: True
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [SimpleNamespace(expert_placement_strategy="linear")],
+    )
+
+    with pytest.raises(RuntimeError, match="FP8 KV cache"):
+        ext._validate_native_layerwise_refit("nccl_reshard")
+
+
 def test_legacy_refit_map_is_built_after_comm_groups_exist(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -524,6 +618,7 @@ def test_legacy_refit_map_is_built_after_comm_groups_exist(monkeypatch):
         _FakeGroup,
     )
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
     ext.init_nccl_reshard_comm_group(
@@ -616,6 +711,7 @@ def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
         "per_layer_params": {},
         "misc_meta": {},
     }
+    ext.pp_comm_groups = {}
     ext._receive_and_load_misc_params = MagicMock()
     ext._maybe_process_fp8_kv_cache = MagicMock()
     finalize = MagicMock()
