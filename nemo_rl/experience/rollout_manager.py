@@ -417,7 +417,11 @@ class _Deadline:
 
     def suspend(self) -> None:
         """Disarm the clock, banking whatever budget is left."""
-        if self._timeout is None or self._remaining is not None or self._timeout.expired():
+        if (
+            self._timeout is None
+            or self._remaining is not None
+            or self._timeout.expired()
+        ):
             return
         when = self._timeout.when()
         if when is None:
