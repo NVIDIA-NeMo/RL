@@ -8,8 +8,9 @@ GPUS_PER_NODE=8
 STEPS_PER_RUN=8
 MAX_STEPS=8
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-# ~25 min startup (30B-MoE load + CUDA-graph warmup + nemo_gym servers) plus ~130 min for 8 steps
-# 180 min leaves margin for teardown + metric-dump within the 4 h job allocation.
+# ~25 min startup plus 8 async steps; colocated steps carry the engine
+# sleep/wake and per-wake reshard on top of training, so keep the async-gym
+# sibling's 180 min budget until measured.
 NUM_MINUTES=180
 # ===== END CONFIG =====
 
@@ -53,6 +54,8 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
+    checkpointing.save_period=4 \
+    grpo.val_period=4 \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \
     $@ \

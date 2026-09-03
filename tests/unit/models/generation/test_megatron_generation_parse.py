@@ -197,12 +197,26 @@ def test_http_server_port_reservation(monkeypatch):
         pass
 
     # Worker-side adoption: the same live socket, duplicated across the
-    # process boundary; still the same port, still accepting.
+    # process boundary. The holder confirms that its original descriptor is
+    # closed before this returns, preventing MCore's SO_REUSEPORT listeners
+    # from racing the old non-reusable socket.
     reserved = receive_held_socket(port)
     try:
+        assert holder._sock.fileno() == -1
         assert reserved.getsockname()[1] == port
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             pass
+
+        # MCore closes the handed-off fd and gives every frontend replica its
+        # own SO_REUSEPORT listener. Verify that such a listener can join the
+        # reservation's reuse group even before this duplicate is closed.
+        replica = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            replica.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            replica.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            replica.bind(("0.0.0.0", port))
+        finally:
+            replica.close()
 
         # Server start with the network and MLM server stubbed out.
         started = {}
@@ -231,6 +245,7 @@ def test_http_server_port_reservation(monkeypatch):
                 rank=0,
                 cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
                 _reserved_http_server_socket=reserved_socket,
+                inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
             )
             base_url = MegatronGenerationMixin._setup_openai_api_server(worker)
             assert started["sock"] is reserved_socket
