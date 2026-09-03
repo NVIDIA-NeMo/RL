@@ -1443,6 +1443,32 @@ def _apply_precision_config(
         model_cfg.quant_recipe = quant_recipe
 
 
+def _inference_optimized_gpt_layer_spec(provider: Any, vp_stage: Any = None) -> Any:
+    """Return the inference-optimized GPT layer spec for a finalized provider.
+
+    Bridge ``GPTModelProvider.default_layer_spec`` only selects TE specs, so
+    ``transformer_impl=inference_optimized`` would otherwise build TE modules.
+    Callable form resolves against provider fields at ``provide()`` time.
+
+    Args:
+        provider: Finalized Megatron-Bridge GPT model provider.
+        vp_stage: Virtual-pipeline stage forwarded by Bridge; unused by this spec.
+    """
+    del vp_stage
+    # Megatron-Core is imported only when an infopt worker builds the model.
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_inference_spec,
+    )
+
+    return get_gpt_layer_with_inference_spec(
+        qk_layernorm=getattr(provider, "qk_layernorm", False),
+        multi_latent_attention=getattr(provider, "multi_latent_attention", False),
+        qk_l2_norm=getattr(provider, "qk_l2_norm", False),
+        num_experts=getattr(provider, "num_moe_experts", None),
+        moe_grouped_gemm=getattr(provider, "moe_grouped_gemm", False),
+    )
+
+
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
@@ -1537,6 +1563,14 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # These overrides need to be applied before the workers spawn.
     if "transformer_impl" in config["megatron_cfg"]:
         model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+        # Bridge GPTModelProvider.default_layer_spec only branches on
+        # use_transformer_engine_full_layer_spec (both branches TE), so
+        # transformer_impl=inference_optimized would otherwise still build TE
+        # modules. Assign the infopt GPT spec through the provider override
+        # (same hook the modelopt path uses). Callable so it resolves against
+        # finalized provider fields at provide() time.
+        if model_cfg.transformer_impl == "inference_optimized":
+            model_cfg.transformer_layer_spec = _inference_optimized_gpt_layer_spec
     if "cuda_graph_impl" in config["megatron_cfg"]:
         model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
         if model_cfg.cuda_graph_impl != "none":
