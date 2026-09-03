@@ -114,8 +114,13 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
 
     def _load_weights(self, weights):
         if self._is_real_quant_model():
+
+            def owned_weights():
+                for name, tensor in weights:
+                    yield name, tensor.detach().clone()
+
             with torch.device(self.device):
-                self._load_full_hf_weights(list(weights))
+                self._load_full_hf_weights(list(owned_weights()))
             return
 
         remapped_weights = []
