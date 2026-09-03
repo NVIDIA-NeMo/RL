@@ -1255,6 +1255,7 @@ class _FakeCaptureBuffer(_FakeBuffer):
     def __init__(self):
         super().__init__()
         self.reserve_rollout_ids: list[list[str] | None] = []
+        self.cleared_staging_key_batches: list[list[str]] = []
 
     def reserve(
         self, *, weight_version, target_step=None, group_id=None, rollout_ids=None
@@ -1267,8 +1268,9 @@ class _FakeCaptureBuffer(_FakeBuffer):
             rollout_ids=rollout_ids,
         )
 
-    async def clear_staging_keys(self, staging_keys):
-        del staging_keys
+    async def clear_staging_keys(self, cut, staging_keys):
+        cut.require_live()
+        self.cleared_staging_key_batches.append(list(staging_keys))
 
 
 def _receipt_record(rollout_ids, receipts):
@@ -1437,6 +1439,49 @@ class TestGenerateForFinalizationFlow:
         with pytest.raises(RuntimeError, match="rollout exploded"):
             _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
+
+    def test_exhausted_capture_cleans_internally_owned_recovery_group(self, capsys):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+        mgr._retry_policy = RolloutRetryPolicy.single_attempt(
+            max_consecutive_dropped_prompts=1
+        )
+
+        class _PartialCaptureImpl:
+            async def run_rollout(
+                self,
+                _sample,
+                *,
+                rollout_ids=None,
+                generation_indices=None,
+                on_completion=None,
+                recovery_granularity=RecoveryGranularity.SIBLING,
+            ):
+                del _sample, recovery_granularity
+                generation_index = generation_indices[0]
+                rollout_id = rollout_ids[generation_index]
+                receipt = {
+                    "rollout_id": rollout_id,
+                    "manifest": [{"staging_key": f"{rollout_id}/call"}],
+                }
+                completion = _receipt_record([rollout_id], [receipt]).completions[0]
+                await on_completion(generation_index, completion)
+                raise GenerationUnavailable("worker disappeared")
+
+        mgr._impl = _PartialCaptureImpl()
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert request is None
+        assert len(mgr.recovery_ledger) == 0
+        first_rollout_ids = buf.reserve_rollout_ids[0]
+        assert first_rollout_ids is not None
+        assert buf.cleared_staging_key_batches == [[f"{first_rollout_ids[0]}/call"]]
+        assert (
+            "dropping capture prompt idx=0 after 1 infrastructure failure(s) "
+            "(GenerationUnavailable: worker disappeared) [consecutive drop 1/1]"
+            in capsys.readouterr().out
+        )
 
     def test_cancel_after_controller_discard_preserves_cancelled_error(self):
         """A stale abort may delete lineage before rollout cleanup runs."""

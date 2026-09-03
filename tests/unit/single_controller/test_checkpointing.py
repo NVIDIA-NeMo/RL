@@ -81,15 +81,15 @@ from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerAct
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
-from nemo_rl.experience.route_plan import (
-    ROUTE_PLAN_SCHEMA_VERSION,
-    RouteAssemblyPlan,
-    encode_route_plan,
-)
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     RolloutRecoveryLedger,
+)
+from nemo_rl.experience.route_plan import (
+    ROUTE_PLAN_SCHEMA_VERSION,
+    RouteAssemblyPlan,
+    encode_route_plan,
 )
 from nemo_rl.utils.checkpoint import CheckpointManager
 
@@ -1200,13 +1200,16 @@ class TestDataPlaneCheckpoint:
         )
         actor._dp_client = _StagingInventoryDPClient([], partition_id=staging_partition)
 
-        with pytest.raises(RuntimeError, match=r"missing=\['sealed-key'\]"):
-            asyncio.run(
-                actor._validate_rollout_recovery_inventory(
+        async def validate_inventory() -> None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                await actor._validate_rollout_recovery_inventory(
+                    cut,
                     replay_metadata=None,
                     clear_unreferenced=False,
                 )
-            )
+
+        with pytest.raises(RuntimeError, match=r"missing=\['sealed-key'\]"):
+            asyncio.run(validate_inventory())
 
     def test_rollout_recovery_inventory_merges_routes_and_clears_orphans(self):
         staging_partition = "rollout_staging"
@@ -1243,12 +1246,15 @@ class TestDataPlaneCheckpoint:
         )
         actor._dp_client = dp_client
 
-        asyncio.run(
-            actor._validate_rollout_recovery_inventory(
-                replay_metadata=replay_metadata,  # type: ignore[arg-type]
-                clear_unreferenced=True,
-            )
-        )
+        async def validate_inventory() -> None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=replay_metadata,  # type: ignore[arg-type]
+                    clear_unreferenced=True,
+                )
+
+        asyncio.run(validate_inventory())
 
         assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
         assert sorted(dp_client.sample_ids) == [route_key, "sealed-key"]
