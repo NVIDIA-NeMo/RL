@@ -1907,6 +1907,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
             policy1.save_checkpoint(
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
+                is_final_checkpoint=False,
             )
             # save_checkpoint() may use MCore's async save path.  Complete the
             # write before inspecting the checkpoint or terminating its workers.

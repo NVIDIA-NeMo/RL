@@ -296,16 +296,24 @@ def test_exit_on_max_epochs(mock_dpo_components):
     assert mock_dpo_components["policy"].train.call_count == 20
 
 
-def test_exit_on_timeout(mock_dpo_components, capsys):
+def test_exit_on_timeout(mock_dpo_components, capsys, tmp_path):
     """Test that training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
     mock_dpo_components["master_config"].dpo.max_num_steps = 100
     mock_dpo_components["master_config"].dpo.max_num_epochs = 10
+    mock_dpo_components["master_config"].checkpointing["enabled"] = True
+    mock_dpo_components["master_config"].checkpointing["metric_name"] = None
+    mock_dpo_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
     dpo_save_state = _initial_dpo_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.dpo.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.dpo.torch.save"),
+        patch("nemo_rl.algorithms.dpo.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # Create a side_effect that returns False 7 times, then True
         check_results = [False] * 7 + [True]
@@ -327,6 +335,12 @@ def test_exit_on_timeout(mock_dpo_components, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_dpo_components["policy"].train.call_count == 8
+        assert (
+            mock_dpo_components["policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and is near the end (not followed by more training)
         captured = capsys.readouterr()

@@ -72,8 +72,6 @@ checkpointing:
   save_period: 600
   checkpoint_must_save_by: null
   save_optimizer: true
-  model_save_format: "safetensors"
-  save_consolidated: false
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B"
@@ -90,6 +88,11 @@ policy:
   dtensor_cfg:
     enabled: true
     _v2: true
+    model_save_format: "safetensors"
+    # Canonical Automodel modes: "false", "final", or "every".
+    save_consolidated: "false"
+    single_rank_consolidation: false
+    consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true

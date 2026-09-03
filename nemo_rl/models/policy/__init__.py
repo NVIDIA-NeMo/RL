@@ -201,6 +201,11 @@ class DTensorConfig(TypedDict):
     automodel_kwargs: NotRequired[AutomodelKwargs]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
+    # Automodel checkpoint settings used by DTensor v2.
+    model_save_format: NotRequired[Literal["torch_save", "safetensors"] | None]
+    save_consolidated: NotRequired[Literal["false", "final", "every"]]
+    single_rank_consolidation: NotRequired[bool]
+    consolidation_timeout_minutes: NotRequired[int]
 
 
 class SequencePackingConfigDisabled(TypedDict):

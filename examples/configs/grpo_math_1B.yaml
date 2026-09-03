@@ -122,8 +122,6 @@ checkpointing:
   # the buffered window fresh instead of reusing completed groups (which skew
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
   # SingleController only: include native TQ state and the metadata-only replay
   # index. Required for recovery-capable samplers to preserve completed,
@@ -150,6 +148,11 @@ policy:
   dtensor_cfg:
     _v2: true
     enabled: true
+    model_save_format: "safetensors"
+    # Canonical Automodel modes: "false", "final", or "every".
+    save_consolidated: "false"
+    single_rank_consolidation: false
+    consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false

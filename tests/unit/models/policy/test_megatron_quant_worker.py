@@ -819,6 +819,7 @@ def test_quant_megatron_checkpoint_save_restore(tiny_llama_model_path):
             policy1.save_checkpoint(
                 weights_path=checkpoint_dir,
                 optimizer_path=checkpoint_dir,
+                is_final_checkpoint=False,
             )
             assert os.path.exists(checkpoint_dir), "Checkpoint dir not created"
         finally:

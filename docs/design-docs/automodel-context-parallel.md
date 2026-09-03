@@ -91,11 +91,24 @@ model = model_class.from_pretrained(
   ([#1172](https://github.com/NVIDIA-NeMo/Automodel/pull/1172)).
 - `Checkpointer._should_write_hf_metadata()` became the module-level
   `_should_write_hf_metadata(config)`.
-- `save_consolidated` now uses `SaveConsolidatedMode`; NeMo RL normalizes values with
-  `_normalize_save_consolidated()` after configuration updates
-  ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL currently rejects
-  `save_consolidated: final` because its checkpoint calls do not identify the final save;
-  use `true`/`every` when inline consolidated export is required.
+- `save_consolidated` now uses the canonical `"false"`, `"final"`, and `"every"`
+  modes ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL
+  exposes these Automodel-only settings under `policy.dtensor_cfg`, delegates
+  normalization to Automodel, explicitly marks terminal checkpoint saves, and
+  supports all three modes. Automodel still accepts legacy booleans, but NeMo RL
+  intentionally exposes only canonical strings: use quoted `"false"` instead of
+  the YAML boolean `false`, and use `"every"` instead of `true`.
+  Timeout-triggered saves remain resumable recovery checkpoints and are not marked
+  as terminal saves.
+  NeMo RL retains ownership of async-save finalization, metric selection, and
+  checkpoint retention, so overlapping or otherwise unsupported upstream settings
+  are rejected instead of silently ignored. Automodel policy saves are asynchronous
+  and finalized before checkpoint promotion; value saves are synchronous because
+  their callers promote the checkpoint immediately after `Value.save_checkpoint()`
+  returns. Automodel's checkpoint CPU offload, consolidation staging, and
+  Transformers v4 compatibility settings are not exposed yet. As with the Megatron
+  backend, checkpoint resource settings are fixed when workers start; an individual
+  save supplies only its destination and whether it is the final checkpoint.
 
 The upgrade removes three compatibility workarounds:
 

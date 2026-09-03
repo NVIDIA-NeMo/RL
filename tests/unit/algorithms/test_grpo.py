@@ -3099,7 +3099,7 @@ def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
     "initial_skip_flag",
     [None, False],
 )
-def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
+def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     monkeypatch, mock_grpo_components, initial_skip_flag
 ):
     from nemo_rl.algorithms import grpo as grpo_mod
@@ -3151,7 +3151,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         def prepare_refit_info(self):
             return {}
 
-    def legacy_policy_factory(
+    def policy_factory(
         *,
         cluster,
         config,
@@ -3245,7 +3245,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         tokenizer,
         dataset,
         None,
-        policy_factory=legacy_policy_factory,
+        policy_factory=policy_factory,
     )
 
     assert master_config.grpo.skip_reference_policy_logprobs_calculation is True
@@ -4474,6 +4474,12 @@ def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp
     assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 2
     assert checkpointer.init_tmp_checkpoint.call_args.args[1]["val_reward"] == 0.75
     mock_grpo_components["policy"].save_checkpoint.assert_called_once()
+    assert (
+        mock_grpo_components["policy"].save_checkpoint.call_args.kwargs[
+            "is_final_checkpoint"
+        ]
+        is True
+    )
     assert checkpointer.shutdown.called
 
 
@@ -4764,12 +4770,18 @@ def test_async_grpo_exit_on_max_epochs(mock_grpo_components, tmp_path):
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
-def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
+def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys, tmp_path):
     """Test that GRPO training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 100
     master_config.grpo.max_num_epochs = 10
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["metric_name"] = None
+    mock_grpo_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
+    mock_grpo_components["checkpointer"].checkpoint_dir = tmp_path
 
     grpo_save_state = _initial_grpo_save_state()
 
@@ -4786,7 +4798,10 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.grpo.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.grpo.torch.save"),
+        patch("nemo_rl.algorithms.grpo.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         check_results = [False] * 7 + [True]
         mock_timeout_instance.check_save.side_effect = check_results
@@ -4839,6 +4854,12 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_grpo_components["policy"].train.call_count == 8
+        assert (
+            mock_grpo_components["policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and training actually stopped
         captured = capsys.readouterr()

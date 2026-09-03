@@ -140,11 +140,6 @@ class CheckpointingConfig(TypedDict):
     ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
         When set, a checkpoint is saved every ft_save_period steps for crash recovery.
         Requires ft_keep_latest_k to control how many of these are retained.
-    model_save_format (str | None): Format for saving model (v2 allowed values: "torch_save" or "safetensors", v1 allowed values: None).
-    save_consolidated (bool): Whether to save consolidated checkpoints (for HF compatibility).
-    model_cache_dir (str): Directory for model cache (for safetensors format).
-    model_repo_id (str): Repository ID for the model (for safetensors format).
-    is_peft (bool): Whether the model uses PEFT.
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
     save_data_plane (bool): Whether SingleController checkpoints include the
         native TQ snapshot and replay-buffer metadata. Currently supported only
@@ -169,14 +164,39 @@ class CheckpointingConfig(TypedDict):
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
     load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
-    # New nemo-automodel integration fields
-    model_save_format: NotRequired[str | None]  # Default: "safetensors"
-    save_consolidated: NotRequired[bool]  # Default: False
-    model_cache_dir: NotRequired[str]  # Default: ""
-    model_repo_id: NotRequired[str]  # Default: ""
-    is_peft: NotRequired[bool]  # Default: False
-    peft_config: NotRequired[Any]  # Default: None
-    is_async: NotRequired[bool]  # Default: False
+
+
+_AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
+    {
+        "model_save_format",
+        "save_consolidated",
+        "single_rank_consolidation",
+        "consolidation_timeout_minutes",
+        "model_cache_dir",
+        "model_repo_id",
+        "is_peft",
+        "peft_config",
+        "is_async",
+    }
+)
+
+
+def should_save_as_final_checkpoint(
+    *, is_last_step: bool, early_stop_requested: bool = False
+) -> bool:
+    """Return whether a checkpoint represents a completed training run.
+
+    A timeout-triggered checkpoint is a resumable interruption point, not a
+    completed run, so timeout state is intentionally not accepted here.
+
+    Args:
+        is_last_step: Whether the algorithm reached its final training step.
+        early_stop_requested: Whether the algorithm deliberately ended early.
+
+    Returns:
+        True when downstream checkpoint logic should apply final-save behavior.
+    """
+    return is_last_step or early_stop_requested
 
 
 class CheckpointManager:
@@ -206,6 +226,20 @@ class CheckpointManager:
         Args:
             config (CheckpointingConfig)
         """
+        automodel_only_fields = sorted(
+            _AUTOMODEL_ONLY_CHECKPOINT_FIELDS.intersection(config)
+        )
+        if automodel_only_fields:
+            raise ValueError(
+                "Automodel-only fields are not supported under the top-level "
+                f"checkpointing config: {', '.join(automodel_only_fields)}. "
+                "Configure model_save_format, save_consolidated, "
+                "single_rank_consolidation, and consolidation_timeout_minutes "
+                "under policy.dtensor_cfg (and value.dtensor_cfg for value "
+                "models); remove the remaining fields because they are managed "
+                "internally."
+            )
+
         self.checkpoint_dir = Path(config["checkpoint_dir"])
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
@@ -213,13 +247,6 @@ class CheckpointManager:
         self.save_period: int = config["save_period"]
         self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
         self.save_optimizer = config["save_optimizer"]
-
-        # Store nemo-automodel specific config options
-        self.model_save_format = config.get("model_save_format", "safetensors")
-        self.save_consolidated = config.get("save_consolidated", False)
-        self.model_cache_dir = config.get("model_cache_dir", "")
-        self.model_repo_id = config.get("model_repo_id", "")
-        self.is_peft = config.get("is_peft", False)
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None

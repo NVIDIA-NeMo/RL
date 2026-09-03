@@ -2,6 +2,23 @@
 
 NeMo RL provides two checkpoint formats for Hugging Face models: Torch distributed and Hugging Face format. Torch distributed is used by default for efficiency, and Hugging Face format is provided for compatibility with Hugging Face's `AutoModel.from_pretrained` API. Note that Hugging Face format checkpoints save only the model weights, ignoring the optimizer states. It is recommended to use Torch distributed format to save intermediate checkpoints and to save a Hugging Face checkpoint only at the end of training. 
 
+## Automodel consolidated checkpoints
+
+Automodel-backed policies accept three canonical values for
+`policy.dtensor_cfg.save_consolidated`: quoted `"false"`, `"final"`, and
+`"every"`.
+`"final"` exports Hugging Face weights only after a completed training run;
+timeout checkpoints remain resumable distributed checkpoints and are not treated as
+final saves.
+
+> [!IMPORTANT]
+> NeMo RL no longer accepts YAML booleans for `save_consolidated`. Migrate
+> `checkpointing.save_consolidated: false` to
+> `policy.dtensor_cfg.save_consolidated: "false"`, and migrate
+> `checkpointing.save_consolidated: true` to
+> `policy.dtensor_cfg.save_consolidated: "every"`.
+> PPO value models use the corresponding `value.dtensor_cfg` fields.
+
 ## Converting Torch Distributed Checkpoints to Hugging Face Format
 
 A checkpoint converter is provided to convert a Torch distributed checkpoint to Hugging Face format after training:

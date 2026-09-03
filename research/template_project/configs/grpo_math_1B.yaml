@@ -88,8 +88,6 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 policy:
@@ -110,6 +108,11 @@ policy:
   dtensor_cfg:
     _v2: true
     enabled: true
+    model_save_format: "safetensors"
+    # Canonical Automodel modes: "false", "final", or "every".
+    save_consolidated: "false"
+    single_rank_consolidation: false
+    consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
