@@ -384,6 +384,9 @@ class DTensorPolicyWorkerV2Impl(
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
+        self._requires_synchronous_checkpoint = (
+            getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
+        )
         self._init_checkpoint_manager(
             config_updates={
                 "model_repo_id": config["model_name"],
@@ -392,12 +395,9 @@ class DTensorPolicyWorkerV2Impl(
                 ),
                 "is_peft": self.lora_enabled,
                 # Automodel's process-based async DCP cannot serialize the
-                # HF-adapted DeepSeek-V4 DTensor/view state. A failed upload also
-                # retains the staged CUDA state across training steps, which
-                # exhausts the memory needed for the next colocated refit. Keep
-                # Automodel checkpointing synchronous until its process stager
-                # supports these adapted state dicts.
-                "is_async": False,
+                # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
+                # the pre-existing async checkpoint path.
+                "is_async": not self._requires_synchronous_checkpoint,
             },
         )
 
@@ -487,6 +487,18 @@ class DTensorPolicyWorkerV2Impl(
             self.move_optimizer_to_device("cpu")
         return should_offload
 
+    @contextmanager
+    def _temporarily_offload_optimizer_for_train(
+        self, eval_mode: bool
+    ) -> Generator[None, None, None]:
+        """Restore train-time optimizer state even when forward/backward fails."""
+        restore_cuda = self._maybe_offload_optimizer_for_train(eval_mode)
+        try:
+            yield
+        finally:
+            if restore_cuda:
+                self.move_optimizer_to_device("cuda")
+
     def _optimizer_state_is_cuda(self) -> bool:
         """Return whether any resident optimizer state tensor is on CUDA."""
         if self.optimizer is None:
@@ -506,7 +518,11 @@ class DTensorPolicyWorkerV2Impl(
         self, optimizer_path: Optional[str]
     ) -> Generator[None, None, None]:
         """Temporarily offload optimizer state while saving a checkpoint."""
-        if optimizer_path is None or self.optimizer is None:
+        if (
+            not getattr(self, "_requires_synchronous_checkpoint", False)
+            or optimizer_path is None
+            or self.optimizer is None
+        ):
             yield
             return
 
@@ -618,79 +634,76 @@ class DTensorPolicyWorkerV2Impl(
                 # all-gathers parameters and forward/backward materializes its
                 # temporary buffers. The state is restored immediately before the
                 # update, after FSDP has resharded the model.
-                offload_opt_train = self._maybe_offload_optimizer_for_train(eval_mode)
+                with self._temporarily_offload_optimizer_for_train(eval_mode):
+                    # Get microbatch iterator based on batching strategy
+                    processed_iterator, iterator_len = get_microbatch_iterator(
+                        batch,
+                        self.cfg,
+                        mbs,
+                        self.dp_mesh,
+                        tokenizer=self.tokenizer,
+                    )
 
-                # Get microbatch iterator based on batching strategy
-                processed_iterator, iterator_len = get_microbatch_iterator(
-                    batch,
-                    self.cfg,
-                    mbs,
-                    self.dp_mesh,
-                    tokenizer=self.tokenizer,
-                )
-
-                # Use automodel_forward_backward for the training loop
-                mb_results = automodel_forward_backward(
-                    model=self.model,
-                    data_iterator=processed_iterator,
-                    post_processing_fn=loss_post_processor,
-                    device_mesh=self.device_mesh,
-                    padding_token_id=self.tokenizer.pad_token_id or 0,
-                    autocast_context_factory=self._autocast_context,
-                    forward_only=eval_mode,
-                    is_reward_model=self._is_reward_model,
-                    allow_flash_attn_args=self.allow_flash_attn_args,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
-                    sampling_params=self.sampling_params,
-                    sequence_dim=sequence_dim,
-                    dp_size=self.dp_size,
-                    cp_size=self.cp_size,
-                    num_global_batches=num_global_batches,
-                    num_valid_microbatches=iterator_len,
-                    on_microbatch_start=on_microbatch_start,
-                )
-
-                # Extract losses and metrics from results
-                mb_losses = []
-                for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
-                    # Only process valid (non-dummy) batches for metrics
-                    if mb_idx < iterator_len:
-                        num_valid_samples = loss_metrics["num_valid_samples"]
-                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
-                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
-
-                        if num_valid_samples > 0:
-                            mb_losses.append(loss.item())
-                            all_mb_metrics.append(loss_metrics)
-
-                grad_norm: Optional[float | torch.Tensor] = None
-                if not eval_mode:
-                    grad_norm = scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.model],
-                        norm_type=2.0,
-                        pp_enabled=False,
+                    # Use automodel_forward_backward for the training loop
+                    mb_results = automodel_forward_backward(
+                        model=self.model,
+                        data_iterator=processed_iterator,
+                        post_processing_fn=loss_post_processor,
                         device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None
-                        and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name=None,
-                        foreach=True,
-                        num_label_tokens=1,
-                        dp_group_size=self.dp_size * self.cp_size,
+                        padding_token_id=self.tokenizer.pad_token_id or 0,
+                        autocast_context_factory=self._autocast_context,
+                        forward_only=eval_mode,
+                        is_reward_model=self._is_reward_model,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                        dp_size=self.dp_size,
+                        cp_size=self.cp_size,
+                        num_global_batches=num_global_batches,
+                        num_valid_microbatches=iterator_len,
+                        on_microbatch_start=on_microbatch_start,
                     )
-                    grad_norm = torch.tensor(
-                        grad_norm, device="cpu", dtype=torch.float32
-                    )
-                    warn_if_inf_grad_norm(grad_norm)
 
-                    if offload_opt_train:
-                        self.move_optimizer_to_device("cuda")
+                    # Extract losses and metrics from results
+                    mb_losses = []
+                    for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
+                        # Only process valid (non-dummy) batches for metrics
+                        if mb_idx < iterator_len:
+                            num_valid_samples = loss_metrics["num_valid_samples"]
+                            loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                            loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                            loss_metrics["global_valid_toks"] = global_valid_toks.item()
 
+                            if num_valid_samples > 0:
+                                mb_losses.append(loss.item())
+                                all_mb_metrics.append(loss_metrics)
+
+                    grad_norm: Optional[float | torch.Tensor] = None
+                    if not eval_mode:
+                        grad_norm = scale_grads_and_clip_grad_norm(
+                            self.max_grad_norm,
+                            [self.model],
+                            norm_type=2.0,
+                            pp_enabled=False,
+                            device_mesh=self.device_mesh,
+                            moe_mesh=self.moe_mesh,
+                            ep_axis_name="ep"
+                            if self.moe_mesh is not None
+                            and "ep" in self.moe_mesh.mesh_dim_names
+                            else None,
+                            pp_axis_name=None,
+                            foreach=True,
+                            num_label_tokens=1,
+                            dp_group_size=self.dp_size * self.cp_size,
+                        )
+                        grad_norm = torch.tensor(
+                            grad_norm, device="cpu", dtype=torch.float32
+                        )
+                        warn_if_inf_grad_norm(grad_norm)
+
+                if not eval_mode:
                     # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
                     self._update_moe_gate_bias_if_supported()
