@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import math
 import os
 import subprocess
 import sys
+import urllib.request
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
@@ -396,7 +398,21 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict["policy_api_key"] = (
             "dummy_key"  # No key necessary for training.
         )
-        initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+        router_url = initial_global_config_dict.pop("router_url", None)
+        if router_url:
+            # POST /workers blocks until the router's own health probe of the
+            # replica succeeds, so a 200 means registered and routable.
+            for base_url in filter(None, self.cfg["base_urls"]):
+                request = urllib.request.Request(
+                    f"{router_url.removesuffix('/v1')}/workers",
+                    data=json.dumps({"url": base_url.removesuffix("/v1")}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(request, timeout=660).close()
+        initial_global_config_dict["policy_base_url"] = (
+            [router_url.rstrip("/") + "/v1"] if router_url else self.cfg["base_urls"]
+        )
         # In multinode runs, Gym-managed service configs must advertise a real node IP
         # rather than falling back to localhost, or remote workers will connect to
         # their own loopback interface instead of the actor-hosted service.
