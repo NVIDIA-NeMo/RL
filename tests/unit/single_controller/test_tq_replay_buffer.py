@@ -1155,9 +1155,10 @@ class TestTQReplayBufferLoadPreflight:
         assert dp.put_calls == []
         assert buf.size() == 0
 
-    def test_over_capacity_mixed_stamps_raise(self):
-        # One target-stamped group is enough to make truncation unsafe.
-        state = _make_envelope(
+    def test_over_capacity_with_target_stamps_is_still_rejected(self):
+        # A capacity change alone is tolerated, but more groups than the new
+        # capacity never are -- target_step stamps do not bypass that guard.
+        state = _make_metadata_envelope(
             [
                 _make_group_entry("g1", weight=1),
                 _make_group_entry("g2", weight=2),
@@ -1167,12 +1168,12 @@ class TestTQReplayBufferLoadPreflight:
         )
         buf = _make_buffer(FakeDataPlaneClient())
 
-        with pytest.raises(ValueError, match="target_step stamps"):
+        with pytest.raises(ValueError, match="more replay groups than the current"):
             _load(buf, state, max_groups=2)
 
     def test_target_stamped_groups_within_capacity_load_fine(self):
         # The guard is scoped to the over-capacity case only.
-        state = _make_envelope(
+        state = _make_metadata_envelope(
             [_make_group_entry(f"g{w}", weight=w, target_step=w) for w in (1, 2)],
             saved_capacity=8,
         )
@@ -1218,12 +1219,16 @@ class TestTQReplayBufferTokenCaptureMode:
     """
 
     def _make_capture_buffer(self, dp) -> TQReplayBuffer:
-        return TQReplayBuffer(
+        buf = TQReplayBuffer(
             dp,
             partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
+            include_message_violation_fields=False,
             staging_partition_id="rollout_staging",
         )
+        # Destructive ops (commit_finalized/remove) refuse to run unbound.
+        buf.set_data_plane_checkpoint_barrier(DataPlaneCheckpointBarrier())
+        return buf
 
     def test_reserve_records_rollout_ids(self):
         buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
@@ -1351,8 +1356,12 @@ class TestTQReplayBufferTokenCaptureMode:
     def test_remove_without_staging_partition_skips_staging_clear(self):
         dp = MultiPartitionFakeDataPlaneClient()
         buf = TQReplayBuffer(
-            dp, partition_id="rollout_data", pad_value_dict={"token_ids": 0}
+            dp,
+            partition_id="rollout_data",
+            pad_value_dict={"token_ids": 0},
+            include_message_violation_fields=False,
         )
+        buf.set_data_plane_checkpoint_barrier(DataPlaneCheckpointBarrier())
         group_id = buf.reserve(weight_version=1)
         meta = KVBatchMeta(
             partition_id="rollout_data",

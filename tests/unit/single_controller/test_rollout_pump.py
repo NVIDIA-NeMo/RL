@@ -1178,6 +1178,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(max_num_epochs=1)
         )
+        ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = manager
         _init_pump_ledgers(ctrl)
         ctrl._finalizer_actors = [object()]
