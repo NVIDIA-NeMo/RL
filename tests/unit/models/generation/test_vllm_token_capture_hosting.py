@@ -32,6 +32,7 @@ import pytest
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
 from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
+    CaptureError,
     RolloutTokenCapture,
 )
 from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
@@ -210,9 +211,15 @@ def _worker_with_capture(sink: _MemorySink):
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )
-    worker._fetch_chain_prefix = lambda staging_chain: (
-        VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(worker, staging_chain)
-    )
+    for name in (
+        "_fetch_chain_prefix",
+        "_capture_admission",
+        "_resolve_admission_prefix",
+        "_enter_request_prefix",
+    ):
+        setattr(
+            worker, name, getattr(VllmAsyncGenerationWorkerImpl, name).__get__(worker)
+        )
     worker.token_capture = RolloutTokenCapture(
         sink=sink,
         weight_version_fn=lambda: worker._rollout_weight_version,
@@ -315,17 +322,13 @@ def test_request_capture_token_in_prev_len_chains():
     assert sink.records[0].token_ids_delta == [20, 21, 22]
 
 
-def test_staging_chain_fetches_patches_and_begins_capture():
-    sink = _MemorySink()
-    worker = _worker_with_capture(sink)
-    source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
-    worker._staging_source = source
-    request = _FakeRequest(
+def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:
+    return _FakeRequest(
         ng_capture={
             "rollout_id": "r0",
             "model_call_id": "c3",
             "parent_call_id": "c2",
-            "prev_len": 3,
+            "prev_len": prev_len,
             "mode": "token_in",
             "staging_chain": ["r0/c1", "r0/c2"],
             "parent_chain_hash": "2" * 64,
@@ -333,17 +336,64 @@ def test_staging_chain_fetches_patches_and_begins_capture():
         stream=False,
     )
 
-    prefix = VllmAsyncGenerationWorkerImpl._patch_chain_prefix(
-        worker, request.ng_capture
+
+def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
+    """The admission dict is read once and never mutated: the resolved prefix
+    reaches the request via the adapter and begin_call via its keyword."""
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
+    worker._staging_source = source
+    request = _staging_chain_request()
+    context_before = dict(request.ng_capture)
+
+    admission = worker._capture_admission(request)
+    prefix = worker._resolve_admission_prefix(admission)
+    worker._enter_request_prefix(request, prefix)
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker,
+        request,
+        prefix + [20],
+        admission=admission,
+        prefix_token_ids=prefix,
     )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, prefix + [20])
 
     assert prefix == [10, 11, 12]
     assert source.calls == [["r0/c1", "r0/c2"]]
-    assert request.ng_capture["required_prefix_token_ids"] == prefix
+    # Never patched back into the wire context.
+    assert request.ng_capture == context_before
+    assert admission.required_prefix_token_ids == []
+    # enter_prefix is the production writer of the request field.
+    assert request.required_prefix_token_ids == prefix
     call, prompt = worker._capture_calls[id(request)]
-    assert call.admission.required_prefix_token_ids == prefix
+    assert call.prefix_token_ids == prefix
     assert prompt == [10, 11, 12, 20]
+
+
+def test_inline_prefix_admission_resolves_without_a_fetch():
+    worker = _worker_with_capture(_MemorySink())
+    worker._staging_source = _MemoryPrefixSource({})
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c2",
+            "parent_call_id": "c1",
+            "prev_len": 2,
+            "mode": "token_in",
+            "required_prefix_token_ids": [10, 11],
+            "parent_chain_hash": "1" * 64,
+        },
+        stream=False,
+    )
+    admission = worker._capture_admission(request)
+    assert worker._resolve_admission_prefix(admission) == [10, 11]
+    assert worker._staging_source.calls == []
+    text_root = worker._capture_admission(
+        _FakeRequest(
+            ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+        )
+    )
+    assert worker._resolve_admission_prefix(text_root) == []
 
 
 def test_staging_chain_cache_fetches_only_uncached_suffix():
@@ -361,15 +411,35 @@ def test_staging_chain_cache_fetches_only_uncached_suffix():
     assert source.calls == [["r0/c1"], ["r0/c2"]]
 
 
-def test_staging_chain_rejects_fetched_length_mismatch():
+def test_staging_chain_prefix_length_mismatch_is_rejected_by_begin_call():
+    """prev_len enforcement lives in Gym's begin_call, not in the worker."""
     worker = _worker_with_capture(_MemorySink())
-    worker._staging_source = _MemoryPrefixSource({"r0/c1": [10, 11]})
-    admission = {"prev_len": 3, "staging_chain": ["r0/c1"]}
+    worker._staging_source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": []})
+    request = _staging_chain_request(prev_len=3)
+    context_before = dict(request.ng_capture)
 
-    with pytest.raises(ValueError, match="expected 3, fetched 2"):
-        VllmAsyncGenerationWorkerImpl._patch_chain_prefix(worker, admission)
+    admission = worker._capture_admission(request)
+    prefix = worker._resolve_admission_prefix(admission)
+    assert prefix == [10, 11]
+    with pytest.raises(CaptureError, match="does not equal prev_len 3"):
+        VllmAsyncGenerationWorkerImpl._begin_request_capture(
+            worker, request, prefix + [20], admission=admission, prefix_token_ids=prefix
+        )
 
-    assert "required_prefix_token_ids" not in admission
+    assert request.ng_capture == context_before
+    assert worker._capture_calls == {}
+
+
+def test_staging_chain_admission_requires_the_resolved_prefix_keyword():
+    worker = _worker_with_capture(_MemorySink())
+    request = _staging_chain_request()
+
+    with pytest.raises(CaptureError, match="pass the resolved prefix_token_ids"):
+        VllmAsyncGenerationWorkerImpl._begin_request_capture(
+            worker, request, [10, 11, 12, 20]
+        )
+
+    assert worker._capture_calls == {}
 
 
 def test_request_capture_is_a_noop_without_context_or_capture():

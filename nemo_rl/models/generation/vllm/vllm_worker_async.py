@@ -406,22 +406,51 @@ class VllmAsyncGenerationWorkerImpl(
         """Rotate the weight version stamped on subsequent captured calls."""
         self._rollout_weight_version = int(version)
 
-    def _begin_request_capture(self, request: Any, prompt_token_ids: list[int]) -> None:
+    def _capture_admission(self, request: Any) -> Any | None:
+        """Parse the ledger's ``ng_capture`` context into a ``CaptureAdmission``.
+
+        Returns None unless capture is installed and the request carries the
+        context. The dict itself is never mutated: the admission is the typed,
+        read-only contract that the prefix resolution and ``begin_call`` share.
+        """
+        context = getattr(request, "ng_capture", None)
+        if self.token_capture is None or not context:
+            return None
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+        return CaptureAdmission.model_validate(context)
+
+    def _begin_request_capture(
+        self,
+        request: Any,
+        prompt_token_ids: list[int],
+        *,
+        admission: Any | None = None,
+        prefix_token_ids: list[int] | None = None,
+    ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
         Called from preprocess_chat once the exact engine prompt is known
         (post-splice in token-in mode, full render in text mode). No-op
         unless capture is installed and the request carries the ledger's
         ``ng_capture`` context.
+
+        ``prefix_token_ids`` is the prefix resolved by
+        :meth:`_resolve_admission_prefix`; Gym's ``begin_call`` checks it
+        against the admission (length == ``prev_len``, equal to an inline
+        prefix) and requires it for a ``staging_chain`` admission.
         """
         capture = self.token_capture
-        context = getattr(request, "ng_capture", None)
-        if capture is None or not context:
+        if capture is None:
             return
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
-
+        if admission is None:
+            admission = self._capture_admission(request)
+            if admission is None:
+                return
         call = capture.begin_call(
-            CaptureAdmission.model_validate(context),
+            admission,
+            prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
         self._capture_calls[id(request)] = (call, list(prompt_token_ids))
@@ -453,22 +482,31 @@ class VllmAsyncGenerationWorkerImpl(
                 del cache[next(iter(cache))]
         return result
 
-    def _patch_chain_prefix(self, ng_capture: dict[str, Any]) -> list[int] | None:
-        """Fetch a staged prefix and patch a raw capture admission in place."""
-        staging_chain = ng_capture.get("staging_chain") or []
-        if not staging_chain:
-            return None
-        prefix_token_ids = self._fetch_chain_prefix(staging_chain)
-        prev_len = ng_capture.get("prev_len")
-        if type(prev_len) is not int or prev_len <= 0:
-            raise ValueError("staging_chain admission requires prev_len > 0")
-        if len(prefix_token_ids) != prev_len:
-            raise ValueError(
-                "staging_chain prefix length mismatch: "
-                f"expected {prev_len}, fetched {len(prefix_token_ids)}"
-            )
-        ng_capture["required_prefix_token_ids"] = prefix_token_ids
-        return prefix_token_ids
+    def _resolve_admission_prefix(self, admission: Any) -> list[int]:
+        """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with.
+
+        A ``staging_chain`` is fetched through the cached TransferQueue read;
+        an inline ``required_prefix_token_ids`` is used as is; a text root has
+        no prefix. Length checks are Gym's: ``begin_call`` rejects a prefix
+        that does not match ``prev_len``.
+        """
+        if admission.mode == "text":
+            return []
+        if admission.staging_chain:
+            return self._fetch_chain_prefix(list(admission.staging_chain))
+        return list(admission.required_prefix_token_ids)
+
+    def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
+        """Attach the resolved prefix to the request through the capture adapter.
+
+        ``VLLMCaptureAdapter.enter_prefix`` writes the engine-native field
+        (``required_prefix_token_ids``) into a payload; the same fields are
+        applied to the pydantic request so the existing prefix-splice branch
+        of preprocess_chat handles staged and inline prefixes alike.
+        """
+        adapter = self.token_capture.adapter
+        for field_name, value in adapter.enter_prefix({}, prefix_token_ids).items():
+            setattr(request, field_name, value)
 
     @staticmethod
     def _delta_align_routed_experts(
@@ -724,19 +762,24 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     raise
 
-                # Check staging_chain in ng_capture before required_prefix_token_ids.
-                # Off-loop: the prefix fetch is a blocking TQ read, and Gym's
-                # staging protocol requires the serving host to move blocking
-                # staging I/O off its event loop explicitly.
-                ng_capture_dict = getattr(request, "ng_capture", None) or {}
-                chain_prefix_token_ids = await asyncio.to_thread(
-                    worker_self._patch_chain_prefix, ng_capture_dict
-                )
+                # Token capture: build the admission once, before branching,
+                # and resolve its prefix from it (staging_chain -> cached TQ
+                # read, inline ids, or nothing for a text root). The
+                # ``ng_capture`` dict is never mutated. Off-loop: the chain
+                # fetch is a blocking TQ read, and Gym's staging protocol
+                # requires the serving host to move blocking staging I/O off
+                # its event loop explicitly. The adapter then attaches the
+                # prefix to the request, so the inline-prefix branch below is
+                # the single splice path for staged and inline prefixes.
+                admission = worker_self._capture_admission(request)
+                capture_prefix_token_ids: list[int] | None = None
+                if admission is not None and admission.mode == "token_in":
+                    capture_prefix_token_ids = await asyncio.to_thread(
+                        worker_self._resolve_admission_prefix, admission
+                    )
+                    worker_self._enter_request_prefix(request, capture_prefix_token_ids)
 
-                if chain_prefix_token_ids is not None:
-                    # External staging, token-in mode: fetch prefix from TQ.
-                    model_prefix_token_ids = chain_prefix_token_ids
-                elif (
+                if (
                     not hasattr(request, "required_prefix_token_ids")
                     or request.required_prefix_token_ids is None
                 ):
@@ -750,11 +793,11 @@ class VllmAsyncGenerationWorkerImpl(
                     # Token capture, text mode: the full render is the exact
                     # engine prompt.
                     worker_self._begin_request_capture(
-                        request, res[1][0]["prompt_token_ids"]
+                        request, res[1][0]["prompt_token_ids"], admission=admission
                     )
                     return res
-                else:
-                    model_prefix_token_ids = list(request.required_prefix_token_ids)
+
+                model_prefix_token_ids = list(request.required_prefix_token_ids)
 
                 # Token-in splice path — shared by staging_chain and direct prefix.
                 last_assistant_message_idx = None
@@ -812,8 +855,14 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 # Token capture, token-in mode: the spliced prompt is the
-                # exact engine prompt.
-                worker_self._begin_request_capture(request, final_prompt_token_ids)
+                # exact engine prompt; begin_call re-checks the prefix it
+                # was spliced from against the admission.
+                worker_self._begin_request_capture(
+                    request,
+                    final_prompt_token_ids,
+                    admission=admission,
+                    prefix_token_ids=capture_prefix_token_ids,
+                )
 
                 return res
 
