@@ -22,8 +22,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Any, Callable, Mapping, NotRequired, Optional, Sequence, TypedDict
+from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
 import mlflow
 import numpy as np
@@ -42,7 +41,6 @@ from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
 
 from nemo_rl.data.interfaces import LLMMessageLogType
-from nemo_rl.data.nemo_gym_sample_artifacts import save_nemo_gym_training_samples
 from nemo_rl.data.train_data_artifacts import (
     TrainDataArtifactPaths,
     save_train_data_artifacts,
@@ -1138,19 +1136,6 @@ class Logger(LoggerInterface):
             num_samples=num_samples,
             non_tensor_data=non_tensor_data,
             tensors=tensors,
-        )
-
-    def log_nemo_gym_training_samples(
-        self,
-        *,
-        step: int,
-        samples: Sequence[Mapping[str, Any]],
-    ) -> Path:
-        """Log selected NeMo Gym responses as one tensor-free ``.pt`` file."""
-        return save_nemo_gym_training_samples(
-            base_dir=self.base_log_dir,
-            step=step,
-            samples=samples,
         )
 
     def log_string_list_as_jsonl(self, to_log: list[str], filename: str) -> None:

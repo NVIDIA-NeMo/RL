@@ -48,10 +48,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import (
-    should_log_nemo_gym_training_samples,
-    should_use_nemo_gym,
-)
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -1309,9 +1306,6 @@ class AsyncTrajectoryCollector:
                 deduplicate_multimodal_data=self._deduplicate_multimodal_data,
                 debug_payload_metrics=self._debug_payload_metrics,
                 target_weight_version=target_weight_version,
-                log_training_samples=should_log_nemo_gym_training_samples(
-                    self.master_config.env
-                ),
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
