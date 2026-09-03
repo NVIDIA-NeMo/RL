@@ -14,9 +14,6 @@ ppo:
   # SC does not support validation yet.
   val_period: 0
   val_at_start: false
-  # SC does not implement it, so leaving it enabled would describe filtering
-  # this run does not do.
-  overlong_filtering: false
   # override from the inherited recipe.
   num_prompts_per_step: 256
   max_num_epochs: 1000

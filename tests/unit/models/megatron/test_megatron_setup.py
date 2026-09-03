@@ -58,6 +58,23 @@ class _SerializableModelConfig:
 
 
 @pytest.mark.mcore
+def test_resolve_optimizer_fp8_moment_dtypes():
+    from nemo_rl.models.megatron.setup import _resolve_optimizer_dtype_kwargs
+
+    resolved = _resolve_optimizer_dtype_kwargs(
+        {
+            "main_params_dtype": "float16",
+            "exp_avg_dtype": "fp8",
+            "exp_avg_sq_dtype": "torch.uint8",
+        }
+    )
+
+    assert resolved["main_params_dtype"] is torch.float16
+    assert resolved["exp_avg_dtype"] is torch.uint8
+    assert resolved["exp_avg_sq_dtype"] is torch.uint8
+
+
+@pytest.mark.mcore
 class TestValidateModelPaths:
     """Tests for validate_model_paths function."""
 

@@ -190,7 +190,11 @@ class PPOConfig(BaseModel, extra="allow"):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
+    # Number of actor (policy) passes over each rollout batch.
     ppo_epochs: int = 4
+    # Number of critic (value) passes over each rollout batch. Defaults to
+    # ppo_epochs (see validate_epoch) unless explicitly set.
+    critic_ppo_epochs: int = 4
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     adv_estimator: GAEConfig = Field(default_factory=GAEConfig)
@@ -215,7 +219,17 @@ class PPOConfig(BaseModel, extra="allow"):
     async_ppo: AsyncPPOConfig | None = Field(default_factory=AsyncPPOConfig)
 
     @model_validator(mode="after")
-    def validate_async_warmup_settings(self) -> "PPOConfig":
+    def validate_epoch(self) -> "PPOConfig":
+        if "critic_ppo_epochs" not in self.model_fields_set:
+            self.critic_ppo_epochs = self.ppo_epochs
+        if self.ppo_epochs < 1:
+            raise ValueError("ppo.ppo_epochs must be at least 1")
+        if self.critic_ppo_epochs < 1:
+            raise ValueError("ppo.critic_ppo_epochs must be at least 1")
+        return self
+
+    @model_validator(mode="after")
+    def validate_async_warmup(self) -> "PPOConfig":
         if (
             self.async_ppo is not None
             and self.async_ppo.enabled
@@ -740,12 +754,10 @@ def setup(
     )
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
-    # ticks once per train() call (matching upstream main's per-rollout
-    # convention), and PPO calls each worker's train() `ppo_epochs` times
-    # per outer step. So total ticks = (outer steps) * ppo_epochs.
-    # Scale train_iters accordingly so the configured warmup/decay horizon
-    # matches the actual scheduler-step count.
+    # ticks once per train() call, so policy and value need separate budgets
+    # when their epoch counts or training start steps differ.
     ppo_epochs = ppo_config.ppo_epochs
+    critic_ppo_epochs = ppo_config.critic_ppo_epochs
     async_config = ppo_config.async_ppo
     if async_config.enabled:
         outer_training_steps = ppo_config.max_num_steps
@@ -754,13 +766,22 @@ def setup(
             ppo_config.max_num_steps,
             ppo_config.max_num_epochs * len(dataloader),
         )
-    total_train_iters = outer_training_steps * ppo_epochs
-
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+        policy_training_steps = max(
+            outer_training_steps - ppo_config.policy_training_start_step,
+            0,
+        )
+        # Megatron-Bridge requires a positive scheduler horizon at setup. The
+        # scheduler is never advanced when critic warmup spans the whole run.
+        policy_config["megatron_cfg"]["train_iters"] = max(
+            policy_training_steps * ppo_epochs,
+            1,
+        )
 
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = total_train_iters
+        value_config["megatron_cfg"]["train_iters"] = (
+            outer_training_steps * critic_ppo_epochs
+        )
 
     # Define initialization functions that will be used in all paths
     def init_policy():
@@ -1234,7 +1255,7 @@ def ppo_train(
     Based on the grpo_train loop with PPO-specific modifications:
     - Value model inference and training (actor-critic)
     - GAE advantage estimation with value bootstrap
-    - Multiple training steps per rollout (ppo_epochs)
+    - Multiple actor and critic training steps per rollout
     - Configurable policy training start epoch
     """
     timer = Timer()
@@ -1273,6 +1294,7 @@ def ppo_train(
     current_epoch = ppo_save_state["current_epoch"]
     max_num_epochs = master_config.ppo.max_num_epochs
     ppo_epochs = master_config.ppo.ppo_epochs
+    critic_ppo_epochs = master_config.ppo.critic_ppo_epochs
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
@@ -1668,16 +1690,18 @@ def ppo_train(
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
-                for step in range(ppo_epochs):
+
+                # Actor and critic share the training GPUs. Keep each model
+                # resident for all of its PPO epochs so their update phases need
+                # only one onload/offload cycle apiece.
+                print("▶ Training value...", flush=True)
+                with timer.time("value_training_prep"):
+                    value_model.prepare_for_training()
+                for critic_epoch in range(critic_ppo_epochs):
                     print(
-                        f"▶ Step {step + 1}/{ppo_epochs}...",
+                        f"▶ Value epoch {critic_epoch + 1}/{critic_ppo_epochs}...",
                         flush=True,
                     )
-
-                    # Train value model first (critic before actor, matching veRL).
-                    with timer.time("value_training_prep"):
-                        value_model.prepare_for_training()
-
                     with (
                         timer.time("value_training"),
                         managed_span(
@@ -1687,32 +1711,36 @@ def ppo_train(
                             **{"rl.iteration": total_steps + 1},
                         ),
                     ):
-                        print("▶ Training value...", flush=True)
                         value_results = value_model.train(
                             train_data,
                             value_loss_fn,
                             timer=timer,
                         )
+                with timer.time("value_training"):
+                    value_model.finish_training()
 
-                        value_model.finish_training()
+                train_results = None
+                if total_steps >= policy_training_start_step:
+                    if (
+                        total_steps == policy_training_start_step
+                        and policy_training_start_step > 0
+                    ):
+                        print(
+                            f"  ✓ Critic warmup complete ({policy_training_start_step} steps). "
+                            f"Starting policy training.",
+                            flush=True,
+                        )
+                    print("▶ Preparing for training...", flush=True)
+                    with timer.time("training_prep"):
+                        policy.prepare_for_training()
+                        POLICY_GENERATION_STALE = True
 
-                    train_results = None
-                    if total_steps >= policy_training_start_step:
-                        if (
-                            total_steps == policy_training_start_step
-                            and policy_training_start_step > 0
-                        ):
-                            print(
-                                f"  ✓ Critic warmup complete ({policy_training_start_step} steps). "
-                                f"Starting policy training.",
-                                flush=True,
-                            )
-                        print("▶ Preparing for training...", flush=True)
-                        with timer.time("training_prep"):
-                            policy.prepare_for_training()
-                            POLICY_GENERATION_STALE = True
-
-                        print("▶ Training policy...", flush=True)
+                    print("▶ Training policy...", flush=True)
+                    for policy_epoch in range(ppo_epochs):
+                        print(
+                            f"▶ Policy epoch {policy_epoch + 1}/{ppo_epochs}...",
+                            flush=True,
+                        )
                         with (
                             timer.time("policy_training"),
                             managed_span(
@@ -1727,17 +1755,15 @@ def ppo_train(
                                 loss_fn,
                                 timer=timer,
                             )
-                            if step < ppo_epochs - 1:
-                                policy.offload_to_cpu()
 
-                    if train_results is not None:
-                        print(
-                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}"
-                        )
-                    if value_results is not None:
-                        print(
-                            f"    • Value loss: {value_results['loss'].mean().item():.4f}"
-                        )
+                if train_results is not None:
+                    print(
+                        f"    • Policy loss: {train_results['loss'].mean().item():.4f}"
+                    )
+                if value_results is not None:
+                    print(
+                        f"    • Value loss: {value_results['loss'].mean().item():.4f}"
+                    )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -2166,8 +2192,7 @@ def async_ppo_train(
     max_trajectory_age_steps = async_config.max_trajectory_age_steps
     warmup_generation_lead_steps = async_config.resolved_warmup_generation_lead_steps
     policy_training_start_step = master_config.ppo.policy_training_start_step
-    if master_config.ppo.ppo_epochs < 1:
-        raise ValueError("ppo.ppo_epochs must be at least 1")
+    critic_ppo_epochs = master_config.ppo.critic_ppo_epochs
     if max_trajectory_age_steps > 1:
         print(
             "⚠️ WARNING: max_trajectory_age_steps > 1 increases off-policy "
@@ -2678,47 +2703,49 @@ def async_ppo_train(
                     if returns is not None:
                         train_data["returns"] = returns
 
-                # ---- 7. ppo_epochs inner loop (critic, then actor) ----
-                # Each epoch: value on GPU -> train -> off. Then, once past critic
-                # warmup, policy on GPU -> train -> off (except the last epoch,
-                # which leaves the policy on GPU for the refit broadcast below).
+                # ---- 7. Grouped critic epochs, then grouped actor epochs ----
+                # Actor and critic share the training GPUs. Keep each model
+                # resident for its complete update phase to avoid per-epoch
+                # onload/offload cycles. The policy remains resident after its
+                # final epoch for the refit broadcast below.
                 # During warmup (step < policy_training_start_step) the policy is
                 # frozen: it is never loaded/trained here, exactly as in sync
                 # ppo_train, so train_results stays None for the step.
                 is_policy_training_step = step >= policy_training_start_step
                 train_results = None
                 value_results = None
-                for epoch in range(ppo_epochs):
-                    print(f"▶ PPO epoch {epoch + 1}/{ppo_epochs}...")
-                    with timer.time("value_training_prep"):
-                        value_model.prepare_for_training()
+
+                with timer.time("value_training_prep"):
+                    value_model.prepare_for_training()
+                for critic_epoch in range(critic_ppo_epochs):
+                    print(f"▶ Value epoch {critic_epoch + 1}/{critic_ppo_epochs}...")
                     with timer.time("value_training"):
                         value_results = value_model.train(
                             train_data,
                             value_loss_fn,
                             timer=timer,
                         )
-                        value_model.finish_training()
+                with timer.time("value_training"):
+                    value_model.finish_training()
 
-                    if is_policy_training_step:
-                        if (
-                            step == policy_training_start_step
-                            and policy_training_start_step > 0
-                            and epoch == 0
-                        ):
-                            print(
-                                f"  ✓ Critic warmup complete ({policy_training_start_step} "
-                                "steps). Starting policy training.",
-                                flush=True,
-                            )
-                        with timer.time("training_prep"):
-                            policy.prepare_for_training()
+                if is_policy_training_step:
+                    if (
+                        step == policy_training_start_step
+                        and policy_training_start_step > 0
+                    ):
+                        print(
+                            f"  ✓ Critic warmup complete ({policy_training_start_step} "
+                            "steps). Starting policy training.",
+                            flush=True,
+                        )
+                    with timer.time("training_prep"):
+                        policy.prepare_for_training()
+                    for policy_epoch in range(ppo_epochs):
+                        print(f"▶ Policy epoch {policy_epoch + 1}/{ppo_epochs}...")
                         with timer.time("policy_training"):
                             train_results = policy.train(
                                 train_data, loss_fn, timer=timer
                             )
-                            if epoch < ppo_epochs - 1:
-                                policy.offload_to_cpu()
 
                 # ---- 8. Refit once after all PPO epochs ----
                 # Warmup still advances the replay-buffer version, but skips the
