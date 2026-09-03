@@ -65,7 +65,11 @@ _PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
     {
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        # Super Omni new-generation HF pipeline (nemotron_h_omni format): same
+        # placeholder contract as the Nano variant — <image> runs expanded via
+        # __call__, image_token/image_start_token/image_end_token attributes.
         "NemotronH_Omni_Reasoning_V3Processor",
+        "NemotronH_Super_Omni_Reasoning_V3Processor",
     }
 )
 
