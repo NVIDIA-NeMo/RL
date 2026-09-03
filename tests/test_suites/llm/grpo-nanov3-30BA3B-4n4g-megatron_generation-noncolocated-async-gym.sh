@@ -10,9 +10,8 @@ STEPS_PER_RUN=8
 MAX_STEPS=8
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 # ~25 min startup (30B-MoE load + CUDA-graph warmup + nemo_gym servers) plus 8
-# async steps on the cross-node non-colocated split; keep the H100 sibling's
-# 180 min budget until measured.
-NUM_MINUTES=180
+# async steps at ~21 min/step on GB200 4n4g.
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -65,7 +64,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/gen_kl_error"]) < 1.3' \
-    'max(data["train/reward"]) > 0.0'
+    'max(data["train/reward"]) > 0.0' \
+    'median(data["timing/train/total_step_time"]) < 1500'
 
 # Clean up checkpoint directory after successful run to save space.
 rm -rf "$CKPT_DIR"

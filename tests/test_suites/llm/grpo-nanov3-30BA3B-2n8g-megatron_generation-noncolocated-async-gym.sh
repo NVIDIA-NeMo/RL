@@ -63,7 +63,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/gen_kl_error"]) < 1.3' \
-    'max(data["train/reward"]) > 0.0'
+    'max(data["train/reward"]) > 0.0' \
+    'median(data["timing/train/total_step_time"]) < 1000'
 
 # Clean up checkpoint directory after successful run to save space.
 rm -rf "$CKPT_DIR"
