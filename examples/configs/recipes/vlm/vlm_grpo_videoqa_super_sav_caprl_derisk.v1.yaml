@@ -1,0 +1,224 @@
+# De-risk recipe for combined SA-V tracking + CapRL video GRPO on the merged
+# super-v3.5-posttraining branch. Adapted from arushig's
+# vlm_grpo_videoqa_super_profile_band.yaml with these deliberate changes:
+#   - defaults now chain to the 16n8g base (the 32n4g recipe from PR #3805 is
+#     not on this branch); the 32n4g deltas her parent supplied are inlined
+#     below (recompute_granularity, cluster shape, generation resources).
+#   - grpo.length_bonus -> grpo.length_penalty (#3852 renamed the block; the
+#     old key is silently ignored). Both stages disabled, matching the
+#     no-profile-band launcher this de-risk run reproduces.
+#   - Dropped keys with no implementation on this branch:
+#     env.reject_generated_media_tokens (bad_words lists below do this job),
+#     policy.generation.vllm_cfg.reset_mm_cache_after_refit (live key
+#     reset_encoder_cache_after_weight_update keeps its default),
+#     env.nemo_gym.debug_gen_timing (instrumentation key from another branch).
+#   - Checkpoint/data/template paths come from the launcher.
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+cluster:
+  num_nodes: 32
+  gpus_per_node: 4
+  segment_size: 8
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  max_num_steps: 50
+  max_num_epochs: 1000
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+  seq_logprob_error_threshold: 2
+  zero_variance_prompt_filtering: false
+  use_dynamic_sampling: false
+  deduplicate_multimodal_data: true
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  length_penalty:
+    default:
+      enabled: false
+      length_type: tokens
+      profile_band_total: false
+      profile_band_reasoning: true
+      profile_band_answer: false
+    profile_band:
+      enabled: false
+      defaults:
+        reasoning:
+          a: 1024
+          b: 4096
+          f: 0.95
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+  use_sequence_length_scaling: false
+  logprob_chunk_size: 2048
+
+checkpointing:
+  enabled: true
+  metric_name: null
+  higher_is_better: true
+  save_period: 1
+  keep_top_k: 20
+  save_optimizer: true
+  save_replay_buffer: false
+
+policy:
+  is_vlm: true
+  model_name: /scratch/fsw/portfolios/nemotron/projects/nemotron_omni_vision/users/pulkitk/tracking/weights/full_generalist_prod/iter_9500
+  hf_config_overrides:
+    video_temporal_patch_size: 2
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: true
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: default
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: 2048
+  max_total_sequence_length: 65536
+  sequence_packing:
+    enabled: true
+    logprob_mb_tokens: 65536
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    recompute_granularity: full
+    checkpoint:
+      async_save: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 16
+    expert_tensor_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    distributed_timeout_minutes: 45
+    mtp_num_layers: 0
+    radio_force_cpe_eval_mode: true
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    moe_shared_expert_overlap: false
+    moe_per_layer_logging: false
+    optimizer:
+      lr: 3.0e-6
+      min_lr: 2.0e-9
+      adam_beta2: 0.99
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-8
+      lr_decay_iters: 100000
+  generation:
+    max_new_tokens: 16384
+    temperature: 1.0
+    top_p: 1.0
+    bad_words:
+      - <image>
+      - <img>
+      - </img>
+      - <so_embedding>
+      - <so_start>
+      - <so_end>
+    vllm_cfg:
+      tensor_parallel_size: 4
+      logprobs_mode: raw_logprobs
+      gpu_memory_utilization: 0.7
+      max_model_len: 65536
+      reasoning_parser_plugin: /opt/nemo-rl/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      enforce_eager: false
+      enable_prefix_caching: false
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 64
+        temporal_patch_size: 2
+      http_server_serving_chat_kwargs:
+        chat_template: ${policy.tokenizer.chat_template}
+        chat_template_content_format: openai
+        reasoning_parser: deepseek_r1
+    vllm_kwargs:
+      reasoning_parser: deepseek_r1
+      allowed_local_media_path: /
+      mm_processor_cache_gb: 0
+      max_num_seqs: 8
+      max_num_batched_tokens: 65536
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 64
+      media_io_kwargs:
+        video:
+          num_frames: 64
+      skip_mm_profiling: true
+      disable_custom_all_reduce: true
+      attention_backend: FLASH_ATTN
+      attention_config:
+        use_trtllm_attention: false
+      compilation_config:
+        cudagraph_mode: FULL_AND_PIECEWISE
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 16
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 0
+  train:
+    data_path: /lustre/fsw/portfolios/nemotron/users/arushig/nemo_gym_rl_video_0803/nemo_rl/results/combined_sav_caprl_20260822/train_sav_all_tracks_plus_caprl_exclude6215_cluster_paths.jsonl
+  validation:
+    data_path: ${data.train.data_path}
+  default:
+    num_frames: 64
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: true
+
+env:
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    policy_max_input_tokens: ${policy.max_total_sequence_length}
+    skip_venv_if_present: true
+    pad_dynamic_image_shapes: true
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/mcqa/configs/mcqa.yaml
+      - resources_servers/string_match/configs/string_match.yaml
+      - resources_servers/sav_tracks/configs/sav_tracks.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            bad_words:
+              - <image>
+              - <img>
+              - </img>
+              - <so_embedding>
+              - <so_start>
+              - <so_end>
+            chat_template_kwargs:
+              enable_thinking: true
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: megatron-omni-v3
+    name: async_grpo_super35_derisk_sav_caprl
