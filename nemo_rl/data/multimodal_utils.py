@@ -124,6 +124,13 @@ def image_size_from_source(source: "str | Image.Image") -> tuple[int, int]:
     image = resolve_to_image(source)
     return image.width, image.height
 
+_FIXED_TILE_IMAGE_PROCESSOR_NAMES = frozenset({"NemotronNanoVLV2Processor"})
+
+
+def uses_fixed_tile_image_processor(processor: Any) -> bool:
+    """Return whether stacked image tiles must keep their legacy metadata contract."""
+    return type(processor).__name__ in _FIXED_TILE_IMAGE_PROCESSOR_NAMES
+
 
 class PackedTensor:
     """A logical batch of rows backed by packable tensor segments.

@@ -188,7 +188,14 @@ class VllmConfig(GenerationConfig):
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
     """Validate and return the optional vLLM video sampling contract."""
-    raw_video_config = config["vllm_cfg"].get("video")
+    vllm_config = cast(dict[str, Any], config["vllm_cfg"])
+    if "video_loader" in vllm_config:
+        raise ValueError(
+            "policy.generation.vllm_cfg.video_loader is not supported; "
+            "use policy.generation.vllm_cfg.video"
+        )
+
+    raw_video_config = vllm_config.get("video")
     if raw_video_config is None:
         return None
     return VllmVideoConfig.model_validate(raw_video_config)
