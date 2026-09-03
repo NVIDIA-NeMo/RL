@@ -265,6 +265,10 @@ class MegatronOptimizerConfig(TypedDict):
     optimizer_offload_fraction: float
     # overlap optimizer state transfers with CPU optimizer updates
     overlap_cpu_optimizer_d2h_h2d: NotRequired[bool]
+    # Precision-aware Adam moment / remainder dtypes (YAML strings resolved in setup).
+    exp_avg_dtype: NotRequired[str]
+    exp_avg_sq_dtype: NotRequired[str]
+    store_param_remainders: NotRequired[bool]
 
 
 class MegatronSchedulerConfig(TypedDict):
