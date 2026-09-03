@@ -303,6 +303,11 @@ def create_app(
         # -- carrying the handshake between the two. The wire model differs from
         # the engine one (opaque_state is bytes in the engine, base64 on the
         # wire), so use TRT-LLM's own converter rather than reproducing it.
+        # Conversation identity for rank-affine ADP routing: canonical body
+        # conversation_params, else the id the disagg service stamps onto
+        # disaggregated_params for its ctx/gen legs. None = no affinity.
+        _conv_id = ((body.get("conversation_params") or {}).get("conversation_id")
+                    or (body.get("disaggregated_params") or {}).get("conversation_id"))
         disagg_params = None
         if body.get("disaggregated_params") is not None:
             from tensorrt_llm.serve.openai_protocol import (
@@ -442,10 +447,16 @@ def create_app(
         )
 
         try:
+            _conv_params = None
+            if _conv_id:
+                from tensorrt_llm.conversation_params import ConversationParams
+
+                _conv_params = ConversationParams(conversation_id=str(_conv_id))
             output = await llm.generate_async(
                 {"prompt_token_ids": adj_prompt},
                 sampling_params=sampling,
                 disaggregated_params=disagg_params,
+                conversation_params=_conv_params,
             )
         except RequestError as e:
             err = str(e)
