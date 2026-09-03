@@ -157,6 +157,9 @@ def _make_worker(loss_type):
     w.dtype = torch.float32
     w._is_reward_model = False
     w._router_replay_enabled = False
+    w.delegate_pack_to_model = False
+    w.delegate_mtp_loss_mask_to_model = False
+    w.model_slices_context_parallel_inputs = False
     # Normally set from get_rank_safe() in __init__, which object.__new__ skips.
     # The step summary in finish_train_step reads it eagerly to decide whether
     # this rank prints.
@@ -426,6 +429,45 @@ class TestTrainMicrobatch:
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         assert mock_module_symbols["mfb"].call_count == 1
+
+    @pytest.mark.parametrize(
+        (
+            "delegate_pack_to_model",
+            "delegate_mtp_loss_mask_to_model",
+            "model_slices_context_parallel_inputs",
+        ),
+        [
+            pytest.param(True, True, False, id="model-owned-packing"),
+            pytest.param(False, False, True, id="model-owned-cp-slicing"),
+        ],
+    )
+    def test_forwards_model_owned_packing_flags(
+        self,
+        mock_module_symbols: dict[str, MagicMock],
+        delegate_pack_to_model: bool,
+        delegate_mtp_loss_mask_to_model: bool,
+        model_slices_context_parallel_inputs: bool,
+    ) -> None:
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 1
+        w.delegate_pack_to_model = delegate_pack_to_model
+        w.delegate_mtp_loss_mask_to_model = delegate_mtp_loss_mask_to_model
+        w.model_slices_context_parallel_inputs = model_slices_context_parallel_inputs
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+
+        kwargs = mock_module_symbols["gmi"].call_args.kwargs
+        assert kwargs["delegate_pack_to_model"] is delegate_pack_to_model
+        assert (
+            kwargs["delegate_mtp_loss_mask_to_model"] is delegate_mtp_loss_mask_to_model
+        )
+        assert (
+            kwargs["model_slices_context_parallel_inputs"]
+            is model_slices_context_parallel_inputs
+        )
 
     def test_passes_placeholder_n_one_to_loss(self, mock_module_symbols):
         """The N=1 trick: loss must be called with global_valid_*=1 so it
