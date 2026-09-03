@@ -118,7 +118,7 @@ policy:
       enforce_eager: true
       enable_prefix_caching: true
     vllm_kwargs:
-      hf_config_path: examples/configs/model/brightdelta-qwen3_8-vllm
+      language_model_only: true
       mamba_cache_mode: align
 data:
   max_input_seq_length: 1024

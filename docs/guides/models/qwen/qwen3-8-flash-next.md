@@ -38,63 +38,51 @@ Notes:
 
 ## Build the Environment
 
-Published NeMo RL containers do not yet include the complete Qwen3.8-Flash-Next
-runtime. Use the pinned AutoModel submodule together with a vLLM build that
-contains Qwen3.8-Flash-Next support.
+Use the pinned AutoModel submodule together with the vLLM wheel selected by the
+repository lock file. The wheel is built from the upstream Qwen3.8-Flash-Next
+support commit, so a separate vLLM source checkout is not required.
 
-### 1. Clone the sources into `3rdparty/`
+### 1. Initialize AutoModel
 
 Sources:
 
 - **AutoModel** — upstream commit
   [`8c954f67`](https://github.com/NVIDIA-NeMo/Automodel/commit/8c954f67d2977b401b06f98ab8b7a218ce07363f),
   pinned by this repository's AutoModel submodule.
-- **vLLM** — the Qwen3.8-Flash-Next support branch from
-  [vLLM PR #53896](https://github.com/vllm-project/vllm/pull/53896).
+- **vLLM** — upstream commit
+  [`e126687a`](https://github.com/vllm-project/vllm/commit/e126687a9a828d513c01a07cd69f025f27d63280),
+  from [vLLM PR #53896](https://github.com/vllm-project/vllm/pull/53896).
 
-The root `pyproject.toml` resolves vLLM from the editable local path
-`3rdparty/vLLM-workspace/vllm`. Clone the source at that exact path before
-running `uv sync`; leaving it absent or empty makes dependency resolution fail.
+The root `pyproject.toml` pins the official CUDA 13 vLLM wheels built from that
+commit for both x86_64 and aarch64.
 
 ```bash
 git submodule update --init 3rdparty/Automodel-workspace/Automodel
-
-mkdir -p 3rdparty/vLLM-workspace
-git clone https://github.com/vllm-project/vllm.git 3rdparty/vLLM-workspace/vllm
-git -C 3rdparty/vLLM-workspace/vllm fetch origin pull/53896/head
-git -C 3rdparty/vLLM-workspace/vllm checkout --detach FETCH_HEAD
 ```
 
-The vLLM environment uses FlashInfer 0.6.17. `flashinfer-cubin` is not an
-install requirement because its 0.6.17 release is hosted outside PyPI;
-FlashInfer uses the pinned 0.6.17 JIT cache instead.
+The vLLM environment uses FlashInfer 0.6.18. `flashinfer-cubin` is not an
+install requirement; FlashInfer uses the pinned 0.6.18 JIT cache instead.
 
-### 2. Force a worker-venv rebuild
+### 2. Refresh the worker environments
 
-Ray worker virtual environments are cached, so they will not pick up the local
-AutoModel and vLLM sources unless you ask for a rebuild:
+Ray worker virtual environments are cached. After updating to this lock file,
+refresh stale environments so they pick up the pinned AutoModel source and
+vLLM wheel:
 
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
 
-# Skip vLLM's CUDA build. Without this the editable install runs cmake, whose
-# FetchContent step clones dependencies from GitHub -- which fails on compute
-# nodes with no external network. Stage the wheel on a shared filesystem first;
-# a URL only works if the compute nodes can reach it.
-export VLLM_USE_PRECOMPILED=1
-export VLLM_PRECOMPILED_WHEEL_LOCATION=/path/to/vllm-<version>.whl
-
 # Multi-node only. Every node's venv builder contends on one lock in the shared
-# uv cache while vLLM's metadata is built; uv's default 300 s lock timeout can
-# expire before the waiting nodes acquire it.
+# uv cache; uv's default 300 s lock timeout can expire before waiting nodes
+# acquire it.
 export UV_LOCK_TIMEOUT=3600
 ```
 
 ## Get the Weights
 
 The recipe ships with a placeholder checkpoint path. Point the model and
-tokenizer at your local checkpoint directory. The matching vLLM compatibility
-config is already included in the repository:
+tokenizer at your local checkpoint directory. The checkpoint must include its
+`qwen4_exp` Hugging Face configuration, which vLLM reads directly:
 
 ```bash
 uv run examples/run_grpo.py \
