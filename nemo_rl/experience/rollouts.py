@@ -47,7 +47,8 @@ from nemo_rl.data.multimodal_utils import (
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
     attach_image_model_inputs_to_message,
-    extract_input_images_from_responses_messages,
+    extract_input_media_sources_from_responses_messages,
+    resolve_to_image,
 )
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -126,7 +127,14 @@ def attach_initial_nemo_gym_image_payloads(
         initial_messages = extra_env_info.get("responses_create_params", {}).get(
             "input", []
         )
-        images = extract_input_images_from_responses_messages(initial_messages)
+        # Load images from Responses-API input messages in encounter order.
+        images = [
+            resolve_to_image(source)
+            for media_type, source in extract_input_media_sources_from_responses_messages(
+                initial_messages
+            )
+            if media_type == "image"
+        ]
         if not images:
             continue
         if processor is None or getattr(processor, "image_processor", None) is None:

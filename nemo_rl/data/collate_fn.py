@@ -45,11 +45,10 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     # Extract stop_strings if present
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
 
-    # check if any of the data batch has vllm content and images
+    # Presence of the key selects vLLM's native-media path. Placeholder-style
+    # processors intentionally set the content to None so vLLM uses input_ids.
     extra_args = {}
-    if any(
-        [datum_spec.get("vllm_content", None) is not None for datum_spec in data_batch]
-    ):
+    if any("vllm_content" in datum_spec for datum_spec in data_batch):
         vllm_content = [
             datum_spec.get("vllm_content", None) for datum_spec in data_batch
         ]
@@ -119,11 +118,10 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     idx = [datum_spec["idx"] for datum_spec in data_batch]
     task_names = [datum_spec.get("task_name", None) for datum_spec in data_batch]
 
-    # Check if any of the data batch has vllm content (multimodal data)
+    # Preserve native media when placeholder-style processors intentionally
+    # set vllm_content to None in favor of their expanded input_ids.
     extra_args = {}
-    if any(
-        datum_spec.get("vllm_content", None) is not None for datum_spec in data_batch
-    ):
+    if any("vllm_content" in datum_spec for datum_spec in data_batch):
         extra_args["vllm_content"] = [
             datum_spec.get("vllm_content", None) for datum_spec in data_batch
         ]
