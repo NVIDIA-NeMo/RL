@@ -394,6 +394,53 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
     torch.testing.assert_close(packed_w13, torch.full_like(packed_w13, 7.0))
 
 
+def test_build_hf_to_local_param_map_stages_nemotron_lightning_padded_experts():
+    """Receive the logical Nano/Lightning weight instead of its padded runtime form."""
+    num_experts, intermediate_size, hidden_size = 128, 928, 2688
+    expert_name = "backbone.layers.0.mlp.experts.gate_proj.weight"
+    runtime_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["backbone.layers.0"],
+        "per_layer_params": {
+            "backbone.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [
+                        num_experts,
+                        intermediate_size,
+                        hidden_size,
+                    ],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "gate_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    packed_runtime = torch.empty(
+        num_experts,
+        hidden_size // 64,
+        1024,
+        64,
+        dtype=torch.bfloat16,
+        device="meta",
+    )
+    ext = _make_ext({runtime_name: packed_runtime})
+    ext.device = torch.device("meta")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=0)}
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+
+    ctx = spec.pre(spec.base)
+    assert ctx.buf.shape == (num_experts, intermediate_size, hidden_size)
+    assert ctx.buf.dtype == torch.bfloat16
+    assert ctx.buf.numel() != packed_runtime.numel()
+
+
 def test_build_hf_to_local_param_map_stages_qwen35_wrapped_experts():
     """Qwen3.5 wrapper prefixes and RoutedExperts names survive staged reload."""
     hidden_size, num_experts, intermediate_size = 16, 4, 32
