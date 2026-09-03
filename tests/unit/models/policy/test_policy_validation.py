@@ -162,6 +162,7 @@ def create_megatron_config(
         "sequence_packing": {
             "enabled": False,
         },
+        "make_sequence_length_divisible_by": 1,
         "optimizer": {
             "name": "torch.optim.AdamW",
             "lr": 5e-6,
@@ -501,6 +502,8 @@ def test_batch_invariant_te_native_pins_worker_cublaslt_workspace(
         "CUBLASLT_WORKSPACE_SIZE": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":0:0",
     }
+    assert config["make_sequence_length_divisible_by"] == 64
+    assert config["dynamic_batching"]["sequence_length_round"] == 64
 
 
 @pytest.mark.mcore
@@ -526,3 +529,5 @@ def test_zero_train_gen_mismatch_pins_worker_cublaslt_workspace(
         "CUBLASLT_WORKSPACE_SIZE": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":0:0",
     }
+    assert config["make_sequence_length_divisible_by"] == 64
+    assert config["dynamic_batching"]["sequence_length_round"] == 64

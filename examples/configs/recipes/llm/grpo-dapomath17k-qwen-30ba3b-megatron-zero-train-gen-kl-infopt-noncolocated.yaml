@@ -36,7 +36,7 @@ policy:
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
       # use nccl for inter-node communication with IB
-      refit_backend: "nvshmem"
+      refit_backend: "nccl"
 
 cluster:
   gpus_per_node: 4
