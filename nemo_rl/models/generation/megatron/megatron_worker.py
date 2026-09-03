@@ -586,11 +586,14 @@ class MegatronGenerationMixin:
 
     def _setup_openai_api_server(self) -> str:
         """Start the OpenAI-compatible HTTP server on this worker."""
+        import random
+
         from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
             start_text_gen_server,
         )
 
         from nemo_rl.distributed.virtual_cluster import (
+            _get_free_port_local,
             _get_node_ip_local,
         )
 
@@ -609,15 +612,13 @@ class MegatronGenerationMixin:
             reserved_socket = receive_held_socket(reserved_port)
             server_port = reserved_socket.getsockname()[1]
         else:
-            # Seed the port draw per DP rank. The default generator is seeded per
-            # run, so every rank produces the same candidate sequence; ranks
-            # sharing a node then converge on one port, and because each frontend
-            # replica binds with SO_REUSEPORT the duplicate bind succeeds instead
-            # of failing. The result is several ranks advertising one address,
-            # which collapses into a single client-side connection pool.
+            # Seed port assignment by rank to ensure that inference servers
+            # do not listen to the same port and parallelize tokenization,
+            # preprocessing, and hashing on multiple CPUs.
             reserved_socket = None
-            dp_rank = get_pg_rank(self.dynamic_inference_engine.pg_collection.dp)
-            server_port = _get_free_port_local(rng=random.Random(dp_rank))
+            server_port = _get_free_port_local(
+                rng=random.Random(torch.distributed.get_rank())
+            )
 
         # Each replica is one asyncio event loop, so this is the per-host
         # frontend capacity; every model-parallel coordinator hosts a set.
