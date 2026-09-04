@@ -833,7 +833,7 @@ def test_legacy_refit_map_is_built_after_comm_groups_exist(monkeypatch):
 def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    model = SimpleNamespace()
+    model = torch.nn.Module()
     trtllm_moe = SimpleNamespace()
     model_config = object()
     vllm_config = object()
