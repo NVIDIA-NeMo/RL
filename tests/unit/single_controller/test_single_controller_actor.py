@@ -591,7 +591,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(
+        grpo=GRPOConfig(
             seq_logprob_error_threshold=2.0,
             overlong_filtering=True,
             invalid_tool_call_advantage=-5.0,
@@ -688,7 +688,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._message_level_advantage_penalties_enabled = False
-    ctrl._algo_cfg = SimpleNamespace(
+    ctrl._algo_cfg = GRPOConfig(
         seq_logprob_error_threshold=None,
         overlong_filtering=overlong_filtering,
     )
@@ -751,7 +751,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        grpo=GRPOConfig(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -787,6 +787,68 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
 
 
+def test_advantage_stage_clips_training_values_and_metrics() -> None:
+    batch_size, sequence_length = 2, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([-4.0, 6.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(
+            seq_logprob_error_threshold=None,
+            advantage_clip_low=-1.0,
+            advantage_clip_high=2.0,
+        )
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "num_mask_sample_filtered": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    assert data_plane.written_fields is not None
+    torch.testing.assert_close(
+        data_plane.written_fields["advantages"],
+        torch.tensor([[-1.0] * sequence_length, [2.0] * sequence_length]),
+    )
+    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
+    assert logged.min().item() == pytest.approx(-1.0)
+    assert logged.max().item() == pytest.approx(2.0)
+
+
 def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -819,7 +881,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0, overlong_filtering=False)
+        grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -879,7 +941,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        grpo=GRPOConfig(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -959,7 +1021,10 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        grpo=GRPOConfig(
+            seq_logprob_error_threshold=None,
+            advantage_clip_high=0.1,
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -1001,6 +1066,14 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     assert ctrl._opd_stat_sum == pytest.approx(1.0)
     assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
     assert ctrl._opd_stat_count == 4
+    assert ctrl._dp_client.put_fields is not None
+    written_advantages = ctrl._dp_client.put_fields["advantages"]
+    torch.testing.assert_close(
+        written_advantages,
+        torch.full_like(written_advantages, 0.1),
+    )
+    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
+    torch.testing.assert_close(logged, torch.full((4,), 0.1))
 
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:

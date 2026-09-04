@@ -77,7 +77,9 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
 )
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOSaveState,
+    _clip_grpo_advantages,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
@@ -1817,7 +1819,6 @@ class SingleControllerActor:
                         )
 
                     if groups_dispatched == 0 and self._gen is not None:
-                        # Raise here for observability.
                         try:
                             await asyncio.to_thread(self._gen.snapshot_step_metrics)
                         except RayActorError as error:
@@ -3377,14 +3378,25 @@ class SingleControllerActor:
 
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
-        self._step_log_dict["masked_advantages"].append(
-            response_advantages.detach().cpu()
-        )
         if self._teacher_logprobs_required:
             valid = response_advantages.detach().double()
             self._opd_stat_sum += float(valid.sum())
             self._opd_stat_sumsq += float((valid * valid).sum())
             self._opd_stat_count += int(valid.numel())
+
+        # OPD accumulates its statistics from the estimator output above. The
+        # ordinary advantage metrics and policy training use the clipped values,
+        # matching the legacy paths.
+        if not self._is_ppo:
+            assert isinstance(self._algo_cfg, GRPOConfig)
+            advantages = _clip_grpo_advantages(
+                advantages,
+                self._algo_cfg,
+            )
+            response_advantages = torch.masked_select(advantages, mask.bool())
+        self._step_log_dict["masked_advantages"].append(
+            response_advantages.detach().cpu()
+        )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
