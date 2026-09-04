@@ -106,7 +106,7 @@ def _make_mtp_refit_extension(
 
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
     ext.device = torch.device("cpu")
-    ext._mtp_drafter_from_disk = from_disk
+    ext._mtp_drafter_weights_from_refit = not from_disk
 
     spec_config = (
         None
@@ -1065,7 +1065,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
     )
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
     if with_mtp:
-        ext._mtp_drafter_from_disk = False
+        ext._mtp_drafter_weights_from_refit = True
         ext.model_runner.drafter = SimpleNamespace(model=draft_model)
         ext.model_runner.vllm_config = SimpleNamespace(
             speculative_config=SimpleNamespace(
