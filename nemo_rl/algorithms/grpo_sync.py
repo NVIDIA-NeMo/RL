@@ -48,6 +48,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
+    _apply_mask_sample_filter,
     _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
@@ -770,6 +771,13 @@ def grpo_train_sync(
                     lm[driver_carry["truncated"]] = 0
                     driver_carry["loss_multiplier"] = lm
 
+                # Same order grpo.py uses: overlong filtering,
+                # then the env flag. The two trainers are selected by
+                # ``data_plane.enabled`` alone, so an infrastructure switch
+                # must not change which samples reach the loss. Shares
+                # grpo.py's implementation rather than restating the rule.
+                num_mask_sample_filtered = _apply_mask_sample_filter(driver_carry)
+
                 # ── Unpack slice (small per-sample tensors) ────────────
                 rewards = (
                     driver_carry["filtered_reward"]
@@ -1059,6 +1067,7 @@ def grpo_train_sync(
                     "advantages/min": torch.min(response_advantages).detach().item()
                     if response_advantages.numel() > 0
                     else 0.0,
+                    "num_mask_sample_filtered": num_mask_sample_filtered,
                     **ds_metrics,
                 }
                 if "moe_metrics" in train_results:
