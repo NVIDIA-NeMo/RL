@@ -3661,9 +3661,10 @@ class SingleControllerActor:
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
-                # Real validity (token-capture placeholders carry sample_mask 0)
-                # instead of the hardwired all-ones — § 9.1, advantage_estimator.
-                valid_mask=sample_mask,
+                # Real validity (token-capture placeholders carry sample_mask 0,
+                # and mask_sample/overlong/seq-logprob-error rows are folded in
+                # via final_sample_mask) instead of the hardwired all-ones.
+                valid_mask=final_sample_mask,
                 **kwargs,
             )
             if self._is_ppo:
