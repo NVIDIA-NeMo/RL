@@ -31,6 +31,8 @@ The two port patches ship their own suites. These cover the remaining patches:
 """
 
 import ast
+import builtins
+import errno
 import logging
 import os
 
@@ -282,38 +284,52 @@ def test_locked_file_patch_writes_under_lock_on_writable_install(tmp_path):
     target = tmp_path / "target.py"
     target.write_text("ORIGINAL")
 
-    with patches._locked_file_patch(str(target)) as (content, write_back):
+    with patches._locked_file_patch(
+        str(target), logging.getLogger(__name__)
+    ) as (content, write_back):
         assert content == "ORIGINAL"
         write_back("PATCHED")
 
     assert target.read_text() == "PATCHED"
 
 
+@pytest.mark.parametrize("lock_errno", [errno.EROFS, errno.EACCES])
 def test_locked_file_patch_degrades_to_lockless_read_on_read_only_install(
-    tmp_path, caplog
+    tmp_path, caplog, monkeypatch, lock_errno
 ):
-    """EACCES/EROFS on the lock file yields the content and a warn-only writer."""
-    ro_dir = tmp_path / "site-packages"
-    ro_dir.mkdir()
-    target = ro_dir / "target.py"
+    """EROFS/EACCES on the lock file yields the content and a declining writer.
+
+    The errno is injected rather than simulated with chmod: a read-only *mount*
+    raises EROFS, which no mode bit reproduces, and CI runs the container as
+    root, where mode bits are ignored entirely.
+    """
+    target = tmp_path / "target.py"
     target.write_text("ORIGINAL")
-    ro_dir.chmod(0o555)
-    if os.access(ro_dir, os.W_OK):  # root ignores mode bits (e.g. CI containers)
-        pytest.skip("cannot simulate a read-only install as root")
-    try:
-        with caplog.at_level(logging.WARNING):
-            with patches._locked_file_patch(str(target)) as (content, write_back):
-                assert content == "ORIGINAL"
-                write_back("MUST_NOT_LAND")
-        assert target.read_text() == "ORIGINAL"
-        assert not (ro_dir / "target.py.patch_lock").exists()
-        assert "Read-only install" in caplog.text
-    finally:
-        ro_dir.chmod(0o755)
+    real_open = builtins.open
+
+    def refuse_the_lock(file, mode="r", *args, **kwargs):
+        if str(file).endswith(".patch_lock"):
+            raise OSError(lock_errno, os.strerror(lock_errno), str(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", refuse_the_lock)
+
+    with caplog.at_level(logging.WARNING):
+        with patches._locked_file_patch(
+            str(target), logging.getLogger(__name__)
+        ) as (content, write_back):
+            assert content == "ORIGINAL"
+            assert write_back("MUST_NOT_LAND") is False
+
+    assert target.read_text() == "ORIGINAL"
+    assert not (tmp_path / "target.py.patch_lock").exists()
+    assert "Read-only install" in caplog.text
 
 
 def test_locked_file_patch_still_raises_on_unrelated_oserror(tmp_path):
     """Only EROFS/EACCES trigger the fallback; anything else propagates."""
     with pytest.raises(FileNotFoundError):
-        with patches._locked_file_patch(str(tmp_path / "missing" / "target.py")):
+        with patches._locked_file_patch(
+            str(tmp_path / "missing" / "target.py"), logging.getLogger(__name__)
+        ):
             pass
