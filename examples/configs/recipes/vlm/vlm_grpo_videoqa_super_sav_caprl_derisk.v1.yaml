@@ -70,8 +70,11 @@ checkpointing:
   enabled: true
   metric_name: null
   higher_is_better: true
-  save_period: 1
-  keep_top_k: 20
+  # ~1.4 TB per checkpoint with optimizer state: save_period=1/keep_top_k=20
+  # filled the project quota in 12 steps (window 0 of the v2 run died on
+  # "Disk quota exceeded"). Save sparsely and keep only two.
+  save_period: 5
+  keep_top_k: 2
   save_optimizer: true
   save_replay_buffer: false
 
