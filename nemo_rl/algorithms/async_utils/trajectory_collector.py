@@ -1260,7 +1260,6 @@ class AsyncTrajectoryCollector:
         num_generations: int,
         use_nemo_gym: bool,
         task_index_to_group_index: dict[int, int],
-        target_weight_version: Optional[int] = None,
     ) -> AsyncGenerator[RolloutGroupResult, None]:
         """Yield prompt groups from either backend through one result type."""
         if use_nemo_gym:
@@ -1305,7 +1304,6 @@ class AsyncTrajectoryCollector:
                 ),
                 deduplicate_multimodal_data=self._deduplicate_multimodal_data,
                 debug_payload_metrics=self._debug_payload_metrics,
-                target_weight_version=target_weight_version,
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
@@ -1616,7 +1614,6 @@ class AsyncTrajectoryCollector:
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,
-                    target_weight_version=target_weight_version,
                 ):
                     group_index = rollout_result.group_index
                     if group_index not in expected_group_indices:

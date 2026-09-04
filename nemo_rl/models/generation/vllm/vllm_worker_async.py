@@ -36,11 +36,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
-from nemo_rl.experience.interfaces import (
-    NEMO_GYM_ROLLOUT_INDEX_KEY,
-    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
-    NEMO_GYM_TASK_INDEX_KEY,
-)
+from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -619,14 +615,6 @@ class VllmAsyncGenerationWorkerImpl(
             nemo_gym_task_index: Optional[int] = Field(
                 default=None,
                 alias=NEMO_GYM_TASK_INDEX_KEY,
-            )
-            nemo_gym_rollout_index: Optional[int] = Field(
-                default=None,
-                alias=NEMO_GYM_ROLLOUT_INDEX_KEY,
-            )
-            nemo_gym_target_weight_version: Optional[int] = Field(
-                default=None,
-                alias=NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
             )
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through

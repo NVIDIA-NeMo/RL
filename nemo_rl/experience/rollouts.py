@@ -58,11 +58,7 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.experience.interfaces import (
-    NEMO_GYM_ROLLOUT_INDEX_KEY,
-    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
-    NEMO_GYM_TASK_INDEX_KEY,
-)
+from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -2228,10 +2224,8 @@ def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
     sampling_params: GenerationSamplingParams,
-    target_weight_version: Optional[int] = None,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
-    next_rollout_index_by_task: dict[Any, int] = defaultdict(int)
     for row_index, row in enumerate(rows):
         responses_create_params = row.get("responses_create_params")
         if not isinstance(responses_create_params, dict):
@@ -2249,16 +2243,6 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
-
-        task_index = row.get(NEMO_GYM_TASK_INDEX_KEY)
-        if task_index is not None:
-            row[NEMO_GYM_ROLLOUT_INDEX_KEY] = next_rollout_index_by_task[task_index]
-            next_rollout_index_by_task[task_index] += 1
-
-        if target_weight_version is None:
-            row.pop(NEMO_GYM_TARGET_WEIGHT_VERSION_KEY, None)
-        else:
-            row[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] = target_weight_version
 
 
 def _tensorize_nemo_gym_result(result: dict) -> None:
@@ -2295,7 +2279,6 @@ async def run_async_nemo_gym_rollout(
     sampling_params: Optional[GenerationSamplingParams] = None,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
-    target_weight_version: Optional[int] = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2335,8 +2318,6 @@ async def run_async_nemo_gym_rollout(
             remote Gym return and restore the exact original payload locally.
         debug_payload_metrics: Emit logical, physical, and serialized media
             payload metrics at the Gym Ray boundary.
-        target_weight_version: Opaque async-RL target version forwarded to vLLM
-            on every model request. ``None`` omits the field.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2422,12 +2403,7 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(
-            nemo_gym_rows,
-            generation_config,
-            sampling_params,
-            target_weight_version=target_weight_version,
-        )
+        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config, sampling_params)
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,
@@ -2548,7 +2524,6 @@ def run_nemo_gym_rollout_sync(
     mask_env_flagged_samples: bool = True,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
-    target_weight_version: Optional[int] = None,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2580,8 +2555,6 @@ def run_nemo_gym_rollout_sync(
         deduplicate_multimodal_data: Omit initial policy-ready media from the
             remote Gym return and restore it from the input batch.
         debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
-        target_weight_version: Opaque async-RL target version forwarded to vLLM
-            on every model request. ``None`` omits the field.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2617,7 +2590,6 @@ def run_nemo_gym_rollout_sync(
             sampling_params=sampling_params,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
             debug_payload_metrics=debug_payload_metrics,
-            target_weight_version=target_weight_version,
         ):
             pass
         if rollout_result is None:

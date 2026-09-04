@@ -390,9 +390,27 @@ def _nemo_gym_impl(mask_env_flagged_samples):
             "stop_strings": None,
             "stop_token_ids": None,
             "top_k": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": 32,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
     )
+
+
+def test_nemo_gym_build_inputs_omits_retired_routing_metadata():
+    rows = _nemo_gym_impl(True)._build_inputs(
+        {
+            "extra_env_info": {
+                "responses_create_params": {},
+                "_ng_task_index": 7,
+            }
+        }
+    )
+
+    assert rows[0]["_ng_task_index"] == 7
+    assert "_ng_rollout_index" not in rows[0]
+    assert "_ng_target_weight_version" not in rows[0]
 
 
 def _mask_gate_result():
