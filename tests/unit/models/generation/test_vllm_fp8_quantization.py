@@ -637,7 +637,9 @@ def test_init_fp8_combines_legacy_and_modelopt_ignore_patterns(fp8_module, monke
         "from_pretrained",
         lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
     )
-    monkeypatch.setattr(fp8.AutoModel, "from_config", lambda *_args: FakeModel())
+    monkeypatch.setattr(
+        fp8.AutoModel, "from_config", lambda *_args, **_kwargs: FakeModel()
+    )
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
     with pytest.warns(
