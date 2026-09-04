@@ -335,6 +335,91 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
+    """Mixed rollout refits rebuild both runtime expert layouts."""
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMxFp8FusedMoE,
+    )
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    model = torch.nn.Module()
+    bf16_moe = torch.nn.Module()
+    bf16_moe.expert_map_manager = SimpleNamespace(placement_strategy="linear")
+    mxfp8_moe = torch.nn.Module()
+    mxfp8_moe.quant_method = ModelOptMxFp8FusedMoE.__new__(ModelOptMxFp8FusedMoE)
+    model.add_module("first_bf16_moe", bf16_moe)
+    model.add_module("middle_mxfp8_moe", mxfp8_moe)
+
+    model_config = object()
+    vllm_config = SimpleNamespace(quant_config=object())
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._mtp_drafter_refit_enabled = lambda: False
+    ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [bf16_moe],
+    )
+    monkeypatch.setattr(
+        ModelOptMxFp8FusedMoE,
+        "process_weights_after_loading",
+        lambda _self, module: call_order.append(("process_mxfp8", module)),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    @contextlib.contextmanager
+    def set_current_vllm_config(config):
+        assert config is vllm_config
+        call_order.append("config_enter")
+        try:
+            yield
+        finally:
+            call_order.append("config_exit")
+
+    monkeypatch.setattr("vllm.config.set_current_vllm_config", set_current_vllm_config)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda module: call_order.append(("initialize", module)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        lambda reload_model, config: call_order.append(
+            ("finalize", reload_model, config)
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda reload_model: call_order.append(("hpc", reload_model)),
+    )
+
+    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+        call_order.append("transfer")
+        finalize()
+
+    assert call_order == [
+        "config_enter",
+        ("initialize", bf16_moe),
+        "transfer",
+        ("finalize", model, model_config),
+        ("process_mxfp8", mxfp8_moe),
+        ("hpc", model),
+        "mtp",
+        "config_exit",
+    ]
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
 def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypatch):
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 
