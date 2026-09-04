@@ -378,7 +378,11 @@ class VllmInternalWorkerExtension:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.load_weights(policy_weights, self.model_runner)
+            fp8.load_weights(
+                policy_weights,
+                self.model_runner,
+                model_load_weights=self._load_full_hf_weights,
+            )
             return
         self._load_full_hf_weights(policy_weights)
 
@@ -851,14 +855,16 @@ class VllmInternalWorkerExtension:
         if not self._uses_unquantized_flashinfer_trtllm():
             return
 
-        if transport == "nccl_reshard":
-            if self._uses_fp8_kv_cache():
-                raise RuntimeError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit does not "
-                    "support an FP8 KV cache because its static scales are "
-                    "outside the targeted MoE reload lifecycle"
-                )
+        if transport in ("ipc", "collective", "nccl_reshard") and (
+            self._uses_fp8_kv_cache()
+        ):
+            raise RuntimeError(
+                "BF16 FlashInfer TRTLLM partial refit does not support an "
+                "FP8 KV cache because its static scales are outside the "
+                "targeted reload lifecycle"
+            )
 
+        if transport == "nccl_reshard":
             realized_placements = set()
             for module in _unquantized_flashinfer_trtllm_modules(
                 self.model_runner.model
