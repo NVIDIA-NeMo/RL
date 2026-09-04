@@ -1697,6 +1697,24 @@ GROUPED_EXPERT_KEY_SHAPES = pytest.mark.parametrize(
 )
 
 
+def test_load_weights_uses_supplied_model_loader(fp8_module):
+    fp8 = fp8_module
+    model = types.SimpleNamespace(
+        packed_modules_mapping={},
+        load_weights=lambda _weights: pytest.fail("must use the supplied loader"),
+    )
+    source = torch.ones(2, dtype=torch.bfloat16)
+    loaded = []
+
+    fp8.load_weights(
+        [("model.norm.weight", source)],
+        types.SimpleNamespace(model=model),
+        model_load_weights=lambda weights: loaded.extend(weights),
+    )
+
+    assert loaded == [("model.norm.weight", source)]
+
+
 @GROUPED_EXPERT_KEY_SHAPES
 def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     fp8_module, monkeypatch, layers_prefix, wrap_language_model

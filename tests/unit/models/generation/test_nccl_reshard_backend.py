@@ -969,7 +969,7 @@ def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     model = torch.nn.Module()
-    trtllm_moe = SimpleNamespace()
+    trtllm_moe = torch.nn.Module()
     model_config = object()
     vllm_config = object()
     call_order = []
