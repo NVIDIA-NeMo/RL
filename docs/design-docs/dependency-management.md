@@ -94,15 +94,20 @@ Within the driver script, NeMo RL starts multiple [`RayWorkerGroup`](https://git
 - **Generation workers** (e.g., vLLM): Require `vllm` dependencies  
 - **Environment workers** (e.g., math evaluation): Use system/base dependencies
 
-Each worker type is mapped to the uv extras its virtual environment needs in the `[tool.nemo_rl.actor_environments]` table of `pyproject.toml`. [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py) is built from that table at import time, and the release container reads the same table to prefetch one virtual environment per worker type:
+Each worker type is mapped to the uv extras its virtual environment needs in `ACTOR_ENVIRONMENTS` in [`nemo_rl/distributed/actor_environments.py`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/actor_environments.py). [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py) is built from it at import time, and `docker/Dockerfile` runs the same module as a script to prefetch one virtual environment per worker type into the image:
 
-```toml
-[tool.nemo_rl.actor_environments]
-"nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker" = ["vllm"]
-"nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker" = ["mcore"]
-"nemo_rl.environments.math_environment.MathEnvironment" = "system"
-# ... more mappings
+```python
+# nemo_rl/distributed/actor_environments.py -- None means the driver's interpreter
+ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": ["vllm"],
+    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": ["mcore"],
+    "nemo_rl.environments.math_environment.MathEnvironment": None,
+    # ... more mappings
+}
 ```
+
+This module is deliberately dependency-free: `docker/Dockerfile` runs it as a script
+from the dependency layer, where the rest of the source tree does not exist yet.
 
 > [!NOTE]
 > For more details on how workers define and use their Python executables, see the [UV Documentation](uv.md#worker-configuration).

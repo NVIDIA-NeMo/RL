@@ -13,43 +13,23 @@
 # limitations under the License.
 
 import os
-import tomllib
-from pathlib import Path
 
-from nemo_rl.distributed.virtual_cluster import (
-    PY_EXECUTABLES,
-    git_root,
-    uv_py_executable,
-)
+from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, uv_py_executable
 
 # NEMO_RL_PY_EXECUTABLES_SYSTEM=1 (single-environment images such as Dockerfile.ngc_pytorch)
 # runs every actor on the driver's interpreter instead of a per-actor uv venv.
 USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
 
-
-def _load_actor_environments() -> dict[str, str]:
-    """Build actor FQN -> py_executable from pyproject.toml's [tool.nemo_rl.actor_environments]."""
-    with open(Path(git_root) / "pyproject.toml", "rb") as f:
-        pyproject = tomllib.load(f)
-    declared_extras = set(pyproject["project"]["optional-dependencies"])
-    registry: dict[str, str] = {}
-    for actor_fqn, extras in pyproject["tool"]["nemo_rl"]["actor_environments"].items():
-        if extras == "system":
-            registry[actor_fqn] = PY_EXECUTABLES.SYSTEM
-            continue
-        unknown = set(extras) - declared_extras
-        if unknown:
-            raise ValueError(
-                f"[tool.nemo_rl.actor_environments] {actor_fqn!r} names extras "
-                f"{sorted(unknown)} that are not in [project.optional-dependencies]"
-            )
-        registry[actor_fqn] = (
-            PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else uv_py_executable(extras)
-        )
-    return registry
-
-
-ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = _load_actor_environments()
+# Actor FQN -> the py_executable its workers launch under. The extras come from
+# nemo_rl.distributed.actor_environments, which docker/Dockerfile also reads to
+# pre-build one venv per actor into the image.
+ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
+    actor_fqn: PY_EXECUTABLES.SYSTEM
+    if extras is None or USE_SYSTEM_EXECUTABLE
+    else uv_py_executable(extras)
+    for actor_fqn, extras in ACTOR_ENVIRONMENTS.items()
+}
 
 
 def get_actor_python_env(actor_class_fqn: str) -> str:
@@ -59,8 +39,10 @@ def get_actor_python_env(actor_class_fqn: str) -> str:
         raise ValueError(
             f"No actor environment registered for {actor_class_fqn}. "
             f"You're attempting to create an actor ({actor_class_fqn}) "
-            "without specifying a python environment for it. Please either"
-            "add the actor to the [tool.nemo_rl.actor_environments] table in pyproject.toml "
+            "without specifying a python environment for it. Please either "
+            "add the actor to ACTOR_ENVIRONMENTS in nemo_rl/distributed/actor_environments.py, "
+            "register it at runtime with ACTOR_ENVIRONMENT_REGISTRY[fqn] = <py_executable> "
+            "(the path for workers defined outside this repo), "
             "or pass a py_executable to the RayWorkerBuilder. If you're unsure about which "
             "environment to use, a good default is PY_EXECUTABLES.SYSTEM for ray actors that "
             "don't have special dependencies. If you do have special dependencies (say, you're "
