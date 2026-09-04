@@ -1,7 +1,8 @@
 defaults: ../../grpo_math_1B.yaml
 
 # Native DeepSeek V4 feature baseline on Automodel r0.6.0. This intentionally
-# excludes the legacy Automodel fork's training-side fake-quant patches.
+# excludes the legacy Automodel fork's training-side fake-quant patches and uses
+# the validated 2K-response AdamW configuration.
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
@@ -19,7 +20,7 @@ grpo:
   reward_shaping:
     enabled: true
     overlong_buffer_length: 1024
-    max_response_length: 8192
+    max_response_length: 2048
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -30,7 +31,7 @@ loss_fn:
   ratio_clip_c: 10
 
 checkpointing:
-  checkpoint_dir: results/grpo-deepseek-v4-flash-base-8n8g-automodel-cp8ep64
+  checkpoint_dir: results/grpo-deepseek-v4-flash-base-16n8g-automodel-cp8ep128
   keep_top_k: 1
   save_period: 5
   checkpoint_must_save_by: 00:03:45:00
@@ -51,7 +52,8 @@ policy:
   train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 10240
+  # 1024 prompt tokens + 2048 response tokens.
+  max_total_sequence_length: 3072
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
   make_sequence_length_divisible_by: 64
@@ -60,7 +62,7 @@ policy:
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
-      betas: [0.9, 0.95]
+      betas: [0.9, 0.999]
       eps: 1.0e-08
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
@@ -80,7 +82,7 @@ policy:
     sequence_parallel: false
     tensor_parallel_size: 1
     context_parallel_size: 8
-    expert_parallel_size: 64
+    expert_parallel_size: 128
     activation_checkpointing: true
     moe_parallelizer:
       ignore_router_for_ac: true
@@ -93,7 +95,7 @@ policy:
         linear: torch
         rms_norm: torch_fp32
         experts: torch_mm
-        dispatcher: hybridep
+        dispatcher: deepep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
@@ -105,7 +107,7 @@ policy:
   dynamic_batching:
     enabled: true
   generation:
-    max_new_tokens: 8192
+    max_new_tokens: 2048
     temperature: 1.0
     vllm_cfg:
       precision: fp8
@@ -150,8 +152,8 @@ logger:
   num_train_samples_to_print: 2
   wandb:
     project: nemo-rl
-    name: grpo-deepseek-v4-flash-base-8n8g-automodel-cp8ep64
+    name: grpo-deepseek-v4-flash-base-16n8g-automodel-cp8ep128
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 8
+  num_nodes: 16
