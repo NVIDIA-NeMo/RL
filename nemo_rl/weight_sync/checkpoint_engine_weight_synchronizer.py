@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.generation.constants import SGLANG_BACKEND
 from nemo_rl.models.generation.interfaces import CheckpointEngineConfig
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -40,11 +41,11 @@ def _sort_ranked_metadata(metadata: list[Any]) -> list[Any]:
 
 
 def _ordered_generation_metadata(generation_results: list[Any]) -> list[Any]:
-    """Order vLLM generation metadata by global rollout rank.
+    """Order generation metadata by global rollout rank.
 
-    Each result belongs to one vLLM data-parallel group. Engine-local ranks
-    are unique only within a group, so sort each group before concatenating
-    them in worker-group order.
+    Each result belongs to one generation engine or data-parallel group.
+    Engine-local ranks may be unique only within a group, so sort each group
+    before concatenating them in engine order.
     """
     metadata: list[Any] = []
     for group_result in generation_results:
@@ -65,10 +66,87 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     _stale: bool = True
     _checkpoint_engine_ready: bool = False
     _bucket_size_bytes: int | None = None
+    _terminal_error: BaseException | None = None
 
     def init_communicator(self) -> None:
-        self._generation.prepare_refit_info(self._policy.prepare_refit_info())
-        self._ensure_checkpoint_engine_ready()
+        self._raise_if_terminal()
+        # SGLang's checkpoint-engine path builds its topology below and does not
+        # consume the legacy refit metadata.  Gathering it would needlessly
+        # materialize every sharded policy tensor on every training rank.
+        if not self._is_sglang():
+            self._generation.prepare_refit_info(self._policy.prepare_refit_info())
+        self._ensure_ready_and_consume_count()
+
+    def _set_terminal(self, exc: BaseException) -> None:
+        if self._terminal_error is None:
+            self._terminal_error = exc
+
+    def _raise_if_terminal(self) -> None:
+        # A failed rebind or a failure after a transfer started leaves NIXL
+        # state (and possibly the served model) in an unknown condition; the
+        # latch guarantees no later sync can issue RPCs over it.
+        if self._terminal_error is not None:
+            raise RuntimeError(
+                "Checkpoint-engine synchronizer is in a terminal error state "
+                "from a previous refit; restart the job. Original error: "
+                f"{self._terminal_error!r}"
+            ) from self._terminal_error
+
+    def _use_fault_tolerance(self) -> bool:
+        return bool(
+            self._generation.sglang_cfg["sglang_cfg"].get("use_fault_tolerance")
+        )
+
+    def _ensure_ready_and_consume_count(self) -> None:
+        """(Re)initialize the communicator; consume SGLang's new-engine count.
+
+        ``_start_engines`` reports both the startup fleet and every recovered
+        cohort through ``num_new_engines`` — consuming it only after a
+        successful setup keeps a failed setup retryable and stops the first
+        ordinary refit from being misclassified as crash recovery.
+        """
+        needs_init = not self._checkpoint_engine_ready
+        try:
+            self._ensure_checkpoint_engine_ready()
+        except BaseException as exc:
+            # NIXL prepare()/add_remote_agent() are not transactional: a retry
+            # over their partial state silently skips or double-registers, so a
+            # failed (re)bind is terminal until that is fixed upstream.
+            self._set_terminal(exc)
+            raise
+        if needs_init and self._is_sglang():
+            self._generation.clear_updatable_num_new_engines()
+
+    def _sglang_recover_and_rebind(self) -> None:
+        """Restart dead engines and rebind the paired NIXL fabric to them."""
+        if self._use_fault_tolerance():
+            from nemo_rl.models.generation.sglang.fault_tolerance import (
+                RecoveryRollbackError,
+            )
+
+            try:
+                # Always probe (it pauses the monitor and finds dead slots);
+                # a plain failure here rolled the cohort back inside
+                # ``_recover`` and is retryable on the next sync.
+                self._generation.recover_updatable_engines()
+            except RecoveryRollbackError as exc:
+                self._set_terminal(exc)
+                raise
+            except BaseException:
+                # The cohort was rolled back to ``None`` slots; readiness must
+                # not survive that — a no-op init or teardown over restored
+                # slots would trust peers the next successful recovery is
+                # about to replace. Retryable, so no terminal latch.
+                self._checkpoint_engine_ready = False
+                raise
+            (_, _, num_new_engines, _, _) = (
+                self._generation.get_updatable_engines_and_lock()
+            )
+            if num_new_engines > 0:
+                # Replacement actors have no receivers and their paired policy
+                # senders still bind the dead agents; force a full rebind.
+                self._checkpoint_engine_ready = False
+        self._ensure_ready_and_consume_count()
 
     @property
     def is_stale(self) -> bool:
@@ -87,6 +165,9 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             method_kwargs=method_kwargs,
         )
 
+    def _is_sglang(self) -> bool:
+        return self._generation.cfg["backend"] == SGLANG_BACKEND
+
     def _generation_rpc(self) -> str:
         return (
             "checkpoint_engine_rpc_async"
@@ -97,6 +178,10 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     def _run_generation(
         self, checkpoint_method: str, method_args: tuple[Any, ...] = ()
     ) -> list[ray.ObjectRef]:
+        if self._is_sglang():
+            return self._generation.run_checkpoint_engine_method(
+                checkpoint_method, method_args
+            )
         return self._generation.worker_group.run_all_workers_single_data(
             self._generation_rpc(),
             checkpoint_method=checkpoint_method,
@@ -183,26 +268,34 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             "train_world_size": len(policy_metadata),
             "rollout_world_size": len(generation_metadata),
         }
-        worker_count = len(self._generation.worker_group.workers)
-        workers_per_group = worker_count // self._generation.dp_size
+        if self._is_sglang():
+            generation_init_refs = (
+                self._generation.init_checkpoint_engine_process_groups(**topology)
+            )
+        else:
+            worker_count = len(self._generation.worker_group.workers)
+            workers_per_group = worker_count // self._generation.dp_size
+            generation_init_refs = (
+                self._generation.worker_group.run_all_workers_multiple_data(
+                    self._generation_rpc(),
+                    method_args=[
+                        (
+                            rank_prefix,
+                            topology["train_world_size"],
+                            topology["rollout_world_size"],
+                            topology["metadata"],
+                        )
+                        for rank_prefix in range(0, worker_count, workers_per_group)
+                    ],
+                    run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                    common_kwargs={
+                        "checkpoint_method": "init_checkpoint_engine_process_group"
+                    },
+                )
+            )
         ray.get(
             self._run_policy("init_checkpoint_engine_process_group", **topology)
-            + self._generation.worker_group.run_all_workers_multiple_data(
-                self._generation_rpc(),
-                method_args=[
-                    (
-                        rank_prefix,
-                        topology["train_world_size"],
-                        topology["rollout_world_size"],
-                        topology["metadata"],
-                    )
-                    for rank_prefix in range(0, worker_count, workers_per_group)
-                ],
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-                common_kwargs={
-                    "checkpoint_method": "init_checkpoint_engine_process_group"
-                },
-            )
+            + generation_init_refs
         )
         self._checkpoint_engine_ready = True
 
@@ -212,8 +305,12 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        self._raise_if_terminal()
         self._stale = True
-        self._ensure_checkpoint_engine_ready()
+        if self._is_sglang():
+            self._sglang_recover_and_rebind()
+        else:
+            self._ensure_checkpoint_engine_ready()
         context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -222,29 +319,115 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
 
         try:
             with context:
-                policy_refs = self._run_policy(
-                    "send_weights_via_checkpoint_engine", kv_scales=kv_scales
-                )
-                results = ray.get(
-                    policy_refs
-                    + self._run_generation("update_weights_from_checkpoint_engine")
-                )
-                if not all(
-                    result
-                    for result in results[len(policy_refs) :]
-                    if result is not None
-                ):
-                    raise RuntimeError(
-                        "Weight transfer failed during "
-                        f"{self._checkpoint_engine_config['backend']} "
-                        "checkpoint-engine sync."
-                    )
+                if self._is_sglang():
+                    self._sglang_transfer(kv_scales)
+                else:
+                    self._transfer(kv_scales)
                 self._stale = False
         finally:
-            if self._release_after_refit():
+            # Never finalize on the terminal path: NIXL may still have
+            # in-flight work, and finalizing would mask the primary error.
+            if self._terminal_error is None and self._release_after_refit():
                 self.shutdown()
 
+    def _transfer(self, kv_scales: Optional[dict[str, float]]) -> None:
+        """Run one policy->rollout checkpoint-engine transfer."""
+        policy_refs = self._run_policy(
+            "send_weights_via_checkpoint_engine", kv_scales=kv_scales
+        )
+        results = ray.get(
+            policy_refs + self._run_generation("update_weights_from_checkpoint_engine")
+        )
+        if not all(
+            result for result in results[len(policy_refs) :] if result is not None
+        ):
+            raise RuntimeError(
+                "Weight transfer failed during "
+                f"{self._checkpoint_engine_config['backend']} "
+                "checkpoint-engine sync."
+            )
+
+    def _sglang_transfer(self, kv_scales: Optional[dict[str, float]]) -> None:
+        """Transfer inside the engine-side weight-update session.
+
+        SGLang gates ``update_weights_from_tensor`` on a session opened by
+        ``begin_weight_update``, and only ``end_weight_update`` rebuilds the
+        quantized kernel layouts afterwards, so the transfer has to sit inside
+        that envelope however the bytes arrive. The pause matters for the same
+        reason it does on the sibling path: the buckets land as several
+        ``update_weights_from_tensor`` calls, each taking the server's model
+        update lock on its own, so a request admitted between two buckets would
+        run against a half-updated model.
+
+        The success-path envelope is the one ``_SGLangWeightSynchronizer._refit``
+        uses; the sibling additionally rejects ``kv_scales``, which this
+        transport forwards to the policy. The failure path deliberately
+        diverges from the sibling: once the transfer has started, a failure is
+        terminal and serving is NOT resumed (a NCCL broadcast can be safely
+        redone next refit; interrupted one-sided NIXL work cannot).
+        """
+        self._generation.prepare_for_generation(tags=["weights"])
+        # Cleanup is two-phase, split at "did the transfer start":
+        # - Before any bucket moved, nothing changed the served weights, so a
+        #   failure releases every acquired state (KV pool re-acquired, monitor
+        #   resumed, serving readmitted) and stays retryable.
+        # - Once the transfer starts, a failure of the transfer OR of
+        #   end_weight_update leaves a half-updated model and possibly
+        #   in-flight NIXL work: latch terminal, keep serving and the health
+        #   monitor paused, and let the primary exception propagate. Job abort
+        #   is the recovery mechanism.
+        transfer_started = False
+        try:
+            self._generation.pause_generation(
+                mode=self._generation.pause_generation_mode
+            )
+            if not self._generation.invalidate_kv_cache():
+                raise RuntimeError("SGLang KV cache invalidation failed before refit.")
+
+            self._generation.begin_weight_update()
+            try:
+                transfer_started = True
+                self._transfer(kv_scales)
+            except BaseException:
+                # Close the session without masking the transfer error.
+                try:
+                    self._generation.end_weight_update()
+                except Exception as end_exc:
+                    print(
+                        "[SGLang refit] end_weight_update also failed after a "
+                        f"failed transfer (suppressed): {end_exc!r}"
+                    )
+                raise
+            # A transfer that moved bytes but never finalized kernel layouts is
+            # as unusable as a failed transfer: end must succeed too.
+            self._generation.end_weight_update()
+        except BaseException as exc:
+            if transfer_started:
+                self._set_terminal(exc)
+                raise
+            # Pre-transfer failure: safe cleanup, then propagate the original.
+            try:
+                self._generation.prepare_for_generation(tags=["kv_cache"])
+                self._generation.continue_generation()
+            except Exception as cleanup_exc:
+                print(
+                    "[SGLang refit] cleanup after a pre-transfer failure also "
+                    f"failed (suppressed): {cleanup_exc!r}"
+                )
+            raise
+        # Success: re-acquire the KV pool (this also resumes the #3613 health
+        # monitor) before readmitting requests.
+        self._generation.prepare_for_generation(tags=["kv_cache"])
+        self._generation.continue_generation()
+
     def shutdown(self) -> None:
+        if self._terminal_error is not None:
+            # After a terminal rebind/transfer failure the NIXL state is
+            # unknown and possibly in-flight; ``finalize_checkpoint_engine``
+            # is not idempotent over it. Zero RPCs — drop readiness so normal
+            # controller teardown stays a no-op too.
+            self._checkpoint_engine_ready = False
+            return
         if not self._checkpoint_engine_ready:
             return
         ray.get(
