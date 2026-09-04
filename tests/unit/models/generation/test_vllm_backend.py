@@ -121,6 +121,86 @@ def _make_mtp_refit_extension(
     return ext, drafter_model
 
 
+class _RecordingGroup:
+    """Stands in for StatelessProcessGroup so no port is bound and no CUDA is touched."""
+
+    instances: list["_RecordingGroup"] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.aborts = 0
+        _RecordingGroup.instances.append(self)
+
+    def init_nccl_communicator(self, device):
+        del device
+
+    def abort(self):
+        self.aborts += 1
+
+
+@pytest.fixture
+def recording_group(monkeypatch):
+    import nemo_rl.distributed.stateless_process_group as spg_module
+
+    _RecordingGroup.instances = []
+    monkeypatch.setattr(spg_module, "StatelessProcessGroup", _RecordingGroup)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    # init_collective derives its rank via resolve_rollout_rank, which reads the default
+    # torch.distributed group. There is none in a unit test, so stand in for the worker's
+    # local rank rather than initialising a real process group.
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    return _RecordingGroup
+
+
+@pytest.mark.vllm
+def test_init_collective_releases_the_previous_group(recording_group):
+    """Elastic recovery rebuilds this group, so it runs more than once per job.
+
+    A rebuild that only overwrites the attribute strands the old NCCL communicator and
+    its TCPStore. Invisible in a one-shot job -- which is why it survived until
+    membership became dynamic -- and unbounded once recovery can repeat.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    worker = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    worker.device = 0
+
+    worker.init_collective(
+        rank_prefix=0, ip="10.0.0.1", port=5000, world_size=4, train_world_size=2
+    )
+    worker.init_collective(
+        rank_prefix=0, ip="10.0.0.1", port=5001, world_size=3, train_world_size=2
+    )
+
+    first, second = recording_group.instances
+    assert first.aborts == 1, "first group was not released on rebuild"
+    assert second.aborts == 0
+    assert worker.model_update_group is second
+    # The rebuild must carry the new membership, not resurrect the old world size.
+    assert second.kwargs["world_size"] == 3
+
+
+@pytest.mark.vllm
+def test_init_collective_keeps_generation_ranks_after_the_training_ranks(
+    recording_group,
+):
+    """The rank offset is what keeps trainer rank 0 the broadcast root across a rebuild."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    worker = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    worker.device = 0
+    worker.init_collective(
+        rank_prefix=0, ip="10.0.0.1", port=5000, world_size=6, train_world_size=4
+    )
+
+    assert recording_group.instances[0].kwargs["rank"] == 4
+
+
 def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
     from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
         UnquantizedMoeBackend,

@@ -24,7 +24,7 @@ loss_fn:
   use_importance_sampling_correction: true
 ```
 
-3. **Disable colocated inference** (required for async mode with the vLLM backend; the Megatron backend supports colocated async — see `examples/configs/recipes/llm/grpo-nanov3-30BA3B-4n4g-megatron_async_colocated.yaml`):
+3. **Disable colocated inference** (required for async mode with the vLLM backend; the Megatron backend supports colocated async — see `examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym.yaml`):
 ```yaml
 policy:
   generation:
@@ -65,6 +65,8 @@ loss_fn:
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 4
+  max_num_epochs: 1
+  max_num_steps: 1000000
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
@@ -76,6 +78,20 @@ cluster:
   num_nodes: 2
   gpus_per_node: 4
 ```
+
+### Configure the training duration
+
+Async GRPO uses the same two training bounds as synchronous GRPO and stops at
+the first one reached:
+
+```text
+min(max_num_steps, max_num_epochs × batches_per_epoch)
+```
+
+One epoch is one complete pass over the training dataloader. The background
+trajectory collector cycles through the stateful dataloader as needed, while
+the trainer stops at the effective step limit above. Async checkpoints retain
+the collector's dataloader position for resume.
 
 ## Implementation Structure
 This section covers the internal architecture of async GRPO and includes detailed explanations of how the core components interact.
@@ -205,9 +221,9 @@ If no `replay_buffer.pt` file is found in the latest checkpoint directory, train
 
 3. **Resource Allocation**: Ensure sufficient GPU memory for both the training and generation clusters
 
-4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` to update engine weights during generation; with vLLM this requires `async_engine: true`, while the Megatron backend is always async-engine. This prevents stalling the training pipeline until the longest generation finishes and provides significant performance benefits.
+4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` to refit without waiting for the longest in-flight generation to finish. Except for managed Dynamo, the collector requests a generation pause and resume from every async backend around the weight transfer. Async vLLM implements this contract while preserving request state. A backend that does not implement the hook emits a warning once per backend type per process and refits without a collector-side pause or drain; SGLang is in this group today and instead relies on the pause its own weight synchronizer performs around the transfer. Managed Dynamo always drains active trajectories before refit. vLLM requires `async_engine: true`; the Megatron backend is always async-engine.
 
-5. **Recompute KV Cache After Weight Updates**: A user can choose whether to invalidate and recompute KV caches after weight updates by setting the `recompute_kv_cache_after_weight_updates` configuration. This is applicable to async GRPO and independent of in-flight updates.
+5. **Recompute KV Cache After Weight Updates**: Set `recompute_kv_cache_after_weight_updates: true` to invalidate reusable KV/prefix caches when weights change. On the native async vLLM in-flight path, caches are cleared while generation is paused, so preserved requests recompute their KV after resuming. Other refit paths keep their existing post-update invalidation behavior. When false, in-flight requests retain their pre-update KV cache. On the Megatron generation backend, this must agree with `policy.generation.mcore_generation_config.kv_cache_management_mode`; setup errors on a mismatch.
 
 ## Why Importance Sampling Correction Is Required for Async
 

@@ -21,7 +21,7 @@ import json
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -47,8 +47,10 @@ from nemo_rl.data.multimodal_utils import (
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
     attach_image_model_inputs_to_message,
-    extract_input_images_from_responses_messages,
+    extract_input_media_sources_from_responses_messages,
+    resolve_to_image,
 )
+from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -75,6 +77,22 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+_REWARD_PENALTY_METRICS = {
+    "duplicated_reasoning": (
+        "penalize_duplicated_reasoning",
+        "reasoning_equal_to_final_answer_rate",
+    ),
+    "empty_final_answer": (
+        "penalize_empty_final_answer",
+        "empty_final_answer_rate",
+    ),
+    "unwanted_token": ("penalize_unwanted_tokens", "unwanted_token_rate"),
+    "malformed_think_tag": (
+        "penalize_malformed_think_tag",
+        "malformed_think_tag_rate",
+    ),
+}
 
 
 def attach_initial_nemo_gym_image_payloads(
@@ -109,7 +127,14 @@ def attach_initial_nemo_gym_image_payloads(
         initial_messages = extra_env_info.get("responses_create_params", {}).get(
             "input", []
         )
-        images = extract_input_images_from_responses_messages(initial_messages)
+        # Load images from Responses-API input messages in encounter order.
+        images = [
+            resolve_to_image(source)
+            for media_type, source in extract_input_media_sources_from_responses_messages(
+                initial_messages
+            )
+            if media_type == "image"
+        ]
         if not images:
             continue
         if processor is None or getattr(processor, "image_processor", None) is None:
@@ -263,16 +288,12 @@ def _add_r3_fallback_metrics(
     )
 
 
-def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
+def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
         [
-            bool(
-                (result["full_result"].get("instance_config") or {}).get(
-                    "mask_sample", False
-                )
-            )
-            for result in results
+            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
+            for extra in extras
         ],
         dtype=torch.bool,
     )
@@ -1875,6 +1896,22 @@ def _get_reward_penalty_config_value(
     return getattr(reward_penalty_config, key, None)
 
 
+def compute_reward_penalty_metrics(
+    penalty_counts: dict[str, int],
+    num_results: int,
+    reward_penalty_config: dict[str, Any] | BaseModel | None,
+) -> dict[str, float]:
+    """Return enabled penalty rates using the legacy NeMo-Gym metric names."""
+    if reward_penalty_config is None or not num_results:
+        return {}
+
+    return {
+        metric_name: penalty_counts[count_key] / num_results
+        for count_key, (flag, metric_name) in _REWARD_PENALTY_METRICS.items()
+        if _get_reward_penalty_config_value(reward_penalty_config, flag)
+    }
+
+
 def _get_reward_penalty_token_id(
     reward_penalty_config: dict[str, Any] | BaseModel,
     key: str,
@@ -2816,33 +2853,22 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
-    # Env/agent mask flag: flagged samples are dropped from the loss but still
-    # count for advantages. env.should_mask_flagged_samples=false skips this.
+    # Carry the raw env/agent flag downstream; the advantage stage composes it
+    # into sample_mask. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:
-        final_batch["mask_sample"] = _extract_mask_sample_flags(results)
+        final_batch[MASK_SAMPLE] = _mask_sample_flags(
+            result["full_result"] for result in results
+        )
 
     rollout_metrics.update(_effort_shaping_metrics(shaping))
 
-    # Penalty metrics — map count keys to (config flag, metric name)
-    _PENALTY_METRICS = {
-        "duplicated_reasoning": (
-            "penalize_duplicated_reasoning",
-            "reasoning_equal_to_final_answer_rate",
-        ),
-        "empty_final_answer": (
-            "penalize_empty_final_answer",
-            "empty_final_answer_rate",
-        ),
-        "unwanted_token": ("penalize_unwanted_tokens", "unwanted_token_rate"),
-        "malformed_think_tag": (
-            "penalize_malformed_think_tag",
-            "malformed_think_tag_rate",
-        ),
-    }
-    if resolved_reward_penalty_config and results:
-        for key, (flag, metric_name) in _PENALTY_METRICS.items():
-            if _get_reward_penalty_config_value(resolved_reward_penalty_config, flag):
-                rollout_metrics[metric_name] = penalty_counts[key] / len(results)
+    rollout_metrics.update(
+        compute_reward_penalty_metrics(
+            penalty_counts,
+            len(results),
+            resolved_reward_penalty_config,
+        )
+    )
 
     # Expose per-component rewards as `reward/<name>` batch keys for multi-reward NeMo
     # Gym environments so GDPO can compute per-component advantages; single-reward envs

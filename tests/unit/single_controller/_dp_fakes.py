@@ -33,6 +33,8 @@ _BULK_FIELDS = [
     "generation_logprobs",
     "token_mask",
     "sample_mask",
+    "mask_sample",
+    "truncated",
     "prompt_ids_for_adv",
     "total_reward",
 ]
@@ -146,6 +148,9 @@ class _SyncDPAdapter:
                 sample_ids=sample_ids, partition_id=partition_id
             )
         )
+
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        return ray.get(self._handle.list_sample_ids.remote(partition_id))
 
     @staticmethod
     def _padded(td: TensorDict) -> TensorDict:
