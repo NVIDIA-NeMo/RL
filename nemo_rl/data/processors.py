@@ -811,11 +811,45 @@ def nemo_gym_data_processor(
             task_name=datum_dict["task_name"],
             data_config=task_data_spec,
         )
-        if video_output is None:
-            raise ValueError(
-                "Gym video data configuration requires a static video in every row"
+        # Combined Gym manifests carry CAPRL videos and SAV still-image rows.
+        # Video defaults select the cached/native video path when applicable;
+        # they must not make a static video mandatory for every row.
+        if video_output is not None:
+            return cast(DatumSpec, video_output)
+
+    if task_data_spec is not None and task_data_spec.image_max_num_tiles is not None:
+        image_max_num_tiles = task_data_spec.image_max_num_tiles
+        if image_max_num_tiles < 1:
+            raise ValueError("image_max_num_tiles must be at least 1.")
+        image_processor = getattr(tokenizer, "image_processor", None)
+        if image_processor is None:
+            raise TypeError(
+                "Gym image_max_num_tiles requires a multimodal processor with "
+                "an image_processor attribute"
             )
-        return cast(DatumSpec, video_output)
+        if not (
+            hasattr(image_processor, "max_num_tiles")
+            or all(
+                hasattr(image_processor, name)
+                for name in ("min_num_patches", "max_num_patches")
+            )
+        ):
+            raise ValueError(
+                "The configured image processor supports neither max_num_tiles "
+                "nor a dynamic min_num_patches/max_num_patches budget."
+            )
+
+        # Use one logical tile budget on both sides of the rollout/training
+        # boundary. The async vLLM worker maps this to the dynamic patch budget.
+        extra_env_info["_nemo_rl_image_max_num_tiles"] = image_max_num_tiles
+        from nemo_rl.environments.nemo_gym_video import (
+            _inject_vllm_mm_processor_kwargs,
+        )
+
+        _inject_vllm_mm_processor_kwargs(
+            extra_env_info,
+            {"max_num_tiles": image_max_num_tiles},
+        )
 
     output: DatumSpec = {
         # load to dict format here since `Dataset` cannot handle nested structure well in `NemoGymDataset`
@@ -824,7 +858,13 @@ def nemo_gym_data_processor(
         "idx": idx,
         "task_name": datum_dict["task_name"],
         # fake keys for compatibility with the current GRPO implementation
-        "message_log": [{"role": "user", "content": "", "token_ids": torch.tensor([])}],
+        "message_log": [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.empty(0, dtype=torch.long),
+            }
+        ],
         "length": 0,
     }
     return output

@@ -28,8 +28,10 @@ from nemo_rl.data.multimodal_utils import (
     IMAGE_CONTENT_TYPES,
     VIDEO_CONTENT_TYPES,
     PackedTensor,
+    attach_media_placeholder_metadata,
     extract_multimodal_model_inputs,
     get_dim_to_pack_along,
+    require_exact_media_placeholder_match,
     resolve_to_image,
 )
 from nemo_rl.environments.nemotron_utils import (
@@ -663,6 +665,12 @@ def nemo_gym_example_to_video_datum_spec(
         "content": "",
         "token_ids": processed["input_ids"][0],
     }
+    # Preserve the policy processor's exact media-run lengths and reject a
+    # rollout that encoded the video differently. Post-generation resizing can
+    # make tensor shapes valid, but cannot make rollout logprobs correspond to
+    # the policy's visual features.
+    attach_media_placeholder_metadata(user_message, processor, processed)
+    require_exact_media_placeholder_match(user_message)
     if "imgs_sizes" in processed and "num_frames" not in processed:
         processed["num_frames"] = torch.tensor([len(frame_items)], dtype=torch.int32)
     user_message.update(extract_multimodal_model_inputs(processor, processed))
