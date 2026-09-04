@@ -566,6 +566,62 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     logger.info("Successfully patched vLLM RADIO LayerScale loading.")
 
 
+def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
+    """Restore the vLLM 0.24 decoder boundary for GLM DSA models.
+
+    vLLM 0.25.1 keeps hidden states sequence-parallel across attention and MoE
+    decoder layers when TP, DP, and EP are all enabled. GLM-5.1/5.2 decode
+    diverges on that new path: the first generated token is correct, while
+    subsequent decode-token logprobs collapse. Keep vLLM's existing MoE-local
+    sequence parallelism, but disable the new decoder-level optimization for
+    ``glm_moe_dsa`` so the MoE gathers its output as it did in vLLM 0.24.
+
+    The upstream bug and proposed fix are tracked at
+    https://github.com/vllm-project/vllm/issues/50154 and
+    https://github.com/vllm-project/vllm/pull/50155. Remove this patch after
+    upgrading to a vLLM release containing the fix and validating iterative
+    GLM-5.1/5.2 decode with TP, DP, and EP all enabled.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/deepseek_v2.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate deepseek_v2.py for the GLM decoder SP-MoE patch."
+        )
+        return
+
+    old_snippet = """        self.use_sequence_parallel_moe = (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+            and is_moe_layer
+        )
+"""
+    new_snippet = """        self.use_sequence_parallel_moe = (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+            and is_moe_layer
+            # vLLM 0.25.1's decoder-level SP-MoE path corrupts iterative
+            # decoding for GLM-5.1/5.2. Retain the vLLM 0.24 MoE-local path.
+            and getattr(config, "model_type", None) != "glm_moe_dsa"
+        )
+"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if new_snippet in content:
+            logger.info("vLLM GLM decoder SP-MoE patch already applied.")
+            return
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply vLLM GLM decoder SP-MoE patch: expected "
+                "vLLM 0.25.1 source shape was not found in %s.",
+                file_to_patch,
+            )
+            return
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -580,6 +636,7 @@ def ensure_vllm_source_compat() -> None:
     patch_logger = init_logger("vllm_patch")
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 
 
 def _apply_vllm_patches(
@@ -634,3 +691,4 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)

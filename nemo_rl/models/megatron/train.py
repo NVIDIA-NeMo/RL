@@ -45,6 +45,7 @@ from nemo_rl.algorithms.loss import (
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -127,6 +128,7 @@ def model_forward(
     mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
+    media_token_validity_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -143,6 +145,9 @@ def model_forward(
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
+        media_token_validity_mask: Which media-token positions actually anchor a
+            projected feature, already in this model's token layout. Only passed
+            when the model accepts it; otherwise the model derives its own.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -161,6 +166,11 @@ def model_forward(
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
+
+    # Only sent when the model advertises the parameter, so it never reaches a
+    # forward that would swallow it into **kwargs and quietly ignore it.
+    if media_token_validity_mask is not None:
+        additional_kwargs["media_token_validity_mask"] = media_token_validity_mask
 
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
@@ -259,6 +269,8 @@ def forward_with_post_processing_fn(
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
+    original_seq_length = processed_mb.original_seq_length
+    media_token_validity_mask = processed_mb.media_token_validity_mask
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -282,6 +294,7 @@ def forward_with_post_processing_fn(
                 mtp_loss_mask=mtp_loss_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
+                media_token_validity_mask=media_token_validity_mask,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -301,16 +314,35 @@ def forward_with_post_processing_fn(
         from megatron.core.transformer.multi_token_prediction import roll_tensor
 
         captured_states = capture.get_captured_states()
-        shifted_input_embeds = roll_tensor(
-            captured_states.inputs_embeds,
-            shifts=-1,
-            dims=0,
-            cp_group=get_context_parallel_group(),
-        )[0]
+        if packed_seq_params is not None:
+            # Packed layout: rolling the captured embeddings would leak the
+            # next segment's first token across every packing boundary, so
+            # shift the token ids per sequence before packing and re-embed
+            # them instead (one extra embedding lookup; also yields the
+            # correct sequence-parallel layout for free). no_grad matches the
+            # capture hooks, which hand the draft detached embeddings.
+            with torch.no_grad():
+                shifted_input_ids = _pack_input_ids(
+                    data_dict["input_ids"],
+                    packed_seq_params.cu_seqlens_q,
+                    packed_seq_params.cu_seqlens_q_padded,
+                    roll_shift=-1,
+                )
+                shifted_input_embeds = capture.model.embedding(
+                    input_ids=shifted_input_ids, position_ids=position_ids
+                )
+        else:
+            shifted_input_embeds = roll_tensor(
+                captured_states.inputs_embeds,
+                shifts=-1,
+                dims=0,
+                cp_group=get_context_parallel_group(),
+            )[0]
         data_dict["student_logits"] = draft_model(
             hidden_states=captured_states.hidden_states,
             input_embeds=shifted_input_embeds,
             attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
         )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -333,15 +365,19 @@ def forward_with_post_processing_fn(
             global_valid_toks=global_valid_toks,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
+        assert original_seq_length is not None
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=original_seq_length,
         )
     elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
+        assert original_seq_length is not None
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=original_seq_length,
         )
     else:
         raise TypeError(
@@ -533,6 +569,26 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
+            if "student_logits" in data_dict:
+                # draft + use_fused_linear_logprobs is rejected at setup in
+                # lm_policy.py (the fused path never materializes the full
+                # next-token logits the teacher needs), so no check here.
+                # Keep the draft head's packed logits out of the policy-loss
+                # data so the per-sequence packing slicers never see them.
+                student_logits = data_dict.pop("student_logits")
+                loss_fn_wrapped = DraftLossWrapper(
+                    loss_fn=loss_fn_wrapped,
+                    prepare_fn=None,
+                    data_dict=data_dict,
+                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=get_context_parallel_group(),
+                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                    d2t=self.d2t,
+                    student_logits=student_logits,
+                )
         else:
             loss_fn_wrapped = partial(
                 wrap_loss_fn_with_input_preparation,
@@ -601,6 +657,7 @@ class LogprobsPostProcessor:
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
+        original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -611,12 +668,12 @@ class LogprobsPostProcessor:
             data_dict: Batched data dictionary containing input sequences
             input_ids: Processed input token IDs
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            original_seq_length: Sequence width before dense padding was applied
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
-        original_seq_length = unpacked_input_ids.shape[1]
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
@@ -666,6 +723,8 @@ class LogprobsPostProcessor:
                     token_logprobs, mask, "prev_logprobs"
                 )
 
+            token_logprobs = token_logprobs[:, :original_seq_length]
+
             return torch.tensor(0.0, device=token_logprobs.device), {
                 "logprobs": token_logprobs
             }
@@ -682,6 +741,7 @@ class TopkLogitsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: torch.Tensor,
+        original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes top-k logits and indices.
 
@@ -692,6 +752,7 @@ class TopkLogitsPostProcessor:
         Args:
             data_dict: Batched data dictionary
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            original_seq_length: Sequence width before dense padding was applied
 
         Returns:
             Callable: Function that takes output tensor and returns
@@ -811,8 +872,8 @@ class TopkLogitsPostProcessor:
                 }
             else:
                 return output_tensor.new_zeros(()), {
-                    "topk_logits": topk_vals_full,
-                    "topk_indices": topk_idx_full,
+                    "topk_logits": topk_vals_full[:, :original_seq_length],
+                    "topk_indices": topk_idx_full[:, :original_seq_length],
                 }
 
         return processor_fn_inner

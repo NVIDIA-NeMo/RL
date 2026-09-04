@@ -22,6 +22,8 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
+# Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
+#   --build-arg BUILD_DYNAMO=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
@@ -71,6 +73,7 @@ apt-get install -y --no-install-recommends \
     less \
     vim \
     ccache \
+    protobuf-compiler \
 
 # Nsight
 apt install -y --no-install-recommends gnupg
@@ -104,6 +107,13 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
+
+# Rust toolchain for setuptools-rust extensions in SGLang.
+ENV PATH="/root/.cargo/bin:$PATH"
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal \
+    && rustc --version \
+    && cargo --version
 
 # Install uv and python
 ARG UV_VERSION=0.11.28
@@ -176,7 +186,12 @@ ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 # Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 ENV CUDNN_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
-ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+# TileLang's $ORIGIN-relative RUNPATH breaks when uv installs worker venvs in
+# symlink mode: libtvm_compiler.so resolves into TileLang's cache directory and
+# cannot find libz3.so in Z3's separate cache directory.
+# TODO: Remove this workaround once the upstream issue is resolved.
+# See https://github.com/tile-ai/tilelang/issues/3075
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/z3/lib:/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
@@ -317,7 +332,7 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 # Custom setup layer (override with: --build-context custom-setup=<dir> --build-arg CUSTOM_SETUP_FNAME=<script>)
 # To skip: --build-arg CUSTOM_SETUP_FNAME=
 ARG CUSTOM_SETUP_FNAME=install_apptainer.sh
-RUN --mount=from=custom-setup,src=/,dst=/tmp/custom-setup <<"EOF" bash -exu
+RUN --mount=from=custom-setup,src=/,dst=/tmp/custom-setup --mount=type=secret,id=APPTAINER_GITHUB_TOKEN,env=GITHUB_TOKEN <<"EOF" bash -exu
 if [[ -z "${CUSTOM_SETUP_FNAME}" ]]; then
     echo "CUSTOM_SETUP_FNAME is empty, skipping custom setup"
     exit 0
@@ -334,6 +349,10 @@ FROM hermetic AS release
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
 ARG SKIP_TRTLLM_BUILD
+ARG BUILD_DYNAMO
+ARG DYNAMO_PYTHON_VERSION=3.12.11
+ARG ETCD_VERSION=v3.5.21
+ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
 # (empty default = skip). Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
@@ -349,6 +368,7 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+ENV NEMO_RL_DYNAMO_VENV_DIR=/opt/dynamo_venv
 
 # AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
 # The host's aws-efa-installer places libnccl-net-ofi.so under
@@ -364,6 +384,16 @@ ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_P
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+
+# Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
+# Ray/vLLM environments. Default image builds do not create this environment.
+RUN <<"EOF" bash -exu -o pipefail
+if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
+    echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
+    exit 0
+fi
+bash docker/dynamo/install.sh
+EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.

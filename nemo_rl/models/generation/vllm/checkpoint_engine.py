@@ -85,6 +85,9 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
 
     checkpoint_engine: "CheckpointEngine"
 
+    def _validate_checkpoint_engine_weight_update(self) -> None:
+        """Run worker-specific compatibility checks before receiving weights."""
+
     def checkpoint_engine_total_memory_bytes(self) -> int:
         device = torch.cuda.current_device()
         return torch.cuda.get_device_properties(device).total_memory
@@ -137,25 +140,25 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
             checkpoint_engine.finalize()
 
     async def _update_weights_from_checkpoint_engine_async(self) -> bool:
+        self._validate_checkpoint_engine_weight_update()
         loaded_tensors = 0
         loaded_bytes = 0
         loaded_batches = 0
         load_time = 0.0
         start_time = time.time()
 
-        with self._weight_update_lifecycle("checkpoint_engine") as finalize:
-            async for weight_batch in self.checkpoint_engine.receive_weight_batches():
-                loaded_batches += 1
-                loaded_tensors += len(weight_batch)
-                loaded_bytes += sum(weight.nbytes for _name, weight in weight_batch)
+        async for weight_batch in self.checkpoint_engine.receive_weight_batches():
+            loaded_batches += 1
+            loaded_tensors += len(weight_batch)
+            loaded_bytes += sum(weight.nbytes for _name, weight in weight_batch)
 
-                load_start = time.time()
-                self._load_weights(weight_batch)
-                torch.cuda.current_stream().synchronize()
-                load_time += time.time() - load_start
-                del weight_batch
+            load_start = time.time()
+            self._load_weights(weight_batch)
+            torch.cuda.current_stream().synchronize()
+            load_time += time.time() - load_start
+            del weight_batch
 
-            finalize()
+        self._maybe_process_fp8_kv_cache()
 
         total_time = time.time() - start_time
         loaded_gib = loaded_bytes / (1024 * 1024 * 1024)

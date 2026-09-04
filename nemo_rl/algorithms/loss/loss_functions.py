@@ -15,7 +15,7 @@
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss.interfaces import (
     LossFunction,
@@ -33,6 +33,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     next_token_accuracy,
     project_student_to_teacher_vocab,
     select_teacher_topk_indices,
+    slice_sparse_projection_cols,
     student_next_token_ce,
     valid_chunk_mask,
 )
@@ -41,6 +42,7 @@ from nemo_rl.distributed.model_utils import (
     DistributedCrossEntropy,
     cp_shift_next,
     group_all_reduce_sum,
+    group_all_reduce_sum_with_grad,
     vocab_parallel_full_log_softmax,
     vocab_parallel_gather_columns,
     vocab_parallel_log_softmax,
@@ -124,7 +126,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     ratio_clip_c: Optional[float] = None
 
     # --- KL regularization ---
-    reference_policy_kl_penalty: float = 0.01
+    reference_policy_kl_penalty: float = Field(default=0.01, ge=0, allow_inf_nan=False)
     # Can be set to k1, k2, k3
     # For more details, see http://joschu.net/blog/kl-approx.html
     reference_policy_kl_type: str = "k3"
@@ -695,7 +697,7 @@ class ClippedPGLossFn(LossFunction):
         # See: docs/guides/grpo.md#sampling-importance-ratio
         if self.sequence_level_importance_ratios:
             sample_importance_ratio = masked_mean(
-                actor_importance_weights,
+                actor_importance_weights.squeeze(-1),
                 sample_mask,
                 global_normalization_factor=global_valid_seqs,
             )
@@ -1619,6 +1621,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         *,
+        student_next_token_logprobs: Optional[torch.Tensor] = None,
+        student_next_token_mask: Optional[torch.Tensor] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1632,9 +1636,16 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         ``student_logits_contig`` (CP-relaid) and the per-teacher ``aligns_by_idx``
         / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
-        the raw ``logits`` is kept for the CE term.
+        the Automodel CP path also supplies its sequence-local CE inputs.
         """
-        ce_loss = self._compute_ce(logits, data, global_valid_toks)
+        ce_loss = self._compute_ce(
+            logits,
+            data,
+            global_valid_toks,
+            student_next_token_logprobs=student_next_token_logprobs,
+            student_next_token_mask=student_next_token_mask,
+            cp_group=cp_group,
+        )
 
         if self.kd_loss_mode == "sum":
             total_kd, per_teacher_metrics = self._sum_kd(
@@ -2275,14 +2286,17 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         Steps:
 
-        1. Project full-vocab student probs through ``M`` to teacher vocab.
-        2. Use the full teacher logits materialized by ``prepare_loss_input``.
-        3. Compute one ``global_top_indices [k]`` per microbatch from the
+        1. Use the full teacher logits materialized by ``prepare_loss_input``.
+        2. Compute one ``global_top_indices [k]`` per microbatch from the
            teacher's importance: ``max`` over flat ``(B*T_t)``, ``topk``
            over ``V_t``. Same vocab subset across every sample/position —
            keeps chunk-averaged KL well-defined.
-        4. Slice both the projected student probs and the teacher logits
-           to those ``k`` columns.
+        3. Restrict ``M`` to those ``k`` teacher columns and project the
+           student probs through it, so only the ``k`` columns are ever
+           produced. Each teacher column of ``M.t() @ p`` is an independent
+           contraction over the student axis, so slicing before the matmul
+           is value-preserving.
+        4. Slice the teacher logits to the same ``k`` columns.
         5. Build per-token chunk masks from ``alignment_*_chunk_id`` and
            chunk-average via ``bmm`` (shared helper).
         6. Renormalize student chunk distributions inside the top-k subset
@@ -2306,10 +2320,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             student_vocab_size=self.student_vocab_size,
             teacher_vocab_size=teacher_vocab_size,
         )  # [V_s, V_t] sparse COO, fp32
-        projected_full = project_student_to_teacher_vocab(
-            student_probs, sparse_projection, tp_group=tp_group
-        )  # [B, T_s_local, V_t]
-        full_teacher_vocab_size = projected_full.shape[-1]
+        # The projection itself is deferred until the top-k columns are known
+        # (see below); its teacher-vocab width is available from the matrix.
+        full_teacher_vocab_size = sparse_projection.size(1)
 
         # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
         # `prepare_loss_input` (rebuilt from the IPC handles). Same transport
@@ -2340,8 +2353,21 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             teacher_full_logits, vocab_topk, cp_group=cp_group
         )  # [k]
 
-        # Slice both sides to the shared [k] columns.
-        projected_topk = projected_full[..., global_top_indices]  # [B, T_s, k]
+        # Slice both sides to the shared [k] columns. On the student side the
+        # slice is folded into the projection matrix rather than applied to its
+        # output: every teacher column of ``M.t() @ p`` is an independent
+        # contraction over the student axis, so restricting M's columns first is
+        # value-preserving, and the only renormalization here is within the [k]
+        # subset (below), never over V_t. Projecting all V_t columns and then
+        # discarding all but k built -- and all-reduced, under TP -- a
+        # [B, T_s, V_t] fp32 tensor to read k of its columns.
+        if vocab_topk < full_teacher_vocab_size:
+            sparse_projection = slice_sparse_projection_cols(
+                sparse_projection, global_top_indices
+            )
+        projected_topk = project_student_to_teacher_vocab(
+            student_probs, sparse_projection, tp_group=tp_group
+        )  # [B, T_s_local, k]
         teacher_topk_logits = teacher_full_logits[
             ..., global_top_indices
         ]  # [B, T_t, k]
@@ -2633,8 +2659,29 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         logits: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         global_valid_toks: torch.Tensor,
+        *,
+        student_next_token_logprobs: Optional[torch.Tensor] = None,
+        student_next_token_mask: Optional[torch.Tensor] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> torch.Tensor:
         """Next-token CE on the student side (TP/CP handled by the helpers)."""
+        if student_next_token_logprobs is not None:
+            assert student_next_token_mask is not None
+            label_mask = student_next_token_mask.to(
+                student_next_token_logprobs.dtype
+            ) * to_local_if_dtensor(data["sample_mask"]).to(
+                student_next_token_logprobs.device
+            ).unsqueeze(-1)
+            local_ce = masked_mean(
+                -student_next_token_logprobs,
+                label_mask,
+                global_normalization_factor=global_valid_toks,
+            )
+            # Forward SUM gives every CP rank the same full-sequence CE (and
+            # therefore the same dynamic KD scale). Identity backward keeps the
+            # disjoint rank-local windows at a single gradient fanout.
+            return group_all_reduce_sum_with_grad(local_ce, cp_group)
+
         per_token_ce = student_next_token_ce(
             logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
         )

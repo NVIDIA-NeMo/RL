@@ -18,8 +18,10 @@ import logging
 import re
 import uuid
 from collections import defaultdict
+from collections.abc import Sequence
 from copy import deepcopy
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Optional, Union
 
 import requests
@@ -32,8 +34,11 @@ from transformers.video_utils import load_video
 
 VLLM_MULTIMODAL_DATA_KEYS = frozenset({"vllm_images", "vllm_videos", "vllm_audios"})
 NATIVE_MULTIMODAL_KEYS = frozenset({"vllm_content", *VLLM_MULTIMODAL_DATA_KEYS})
+IMAGE_CONTENT_TYPES = frozenset({"input_image", "image", "image_url"})
+VIDEO_CONTENT_TYPES = frozenset({"input_video", "video", "video_url"})
+AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
-    {"input_image", "image", "image_url", "video", "audio"}
+    {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
 
 # List of allowed placeholder strings for different media types in the dataset string
@@ -45,6 +50,8 @@ MEDIA_TAGS = {
     "video-audio": "<video-audio>",
 }
 MEDIA_TAGS_REVERSED = {v: k for k, v in MEDIA_TAGS.items()}
+CACHED_VIDEO_FRAME_MANIFEST_MAGIC = b"NEMO_RL_CACHED_VIDEO_FRAMES_V1\n"
+CACHED_VIDEO_FRAME_MANIFEST_MIME = "video/x-nemo-rl-cached-frames"
 
 DEFAULT_MEDIA_EXTENSIONS = {
     "image": ["png", "jpeg", "jpg", "img"],
@@ -783,7 +790,15 @@ def extract_multimodal_model_inputs(
 
     extracted: dict[str, PackedTensor | torch.Tensor] = {}
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    for key in ("imgs_sizes", "num_frames"):
+    # TODO(rohitrango): Let ProcessorInterface declare model-specific media inputs.
+    # Some remote-code processors omit these inputs from model_input_names even
+    # though their model forward requires them.
+    for key in (
+        "imgs_sizes",
+        "num_frames",
+        "pixel_values_flat",
+        "image_num_patches",
+    ):
         if key in processed and key not in multimodal_keys:
             multimodal_keys.append(key)
     for key in multimodal_keys:
@@ -876,14 +891,25 @@ def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{encoded}"
 
 
-def extract_input_image_sources_from_responses_messages(
+def get_responses_content_part_url(part: dict[str, Any], *keys: str) -> str:
+    """Return a string media source from a Responses/Chat content part."""
+    for key in keys:
+        value = part.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("path")
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def extract_input_media_sources_from_responses_messages(
     messages: Any,
-) -> list[str | Image.Image]:
-    """Extract image sources from Responses-API messages in encounter order."""
+) -> list[tuple[str, Any]]:
+    """Extract tagged image and video sources in encounter order."""
     if not isinstance(messages, list):
         return []
 
-    sources: list[str | Image.Image] = []
+    sources: list[tuple[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -893,24 +919,37 @@ def extract_input_image_sources_from_responses_messages(
         for part in content:
             if not isinstance(part, dict):
                 continue
-            if part.get("type") not in ("input_image", "image", "image_url"):
+            part_type = part.get("type")
+            if part_type in IMAGE_CONTENT_TYPES:
+                media_type = "image"
+                source = part.get("image") or part.get("image_url") or part.get("url")
+            elif part_type in VIDEO_CONTENT_TYPES:
+                media_type = "video"
+                source = part.get("video") or part.get("video_url") or part.get("url")
+            else:
                 continue
-            source = part.get("image") or part.get("image_url") or part.get("url")
             if isinstance(source, dict):
-                source = source.get("url")
+                source = source.get("url") or source.get("path")
+            # Skip non-str/non-Image sources: callers hand these straight to
+            # `resolve_to_image`, which would raise on e.g. an int `image_url`.
             if isinstance(source, (str, Image.Image)):
-                sources.append(source)
+                sources.append((media_type, source))
     return sources
 
 
-def extract_input_images_from_responses_messages(
-    messages: Any,
-) -> list[Image.Image]:
-    """Load images from Responses-API input messages in encounter order."""
-    return [
-        resolve_to_image(source)
-        for source in extract_input_image_sources_from_responses_messages(messages)
-    ]
+def media_sources_equal(
+    left: tuple[str, Any],
+    right: tuple[str, Any],
+) -> bool:
+    """Compare tagged media by string value or object identity."""
+    if left[0] != right[0]:
+        return False
+    left_source, right_source = left[1], right[1]
+    return (
+        left_source == right_source
+        if isinstance(left_source, str) and isinstance(right_source, str)
+        else left_source is right_source
+    )
 
 
 def _materialize_ragged_pixel_values(
@@ -1018,51 +1057,41 @@ def attach_image_model_inputs_to_message(
     )
 
 
-def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
-    """Replace local image paths in NeMo Gym examples with base64 data URLs.
+_VIDEO_EXT_TO_MIME = {
+    ".mp4": "mp4",
+    ".m4v": "mp4",
+    ".mov": "quicktime",
+    ".webm": "webm",
+    ".mkv": "x-matroska",
+    ".avi": "x-msvideo",
+}
 
-    Walks each example's ``responses_create_params.input[].content[]`` items
-    and rewrites any ``input_image`` part whose ``image_url`` is a local path
-    (or ``file://`` URL) into a base64 ``data:`` URL via
-    :func:`image_to_data_url`. Parts whose URL already starts with ``http://``,
-    ``https://``, or ``data:`` are left untouched. Malformed items (non-dict
-    entries, missing/empty URLs, non-list ``input``/``content``) are skipped
-    without raising.
 
-    The examples are mutated in place; the same list is also returned for
-    convenience so callers can chain the call.
+def video_path_to_data_url(video_path: str) -> str:
+    """Inline a local or ``file://`` video as a base64 data URL."""
+    if video_path.startswith("data:"):
+        return video_path
 
-    Args:
-        nemo_gym_examples: List of NeMo Gym example dicts. Each example is
-            expected to contain a ``responses_create_params`` mapping with an
-            ``input`` list of Responses API messages.
+    resolved = (
+        video_path.removeprefix("file://")
+        if video_path.startswith("file://")
+        else str(Path(video_path).expanduser().resolve())
+    )
+    path = Path(resolved)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Video path resolved to {resolved!r}, which does not exist."
+        )
 
-    Returns:
-        The same ``nemo_gym_examples`` list, with local image references
-        rewritten to base64 data URLs in place.
-    """
-    for example in nemo_gym_examples:
-        input_items = example.get("responses_create_params", {}).get("input", [])
-        if not isinstance(input_items, list):
-            continue
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if not isinstance(part, dict) or part.get("type") != "input_image":
-                    continue
-                url = part.get("image_url", "")
-                if isinstance(url, dict):
-                    url = url.get("url", "")
-                if not isinstance(url, str) or not url:
-                    continue
-                if url.startswith(("http://", "https://", "data:")):
-                    continue
-                part["image_url"] = image_to_data_url(resolve_to_image(url))
-    return nemo_gym_examples
+    ext = path.suffix.lower()
+    mime = _VIDEO_EXT_TO_MIME.get(ext)
+    if mime is None:
+        raise ValueError(
+            f"Unsupported video extension {ext!r} for {resolved!r}. "
+            f"Supported: {sorted(_VIDEO_EXT_TO_MIME)}."
+        )
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:video/{mime};base64,{encoded}"
 
 
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
@@ -1151,3 +1180,130 @@ def load_media_from_message(
                 loaded_media["video"].append(vid)
 
     return loaded_media
+
+
+def build_media_token_validity_mask(
+    input_ids: torch.Tensor,
+    media_token_id: int,
+    media_counts_by_row: Sequence[int],
+    base_mask: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Mark media-token positions in rows that carry no media of that modality.
+
+    A media token is an ordinary vocabulary entry with its own embedding row.
+    It only means "a projected feature belongs here" when media is attached;
+    in a text-only row the same id is whatever the author wrote, and counting
+    it as a placeholder makes the model demand a feature that does not exist.
+
+    Rows that do carry media keep every position valid, so a real
+    placeholder/feature disagreement there is still reported rather than
+    silently masked away.
+
+    Args:
+        input_ids: ``[B, S]`` token ids, one row per sample.
+        media_token_id: Vocabulary id the model treats as a media placeholder.
+        media_counts_by_row: Attached media items per row, e.g. from
+            :meth:`PackedTensor.logical_segment_counts_by_row`.
+        base_mask: Optional ``[B, S]`` validity mask to refine, so masks for
+            several modalities can be combined.
+
+    Returns:
+        A ``[B, S]`` bool mask, or ``None`` when nothing needs masking and the
+        caller should leave the model's own derivation untouched.
+    """
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must be [B, S], got {tuple(input_ids.shape)}")
+    if len(media_counts_by_row) != input_ids.shape[0]:
+        raise ValueError(
+            "media_counts_by_row must have one entry per row: got "
+            f"{len(media_counts_by_row)} for {input_ids.shape[0]} rows"
+        )
+
+    empty_rows = [row for row, count in enumerate(media_counts_by_row) if count == 0]
+    if not empty_rows:
+        return base_mask
+
+    is_media_token = input_ids == media_token_id
+    if not bool(is_media_token[empty_rows].any()):
+        # Text-only rows exist but none of them spell the token, so the
+        # model's own derivation is already correct.
+        return base_mask
+
+    mask = (
+        torch.ones_like(input_ids, dtype=torch.bool)
+        if base_mask is None
+        else base_mask.clone()
+    )
+    for row in empty_rows:
+        mask[row] &= ~is_media_token[row]
+    return mask
+
+
+def media_placeholder_token_id_from_chunks(chunks: Sequence[Any]) -> Optional[int]:
+    """The vocabulary id these model chunks treat as a media placeholder, if any."""
+    for chunk in chunks:
+        token_id = getattr(chunk, "image_token_index", None)
+        if token_id is not None:
+            return int(token_id)
+    return None
+
+
+def chunks_accept_media_token_validity_mask(chunks: Sequence[Any]) -> bool:
+    """Whether a model chunk's forward takes an explicit media-token validity mask.
+
+    Checked against the signature rather than a class flag so a model that does
+    not know about the mask never receives it: such a forward would absorb it
+    into ``**kwargs`` and silently ignore it, which looks identical to the mask
+    having been applied. Failing to send it is visible; sending it into a void
+    is not.
+    """
+    for chunk in chunks:
+        try:
+            parameters = inspect.signature(chunk.forward).parameters
+        except (TypeError, ValueError):
+            continue
+        if "media_token_validity_mask" in parameters:
+            return True
+    return False
+
+
+def image_counts_by_row(batch: Any, num_rows: int) -> Optional[list[int]]:
+    """How many images each row of the batch actually carries.
+
+    Returns None when the batch describes its images in a way this cannot read,
+    so the caller leaves the model's own derivation alone rather than guessing a
+    count and masking against it.
+    """
+    pixel_values = batch.get("pixel_values", None)
+    if pixel_values is None:
+        # A text-only batch genuinely has no images anywhere, which is exactly
+        # the case the mask exists for -- not a missing-data case.
+        return [0] * num_rows
+    if not isinstance(pixel_values, PackedTensor):
+        return None
+    counts = pixel_values.logical_segment_counts_by_row()
+    return counts if len(counts) == num_rows else None
+
+
+def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) -> None:
+    """Mark media tokens that anchor nothing, so the model keeps their embedding.
+
+    Builds the mask while rows still are samples. Sequence packing later
+    concatenates those rows into one THD sequence, after which no per-row
+    question can be asked, so the packing step carries this through the same
+    transform as ``input_ids`` rather than deriving it downstream.
+
+    The batch is duck-typed rather than annotated as ``BatchedDataDict``:
+    that module imports this one, so naming it here would be circular.
+    """
+    if media_token_id is None:
+        return
+    input_ids = batch.get("input_ids", None)
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        return
+    counts = image_counts_by_row(batch, input_ids.shape[0])
+    if counts is None:
+        return
+    mask = build_media_token_validity_mask(input_ids, media_token_id, counts)
+    if mask is not None:
+        batch["media_token_validity_mask"] = mask

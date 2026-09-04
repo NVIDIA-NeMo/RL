@@ -15,7 +15,6 @@
 """Tests for vLLM checkpoint-engine worker lifecycle helpers."""
 
 import asyncio
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -96,14 +95,7 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
     worker._load_weights = lambda batch: events.append(
         ("load", [name for name, _weight in batch])
     )
-
-    @contextmanager
-    def lifecycle(transport):
-        events.append(("lifecycle_enter", transport))
-        yield lambda: events.append(("finalize",))
-        events.append(("lifecycle_exit",))
-
-    worker._weight_update_lifecycle = lifecycle
+    worker._maybe_process_fp8_kv_cache = lambda: events.append(("fp8",))
     monkeypatch.setattr(
         torch.cuda,
         "current_stream",
@@ -112,14 +104,27 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
 
     assert asyncio.run(worker._update_weights_from_checkpoint_engine_async()) is True
     assert events == [
-        ("lifecycle_enter", "checkpoint_engine"),
         ("load", ["a"]),
         ("sync",),
         ("load", ["b", "c"]),
         ("sync",),
-        ("finalize",),
-        ("lifecycle_exit",),
+        ("fp8",),
     ]
+
+
+@pytest.mark.vllm
+def test_checkpoint_engine_rejects_native_trtllm_refit():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtensionWithCheckpointEngine,
+    )
+
+    worker = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
+    worker._uses_unquantized_flashinfer_trtllm = lambda: True
+
+    with pytest.raises(RuntimeError, match="checkpoint-engine"):
+        asyncio.run(worker._update_weights_from_checkpoint_engine_async())
 
 
 @pytest.mark.vllm

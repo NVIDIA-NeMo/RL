@@ -7,6 +7,19 @@ grpo:
   # SC reads async_rl instead, and the entrypoint raises if this block is set.
   async_grpo: null
   val_period: 0
+  # Optional NeMo-Gym message-level penalties. Values overwrite computed
+  # advantages on tokens belonging to the corresponding assistant message.
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+
+# Reward-zeroing penalties applied to NeMo-Gym rollout results.
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: false
+  # Optional model/tokenizer-specific IDs. Example:
+  # token_ids: {unwanted: [2], think_open: 12, think_close: 13}
 
 async_rl:
   sampler:
@@ -35,7 +48,7 @@ async_rl:
   # so the structure says which knob applies where. Filling in the block for the
   # path a run is not taking is rejected at setup rather than silently ignored.
   rollout_failure:
-    max_infra_attempts_per_prompt: 5  # infra budget; exhausting it fails the run
+    max_infra_attempts_per_prompt: 5  # infra budget; exhausting it drops the prompt
     max_data_attempts_per_prompt: 2   # data budget; 1 retry separates transient from deterministic
     backoff_base_s: 1.0
     max_backoff_s: 30.0
@@ -43,6 +56,30 @@ async_rl:
     # on the first one, propagating the original error. The two budgets above are
     # INDEPENDENT counters, so one prompt can consume up to their sum minus one.
     max_skipped_prompts: 0
+    # CONSECUTIVE prompts allowed to exhaust their infra budget and be dropped; any
+    # committed rollout resets the count. 0 fails the run on the first one. Raise it
+    # on a large fleet where losing the odd shard is expected and a whole run is
+    # expensive to restart -- a step short a few groups still trains, and the count
+    # only keeps climbing if nothing at all is coming back.
+    max_consecutive_dropped_prompts: 0
+    # Smallest batch a step may train on, as a fraction of num_prompts_per_step.
+    # The budgets above are run-scoped and cannot bound how short one step gets, so
+    # this is what guarantees the gradient is computed from most of a batch. The floor
+    # is ceil(fraction * num_prompts_per_step), so small batches tolerate no drops.
+    min_step_batch_fraction: 0.9
+    # What happens to the step a dropped prompt was stamped for (in_order sampler only;
+    # an unstamped sampler strands nothing). "shrink" trains the step on fewer groups,
+    # bounded by the floor above. "replace" substitutes a fresh prompt so the step keeps
+    # its configured batch size -- what the v1 stack does -- and still shrinks if the
+    # attempts or spares below run out. When a later step already has a finished group,
+    # replace borrows it to close the dropped step immediately and sends the fresh
+    # prompt to repay that step instead, so the trainer does not idle waiting on a new
+    # rollout; promoted_prompt_groups reports when that happened.
+    on_dropped_prompt: shrink         # shrink | replace
+    max_replacement_attempts: 1       # fresh prompts tried per lost group
+    # Low-water mark for the spare-prompt pool. Refilled by diverting one whole batch
+    # from the dataloader before it is admitted, so a refill yields a batch of spares.
+    replacement_reserve_prompts: 1
 
     # Deadlines. null disables, which is the default and reproduces the historical
     # behaviour of waiting forever. Set them in any run that matters: without one a
@@ -60,16 +97,53 @@ async_rl:
 
   # Last-resort stall detection. stall_timeout_s must exceed interval_s and every
   # deadline above, so a merely-slow rollout is not reported as a stall.
-  watchdog:
+  stall_watchdog:
     interval_s: 30.0
     stall_timeout_s: 600.0
     stall_action: warn                # warn | abort
     gym_subprocess_check: true        # polls NeMo-Gym's RunHelper for dead servers
 
+  # Per-shard liveness for the generation fleet. Off by default, in which case shard
+  # selection keeps its historical health-blind round-robin. On, a shard that fails
+  # probes or real requests is quarantined instead of keeping its 1/N of traffic, and
+  # the run aborts with an attributable error once too few shards remain.
+  generation_fleet_health:
+    enabled: false
+    probe_interval_s: 5.0             # must exceed probe_timeout_s
+    probe_timeout_s: 2.0
+    unhealthy_threshold: 3            # ~15s to quarantine at the default interval
+    healthy_threshold: 2              # successes before a suspect shard is trusted again
+    selection: least_outstanding      # steers away from a slow shard without diagnosing it
+    on_dead_shard: fail_fast          # only value; recovery is not selected here -- the reconcile
+                                      # rebuilds over the survivors whenever a shard becomes absent
+    max_restart_attempts_per_shard: 5
+    min_healthy_shards: 1             # below this the run aborts
+    refit_timeout_s: 300.0            # deadline for one refit collective, then each worker aborts its own
+                                      # communicator. Required for recovery, not cosmetic: without it a shard
+                                      # dying mid-refit leaves the trainers blocked in NCCL and the rebuild
+                                      # queues behind them, so the recovery wedges too. ~150x a healthy refit
+                                      # at this size (~1.9s); raise it for frontier-scale models (~500s at
+                                      # 405B). null disarms the watchdog entirely.
+
+  # NeMo-Gym-facing router in front of the generation fleet. Gym picks an endpoint by
+  # round-robin over a list fixed at process start and never fails over, so it is handed
+  # one NeMo-RL-owned URL instead and the routing decision moves next to generation_fleet_health.
+  # Only meaningful on the NeMo-Gym path; the native path calls generation over Ray.
+  generation_router:
+    enabled: false
+    port_range_low: 1202              # between Ray client (1201) and management (1301+)
+    port_range_high: 1300
+    backend_timeout_s: 600.0          # covers a whole generation; Gym sets none at all
+    connect_timeout_s: 5.0            # a local handshake is ms-or-never
+    no_healthy_backend_status: 409    # must stay outside Gym's retry set
+
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-single-controller
   metric_name: null
+  # Include native TQ state and the metadata-only replay index. A save failure
+  # aborts checkpoint finalization.
+  save_data_plane: true
 
 policy:
   dtensor_cfg:
@@ -78,8 +152,7 @@ policy:
     enabled: true
 
   generation:
-    port_range_low: 11001
-    port_range_high: 15000
+    # HTTP ports inherit the shared [3000, 4999) band from grpo_math_1B.yaml.
     mcore_generation_config:
       unified_memory_level: 0
     vllm_cfg:
@@ -102,6 +175,5 @@ data_plane:
   enabled: true
 
 cluster:
+  # Master ports inherit the shared 1400-1999 band from grpo_math_1B.yaml.
   gpus_per_node: 2
-  master_port_range_low: 25000
-  master_port_range_high: 28000
