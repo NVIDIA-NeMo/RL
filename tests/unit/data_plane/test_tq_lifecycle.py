@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Callable
+import pickle
+from pathlib import Path
+from typing import Any, Callable
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -263,6 +265,98 @@ def test_checkpoint_lifecycle_forwards_to_tq(monkeypatch, tmp_path) -> None:
     assert load_calls == [checkpoint_dir]
     assert metadata == {"step": 7}
     assert client._data_operations_started
+
+
+def test_deserialization_rebuilds_mooncake_client_before_attach(monkeypatch) -> None:
+    from nemo_rl.data_plane.adapters import tq_mooncake_checkpoint
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+        "mooncake_cpu": {
+            "reuse_registered_buffers": False,
+            "checkpoint": {"enabled": True},
+        },
+    }
+    events: list[str] = []
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(
+        tq_adapter,
+        "_patch_mooncake_register_check",
+        lambda: events.append("register_patch"),
+    )
+    monkeypatch.setattr(
+        tq_mooncake_checkpoint,
+        "install_tq_mooncake_checkpoint_plugin",
+        lambda: events.append("checkpoint_plugin"),
+    )
+    monkeypatch.setattr(
+        tq_adapter, "_connect_existing", lambda: events.append("connect")
+    )
+    bootstrap = MagicMock(side_effect=AssertionError("unexpected TQ bootstrap"))
+    monkeypatch.setattr(tq_adapter, "_init_tq", bootstrap)
+
+    source = object.__new__(tq_adapter.TQDataPlaneClient)
+    source._cfg = cfg
+    restored = pickle.loads(pickle.dumps(source))
+
+    assert events == ["register_patch", "checkpoint_plugin", "connect"]
+    assert restored._cfg == cfg
+    assert restored._supports_checkpointing is True
+    bootstrap.assert_not_called()
+
+
+@pytest.mark.parametrize("storage_metadata", [{}, {"storage_saved": False}])
+@pytest.mark.parametrize("operation", ["save", "load"])
+def test_checkpoint_rejects_incomplete_storage(
+    monkeypatch,
+    tmp_path,
+    storage_metadata: dict[str, Any],
+    operation: str,
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    checkpoint_dir = tmp_path / f"{operation}-checkpoint"
+    connect = MagicMock()
+    load = MagicMock()
+
+    def save(
+        path: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        del metadata
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "metadata.json").write_text(json.dumps(storage_metadata))
+
+    monkeypatch.setattr(tq_adapter, "_connect_existing", connect)
+    monkeypatch.setattr(tq_adapter.tq, "save_checkpoint", save)
+    monkeypatch.setattr(tq_adapter.tq, "load_checkpoint", load)
+
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._backend = "simple"
+    client._supports_checkpointing = True
+    client._data_operations_started = False
+
+    if operation == "load":
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "metadata.json").write_text(json.dumps(storage_metadata))
+
+    with pytest.raises(RuntimeError, match="storage_saved must be true"):
+        if operation == "save":
+            client.save_checkpoint(checkpoint_dir)
+        else:
+            client.load_checkpoint(checkpoint_dir)
+
+    if operation == "save":
+        connect.assert_called_once_with()
+    else:
+        connect.assert_not_called()
+    load.assert_not_called()
 
 
 def test_list_sample_ids_uses_tq_partition_listing(monkeypatch) -> None:
