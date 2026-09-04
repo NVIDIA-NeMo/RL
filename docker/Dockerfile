@@ -129,6 +129,9 @@ ENV RAY_USAGE_STATS_ENABLED=0
 # There is severe contention and performance issues with this enabled considering our dependencies are so large and occasionally
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+# Set once here: `hermetic` and `release` both derive from `base`, so they inherit it.
+# The worker-venv prefetch in the hermetic stage reads it -- do not re-declare it in a
+# later stage, or the value the prefetch uses and the value the image ships can drift.
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
 
@@ -387,7 +390,6 @@ find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_f
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
-ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 # Custom setup layer (override with: --build-context custom-setup=<dir> --build-arg CUSTOM_SETUP_FNAME=<script>)
 # To skip: --build-arg CUSTOM_SETUP_FNAME=
@@ -427,7 +429,6 @@ ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
-ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 ENV NEMO_RL_DYNAMO_VENV_DIR=/opt/dynamo_venv
 
 # AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
