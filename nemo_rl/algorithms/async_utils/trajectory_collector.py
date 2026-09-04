@@ -48,7 +48,11 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import (
+    emit_nemo_gym_trace,
+    format_nemo_gym_exception,
+    should_use_nemo_gym,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -1607,11 +1611,22 @@ class AsyncTrajectoryCollector:
             )
             for group_index in range(expected_prompt_groups)
         ]
+
+        def _group_identities(group_indices: set[int]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "group_index": group_index,
+                    "task_index": group_input_task_indices[group_index],
+                }
+                for group_index in sorted(group_indices)
+            ]
+
         buffered_group_indices: set[int] = set()
         last_error: Exception | None = None
         last_enqueue_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
+            attempt_started_at = time.perf_counter()
             pending_group_indices = expected_group_indices - buffered_group_indices
             if len(pending_group_indices) == expected_prompt_groups:
                 attempt_batch = repeated_batch
@@ -1633,7 +1648,22 @@ class AsyncTrajectoryCollector:
                 for row in attempt_batch["extra_env_info"]:
                     row[_NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt - 1
 
+            emit_nemo_gym_trace(
+                "collector_attempt_started",
+                generation_weight_version=generation_weight_version,
+                target_weight_version=target_weight_version,
+                attempt_number=attempt,
+                attempt_index=attempt - 1,
+                max_attempts=max_attempts,
+                use_nemo_gym=use_nemo_gym,
+                attempt_rows=attempt_batch.size,
+                expected_groups=expected_prompt_groups,
+                buffered_groups=_group_identities(buffered_group_indices),
+                pending_groups=_group_identities(pending_group_indices),
+            )
+
             push_tasks: list[asyncio.Task[None]] = []
+            push_task_group_indices: list[int] = []
             scheduled_group_indices: set[int] = set()
             stream_error: Exception | None = None
             try:
@@ -1659,6 +1689,7 @@ class AsyncTrajectoryCollector:
                             f"Rollout stream yielded prompt group {group_index} twice"
                         )
                     scheduled_group_indices.add(group_index)
+                    push_task_group_indices.append(group_index)
                     push_tasks.append(
                         asyncio.create_task(
                             self._enqueue_rollout_group(
@@ -1674,8 +1705,44 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as error:
                 stream_error = error
+                emit_nemo_gym_trace(
+                    "collector_stream_exception",
+                    generation_weight_version=generation_weight_version,
+                    target_weight_version=target_weight_version,
+                    attempt_number=attempt,
+                    attempt_index=attempt - 1,
+                    max_attempts=max_attempts,
+                    elapsed_seconds=time.perf_counter() - attempt_started_at,
+                    scheduled_groups=_group_identities(scheduled_group_indices),
+                    buffered_groups=_group_identities(buffered_group_indices),
+                    pending_groups=_group_identities(
+                        expected_group_indices - buffered_group_indices
+                    ),
+                    exception=format_nemo_gym_exception(error),
+                )
 
             push_results = await asyncio.gather(*push_tasks, return_exceptions=True)
+            push_failures = [
+                (group_index, result)
+                for group_index, result in zip(
+                    push_task_group_indices, push_results, strict=True
+                )
+                if isinstance(result, BaseException)
+            ]
+            for group_index, error in push_failures:
+                emit_nemo_gym_trace(
+                    "collector_enqueue_exception",
+                    generation_weight_version=generation_weight_version,
+                    target_weight_version=target_weight_version,
+                    attempt_number=attempt,
+                    attempt_index=attempt - 1,
+                    group={
+                        "group_index": group_index,
+                        "task_index": group_input_task_indices[group_index],
+                    },
+                    elapsed_seconds=time.perf_counter() - attempt_started_at,
+                    exception=format_nemo_gym_exception(error),
+                )
             push_errors = [
                 result for result in push_results if isinstance(result, Exception)
             ]
@@ -1683,6 +1750,21 @@ class AsyncTrajectoryCollector:
                 last_enqueue_error = push_errors[0]
             pending_group_indices = expected_group_indices - buffered_group_indices
             if not pending_group_indices:
+                emit_nemo_gym_trace(
+                    "collector_attempt_finished",
+                    outcome="complete",
+                    generation_weight_version=generation_weight_version,
+                    target_weight_version=target_weight_version,
+                    attempt_number=attempt,
+                    attempt_index=attempt - 1,
+                    max_attempts=max_attempts,
+                    elapsed_seconds=time.perf_counter() - attempt_started_at,
+                    scheduled_groups=_group_identities(scheduled_group_indices),
+                    buffered_groups=_group_identities(buffered_group_indices),
+                    pending_groups=[],
+                    stream_failed=stream_error is not None,
+                    enqueue_failure_count=len(push_failures),
+                )
                 return True
 
             last_error = stream_error or (push_errors[0] if push_errors else None)
@@ -1691,10 +1773,39 @@ class AsyncTrajectoryCollector:
                     "Rollout stream ended before yielding prompt groups "
                     f"{sorted(pending_group_indices)}"
                 )
+            emit_nemo_gym_trace(
+                "collector_attempt_finished",
+                outcome="partial",
+                generation_weight_version=generation_weight_version,
+                target_weight_version=target_weight_version,
+                attempt_number=attempt,
+                attempt_index=attempt - 1,
+                max_attempts=max_attempts,
+                elapsed_seconds=time.perf_counter() - attempt_started_at,
+                scheduled_groups=_group_identities(scheduled_group_indices),
+                buffered_groups=_group_identities(buffered_group_indices),
+                pending_groups=_group_identities(pending_group_indices),
+                stream_failed=stream_error is not None,
+                enqueue_failure_count=len(push_failures),
+                exception=format_nemo_gym_exception(last_error),
+            )
             if attempt == max_attempts or not self.running:
                 break
 
             retry_delay = _NEMO_GYM_RETRY_DELAY_BASE_SECONDS * (2 ** (attempt - 1))
+            emit_nemo_gym_trace(
+                "collector_retry_scheduled",
+                generation_weight_version=generation_weight_version,
+                target_weight_version=target_weight_version,
+                completed_attempt_number=attempt,
+                next_attempt_number=attempt + 1,
+                next_attempt_index=attempt,
+                max_attempts=max_attempts,
+                retry_delay_seconds=retry_delay,
+                buffered_groups=_group_identities(buffered_group_indices),
+                pending_groups=_group_identities(pending_group_indices),
+                exception=format_nemo_gym_exception(last_error),
+            )
             print(
                 "❌ NeMo-Gym batch did not complete prompt groups "
                 f"{sorted(pending_group_indices)}; retrying in "
@@ -1705,6 +1816,21 @@ class AsyncTrajectoryCollector:
 
         if use_nemo_gym and buffered_group_indices and last_enqueue_error is None:
             pending_group_indices = expected_group_indices - buffered_group_indices
+            emit_nemo_gym_trace(
+                "collector_retries_exhausted",
+                outcome="release_for_gap_fill",
+                generation_weight_version=generation_weight_version,
+                target_weight_version=target_weight_version,
+                max_attempts=max_attempts,
+                elapsed_seconds=time.perf_counter() - collection_started_at,
+                buffered_groups=_group_identities(buffered_group_indices),
+                pending_groups=_group_identities(pending_group_indices),
+                exception=(
+                    format_nemo_gym_exception(last_error)
+                    if last_error is not None
+                    else None
+                ),
+            )
             print(
                 "⚠️ NeMo-Gym batch exhausted retries after buffering "
                 f"{len(buffered_group_indices)}/{expected_prompt_groups} prompt "
@@ -1719,6 +1845,22 @@ class AsyncTrajectoryCollector:
             f"{sorted(expected_group_indices - buffered_group_indices)}"
         )
         error_cause = last_enqueue_error or last_error
+        emit_nemo_gym_trace(
+            "collector_batch_failed",
+            generation_weight_version=generation_weight_version,
+            target_weight_version=target_weight_version,
+            max_attempts=max_attempts,
+            elapsed_seconds=time.perf_counter() - collection_started_at,
+            buffered_groups=_group_identities(buffered_group_indices),
+            pending_groups=_group_identities(
+                expected_group_indices - buffered_group_indices
+            ),
+            exception=(
+                format_nemo_gym_exception(error_cause)
+                if error_cause is not None
+                else format_nemo_gym_exception(batch_error)
+            ),
+        )
         if error_cause is not None:
             raise batch_error from error_cause
         raise batch_error

@@ -2900,7 +2900,7 @@ class TestAsyncTrajectoryCollector:
         assert "unexpected add status" in str(exc.value.__cause__)
 
     def test_nemo_gym_batch_retry_forwards_effort_config_without_duplicates(
-        self, monkeypatch
+        self, monkeypatch, capsys
     ):
         """Retries preserve effort shaping and do not re-enqueue buffered groups."""
 
@@ -3017,6 +3017,12 @@ class TestAsyncTrajectoryCollector:
         assert rollout_call_attempt_indices == [[0, 0, 0, 0], [1, 1]]
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
+        trace = capsys.readouterr().out
+        assert '"event":"collector_stream_exception"' in trace
+        assert '"event":"collector_retry_scheduled"' in trace
+        assert '"event":"collector_attempt_finished"' in trace
+        assert '"task_index":8' in trace
+        assert "transient stream failure" in trace
 
     def test_invalid_gym_batch_releases_target(self):
         """Validation errors cannot leave a target reservation stuck."""

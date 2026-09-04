@@ -19,8 +19,9 @@ import asyncio
 import copy
 import json
 import statistics
+import time
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -56,7 +57,10 @@ from nemo_rl.environments.interfaces import (
 )
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
+    emit_nemo_gym_trace,
+    format_nemo_gym_exception,
     get_pad_dynamic_image_shapes,
+    summarize_nemo_gym_row,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_ROLLOUT_INDEX_KEY,
@@ -1750,6 +1754,57 @@ class _NemoGymStreamAccumulator:
     def is_complete(self) -> bool:
         return len(self._received_row_indices) == len(self._rows)
 
+    def diagnostic_state(self) -> dict[str, Any]:
+        """Describe received, partial, and missing stream state for failure logs."""
+        try:
+            expected_row_indices = set(range(len(self._rows)))
+            missing_row_indices = sorted(
+                expected_row_indices - self._received_row_indices
+            )
+            pending_group_indices = set(self._pending_results)
+            received_group_indices = {
+                row_index // self._num_generations
+                for row_index in self._received_row_indices
+            }
+            partial_groups = []
+            for group_index in sorted(pending_group_indices):
+                start = group_index * self._num_generations
+                expected_group_rows = set(range(start, start + self._num_generations))
+                received_group_rows = set(self._pending_results[group_index])
+                partial_groups.append(
+                    {
+                        "group_index": group_index,
+                        "received_row_indices": sorted(received_group_rows),
+                        "missing_row_indices": sorted(
+                            expected_group_rows - received_group_rows
+                        ),
+                    }
+                )
+            return {
+                "expected_rows": len(self._rows),
+                "received_rows": len(self._received_row_indices),
+                "received_row_indices": sorted(self._received_row_indices),
+                "missing_row_indices": missing_row_indices,
+                "missing_rows": [
+                    {
+                        "stream_row_index": row_index,
+                        **summarize_nemo_gym_row(self._rows[row_index]),
+                    }
+                    for row_index in missing_row_indices
+                ],
+                "expected_groups": len(self._rows) // self._num_generations,
+                "completed_group_indices": sorted(
+                    received_group_indices - pending_group_indices
+                ),
+                "partial_groups": partial_groups,
+            }
+        except BaseException as error:  # pragma: no cover - defensive diagnostics
+            return {
+                "expected_rows": len(self._rows),
+                "received_rows": len(self._received_row_indices),
+                "diagnostic_error": format_nemo_gym_exception(error),
+            }
+
     def add(self, row_index: int, result: dict) -> _CompletedNemoGymGroup | None:
         """Add one streamed row and return its group when that group is complete."""
         if not isinstance(row_index, int):
@@ -1810,6 +1865,37 @@ class _NemoGymStreamAccumulator:
             "NeMo-Gym rollout stream ended before all rows arrived; missing row "
             f"indices {missing_row_indices}"
         )
+
+
+def _summarize_nemo_gym_batch(rows: list[dict]) -> dict[str, Any]:
+    """Return safe batch identity fields used by cross-process trace events."""
+    try:
+        agent_counts = Counter(
+            str((row.get("agent_ref") or {}).get("name"))
+            for row in rows
+            if isinstance(row, dict)
+        )
+
+        def _unique_values(key: str) -> list[Any]:
+            values = {
+                row.get(key)
+                for row in rows
+                if isinstance(row, dict) and row.get(key) is not None
+            }
+            return sorted(values, key=repr)
+
+        return {
+            "rows": len(rows),
+            "agent_counts": dict(agent_counts),
+            "task_indices": _unique_values("_ng_task_index"),
+            "rollout_indices": _unique_values("_ng_rollout_index"),
+            "attempt_indices": _unique_values("_ng_attempt_index"),
+        }
+    except BaseException as error:  # pragma: no cover - defensive diagnostics
+        return {
+            "rows": len(rows),
+            "diagnostic_error": format_nemo_gym_exception(error),
+        }
 
 
 def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
@@ -2418,6 +2504,8 @@ async def run_async_nemo_gym_rollout(
             num_generations=num_generations,
             allow_mixed_agents=returns_entire_batch,
         )
+        stream_started_at = time.perf_counter()
+        batch_trace = _summarize_nemo_gym_batch(nemo_gym_rows)
         final_rollout_result: NemoGymRolloutResult | None = None
         actor_timing_metrics: dict[str, Any] = {}
         nemo_gym_environment = task_to_env["nemo_gym"]
@@ -2434,10 +2522,26 @@ async def run_async_nemo_gym_rollout(
                     enabled=debug_payload_metrics,
                 )
             )
-            rollout_gen = nemo_gym_environment.run_rollouts.options(
-                num_returns="streaming"
-            ).remote(*ray_arguments)
-        rollout_iterator = rollout_gen.__aiter__()
+            try:
+                rollout_gen = nemo_gym_environment.run_rollouts.options(
+                    num_returns="streaming"
+                ).remote(*ray_arguments)
+                rollout_iterator = rollout_gen.__aiter__()
+            except BaseException as error:
+                emit_nemo_gym_trace(
+                    "ray_stream_exception",
+                    phase="launch_actor_stream",
+                    batch=batch_trace,
+                    elapsed_seconds=time.perf_counter() - stream_started_at,
+                    accumulator=accumulator.diagnostic_state(),
+                    exception=format_nemo_gym_exception(error),
+                )
+                raise
+        emit_nemo_gym_trace(
+            "ray_stream_opened",
+            batch=batch_trace,
+            elapsed_seconds=time.perf_counter() - stream_started_at,
+        )
 
     while True:
         stream_finished = False
@@ -2448,55 +2552,104 @@ async def run_async_nemo_gym_rollout(
                     future = await anext(rollout_iterator)
                 except StopAsyncIteration:
                     stream_finished = True
-                else:
-                    rowidx, result, timing_metrics = await future
-                    # Measure the received streaming Ray value in the caller. In
-                    # async training this runs in the collector actor; validation
-                    # runs in the driver, so the two phases cannot share a metric
-                    # accumulator even when they share the NeMo-Gym actor.
-                    print_multimodal_payload_metrics(
-                        collect_multimodal_payload_metrics(
-                            (rowidx, result, timing_metrics),
-                            "nemo_gym_return",
-                            enabled=debug_payload_metrics,
-                        )
+                except BaseException as error:
+                    emit_nemo_gym_trace(
+                        "ray_stream_exception",
+                        phase="next_stream_reference",
+                        batch=batch_trace,
+                        elapsed_seconds=time.perf_counter() - stream_started_at,
+                        accumulator=accumulator.diagnostic_state(),
+                        exception=format_nemo_gym_exception(error),
                     )
+                    raise
+                else:
+                    stream_value_phase = "await_stream_value"
+                    try:
+                        streamed_value = await future
+                        stream_value_phase = "decode_stream_value"
+                        rowidx, result, timing_metrics = streamed_value
+                        stream_value_phase = "measure_stream_value"
+                        # Measure the received streaming Ray value in the caller. In
+                        # async training this runs in the collector actor; validation
+                        # runs in the driver, so the two phases cannot share a metric
+                        # accumulator even when they share the NeMo-Gym actor.
+                        print_multimodal_payload_metrics(
+                            collect_multimodal_payload_metrics(
+                                (rowidx, result, timing_metrics),
+                                "nemo_gym_return",
+                                enabled=debug_payload_metrics,
+                            )
+                        )
+                    except BaseException as error:
+                        emit_nemo_gym_trace(
+                            "ray_stream_exception",
+                            phase=stream_value_phase,
+                            batch=batch_trace,
+                            elapsed_seconds=time.perf_counter() - stream_started_at,
+                            accumulator=accumulator.diagnostic_state(),
+                            exception=format_nemo_gym_exception(error),
+                        )
+                        raise
 
             if not stream_finished:
-                if timing_metrics is not None:
-                    actor_timing_metrics = timing_metrics
+                processing_phase = "update_actor_timing"
+                try:
+                    if timing_metrics is not None:
+                        actor_timing_metrics = timing_metrics
 
-                _tensorize_nemo_gym_result(result)
-                completed_group = accumulator.add(rowidx, result)
-                if original_message_logs is not None:
-                    _reattach_static_multimodal_payloads_to_result(
-                        result, original_message_logs[rowidx]
+                    processing_phase = "tensorize_result"
+                    _tensorize_nemo_gym_result(result)
+                    processing_phase = "accumulate_result"
+                    completed_group = accumulator.add(rowidx, result)
+                    processing_phase = "reattach_multimodal_payload"
+                    if original_message_logs is not None:
+                        _reattach_static_multimodal_payloads_to_result(
+                            result, original_message_logs[rowidx]
+                        )
+                        result.pop("_initial_multimodal_data_omitted", None)
+                    if completed_group is not None:
+                        processing_phase = "slice_prompt_group"
+                        group_input_batch = input_batch.slice(
+                            completed_group.group_index * num_generations,
+                            (completed_group.group_index + 1) * num_generations,
+                        )
+                        processing_phase = "postprocess_prompt_group"
+                        rollout_result = _postprocess_single_nemo_gym_group(
+                            nemo_gym_rows=completed_group.rows,
+                            results=completed_group.results,
+                            timer=timer,
+                            timer_prefix=timer_prefix,
+                            policy_generation=policy_generation,
+                            input_batch=group_input_batch,
+                            tokenizer=tokenizer,
+                            log_full_result_tables=log_full_result_tables,
+                            effort_config=effort_config,
+                            reward_penalty_config=reward_penalty_config,
+                            length_penalty_config=length_penalty_config,
+                            thinking_tags=thinking_tags,
+                            mask_env_flagged_samples=mask_env_flagged_samples,
+                        )
+                        if accumulator.is_complete:
+                            final_rollout_result = rollout_result
+                        else:
+                            group_to_yield = rollout_result
+                except BaseException as error:
+                    row_trace: dict[str, Any] = {"stream_row_index": repr(rowidx)}
+                    if isinstance(rowidx, int) and 0 <= rowidx < len(nemo_gym_rows):
+                        row_trace = {
+                            "stream_row_index": rowidx,
+                            **summarize_nemo_gym_row(nemo_gym_rows[rowidx]),
+                        }
+                    emit_nemo_gym_trace(
+                        "consumer_result_exception",
+                        phase=processing_phase,
+                        row=row_trace,
+                        batch=batch_trace,
+                        elapsed_seconds=time.perf_counter() - stream_started_at,
+                        accumulator=accumulator.diagnostic_state(),
+                        exception=format_nemo_gym_exception(error),
                     )
-                    result.pop("_initial_multimodal_data_omitted", None)
-                if completed_group is not None:
-                    group_input_batch = input_batch.slice(
-                        completed_group.group_index * num_generations,
-                        (completed_group.group_index + 1) * num_generations,
-                    )
-                    rollout_result = _postprocess_single_nemo_gym_group(
-                        nemo_gym_rows=completed_group.rows,
-                        results=completed_group.results,
-                        timer=timer,
-                        timer_prefix=timer_prefix,
-                        policy_generation=policy_generation,
-                        input_batch=group_input_batch,
-                        tokenizer=tokenizer,
-                        log_full_result_tables=log_full_result_tables,
-                        effort_config=effort_config,
-                        reward_penalty_config=reward_penalty_config,
-                        length_penalty_config=length_penalty_config,
-                        thinking_tags=thinking_tags,
-                        mask_env_flagged_samples=mask_env_flagged_samples,
-                    )
-                    if accumulator.is_complete:
-                        final_rollout_result = rollout_result
-                    else:
-                        group_to_yield = rollout_result
+                    raise
 
         if stream_finished:
             break
@@ -2504,14 +2657,32 @@ async def run_async_nemo_gym_rollout(
             yield group_to_yield
 
     with timer.time(total_timer_label):
-        accumulator.finish()
-        if final_rollout_result is None:
-            raise RuntimeError(
-                "NeMo-Gym completed without producing a final prompt group"
+        try:
+            accumulator.finish()
+            if final_rollout_result is None:
+                raise RuntimeError(
+                    "NeMo-Gym completed without producing a final prompt group"
+                )
+        except BaseException as error:
+            emit_nemo_gym_trace(
+                "ray_stream_incomplete",
+                phase="validate_stream_completion",
+                batch=batch_trace,
+                elapsed_seconds=time.perf_counter() - stream_started_at,
+                accumulator=accumulator.diagnostic_state(),
+                exception=format_nemo_gym_exception(error),
             )
+            raise
 
     final_rollout_result.rollout_metrics.update(actor_timing_metrics)
     final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))
+    emit_nemo_gym_trace(
+        "ray_stream_completed",
+        batch=batch_trace,
+        expected_rows=len(nemo_gym_rows),
+        received_rows=len(nemo_gym_rows),
+        elapsed_seconds=time.perf_counter() - stream_started_at,
+    )
     yield final_rollout_result
 
 

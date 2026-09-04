@@ -1551,7 +1551,7 @@ def test_nemo_gym_dedup_keeps_authoritative_changed_seed_media(
         )
 
 
-def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
+def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path, capsys):
     video_path = tmp_path / "clip with spaces.mp4"
     video_path.write_bytes(b"video")
     image_path = tmp_path / "still.png"
@@ -1560,7 +1560,12 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
     async def _run():
         nemo_gym_row = {
             "_rowidx": 7,
+            "_ng_task_index": 42,
+            "_ng_rollout_index": 1,
+            "_ng_attempt_index": 0,
             "agent_ref": {"name": "test_agent"},
+            "dataset": "trace-dataset",
+            "metadata": {"uuid": "trace-row-uuid"},
             "responses_create_params": {
                 "input": [
                     {
@@ -1635,6 +1640,13 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         assert streamed_results[0][1] == {"message_log": []}
 
     asyncio.run(_run())
+    trace = capsys.readouterr().out
+    assert '"event":"actor_stream_started"' in trace
+    assert '"event":"actor_stream_exit"' in trace
+    assert '"outcome":"complete"' in trace
+    assert '"task_index":42' in trace
+    assert '"rollout_index":1' in trace
+    assert '"dataset_uuid":"trace-row-uuid"' in trace
 
 
 def test_nemo_gym_postprocess_no_generation_data_raises():

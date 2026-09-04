@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import math
 import os
 import subprocess
 import sys
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -73,6 +75,129 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+_NEMO_GYM_DIAGNOSTIC_TEXT_LIMIT = 131_072
+_NEMO_GYM_EXCEPTION_CHAIN_LIMIT = 8
+
+
+def _bounded_nemo_gym_diagnostic_text(value: Any) -> str:
+    """Keep failure diagnostics useful without allowing one event to consume the log."""
+    try:
+        text = str(value)
+    except BaseException as error:  # pragma: no cover - defensive diagnostics path
+        text = f"<str failed: {type(error).__name__}: {error!r}>"
+    if len(text) <= _NEMO_GYM_DIAGNOSTIC_TEXT_LIMIT:
+        return text
+    half = _NEMO_GYM_DIAGNOSTIC_TEXT_LIMIT // 2
+    omitted = len(text) - (2 * half)
+    return f"{text[:half]}...<truncated {omitted} chars>...{text[-half:]}"
+
+
+def format_nemo_gym_exception(error: BaseException) -> dict[str, Any]:
+    """Return a bounded, JSON-safe exception, traceback, and explicit cause chain."""
+    chain: list[dict[str, str]] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and len(chain) < _NEMO_GYM_EXCEPTION_CHAIN_LIMIT:
+        if id(current) in seen:
+            chain.append({"error_type": "<cycle>", "error": "exception chain cycle"})
+            break
+        seen.add(id(current))
+        chain.append(
+            {
+                "error_type": f"{type(current).__module__}.{type(current).__qualname__}",
+                "error": _bounded_nemo_gym_diagnostic_text(repr(current)),
+                "message": _bounded_nemo_gym_diagnostic_text(current),
+            }
+        )
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+
+    try:
+        formatted_traceback = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+    except BaseException as formatting_error:  # pragma: no cover - defensive
+        formatted_traceback = (
+            "<traceback formatting failed: "
+            f"{type(formatting_error).__name__}: {formatting_error!r}>"
+        )
+    return {
+        "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+        "error": _bounded_nemo_gym_diagnostic_text(repr(error)),
+        "message": _bounded_nemo_gym_diagnostic_text(error),
+        "exception_chain": chain,
+        "traceback": _bounded_nemo_gym_diagnostic_text(formatted_traceback),
+    }
+
+
+def summarize_nemo_gym_row(row: Any) -> dict[str, Any]:
+    """Return stable rollout identity without logging the potentially large prompt."""
+    if not isinstance(row, Mapping):
+        return {"row_type": type(row).__name__}
+    agent_ref = row.get("agent_ref") or {}
+    metadata = row.get("metadata") or {}
+    task_index = row.get("_ng_task_index")
+    rollout_index = row.get("_ng_rollout_index")
+    attempt_index = row.get("_ng_attempt_index")
+    rollout_id = None
+    if task_index is not None and rollout_index is not None:
+        rollout_id = f"{task_index}-{rollout_index}"
+        if isinstance(attempt_index, int) and attempt_index > 0:
+            rollout_id = f"{rollout_id}-a{attempt_index}"
+    summary = {
+        "rollout_id": rollout_id,
+        "row_index": row.get("_rowidx"),
+        "task_index": task_index,
+        "rollout_index": rollout_index,
+        "attempt_index": attempt_index,
+        "agent_name": agent_ref.get("name") if isinstance(agent_ref, Mapping) else None,
+        "dataset": row.get("dataset"),
+        "dataset_uuid": metadata.get("uuid") if isinstance(metadata, Mapping) else None,
+    }
+    return {key: value for key, value in summary.items() if value is not None}
+
+
+def emit_nemo_gym_trace(event: str, **fields: Any) -> None:
+    """Emit one always-on structured event; diagnostics must never alter execution."""
+    try:
+        if event.startswith("actor_"):
+            component = "nemo_rl.nemo_gym_actor"
+        elif event.startswith(("ray_stream_", "consumer_")):
+            component = "nemo_rl.rollout_consumer"
+        elif event.startswith("collector_"):
+            component = "nemo_rl.trajectory_collector"
+        else:
+            component = "nemo_rl"
+        print(
+            "[nemo_gym_trace] "
+            + json.dumps(
+                {
+                    "component": component,
+                    "event": event,
+                    "hostname": os.uname().nodename,
+                    "pid": os.getpid(),
+                    "timestamp": time.time(),
+                    **fields,
+                },
+                default=repr,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+    except BaseException as error:  # pragma: no cover - defensive diagnostics path
+        print(
+            "[nemo_gym_trace] diagnostic serialization failed "
+            f"event={event!r} error={error!r}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -837,80 +962,144 @@ Depending on your data shape, you may want to change these values."""
 
         timer = Timer()
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
-
-        from nemo_rl.environments.nemo_gym_video import (
-            normalize_video_urls_in_examples,
-        )
-
-        # Normalize local media before shipping requests to vLLM. Both helpers
-        # are no-ops for text-only rows and already-qualified URLs.
-        normalize_video_urls_in_examples(nemo_gym_examples)
-        encode_images_in_examples(nemo_gym_examples)
-
-        timer.start("_run_rollouts_total")
-        nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
-        )
-
+        stream_started_at = time.perf_counter()
+        expected_results = len(nemo_gym_examples)
         num_results = 0
-        for task in nemo_gym_result_iterator:
-            with timer.time(label=f"{timer_prefix}/await_results"):
-                try:
-                    nemo_gym_row, nemo_gym_result = await task
-                except Exception as error:
-                    if hasattr(error, "response_content"):
-                        print(
-                            "EXCEPTION RESULT",
-                            error.response_content,
-                            file=sys.stderr,
+        stream_outcome = "running"
+        terminal_error: BaseException | None = None
+
+        emit_nemo_gym_trace(
+            "actor_stream_started",
+            expected_rows=expected_results,
+            agent_counts=dict(counts_left),
+            rows=[summarize_nemo_gym_row(row) for row in nemo_gym_examples],
+        )
+
+        try:
+            from nemo_rl.environments.nemo_gym_video import (
+                normalize_video_urls_in_examples,
+            )
+
+            # Normalize local media before shipping requests to vLLM. Both helpers
+            # are no-ops for text-only rows and already-qualified URLs.
+            normalize_video_urls_in_examples(nemo_gym_examples)
+            encode_images_in_examples(nemo_gym_examples)
+
+            timer.start("_run_rollouts_total")
+            nemo_gym_result_iterator = self.rch.run_examples(
+                examples=nemo_gym_examples, head_server_config=self.head_server_config
+            )
+
+            for task in nemo_gym_result_iterator:
+                with timer.time(label=f"{timer_prefix}/await_results"):
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except Exception as error:
+                        emit_nemo_gym_trace(
+                            "actor_task_exception",
+                            phase="await_agent_result",
+                            completed_rows=num_results,
+                            expected_rows=expected_results,
+                            remaining_rows=expected_results - num_results,
+                            remaining_agent_counts=dict(counts_left),
+                            elapsed_seconds=time.perf_counter() - stream_started_at,
+                            exception=format_nemo_gym_exception(error),
                         )
-                    typed = _typed_gym_failure(error)
-                    if typed is not None:
-                        # `from None`, deliberately: chaining the original would put the
-                        # unpicklable exception back on the wire as __cause__ and undo
-                        # the whole point. The status and message are already in `detail`.
-                        raise typed from None
+                        if hasattr(error, "response_content"):
+                            print(
+                                "EXCEPTION RESULT",
+                                error.response_content,
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        typed = _typed_gym_failure(error)
+                        if typed is not None:
+                            # `from None`, deliberately: chaining the original would put the
+                            # unpicklable exception back on the wire as __cause__ and undo
+                            # the whole point. The status and message are already in `detail`.
+                            raise typed from None
+                        raise
+
+                try:
+                    with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=(
+                                not deduplicate_multimodal_data
+                            ),
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
+                except BaseException as error:
+                    emit_nemo_gym_trace(
+                        "actor_result_exception",
+                        phase="postprocess_result",
+                        row=summarize_nemo_gym_row(nemo_gym_row),
+                        completed_rows=num_results,
+                        expected_rows=expected_results,
+                        remaining_agent_counts=dict(counts_left),
+                        elapsed_seconds=time.perf_counter() - stream_started_at,
+                        exception=format_nemo_gym_exception(error),
+                    )
                     raise
 
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_row,
-                    nemo_gym_result,
-                    tokenizer,
-                    include_initial_multimodal_data=not deduplicate_multimodal_data,
-                )
-                if _has_nan_generation_logprobs(nemo_rl_result):
-                    raise RuntimeError("Generation logprobs contain NaN")
+                num_results += 1
+                timing_metrics = None
+                if num_results == expected_results:
+                    timer.stop("_run_rollouts_total")
+                    timing_metrics = timer.get_timing_metrics("sum")
+                    total_time = timing_metrics.pop("_run_rollouts_total")
+                    timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                        100
+                        * timing_metrics[f"{timer_prefix}/postprocess_results"]
+                        / total_time
+                    )
 
-            num_results += 1
-            timing_metrics = None
-            if num_results == len(nemo_gym_examples):
-                timer.stop("_run_rollouts_total")
-                timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
-                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
-                )
+                agent_name = nemo_gym_row["agent_ref"]["name"]
+                counts_left[agent_name] -= 1
+                if counts_left[agent_name] <= 0:
+                    counts_left.pop(agent_name)
+                if num_results % 10 == 0 and counts_left:
+                    top_left = counts_left.most_common(5)
+                    top_left_str = "\n".join(
+                        f"{index + 1}. {name}: {count}"
+                        for index, (name, count) in enumerate(top_left)
+                    )
+                    print(
+                        "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                        f"{top_left_str}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
-            agent_name = nemo_gym_row["agent_ref"]["name"]
-            counts_left[agent_name] -= 1
-            if counts_left[agent_name] <= 0:
-                counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
-                top_left = counts_left.most_common(5)
-                top_left_str = "\n".join(
-                    f"{index + 1}. {name}: {count}"
-                    for index, (name, count) in enumerate(top_left)
-                )
-                print(
-                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
-                    f"{top_left_str}",
-                    file=sys.stderr,
-                )
-
-            yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
+                yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
+            stream_outcome = "complete"
+        except asyncio.CancelledError as error:
+            stream_outcome = "cancelled"
+            terminal_error = error
+            raise
+        except GeneratorExit as error:
+            stream_outcome = "closed"
+            terminal_error = error
+            raise
+        except BaseException as error:
+            stream_outcome = "error"
+            terminal_error = error
+            raise
+        finally:
+            trace_fields: dict[str, Any] = {
+                "outcome": stream_outcome,
+                "completed_rows": num_results,
+                "expected_rows": expected_results,
+                "remaining_rows": expected_results - num_results,
+                "remaining_agent_counts": dict(counts_left),
+                "elapsed_seconds": time.perf_counter() - stream_started_at,
+            }
+            if terminal_error is not None:
+                trace_fields["exception"] = format_nemo_gym_exception(terminal_error)
+            emit_nemo_gym_trace("actor_stream_exit", **trace_fields)
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,

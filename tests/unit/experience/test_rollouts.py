@@ -1774,7 +1774,7 @@ def test_native_rollout_groups_match_whole_batch(monkeypatch):
     )
 
 
-def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
+def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch, capsys):
     """Prompt groups are yielded in completion order using async iteration."""
 
     clock = {"now": 0.0}
@@ -1950,10 +1950,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     monkeypatch.setattr(
         rollouts_mod,
         "collect_multimodal_payload_metrics",
-        lambda payload, boundary, enabled: payload_calls.append(
-            (payload, boundary, enabled)
-        )
-        or {},
+        lambda payload, boundary, enabled: (
+            payload_calls.append((payload, boundary, enabled)) or {}
+        ),
     )
     monkeypatch.setattr(
         rollouts_mod, "print_multimodal_payload_metrics", lambda metrics: None
@@ -2019,12 +2018,24 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     assert rollout_results[-1].rollout_metrics["timing/remote"] == 1.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/run_rollouts"] == 4.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
+    trace = capsys.readouterr().out
+    assert '"event":"ray_stream_opened"' in trace
+    assert '"event":"ray_stream_completed"' in trace
+    assert '"task_indices":[10,11]' in trace
 
 
 def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
     rows = [
-        {"agent_ref": {"name": "agent"}},
-        {"agent_ref": {"name": "agent"}},
+        {
+            "agent_ref": {"name": "agent"},
+            "_ng_task_index": 9,
+            "_ng_rollout_index": 0,
+        },
+        {
+            "agent_ref": {"name": "agent"},
+            "_ng_task_index": 9,
+            "_ng_rollout_index": 1,
+        },
     ]
     accumulator = rollouts_mod._NemoGymStreamAccumulator(
         rows=rows,
@@ -2033,6 +2044,25 @@ def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
     )
 
     assert accumulator.add(0, {"row": 0}) is None
+    diagnostic_state = accumulator.diagnostic_state()
+    assert diagnostic_state["received_row_indices"] == [0]
+    assert diagnostic_state["missing_row_indices"] == [1]
+    assert diagnostic_state["missing_rows"] == [
+        {
+            "stream_row_index": 1,
+            "rollout_id": "9-1",
+            "task_index": 9,
+            "rollout_index": 1,
+            "agent_name": "agent",
+        }
+    ]
+    assert diagnostic_state["partial_groups"] == [
+        {
+            "group_index": 0,
+            "received_row_indices": [0],
+            "missing_row_indices": [1],
+        }
+    ]
     with pytest.raises(ValueError, match="duplicate row index 0"):
         accumulator.add(0, {"row": 0})
     with pytest.raises(RuntimeError, match=r"missing row indices \[1\]"):
