@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import threading as _threading
 import time
 from collections import defaultdict, deque
@@ -53,6 +54,7 @@ from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
@@ -72,6 +74,10 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
+_NEMO_GYM_DIAGNOSTIC_GROUP_LIMIT = 16
+_NEMO_GYM_DIAGNOSTIC_ROLLOUT_LIMIT = 16
+_NEMO_GYM_DIAGNOSTIC_IDENTITY_TEXT_LIMIT = 256
+_NEMO_GYM_DIAGNOSTIC_ERROR_TEXT_LIMIT = 2_048
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
@@ -107,6 +113,141 @@ def _unanimous_task_index(rows: list[Any]) -> Optional[int]:
         return None
     (ordinal,) = ordinals
     return int(ordinal) if ordinal is not None else None
+
+
+def _bounded_diagnostic_text(value: Any, limit: int) -> str:
+    """Convert a diagnostic value to text without allowing an unbounded log."""
+    try:
+        text = str(value)
+    except BaseException as error:  # pragma: no cover - defensive diagnostics path
+        text = f"<str failed: {type(error).__name__}>"
+    if len(text) <= limit:
+        return text
+
+    marker = "...<truncated>..."
+    prefix_length = (limit - len(marker)) // 2
+    suffix_length = limit - len(marker) - prefix_length
+    return f"{text[:prefix_length]}{marker}{text[-suffix_length:]}"
+
+
+def _bounded_identity_value(value: Any) -> str | int | float | bool | None:
+    """Keep scalar identity values only; never stringify nested request data."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _bounded_diagnostic_text(value, _NEMO_GYM_DIAGNOSTIC_IDENTITY_TEXT_LIMIT)
+    return None
+
+
+def _bounded_nemo_gym_group_identities(
+    input_rows: Any,
+    group_task_indices: list[Optional[int]],
+    group_indices: set[int],
+    num_generations: int,
+) -> dict[str, Any]:
+    """Summarize pending Gym prompt groups using identity-only input fields."""
+    ordered_group_indices = sorted(group_indices)
+    identities: list[dict[str, Any]] = []
+    rows = input_rows if isinstance(input_rows, list) else []
+
+    for group_index in ordered_group_indices[:_NEMO_GYM_DIAGNOSTIC_GROUP_LIMIT]:
+        identity: dict[str, Any] = {"group_index": group_index}
+        if group_index < len(group_task_indices):
+            task_index = group_task_indices[group_index]
+            if task_index is not None:
+                identity["task_index"] = task_index
+
+        start = group_index * num_generations
+        group_rows = rows[start : start + num_generations]
+        rollout_indices = sorted(
+            {
+                int(rollout_index)
+                for row in group_rows
+                if isinstance(row, dict)
+                and isinstance(
+                    rollout_index := row.get(NEMO_GYM_ROLLOUT_INDEX_KEY), int
+                )
+                and not isinstance(rollout_index, bool)
+            }
+        )
+        if rollout_indices:
+            identity["rollout_indices"] = rollout_indices[
+                :_NEMO_GYM_DIAGNOSTIC_ROLLOUT_LIMIT
+            ]
+            omitted_rollout_count = max(
+                0, len(rollout_indices) - _NEMO_GYM_DIAGNOSTIC_ROLLOUT_LIMIT
+            )
+            if omitted_rollout_count:
+                identity["omitted_rollout_index_count"] = omitted_rollout_count
+
+        row = next((row for row in group_rows if isinstance(row, dict)), None)
+        if row is not None:
+            agent_ref = row.get("agent_ref")
+            metadata = row.get("metadata")
+            optional_identity = {
+                "agent_name": (
+                    _bounded_identity_value(agent_ref.get("name"))
+                    if isinstance(agent_ref, dict)
+                    else None
+                ),
+                "dataset": _bounded_identity_value(row.get("dataset")),
+                "dataset_uuid": (
+                    _bounded_identity_value(metadata.get("uuid"))
+                    if isinstance(metadata, dict)
+                    else None
+                ),
+            }
+            identity.update(
+                {
+                    key: value
+                    for key, value in optional_identity.items()
+                    if value is not None
+                }
+            )
+        identities.append(identity)
+
+    return {
+        "group_count": len(ordered_group_indices),
+        "groups": identities,
+        "omitted_group_count": max(
+            0, len(ordered_group_indices) - _NEMO_GYM_DIAGNOSTIC_GROUP_LIMIT
+        ),
+    }
+
+
+def _bounded_nemo_gym_exception(error: BaseException) -> dict[str, str]:
+    """Return only the exception type and a bounded representation."""
+    try:
+        error_repr = repr(error)
+    except BaseException as formatting_error:  # pragma: no cover - defensive
+        error_repr = f"<repr failed: {type(formatting_error).__name__}>"
+    return {
+        "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+        "error": _bounded_diagnostic_text(
+            error_repr, _NEMO_GYM_DIAGNOSTIC_ERROR_TEXT_LIMIT
+        ),
+    }
+
+
+def _emit_nemo_gym_collector_failure(event: str, **fields: Any) -> None:
+    """Emit a bounded failure-path event without affecting collection behavior."""
+    try:
+        print(
+            "[nemo_gym_trace] "
+            + json.dumps(
+                {
+                    "component": "nemo_rl.trajectory_collector",
+                    "event": event,
+                    **fields,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+    except BaseException:  # pragma: no cover - diagnostics must be best-effort
+        pass
 
 
 @ray.remote  # pragma: no cover
@@ -1615,6 +1756,15 @@ class AsyncTrajectoryCollector:
             )
             for group_index in range(expected_prompt_groups)
         ]
+
+        def _pending_identities(group_indices: set[int]) -> dict[str, Any]:
+            return _bounded_nemo_gym_group_identities(
+                input_rows,
+                group_input_task_indices,
+                group_indices,
+                num_generations,
+            )
+
         buffered_group_indices: set[int] = set()
         last_error: Exception | None = None
         last_enqueue_error: Exception | None = None
@@ -1684,22 +1834,44 @@ class AsyncTrajectoryCollector:
             if push_errors:
                 last_enqueue_error = push_errors[0]
             pending_group_indices = expected_group_indices - buffered_group_indices
+            if use_nemo_gym and stream_error is not None:
+                _emit_nemo_gym_collector_failure(
+                    "collector_stream_exception",
+                    generation_weight_version=generation_weight_version,
+                    target_weight_version=target_weight_version,
+                    attempt_number=attempt,
+                    max_attempts=max_attempts,
+                    buffered_group_count=len(buffered_group_indices),
+                    pending_groups=_pending_identities(pending_group_indices),
+                    exception=_bounded_nemo_gym_exception(stream_error),
+                )
             if not pending_group_indices:
                 return True
 
             last_error = stream_error or (push_errors[0] if push_errors else None)
             if last_error is None:
                 last_error = RuntimeError(
-                    "Rollout stream ended before yielding prompt groups "
-                    f"{sorted(pending_group_indices)}"
+                    "Rollout stream ended before yielding "
+                    f"{len(pending_group_indices)} prompt group(s)"
                 )
             if attempt == max_attempts or not self.running:
                 break
 
             retry_delay = _NEMO_GYM_RETRY_DELAY_BASE_SECONDS * (2 ** (attempt - 1))
+            _emit_nemo_gym_collector_failure(
+                "collector_retry_scheduled",
+                generation_weight_version=generation_weight_version,
+                target_weight_version=target_weight_version,
+                completed_attempt_number=attempt,
+                next_attempt_number=attempt + 1,
+                max_attempts=max_attempts,
+                retry_delay_seconds=retry_delay,
+                pending_groups=_pending_identities(pending_group_indices),
+                exception=_bounded_nemo_gym_exception(last_error),
+            )
             print(
-                "❌ NeMo-Gym batch did not complete prompt groups "
-                f"{sorted(pending_group_indices)}; retrying in "
+                "❌ NeMo-Gym batch did not complete "
+                f"{len(pending_group_indices)} prompt group(s); retrying in "
                 f"{retry_delay:.1f}s "
                 f"(attempt {attempt + 1}/{max_attempts})",
                 flush=True,
@@ -1708,6 +1880,20 @@ class AsyncTrajectoryCollector:
 
         if use_nemo_gym and buffered_group_indices and last_enqueue_error is None:
             pending_group_indices = expected_group_indices - buffered_group_indices
+            _emit_nemo_gym_collector_failure(
+                "collector_retries_exhausted",
+                outcome="release_for_gap_fill",
+                generation_weight_version=generation_weight_version,
+                target_weight_version=target_weight_version,
+                max_attempts=max_attempts,
+                buffered_group_count=len(buffered_group_indices),
+                pending_groups=_pending_identities(pending_group_indices),
+                exception=(
+                    _bounded_nemo_gym_exception(last_error)
+                    if last_error is not None
+                    else None
+                ),
+            )
             print(
                 "⚠️ NeMo-Gym batch exhausted retries after buffering "
                 f"{len(buffered_group_indices)}/{expected_prompt_groups} prompt "
@@ -1717,11 +1903,22 @@ class AsyncTrajectoryCollector:
             )
             return False
 
+        pending_group_indices = expected_group_indices - buffered_group_indices
         batch_error = RuntimeError(
-            "Rollout batch failed to buffer prompt groups "
-            f"{sorted(expected_group_indices - buffered_group_indices)}"
+            "Rollout batch failed to buffer prompt groups; "
+            f"pending_group_count={len(pending_group_indices)}"
         )
         error_cause = last_enqueue_error or last_error
+        if use_nemo_gym:
+            _emit_nemo_gym_collector_failure(
+                "collector_batch_failed",
+                generation_weight_version=generation_weight_version,
+                target_weight_version=target_weight_version,
+                max_attempts=max_attempts,
+                buffered_group_count=len(buffered_group_indices),
+                pending_groups=_pending_identities(pending_group_indices),
+                exception=_bounded_nemo_gym_exception(error_cause or batch_error),
+            )
         if error_cause is not None:
             raise batch_error from error_cause
         raise batch_error

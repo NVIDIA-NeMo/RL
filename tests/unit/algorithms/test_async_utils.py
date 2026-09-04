@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import tempfile
 import threading
@@ -2138,6 +2139,62 @@ class TestAsyncTrajectoryCollector:
         assert _unanimous_task_index(unstamped) is None
         assert _unanimous_task_index([]) is None
 
+    def test_nemo_gym_group_identity_summary_is_bounded(self):
+        group_count = trajectory_collector_mod._NEMO_GYM_DIAGNOSTIC_GROUP_LIMIT + 2
+        num_generations = 2
+        rows = [
+            {
+                NEMO_GYM_TASK_INDEX_KEY: group_index,
+                "_ng_rollout_index": rollout_index,
+                "agent_ref": {"name": f"agent-{group_index}"},
+                "dataset": "d" * 1_000,
+                "metadata": {
+                    "uuid": f"uuid-{group_index}",
+                    "private_detail": "must-not-be-logged",
+                },
+                "responses_create_params": {"input": "secret prompt"},
+            }
+            for group_index in range(group_count)
+            for rollout_index in range(num_generations)
+        ]
+
+        summary = trajectory_collector_mod._bounded_nemo_gym_group_identities(
+            rows,
+            list(range(group_count)),
+            set(range(group_count)),
+            num_generations,
+        )
+
+        assert summary["group_count"] == group_count
+        assert summary["omitted_group_count"] == 2
+        assert (
+            len(summary["groups"])
+            == trajectory_collector_mod._NEMO_GYM_DIAGNOSTIC_GROUP_LIMIT
+        )
+        first_group = summary["groups"][0]
+        assert first_group["group_index"] == 0
+        assert first_group["task_index"] == 0
+        assert first_group["rollout_indices"] == [0, 1]
+        assert first_group["agent_name"] == "agent-0"
+        assert first_group["dataset_uuid"] == "uuid-0"
+        assert (
+            len(first_group["dataset"])
+            == trajectory_collector_mod._NEMO_GYM_DIAGNOSTIC_IDENTITY_TEXT_LIMIT
+        )
+        rendered = json.dumps(summary)
+        assert "secret prompt" not in rendered
+        assert "must-not-be-logged" not in rendered
+
+        exception = trajectory_collector_mod._bounded_nemo_gym_exception(
+            RuntimeError("x" * 4_096)
+        )
+        assert exception["error_type"] == "builtins.RuntimeError"
+        assert (
+            len(exception["error"])
+            == trajectory_collector_mod._NEMO_GYM_DIAGNOSTIC_ERROR_TEXT_LIMIT
+        )
+        assert "<truncated>" in exception["error"]
+
     def test_rollouts_state_roundtrips_pending_batch(self, tmp_path):
         """The pending remainder survives torch.save/load and collector restore."""
         collector = self.create_local_collector()
@@ -2907,7 +2964,7 @@ class TestAsyncTrajectoryCollector:
         assert "unexpected add status" in str(exc.value.__cause__)
 
     def test_nemo_gym_batch_retry_forwards_effort_config_without_duplicates(
-        self, monkeypatch
+        self, monkeypatch, capsys
     ):
         """Retries preserve effort shaping and do not re-enqueue buffered groups."""
 
@@ -2956,10 +3013,16 @@ class TestAsyncTrajectoryCollector:
         repeated_batch = BatchedDataDict(
             {
                 "extra_env_info": [
-                    {"_ng_task_index": 7},
-                    {"_ng_task_index": 7},
-                    {"_ng_task_index": 8},
-                    {"_ng_task_index": 8},
+                    {
+                        "_ng_task_index": task_index,
+                        "_ng_rollout_index": rollout_index,
+                        "agent_ref": {"name": "debug_agent"},
+                        "dataset": "debug_dataset",
+                        "metadata": {"uuid": f"uuid-{task_index}"},
+                        "responses_create_params": {"input": "secret prompt"},
+                    }
+                    for task_index in (7, 8)
+                    for rollout_index in (0, 1)
                 ],
                 "loss_multiplier": torch.ones(4),
             }
@@ -3021,6 +3084,37 @@ class TestAsyncTrajectoryCollector:
         assert rollout_call_task_indices == [[7, 7, 8, 8], [8, 8]]
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
+        output = capsys.readouterr().out
+        traces = [
+            json.loads(line.removeprefix("[nemo_gym_trace] "))
+            for line in output.splitlines()
+            if line.startswith("[nemo_gym_trace] ")
+        ]
+        stream_failure = next(
+            trace for trace in traces if trace["event"] == "collector_stream_exception"
+        )
+        retry = next(
+            trace for trace in traces if trace["event"] == "collector_retry_scheduled"
+        )
+        expected_pending = {
+            "group_count": 1,
+            "groups": [
+                {
+                    "agent_name": "debug_agent",
+                    "dataset": "debug_dataset",
+                    "dataset_uuid": "uuid-8",
+                    "group_index": 1,
+                    "rollout_indices": [0, 1],
+                    "task_index": 8,
+                }
+            ],
+            "omitted_group_count": 0,
+        }
+        assert stream_failure["pending_groups"] == expected_pending
+        assert retry["pending_groups"] == expected_pending
+        assert stream_failure["exception"]["error_type"] == "builtins.RuntimeError"
+        assert "transient stream failure" in stream_failure["exception"]["error"]
+        assert "secret prompt" not in output
 
     def test_invalid_gym_batch_releases_target(self):
         """Validation errors cannot leave a target reservation stuck."""
@@ -3047,7 +3141,9 @@ class TestAsyncTrajectoryCollector:
 
         assert target_weight not in collector._generating_targets
 
-    def test_nemo_gym_partial_batch_exhaustion_wakes_gap_fill(self, monkeypatch):
+    def test_nemo_gym_partial_batch_exhaustion_wakes_gap_fill(
+        self, monkeypatch, capsys
+    ):
         """A Gym batch with useful partial progress is not a fatal failure."""
 
         class _ReadyResult:
@@ -3080,10 +3176,16 @@ class TestAsyncTrajectoryCollector:
         repeated_batch = BatchedDataDict(
             {
                 "extra_env_info": [
-                    {"_ng_task_index": 7},
-                    {"_ng_task_index": 7},
-                    {"_ng_task_index": 8},
-                    {"_ng_task_index": 8},
+                    {
+                        "_ng_task_index": task_index,
+                        "_ng_rollout_index": rollout_index,
+                        "agent_ref": {"name": "persistent_failure_agent"},
+                        "dataset": "debug_dataset",
+                        "metadata": {"uuid": f"uuid-{task_index}"},
+                        "responses_create_params": {"input": "secret prompt"},
+                    }
+                    for task_index in (7, 8)
+                    for rollout_index in (0, 1)
                 ],
                 "loss_multiplier": torch.ones(4),
             }
@@ -3131,6 +3233,20 @@ class TestAsyncTrajectoryCollector:
         assert collector._generation_limit_cleared.is_set()
         assert target_weight not in collector._generating_targets
         collector.check_health()
+        output = capsys.readouterr().out
+        traces = [
+            json.loads(line.removeprefix("[nemo_gym_trace] "))
+            for line in output.splitlines()
+            if line.startswith("[nemo_gym_trace] ")
+        ]
+        exhaustion = next(
+            trace for trace in traces if trace["event"] == "collector_retries_exhausted"
+        )
+        assert exhaustion["outcome"] == "release_for_gap_fill"
+        assert exhaustion["pending_groups"]["groups"][0]["task_index"] == 8
+        assert exhaustion["pending_groups"]["groups"][0]["dataset_uuid"] == "uuid-8"
+        assert "persistent stream failure" in exhaustion["exception"]["error"]
+        assert "secret prompt" not in output
 
     def test_rollouts_state_retrieval(self):
         collector = self.create_local_collector(next_nemo_gym_task_index=123)
