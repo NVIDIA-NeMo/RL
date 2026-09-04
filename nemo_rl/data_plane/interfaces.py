@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
 from pydantic import BaseModel, Field
@@ -149,11 +150,17 @@ _CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple"})
 def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
     """Return whether the configured backend supports complete save/load.
 
-    This is a static allow-list so an unrecognized future backend defaults to
+    Simple always supports native TQ checkpoints. Mooncake supports them only
+    when its explicit checkpoint plugin is enabled; normal Mooncake operation
+    remains memory-only. An unrecognized future backend defaults to
     unsupported until its storage payload and controller metadata are both
     known to round-trip through a checkpoint.
     """
-    return cfg["backend"] in _CHECKPOINTABLE_BACKENDS
+    if cfg["backend"] in _CHECKPOINTABLE_BACKENDS:
+        return True
+    if cfg["backend"] == "mooncake_cpu":
+        return bool(backend_config(cfg).checkpoint.enabled)
+    return False
 
 
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {

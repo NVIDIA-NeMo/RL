@@ -572,12 +572,27 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
 
-    def test_rejects_mooncake_data_plane_checkpointing(self):
+    def test_rejects_mooncake_data_plane_checkpointing_without_opt_in(self):
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
         mc.checkpointing["save_data_plane"] = True
         with pytest.raises(NotImplementedError, match="backend='mooncake_cpu'"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_accepts_explicit_mooncake_data_plane_checkpointing(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.data_plane["backend"] = "mooncake_cpu"
+        mc.data_plane["mooncake_cpu"] = {"checkpoint": {"enabled": True}}
+        mc.checkpointing["save_data_plane"] = True
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert (
+            actor_args.dp_client
+            is patched_factories["build_data_plane_client"].return_value
+        )
 
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()

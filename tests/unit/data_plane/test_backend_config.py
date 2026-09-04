@@ -58,6 +58,14 @@ def test_checkpointing_capability_defaults_to_unsupported(
     assert data_plane_supports_checkpointing(_cfg(backend)) is expected
 
 
+def test_mooncake_checkpointing_capability_requires_explicit_opt_in() -> None:
+    cfg = _cfg(
+        "mooncake_cpu",
+        mooncake_cpu={"checkpoint": {"enabled": True}},
+    )
+    assert data_plane_supports_checkpointing(cfg) is True
+
+
 def test_nested_block_is_used() -> None:
     cfg = _cfg(
         "mooncake_cpu",

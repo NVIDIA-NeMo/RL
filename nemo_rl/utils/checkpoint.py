@@ -147,8 +147,8 @@ class CheckpointingConfig(TypedDict):
     is_peft (bool): Whether the model uses PEFT.
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
     save_data_plane (bool): Whether SingleController checkpoints include the
-        native TQ snapshot and replay-buffer metadata. Currently supported only
-        with the simple data-plane backend.
+        native TQ snapshot and replay-buffer metadata. Supported by the simple
+        backend and by Mooncake when its explicit checkpoint plugin is enabled.
     load_replay_buffer (bool): Whether async GRPO restores replay-buffer state
         when resuming from a checkpoint. Defaults to True. When False the
         buffer starts empty and a frontier-aligned resume regenerates the
