@@ -26,6 +26,7 @@ import torch
 from omegaconf import OmegaConf
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms import grpo as grpo_mod
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
@@ -216,6 +217,51 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     policy.stream_weights_via_ipc_zmq.assert_called_once_with(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
+    )
+
+
+def test_megatron_m2n_refit_delegates_entirely_to_the_synchronizer() -> None:
+    """MegatronWeightSynchronizer owns the engine lifecycle; the caller must not duplicate it.
+
+    ``refit_policy_generation`` returns as soon as a weight synchronizer is
+    present, so suspend/offload/prepare/resume must NOT be driven here — they
+    live inside ``MegatronWeightSynchronizer.sync_weights`` and are asserted in
+    ``tests/unit/weight_sync/test_weight_synchronizer.py``.
+    """
+    policy = MagicMock()
+    generation = object.__new__(MegatronGeneration)
+    generation.suspend_for_refit = MagicMock()
+    generation.prepare_for_generation = MagicMock()
+    generation.resume_after_refit = MagicMock()
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = {"bytes": 16.0}
+
+    metrics = refit_policy_generation(
+        policy,
+        generation,
+        colocated_inference=False,
+        kv_scales={"layer.0": 0.5},
+    )
+
+    assert metrics == {"bytes": 16.0}
+    generation.weight_synchronizer.sync_weights.assert_called_once_with(
+        timer=None, kv_scales={"layer.0": 0.5}
+    )
+    generation.suspend_for_refit.assert_not_called()
+    generation.prepare_for_generation.assert_not_called()
+    generation.resume_after_refit.assert_not_called()
+    policy.offload_before_refit.assert_not_called()
+
+
+def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
+    """``sync_weights`` returning None must not propagate as the metrics dict."""
+    generation = object.__new__(MegatronGeneration)
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = None
+
+    assert (
+        refit_policy_generation(MagicMock(), generation, colocated_inference=False)
+        == {}
     )
 
 
@@ -3374,8 +3420,6 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     monkeypatch, mock_grpo_components
 ):
     """The initial refit must start a skip-load endpoint before Gym can finish."""
-    from nemo_rl.algorithms import grpo as grpo_mod
-
     events = []
     gym_started = Event()
     engine_ready = Event()

@@ -140,7 +140,7 @@ def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> No
         ),
         (
             {"backend": "sglang"},
-            "policy.generation.backend must be 'vllm' (got 'sglang')",
+            "policy.generation.backend must be 'vllm' or 'megatron' (got 'sglang')",
         ),
     ],
 )
@@ -149,6 +149,217 @@ def test_check_nccl_reshard_refit_support_rejects_invalid_config(
 ) -> None:
     config = _valid_nccl_reshard_config()
     config.policy["generation"].update(generation_update)
+
+    with pytest.raises(ValueError) as exc_info:
+        check_nccl_reshard_refit_support(config)
+
+    assert expected_violation in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("train_fp8_cfg", "generation_fp8_cfg"),
+    [
+        ({"enabled": False}, {"enabled": False}),
+        (
+            {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": True},
+            {"enabled": True, "fp8_recipe": "mxfp8"},
+        ),
+    ],
+)
+def test_check_nccl_reshard_refit_support_accepts_megatron_bf16_and_mxfp8(
+    train_fp8_cfg: dict[str, object], generation_fp8_cfg: dict[str, object]
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["megatron_cfg"]["expert_tensor_parallel_size"] = 2
+    config.policy["megatron_cfg"]["fp8_cfg"] = train_fp8_cfg
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "expert_model_parallel_size": 2,
+            "expert_tensor_parallel_size": 2,
+            "pipeline_model_parallel_size": 1,
+            # MXFP8 destinations quantize through resolve_mxfp8_backend, so the
+            # grouped-GEMM backend must be one it accepts. MCore's default
+            # ("vllm") is not, and NeMo-RL supplies no default of its own.
+            "inference_grouped_gemm_backend": "torch",
+            # _prepare_mxfp8_refit only installs MXFP8 destinations for
+            # inference_optimized cores; this mirrors the functional test.
+            "transformer_impl": "inference_optimized",
+            "fp8_cfg": generation_fp8_cfg,
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_accepts_blockwise_megatron_source() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_recipe": "blockwise",
+        "fp8_param": True,
+    }
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "expert_tensor_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "fp8_cfg": {"enabled": False},
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_accepts_megatron_transport() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "refit_backend": "nvshmem",
+            "pipeline_model_parallel_size": 1,
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_rejects_mxfp8_with_unsupported_grouped_gemm_backend() -> (
+    None
+):
+    """MXFP8 inference quantizes only through the torch/flashinfer backends.
+
+    MCore's own guard for this compares ``config.fp8`` (an e4m3/hybrid *format*)
+    against ``"mxfp8"`` (a *recipe*) and so never fires, and the failure would
+    otherwise surface deep inside the first refit.
+    """
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "pipeline_model_parallel_size": 1,
+            "inference_grouped_gemm_backend": "vllm",
+            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+        },
+    }
+
+    with pytest.raises(ValueError, match="inference_grouped_gemm_backend"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("gemm_backend", ["torch", "flashinfer"])
+def test_check_nccl_reshard_accepts_supported_grouped_gemm_backends(
+    gemm_backend: str,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "pipeline_model_parallel_size": 1,
+            "inference_grouped_gemm_backend": gemm_backend,
+            "transformer_impl": "inference_optimized",
+            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_rejects_mxfp8_with_omitted_grouped_gemm_backend() -> None:
+    """An omitted key resolves to MCore's default 'vllm', which MXFP8 rejects.
+
+    Treating the omitted case as valid would let exactly the configuration the
+    guard exists for reach the first refit before failing.
+    """
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "pipeline_model_parallel_size": 1,
+            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+        },
+    }
+
+    with pytest.raises(ValueError, match="inference_grouped_gemm_backend"):
+        check_nccl_reshard_refit_support(config)
+
+
+def _megatron_gen_config(*, policy_updates=None, **mcore_generation_config):
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy.update(policy_updates or {})
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "pipeline_model_parallel_size": 1,
+            **mcore_generation_config,
+        },
+    }
+    return config
+
+
+@pytest.mark.parametrize(
+    ("policy_updates", "mcore_generation_config", "expected_violation"),
+    [
+        # Gen-side PP has no stage-aware destination routing yet.
+        (
+            None,
+            {"pipeline_model_parallel_size": 2},
+            "pipeline_model_parallel_size must be 1",
+        ),
+        # The transport materializes logical BF16; a non-BF16 trainer would
+        # silently ship the wrong dtype.
+        ({"precision": "float32"}, {}, "policy.precision must be 'bfloat16'"),
+        # fp8_param without fp8_cfg.enabled is a half-configured trainer.
+        (
+            {"megatron_cfg": {"enabled": True, "fp8_cfg": {"fp8_param": True}}},
+            {},
+            "fp8_cfg.enabled=True",
+        ),
+        # Megatron inference weights are BF16 or MXFP8 only.
+        (
+            None,
+            {"fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"}},
+            "fp8_recipe must be 'mxfp8'",
+        ),
+        # Without inference_optimized, _prepare_mxfp8_refit installs no MXFP8
+        # destination and the refit silently copies BF16 into TE FP8 params.
+        (
+            None,
+            {
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+                "inference_grouped_gemm_backend": "torch",
+            },
+            "transformer_impl='inference_optimized'",
+        ),
+    ],
+)
+def test_check_nccl_reshard_rejects_unsupported_megatron_generation(
+    policy_updates, mcore_generation_config, expected_violation
+) -> None:
+    config = _megatron_gen_config(
+        policy_updates=policy_updates, **mcore_generation_config
+    )
 
     with pytest.raises(ValueError) as exc_info:
         check_nccl_reshard_refit_support(config)
@@ -358,6 +569,24 @@ def test_get_placements_expert_tp_shifts_by_one():
     )
 
 
+def test_get_placements_expert_ep_and_etp_shard_distinct_axes():
+    # Megatron generation activates EP and expert-TP in the SAME mesh (the layout
+    # build_mesh_info emits for etp>1, ep>1). EP must own the expert dim and ETP
+    # the shifted projection dim; asserting per-axis rather than on the set of
+    # shard dims is what catches the two being swapped.
+    dm = {"ep": 0, "tp": 1}
+    gate = get_placements("a.mlp.experts.gate_proj.weight", dm, 3)
+    down = get_placements("a.mlp.experts.down_proj.weight", dm, 3)
+    assert _shard_dim_at(gate, dm, "ep") == 0
+    assert _shard_dim_at(gate, dm, "tp") == 1
+    assert _shard_dim_at(down, dm, "ep") == 0
+    assert _shard_dim_at(down, dm, "tp") == 2
+    # The router gate is not an expert param: it stays replicated on both axes.
+    assert all(
+        isinstance(p, Replicate) for p in get_placements("a.mlp.gate.weight", dm, 2)
+    )
+
+
 # --------------------------------------------------------------------------
 # group_expert_params_in_metadata
 # --------------------------------------------------------------------------
@@ -545,6 +774,73 @@ def test_build_refit_info_groups_experts_and_tags_them():
         ".experts.0." in p["name"] or ".experts.1." in p["name"]
         for layer in info["layer_names"]
         for p in info["per_layer_params"][layer]
+    )
+
+
+def test_build_refit_info_replicates_megatron_experts_when_etp_is_one():
+    info = build_nccl_reshard_refit_info(
+        _moe_metadata(num_experts=2),
+        train_parallelism={"tp_size": 1, "ep_size": 2, "pp_size": 1},
+        gen_parallelism={
+            "tp_size": 2,
+            "ep_size": 1,
+            "etp_size": 1,
+            "pp_size": 1,
+        },
+        train_world_size=2,
+        gen_world_size=2,
+    )
+
+    gate = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+    assert all(isinstance(placement, Replicate) for placement in gate["dst_placements"])
+
+
+def test_build_refit_info_shards_megatron_experts_across_ep_and_etp():
+    info = build_nccl_reshard_refit_info(
+        _moe_metadata(num_experts=2),
+        train_parallelism={
+            "tp_size": 1,
+            "ep_size": 2,
+            "etp_size": 2,
+            "pp_size": 1,
+        },
+        gen_parallelism={
+            "tp_size": 2,
+            "ep_size": 2,
+            "etp_size": 2,
+            "pp_size": 1,
+        },
+        train_world_size=4,
+        gen_world_size=4,
+    )
+
+    gate = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+    down = _find(info, "model.layers.0.mlp.experts.down_proj.weight")
+    assert {
+        placement.dim
+        for placement in gate["src_placements"]
+        if isinstance(placement, Shard)
+    } == {0, 1}
+    assert {
+        placement.dim
+        for placement in down["src_placements"]
+        if isinstance(placement, Shard)
+    } == {0, 2}
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 0
+        for placement in gate["dst_placements"]
+    )
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 1
+        for placement in gate["dst_placements"]
+    )
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 0
+        for placement in down["dst_placements"]
+    )
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 2
+        for placement in down["dst_placements"]
     )
 
 

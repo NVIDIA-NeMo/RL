@@ -8,5 +8,6 @@ checkpointing:
 policy:
   generation:
     backend: megatron
+    refit_transport: mcore
     mcore_generation_config:
       kv_cache_management_mode: recompute

@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 def maybe_preinit_nixl_checkpoint_engine(config: dict[str, Any]) -> Any:
     """Preinitialize NIXL when checkpoint-engine refit is configured."""
     generation_config = config.get("generation")
-    if generation_config is None:
+    if generation_config is None or generation_config.get("backend") != "vllm":
         return None
     checkpoint_config = checkpoint_engine_refit_config(generation_config)
     if checkpoint_config is None or checkpoint_config["backend"] != "nixl":

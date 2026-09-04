@@ -19,6 +19,7 @@ policy:
   make_sequence_length_divisible_by: 1
   generation:
     backend: megatron
+    refit_transport: mcore
     max_new_tokens: 512
     vllm_cfg:
       max_model_len: 512
@@ -33,4 +34,3 @@ logger:
     name: grpo-llama3.2-1b-instruct-1n8g-megatron_generation
 cluster:
   gpus_per_node: 8
-

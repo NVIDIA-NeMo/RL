@@ -36,6 +36,11 @@ run_test() {
 
 run_test uv run --no-sync bash ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
 
+# MXFP8 leg of the Megatron M-to-N reshard refit. Sized for 2 GPUs
+# (cluster.gpus_per_node=2, 1 train + 1 gen), so it fits this shard's runner.
+# MXFP8 inference is Blackwell-only, which is what this runner provides.
+run_test env REFIT_PRECISION=mxfp8 uv run --no-sync bash ./tests/functional/grpo_megatron_nccl_reshard_refit.sh
+
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
     coverage combine .coverage*

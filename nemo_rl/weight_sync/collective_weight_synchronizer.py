@@ -181,7 +181,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # prepare_refit_info is called before init_collective. This matches
         # distillation.py ordering. Neither call depends on the other today,
         # but we document this as the canonical ordering for future reference.
-        state_dict_info = self._policy.prepare_refit_info()
+        state_dict_info = self._policy.prepare_refit_info(
+            refit_payload_mode=self._generation.get_refit_payload_mode()
+        )
         self._generation.prepare_refit_info(state_dict_info)
 
         ip, port = self._train_cluster.get_master_address_and_port()

@@ -28,6 +28,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.dtensor_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
     policy.generation.backend=megatron \
+    policy.generation.refit_transport=mcore \
     cluster.gpus_per_node=2 \
     grpo.max_rollout_turns=5 \
     grpo.max_num_steps=3 \
