@@ -1381,8 +1381,11 @@ class SingleControllerActor:
         self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
         return True
 
-    async def _cleanup_consumed_metas_unlocked(self, metas: list[KVBatchMeta]) -> None:
+    async def _cleanup_consumed_metas_unlocked(
+        self, cut: DataPlaneMutationCut, metas: list[KVBatchMeta]
+    ) -> None:
         """Clear consumed ownership while holding a barrier mutation slot."""
+        cut.require_live()
         canonical_by_partition: dict[str, list[str]] = {}
         staging_by_partition: dict[str, list[str]] = {}
         for meta in metas:
@@ -1434,8 +1437,8 @@ class SingleControllerActor:
 
     async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
         """Clear consumed rows without racing a native TQ checkpoint."""
-        async with self._data_plane_checkpoint_barrier.mutation():
-            await self._cleanup_consumed_metas_unlocked(metas)
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
+            await self._cleanup_consumed_metas_unlocked(cut, metas)
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
