@@ -266,6 +266,7 @@ def patched_factories():
             "_generation_max_seq_len",
             return_value=32,
         ),
+        patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
     ):
         yield {
             "setup_response_data": mock_setup_response,
@@ -822,7 +823,7 @@ class TestSetup:
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=use_gym),
-            patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
+            patch.object(sc_setup_mod, "build_nemo_gym_actors") as mock_spinup,
             pytest.raises(expected_error, match=match),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -1123,7 +1124,7 @@ class TestSetup:
         assert "train_iters" not in mc.policy.get("megatron_cfg", {})
 
     def test_nemo_gym_wires_env_handle(self, patched_factories):
-        """When should_use_nemo_gym is True the nemo-gym actor is spun up and stored."""
+        """When enabled, the NeMo-Gym shard set is spun up and stored."""
         mc = _make_master_config(backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
@@ -1133,20 +1134,23 @@ class TestSetup:
             list(range(8)),
             None,
         )
-        fake_gym_actor = MagicMock(name="nemo_gym_actor")
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
-                sc_setup_mod, "spinup_nemo_gym_actor", return_value=fake_gym_actor
+                sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_shards
             ) as mock_spinup,
+            patch.object(
+                sc_setup_mod, "validate_dataset_agent_coverage"
+            ) as mock_validate,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
             tokenizer = MagicMock(pad_token_id=0)
             actor_args, _ = setup_single_controller(mc, tokenizer)
 
         mock_spinup.assert_called_once_with(
-            env_configs=mc.env,
+            mc.env,
             base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
             model_name="test-model",
             # Reaches the actor once, at spinup, rather than riding along with every
@@ -1155,7 +1159,64 @@ class TestSetup:
             enable_router_replay=False,
             use_fastokens=False,
         )
-        assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+        mock_validate.assert_called_once_with(
+            fake_gym_shards,
+            {"training": list(range(8)), "validation": None},
+        )
+        assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
+
+    def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
+        mc = _make_master_config(colocated=False, backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_shards
+            ),
+            patch.object(
+                sc_setup_mod,
+                "validate_dataset_agent_coverage",
+                side_effect=RuntimeError("unhosted agent"),
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            pytest.raises(RuntimeError, match="unhosted agent"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        fake_gym_shards.shutdown.assert_called_once_with()
+
+    def test_parallel_setup_failure_shuts_down_completed_gym_shards(
+        self, patched_factories
+    ):
+        mc = _make_master_config(colocated=False, backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        patched_factories["_build_trainer"].side_effect = RuntimeError("trainer failed")
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_shards
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            pytest.raises(RuntimeError, match="trainer failed"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        fake_gym_shards.shutdown.assert_called_once_with()
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""
@@ -1201,7 +1262,7 @@ class TestSetup:
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
-                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
             ),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
@@ -1227,7 +1288,7 @@ class TestSetup:
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
-                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
             ),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
@@ -1253,7 +1314,7 @@ class TestSetup:
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
-                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
             ),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
@@ -1297,7 +1358,7 @@ class TestSetup:
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
-                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
             ),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
@@ -1380,7 +1441,7 @@ class TestSetup:
         endpoint_up = threading.Event()
         weight_sync.sync_weights.side_effect = lambda **_: endpoint_up.set()
 
-        def _spinup_gym(**_):
+        def _spinup_gym(_env_configs, **_):
             if not endpoint_up.wait(timeout=5):
                 raise TimeoutError("Gym was awaited before the initial refit")
             return fake_gym_actor
@@ -1399,7 +1460,7 @@ class TestSetup:
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=gym),
             patch.object(
-                sc_setup_mod, "spinup_nemo_gym_actor", side_effect=_spinup_gym
+                sc_setup_mod, "build_nemo_gym_actors", side_effect=_spinup_gym
             ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
@@ -1508,7 +1569,7 @@ class TestSetup:
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-            patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
+            patch.object(sc_setup_mod, "build_nemo_gym_actors") as mock_spinup,
             pytest.raises(NotImplementedError, match="vllm"),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))

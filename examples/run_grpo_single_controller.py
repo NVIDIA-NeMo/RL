@@ -41,6 +41,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -48,10 +49,6 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
-
-# Teardown must be bounded: it runs in a finally block, so a hung shutdown would
-# replace a real training error with an indefinite hang.
-_SHUTDOWN_TIMEOUT_S = 10
 
 # Drop examples/ from sys.path so examples/nemo_gym/ (no __init__.py) doesn't
 # shadow the real nemo_gym package as a namespace package.
@@ -157,15 +154,7 @@ def main() -> None:
         print(f"SC run complete: {result}")
     finally:
         # Drain env actors before generation to avoid in-flight requests during shutdown.
-        for env_name, handle in actor_args.env_handles.items():
-            try:
-                ray.get(handle.shutdown.remote(), timeout=_SHUTDOWN_TIMEOUT_S)
-            except Exception as e:
-                print(f"Env {env_name!r} shutdown failed: {e}")
-                try:
-                    ray.kill(handle)
-                except Exception as kill_error:
-                    print(f"Env {env_name!r} kill failed: {kill_error}")
+        shutdown_environments(actor_args.env_handles)
 
         teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
         for teacher_alias, teacher in teacher_worker_groups.items():

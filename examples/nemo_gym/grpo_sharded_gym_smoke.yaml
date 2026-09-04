@@ -1,0 +1,72 @@
+# Two-shard NeMo-Gym smoke config, for exercising sharding by hand.
+#
+# This is not a training recipe. It is the smallest config that puts two Gym
+# stacks behind one job so the sharding machinery can be watched end to end:
+# per-shard spinup, the agent->shard map, routing whole prompt groups to the
+# shard hosting their agent, per-shard log directories, and teardown of both
+# actors plus their placement group.
+#
+# The split is by environment, since an agent may live in exactly one shard:
+# workplace_assistant on one, math_with_judge on the other. Both were already
+# a supported multi-environment combination -- see the commented config_paths
+# in the base recipe -- so this only changes where they run, not what they do.
+#
+# Run `gym dataset collate` with BOTH resources-server config paths.
+# Point data.train/validation at the combined JSONL before running.
+# A dataset covering only one environment still starts.
+# Every row then lands on one shard, so routing is never exercised.
+# A dataset naming a third agent fails at setup.
+#
+# Single node:
+#   the default STRICT_SPREAD wants one node per shard, so override
+#   env.nemo_gym.placement_strategy=PACK to colocate them. That gives up the
+#   capacity isolation sharding exists for, which is fine when the point is to
+#   test the mechanism rather than to relieve a node.
+#
+# Two or more nodes:
+#   leave placement_strategy alone and confirm the shards land on different
+#   nodes.
+
+defaults: "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
+
+env:
+  nemo_gym:
+    # Retract inherited settings that no shard owns.
+    # A Hydra override can blank an inherited key but cannot delete it.
+    # The schema reads null as absent.
+    config_paths: null
+    code_gen: null
+
+    # Each shard gets its own port window so two stacks on one node cannot
+    # collide. The base recipe's 5000-5999 is split in half.
+    shards:
+      - name: workplace
+        port_range_low: 5000
+        port_range_high: 5499
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+
+      - name: math
+        port_range_low: 5500
+        port_range_high: 5999
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/math_with_judge/configs/math_with_judge.yaml
+
+    # The base recipe already configures policy_model.
+    # Claim that inherited overlay by key instead of copying its value.
+    # Both shards need the proxy.
+    # Duplicating it claims no extra GPU.
+    common_inherited_overlays:
+      - policy_model
+
+    # An inherited overlay must be assigned to one shard or to all shards.
+    # Multi-shard plans reject unclaimed and multiply claimed keys.
+    allowed_duplicate_entries:
+      - policy_model
+
+logger:
+  log_dir: "logs/grpo-sharded-gym-smoke"
+  wandb_enabled: false
+  monitor_gpus: false

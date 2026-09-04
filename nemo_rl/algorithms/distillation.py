@@ -49,8 +49,9 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
+    build_nemo_gym_actors,
     should_use_nemo_gym,
-    spinup_nemo_gym_actor,
+    validate_dataset_agent_coverage,
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import (
@@ -519,7 +520,7 @@ def setup(
                 return deferred_vllm
 
             def init_nemo_gym():
-                return spinup_nemo_gym_actor(
+                shard_set = build_nemo_gym_actors(
                     env_configs,
                     base_urls=cast(list[str], deferred_vllm.dp_openai_server_base_urls),
                     model_name=generation_config["model_name"],
@@ -528,6 +529,15 @@ def setup(
                     enable_router_replay=False,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
                 )
+                try:
+                    validate_dataset_agent_coverage(
+                        shard_set,
+                        {"training": train_dataset, "validation": val_dataset},
+                    )
+                except BaseException:
+                    shard_set.shutdown()
+                    raise
+                return shard_set
 
             init_tasks = {
                 "vllm": init_vllm_deferred,
@@ -538,9 +548,20 @@ def setup(
                 f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
                 flush=True,
             )
-            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
-                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
-                results = {k: f.result() for k, f in submitted.items()}
+            submitted = {}
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                    results = {k: f.result() for k, f in submitted.items()}
+            except BaseException:
+                if "nemo_gym" in submitted:
+                    try:
+                        completed_shard_set = submitted["nemo_gym"].result()
+                    except BaseException:
+                        pass
+                    else:
+                        completed_shard_set.shutdown()
+                raise
 
             student_generation = cast(GenerationInterface, results["vllm"])
             nemo_gym_actor = cast(EnvironmentInterface, results["nemo_gym"])
@@ -807,6 +828,9 @@ def _distillation_train_impl(
                             ),
                             max_rollout_turns=None,
                             greedy=False,
+                            num_generations_per_prompt=(
+                                master_config.distillation.num_generations_per_prompt
+                            ),
                         )
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -1288,6 +1312,7 @@ def validate(
                     ),
                     max_rollout_turns=None,
                     greedy=False,
+                    num_generations_per_prompt=1,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics

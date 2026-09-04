@@ -1099,7 +1099,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         patch.object(
             distil_mod, "create_weight_synchronizer"
         ) as mock_create_synchronizer,
-        patch.object(distil_mod, "spinup_nemo_gym_actor") as mock_spinup_nemo_gym,
+        patch.object(distil_mod, "build_nemo_gym_actors") as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
@@ -1124,7 +1124,8 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
             assert DummyVllmGeneration.collective_calls
 
 
-def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
+@pytest.mark.parametrize("vllm_start_fails", [False, True])
+def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_fails):
     import nemo_rl.algorithms.distillation as distil_mod
 
     nemo_gym_config = {
@@ -1226,6 +1227,8 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
 
         def load_and_start(self):
             self.load_and_start_called = True
+            if vllm_start_fails:
+                raise RuntimeError("vLLM startup failed")
 
         def finish_generation(self):
             self.finish_generation_called = True
@@ -1243,7 +1246,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
         patch.object(
-            distil_mod, "spinup_nemo_gym_actor", return_value=nemo_gym_actor
+            distil_mod, "build_nemo_gym_actors", return_value=nemo_gym_actor
         ) as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
@@ -1252,11 +1255,19 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
         mock_ray.get.return_value = None
 
-        result = distil_mod.setup(master_config, tokenizer, dataset, None)
+        if vllm_start_fails:
+            with pytest.raises(RuntimeError, match="vLLM startup failed"):
+                distil_mod.setup(master_config, tokenizer, dataset, None)
+        else:
+            result = distil_mod.setup(master_config, tokenizer, dataset, None)
 
     assert created_vllm
     assert created_vllm[0].defer_model_load is True
     assert created_vllm[0].load_and_start_called
+    if vllm_start_fails:
+        nemo_gym_actor.shutdown.assert_called_once_with()
+        return
+
     assert created_vllm[0].finish_generation_called
     assert created_vllm[0].prepare_refit_info_called
     assert result[2] is created_vllm[0]

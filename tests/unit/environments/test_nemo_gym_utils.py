@@ -18,9 +18,12 @@ These run in the default L0 suite. Keep this module free of heavy imports
 """
 
 import copy
+import json
+import os
 import sys
 import types
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -30,10 +33,10 @@ from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
     NEMO_GYM_ACTOR_FQN,
     _detect_invalid_tool_call_and_malformed_thinking,
+    build_nemo_gym_actors,
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
-    spinup_nemo_gym_actor,
 )
 
 
@@ -227,9 +230,10 @@ def test_build_nemo_gym_config_router_replay_resolves_dtype(detected_uv_dirs):
 
 
 @pytest.mark.parametrize("num_gpu_nodes", [0, 1], ids=["no-gpus", "colocated-gpus"])
-def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
-    """The actor gets the registry runtime_env, and node affinity only when it
-    has colocated GPUs to land next to."""
+def test_an_unsharded_job_gets_the_registry_runtime_env(
+    detected_uv_dirs, num_gpu_nodes
+):
+    """Node affinity applies only when the actor has colocated GPUs to land next to."""
     actor = MagicMock()
     actor._spinup.remote.return_value = "spinup-ref"
     actor.set_tokenizer.remote.return_value = "tokenizer-ref"
@@ -245,7 +249,7 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
         mock_cls.options.return_value.remote.return_value = actor
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
 
-        result = spinup_nemo_gym_actor(
+        result = build_nemo_gym_actors(
             _env_configs(num_gpu_nodes=num_gpu_nodes),
             base_urls=["http://vllm-0"],
             model_name="test-model",
@@ -254,7 +258,8 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
             use_fastokens=True,
         )
 
-    assert result is actor
+    assert result.all_handles == [actor]
+    assert not result.is_sharded
     mock_runtime_env.assert_called_once_with(NEMO_GYM_ACTOR_FQN)
 
     options_kwargs = mock_cls.options.call_args.kwargs
@@ -545,7 +550,7 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
         )
 
     assert not shard_set.is_sharded
-    assert shard_set.sole_handle() is cluster.actors[0]
+    assert shard_set.all_handles == [cluster.actors[0]]
     assert cluster.placement_group_calls == []
     # Node affinity still applies when the actor has colocated GPUs.
     assert isinstance(
@@ -677,6 +682,49 @@ def test_actor_cpus_override_sizes_that_shards_bundle(detected_uv_dirs):
     ]
 
 
+def test_shard_spinup_timeout_is_one_global_deadline():
+    """One budget covers starting every shard and installing every tokenizer.
+
+    A per-wait timeout would let each shard spend the full budget, and the
+    tokenizer pass restarting it would double the worst case again.
+    """
+    first = MagicMock(name="first")
+    second = MagicMock(name="second")
+    first._spinup.remote.return_value = "first-ref"
+    second._spinup.remote.return_value = "second-ref"
+    first.set_tokenizer.remote.return_value = "first-tokenizer-ref"
+    second.set_tokenizer.remote.return_value = "second-tokenizer-ref"
+    shard_set = nemo_gym_mod.NemoGymShardSet(
+        handles={"first": [first], "second": [second]}
+    )
+
+    with (
+        patch.object(
+            nemo_gym_mod,
+            "monotonic",
+            side_effect=[100.0, 101.0, 104.0, 104.5, 104.75],
+        ),
+        patch.object(nemo_gym_mod.ray, "get") as ray_get,
+    ):
+        nemo_gym_mod._spinup_shards_concurrently(
+            shard_set, spinup_timeout=5.0, tokenizer=_TOKENIZER
+        )
+
+    assert [invocation.args[0] for invocation in ray_get.call_args_list] == [
+        "first-ref",
+        "second-ref",
+        "first-tokenizer-ref",
+        "second-tokenizer-ref",
+    ]
+    # Set at 100.0 + 5.0, so each wait gets only what is left of 105.0.
+    assert [invocation.kwargs["timeout"] for invocation in ray_get.call_args_list] == [
+        4.0,
+        1.0,
+        0.5,
+        0.25,
+    ]
+
+
 def test_a_shard_that_fails_to_start_names_itself_and_tears_everything_down(
     detected_uv_dirs,
 ):
@@ -792,19 +840,6 @@ def test_duplicate_agent_across_shards_tears_the_set_down(detected_uv_dirs):
     assert cluster.removed_placement_groups == [cluster.placement_group]
 
 
-def test_spinup_nemo_gym_actor_rejects_a_sharded_config(detected_uv_dirs):
-    """Single-handle callers cannot serve several shards; say so up front."""
-    with pytest.raises(nemo_gym_mod.ShardConfigError, match="not wired up yet"):
-        spinup_nemo_gym_actor(
-            _shard_env_configs(),
-            base_urls=["http://vllm-0"],
-            model_name="test-model",
-            tokenizer=_TOKENIZER,
-            enable_router_replay=False,
-            use_fastokens=False,
-        )
-
-
 def test_a_bare_actor_handle_reads_as_a_one_shard_set():
     """Call sites that predate sharding keep working without building a set."""
     handle = MagicMock()
@@ -834,13 +869,160 @@ def test_shard_name_of_identifies_a_replica_for_error_messages():
         shard_set.shard_name_of(MagicMock())
 
 
-def test_sole_handle_refuses_to_pick_one_of_many():
-    shard_set = nemo_gym_mod.NemoGymShardSet(
-        handles={"a": [MagicMock()], "b": [MagicMock()]}
+def _gym_dataset(*agent_names):
+    """A dataset whose rows carry gym env info, JSON-encoded as on disk."""
+    return [
+        {"extra_env_info": json.dumps({"agent_ref": {"name": name}})}
+        for name in agent_names
+    ]
+
+
+def _sharded_set(agent_to_shard):
+    return nemo_gym_mod.NemoGymShardSet(
+        handles={shard: [MagicMock()] for shard in set(agent_to_shard.values())},
+        agent_to_shard=dict(agent_to_shard),
+        placement_group=MagicMock(),
     )
 
-    with pytest.raises(nemo_gym_mod.ShardSetupError, match="2 across shards"):
-        shard_set.sole_handle()
+
+def test_an_agent_no_shard_hosts_is_caught_before_the_first_step():
+    shard_set = _sharded_set({"alpha": "left"})
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set,
+            {"train": _gym_dataset("alpha"), "validation": _gym_dataset("ghost")},
+        )
+
+    # Name the split, the unhosted agent, and what is on offer -- the mistake is
+    # a typo or a missing shard, and all three are needed to tell which.
+    assert "validation" in str(excinfo.value)
+    assert "['ghost']" in str(excinfo.value)
+    assert "['alpha']" in str(excinfo.value)
+
+
+def test_a_fully_hosted_dataset_passes():
+    shard_set = _sharded_set({"alpha": "left", "beta": "right"})
+
+    nemo_gym_mod.validate_dataset_agent_coverage(
+        shard_set,
+        {"train": _gym_dataset("alpha", "beta", "alpha"), "validation": None},
+    )
+
+
+def test_an_unsharded_job_is_not_scanned_at_all():
+    """One actor hosts everything, so parsing every row would buy nothing."""
+    dataset = MagicMock()
+
+    with patch.object(nemo_gym_mod, "_load_agent_names_from_source") as load_names:
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            nemo_gym_mod.as_nemo_gym_shard_set(MagicMock()), {"train": dataset}
+        )
+
+    load_names.assert_not_called()
+    dataset.__iter__.assert_not_called()
+
+
+def test_the_wrapped_dataset_is_unwrapped_before_scanning():
+    """Rows live on AllTaskProcessedDataset.dataset, not on the wrapper."""
+    wrapper = SimpleNamespace(dataset=_gym_dataset("ghost"))
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="ghost"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left"}), {"train": wrapper}
+        )
+
+
+def test_source_agent_names_are_cached_across_separate_datasets(tmp_path):
+    data_path = tmp_path / "gym.jsonl"
+    data_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"agent_ref": {"name": "alpha"}}),
+                json.dumps({"agent_ref": {"name": "beta"}}),
+            ]
+        )
+        + "\n"
+    )
+    source_stat = data_path.stat()
+    source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
+        str(data_path.resolve()), source_stat
+    )
+    alpha_rows = MagicMock()
+    beta_rows = MagicMock()
+    datasets = {
+        "alpha": SimpleNamespace(
+            dataset=alpha_rows,
+            agent_name_sources=frozenset({source}),
+        ),
+        "beta": SimpleNamespace(
+            dataset=beta_rows,
+            agent_name_sources=frozenset({source}),
+        ),
+    }
+
+    with patch.object(
+        nemo_gym_mod,
+        "_get_agent_name",
+        wraps=nemo_gym_mod._get_agent_name,
+    ) as get_agent_name:
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left", "beta": "right"}), {"train": datasets}
+        )
+
+    assert get_agent_name.call_count == 2
+    alpha_rows.__iter__.assert_not_called()
+    beta_rows.__iter__.assert_not_called()
+
+
+def test_changed_source_falls_back_to_loaded_rows(tmp_path):
+    data_path = tmp_path / "gym.jsonl"
+    data_path.write_text(json.dumps({"agent_ref": {"name": "alpha"}}) + "\n")
+    source_stat = data_path.stat()
+    source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
+        str(data_path.resolve()), source_stat
+    )
+    wrapper = SimpleNamespace(
+        dataset=_gym_dataset("ghost"),
+        agent_name_sources=frozenset({source}),
+    )
+    data_path.write_text(
+        json.dumps({"agent_ref": {"name": "changed-and-longer"}}) + "\n"
+    )
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="ghost"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left"}), {"train": wrapper}
+        )
+
+
+def test_same_size_source_replacement_falls_back_to_loaded_rows(tmp_path):
+    data_path = tmp_path / "gym.jsonl"
+    data_path.write_text(json.dumps({"agent_ref": {"name": "alpha"}}) + "\n")
+    source_stat = data_path.stat()
+    source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
+        str(data_path.resolve()), source_stat
+    )
+    wrapper = SimpleNamespace(
+        dataset=_gym_dataset("ghost"),
+        agent_name_sources=frozenset({source}),
+    )
+
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_text(json.dumps({"agent_ref": {"name": "bravo"}}) + "\n")
+    os.utime(
+        replacement,
+        ns=(replacement.stat().st_atime_ns, source_stat.st_mtime_ns),
+    )
+    os.replace(replacement, data_path)
+    replaced_stat = data_path.stat()
+    assert replaced_stat.st_size == source_stat.st_size
+    assert replaced_stat.st_mtime_ns == source_stat.st_mtime_ns
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="ghost"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left"}), {"train": wrapper}
+        )
 
 
 def test_shard_set_shutdown_releases_the_placement_group_once():

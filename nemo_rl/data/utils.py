@@ -28,6 +28,7 @@ from nemo_rl.data.datasets import (
     merge_datasets,
     update_single_dataset_config,
 )
+from nemo_rl.data.interfaces import NemoGymSourceIdentity
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
@@ -101,6 +102,25 @@ def load_dataloader_state(
             return
 
     dataloader.load_state_dict(saved_state)
+
+
+def _combine_agent_name_sources(
+    datasets: list[Any],
+) -> frozenset[NemoGymSourceIdentity] | None:
+    return _combine_agent_name_source_sets(
+        [dataset.agent_name_sources for dataset in datasets]
+    )
+
+
+def _combine_agent_name_source_sets(
+    source_sets: list[frozenset[NemoGymSourceIdentity] | None],
+) -> frozenset[NemoGymSourceIdentity] | None:
+    """Combine source identities without hiding an unknown source."""
+    if any(sources is None for sources in source_sets):
+        return None
+    return frozenset(
+        source for sources in source_sets if sources is not None for source in sources
+    )
 
 
 # TODO: @yukih: unify to setup_data after dataset refactored
@@ -202,6 +222,7 @@ def setup_response_data(
                 task_data_processors,
                 task_data_preprocessors=task_data_preprocessors,
                 max_seq_length=data_config["max_input_seq_length"],
+                agent_name_sources=data.agent_name_sources,
             )
             for data in data_list
         }
@@ -215,6 +236,7 @@ def setup_response_data(
             task_data_processors,
             task_data_preprocessors=task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
+            agent_name_sources=_combine_agent_name_sources(data_list),
         )
     sample_count = sum(len(data.dataset) for data in data_list)
     print(f"  ✓ Training dataset loaded with {sample_count} samples.")
@@ -226,11 +248,13 @@ def setup_response_data(
     val_task_data_preprocessors = {}
     val_task_to_env = {}
     val_data_list = []
+    val_agent_name_source_sets = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
     for data in data_list:
         if hasattr(data, "val_dataset") and data.val_dataset is not None:
             val_data_list.append(data.val_dataset)
+            val_agent_name_source_sets.append(data.agent_name_sources)
             print(
                 f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
             )
@@ -255,6 +279,7 @@ def setup_response_data(
                 update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
             val_data_list.append(val_data.dataset)
+            val_agent_name_source_sets.append(val_data.agent_name_sources)
             print(
                 f"  - Loaded validation dataset {val_data.task_name} with {len(val_data.dataset)} samples."
             )
@@ -280,6 +305,9 @@ def setup_response_data(
             val_task_data_processors,
             task_data_preprocessors=val_task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
+            agent_name_sources=_combine_agent_name_source_sets(
+                val_agent_name_source_sets
+            ),
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
