@@ -197,6 +197,10 @@ ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/z3/lib:/opt/
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
+# The single source of truth for which extras each Ray actor's venv needs. Run as a
+# script by the prefetch below; imported by nemo_rl.distributed.ray_actor_environment_registry
+# at runtime. Kept dependency-free so it can be copied in without the rest of the source.
+COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl --link research/ ./research/
@@ -249,48 +253,34 @@ UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
 
 # Worker-venv prefetch, phase 1:
 # Materialize each actor venv's third-party packages in THIS layer, hardlinked against the above cache,
-# so the N worker venvs cost directory entries instead of N wheel copies
-# Emit "<actor FQN>\t<stage>\t<uv sync extra flags>" for every uv-managed actor in
-# pyproject.toml's [tool.nemo_rl.actor_environments]; the runtime registry reads the same table.
-list_actor_venvs() {
-    "${UV_PROJECT_ENVIRONMENT}/bin/python" - <<'PY'
-import tomllib
-with open("pyproject.toml", "rb") as f:
-    table = tomllib.load(f)["tool"]["nemo_rl"]["actor_environments"]
-for actor_fqn, extras in sorted(table.items()):
-    if extras == "system":
-        continue
-    stage = "trtllm" if "trtllm" in extras else "deps"
-    print(actor_fqn, stage, " ".join(f"--extra {e}" for e in extras), sep="\t")
-PY
-}
-PREFETCH_NEGATIVE_FILTERS=""
+# so the N worker venvs cost directory entries instead of N wheel copies.
+# nemo_rl/distributed/actor_environments.py is the single source of truth for which extras each
+# actor needs; the runtime registry imports the same dict. It is run as a script (not imported)
+# because nemo_rl/__init__.py cannot execute in this layer -- the source tree is not here yet.
+SKIP_EXTRAS=""
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
-    PREFETCH_NEGATIVE_FILTERS="$PREFETCH_NEGATIVE_FILTERS vllm"
+    SKIP_EXTRAS="$SKIP_EXTRAS vllm"
 fi
 if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
-    PREFETCH_NEGATIVE_FILTERS="$PREFETCH_NEGATIVE_FILTERS sglang"
+    SKIP_EXTRAS="$SKIP_EXTRAS sglang"
 fi
 if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    PREFETCH_NEGATIVE_FILTERS="$PREFETCH_NEGATIVE_FILTERS trtllm"
+    SKIP_EXTRAS="$SKIP_EXTRAS trtllm"
 fi
+# Write the list once, in a plain redirect so `set -e` catches a failure here
+# instead of silently prefetching nothing.
+"${UV_PROJECT_ENVIRONMENT}/bin/python" nemo_rl/distributed/actor_environments.py all $SKIP_EXTRAS \
+    > /opt/actor_venvs.tsv
+test -s /opt/actor_venvs.tsv
 while IFS=$'\t' read -r venv_name stage extras; do
-    skip=""
-    for f in $PREFETCH_NEGATIVE_FILTERS; do
-        if [[ "$venv_name" == *"$f"* ]]; then
-            skip=1
-        fi
-    done
-    if [[ -n "$skip" ]]; then
-        continue
-    fi
     if [[ "$stage" == "trtllm" ]]; then
+        # tensorrt_llm does not exist yet; warm the base and finish in the TRT-LLM layer.
         extras=""
     fi
     venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
     uv venv --allow-existing "$venv_path"
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
-done < <(list_actor_venvs)
+done < /opt/actor_venvs.tsv
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
@@ -373,20 +363,8 @@ du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 # top off the venv with the full extra set so that the added files hardlink in-layer.
 # tensorrt_llm itself is new in this layer; trtllm-extra deps already present in the
 # dependency layer's cache (e.g. tilelang) get copied up here, a small accepted cost.
-# Emit "<actor FQN>\t<stage>\t<uv sync extra flags>" for every uv-managed actor in
-# pyproject.toml's [tool.nemo_rl.actor_environments]; the runtime registry reads the same table.
-list_actor_venvs() {
-    "${UV_PROJECT_ENVIRONMENT}/bin/python" - <<'PY'
-import tomllib
-with open("pyproject.toml", "rb") as f:
-    table = tomllib.load(f)["tool"]["nemo_rl"]["actor_environments"]
-for actor_fqn, extras in sorted(table.items()):
-    if extras == "system":
-        continue
-    stage = "trtllm" if "trtllm" in extras else "deps"
-    print(actor_fqn, stage, " ".join(f"--extra {e}" for e in extras), sep="\t")
-PY
-}
+# The dependency layer already wrote the actor list to /opt/actor_venvs.tsv, so this layer
+# reuses it rather than re-deriving it -- one reader, one place it can go wrong.
 while IFS=$'\t' read -r venv_name stage extras; do
     if [[ "$stage" != "trtllm" ]]; then
         continue
@@ -395,8 +373,9 @@ while IFS=$'\t' read -r venv_name stage extras; do
     uv venv --allow-existing "$venv_path"
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink \
         TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+        TRTLLM_REQUIRE_CACHED_WHEEL=1 \
         uv sync --frozen $extras --no-install-project
-done < <(list_actor_venvs)
+done < /opt/actor_venvs.tsv
 
 # The main venv was never touched (the build ran in the throwaway venv), so
 # the previous "restore the default environment" sync is no longer needed.
