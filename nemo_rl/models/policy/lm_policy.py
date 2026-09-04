@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Optional, Union, cast
 
 import numpy as np
 import ray
@@ -39,6 +39,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.deferred import (
+    DeferredTopkLogits,
+    DeferredTopkWorkerResult,
+)
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -559,12 +563,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         does not return ``unsorted_data_indices`` because train returns
         scalar metrics (no per-row outputs to reorder).
         """
+        sharded_data, _ = self._shard_for_train_and_indices(data, batch_size)
+        return sharded_data
+
+    def _shard_for_train_and_indices(
+        self,
+        data: BatchedDataDict[Any],
+        batch_size: int,
+    ) -> tuple[list["SlicedDataDict"], list[list[int]]]:
+        """Shard training data and retain each DP shard's global row order."""
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
             ]["train_mb_tokens"]
-            sharded_data, _ = data.shard_by_batch_size(
+            sharded_data, sorted_indices = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,
                 dynamic_batching_args=self.dynamic_batching_args,
@@ -573,7 +586,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
             ]["train_mb_tokens"]
-            sharded_data, _ = data.shard_by_batch_size(
+            sharded_data, sorted_indices = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,
                 sequence_packing_args=self.sequence_packing_args,
@@ -583,7 +596,53 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dp_size,
                 batch_size=batch_size,
             )
-        return sharded_data
+            shard_size = batch_size // dp_size
+            sorted_indices = []
+            for dp_rank in range(dp_size):
+                for chunk_start in range(0, data.size, batch_size):
+                    start = chunk_start + dp_rank * shard_size
+                    sorted_indices.extend(range(start, start + shard_size))
+
+        indices_per_dp: list[list[int]] = []
+        offset = 0
+        for shard in sharded_data:
+            shard_size = shard.size
+            indices_per_dp.append(sorted_indices[offset : offset + shard_size])
+            offset += shard_size
+        if offset != len(sorted_indices):
+            raise RuntimeError(
+                "Training shard row-order metadata does not match sharded data: "
+                f"{offset} rows vs {len(sorted_indices)} indices."
+            )
+        return cast(list[SlicedDataDict], sharded_data), indices_per_dp
+
+    def can_consume_deferred_topk_from(
+        self,
+        teacher: "Policy",
+        data: BatchedDataDict[Any],
+        batch_size: int,
+    ) -> bool:
+        """Whether teacher and student produce identical DP-local row layouts."""
+        if data.size != batch_size:
+            return False
+        if self.data_parallel_size != teacher.data_parallel_size:
+            return False
+        if self.use_dynamic_batches or teacher.use_dynamic_batches:
+            return False
+        if self.use_sequence_packing != teacher.use_sequence_packing:
+            return False
+        if not self.use_sequence_packing:
+            return True
+
+        student_args = dict(self.sequence_packing_args)
+        teacher_args = dict(teacher.sequence_packing_args)
+        student_args["max_tokens_per_microbatch"] = self.cfg["sequence_packing"][
+            "train_mb_tokens"
+        ]
+        teacher_args["max_tokens_per_microbatch"] = teacher.cfg["sequence_packing"][
+            "logprob_mb_tokens"
+        ]
+        return student_args == teacher_args
 
     def _report_sharded_payload(
         self,
@@ -749,6 +808,79 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    def get_topk_logits_deferred(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> DeferredTopkLogits:
+        """Return DP-local top-k results as Ray refs without driver materialization."""
+        if self.use_dynamic_batches:
+            raise ValueError(
+                "Deferred top-k handoff does not support dynamic batching."
+            )
+
+        with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
+            sharded_data, sorted_indices = self._shard_for_logprob(data)
+
+        with (
+            timer.time("get_topk_logits/submit_topk_logits_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_topk_logits_deferred",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+            )
+
+        # Materialize only the small wrappers. This preserves the original
+        # all-worker error propagation while the large payloads stay remote.
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        if not all(
+            isinstance(result, DeferredTopkWorkerResult) for result in worker_results
+        ):
+            raise TypeError(
+                "Deferred top-k workers must return DeferredTopkWorkerResult."
+            )
+        refs = [result.payload_ref for result in worker_results]
+        if len(refs) != self.data_parallel_size:
+            raise RuntimeError(
+                "Deferred top-k produced an unexpected number of DP results: "
+                f"{len(refs)} vs {self.data_parallel_size}."
+            )
+        if sorted_indices is None:
+            sorted_indices = list(range(data.size))
+        indices_per_dp: list[list[int]] = []
+        offset = 0
+        for shard in sharded_data:
+            shard_size = shard.size
+            indices_per_dp.append(sorted_indices[offset : offset + shard_size])
+            offset += shard_size
+        if offset != data.size:
+            raise RuntimeError(
+                "Teacher shard row-order metadata does not match input data: "
+                f"{offset} rows vs {data.size}."
+            )
+
+        return DeferredTopkLogits(
+            refs=refs,
+            global_indices_per_dp=indices_per_dp,
+            batch_size=data.size,
+        )
+
     def get_full_logits_ipc(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -816,6 +948,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        deferred_topk_logits: Optional[DeferredTopkLogits] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
@@ -830,7 +963,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
-            sharded_data = self._shard_for_train(data, batch_size)
+            if deferred_topk_logits is None:
+                sharded_data = self._shard_for_train(data, batch_size)
+                train_indices_per_dp = None
+            else:
+                sharded_data, train_indices_per_dp = self._shard_for_train_and_indices(
+                    data, batch_size
+                )
+        if deferred_topk_logits is not None:
+            if deferred_topk_logits.batch_size != data.size:
+                raise ValueError(
+                    "Deferred teacher top-k batch size does not match training data: "
+                    f"{deferred_topk_logits.batch_size} vs {data.size}."
+                )
+            if deferred_topk_logits.global_indices_per_dp != train_indices_per_dp:
+                raise ValueError(
+                    "Deferred teacher top-k DP row order does not match student "
+                    "training shards; use the materialized fallback."
+                )
         self._report_sharded_payload(sharded_data, "policy_train")
 
         if self.flops_tracker is not None:
@@ -845,9 +995,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if timer
             else nullcontext()
         ):
+            sharded_kwargs: dict[str, Any] = {"data": sharded_data}
+            if deferred_topk_logits is not None:
+                sharded_kwargs["deferred_topk_logits"] = deferred_topk_logits.refs
             futures = self.worker_group.run_all_workers_sharded_data(
                 "train",
-                data=sharded_data,
                 in_sharded_axes=["data_parallel"],
                 replicate_on_axes=[
                     "context_parallel",
@@ -866,6 +1018,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "mbs": micro_batch_size,
                     "check_dim_skip_keys": check_dim_skip_keys,
                 },
+                **sharded_kwargs,
             )
         results = self.worker_group.get_all_worker_results(futures)
 
