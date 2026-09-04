@@ -36,6 +36,12 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_sync.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_async.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_nixl_non_colocated.sh
+# The TP2 variant needs four GPUs (two policy senders plus two SGLang ranks),
+# while both H100 and GB200 L1 runners expose two. Keep it as an explicit
+# manual test instead of registering a guaranteed skip whose green check would
+# imply coverage it did not provide:
+#   uv run --no-sync bash tests/functional/grpo_sglang_nixl_non_colocated_tp2.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

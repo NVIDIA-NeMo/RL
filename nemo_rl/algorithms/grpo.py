@@ -1618,6 +1618,17 @@ def setup(
 
     elif backend == "sglang":
         generation_config = cast(SGLangConfig, generation_config)
+        refit_transport = generation_config.get("refit_transport")
+        if refit_transport is not None:
+            checkpoint_engine_config = checkpoint_engine_refit_config(generation_config)
+            if checkpoint_engine_config is None:
+                raise NotImplementedError(
+                    f"SGLang does not support refit_transport={refit_transport!r}. "
+                    "Use 'nixl', a custom 'module:ClassName' checkpoint "
+                    "engine, or null for the default path: Ray CUDA-IPC when "
+                    "colocated, and SGLang's own NCCL weight-update group when "
+                    "not, which today requires a Megatron policy."
+                )
 
         # Set model_path if not already set
         if "model_path" not in generation_config["sglang_cfg"]:
@@ -1709,10 +1720,14 @@ def setup(
 
         check_nccl_reshard_refit_support(master_config)
 
-    if generation_config.get("refit_transport") is not None and backend != "vllm":
+    if (
+        generation_config.get("refit_transport") is not None
+        and checkpoint_engine_config is None
+        and backend != "vllm"
+    ):
         raise NotImplementedError(
-            "Non-default refit transports are only supported for the vLLM "
-            f"generation backend, but policy.generation.backend={backend!r}. "
+            "This non-default refit transport is not supported for "
+            f"policy.generation.backend={backend!r}. "
             "Set policy.generation.refit_transport=null. Support for other "
             "generation backends is tracked in "
             "https://github.com/NVIDIA-NeMo/RL/issues/3288."
@@ -1784,7 +1799,7 @@ def setup(
         )
     elif checkpoint_engine_config is not None:
         t0 = time.perf_counter()
-        assert isinstance(policy_generation, VllmGeneration)
+        assert isinstance(policy_generation, (VllmGeneration, SGLangGeneration))
         policy_generation.weight_synchronizer = create_weight_synchronizer(
             policy=policy,
             generation=policy_generation,
@@ -1794,7 +1809,7 @@ def setup(
             inference_cluster=inference_cluster,
         )
         policy_generation.weight_synchronizer.init_communicator()
-        setup_timing_metrics.vllm_checkpoint_engine_init_time_s = (
+        setup_timing_metrics.extras[f"{backend}_checkpoint_engine_init_time_s"] = (
             time.perf_counter() - t0
         )
         print(

@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.generation.constants import SGLANG_BACKEND
 from nemo_rl.models.generation.interfaces import CheckpointEngineConfig
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -40,11 +41,11 @@ def _sort_ranked_metadata(metadata: list[Any]) -> list[Any]:
 
 
 def _ordered_generation_metadata(generation_results: list[Any]) -> list[Any]:
-    """Order vLLM generation metadata by global rollout rank.
+    """Order generation metadata by global rollout rank.
 
-    Each result belongs to one vLLM data-parallel group. Engine-local ranks
-    are unique only within a group, so sort each group before concatenating
-    them in worker-group order.
+    Each result belongs to one generation engine or data-parallel group.
+    Engine-local ranks may be unique only within a group, so sort each group
+    before concatenating them in engine order.
     """
     metadata: list[Any] = []
     for group_result in generation_results:
@@ -67,7 +68,11 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     _bucket_size_bytes: int | None = None
 
     def init_communicator(self) -> None:
-        self._generation.prepare_refit_info(self._policy.prepare_refit_info())
+        # SGLang's checkpoint-engine path builds its topology below and does not
+        # consume the legacy refit metadata.  Gathering it would needlessly
+        # materialize every sharded policy tensor on every training rank.
+        if not self._is_sglang():
+            self._generation.prepare_refit_info(self._policy.prepare_refit_info())
         self._ensure_checkpoint_engine_ready()
 
     @property
@@ -87,6 +92,9 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             method_kwargs=method_kwargs,
         )
 
+    def _is_sglang(self) -> bool:
+        return self._generation.cfg["backend"] == SGLANG_BACKEND
+
     def _generation_rpc(self) -> str:
         return (
             "checkpoint_engine_rpc_async"
@@ -97,6 +105,10 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     def _run_generation(
         self, checkpoint_method: str, method_args: tuple[Any, ...] = ()
     ) -> list[ray.ObjectRef]:
+        if self._is_sglang():
+            return self._generation.run_checkpoint_engine_method(
+                checkpoint_method, method_args
+            )
         return self._generation.worker_group.run_all_workers_single_data(
             self._generation_rpc(),
             checkpoint_method=checkpoint_method,
@@ -183,26 +195,34 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             "train_world_size": len(policy_metadata),
             "rollout_world_size": len(generation_metadata),
         }
-        worker_count = len(self._generation.worker_group.workers)
-        workers_per_group = worker_count // self._generation.dp_size
+        if self._is_sglang():
+            generation_init_refs = (
+                self._generation.init_checkpoint_engine_process_groups(**topology)
+            )
+        else:
+            worker_count = len(self._generation.worker_group.workers)
+            workers_per_group = worker_count // self._generation.dp_size
+            generation_init_refs = (
+                self._generation.worker_group.run_all_workers_multiple_data(
+                    self._generation_rpc(),
+                    method_args=[
+                        (
+                            rank_prefix,
+                            topology["train_world_size"],
+                            topology["rollout_world_size"],
+                            topology["metadata"],
+                        )
+                        for rank_prefix in range(0, worker_count, workers_per_group)
+                    ],
+                    run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                    common_kwargs={
+                        "checkpoint_method": "init_checkpoint_engine_process_group"
+                    },
+                )
+            )
         ray.get(
             self._run_policy("init_checkpoint_engine_process_group", **topology)
-            + self._generation.worker_group.run_all_workers_multiple_data(
-                self._generation_rpc(),
-                method_args=[
-                    (
-                        rank_prefix,
-                        topology["train_world_size"],
-                        topology["rollout_world_size"],
-                        topology["metadata"],
-                    )
-                    for rank_prefix in range(0, worker_count, workers_per_group)
-                ],
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-                common_kwargs={
-                    "checkpoint_method": "init_checkpoint_engine_process_group"
-                },
-            )
+            + generation_init_refs
         )
         self._checkpoint_engine_ready = True
 
@@ -222,27 +242,71 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
 
         try:
             with context:
-                policy_refs = self._run_policy(
-                    "send_weights_via_checkpoint_engine", kv_scales=kv_scales
-                )
-                results = ray.get(
-                    policy_refs
-                    + self._run_generation("update_weights_from_checkpoint_engine")
-                )
-                if not all(
-                    result
-                    for result in results[len(policy_refs) :]
-                    if result is not None
-                ):
-                    raise RuntimeError(
-                        "Weight transfer failed during "
-                        f"{self._checkpoint_engine_config['backend']} "
-                        "checkpoint-engine sync."
-                    )
+                if self._is_sglang():
+                    self._sglang_transfer(kv_scales)
+                else:
+                    self._transfer(kv_scales)
                 self._stale = False
         finally:
             if self._release_after_refit():
                 self.shutdown()
+
+    def _transfer(self, kv_scales: Optional[dict[str, float]]) -> None:
+        """Run one policy->rollout checkpoint-engine transfer."""
+        policy_refs = self._run_policy(
+            "send_weights_via_checkpoint_engine", kv_scales=kv_scales
+        )
+        results = ray.get(
+            policy_refs + self._run_generation("update_weights_from_checkpoint_engine")
+        )
+        if not all(
+            result for result in results[len(policy_refs) :] if result is not None
+        ):
+            raise RuntimeError(
+                "Weight transfer failed during "
+                f"{self._checkpoint_engine_config['backend']} "
+                "checkpoint-engine sync."
+            )
+
+    def _sglang_transfer(self, kv_scales: Optional[dict[str, float]]) -> None:
+        """Transfer inside the engine-side weight-update session.
+
+        SGLang gates ``update_weights_from_tensor`` on a session opened by
+        ``begin_weight_update``, and only ``end_weight_update`` rebuilds the
+        quantized kernel layouts afterwards, so the transfer has to sit inside
+        that envelope however the bytes arrive. The pause matters for the same
+        reason it does on the sibling path: the buckets land as several
+        ``update_weights_from_tensor`` calls, each taking the server's model
+        update lock on its own, so a request admitted between two buckets would
+        run against a half-updated model.
+
+        The envelope is the one ``_SGLangWeightSynchronizer._refit`` uses; the
+        two SGLang transports differ only in how the weights travel, and the
+        sibling additionally rejects ``kv_scales``, which this transport
+        forwards to the policy.
+        """
+        self._generation.prepare_for_generation(tags=["weights"])
+        # Every state acquired below is released in the finally, so a failure
+        # anywhere in the refit leaves the engines usable instead of wedged
+        # with no error pointing at why. Re-acquire the KV pool before
+        # readmitting requests, not after.
+        try:
+            self._generation.pause_generation(
+                mode=self._generation.pause_generation_mode
+            )
+            if not self._generation.invalidate_kv_cache():
+                raise RuntimeError("SGLang KV cache invalidation failed before refit.")
+
+            self._generation.begin_weight_update()
+            try:
+                self._transfer(kv_scales)
+            finally:
+                # Only closes a session that actually opened: if
+                # begin_weight_update raised, this inner block never ran.
+                self._generation.end_weight_update()
+        finally:
+            self._generation.prepare_for_generation(tags=["kv_cache"])
+            self._generation.continue_generation()
 
     def shutdown(self) -> None:
         if not self._checkpoint_engine_ready:
