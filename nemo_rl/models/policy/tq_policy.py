@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -65,6 +65,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
+    if "mtp_metrics" in results[0]:
+        out["mtp_metrics"] = results[0]["mtp_metrics"]
     if "draft_grad_norm" in results[0]:
         out["draft_grad_norm"] = results[0]["draft_grad_norm"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
@@ -218,14 +220,22 @@ class TQPolicy(TQDriverMixin, Policy):
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
-        Logprob workers need only LP_SEED_FIELDS — narrow the meta's
-        field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
-        multimodal). The same shape is used for both prev_lp and ref_lp.
-        Workers compute the per-token tensor and commit it to TQ via the
-        leader-rank ``_write_back_result_field``; the Ray return is
-        always None, so this dispatcher just waits for completion.
+        Logprob workers fetch ``LP_SEED_FIELDS`` plus the multimodal
+        columns ``_isolated_meta`` unions in, so prev/ref logprobs see the
+        same model inputs as the training forward, which is narrowed through
+        the same helper. Narrowing the
+        meta's field list still keeps rollout-only payload (message-log
+        bulk, ``content``) in TQ. The same shape is used for both prev_lp
+        and ref_lp. Workers compute the per-token tensor and commit it to
+        TQ via the leader-rank ``_write_back_result_field``; the Ray
+        return is always None, so this dispatcher just waits for
+        completion.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
+        # Narrow the fetch to LP_SEED_FIELDS + optional routed_experts under
+        # R3 replay. ``_isolated_meta`` unions in the multimodal columns the
+        # rollout wrote, for this dispatch and the training one alike, so the
+        # prev/ref logprobs and the training forward see identical model inputs.
         lp_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
@@ -333,10 +343,14 @@ class TQPolicy(TQDriverMixin, Policy):
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
+        # The multimodal columns are per-batch, not part of the static schema,
+        # so ``_isolated_meta`` unions them in — without them a VLM training
+        # forward would run image-blind while the logprob forwards saw images.
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+                train_fields,
+                enabled=self._router_replay_enabled,
             ),
             task_name="train",
         )
@@ -465,7 +479,8 @@ class TQPolicy(TQDriverMixin, Policy):
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+                train_fields,
+                enabled=self._router_replay_enabled,
             ),
             task_name="train",
         )

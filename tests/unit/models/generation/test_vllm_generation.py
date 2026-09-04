@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 import os
 import sys
+import threading
 import types
 from copy import deepcopy
 from pathlib import Path
@@ -44,6 +46,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _AsyncLLMHTTPClient,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -182,6 +185,196 @@ async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
 
     worker.llm.pause_generation.assert_awaited_once_with(mode="keep", clear_cache=False)
     worker.llm.resume_generation.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
+    engine_loop = asyncio.get_running_loop()
+    engine_thread = threading.get_ident()
+    calls = []
+
+    class FakeEngine:
+        model_config = "model-config"
+        renderer = "renderer"
+        input_processor = "input-processor"
+        vllm_config = "vllm-config"
+
+        @property
+        def errored(self):
+            calls.append(("errored", asyncio.get_running_loop(), threading.get_ident()))
+            return False
+
+        @property
+        def dead_error(self):
+            return RuntimeError("engine dead")
+
+        async def is_tracing_enabled(self):
+            calls.append(
+                (
+                    "is_tracing_enabled",
+                    asyncio.get_running_loop(),
+                    threading.get_ident(),
+                )
+            )
+            return False
+
+        async def generate(self, *args, **kwargs):
+            calls.append(
+                ("generate", asyncio.get_running_loop(), threading.get_ident())
+            )
+            yield "first"
+            yield "second"
+
+        async def abort(self, _request_id: str) -> None:
+            calls.append(("abort", asyncio.get_running_loop(), threading.get_ident()))
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    assert (
+        await client._run_on_engine_loop(
+            lambda: asyncio.sleep(0, result="same-loop-result")
+        )
+        == "same-loop-result"
+    )
+
+    def use_client_from_http_thread():
+        async def use_client():
+            tracing_enabled = await client.is_tracing_enabled()
+            outputs = [
+                output async for output in client.generate(None, None, "request")
+            ]
+            errored = client.errored
+            return (
+                tracing_enabled,
+                outputs,
+                errored,
+                asyncio.get_running_loop(),
+                threading.get_ident(),
+            )
+
+        return asyncio.run(use_client())
+
+    tracing_enabled, outputs, errored, http_loop, http_thread = await asyncio.to_thread(
+        use_client_from_http_thread
+    )
+
+    assert tracing_enabled is False
+    assert outputs == ["first", "second"]
+    assert errored is False
+    assert client.model_config == "model-config"
+    assert client.renderer == "renderer"
+    assert client.input_processor == "input-processor"
+    assert client.vllm_config == "vllm-config"
+    assert str(client.dead_error) == "engine dead"
+    assert not hasattr(client, "check_health")
+    assert http_loop is not engine_loop
+    assert http_thread != engine_thread
+    assert [call[0] for call in calls] == [
+        "is_tracing_enabled",
+        "generate",
+        "errored",
+    ]
+    assert calls[0][1:] == (http_loop, http_thread)
+    assert calls[1][1:] == (engine_loop, engine_thread)
+    assert calls[2][1:] == (http_loop, http_thread)
+
+
+@pytest.mark.parametrize(
+    "abort_error",
+    [None, RuntimeError("abort failed")],
+    ids=["success", "failure"],
+)
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_aborts_cancelled_generation(
+    abort_error: RuntimeError | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine_loop = asyncio.get_running_loop()
+    started = threading.Event()
+    aborts = []
+
+    class FakeEngine:
+        model_config = None
+        renderer = None
+        input_processor = None
+        vllm_config = None
+
+        async def generate(self, *args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+            yield None
+
+        async def abort(self, request_id):
+            aborts.append((request_id, asyncio.get_running_loop()))
+            if abort_error is not None:
+                raise abort_error
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+
+    def cancel_from_http_thread():
+        async def cancel():
+            async def consume():
+                async for _ in client.generate(None, None, "cancelled-request"):
+                    pass
+
+            task = asyncio.create_task(consume())
+            await asyncio.to_thread(started.wait)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(cancel())
+
+    await asyncio.to_thread(cancel_from_http_thread)
+
+    assert aborts == [("cancelled-request", engine_loop)]
+    if abort_error is not None:
+        assert "Failed to abort vLLM request cancelled-request" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_worker_stops_http_server_before_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class ServerThread:
+        def join(self) -> None:
+            calls.append("server")
+
+    class SparseRefitReceiver:
+        def shutdown(self) -> None:
+            calls.append("sparse-refit")
+
+    class Engine:
+        async def collective_rpc(self, *args, **kwargs) -> None:
+            calls.append("engine-cleanup")
+
+        def shutdown(self) -> None:
+            calls.append("engine-shutdown")
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.server_thread = ServerThread()
+    worker.http_server = MagicMock()
+    worker._sparse_refit_receiver = SparseRefitReceiver()
+    worker.llm = Engine()
+    worker.tokenizer = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.gc.collect", lambda: None
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
+        lambda: None,
+    )
+
+    assert await worker.shutdown()
+    assert calls == ["server", "sparse-refit", "engine-cleanup", "engine-shutdown"]
+    assert worker.http_server.should_exit is True
+    assert worker.server_thread is None
+    assert worker.llm is None
 
 
 def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
@@ -448,6 +641,7 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         },
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
     model_config = MagicMock(served_model_name="served-model", model="model-path")
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = model_config
