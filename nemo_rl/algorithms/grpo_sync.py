@@ -53,6 +53,7 @@ from nemo_rl.algorithms.grpo import (
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
+    _profile_sync_vllm_rollout,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _validation_early_stop_message,
@@ -651,7 +652,16 @@ def grpo_train_sync(
                 # writes bulk to TQ in one flat put_samples, returns
                 # only meta + small slice. Bulk never visits the driver.
                 dynamic_sampling_num_gen_batches += 1
-                with timer.time("generation"):
+                with (
+                    timer.time("generation"),
+                    _profile_sync_vllm_rollout(
+                        policy_generation,
+                        step_id=(
+                            f"step{total_steps + 1}/attempt"
+                            f"{dynamic_sampling_num_gen_batches}"
+                        ),
+                    ),
+                ):
                     # Single Ray RPC: rollout + flatten + mask + prompt
                     # extraction + baseline/std + put_samples + finish
                     # generation + logger metrics — all bundled into one

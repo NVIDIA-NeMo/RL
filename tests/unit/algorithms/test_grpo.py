@@ -32,6 +32,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    _ASYNC_ROLLOUT_PROFILER_DRAIN_RPC_TIMEOUT_S,
     AdvEstimatorConfig,
     AsyncGRPOConfig,
     GRPOConfig,
@@ -46,10 +47,12 @@ from nemo_rl.algorithms.grpo import (
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
+    _profile_sync_vllm_rollout,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
+    _shutdown_async_trajectory_collector,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
@@ -93,6 +96,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
@@ -104,6 +108,7 @@ def _mock_policy_generation() -> MagicMock:
     """Generation-interface stand-in for grpo_train / async_grpo_train tests."""
     policy_generation = MagicMock(spec=MegatronGeneration)
     policy_generation.requires_kv_scale_sync = False
+    policy_generation.rollout_profiler_enabled = False
     policy_generation.get_logger_metrics.return_value = {}
     policy_generation.blocks_training.return_value = False
     policy_generation.wake_carries_weight_updates.return_value = False
@@ -127,6 +132,94 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
     replay_buffer.save_to_path.remote.assert_called_once_with(
         str(tmp_path / "replay_buffer.pt")
     )
+
+
+def test_async_collector_drains_then_flushes_and_is_killed():
+    collector = MagicMock()
+    drain_ref = object()
+    collector.drain_for_rollout_profiler_shutdown.remote.return_value = drain_ref
+    policy_generation = MagicMock()
+    policy_generation.rollout_profiler_enabled = True
+    events = []
+
+    def get_drain(value, *, timeout):
+        assert value is drain_ref
+        assert timeout == _ASYNC_ROLLOUT_PROFILER_DRAIN_RPC_TIMEOUT_S
+        events.append("drain")
+
+    with (
+        patch("nemo_rl.algorithms.grpo.ray.get", side_effect=get_drain),
+        patch(
+            "nemo_rl.algorithms.grpo.ray.kill",
+            side_effect=lambda value: events.append("kill"),
+        ),
+    ):
+        _shutdown_async_trajectory_collector(
+            collector,
+            policy_generation,
+            flush_telemetry=lambda: events.append("flush"),
+        )
+
+    assert events == ["drain", "flush", "kill"]
+
+
+def test_async_collector_cleanup_precedes_profiler_drain_failure_propagation(capsys):
+    collector = MagicMock()
+    collector.drain_for_rollout_profiler_shutdown.remote.return_value = object()
+    policy_generation = MagicMock()
+    policy_generation.rollout_profiler_enabled = True
+    events = []
+
+    def fail_drain(value, *, timeout):
+        assert timeout == _ASYNC_ROLLOUT_PROFILER_DRAIN_RPC_TIMEOUT_S
+        events.append("drain")
+        raise RuntimeError("drain failed")
+
+    with (
+        pytest.raises(RuntimeError, match="drain failed"),
+        patch(
+            "nemo_rl.algorithms.grpo.ray.get",
+            side_effect=fail_drain,
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.ray.kill",
+            side_effect=lambda value: events.append("kill"),
+        ),
+    ):
+        _shutdown_async_trajectory_collector(
+            collector,
+            policy_generation,
+            flush_telemetry=lambda: events.append("flush"),
+        )
+
+    assert events == ["drain", "flush", "kill"]
+    assert (
+        "Error draining trajectory collector: drain failed" in capsys.readouterr().out
+    )
+
+
+def test_async_collector_skips_profiler_drain_when_disabled():
+    collector = MagicMock()
+    policy_generation = MagicMock()
+    policy_generation.rollout_profiler_enabled = False
+    events = []
+
+    with (
+        patch("nemo_rl.algorithms.grpo.ray.get") as ray_get,
+        patch(
+            "nemo_rl.algorithms.grpo.ray.kill",
+            side_effect=lambda value: events.append("kill"),
+        ),
+    ):
+        _shutdown_async_trajectory_collector(
+            collector,
+            policy_generation,
+            flush_telemetry=lambda: events.append("flush"),
+        )
+
+    ray_get.assert_not_called()
+    collector.drain_for_rollout_profiler_shutdown.remote.assert_not_called()
+    assert events == ["flush", "kill"]
 
 
 @pytest.mark.parametrize("load_replay_buffer", [True, None])
@@ -190,6 +283,87 @@ def test_restore_async_replay_buffer_checkpoint_missing_file(tmp_path):
 
     assert metadata is None
     replay_buffer.load_from_path.remote.assert_not_called()
+
+
+def _mock_profiled_vllm_generation() -> VllmGeneration:
+    policy_generation = VllmGeneration.__new__(VllmGeneration)
+    policy_generation._rollout_profiler_enabled = True
+    policy_generation.begin_rollout_profile = MagicMock()
+    policy_generation.finish_rollout_profile = MagicMock()
+    policy_generation.abort_rollout_profile = MagicMock()
+    return policy_generation
+
+
+def test_profile_sync_vllm_rollout_finishes_successful_attempt():
+    policy_generation = _mock_profiled_vllm_generation()
+
+    with _profile_sync_vllm_rollout(policy_generation, step_id="step2/attempt3"):
+        pass
+
+    policy_generation.begin_rollout_profile.assert_called_once_with(
+        step_id="step2/attempt3"
+    )
+    policy_generation.finish_rollout_profile.assert_called_once_with()
+    policy_generation.abort_rollout_profile.assert_not_called()
+
+
+def test_profile_sync_vllm_rollout_aborts_failed_attempt():
+    policy_generation = _mock_profiled_vllm_generation()
+
+    with (
+        pytest.raises(RuntimeError, match="rollout failed"),
+        _profile_sync_vllm_rollout(policy_generation, step_id=1),
+    ):
+        raise RuntimeError("rollout failed")
+
+    policy_generation.abort_rollout_profile.assert_called_once_with(
+        reason="grpo_rollout_error"
+    )
+    policy_generation.finish_rollout_profile.assert_not_called()
+
+
+def test_profile_sync_vllm_rollout_aborts_partial_begin():
+    policy_generation = _mock_profiled_vllm_generation()
+    begin_error = RuntimeError("begin failed")
+    policy_generation.begin_rollout_profile.side_effect = begin_error
+
+    with (
+        pytest.raises(RuntimeError, match="begin failed") as exc_info,
+        _profile_sync_vllm_rollout(policy_generation, step_id=1),
+    ):
+        pass
+
+    assert exc_info.value is begin_error
+    policy_generation.abort_rollout_profile.assert_called_once_with(
+        reason="grpo_rollout_begin_error"
+    )
+    policy_generation.finish_rollout_profile.assert_not_called()
+
+
+def test_profile_sync_vllm_rollout_aborts_failed_finish():
+    policy_generation = _mock_profiled_vllm_generation()
+    finish_error = RuntimeError("finish failed")
+    policy_generation.finish_rollout_profile.side_effect = finish_error
+
+    with (
+        pytest.raises(RuntimeError, match="finish failed") as exc_info,
+        _profile_sync_vllm_rollout(policy_generation, step_id=1),
+    ):
+        pass
+
+    assert exc_info.value is finish_error
+    policy_generation.abort_rollout_profile.assert_called_once_with(
+        reason="grpo_rollout_finish_error"
+    )
+
+
+def test_profile_sync_vllm_rollout_is_inert_for_other_generation_backends():
+    policy_generation = _mock_policy_generation()
+
+    with _profile_sync_vllm_rollout(policy_generation, step_id=1):
+        pass
+
+    assert policy_generation.rollout_profiler_enabled is False
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
@@ -1829,6 +2003,7 @@ def test_async_resume_plumbs_frontier_metadata_into_collector(
     assert collector_kwargs["resume_covered_task_indices"] == [9, 10, 15]
     assert collector_kwargs["pending_batch"] is None
     assert collector_kwargs["ordinals_frontier_aligned"] is True
+    assert collector_kwargs["enable_rollout_profile_windows"] is True
 
 
 @pytest.mark.parametrize(
