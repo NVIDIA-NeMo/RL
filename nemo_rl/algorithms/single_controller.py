@@ -2336,53 +2336,46 @@ class SingleControllerActor:
                         )
                         selected_group_ids: list[str] = []
                         selected_training_claim_ids: list[str] = []
-                        async with self._data_plane_checkpoint_barrier.mutation():
-                            training_claim_ids_before = (
-                                self._buffer.training_owned_group_ids()
+                        training_claim_ids_before = (
+                            self._buffer.training_owned_group_ids()
+                        )
+                        train_meta, num_groups = await self._sampler.select(
+                            current_train_weight=self._trainer_version,
+                            min_prompt_groups=min_prompt_groups,
+                            max_prompt_groups=max_prompt_groups,
+                        )
+                        training_claim_ids_after = (
+                            self._buffer.training_owned_group_ids()
+                        )
+                        removed_training_claim_ids = (
+                            training_claim_ids_before - training_claim_ids_after
+                        )
+                        if removed_training_claim_ids:
+                            raise RuntimeError(
+                                "sampler selection removed existing training claims: "
+                                f"{sorted(removed_training_claim_ids)!r}"
                             )
-                            train_meta, num_groups = await self._sampler.select(
-                                current_train_weight=self._trainer_version,
-                                min_prompt_groups=min_prompt_groups,
-                                max_prompt_groups=max_prompt_groups,
+                        new_training_claim_ids = (
+                            training_claim_ids_after - training_claim_ids_before
+                        )
+                        if train_meta is not None:
+                            selected_group_ids = self._group_ids_from_meta(train_meta)
+                            if new_training_claim_ids:
+                                if set(selected_group_ids) != new_training_claim_ids:
+                                    raise RuntimeError(
+                                        "sampler selection does not match its new "
+                                        "training claims: "
+                                        f"selected={selected_group_ids!r}, "
+                                        "claimed="
+                                        f"{sorted(new_training_claim_ids)!r}"
+                                    )
+                                selected_training_claim_ids = selected_group_ids
+                        elif new_training_claim_ids:
+                            raise RuntimeError(
+                                "sampler selection created training claims without "
+                                "returning batch metadata: "
+                                f"{sorted(new_training_claim_ids)!r}"
                             )
-                            training_claim_ids_after = (
-                                self._buffer.training_owned_group_ids()
-                            )
-                            removed_training_claim_ids = (
-                                training_claim_ids_before - training_claim_ids_after
-                            )
-                            if removed_training_claim_ids:
-                                raise RuntimeError(
-                                    "sampler selection removed existing training "
-                                    "claims: "
-                                    f"{sorted(removed_training_claim_ids)!r}"
-                                )
-                            new_training_claim_ids = (
-                                training_claim_ids_after - training_claim_ids_before
-                            )
-                            if train_meta is not None:
-                                selected_group_ids = self._group_ids_from_meta(
-                                    train_meta
-                                )
-                                if new_training_claim_ids:
-                                    if (
-                                        set(selected_group_ids)
-                                        != new_training_claim_ids
-                                    ):
-                                        raise RuntimeError(
-                                            "sampler selection does not match its new "
-                                            "training claims: "
-                                            f"selected={selected_group_ids!r}, "
-                                            "claimed="
-                                            f"{sorted(new_training_claim_ids)!r}"
-                                        )
-                                    selected_training_claim_ids = selected_group_ids
-                            elif new_training_claim_ids:
-                                raise RuntimeError(
-                                    "sampler selection created training claims without "
-                                    "returning batch metadata: "
-                                    f"{sorted(new_training_claim_ids)!r}"
-                                )
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:

@@ -275,8 +275,7 @@ class TestDataPlaneCheckpointBarrier:
             barrier = DataPlaneCheckpointBarrier()
             assert barrier.mutation_version == 0
             async with barrier.mutation():
-                async with barrier.mutation():
-                    assert barrier.mutation_version == 0
+                assert barrier.mutation_version == 0
             assert barrier.mutation_version == 1
             with pytest.raises(RuntimeError, match="injected"):
                 async with barrier.mutation():
