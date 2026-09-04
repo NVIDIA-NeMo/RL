@@ -203,7 +203,7 @@ def test_init_collective_keeps_generation_ranks_after_the_training_ranks(
 
 def _make_unquantized_moe_model(
     moe_backend: str, expert_placement_strategy: str = "linear"
-) -> SimpleNamespace:
+) -> torch.nn.Module:
     from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
         UnquantizedMoeBackend,
     )
@@ -213,13 +213,14 @@ def _make_unquantized_moe_model(
 
     quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
     quant_method.unquantized_backend = UnquantizedMoeBackend(moe_backend)
-    module = SimpleNamespace(
-        quant_method=quant_method,
-        expert_map_manager=SimpleNamespace(
-            placement_strategy=expert_placement_strategy
-        ),
+    model = torch.nn.Module()
+    module = torch.nn.Module()
+    module.quant_method = quant_method
+    module.expert_map_manager = SimpleNamespace(
+        placement_strategy=expert_placement_strategy
     )
-    return SimpleNamespace(modules=lambda: [module])
+    model.add_module("moe", module)
+    return model
 
 
 @pytest.mark.vllm
@@ -267,6 +268,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
     call_order = []
     model = _make_unquantized_moe_model("FlashInfer TRTLLM")
+    moe_module = vllm_backend._unquantized_flashinfer_trtllm_modules(model)[0]
     model_config = object()
     vllm_config = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend="auto"), quant_config=None
@@ -323,7 +325,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
     expected_cycle = [
         "config_enter",
-        ("initialize", model),
+        ("initialize", moe_module),
         "load",
         ("finalize", model, model_config),
         ("hpc", model),
@@ -335,10 +337,12 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
-    """Mixed rollout refits rebuild both runtime expert layouts."""
+@pytest.mark.parametrize("transport", ["ipc", "collective", "nccl_reshard"])
+def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transport):
+    """Mixed refits reload BF16 experts and rebuild each MXFP8 layout once."""
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptMxFp8FusedMoE,
+        ModelOptMxFp8LinearMethod,
     )
 
     from nemo_rl.models.generation.vllm import vllm_backend
@@ -349,10 +353,15 @@ def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
     first_bf16_moe.expert_map_manager = SimpleNamespace(placement_strategy="linear")
     mxfp8_moe = torch.nn.Module()
     mxfp8_moe.quant_method = ModelOptMxFp8FusedMoE.__new__(ModelOptMxFp8FusedMoE)
+    mxfp8_qkv = torch.nn.Module()
+    mxfp8_qkv.quant_method = ModelOptMxFp8LinearMethod.__new__(
+        ModelOptMxFp8LinearMethod
+    )
     last_bf16_moe = torch.nn.Module()
     last_bf16_moe.expert_map_manager = SimpleNamespace(placement_strategy="linear")
     model.add_module("first_bf16_moe", first_bf16_moe)
     model.add_module("middle_mxfp8_moe", mxfp8_moe)
+    model.add_module("middle_mxfp8_qkv", mxfp8_qkv)
     model.add_module("last_bf16_moe", last_bf16_moe)
 
     model_config = object()
@@ -372,10 +381,15 @@ def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
         "_unquantized_flashinfer_trtllm_modules",
         lambda _model: [first_bf16_moe, last_bf16_moe],
     )
+
+    def process_mxfp8(_self, module):
+        call_order.append(("process_mxfp8", module))
+
     monkeypatch.setattr(
-        ModelOptMxFp8FusedMoE,
-        "process_weights_after_loading",
-        lambda _self, module: call_order.append(("process_mxfp8", module)),
+        ModelOptMxFp8FusedMoE, "process_weights_after_loading", process_mxfp8
+    )
+    monkeypatch.setattr(
+        ModelOptMxFp8LinearMethod, "process_weights_after_loading", process_mxfp8
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
@@ -389,15 +403,28 @@ def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
             call_order.append("config_exit")
 
     monkeypatch.setattr("vllm.config.set_current_vllm_config", set_current_vllm_config)
+    initialized_targets = []
+
+    def initialize(module):
+        initialized_targets.append(module)
+        call_order.append(("initialize", module))
+
+    def finalize(reload_model, config):
+        call_order.append(("finalize", reload_model, config))
+        for target in initialized_targets:
+            for module in target.modules():
+                quant_method = getattr(module, "quant_method", None)
+                if isinstance(
+                    quant_method, (ModelOptMxFp8FusedMoE, ModelOptMxFp8LinearMethod)
+                ):
+                    quant_method.process_weights_after_loading(module)
+
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
-        lambda module: call_order.append(("initialize", module)),
+        initialize,
     )
     monkeypatch.setattr(
-        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
-        lambda reload_model, config: call_order.append(
-            ("finalize", reload_model, config)
-        ),
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload", finalize
     )
     monkeypatch.setattr(
         vllm_backend,
@@ -405,7 +432,7 @@ def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
         lambda reload_model: call_order.append(("hpc", reload_model)),
     )
 
-    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+    with ext._weight_update_lifecycle(transport) as finalize:
         call_order.append("transfer")
         finalize()
 
@@ -416,11 +443,61 @@ def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
         "transfer",
         ("finalize", model, model_config),
         ("process_mxfp8", mxfp8_moe),
+        ("process_mxfp8", mxfp8_qkv),
         ("hpc", model),
         "mtp",
         "config_exit",
     ]
     ext._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("transport", ["ipc", "collective"])
+def test_mixed_native_refit_preserves_post_load_mxfp8_scale(monkeypatch, transport):
+    """Native reload must not restore MXFP8 linears to pre-load metadata."""
+    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = torch.nn.Module()
+    bf16_moe = torch.nn.Module()
+    bf16_moe.register_parameter(
+        "weight", torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    )
+    mxfp8_qkv = torch.nn.Module()
+    mxfp8_qkv.register_parameter(
+        "weight", torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    )
+    model.add_module("first_bf16_moe", bf16_moe)
+    model.add_module("middle_mxfp8_qkv", mxfp8_qkv)
+    record_metadata_for_reloading(model)
+
+    mxfp8_qkv.register_parameter(
+        "weight_scale_from_checkpoint",
+        torch.nn.Parameter(torch.ones(2), requires_grad=False),
+    )
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=model, vllm_config=SimpleNamespace(quant_config=object())
+    )
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [bf16_moe],
+    )
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _config: contextlib.nullcontext()
+    )
+
+    with ext._weight_update_lifecycle(transport):
+        assert hasattr(mxfp8_qkv, "weight_scale_from_checkpoint")
 
 
 @pytest.mark.vllm
