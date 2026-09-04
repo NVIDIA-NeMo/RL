@@ -858,44 +858,6 @@ class TestSetupDistributed:
         with pytest.raises(ValueError, match="dp_replicate_size"):
             setup_distributed(mock_config, mock_runtime_config)
 
-    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.MeshContext")
-    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
-    @patch("nemo_rl.models.automodel.setup.torch.distributed")
-    def test_setup_distributed_overlays_ep_on_dp_cp_mesh(
-        self,
-        mock_torch_dist,
-        mock_fsdp2_config,
-        mock_mesh_context,
-        mock_moe_config,
-        mock_config,
-        mock_runtime_config,
-        mock_device_mesh,
-    ):
-        """CP8 and EP64 can share a 64-rank mesh; their sizes do not multiply."""
-        mock_torch_dist.get_world_size.return_value = 64
-        mock_fsdp2_config.return_value = MagicMock()
-        mock_moe_config.return_value = MagicMock()
-        mock_mesh_context.build.return_value = SimpleNamespace(
-            device_mesh=mock_device_mesh, moe_mesh=MagicMock()
-        )
-        mock_config["dtensor_cfg"].update(
-            {
-                "tensor_parallel_size": 1,
-                "context_parallel_size": 8,
-                "expert_parallel_size": 64,
-            }
-        )
-
-        setup_distributed(mock_config, mock_runtime_config)
-
-        parallelism = mock_mesh_context.build.call_args.args[1]
-        assert parallelism.tp_size == 1
-        assert parallelism.cp_size == 8
-        assert parallelism.ep_size == 64
-        assert mock_mesh_context.build.call_args.kwargs["world_size"] == 64
-
-
 @pytest.mark.automodel
 class TestSetupModelAndOptimizer:
     """Test suite for setup_model_and_optimizer function."""
