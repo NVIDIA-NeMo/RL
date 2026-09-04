@@ -767,13 +767,17 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     )
 
     layer = torch.nn.Module()
-    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
-    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros(2, 128, 512), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros(2, 512, 128), requires_grad=False
+    )
     layer.w13_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 4, 1), requires_grad=False
+        torch.zeros(2, 128, 16), requires_grad=False
     )
     layer.w2_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 3, 1), requires_grad=False
+        torch.zeros(2, 512, 4), requires_grad=False
     )
     layer.w13_weight_scale.weight_loader = object()
     layer.w2_weight_scale.weight_loader = object()
