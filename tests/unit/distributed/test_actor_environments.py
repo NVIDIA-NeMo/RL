@@ -19,6 +19,7 @@ imports the same dict. These tests keep the two readers honest.
 """
 
 import ast
+import importlib.util
 import subprocess
 import sys
 import tomllib
@@ -140,6 +141,30 @@ def test_script_output_matches_the_registry():
     listed = {line.split("\t")[0] for line in proc.stdout.splitlines() if line.strip()}
     expected = {fqn for fqn, extras in ACTOR_ENVIRONMENTS.items() if extras is not None}
     assert listed == expected
+
+
+def test_fingerprint_covers_the_actor_table():
+    """Editing an actor's extras must invalidate the container fingerprint.
+
+    Venvs at NEMO_RL_VENV_DIR are reused rather than rebuilt, and nothing prunes
+    them (the base sync runs --inexact and `uv run` is inexact by default). So a
+    changed extras list has to trip _check_container_fingerprint(), which is what
+    tells the user to set NRL_FORCE_REBUILD_VENVS=true.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_gen_fingerprint", Path(git_root) / "tools" / "generate_fingerprint.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    fingerprint = module.generate_fingerprint()
+    assert "nemo_rl/distributed/actor_environments.py" in fingerprint, (
+        "tools/generate_fingerprint.py must hash the actor -> extras table, or a "
+        "changed actor environment leaves a stale venv with no warning"
+    )
+    assert fingerprint["nemo_rl/distributed/actor_environments.py"] not in (
+        "",
+        "missing",
+    )
 
 
 def test_script_skips_by_extra_not_by_name():
