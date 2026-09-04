@@ -136,7 +136,7 @@ policy:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
     tokenizer_kwargs: null # extra kwargs forwarded to tokenizer loading, e.g., {fix_mistral_regex: false}
-    use_fastokens: false # opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
+    use_fastokens: false # opt-in Rust-backed BPE tokenizer for NeMo-RL tokenization; NRL_USE_FASTOKENS overrides this and also sets VLLM_USE_FASTOKENS.
   hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4

@@ -47,6 +47,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 
 
 class FakeBuffer:
@@ -68,11 +69,13 @@ class FakeBuffer:
         *,
         ready: bool = True,
         target_step: int | None = None,
+        rollout_metrics: dict[str, float] | None = None,
     ) -> None:
         meta = KVBatchMeta(
             partition_id=self._partition_id,
             task_name=None,
             sample_ids=[f"{group_id}_g0"],
+            extra_info={ROLLOUT_METRICS: [dict(rollout_metrics or {})]},
             tags=[{"weight_version": weight, "group_id": group_id}],
         )
         self.meta_list.append(meta if ready else None)
@@ -428,6 +431,52 @@ class TestWindowedSelect:
         )
         assert selection.num_groups == 2  # a(3) and b(5); c(1) excluded
         assert len(buf.start_weight_list) == 1  # only c remains
+
+    def test_carries_metrics_only_for_selected_groups(self):
+        buf = FakeBuffer()
+        buf.add("a", weight=5, rollout_metrics={"metric": 1.0})
+        buf.add("b", weight=5, rollout_metrics={"metric": 2.0})
+        buf.add("not-selected", weight=5, rollout_metrics={"metric": 100.0})
+        sampler = WindowedSampler(buf, max_staleness_versions=1)
+
+        selection = _run(
+            sampler.select(
+                current_train_weight=5,
+                min_prompt_groups=1,
+                max_prompt_groups=2,
+            )
+        )
+
+        assert selection.num_groups == 2
+        assert selection.meta is not None
+        assert selection.meta.extra_info[ROLLOUT_METRICS] == [
+            {"metric": 1.0},
+            {"metric": 2.0},
+        ]
+        assert buf.start_weight_list == [5]
+
+    def test_carries_metrics_for_groups_restored_without_them(self):
+        buf = FakeBuffer()
+        buf.add("restored", weight=5)
+        buf.add("fresh", weight=5, rollout_metrics={"metric": 2.0})
+        # A checkpoint written before per-group metrics existed restores metas
+        # whose extra_info has no ROLLOUT_METRICS key at all.
+        restored_meta = buf.meta_list[0]
+        assert restored_meta is not None
+        restored_meta.extra_info.pop(ROLLOUT_METRICS)
+        sampler = WindowedSampler(buf, max_staleness_versions=1)
+
+        selection = _run(
+            sampler.select(
+                current_train_weight=5,
+                min_prompt_groups=1,
+                max_prompt_groups=2,
+            )
+        )
+
+        assert selection.num_groups == 2
+        assert selection.meta is not None
+        assert selection.meta.extra_info[ROLLOUT_METRICS] == [{"metric": 2.0}]
 
     def test_below_min_returns_none(self):
         buf = FakeBuffer()
