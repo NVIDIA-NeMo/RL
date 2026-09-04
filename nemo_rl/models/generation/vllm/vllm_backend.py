@@ -140,8 +140,17 @@ def _unquantized_flashinfer_trtllm_modules(
     ]
 
 
-def _process_mxfp8_modules_after_native_reload(model: torch.nn.Module) -> None:
-    """Rebuild MXFP8 runtime layouts skipped by the partial native reload."""
+def _reload_target_module_ids(
+    reload_targets: Sequence[torch.nn.Module],
+) -> set[int]:
+    """Return every module covered by the native reload targets."""
+    return {id(module) for target in reload_targets for module in target.modules()}
+
+
+def _process_mxfp8_modules_after_native_reload(
+    model: torch.nn.Module, reloaded_module_ids: set[int]
+) -> None:
+    """Rebuild MXFP8 layouts outside the partial native reload."""
     try:
         from vllm.model_executor.layers.quantization.modelopt import (
             ModelOptMxFp8FusedMoE,
@@ -152,6 +161,8 @@ def _process_mxfp8_modules_after_native_reload(model: torch.nn.Module) -> None:
 
     mxfp8_methods = (ModelOptMxFp8FusedMoE, ModelOptMxFp8LinearMethod)
     for module in model.modules():
+        if id(module) in reloaded_module_ids:
+            continue
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, mxfp8_methods):
             quant_method.process_weights_after_loading(module)
@@ -967,19 +978,19 @@ class VllmInternalWorkerExtension:
             )
 
             model = self.model_runner.model
-            # NCCL reshard receives most weights directly into live parameter
-            # storage; only the TRTLLM MoE modules need the layerwise reload
-            # lifecycle to rebuild the kernel's private repacked layout.
-            reload_targets = (
-                _unquantized_flashinfer_trtllm_modules(model)
-                if transport == "nccl_reshard"
-                else [model]
-            )
+            # Restore only the realized BF16 TRTLLM modules. MXFP8 modules own
+            # checkpoint-scale parameters created after vLLM recorded reload
+            # metadata, so restoring the whole mixed model would delete those
+            # parameters. Their layouts are rebuilt separately after transfer.
+            reload_targets = _unquantized_flashinfer_trtllm_modules(model)
+            reloaded_module_ids = _reload_target_module_ids(reload_targets)
 
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
-                    _process_mxfp8_modules_after_native_reload(model)
+                    _process_mxfp8_modules_after_native_reload(
+                        model, reloaded_module_ids
+                    )
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
