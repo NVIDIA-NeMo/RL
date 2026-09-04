@@ -518,9 +518,10 @@ def test_fp8_load_uses_buffer_safe_model_loader(monkeypatch):
     ext._load_hf_weights(weights)
 
     args = load_weights.call_args.args
-    assert args[:2] == (weights, ext.model_runner)
-    assert args[2].__self__ is ext
-    assert args[2].__func__ is ext._load_full_hf_weights.__func__
+    assert args == (weights, ext.model_runner)
+    model_load_weights = load_weights.call_args.kwargs["model_load_weights"]
+    assert model_load_weights.__self__ is ext
+    assert model_load_weights.__func__ is ext._load_full_hf_weights.__func__
 
 
 @pytest.mark.vllm
