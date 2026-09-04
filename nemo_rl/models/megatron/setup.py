@@ -1330,6 +1330,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.fp8 = fp8_cfg["fp8"]
             model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
             model_cfg.fp8_param = fp8_cfg["fp8_param"]
+            model_cfg.fp8_quantizer_factory = fp8_cfg.get("fp8_quantizer_factory")
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
