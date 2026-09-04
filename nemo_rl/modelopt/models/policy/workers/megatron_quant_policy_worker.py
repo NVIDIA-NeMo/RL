@@ -40,6 +40,10 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
     quantize_model,
     symlink_pre_quantized_model,
 )
+from nemo_rl.modelopt.models.policy.workers.weight_folding import (
+    temporarily_cache_weight_quantization,
+    temporarily_fold_weights,
+)
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     resolve_nvfp4_real_quant_mode,
@@ -434,6 +438,55 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             "positive_amax": positive_amax,
             "kv_amax": kv_amax,
         }
+
+    def get_logprobs(self, *args, **kwargs):
+        """Compute logprobs, optionally folding the frozen weights for the stage.
+
+        With ``policy.quant_fold_frozen_weight_snap`` set, each weight is fake-quantized
+        once for the whole stage instead of on every microbatch forward. Off by default;
+        when unset this is exactly the base implementation.
+
+        Safe only because the re-scoring pass runs under ``no_grad`` with no optimizer
+        step -- the fold is written into the parameter and reverted on exit.
+        """
+        if not self.cfg.get("quant_fold_frozen_weight_snap"):
+            return super().get_logprobs(*args, **kwargs)
+
+        with temporarily_fold_weights(self.model, verbose=True, rank=self.rank):
+            return super().get_logprobs(*args, **kwargs)
+
+    def train(self, *args, **kwargs):
+        """Train, optionally caching the fake-quantized weights per global batch.
+
+        With ``policy.quant_cache_train_weight_snap`` set, each weight is fake-quantized
+        once per gradient-accumulation window instead of on every microbatch forward:
+        every ``megatron_forward_backward`` call inside the base ``train`` — one per
+        global batch, strictly between ``zero_grad`` and ``optimizer.step()`` — is
+        wrapped in :func:`temporarily_cache_weight_quantization`, so the cache is
+        rebuilt from fresh weights after every optimizer step and can never go stale.
+
+        Unlike the ``get_logprobs`` fold, the quantizer stays in the autograd graph:
+        the cached forward replicates ModelOpt's backward exactly (pass-through STE, or
+        the amax clip mask when ``pass_through_bwd`` is off), so gradients are
+        bit-identical to the uncached path. Off by default; when unset this is exactly
+        the base implementation.
+        """
+        if not self.cfg.get("quant_cache_train_weight_snap"):
+            return super().train(*args, **kwargs)
+
+        original_forward_backward = megatron_policy_worker.megatron_forward_backward
+
+        def caching_forward_backward(*fb_args, **fb_kwargs):
+            with temporarily_cache_weight_quantization(
+                self.model, verbose=True, rank=self.rank
+            ):
+                return original_forward_backward(*fb_args, **fb_kwargs)
+
+        megatron_policy_worker.megatron_forward_backward = caching_forward_backward
+        try:
+            return super().train(*args, **kwargs)
+        finally:
+            megatron_policy_worker.megatron_forward_backward = original_forward_backward
 
     def generate(self, **kwargs):
         """Quantized Megatron generation is not supported.
