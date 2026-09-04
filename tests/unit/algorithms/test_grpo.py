@@ -3251,6 +3251,142 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
     assert master_config.grpo.skip_reference_policy_logprobs_calculation is True
 
 
+def test_real_quant_setup_builds_vllm_from_policy_config(
+    monkeypatch, mock_grpo_components
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    events = []
+    descriptor = {"quant_method": "modelopt", "quant_algo": "FP8"}
+
+    class DummyLoader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+        def load_state_dict(self, _state):
+            pass
+
+    class DummyCluster:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def world_size(self):
+            return 1
+
+        def get_master_address_and_port(self):
+            return "127.0.0.1", 1234
+
+    class DummyPolicy:
+        def __init__(self, **_kwargs):
+            self.cfg = _kwargs["config"]
+            events.append("policy")
+
+        def get_real_quantization_config(self):
+            events.append("config")
+            return descriptor
+
+        def offload_after_refit(self):
+            events.append("offload")
+
+        def prepare_for_training(self):
+            events.append("restore")
+
+        def print_node_ip_and_gpu_id(self):
+            pass
+
+        def prepare_refit_info(self):
+            return {}
+
+    class DummyVllmGeneration:
+        weight_synchronizer = None
+
+        def __init__(self, *, config, **_kwargs):
+            events.append("vllm")
+            assert (
+                config["vllm_kwargs"]["hf_overrides"]["quantization_config"]
+                == descriptor
+            )
+
+        def finish_generation(self):
+            events.append("finish")
+
+        def prepare_refit_info(self, _state):
+            pass
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy.update(
+        {
+            "model_name": "fake-model",
+            "quant_cfg": "/tmp/modelopt.yaml",
+            "dtensor_cfg": {"enabled": False},
+            "megatron_cfg": {
+                "enabled": True,
+                "pipeline_model_parallel_size": 1,
+            },
+        }
+    )
+    master_config.policy["generation"] = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "val_temperature": 1.0,
+        "val_top_p": 1.0,
+        "val_top_k": None,
+        "backend": "vllm",
+        "real_quant": True,
+        "quant_cfg": None,
+        "refit_transport": None,
+        "colocated": {
+            "enabled": True,
+            "resources": {"gpus_per_node": None, "num_nodes": None},
+        },
+        "vllm_cfg": {
+            "async_engine": False,
+            "precision": "bfloat16",
+            "enforce_eager": True,
+            "kv_cache_dtype": "auto",
+        },
+        "vllm_kwargs": {},
+    }
+    master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.grpo.async_grpo.enabled = False
+    master_config.data.update(shuffle=False, num_workers=0)
+
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(grpo_mod, "CheckpointManager", lambda *_a, **_k: checkpointer)
+    monkeypatch.setattr(grpo_mod, "ClippedPGLossFn", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", DummyVllmGeneration)
+
+    dataset = MagicMock()
+    dataset.__len__.return_value = 1
+    grpo_mod.setup(
+        master_config,
+        MagicMock(),
+        dataset,
+        None,
+        policy_factory=DummyPolicy,
+    )
+
+    assert events[:6] == [
+        "policy",
+        "config",
+        "offload",
+        "vllm",
+        "finish",
+        "restore",
+    ]
+
+
 def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     """Guard the TRT-LLM NeMo-Gym startup path in shared GRPO setup."""
     from nemo_rl.algorithms import grpo as grpo_mod

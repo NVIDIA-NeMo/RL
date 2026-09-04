@@ -1037,6 +1037,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def get_real_quantization_config(self) -> dict[str, Any]:
+        """Return the canonical real-quant config agreed by every policy rank."""
+        configs = self.run_all_workers_single_data("get_real_quantization_config")
+        if not configs:
+            raise RuntimeError("No policy workers returned a real-quant config")
+        if any(config != configs[0] for config in configs[1:]):
+            raise RuntimeError("Policy ranks produced different real-quant configs")
+        return configs[0]
+
     def finish_inference(self) -> None:
         """Offload policy model to CPU after inference."""
         futures = self.worker_group.run_all_workers_single_data("finish_inference")

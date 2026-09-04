@@ -40,10 +40,10 @@ def _tolerate_dummy_weight_nan_amax():
 
     The dummy-calibration amax is *meant* to be discarded — the prolog
     sentinels every enabled quantizer's `_amax` to `-1.0` immediately
-    afterwards, and Megatron's real amax is loaded via
-    `vllm_quant_backend.input_amax_loader` during refit (`max(-1.0,
-    real)=real`). So a fully-NaN input here should produce zero amax
-    rather than crash the prolog.
+    afterwards, and Megatron's real amax is loaded by the temporary loaders
+    attached in `VllmQuantInternalWorkerExtension` during refit
+    (`max(-1.0, real)=real`). So a fully-NaN input here should produce zero
+    amax rather than crash the prolog.
 
     Scoping this monkey-patch to the prolog (instead of editing
     `MaxCalibrator.collect` in modelopt) keeps modelopt's source pristine

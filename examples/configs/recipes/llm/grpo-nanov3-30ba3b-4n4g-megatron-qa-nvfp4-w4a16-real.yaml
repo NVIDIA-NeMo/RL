@@ -9,39 +9,8 @@ policy:
   tokenizer:
     name: ${policy.model_name}
   generation:
+    quant_cfg: null
     real_quant: true
-    # Nano3-specific paths that stay in BF16 during real-quant rollout.
-    real_quant_ignore:
-      - lm_head
-      - '*output_layer*'
-      - '*mlp.gate'
-      - '*router*'
-      - '*block_sparse_moe.gate*'
-      - '*self_attention*'
-      - '*self_attn*'
-      - '*proj_out.*'
-      - '*.gate.*'
-      - '*mlp.shared_expert_gate.*'
-      - '*linear_attn.conv1d*'
-      - '*mixer.conv1d*'
-      - '*.mixer.in_proj*'
-      - '*.mixer.out_proj*'
-      - '*.shared_expert.*'
-      - '*.shared_experts.*'
-      - '*.norm.*'
-      - '*.q_proj*'
-      - '*.k_proj*'
-      - '*.v_proj*'
-      - '*.o_proj*'
-      - '*.qkv_proj*'
-      - '*.linear_proj*'
-      - '*.linear_qkv*'
-      - '*.layers.4.*'
-      - '*.layers.11.*'
-      - '*.layers.18.*'
-      - '*.layers.25.*'
-      - '*.layers.32.*'
-      - '*.layers.41.*'
     vllm_cfg:
       # Keep vLLM conservative because the full-parameter Nano3 policy and
       # reference model are colocated on these GPUs. With TP=4, this leaves

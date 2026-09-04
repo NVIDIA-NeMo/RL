@@ -1068,6 +1068,138 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
             assert DummyVllmGeneration.collective_calls
 
 
+def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypatch):
+    import nemo_rl.algorithms.distillation as distil_mod
+
+    events = []
+    descriptor = {"quant_method": "modelopt", "quant_algo": "FP8"}
+
+    master_config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "model_name": "test-student",
+                "quant_cfg": "/tmp/modelopt.yaml",
+                "hf_config_overrides": {"architectures": ["TestStudent"]},
+                "dtensor_cfg": {"enabled": False},
+                "megatron_cfg": {
+                    "enabled": True,
+                    "pipeline_model_parallel_size": 1,
+                },
+                "generation": {
+                    "backend": "vllm",
+                    "real_quant": True,
+                    "quant_cfg": None,
+                    "refit_transport": None,
+                    "colocated": {
+                        "enabled": True,
+                        "resources": {"gpus_per_node": None, "num_nodes": None},
+                    },
+                    "vllm_cfg": {
+                        "async_engine": False,
+                        "precision": "bfloat16",
+                        "enforce_eager": True,
+                        "kv_cache_dtype": "auto",
+                    },
+                    "vllm_kwargs": {},
+                },
+            },
+            "teacher": {
+                "model_name": "test-teacher",
+                "dtensor_cfg": {"enabled": False},
+            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
+            "distillation": DistillationConfig.model_construct(
+                seed=42,
+                topk_logits_k=64,
+                num_prompts_per_step=1,
+                max_num_epochs=1,
+                max_num_steps=1,
+                val_period=0,
+                val_at_start=False,
+                val_at_end=False,
+            ),
+            "data": {"shuffle": False},
+            "logger": {},
+            "checkpointing": {},
+            "cluster": {"num_nodes": 1, "gpus_per_node": 2},
+        }
+    )
+
+    class DummyCluster:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def world_size(self):
+            return 1
+
+    class DummyPolicy:
+        def __init__(self, *, name_prefix, **_kwargs):
+            self.name_prefix = name_prefix
+            self.cfg = _kwargs["config"]
+            events.append(name_prefix)
+
+        def get_real_quantization_config(self):
+            events.append("config")
+            return descriptor
+
+        def offload_after_refit(self):
+            if self.name_prefix == "student":
+                events.append("offload")
+
+        def prepare_for_training(self):
+            events.append("restore")
+
+        def prepare_refit_info(self):
+            return {}
+
+    class DummyVllmGeneration:
+        weight_synchronizer = None
+
+        def __init__(self, *, config, **_kwargs):
+            events.append("vllm")
+            assert config["vllm_kwargs"]["hf_overrides"] == {
+                "architectures": ["TestStudent"],
+                "quantization_config": descriptor,
+            }
+
+        def finish_generation(self):
+            events.append("finish")
+
+        def prepare_refit_info(self, _state):
+            pass
+
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    dataloader = MagicMock()
+    dataloader.__len__.return_value = 1
+    monkeypatch.setenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", "1")
+    monkeypatch.setattr(distil_mod, "RayVirtualCluster", DummyCluster)
+    monkeypatch.setattr(distil_mod, "Logger", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(distil_mod, "CheckpointManager", lambda *_a, **_k: checkpointer)
+    monkeypatch.setattr(distil_mod, "StatefulDataLoader", lambda *_a, **_k: dataloader)
+    monkeypatch.setattr(distil_mod, "Policy", DummyPolicy)
+    monkeypatch.setattr(distil_mod, "VllmGeneration", DummyVllmGeneration)
+
+    dataset = MagicMock()
+    dataset.__len__.return_value = 1
+    distil_mod.setup(master_config, MagicMock(), dataset, None)
+
+    student_start = events.index("student")
+    assert events[student_start : student_start + 6] == [
+        "student",
+        "config",
+        "offload",
+        "vllm",
+        "finish",
+        "restore",
+    ]
+
+
 @pytest.mark.parametrize(
     (
         "configured_uv_cache_dir",

@@ -501,21 +501,50 @@ def setup(
     )
     teacher_policy.offload_after_refit()
 
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
+        total_train_iters = min(
+            distillation_config.max_num_steps,
+            distillation_config.max_num_epochs * len(dataloader),
+        )
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+
+    def init_student_policy() -> Policy:
+        return Policy(
+            name_prefix="student",
+            cluster=train_cluster,
+            config=policy_config,
+            tokenizer=tokenizer,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            init_optimizer=True,
+            init_reference_model=False,
+        )
+
     # ==========================
     #    Student Generation Interface
     # ==========================
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    real_quant = backend == "vllm" and bool(generation_config.get("real_quant"))
+    student_policy = None
+
+    if backend == "vllm":
+        generation_config = cast(VllmConfig, generation_config)
+        vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+        vllm_kwargs["hf_overrides"] = dict(policy_config.get("hf_config_overrides", {}))
+
+    if real_quant:
+        from nemo_rl.modelopt.utils import prepare_real_quant_generation_config
+
+        student_policy = init_student_policy()
+        prepare_real_quant_generation_config(student_policy, generation_config)
+        if colocated_inference:
+            student_policy.offload_after_refit()
 
     if backend == "megatron":
         student_generation = None
     elif backend == "vllm":
-        generation_config = cast(VllmConfig, generation_config)
-        if "vllm_cfg" in generation_config:
-            ## make vllm hf overrides match the training policy
-            generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
-                "hf_config_overrides", {}
-            )
         if enable_nemo_gym:
             deferred_vllm = VllmGeneration(
                 cluster=inference_cluster,
@@ -598,28 +627,10 @@ def setup(
     #      Student Policy
     # ==========================
     print("\n▶ Setting up student policy...", flush=True)
-
-    # Checkpoint paths
-    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
-
-    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
-        ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            distillation_config.max_num_steps,
-            distillation_config.max_num_epochs * len(dataloader),
-        )
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
-
-    student_policy = Policy(
-        name_prefix="student",
-        cluster=train_cluster,
-        config=policy_config,
-        tokenizer=tokenizer,
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
-        init_optimizer=True,
-        init_reference_model=False,
-    )
+    if student_policy is None:
+        student_policy = init_student_policy()
+    elif colocated_inference:
+        student_policy.prepare_for_training()
 
     if checkpoint_engine_config is not None:
         assert isinstance(student_generation, VllmGeneration)

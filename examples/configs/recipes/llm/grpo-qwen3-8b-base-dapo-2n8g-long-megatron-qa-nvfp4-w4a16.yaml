@@ -28,6 +28,8 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 30720
   refit_buffer_size_gb: 4
+  # Ray/container launchers must override this repo-relative example path with
+  # an absolute path visible to every worker.
   quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
   dtensor_cfg:
     enabled: false
@@ -53,13 +55,13 @@ policy:
     2}
   generation:
     max_new_tokens: 28672
-    quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
+    quant_cfg: null
     real_quant: true
     vllm_cfg:
       tensor_parallel_size: 2
       max_model_len: 30720
       gpu_memory_utilization: 0.5
-      enforce_eager: true
+      enforce_eager: false
 
 data:
   max_input_seq_length: 2048
