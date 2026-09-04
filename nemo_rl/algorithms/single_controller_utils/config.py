@@ -673,9 +673,9 @@ def _validate_opd_full_config(
 
     Raises:
         ValueError: If ``opd_full`` is enabled with an unsupported backend, an
-            incompatible logprob path, more than one teacher checkpoint, or a
-            student pipeline-parallel size the teacher LM-head load cannot
-            support.
+            incompatible logprob path, a fused packing path that never reaches
+            the opd_full branch, more than one teacher checkpoint, or a student
+            pipeline-parallel size the teacher LM-head load cannot support.
     """
     full_cfg = opd_module.get_opd_full_config(master_config)
     if full_cfg is None:
@@ -697,6 +697,20 @@ def _validate_opd_full_config(
             "megatron_cfg.use_fused_linear_logprobs: the fused forward bypasses "
             "output_layer, so the teacher hidden-state hook never fires and the "
             "student never exposes full-vocabulary logits."
+        )
+
+    sequence_packing_config = policy_config.get("sequence_packing", {})
+    if sequence_packing_config.get("enabled", False) and sequence_packing_config.get(
+        "fuse_loss", False
+    ):
+        raise ValueError(
+            "on_policy_distillation.full is incompatible with "
+            "policy.sequence_packing.fuse_loss: the fused packing path routes "
+            "through prepare_packed_loss_input, which only supports "
+            "LossInputType.LOGPROB and never reaches the opd_full branch. "
+            "Without this check the run fails inside the first training forward, "
+            "after the whole cluster and every teacher have already come up. "
+            "Set sequence_packing.fuse_loss=false."
         )
 
     unique_teacher_checkpoints = sorted(
@@ -726,8 +740,9 @@ def _validate_opd_full_config(
 
     if full_cfg.teacher_payload == "logits":
         # The logits payload is vocab_size wide instead of hidden_size wide, so a
-        # production-scale run would move tens of GB per teacher batch. The guard
-        # keeps it to the numerical-reference and small-vocabulary use it is for.
+        # production-scale run would move tens of GB per teacher batch. Advisory
+        # rather than an error: a small-vocabulary model, or a short-sequence
+        # cross-check against the hidden path, is a legitimate use of it.
         print(
             "  ! on_policy_distillation.full.teacher_payload='logits' transports "
             "the full vocabulary per token. This is a numerical-reference path; "

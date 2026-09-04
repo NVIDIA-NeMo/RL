@@ -113,24 +113,16 @@ class OnPolicyDistillationFullConfig(BaseModel, extra="allow"):
     #   offload -- park on CPU between train steps, stage back in per step
     #   evict   -- free after every train step and reload from the checkpoint
     teacher_lm_head_lifecycle: Literal["none", "offload", "evict"] = "offload"
-    # Refuse to start when the estimated teacher payload for one enrichment batch
-    # exceeds this. Guards the "logits" path against production-scale misuse.
-    max_payload_bytes_per_batch: int = 8 * 1024**3
     # Also compute entropy and cross entropy and report their residual against
     # the reverse KL. Roughly doubles the divergence cost; diagnostics only.
     validate_decomposition: bool = False
 
     @model_validator(mode="after")
     def validate_positive_sizes(self) -> "OnPolicyDistillationFullConfig":
-        """Reject sizes that would make the divergence kernels or the guard useless."""
+        """Reject a chunk size that would make the divergence kernels useless."""
         if self.chunk_size is not None and self.chunk_size < 1:
             raise ValueError(
                 f"on_policy_distillation.full.chunk_size must be >= 1, got {self.chunk_size}."
-            )
-        if self.max_payload_bytes_per_batch < 1:
-            raise ValueError(
-                "on_policy_distillation.full.max_payload_bytes_per_batch must be >= 1, "
-                f"got {self.max_payload_bytes_per_batch}."
             )
         return self
 
@@ -205,54 +197,11 @@ def get_opd_full_config(master_config: Any) -> Optional[OnPolicyDistillationFull
     return full_cfg if full_cfg.enabled else None
 
 
-def is_opd_full_enabled(master_config: Any) -> bool:
-    """Whether full-vocabulary on-policy distillation is enabled."""
-    return get_opd_full_config(master_config) is not None
-
-
 def opd_full_payload_field(full_cfg: OnPolicyDistillationFullConfig) -> str:
     """Return the data-plane column name carrying this run's teacher payload."""
     if full_cfg.teacher_payload == "hidden_states":
         return OPD_FULL_HIDDEN_STATES_FIELD
     return OPD_FULL_LOGITS_FIELD
-
-
-_PAYLOAD_DTYPE_ITEMSIZE = {"bfloat16": 2, "float16": 2, "float32": 4}
-
-
-def estimate_opd_full_payload_bytes(
-    *,
-    num_sequences: int,
-    padded_seq_len: int,
-    payload_width: int,
-    payload_dtype: str,
-) -> int:
-    """Estimate the teacher payload size for one enrichment batch.
-
-    Args:
-        num_sequences: Rows in the batch handed to the teacher.
-        padded_seq_len: Padded sequence width of those rows.
-        payload_width: ``hidden_size`` on the hidden-state path, ``vocab_size``
-            on the logits path.
-        payload_dtype: One of ``bfloat16``, ``float16``, ``float32``.
-
-    Returns:
-        Payload size in bytes.
-
-    Raises:
-        ValueError: If ``payload_dtype`` is not a supported payload dtype.
-    """
-    if payload_dtype not in _PAYLOAD_DTYPE_ITEMSIZE:
-        raise ValueError(
-            f"Unsupported opd_full payload dtype {payload_dtype!r}; expected one of "
-            f"{sorted(_PAYLOAD_DTYPE_ITEMSIZE)}."
-        )
-    return (
-        int(num_sequences)
-        * int(padded_seq_len)
-        * int(payload_width)
-        * _PAYLOAD_DTYPE_ITEMSIZE[payload_dtype]
-    )
 
 
 def _skip_prev_logprobs(master_config: Any) -> bool:
@@ -578,8 +527,8 @@ class TQTeacherLogprobCoordinator:
         }
         if self._opd_full_field is not None:
             # Tokens rather than bytes: the coordinator does not know the payload
-            # width. Multiply by hidden_size (or vocab_size) times the payload
-            # dtype's itemsize -- see estimate_opd_full_payload_bytes.
+            # width. To read this as bytes, multiply by hidden_size (hidden path)
+            # or vocab_size (logits path) times the payload dtype's itemsize.
             metrics["on_policy_distillation/teacher_full_payload_tokens"] = float(
                 self._teacher_full_payload_tokens
             )

@@ -1026,6 +1026,13 @@ def _validate_opd_full_loss_config(
         raise ValueError("opd_full is incompatible with CISPO.")
     if cfg.force_on_policy_ratio:
         raise ValueError("opd_full is incompatible with force_on_policy_ratio.")
+    if cfg.use_on_policy_kl_approximation:
+        raise ValueError(
+            "opd_full is incompatible with use_on_policy_kl_approximation: it "
+            "reweights the reference-KL term by a generation-to-current ratio "
+            "that only the policy-gradient branch computes. The opd_full branch "
+            "never reads it, so leaving it on would be silently ignored."
+        )
     if cfg.sequence_level_importance_ratios:
         raise ValueError(
             "opd_full is incompatible with sequence_level_importance_ratios."

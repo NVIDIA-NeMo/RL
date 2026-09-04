@@ -38,6 +38,7 @@ loss_fn:
   # (see _validate_opd_full_loss_config in nemo_rl/algorithms/loss/loss_functions.py).
   use_importance_sampling_correction: false
   truncated_importance_sampling_type: null
+  use_on_policy_kl_approximation: false
 
 policy:
   # The teacher payload is per-token, so the base recipe's 32K window would move
