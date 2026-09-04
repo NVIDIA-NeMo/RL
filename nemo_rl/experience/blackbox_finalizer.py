@@ -106,7 +106,6 @@ class BlackboxFinalizer:
         partition_id: str,
         staging_partition: str,
         pad_token_id: int,
-        mixed_weight_version_policy: str,
         min_valid_fraction_per_group: Optional[float],
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
@@ -114,7 +113,6 @@ class BlackboxFinalizer:
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
-        self._mixed_weight_version_policy = mixed_weight_version_policy
         self._min_valid_fraction = min_valid_fraction_per_group
         self._router_replay_enabled = router_replay_enabled
         self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
@@ -228,8 +226,6 @@ class BlackboxFinalizer:
             return rejected(f"rebuild_failed:{error}", staging_keys)
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
-        if self._mixed_weight_version_policy == "reject" and min_wv != max_wv:
-            return rejected(f"mixed_weight_versions:{min_wv}..{max_wv}", staging_keys)
 
         route_plan = None
         routed_experts: Optional[torch.Tensor] = None

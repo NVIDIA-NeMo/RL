@@ -101,7 +101,6 @@ def _finalizer(tq_client, **overrides) -> BlackboxFinalizer:
         partition_id=CANONICAL_PARTITION,
         staging_partition=STAGING_PARTITION,
         pad_token_id=PAD,
-        mixed_weight_version_policy="allow",
         min_valid_fraction_per_group=None,
     )
     kwargs.update(overrides)
@@ -168,18 +167,6 @@ def test_finalize_rollout_rejections(tq_client, partitions):
     ]
     bad = finalizer.finalize_rollout("rej_a", corrupted, reward=0.0)
     assert (bad.rejection_reason or "").startswith("rebuild_failed:wrong_digest")
-
-
-def test_mixed_weight_version_policy_reject(tq_client, partitions):
-    receipt, _ = _stage_fixture(tq_client, "mixed_weight_versions", rollout_id="mix_r0")
-    receipt["rollout_id"] = "mix_r0"
-    allow_row = _finalizer(tq_client).finalize_rollout("mix_r0", receipt, reward=0.0)
-    assert allow_row.valid
-    assert allow_row.min_wv < allow_row.max_wv
-    reject_row = _finalizer(
-        tq_client, mixed_weight_version_policy="reject"
-    ).finalize_rollout("mix_r0", receipt, reward=0.0)
-    assert (reject_row.rejection_reason or "").startswith("mixed_weight_versions")
 
 
 def _fetch_rows(tq_client, sample_ids):
@@ -404,7 +391,6 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         partition_id=_R3_PARTITION,
         staging_partition=_R3_STAGING,
         pad_token_id=PAD,
-        mixed_weight_version_policy="allow",
         min_valid_fraction_per_group=None,
         router_replay_enabled=True,
     )
@@ -461,7 +447,6 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
         partition_id=_R3_PARTITION,
         staging_partition=_R3_STAGING,
         pad_token_id=PAD,
-        mixed_weight_version_policy="allow",
         min_valid_fraction_per_group=None,
         router_replay_enabled=True,
     )
@@ -556,7 +541,6 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
         pad_token_id=PAD,
-        mixed_weight_version_policy="allow",
         min_valid_fraction_per_group=None,
         router_replay_enabled=True,
         defer_routed_experts_to_policy=True,
@@ -616,7 +600,6 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
         pad_token_id=PAD,
-        mixed_weight_version_policy="allow",
         min_valid_fraction_per_group=None,
         router_replay_enabled=True,
         defer_routed_experts_to_policy=True,
@@ -651,7 +634,6 @@ def _mode_finalizer(tq_client, *, deferred: bool) -> BlackboxFinalizer:
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
         pad_token_id=PAD,
-        mixed_weight_version_policy="allow",
         min_valid_fraction_per_group=None,
         router_replay_enabled=True,
         defer_routed_experts_to_policy=deferred,

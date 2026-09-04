@@ -600,10 +600,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # TQ partition holding per-call staged token deltas (cleared by the
     # finalizer; distinct from the canonical rollout partition).
     staging_partition: str = "rollout_staging"
-    # "allow" trains groups whose calls span a refit (staleness accounted via
-    # group_min_wv); "reject" placeholders them. Strict modes beyond the MVP
-    # matrix raise NotImplementedError at setup.
-    mixed_weight_version_policy: Literal["allow", "reject"] = "allow"
     # Drop the whole group when fewer than this fraction of its rollouts
     # produced valid rows (None keeps every group).
     min_valid_fraction_per_group: Optional[float] = None

@@ -73,7 +73,6 @@ class FinalizerActorConfig:
     partition_id: str
     staging_partition: str
     pad_token_id: int
-    mixed_weight_version_policy: str
     min_valid_fraction_per_group: Optional[float]
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
@@ -128,7 +127,6 @@ class FinalizerActor:  # pragma: no cover
             partition_id=config.partition_id,
             staging_partition=config.staging_partition,
             pad_token_id=config.pad_token_id,
-            mixed_weight_version_policy=config.mixed_weight_version_policy,
             min_valid_fraction_per_group=config.min_valid_fraction_per_group,
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
