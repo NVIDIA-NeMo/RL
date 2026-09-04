@@ -839,13 +839,26 @@ class VllmInternalWorkerExtension:
         if not self._supports_unquantized_flashinfer_trtllm_refit():
             return False
         model_runner = getattr(self, "model_runner", None)
-        vllm_config = getattr(model_runner, "vllm_config", None)
-        if vllm_config is None:
-            return False
-        if getattr(vllm_config, "quant_config", None) is not None:
+        model = getattr(model_runner, "model", None)
+        if model is None:
             return False
 
-        return _model_uses_unquantized_flashinfer_trtllm(self.model_runner.model)
+        return _model_uses_unquantized_flashinfer_trtllm(model)
+
+    def _unquantized_flashinfer_trtllm_param_ids(self) -> set[int]:
+        """Return parameters owned by realized unquantized TRTLLM MoE modules."""
+        if not self._supports_unquantized_flashinfer_trtllm_refit():
+            return set()
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None)
+        if model is None:
+            return set()
+
+        return {
+            id(param)
+            for module in _unquantized_flashinfer_trtllm_modules(model)
+            for param in module.parameters(recurse=False)
+        }
 
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         """Return whether this transport needs vLLM's layerwise lifecycle."""
@@ -1378,11 +1391,13 @@ class VllmInternalWorkerExtension:
         }
         vllm_params = dict(self.model_runner.model.named_parameters())
         vllm_names_by_id = {id(param): name for name, param in vllm_params.items()}
-        use_trtllm_staging = self._uses_unquantized_flashinfer_trtllm()
+        unquantized_trtllm_param_ids = self._unquantized_flashinfer_trtllm_param_ids()
         specs = {}
         for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
             param_info = param_info_by_name[hf_name]
-            if use_trtllm_staging and param_info.get("grouped_expert_proj"):
+            if id(vllm_param) in unquantized_trtllm_param_ids and param_info.get(
+                "grouped_expert_proj"
+            ):
                 specs[hf_name] = _trtllm_grouped_expert_spec(param_info, vllm_param)
                 continue
 
