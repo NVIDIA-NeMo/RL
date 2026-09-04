@@ -450,7 +450,7 @@ def test_layerwise_reload_propagates_detach_error_after_successful_load(monkeypa
 def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    model = object()
+    model = SimpleNamespace(modules=lambda: [])
     model_config = object()
     vllm_config = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
@@ -545,12 +545,50 @@ def test_quantized_model_uses_native_refit_for_realized_bf16_trtllm_modules():
 
 
 @pytest.mark.vllm
+def test_unquantized_trtllm_param_ids_are_scoped_to_realized_modules(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    bf16_experts = torch.nn.Module()
+    bf16_experts.register_parameter(
+        "w13_weight", torch.nn.Parameter(torch.empty(2, 4, 8), requires_grad=False)
+    )
+    bf16_experts.register_parameter(
+        "w2_weight", torch.nn.Parameter(torch.empty(2, 8, 2), requires_grad=False)
+    )
+    mxfp8_experts = torch.nn.Module()
+    mxfp8_experts.register_parameter(
+        "w13_weight",
+        torch.nn.Parameter(
+            torch.empty(2, 4, 8, dtype=torch.float8_e4m3fn), requires_grad=False
+        ),
+    )
+    model = torch.nn.Module()
+    model.add_module("bf16_experts", bf16_experts)
+    model.add_module("mxfp8_experts", mxfp8_experts)
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model)
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [bf16_experts],
+    )
+
+    assert ext._unquantized_flashinfer_trtllm_param_ids() == {
+        id(bf16_experts.w13_weight),
+        id(bf16_experts.w2_weight),
+    }
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     ("moe_backend", "quant_config", "expected"),
     [
         ("FlashInfer TRTLLM", None, True),
         ("TRITON", None, False),
-        ("FlashInfer TRTLLM", object(), False),
+        ("FlashInfer TRTLLM", object(), True),
     ],
 )
 def test_weight_update_errors_are_fatal_only_for_native_trtllm_refit(
