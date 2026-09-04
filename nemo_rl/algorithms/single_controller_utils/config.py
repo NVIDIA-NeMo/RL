@@ -600,10 +600,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # TQ partition holding per-call staged token deltas (cleared by the
     # finalizer; distinct from the canonical rollout partition).
     staging_partition: str = "rollout_staging"
-    # A failed worker-side stage poisons the rollout; "continue" serves the
-    # completion and lets the finalizer emit a placeholder row, "abort" fails
-    # the whole rollout in the ledger.
-    on_capture_failure: Literal["continue", "abort"] = "continue"
     # "allow" trains groups whose calls span a refit (staleness accounted via
     # group_min_wv); "reject" placeholders them. Strict modes beyond the MVP
     # matrix raise NotImplementedError at setup.

@@ -64,6 +64,12 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.experience.route_assembly import RouteFragment
 
+# These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
+# transformed by stage() below. Adding a field means editing both this list and
+# stage(); a mismatch is caught by test_tq_sink_source_passes_conformance's
+# round-trip equality check -- but only for required StagedCallRecord fields. An
+# optional field Gym adds that this sink never stages will default identically
+# on both sides and pass that check silently.
 STAGING_FIELDS = [
     "token_ids_delta",
     "token_mask_delta",
@@ -139,8 +145,8 @@ class TQTokenSink:
     ``stage`` is synchronous and returns only after TQ acknowledged the
     write, so the capture layer's fail-closed ordering (bytes durable before
     the model call is acked) holds by construction. Failures are reported in
-    the ``StageResult`` — the caller decides whether the rollout poisons or
-    aborts (``token_capture.on_capture_failure``).
+    the ``StageResult``; the finalizer turns a poisoned rollout into a
+    placeholder row (see ``BlackboxFinalizer.finalize_group``).
 
     ``stage`` is thread-safe per the ``StagingSink`` contract: it holds no
     per-call mutable state, so the capture host may run writes for unrelated
