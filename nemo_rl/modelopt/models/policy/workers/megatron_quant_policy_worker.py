@@ -502,11 +502,11 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             )
         return copy.deepcopy(self._get_modelopt_export_plan().quantization_config)
 
-    def _iter_real_quant_refit_params(
+    def _iter_real_quant_refit_groups(
         self,
         kv_scales: dict[str, float] | None = None,
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Export canonical ModelOpt deployment tensors for vLLM rollout."""
+    ) -> Generator[tuple[tuple[str, torch.Tensor], ...], None, None]:
+        """Export collective-complete ModelOpt deployment tensor groups."""
         if kv_scales:
             raise ValueError("Real-quant refit does not support KV-cache scale sync")
         generation_cfg = self.cfg["generation"]
@@ -534,9 +534,43 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             except StopIteration:
                 return
             try:
+                yield group
+            finally:
+                del group
+
+    def _iter_real_quant_refit_params(
+        self,
+        kv_scales: dict[str, float] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Export canonical ModelOpt deployment tensors for non-IPC transports."""
+        groups = iter(self._iter_real_quant_refit_groups(kv_scales))
+        while True:
+            try:
+                group = next(groups)
+            except StopIteration:
+                return
+            try:
                 yield from group
             finally:
                 del group
+
+    @torch.no_grad()
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes=0, kv_scales=None) -> None:
+        if not self._use_real_quant_refit():
+            return super().stream_weights_via_ipc_zmq(buffer_size_bytes, kv_scales)
+
+        self.maybe_init_zmq()
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=self._iter_real_quant_refit_groups(kv_scales),
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self),
+            drain_between_groups=True,
+        )
 
     @staticmethod
     def _find_weight_quantizer(

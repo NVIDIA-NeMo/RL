@@ -137,6 +137,79 @@ class _FakeIpcSocket:
         return 0
 
 
+def test_stream_weights_drains_group_before_requesting_next(monkeypatch):
+    events = []
+
+    class OrderingSocket(_FakeIpcSocket):
+        def send_pyobj(self, payload):
+            if payload == IPCProtocol.COMPLETE:
+                events.append("complete")
+            else:
+                events.append(("send", payload[1]))
+            super().send_pyobj(payload)
+
+        def recv(self):
+            events.append("ack")
+            return super().recv()
+
+    def param_groups():
+        events.append("group_0")
+        tensor = torch.ones(1)
+        tensor_ref = weakref.ref(tensor)
+        group = (("weight_0", tensor),)
+        yield group
+        del group, tensor
+        assert tensor_ref() is None
+        events.append("group_0_released")
+
+        events.append("group_1")
+        yield tuple((f"weight_{index}", torch.ones(1)) for index in range(1, 4))
+
+        events.append("group_2")
+        yield (("oversized_weight", torch.ones(300)),)
+
+        events.append("empty_group")
+        yield ()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: unittest.mock.Mock(synchronize=lambda: None),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda _buffer: ("ipc-handle",),
+    )
+
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=param_groups(),
+        buffer_size_bytes=2048,
+        zmq_socket=OrderingSocket(),
+        rank=0,
+        worker_name="test_worker",
+        drain_between_groups=True,
+    )
+
+    assert events == [
+        "group_0",
+        ("send", ["weight_0"]),
+        "ack",
+        "group_0_released",
+        "group_1",
+        ("send", ["weight_1", "weight_2"]),
+        "ack",
+        ("send", ["weight_3"]),
+        "ack",
+        "group_2",
+        ("send", ["oversized_weight"]),
+        "ack",
+        "empty_group",
+        "complete",
+        "ack",
+    ]
+
+
 def test_stream_weights_releases_buffers_before_complete_without_full_gc(
     monkeypatch,
 ):

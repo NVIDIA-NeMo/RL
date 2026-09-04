@@ -360,7 +360,13 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
+    *,
+    drain_between_groups: bool = False,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -368,11 +374,14 @@ def stream_weights_via_ipc_zmq_impl(
     to reduce memory allocation overhead and improve stability.
 
     Args:
-        params_generator: Generator yielding (name, tensor) pairs
+        params_generator: Generator yielding (name, tensor) pairs. When
+            ``drain_between_groups`` is true, yields groups of those pairs.
         buffer_size_bytes: total size of buffer in bytes for batching parameters
         zmq_socket: ZMQ socket for communication
         rank: Worker rank for logging
         worker_name: Name of the worker for logging
+        drain_between_groups: Drain buffered tensors and acknowledgements before
+            requesting the next parameter group.
     """
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
@@ -433,7 +442,42 @@ def stream_weights_via_ipc_zmq_impl(
     count_of_groups = 0
 
     try:
-        for name, tensor in params_generator:
+        group_boundary = object()
+        if drain_between_groups:
+            param_groups = params_generator
+
+            def _iter_params_with_group_boundaries():
+                groups = iter(param_groups)
+                while True:
+                    try:
+                        group = next(groups)
+                    except StopIteration:
+                        return
+                    try:
+                        yield from group
+                    finally:
+                        del group
+                    yield group_boundary
+
+            params_generator = _iter_params_with_group_boundaries()
+
+        for item in params_generator:
+            if item is group_boundary:
+                # The grouped producer may synchronize before its next group.
+                # Drain this group first so producer and consumer cannot wait on
+                # opposite sides of that synchronization.
+                if param_names:
+                    await_recv = send_buffer_group_overlap(
+                        current_buffer, param_names, used_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    used_bytes, param_names = 0, []
+                if await_recv:
+                    zmq_socket.recv()
+                    await_recv = False
+                continue
+
+            name, tensor = item
             # Initialize device and buffers on first tensor
             if buffer_a is None:
                 buffer_device = tensor.device
@@ -485,6 +529,7 @@ def stream_weights_via_ipc_zmq_impl(
                 finally:
                     del oversized_buffer
                     torch.cuda.empty_cache()
+                del tensor
                 continue
 
             # Check if we need to send current buffer and switch to the other one
@@ -501,6 +546,7 @@ def stream_weights_via_ipc_zmq_impl(
             # Pack tensor into current buffer
             param_names.append(name)
             used_bytes = pack_tensor(current_buffer, tensor, used_bytes)
+            del tensor
 
         # Send remaining tensors
         if param_names:

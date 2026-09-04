@@ -620,6 +620,41 @@ def test_stream_weights_via_ipc_zmq_does_not_move_without_real_quant(monkeypatch
     assert calls[1]["rank"] == 0
 
 
+@requires_weight_folding
+def test_real_quant_ipc_stream_preserves_and_drains_export_groups(monkeypatch):
+    from nemo_rl.models.policy import utils as policy_utils
+
+    worker = _make_real_quant_worker()
+    worker.zmq_socket = object()
+    calls = []
+    groups = (("model.weight", torch.ones(1)),)
+
+    monkeypatch.setattr(worker, "maybe_init_zmq", lambda: calls.append("init_zmq"))
+    monkeypatch.setattr(
+        worker,
+        "_iter_real_quant_refit_groups",
+        lambda kv_scales=None: iter([groups]),
+    )
+
+    def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
+        calls.append(kwargs)
+        assert list(kwargs["params_generator"]) == [groups]
+
+    monkeypatch.setattr(
+        policy_utils,
+        "stream_weights_via_ipc_zmq_impl",
+        fake_stream_weights_via_ipc_zmq_impl,
+    )
+
+    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123)
+
+    assert calls[0] == "init_zmq"
+    assert calls[1]["drain_between_groups"] is True
+    assert calls[1]["buffer_size_bytes"] == 123
+    assert calls[1]["zmq_socket"] is worker.zmq_socket
+    assert calls[1]["rank"] == 0
+
+
 def _make_cluster(name):
     return RayVirtualCluster(
         name=name,
