@@ -57,6 +57,33 @@ dictionaries follow the hierarchy of nested model-config objects. NeMo
 RL-specific settings such as optimizer, scheduler, checkpointing, and
 environment variables remain under their existing `megatron_cfg` sections.
 
+#### Out-of-tree model bridges
+
+Megatron Bridge resolves a model through bridges registered at import time and
+has no plugin auto-discovery, so a bridge defined outside the package is invisible
+unless something imports it first. List the modules that register yours in
+`policy.megatron_cfg.bridge_plugins`:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+    bridge_plugins:
+      - my_bridges.llama_variant
+```
+
+These are dotted module paths, not file paths — the difference from
+`policy.generation.vllm_cfg.reasoning_parser_plugin`, which takes a file. Each must
+be importable from the process that resolves the model: the Megatron policy worker,
+which is a Ray actor rather than the driver, so the module has to be installed in
+the worker environment or reachable inside the Ray working directory. A module that
+cannot be imported fails at setup naming the config key; one that imports but
+registers nothing surfaces later as the ordinary unsupported-architecture error.
+
+`examples/converters/convert_megatron_to_hf.py` reads the same key from the run's
+saved config, so a checkpoint trained with a custom bridge converts back to
+Hugging Face without extra flags.
+
 #### Fine-grained activation CPU offload
 
 Fine-grained activation offloading asynchronously moves selected module-input

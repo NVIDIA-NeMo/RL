@@ -17,6 +17,7 @@ import argparse
 import yaml
 
 from nemo_rl.models.megatron.community_import import export_model_from_megatron
+from nemo_rl.models.policy.utils import import_bridge_plugins
 
 """ NOTE: this script requires mcore. Make sure to launch with the mcore extra:
 uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
@@ -81,6 +82,10 @@ def main():
     )
     tokenizer_name = config["policy"]["tokenizer"]["name"]
     hf_overrides = config["policy"].get("hf_overrides", {}) or {}
+
+    # A custom bridge registers on import, and export resolves the same
+    # architecture the run trained, so the converter needs the plugins too.
+    import_bridge_plugins(config["policy"]["megatron_cfg"].get("bridge_plugins"))
 
     export_model_from_megatron(
         hf_model_name=model_name,
