@@ -276,6 +276,9 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # aborts the run. A successful batch worker resets the count.
     # 0 makes the very first worker exception fatal.
     max_generation_failures: int = 0
+    # Number of retries after the initial NeMo-Gym stream attempt. Keep this
+    # small because each retry can substantially extend rollout wall time.
+    nemo_gym_stream_retries: int = Field(default=1, ge=0)
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
@@ -4467,6 +4470,7 @@ def async_grpo_train(
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
     max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
+    nemo_gym_stream_retries = master_config.grpo.async_grpo.nemo_gym_stream_retries
     log_nemo_gym_training_samples = should_log_nemo_gym_training_samples(
         master_config.env
     )
@@ -4717,7 +4721,8 @@ def async_grpo_train(
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, "
         f"max_age={max_trajectory_age_steps} steps, "
-        f"max_generation_failures={max_generation_failures}"
+        f"max_generation_failures={max_generation_failures}, "
+        f"nemo_gym_stream_retries={nemo_gym_stream_retries}"
     )
 
     timer.start("init/total")

@@ -72,7 +72,6 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
-_MAX_NEMO_GYM_STREAM_RETRIES = 3
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
@@ -148,12 +147,14 @@ class AsyncTrajectoryCollector:
             )
             self._debug_payload_metrics = algorithm_config.debug_payload_metrics
             self._max_generation_failures = async_config.max_generation_failures
+            self._nemo_gym_stream_retries = async_config.nemo_gym_stream_retries
         elif isinstance(master_config, PPOMasterConfig):
             algorithm_config = master_config.ppo
             async_config = algorithm_config.async_ppo
             self._deduplicate_multimodal_data = False
             self._debug_payload_metrics = False
             self._max_generation_failures = 0
+            self._nemo_gym_stream_retries = 1
         else:
             raise TypeError(
                 "master_config must be a GRPO or PPO MasterConfig, got "
@@ -1617,7 +1618,7 @@ class AsyncTrajectoryCollector:
         buffered_group_indices: set[int] = set()
         last_error: Exception | None = None
         last_enqueue_error: Exception | None = None
-        max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
+        max_attempts = 1 + (self._nemo_gym_stream_retries if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
             pending_group_indices = expected_group_indices - buffered_group_indices
             if len(pending_group_indices) == expected_prompt_groups:
@@ -1700,7 +1701,8 @@ class AsyncTrajectoryCollector:
                 "❌ NeMo-Gym batch did not complete prompt groups "
                 f"{sorted(pending_group_indices)}; retrying in "
                 f"{retry_delay:.1f}s "
-                f"(attempt {attempt + 1}/{max_attempts})"
+                f"(attempt {attempt + 1}/{max_attempts})",
+                flush=True,
             )
             await asyncio.sleep(retry_delay)
 

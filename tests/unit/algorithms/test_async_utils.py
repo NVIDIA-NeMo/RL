@@ -1295,6 +1295,7 @@ class TestAsyncTrajectoryCollector:
         replay_buffer=None,
         next_nemo_gym_task_index: int = 0,
         max_generation_failures: int = 0,
+        nemo_gym_stream_retries: int = 1,
         pending_batch=None,
         ordinals_frontier_aligned: bool = True,
         resume_frontier_ordinal=None,
@@ -1307,6 +1308,7 @@ class TestAsyncTrajectoryCollector:
         task_to_env = {}
         master_config = self.create_mock_config()
         master_config.grpo.async_grpo.max_generation_failures = max_generation_failures
+        master_config.grpo.async_grpo.nemo_gym_stream_retries = nemo_gym_stream_retries
         if replay_buffer is None:
             replay_buffer = mock.MagicMock()
             replay_buffer.get_held_task_indices.remote.return_value = []
@@ -1324,6 +1326,11 @@ class TestAsyncTrajectoryCollector:
             resume_frontier_ordinal=resume_frontier_ordinal,
             resume_covered_task_indices=resume_covered_task_indices,
         )
+
+    def test_nemo_gym_stream_retry_count_comes_from_config(self):
+        collector = self.create_local_collector(nemo_gym_stream_retries=2)
+
+        assert collector._nemo_gym_stream_retries == 2
 
     def _prime_collection_loop(self, collector):
         """Unblock every wait-event so _collection_loop() runs to completion."""
@@ -3116,8 +3123,6 @@ class TestAsyncTrajectoryCollector:
 
         assert rollout_call_task_indices == [
             [7, 7, 8, 8],
-            [8, 8],
-            [8, 8],
             [8, 8],
         ]
         assert replay_buffer.add.task_indices == [7]

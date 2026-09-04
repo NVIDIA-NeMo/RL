@@ -573,6 +573,7 @@ def test_grpo_config_nested_defaults_are_populated():
     assert isinstance(first.reward_scaling, RewardScalingConfig)
     assert first.async_grpo.enabled is False
     assert first.async_grpo.max_generation_failures == 0
+    assert first.async_grpo.nemo_gym_stream_retries == 1
     assert first.adv_estimator.use_leave_one_out_baseline is True
     assert first.adv_estimator.normalize_rewards is True
     assert first.adv_estimator.minus_baseline is True
@@ -580,6 +581,11 @@ def test_grpo_config_nested_defaults_are_populated():
     assert first.adv_estimator is not second.adv_estimator
     assert first.reward_shaping is not second.reward_shaping
     assert first.reward_scaling is not second.reward_scaling
+
+
+def test_async_grpo_config_rejects_negative_nemo_gym_stream_retries():
+    with pytest.raises(ValueError, match="nemo_gym_stream_retries"):
+        AsyncGRPOConfig(nemo_gym_stream_retries=-1)
 
 
 def _mock_seq_logprob_error_result() -> dict[str, object]:
