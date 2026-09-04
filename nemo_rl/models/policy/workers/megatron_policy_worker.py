@@ -2688,6 +2688,52 @@ class MegatronPolicyWorkerImpl(
             f"with mapping {type(mapping).__name__}"
         )
 
+    def _grouped_source_uses_native_mxfp8(self, task: Any) -> bool:
+        """Return whether a grouped expert weight really stores MXFP8 members.
+
+        Bridge owns task construction now, and it names a grouped expert weight
+        the same way whatever that weight stores, so this is the only place a
+        BF16 boundary layer can still be told apart from a quantized one. A
+        negative answer means "send it down the misc path", exactly as the
+        ungrouped branch concludes from an absent ``get_metadata``; it is not an
+        error. Asking ``get_grouped_quantized_members`` first instead would turn
+        the supported first-N/last-M-BF16 config into a planning-time
+        ``ValueError``, since a BF16 ``GroupedTensor`` has no quantized storage
+        to enumerate.
+
+        The remaining raises stay: once the weight *is* MXFP8, a missing or empty
+        member list is a real defect and must not be demoted to BF16 transport.
+        """
+        from megatron.core.fp8_utils import (
+            get_grouped_quantized_members,
+            is_grouped_mxfp8tensor,
+        )
+
+        if not is_grouped_mxfp8tensor(task.param_weight):
+            return False
+
+        try:
+            members = get_grouped_quantized_members(
+                task.param_weight, create_if_missing=False
+            )
+        except RuntimeError:
+            members = get_grouped_quantized_members(
+                task.param_weight, create_if_missing=True
+            )
+        except ValueError as error:
+            logical_name = self._native_task_projections(task, grouped=True)[0][0]
+            raise ValueError(
+                f"Invalid grouped MXFP8 source {logical_name!r} role 'weight': {error}"
+            ) from error
+        if not members:
+            logical_name = self._native_task_projections(task, grouped=True)[0][0]
+            raise ValueError(
+                f"Grouped MXFP8 source {logical_name!r} role 'weight' has no members"
+            )
+        for member in members:
+            extract_native_mxfp8_components(member)
+        return True
+
     def _task_uses_native_mxfp8_storage(self, task: Any, *, grouped: bool) -> bool:
         """Return whether every local source component uses native MXFP8 storage."""
         if not self._native_task_projections(task, grouped=grouped):
@@ -2696,35 +2742,7 @@ class MegatronPolicyWorkerImpl(
         local_uses_native: bool | None = None
         if task.param_weight is not None:
             if grouped:
-                from megatron.core.fp8_utils import get_grouped_quantized_members
-
-                try:
-                    members = get_grouped_quantized_members(
-                        task.param_weight, create_if_missing=False
-                    )
-                except RuntimeError:
-                    members = get_grouped_quantized_members(
-                        task.param_weight, create_if_missing=True
-                    )
-                except ValueError as error:
-                    logical_name = self._native_task_projections(task, grouped=True)[0][
-                        0
-                    ]
-                    raise ValueError(
-                        f"Invalid grouped MXFP8 source {logical_name!r} role "
-                        f"'weight': {error}"
-                    ) from error
-                if not members:
-                    logical_name = self._native_task_projections(task, grouped=True)[0][
-                        0
-                    ]
-                    raise ValueError(
-                        f"Grouped MXFP8 source {logical_name!r} role 'weight' "
-                        "has no members"
-                    )
-                for member in members:
-                    extract_native_mxfp8_components(member)
-                local_uses_native = True
+                local_uses_native = self._grouped_source_uses_native_mxfp8(task)
             else:
                 metadata_getter = getattr(task.param_weight, "get_metadata", None)
                 if callable(metadata_getter):
