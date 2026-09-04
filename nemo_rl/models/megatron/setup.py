@@ -2333,9 +2333,17 @@ def load_teacher_output_layer_weight(
     it is far more fragile, since provider and config objects accumulate
     runtime-only distributed state during live training.
 
-    The request is built at the **student's** tensor-parallel rank and size with
-    ``allow_shape_mismatch=True``, which is what lets a teacher sharded over a
-    different tensor-parallel width be re-sharded onto the student's layout.
+    The request is built at the **student's** tensor-parallel rank and size.
+    Re-sharding a teacher saved at a different tensor-parallel width is
+    dist_checkpointing's ordinary by-offset load and needs no special flag.
+    ``allow_shape_mismatch=True`` covers a different case: a teacher whose
+    *padded* vocabulary differs from the student's. Megatron pads to a multiple
+    of ``make_vocab_size_divisible_by * tp_size``, so the two widths diverge
+    whenever the parallel sizes do. Under that flag mcore zero-initializes and
+    partially loads instead of raising, so rows above the narrower of the two
+    padded widths come back as zeros. Those are pad slots rather than real
+    vocabulary entries, so the objective is unaffected in practice -- but this
+    is a silent fallback, not a re-sharding mechanism.
 
     Args:
         teacher_pretrained_path: Megatron checkpoint root of the teacher.
@@ -2348,15 +2356,16 @@ def load_teacher_output_layer_weight(
     Raises:
         FileNotFoundError: If the checkpoint root holds no readable iteration.
         KeyError: If neither an output-layer nor a tied-embedding weight exists.
+        TypeError: If the loaded checkpoint entry is not a ``torch.Tensor``.
         ValueError: If the checkpoint tensor is not a rank-2 matrix.
     """
-    from megatron.core import dist_checkpointing
-    from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
     from megatron.bridge.training.utils.checkpoint_utils import (
         get_checkpoint_name,
         get_checkpoint_train_state_filename,
         read_train_state,
     )
+    from megatron.core import dist_checkpointing
+    from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
     if not checkpoint_exists(teacher_pretrained_path):
         raise FileNotFoundError(

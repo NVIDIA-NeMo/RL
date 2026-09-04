@@ -81,10 +81,10 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
-    load_teacher_output_layer_weight,
     build_inference_model,
     finalize_megatron_setup,
     handle_model_import,
+    load_teacher_output_layer_weight,
     setup_distributed,
     setup_model_and_optimizer,
     setup_reference_model_state,

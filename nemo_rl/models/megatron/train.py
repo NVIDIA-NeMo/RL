@@ -902,7 +902,10 @@ class TeacherFullPayloadPostProcessor:
                             # Some kernels may return [X, Y, D] where X*Y = (end_idx - start_idx).
                             # Flatten leading dims and reshape to [1, expected_len, D] to match target.
                             expected_len = end_idx - start_idx
-                            if gathered.dim() == 3 and gathered.shape[1] != expected_len:
+                            if (
+                                gathered.dim() == 3
+                                and gathered.shape[1] != expected_len
+                            ):
                                 gathered = gathered.reshape(
                                     1, expected_len, gathered.shape[-1]
                                 )
