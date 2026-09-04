@@ -5260,13 +5260,6 @@ def async_grpo_train(
                         train_data["advantages"], master_config.grpo
                     )
 
-                # Message logs are only needed through advantage penalties. Drop
-                # the large Python object graph before policy.train serializes its
-                # data-parallel shards.
-                with timer.time("driver_memory_cleanup"):
-                    del repeated_batch["message_log"]
-                    gc.collect()
-
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
                     policy.prepare_for_training()
