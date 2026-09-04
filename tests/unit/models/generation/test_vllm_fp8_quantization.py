@@ -326,6 +326,53 @@ def test_init_fp8_keeps_mixed_recipe_boundary_targets_in_bf16(
             assert modelopt_config.is_layer_excluded(module_name)
 
 
+def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    num_hidden_layers = 8
+    param_names = [
+        f"model.layers.{layer_idx}.mlp.experts.up_proj.weight"
+        for layer_idx in range(num_hidden_layers)
+    ]
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            text_config=types.SimpleNamespace(num_hidden_layers=num_hidden_layers)
+        ),
+    )
+    monkeypatch.setattr(
+        fp8.AutoModel,
+        "from_config",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            named_parameters=lambda: [(name, None) for name in param_names]
+        ),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "num_first_layers_in_bf16": 2,
+            "num_last_layers_in_bf16": 2,
+        },
+        "dummy-model-with-text-config",
+        model_parallel_size=1,
+    )
+
+    ignored_layers = vllm_kwargs["hf_overrides"]["quantization_config"][
+        "ignored_layers"
+    ]
+    assert "model.layers.0.mlp.experts.up_proj.weight" in ignored_layers
+    assert "model.layers.1.mlp.experts.up_proj.weight" in ignored_layers
+    assert "model.layers.6.mlp.experts.up_proj.weight" in ignored_layers
+    assert "model.layers.7.mlp.experts.up_proj.weight" in ignored_layers
+    assert "model.layers.2.mlp.experts.up_proj.weight" not in ignored_layers
+
+
 @pytest.mark.parametrize(
     "config",
     [
