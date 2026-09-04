@@ -70,10 +70,8 @@ tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
 #
 # Qwen3.5 adds a gate the base cannot use: it trains one inner step per rollout,
 # so probs_ratio is an exact identity there. Nemotron-Omni adds none -- turning
-# the data plane on must not change what a recipe is held to, and the
-# token_mult_prob_error bound it used to carry was borrowed from the AutoModel
-# sibling (1.0129-1.0155 there) and does not transfer: the no-data-plane control
-# measures 1.031-1.063 on that recipe, so the gate failed the control too.
+# the data plane on must not change what a recipe is held to, so its logprob
+# check lives on the base recipe instead.
 tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16-tq_simple.sh
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1-tq_mooncake.sh
 

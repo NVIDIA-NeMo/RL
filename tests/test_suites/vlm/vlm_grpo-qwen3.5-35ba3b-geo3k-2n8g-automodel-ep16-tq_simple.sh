@@ -7,7 +7,8 @@ NUM_NODES=2
 STEPS_PER_RUN=20
 MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=240
+# 150, not the base recipe's 240: a 20-step run of this recipe takes ~86 min.
+NUM_MINUTES=150
 # ===== END CONFIG =====
 
 source "$SCRIPT_DIR/common-tq.env"
@@ -16,7 +17,8 @@ source "$SCRIPT_DIR/common-tq.env"
 export EXP_NAME="$TQ_EXP_NAME"
 bash "$SCRIPT_DIR/$BASE_RECIPE.sh" "$@"
 
-# TQ-specific gate, on top of the base recipe's own reward check.
+# TQ-specific gate, on top of the base recipe's own reward and
+# median(train/token_mult_prob_error) checks.
 #
 # This recipe trains one inner step per rollout (train_global_batch_size ==
 # num_prompts_per_step * num_generations_per_prompt), so the training forward

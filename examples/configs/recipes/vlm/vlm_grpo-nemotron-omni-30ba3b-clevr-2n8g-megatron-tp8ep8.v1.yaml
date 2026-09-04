@@ -1,14 +1,9 @@
 # Two-node sibling of vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.
 #
 # tp8 on one node leaves dp=1, so Megatron's distributed optimizer has nothing to
-# shard and the run exhausts GPU memory -- ~108 MiB short in the MoE forward,
-# 282 MiB in the logprob softmax, or 1.13 GiB in the gradient all-reduce,
-# depending on where it happens to land. dp=2 fits: 10/10 steps, reward 0.64 ->
-# 0.88 with the shipped 8192 sequence length.
-#
-# This is not a data-plane property. The 1n8g recipe OOMs the same way with
-# data_plane.enabled=false, so the TQ wrapper needs a base that actually fits
-# rather than a node-count override that contradicts its own name.
+# shard and the run runs out of GPU memory; dp=2 fits. This is not a data-plane
+# property -- the 1n8g recipe OOMs the same way with data_plane.enabled=false --
+# so the TQ wrapper delegates here rather than overriding the node count.
 defaults: vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml
 cluster:
   num_nodes: 2
