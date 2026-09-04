@@ -41,7 +41,7 @@ import torch
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -140,6 +140,18 @@ def _canonical_manifest_value(value: Any, *, path: str) -> Any:
     )
 
 
+def _canonical_manifest_extra_info(value: Any, *, path: str) -> Any:
+    """Canonicalize identity metadata without hashing advisory rollout metrics.
+
+    Rollout metrics may contain logger payloads that are not JSON-compatible.
+    They remain in the serialized ``KVBatchMeta`` for post-restore logging, but
+    do not identify the replay rows bound to the native TQ checkpoint.
+    """
+    if isinstance(value, Mapping):
+        value = {key: item for key, item in value.items() if key != ROLLOUT_METRICS}
+    return _canonical_manifest_value(value, path=path)
+
+
 def replay_manifest_digest(groups: list[TQReplayGroupMetadata]) -> str:
     """Return a stable digest binding replay metadata to a TQ checkpoint."""
     digest_input = [
@@ -166,7 +178,7 @@ def replay_manifest_digest(groups: list[TQReplayGroupMetadata]) -> str:
                     group["meta"].tags,
                     path=f"groups[{group_index}].meta.tags",
                 ),
-                "extra_info": _canonical_manifest_value(
+                "extra_info": _canonical_manifest_extra_info(
                     group["meta"].extra_info,
                     path=f"groups[{group_index}].meta.extra_info",
                 ),
@@ -981,11 +993,13 @@ class TQReplayBuffer:
         partition_id: str,
         *,
         pad_value_dict: Mapping[str, int],
+        include_message_violation_fields: bool,
         require_routed_experts: bool = False,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
+        self._include_message_violation_fields = include_message_violation_fields
         self._require_routed_experts = require_routed_experts
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
@@ -1090,7 +1104,11 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before committing samples"
             )
-        train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
+        train_batch = record_to_train_batch(
+            record,
+            pad_value_dict=self._pad_value_dict,
+            include_message_violation_fields=self._include_message_violation_fields,
+        )
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=start_weight_version,
@@ -1124,6 +1142,7 @@ class TQReplayBuffer:
                     sample_ids=list(sample_ids),
                     fields=list(fields.keys()),
                     sequence_lengths=[int(s) for s in lengths.tolist()],
+                    extra_info={ROLLOUT_METRICS: [dict(record.rollout_metrics)]},
                     tags=[dict(t) for t in tags],
                 )
 

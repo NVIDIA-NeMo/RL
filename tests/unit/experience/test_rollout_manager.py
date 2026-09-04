@@ -573,9 +573,12 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
     assert RolloutManager(**common)._impl._mask_env_flagged_samples is True
     manager = RolloutManager(**common, mask_env_flagged_samples=False)
     assert manager._impl._mask_env_flagged_samples is False
+    reward_penalty_config = {"penalize_empty_final_answer": True}
+    manager = RolloutManager(**common, reward_penalty_config=reward_penalty_config)
+    assert manager._impl._reward_penalty_config is reward_penalty_config
 
 
-def _nemo_gym_impl(mask_env_flagged_samples):
+def _nemo_gym_impl(mask_env_flagged_samples, reward_penalty_config=None):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
         task_to_env={},
@@ -588,6 +591,7 @@ def _nemo_gym_impl(mask_env_flagged_samples):
             "top_k": None,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
+        reward_penalty_config=reward_penalty_config,
     )
 
 
@@ -608,14 +612,126 @@ def _mask_gate_result():
 
 
 def test_result_to_completion_keeps_mask_flag_when_gate_on():
-    completion = _nemo_gym_impl(True)._result_to_completion(_mask_gate_result())
+    completion = _nemo_gym_impl(True)._results_to_completions([_mask_gate_result()])[0][
+        0
+    ]
     assert completion.env_extras["instance_config"]["mask_sample"] is True
 
 
 def test_result_to_completion_drops_mask_flag_when_gate_off():
-    completion = _nemo_gym_impl(False)._result_to_completion(_mask_gate_result())
+    completion = _nemo_gym_impl(False)._results_to_completions([_mask_gate_result()])[
+        0
+    ][0]
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
+def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
+    assistant_message = {
+        "role": "assistant",
+        "content": "answer",
+        "token_ids": assistant_tokens or [2],
+        "generation_logprobs": [0.0] * len(assistant_tokens or [2]),
+    }
+    assistant_message.update(assistant_overrides or {})
+    return {
+        "message_log": [
+            {"role": "user", "content": "question", "token_ids": [1]},
+            assistant_message,
+        ],
+        "full_result": {
+            "reward": 1.0,
+            "response": {"output": output},
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    (
+        "reward_penalty_config",
+        "output",
+        "assistant_overrides",
+        "assistant_tokens",
+        "count_key",
+        "metric_name",
+    ),
+    [
+        (
+            {"penalize_duplicated_reasoning": True},
+            [
+                {"type": "reasoning", "summary": [{"text": "same"}]},
+                {"type": "message", "content": [{"text": "same"}]},
+            ],
+            None,
+            None,
+            "duplicated_reasoning",
+            "reasoning_equal_to_final_answer_rate",
+        ),
+        (
+            {"penalize_empty_final_answer": True},
+            [{"type": "message", "content": [{"text": ""}]}],
+            None,
+            None,
+            "empty_final_answer",
+            "empty_final_answer_rate",
+        ),
+        (
+            {
+                "penalize_unwanted_tokens": True,
+                "token_ids": {"unwanted": [99]},
+            },
+            [{"type": "message", "content": [{"text": "answer"}]}],
+            None,
+            [2, 99],
+            "unwanted_token",
+            "unwanted_token_rate",
+        ),
+        (
+            {
+                "penalize_malformed_think_tag": True,
+                "thinking_tags": ("<think>", "</think>"),
+            },
+            [{"type": "message", "content": [{"text": "answer"}]}],
+            {"has_malformed_thinking": True},
+            None,
+            "malformed_think_tag",
+            "malformed_think_tag_rate",
+        ),
+    ],
+)
+def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
+    reward_penalty_config,
+    output,
+    assistant_overrides,
+    assistant_tokens,
+    count_key,
+    metric_name,
+):
+    impl = _nemo_gym_impl(True, reward_penalty_config)
+    result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
+
+    completions, penalty_counts = impl._results_to_completions([result])
+
+    assert completions[0].reward == 0.0
+    assert penalty_counts[count_key] == 1
+    assert sum(penalty_counts.values()) == 1
+    assert impl._compute_reward_penalty_metrics(penalty_counts, 1) == {metric_name: 1.0}
+
+
+def test_nemo_gym_reward_penalty_metrics_compute_fractional_rate():
+    impl = _nemo_gym_impl(True, {"penalize_empty_final_answer": True})
+
+    metrics = impl._compute_reward_penalty_metrics(
+        {
+            "duplicated_reasoning": 0,
+            "empty_final_answer": 1,
+            "unwanted_token": 0,
+            "malformed_think_tag": 0,
+        },
+        3,
+    )
+
+    assert metrics == {"empty_final_answer_rate": 1 / 3}
 
 
 # ---------------------------------------------------------------------------

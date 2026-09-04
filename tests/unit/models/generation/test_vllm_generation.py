@@ -1012,6 +1012,38 @@ def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     )
 
 
+@pytest.mark.vllm
+def test_vllm_policy_generation_with_fastokens_enabled(
+    monkeypatch, cluster, test_input_data, tokenizer
+):
+    """Test real vLLM generation when vLLM's fastokens patch is enabled."""
+    # Keep this on the VLLM-only flag path; NeMo-RL mirrors NRL_USE_FASTOKENS.
+    monkeypatch.delenv("NRL_USE_FASTOKENS", raising=False)
+    monkeypatch.setenv("VLLM_USE_FASTOKENS", "1")
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+    vllm_policy = VllmGeneration(cluster, vllm_config)
+
+    try:
+        outputs = vllm_policy.generate(test_input_data)
+
+        assert "output_ids" in outputs, "output_ids not found in generation output"
+        assert outputs["output_ids"].shape[0] == len(test_input_data["input_ids"]), (
+            "Wrong batch size in output"
+        )
+
+        generated_texts = tokenizer.batch_decode(
+            outputs["output_ids"], skip_special_tokens=True
+        )
+        print(f"Generated texts with fastokens enabled: {generated_texts}")
+        assert all(len(text) > 0 for text in generated_texts), (
+            "Some generated texts are empty"
+        )
+    finally:
+        vllm_policy.shutdown()
+
+
 async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False):
     collected_indexed_outputs = []
     # generate_async is restricted to handle only single samples
