@@ -31,12 +31,6 @@ tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g-megatron-t
 # functional test before moving it to a recurring suite.
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-count-1n4g-megatron_generation.v1.sh
 
-# TODO(@cspades): Multimodal SingleController/TransferQueue recipes awaiting prepared
-# fixtures and validation. The 1n4g CLEVR sibling remains enabled as an L1 smoke test.
-tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.sh
-tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-vstat-1n4g-megatron-single-controller-async.v1.sh
-tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-vstat-8n4g-megatron-single-controller-async.v1.sh
-
 # Nemotron Super Omni: 16-node topology, and the checkpoint and multimodal Gym
 # blend are too large to ship with the repo, so these are invoked manually via
 # examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh rather than run
