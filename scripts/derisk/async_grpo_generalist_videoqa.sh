@@ -193,7 +193,7 @@ export NEMO_RL_VIDEO_MEDIA_ROOT=/
   cluster.gpus_per_node="${gpus_per_node}" \
   cluster.segment_size="${segment_size}" \
   policy.generation.colocated.resources.num_nodes="${num_gen_nodes}" \
-  policy.generation.colocated.resources.gpus_per_node="${gpus_per_node}"
+  policy.generation.colocated.resources.gpus_per_node="${gpus_per_node}" ${EXTRA_OVERRIDES:-}
 COMMAND_EOF
 export COMMAND
 
