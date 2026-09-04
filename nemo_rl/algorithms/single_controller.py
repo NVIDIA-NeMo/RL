@@ -495,22 +495,30 @@ class SingleControllerActor:
         if probe_task is not None:
             tasks.append(probe_task)
         try:
-            done, _ = await asyncio.wait(
-                set(tasks), return_when=asyncio.FIRST_COMPLETED
-            )
-            if probe_task is not None and probe_task in done:
-                # Loops forever like the watchdog, so finishing at all means it raised.
-                await probe_task
-            if watchdog_task in done:
-                # The watchdog loops forever, so finishing at all means it raised --
-                # a stall or an unhealthy environment. Surface that ahead of the
-                # pumps, whose own symptom would just be "waiting".
-                await watchdog_task
-            if rollout_task in done:
-                # Propagate rollout failures immediately. A normally exhausted
-                # rollout pump leaves the train pump to drain committed groups.
-                await rollout_task
-            await train_task
+            # Keep supervising every task until the train pump is done. A single
+            # wait would stop watching the monitors as soon as anything finished,
+            # and the rollout pump finishing is the *normal* end-of-data path --
+            # so a watchdog raise during the drain that follows would land on a
+            # task nobody awaits, and the gather() below would discard it.
+            pending = set(tasks)
+            while train_task in pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                if probe_task is not None and probe_task in done:
+                    # Loops forever like the watchdog, so finishing at all means it raised.
+                    await probe_task
+                if watchdog_task in done:
+                    # The watchdog loops forever, so finishing at all means it raised --
+                    # a stall or an unhealthy environment. Surface that ahead of the
+                    # pumps, whose own symptom would just be "waiting".
+                    await watchdog_task
+                if rollout_task in done:
+                    # Propagate rollout failures immediately. A normally exhausted
+                    # rollout pump leaves the train pump to drain committed groups.
+                    await rollout_task
+                if train_task in done:
+                    await train_task
         finally:
             for task in tasks:
                 task.cancel()
