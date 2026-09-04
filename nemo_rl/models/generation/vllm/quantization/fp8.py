@@ -538,6 +538,25 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
+def mark_quant_layouts_stale(model: torch.nn.Module) -> None:
+    """Clear vLLM's exactly-once guard so a refit can rebuild kernel layouts.
+
+    ``process_weights_after_loading`` derives a kernel-private layout from the
+    checkpoint-layout weights and guards itself with a sticky attribute so it
+    runs once per load. vLLM sets that attribute during engine startup and only
+    its own layerwise reload clears it, because upstream a load happens once per
+    process. A refit loads again, so it has to clear the guard itself; otherwise
+    the rebuild is skipped and the kernel keeps serving the previous step's
+    layout. The inverse is equally unsafe: these transforms are
+    read-modify-write on the weight, so they must not run twice for one load.
+    Pair every clear with an actual weight write and the transform stays
+    exactly-once per load.
+    """
+    for module in model.modules():
+        if hasattr(module, "_already_called_process_weights_after_loading"):
+            delattr(module, "_already_called_process_weights_after_loading")
+
+
 def load_weights(weights, model_runner):
     global global_fp8_config
     weights_quantized = []

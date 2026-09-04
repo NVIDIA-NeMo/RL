@@ -1025,7 +1025,15 @@ class VllmInternalWorkerExtension:
         processed_weights_after_loading = False
 
         def finalize() -> None:
+            # Transports that write into live parameter storage (nccl_reshard)
+            # never route through ``fp8.load_weights``, so the exactly-once
+            # guard is still set from engine startup and would skip the rebuild.
             nonlocal processed_weights_after_loading
+            from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                mark_quant_layouts_stale,
+            )
+
+            mark_quant_layouts_stale(self.model_runner.model)
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device
