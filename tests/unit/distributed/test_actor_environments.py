@@ -19,6 +19,7 @@ imports the same dict. These tests keep the two readers honest.
 """
 
 import ast
+import hashlib
 import importlib.util
 import subprocess
 import sys
@@ -27,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
+from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS, _build_stage
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
     USE_SYSTEM_EXECUTABLE,
@@ -143,6 +144,40 @@ def test_script_output_matches_the_registry():
     assert listed == expected
 
 
+def test_script_emits_the_stage_and_extra_flags_each_actor_needs():
+    """The Dockerfile builds each venv from columns 2 and 3, not just the name.
+
+    Column 3 is what `uv sync $extras` consumes, and column 2 is what the deps
+    layer branches on to leave the TRT-LLM venv base-only until its wheel exists.
+    Checking only column 1 lets both go wrong silently: emitting one extra per
+    actor, or staging everything as "deps", passes a name-only assertion.
+    """
+    proc = subprocess.run(
+        [sys.executable, str(MODULE_PATH), "all"],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=git_root,
+    )
+    rows = {
+        line.split("\t")[0]: line.split("\t")[1:]
+        for line in proc.stdout.splitlines()
+        if line.strip()
+    }
+    expected = {
+        fqn: [_build_stage(extras), " ".join(f"--extra {e}" for e in extras)]
+        for fqn, extras in ACTOR_ENVIRONMENTS.items()
+        if extras is not None
+    }
+    assert rows == expected
+    assert (
+        rows[
+            "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker"
+        ][0]
+        == "trtllm"
+    )
+
+
 def test_fingerprint_covers_the_actor_table():
     """Editing an actor's extras must invalidate the container fingerprint.
 
@@ -161,9 +196,11 @@ def test_fingerprint_covers_the_actor_table():
         "tools/generate_fingerprint.py must hash the actor -> extras table, or a "
         "changed actor environment leaves a stale venv with no warning"
     )
-    assert fingerprint["nemo_rl/distributed/actor_environments.py"] not in (
-        "",
-        "missing",
+    # Check the value is this file's hash, not merely present and non-empty --
+    # pointing the entry at some other file passes the weaker check.
+    assert (
+        fingerprint["nemo_rl/distributed/actor_environments.py"]
+        == hashlib.md5(MODULE_PATH.read_bytes()).hexdigest()
     )
 
 
