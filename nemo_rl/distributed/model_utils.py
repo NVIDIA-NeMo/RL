@@ -83,6 +83,57 @@ def _compute_distributed_log_softmax(
 
 
 @torch.no_grad()
+def _compute_distributed_selected_logprobs(
+    vocab_parallel_logits: torch.Tensor,
+    *,
+    masked_target: torch.Tensor,
+    target_mask: torch.Tensor,
+    group: torch.distributed.ProcessGroup,
+    reduce_output: bool = True,
+) -> torch.Tensor:
+    """Compute selected-token logprobs without materializing full logprobs.
+
+    The normalization still spans the complete tensor-parallel vocabulary, but
+    the final log-normalizer subtraction is applied only to the selected token
+    from each row instead of every vocabulary element. When ``reduce_output`` is
+    ``False``, the caller owns the final sum-reduction across vocabulary partitions.
+    """
+    logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
+    torch.distributed.all_reduce(
+        logits_max,
+        op=torch.distributed.ReduceOp.MAX,
+        group=group,
+    )
+
+    shifted_logits = vocab_parallel_logits - logits_max
+    selected_logits = torch.gather(
+        shifted_logits, -1, masked_target.unsqueeze(-1)
+    ).squeeze(-1)
+
+    # The selected logits have already been gathered, so the full-vocabulary
+    # shifted buffer can be reused for exp/sum instead of allocating another
+    # [batch, sequence, local_vocab] tensor.
+    sum_exp_logits = shifted_logits.exp_().sum(-1, keepdim=True).float()
+    torch.distributed.all_reduce(
+        sum_exp_logits,
+        op=torch.distributed.ReduceOp.SUM,
+        group=group,
+    )
+    selected_logprobs = selected_logits - sum_exp_logits.log().squeeze(-1).to(
+        selected_logits.dtype
+    )
+    selected_logprobs[target_mask] = 0.0
+
+    if reduce_output:
+        torch.distributed.all_reduce(
+            selected_logprobs,
+            op=torch.distributed.ReduceOp.SUM,
+            group=group,
+        )
+    return selected_logprobs
+
+
+@torch.no_grad()
 def _compute_distributed_softmax(
     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
@@ -305,25 +356,22 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
             logits = logits.to(dtype=torch.float32)
 
-            log_probs = _compute_distributed_log_softmax(
+            log_probs = _compute_distributed_selected_logprobs(
                 logits,
+                masked_target=masked_target[:, chunk_start:chunk_end],
+                target_mask=target_mask[:, chunk_start:chunk_end],
                 group=tp_group,
-            )
-
-            log_probs = torch.gather(
-                log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
-            ).squeeze(-1)
-            log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
-
-            torch.distributed.all_reduce(
-                log_probs,
-                op=torch.distributed.ReduceOp.SUM,
-                group=tp_group,
+                reduce_output=False,
             )
 
             all_log_probs.append(log_probs)
 
         log_probs = torch.cat(all_log_probs, dim=1)
+        torch.distributed.all_reduce(
+            log_probs,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
 
         if not inference_only:
             # only save for backward when we have inference only=False
@@ -2346,19 +2394,13 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
                 output_weight_layer.T,
             )
             logits = logits.to(dtype=torch.float32).transpose(0, 1).contiguous()
-            log_probs = _compute_distributed_log_softmax(
+            log_probs = _compute_distributed_selected_logprobs(
                 logits,
+                masked_target=masked_target[:, chunk_start:chunk_end],
+                target_mask=target_mask[:, chunk_start:chunk_end],
                 group=tp_group,
+                reduce_output=False,
             )
-
-            log_probs = (
-                torch.gather(
-                    log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
-                )
-                .squeeze(-1)
-                .detach()
-            )
-            log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
 
             all_log_probs.append(log_probs)
 
