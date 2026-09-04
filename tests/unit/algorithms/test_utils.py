@@ -14,13 +14,17 @@
 
 import math
 from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from nemo_rl.algorithms.grpo import AsyncGRPOConfig, GRPOConfig, MasterConfig
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
+    STEP_WINDOW_WALL_CLOCK_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
@@ -144,6 +148,43 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     assert formatted == expected
 
 
+def test_get_tokenizer_forwards_tokenizer_kwargs():
+    """Test get_tokenizer unpacks tokenizer_kwargs into from_pretrained."""
+    config = {
+        "name": "meta-llama/Llama-3.2-1B-Instruct",
+        "tokenizer_kwargs": {"model_max_length": 123},
+    }
+    with patch("nemo_rl.algorithms.utils.AutoTokenizer") as mock_auto_tokenizer:
+        get_tokenizer(config)
+
+    mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+        "meta-llama/Llama-3.2-1B-Instruct",
+        trust_remote_code=True,
+        model_max_length=123,
+    )
+
+
+def test_get_processor_forwards_tokenizer_kwargs():
+    """Test get_tokenizer forwards tokenizer_kwargs through AutoProcessor."""
+    config = {
+        "name": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "tokenizer_kwargs": {"model_max_length": 123, "use_fast": False},
+    }
+    with patch("nemo_rl.algorithms.utils.AutoProcessor") as mock_auto_processor:
+        get_tokenizer(config, get_processor=True)
+
+    mock_auto_processor.from_pretrained.assert_called_once_with(
+        "Qwen/Qwen2.5-VL-3B-Instruct",
+        trust_remote_code=True,
+        use_fast=False,
+        model_max_length=123,
+    )
+    assert config["tokenizer_kwargs"] == {
+        "model_max_length": 123,
+        "use_fast": False,
+    }
+
+
 def test_maybe_pad_last_batch():
     """Test maybe_pad_last_batch function for various scenarios"""
     # Test case 1: No padding needed
@@ -247,6 +288,26 @@ def _base_master_config(colocated: bool):
     )
 
 
+def _base_ppo_master_config(colocated: bool):
+    return PPOMasterConfig.model_construct(
+        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        policy={
+            "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
+                "colocated": {
+                    "enabled": colocated,
+                    "resources": {"num_nodes": 1, "gpus_per_node": 8},
+                },
+            }
+        },
+        ppo=PPOConfig.model_construct(
+            num_prompts_per_step=8, num_generations_per_prompt=10
+        ),
+    )
+
+
 def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     master_config = _base_master_config(colocated=True)
 
@@ -274,7 +335,13 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     }
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
     )
 
     # Validate key throughput metrics
@@ -343,7 +410,13 @@ def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
     }
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
     )
 
     assert math.isclose(perf["train_flops_per_gpu"], 500.0 / 8, rel_tol=1e-6)
@@ -375,8 +448,16 @@ def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=True,
     )
+
+    assert "training_worker_idle_time_ratio" in perf
 
     # Throughput checks
     assert math.isclose(perf["samples_per_sec_per_gpu"], 0.5, rel_tol=1e-6)
@@ -427,7 +508,13 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
     )
 
     # Core metrics exist
@@ -459,13 +546,45 @@ def test_empty_per_worker_token_counts_skips_imbalance(capsys):
         "per_worker_token_counts": {},
     }
 
-    perf = print_performance_metrics({}, metrics, timing_metrics, master_config)
+    perf = print_performance_metrics(
+        {},
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
+    )
 
     assert "average_token_imbalance" not in perf
 
     out = capsys.readouterr().out
     assert "No per-worker generation load data available." in out
     assert "Throughputs (per GPU)" in out
+
+
+def test_async_ppo_metrics_use_async_flag_without_grpo_config():
+    master_config = _base_ppo_master_config(colocated=False)
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,
+        "total_step_time": 10.0,
+        "exposed_generation": 2.0,
+        "prepare_for_generation/total": 1.0,
+    }
+    metrics = {"total_num_tokens": 6050.0}
+
+    perf = print_performance_metrics(
+        {},
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=True,
+    )
+
+    assert "training_worker_idle_time_ratio" in perf
 
 
 # ============================================================================
@@ -680,9 +799,11 @@ class TestPrintEfficiencySummary:
 
         result = print_efficiency_summary(metrics, total_wall, step=1)
 
-        assert result["efficiency/total_waste_s"] == 20.0
-        assert result["efficiency/productive_time_s"] == 80.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(80.0)
+        # init/total is not waste for this step: it is a run-long constant, so
+        # only the three per-step idle categories count (5 + 3 + 2).
+        assert result["efficiency/total_waste_s"] == 10.0
+        assert result["efficiency/productive_time_s"] == 90.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(90.0)
         assert result["efficiency/total_wall_time_s"] == 100.0
 
         assert result["efficiency/init/total_s"] == 10.0
@@ -694,7 +815,51 @@ class TestPrintEfficiencySummary:
 
         captured = capsys.readouterr()
         assert "Efficiency Summary (Step 1)" in captured.out
-        assert "80.00%" in captured.out
+        assert "90.00%" in captured.out
+
+    def test_startup_cost_is_not_charged_to_every_step(self):
+        """init/total is republished every step, so counting it would recur.
+
+        The driver measures it once before the loop and re-supplies the same
+        value on every step so the series does not zero out. Folding it into the
+        waste aggregate would subtract the whole startup cost from every step.
+        """
+        idle_only = {"idle/refit_bubble": 4.0}
+        with_startup = {**idle_only, "init/total": 300.0}
+
+        assert print_efficiency_summary(
+            with_startup, total_wall_time_s=1000.0, step=9, step_wall_time_s=20.0
+        )["efficiency/efficiency_pct"] == pytest.approx(
+            print_efficiency_summary(
+                idle_only, total_wall_time_s=1000.0, step=9, step_wall_time_s=20.0
+            )["efficiency/efficiency_pct"]
+        )
+
+    def test_efficiency_is_a_per_step_ratio(self):
+        """The numerator is per-step, so the denominator has to be too.
+
+        Against the run's elapsed time, a fixed per-step idle cost would look
+        like it was shrinking: the same 5s of idle in a 20s step is 25% waste at
+        step 2 and 25% at step 500, but 5/1000 at step 500 if divided by the run.
+        """
+        metrics = {"idle/buffer_starvation": 5.0}
+
+        result = print_efficiency_summary(
+            metrics, total_wall_time_s=1000.0, step=50, step_wall_time_s=20.0
+        )
+
+        assert result["efficiency/efficiency_pct"] == pytest.approx(75.0)
+        # The per-category column stays a share of the run, which is what makes
+        # a cumulative denominator the right one there.
+        assert result["efficiency/idle/buffer_starvation_pct"] == pytest.approx(0.5)
+
+    def test_step_wall_time_defaults_to_the_run(self):
+        """Callers with no per-step measurement keep the old denominator."""
+        metrics = {"idle/refit_bubble": 25.0}
+
+        result = print_efficiency_summary(metrics, total_wall_time_s=100.0, step=1)
+
+        assert result["efficiency/efficiency_pct"] == pytest.approx(75.0)
 
     def test_zero_wall_time(self):
         """Test that zero wall time produces 100% efficiency."""
@@ -713,10 +878,11 @@ class TestPrintEfficiencySummary:
             if cat in WALL_CLOCK_EFFICIENCY_CATEGORIES:
                 assert f"efficiency/{cat}_pct" in result
 
-        # total_waste_s reflects wall-clock categories only (4 x 1.0); collector
-        # thread-seconds are reported separately, not folded into wall waste.
-        assert result["efficiency/total_waste_s"] == 4.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(96.0)
+        # total_waste_s reflects the per-step wall-clock categories only
+        # (3 x 1.0): collector thread-seconds are reported separately rather
+        # than folded into wall waste, and init/total is a run constant.
+        assert result["efficiency/total_waste_s"] == 3.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(97.0)
 
     def test_efficiency_with_collector_metrics_merge(self):
         """Test merging driver and collector metrics before computing efficiency."""
@@ -729,13 +895,16 @@ class TestPrintEfficiencySummary:
 
         result = print_efficiency_summary(merged, total_wall_time_s=50.0, step=3)
 
-        assert result["efficiency/total_waste_s"] == 8.0
+        # Only the driver's per-step idle counts: refit_bubble (3.0). The
+        # collector's two categories are thread-seconds, init/total is a run
+        # constant.
+        assert result["efficiency/total_waste_s"] == 3.0
         assert result["efficiency/thread_seconds_total_s"] == 3.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(84.0)
+        assert result["efficiency/efficiency_pct"] == pytest.approx(94.0)
 
     def test_wall_waste_clamped_to_wall_time(self):
         """Wall-clock waste is capped so efficiency stays in [0, 100]."""
-        metrics = {cat: 30.0 for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES}
+        metrics = {cat: 30.0 for cat in STEP_WINDOW_WALL_CLOCK_CATEGORIES}
         result = print_efficiency_summary(metrics, total_wall_time_s=60.0, step=2)
 
         assert result["efficiency/total_waste_s"] == 60.0

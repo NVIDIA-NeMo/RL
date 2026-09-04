@@ -427,22 +427,25 @@ class TestAudioMCQProcessor:
         assert result["extra_env_info"]["ground_truth"] == rows[0]["answer"]
         assert result["extra_env_info"]["choices"] == rows[0]["choices"]
 
-    def test_dispatcher_rejects_unknown_task_name(self):
+    def test_dispatcher_accepts_generic_preformatted_messages(self):
         from nemo_rl.data.interfaces import TaskDataSpec
         from nemo_rl.data.processors import vlm_hf_data_processor
 
-        bogus_datum = {
-            "task_name": "definitely-not-a-task",
+        generic_datum = {
+            "task_name": "custom-vlm-task",
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "hi"}]},
                 {"role": "assistant", "content": "hello"},
             ],
         }
-        with pytest.raises(ValueError, match="No data processor for task"):
-            vlm_hf_data_processor(
-                datum_dict=bogus_datum,
-                task_data_spec=TaskDataSpec(task_name="definitely-not-a-task"),
-                processor=_FakeProcessor(),
-                max_seq_length=4096,
-                idx=0,
-            )
+        result = vlm_hf_data_processor(
+            datum_dict=generic_datum,
+            task_data_spec=TaskDataSpec(task_name="custom-vlm-task"),
+            processor=_FakeProcessor(),
+            max_seq_length=4096,
+            idx=0,
+        )
+
+        assert result["task_name"] == "custom-vlm-task"
+        assert result["extra_env_info"]["ground_truth"] == "hello"
+        assert result["vllm_content"] == "<chat>fake</chat>"

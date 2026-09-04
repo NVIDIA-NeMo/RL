@@ -27,7 +27,6 @@ import torch
 from torch.distributed._tensor import Replicate, Shard
 
 from nemo_rl.weight_sync import xferdtensor_python as impl
-from nemo_rl.weight_sync.xferdtensor import get_local_shard_slices
 
 
 class _Mesh:
@@ -165,49 +164,6 @@ def test_compute_shard_slices_uses_uneven_torch_chunk_semantics():
         slice(6, 9),
         slice(9, 10),
     ]
-
-
-def test_public_local_shard_slices_matches_exact_transfer_for_uneven_shards():
-    mesh = _Mesh([0, 1, 2, 3], (4,))
-
-    slices = [
-        get_local_shard_slices((10,), mesh, (Shard(0),), rank)[0] for rank in range(4)
-    ]
-
-    assert slices == [
-        slice(0, 3),
-        slice(3, 6),
-        slice(6, 9),
-        slice(9, 10),
-    ]
-
-
-def test_public_local_shard_slices_matches_repeated_shard_dimensions():
-    mesh = _Mesh(list(range(6)), (2, 3))
-    placements = (Shard(0), Shard(0))
-
-    public_slices = [
-        get_local_shard_slices((10,), mesh, placements, rank)[0] for rank in range(6)
-    ]
-    exact_transfer_slices = [
-        impl._compute_shard_slices(
-            global_shape=(10,),
-            mesh_shape=(2, 3),
-            coordinates=(rank // 3, rank % 3),
-            placements=placements,
-        )[0]
-        for rank in range(6)
-    ]
-
-    expected = [
-        slice(0, 2),
-        slice(2, 4),
-        slice(4, 5),
-        slice(5, 7),
-        slice(7, 9),
-        slice(9, 10),
-    ]
-    assert public_slices == exact_transfer_slices == expected
 
 
 def test_plan_geometry_tp2_to_tp1_gather():

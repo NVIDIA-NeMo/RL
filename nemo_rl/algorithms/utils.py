@@ -300,6 +300,10 @@ def get_tokenizer(
                     - "default": Uses the tokenizer's default template
                     - A custom jinja2 template string
                     If not specified, the tokenizer's default template will be used.
+                - tokenizer_kwargs: Extra keyword arguments forwarded to tokenizer
+                  loading, e.g. {"fix_mistral_regex": False}. When
+                  get_processor=True, these are passed through
+                  AutoProcessor.from_pretrained().
         get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
 
     Returns:
@@ -359,15 +363,21 @@ def get_tokenizer(
     maybe_patch_fastokens(bool(tokenizer_config.get("use_fastokens")))
 
     processor = None
+    tokenizer_kwargs = dict(tokenizer_config.get("tokenizer_kwargs") or {})
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            use_fast=tokenizer_kwargs.pop("use_fast", True),
+            **tokenizer_kwargs,
         )
         tokenizer = processor.tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            **tokenizer_kwargs,
         )
 
     if tokenizer.pad_token is None:
@@ -521,8 +531,12 @@ def print_performance_metrics(
     metrics: dict[str, Any],
     timing_metrics: dict[str, float],
     master_config: dict,
+    *,
+    num_prompts_per_step: int,
+    num_generations_per_prompt: int,
+    is_async_rl: bool,
 ) -> dict[str, float]:
-    """Print performance metrics for GRPO."""
+    """Print performance metrics for an RL training step."""
 
     # =====================================================
     # Generate Token Imbalance Visualization
@@ -739,10 +753,10 @@ def print_performance_metrics(
     total_num_gpus = num_nodes * gpus_per_node
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
-    # Idle Time from Training Worker (Async GRPO only)
+    # Idle time from the training worker in async RL.
     if (
         "exposed_generation" in timing_metrics
-        and master_config.grpo.async_grpo.enabled
+        and is_async_rl
         and not colocated_inference
     ):
         exposed_generation_time = timing_metrics["exposed_generation"]
@@ -764,15 +778,6 @@ def print_performance_metrics(
             training_worker_idle_time_ratio
         )
 
-    # Detect which algorithm config key is being used
-    grpo_config = getattr(master_config, "grpo", None)
-    algo_config = grpo_config or getattr(master_config, "ppo", None) or {}
-    if isinstance(algo_config, dict):
-        num_prompts_per_step = algo_config.get("num_prompts_per_step", 1)
-        num_generations_per_prompt = algo_config.get("num_generations_per_prompt", 1)
-    else:
-        num_prompts_per_step = algo_config.num_prompts_per_step
-        num_generations_per_prompt = algo_config.num_generations_per_prompt
     number_of_samples_per_step = num_prompts_per_step * num_generations_per_prompt
 
     if colocated_inference:
@@ -962,28 +967,62 @@ EFFICIENCY_CATEGORIES = (
     WALL_CLOCK_EFFICIENCY_CATEGORIES + THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES
 )
 
+# Wall-clock categories whose value covers the whole run rather than one step.
+# The driver's Timer is reset every step, so its idle categories are per-step
+# deltas -- but init/total is measured once before the loop and republished
+# unchanged afterwards, so it cannot be compared against a single step's wall
+# time. Mirrored by _RUN_WINDOW_WALL_CLOCK_CATEGORIES in
+# nemo_rl/telemetry/metrics.py, which cannot import this module (torch); a test
+# keeps the two in lockstep.
+RUN_WINDOW_WALL_CLOCK_CATEGORIES = frozenset({"init/total"})
+
+STEP_WINDOW_WALL_CLOCK_CATEGORIES = [
+    category
+    for category in WALL_CLOCK_EFFICIENCY_CATEGORIES
+    if category not in RUN_WINDOW_WALL_CLOCK_CATEGORIES
+]
+
 
 def print_efficiency_summary(
     efficiency_metrics: dict[str, float],
     total_wall_time_s: float,
     step: int,
+    step_wall_time_s: Optional[float] = None,
 ) -> dict[str, float]:
     """Print a summary table of efficiency metrics and return loggable dict.
 
-    Wall-clock categories (driver-side idle) are used for the efficiency
-    percentage.  Collector-side categories are summed across concurrent
-    threads and reported separately as thread-seconds so they are not
-    compared directly against a single wall-clock denominator.
+    Driver-side wall-clock categories drive the efficiency percentage.
+    Collector-side categories are summed across concurrent threads and reported
+    separately as thread-seconds so they are not compared directly against a
+    single wall-clock denominator.
+
+    The efficiency percentage is a *per-step* ratio, because the numerator is:
+    the driver resets its Timer every step, so its idle categories are per-step
+    deltas. Dividing them by the cumulative ``total_wall_time_s`` would make the
+    run look monotonically more efficient the longer it ran, whatever the idle
+    time actually did. ``init/total`` is excluded from that numerator for the
+    same reason in reverse -- it is a run-long constant (see
+    :data:`RUN_WINDOW_WALL_CLOCK_CATEGORIES`) and would otherwise add the whole
+    startup cost to every single step's waste.
 
     Args:
         efficiency_metrics: Dict mapping category labels to total seconds spent.
         total_wall_time_s: Total wall-clock time in seconds since training began.
+            Used for the per-category ``% of Wall`` column.
         step: Current training step number.
+        step_wall_time_s: Wall-clock seconds in the step being reported, the
+            denominator of the efficiency percentage. Defaults to
+            ``total_wall_time_s`` for callers with no per-step measurement.
 
     Returns:
         Dict of metrics suitable for logging to WandB/TensorBoard, including
         per-category seconds and percentages, total waste, and efficiency_pct.
     """
+    # Captured before the fallback below, because it decides which window the
+    # efficiency percentage actually covers.
+    pct_is_per_step = step_wall_time_s is not None
+    if step_wall_time_s is None:
+        step_wall_time_s = total_wall_time_s
     print(f"\n📊 Efficiency Summary (Step {step}):")
     print(f"  {'Category':<35} {'Time (s)':>10} {'% of Wall':>10}")
     print(f"  {'─' * 57}")
@@ -1005,17 +1044,17 @@ def print_efficiency_summary(
         loggable[f"efficiency/{category}_s"] = duration
 
     wall_waste = sum(
-        efficiency_metrics.get(cat, 0.0) for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES
+        efficiency_metrics.get(cat, 0.0) for cat in STEP_WINDOW_WALL_CLOCK_CATEGORIES
     )
-    if total_wall_time_s > 0 and wall_waste > total_wall_time_s:
-        wall_waste = total_wall_time_s
+    if step_wall_time_s > 0 and wall_waste > step_wall_time_s:
+        wall_waste = step_wall_time_s
 
-    productive = max(0.0, total_wall_time_s - wall_waste)
+    productive = max(0.0, step_wall_time_s - wall_waste)
     efficiency_pct = (
-        (productive / total_wall_time_s * 100) if total_wall_time_s > 0 else 100.0
+        (productive / step_wall_time_s * 100) if step_wall_time_s > 0 else 100.0
     )
     efficiency_pct = min(100.0, max(0.0, efficiency_pct))
-    waste_pct = (wall_waste / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+    waste_pct = (wall_waste / step_wall_time_s * 100) if step_wall_time_s > 0 else 0.0
     waste_pct = min(100.0, max(0.0, waste_pct))
 
     print(f"  {'─' * 57}")
@@ -1023,14 +1062,26 @@ def print_efficiency_summary(
         f"  {'Collector thread-seconds (info)':<35} "
         f"{thread_seconds_total:>10.2f} {'n/a':>10}"
     )
-    print(f"  {'Wall-clock waste':<35} {wall_waste:>10.2f} {waste_pct:>9.2f}%")
-    print(f"  {'Productive time':<35} {productive:>10.2f} {efficiency_pct:>9.2f}%")
-    print(f"  {'Efficiency':<35} {'':>10} {efficiency_pct:>9.2f}%")
+    # Labelled "this step" because the denominator is the step's wall time, not
+    # the run's -- the column header above it is a share of the run.
+    print(
+        f"  {'Wall-clock waste (this step)':<35} {wall_waste:>10.2f} {waste_pct:>9.2f}%"
+    )
+    print(
+        f"  {'Productive time (this step)':<35} {productive:>10.2f} {efficiency_pct:>9.2f}%"
+    )
+    print(f"  {'Efficiency (this step)':<35} {'':>10} {efficiency_pct:>9.2f}%")
 
     loggable["efficiency/thread_seconds_total_s"] = thread_seconds_total
     loggable["efficiency/total_waste_s"] = wall_waste
     loggable["efficiency/productive_time_s"] = productive
     loggable["efficiency/efficiency_pct"] = efficiency_pct
     loggable["efficiency/total_wall_time_s"] = total_wall_time_s
+    # Carries the window of the ratio above to the OTel tee, which tags it. A
+    # caller that supplies no per-step denominator gets a run-cumulative ratio,
+    # and publishing that as per-step would state the opposite of what it is.
+    # A float, not the string it represents, because everything in this dict is
+    # also logged to WandB/TensorBoard as a scalar.
+    loggable["efficiency/efficiency_pct_is_per_step"] = float(pct_is_per_step)
 
     return loggable

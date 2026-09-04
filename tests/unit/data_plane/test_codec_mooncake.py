@@ -75,6 +75,28 @@ def test_promote_1d_roundtrip_via_from_wire() -> None:
     assert torch.equal(back["input_lengths"], original)
 
 
+@pytest.mark.parametrize("field_name", ["mask_sample", "truncated"])
+def test_raw_sample_filter_fields_roundtrip_as_dense_1d(field_name: str) -> None:
+    """Raw loss-filter fields use the Mooncake scalar wire workaround."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import (
+        _from_wire,
+        _promote_1d_leaves,
+    )
+
+    n = 4
+    original = torch.tensor([False, True, False, True])
+    td = TensorDict({field_name: original}, batch_size=[n])
+
+    wire = _promote_1d_leaves(td)
+    assert wire[field_name].shape == (n, 1)
+
+    back = _from_wire(wire)
+    assert back[field_name].shape == (n,)
+    assert torch.equal(back[field_name], original)
+
+
 def test_from_wire_densifies_uniform_nested_rows() -> None:
     """TQ v0.1.9's uniform nested reads are restored to dense tensors."""
     from tensordict import TensorDict
@@ -234,6 +256,7 @@ def test_get_samples_uses_static_shape_schema(monkeypatch) -> None:
     monkeypatch.setattr(tq_adapter.tq, "kv_batch_get", fake_kv_batch_get)
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._promote_1d = True
+    client._data_operations_started = False
 
     restored = client.get_samples(
         ["a", "b", "c"], "train", ["total_reward", "input_ids"]
@@ -268,6 +291,7 @@ def test_get_samples_densifies_uniform_rows_without_1d_promotion(monkeypatch) ->
     monkeypatch.setattr(tq_adapter.tq, "kv_batch_get", fake_kv_batch_get, raising=False)
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._promote_1d = False
+    client._data_operations_started = False
 
     restored = client.get_samples(["a", "b"], "train", ["input_ids"])
 

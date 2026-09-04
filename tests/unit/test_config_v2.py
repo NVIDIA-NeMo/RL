@@ -27,12 +27,22 @@ from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
-from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
+from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
+)
+from nemo_rl.algorithms.grpo import (
+    MasterConfig as GRPOMasterConfig,
+)
+from nemo_rl.algorithms.ppo import AsyncPPOConfig, PPOConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
@@ -46,6 +56,15 @@ reference_configs_dir = Path(os.path.join(absolute_dir, "reference_configs"))
 reference_config_files = glob.glob(
     str(reference_configs_dir / "*.yaml"), recursive=True
 )
+
+
+def test_ppo_recipe_critic_epochs_follow_actor_override():
+    config = load_config(real_configs_dir / "ppo_math_1B.yaml")
+    config = parse_hydra_overrides(config, ["ppo.ppo_epochs=7"])
+
+    resolved = OmegaConf.to_container(config, resolve=True)
+    assert resolved["ppo"]["ppo_epochs"] == 7
+    assert resolved["ppo"]["critic_ppo_epochs"] == 7
 
 
 def _collect_mismatched_keys(real: dict, reference: dict, path: str = ""):
@@ -132,6 +151,11 @@ def test_config_v2_same_as_v1(config_file):
         master_config_class = RMMasterConfig
 
     config_v2 = master_config_class(**config_v1)
+    if "grpo" in config_v1 and "async_grpo" in config_v1["grpo"]:
+        assert isinstance(config_v2.grpo.async_grpo, AsyncGRPOConfig)
+    if "ppo" in config_v1 and "async_ppo" in config_v1["ppo"]:
+        assert isinstance(config_v2.ppo, PPOConfig)
+        assert isinstance(config_v2.ppo.async_ppo, AsyncPPOConfig)
     config_v2 = config_v2.model_dump()
 
     # Check v1 keys missing from v2, and differing values

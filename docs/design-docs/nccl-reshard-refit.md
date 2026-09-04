@@ -39,7 +39,7 @@ single `ValueError` listing every violation. The current requirements are:
   `vllm_cfg.precision=fp8` and `vllm_cfg.is_mx=true`; the generation ranks
   quantize each received BF16 shard before installing it. Blockwise-FP8 train →
   MXFP8 gen is not supported.
-* Unquantized BF16 FlashInfer TRTLLM MoE is supported through vLLM's native
+* BF16 FlashInfer TRTLLM MoE is supported through vLLM's native
   layerwise-reload path. Its grouped expert weights must use expert-parallel
   destination sharding with linear expert placement; tensor-sharded expert
   destinations and round-robin placement are rejected.
@@ -140,7 +140,7 @@ realized **locally**:
   views into a `[num_local_experts, ...]` tensor fresh at each refit.
 * On the **generation side**, a direct parameter's `base` is the live vLLM parameter
   (received into in place). Conventional fused parameters use `pre`/`post` hooks to
-  receive a component and copy it into the appropriate local region. Unquantized
+  receive a component and copy it into the appropriate local region. BF16
   FlashInfer TRTLLM grouped experts instead receive into canonical EP-local staging
   tensors; `post` loads each logical expert with its global expert ID through vLLM's
   native weight loader.

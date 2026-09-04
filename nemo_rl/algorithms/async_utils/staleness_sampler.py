@@ -44,6 +44,7 @@ import importlib
 from typing import (
     Annotated,
     Callable,
+    ClassVar,
     Literal,
     Optional,
     Protocol,
@@ -51,10 +52,14 @@ from typing import (
     runtime_checkable,
 )
 
-from pydantic import BaseModel, Field, NonNegativeInt
+from pydantic import BaseModel, Field, NonNegativeInt, model_validator
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneMutationCut,
+    TQReplayBuffer,
+)
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 
 # Poll interval for the rollout-pump admission gate.
 _GATE_POLL_SECONDS = 0.005
@@ -109,12 +114,39 @@ class PromptGroupSampler(Protocol):
         """True when the policy admits zero staleness (sync mode)."""
         ...
 
+    supports_buffer_checkpoint: ClassVar[bool]
+    """Whether completed buffered groups can be restored safely."""
+
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
 
-    def set_dispatch_index(self, resume_from_step: int) -> None:
-        """Seed the dispatch cursor when resuming from a checkpoint."""
+    @property
+    def dispatch_index(self) -> int:
+        """Last admitted dispatch batch index."""
+        ...
+
+    def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
+        """Seed the cursor for checkpoints that predate exact sampler state."""
+        ...
+
+    def restore_dispatch_index(self, dispatch_index: int) -> None:
+        """Restore the exact dispatch cursor from controller state."""
+        ...
+
+
+@runtime_checkable
+class TransactionalAdmissionSampler(Protocol):
+    """Sampler whose blocking wait is separate from its cursor mutation."""
+
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Wait until one admission can commit without mutating sampler state."""
+        ...
+
+    def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:
+        """Advance the cursor under a live data-plane mutation cut."""
         ...
 
 
@@ -126,28 +158,45 @@ class BaseSampler(abc.ABC):
     select-finalize / weight-window-evict helpers.
     """
 
+    supports_buffer_checkpoint: ClassVar[bool] = False
+
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
         # Pre-incremented before each admitted batch, so -1 lets the first
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
 
-    def set_dispatch_index(self, resume_from_step: int) -> None:
-        """Seed the dispatch cursor when resuming from a checkpoint.
+    @property
+    def dispatch_index(self) -> int:
+        """Return the last admitted dispatch batch index."""
+        return self._dispatch_index
+
+    def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
+        """Seed the cursor for checkpoints that predate exact sampler state.
 
         Args:
-            resume_from_step: Trainer step this run starts from — 0 for a
-                fresh run, the restored ``current_step`` when resuming. Sets
-                the cursor to ``resume_from_step - 1`` so gated ``admit`` and
-                ``InOrderSampler``'s target_step stamps line up with the
-                restored trainer version exactly as at step 0 of a fresh run.
-                Call before the first ``admit``.
+            resume_from_trainer_version: Trainer version from which the run
+                resumes. The next admitted batch receives that version.
         """
-        if resume_from_step < 0:
+        if resume_from_trainer_version < 0:
             raise ValueError(
-                f"resume_from_step must be non-negative, got {resume_from_step}"
+                "resume_from_trainer_version must be non-negative, got "
+                f"{resume_from_trainer_version}"
             )
-        self._dispatch_index = resume_from_step - 1
+        self._dispatch_index = resume_from_trainer_version - 1
+
+    def restore_dispatch_index(self, dispatch_index: int) -> None:
+        """Restore the exact dispatch cursor.
+
+        Args:
+            dispatch_index: Last admitted batch index, or ``-1`` when no batch
+                has been admitted. Call before the first ``admit``.
+        """
+        if dispatch_index < -1:
+            raise ValueError(
+                f"dispatch_index must be at least -1, got {dispatch_index}"
+            )
+        self._dispatch_index = dispatch_index
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -231,11 +280,15 @@ class BaseSampler(abc.ABC):
         requested_groups = min(len(valid_idxs), max_prompt_groups)
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
+        selected_rollout_metrics = [
+            metrics
+            for meta in selected_metas
+            for metrics in meta.extra_info.get(ROLLOUT_METRICS, [])  # type: ignore[union-attr]
+        ]
+        selected_meta = selected_metas[0].concat(*selected_metas[1:])  # type: ignore[union-attr]
+        selected_meta.extra_info[ROLLOUT_METRICS] = selected_rollout_metrics
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
-        return (
-            selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
-            len(selected_idxs),
-        )
+        return selected_meta, len(selected_idxs)
 
 
 class WindowedSampler(BaseSampler):
@@ -246,6 +299,9 @@ class WindowedSampler(BaseSampler):
     within ``[train_weight - max_staleness_versions, train_weight]``, optionally
     freshest-first.
     """
+
+    # Ungated restored groups are ordinary in-window candidates.
+    supports_buffer_checkpoint: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -278,8 +334,19 @@ class WindowedSampler(BaseSampler):
         )
         return start_weight_version < min_valid_version
 
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Return immediately because buffer capacity is this policy's gate."""
+        del trainer_version_fn
+
+    def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:
+        """Return the unstamped admission result without changing a cursor."""
+        cut.require_live()
+        return None
+
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
-        # Over-sampled: dispatch is bounded by buffer capacity, not by version.
+        await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
         return None
 
     async def select(
@@ -327,6 +394,10 @@ class _GatedSampler(BaseSampler):
 
     def __init__(self, buffer: TQReplayBuffer, *, gate_window: int) -> None:
         super().__init__(buffer)
+        self._gate_window = 0
+        self.set_gate_window(gate_window)
+
+    def set_gate_window(self, gate_window: int) -> None:
         if gate_window < 0:
             raise ValueError(f"gate_window must be non-negative, got {gate_window}")
         self._gate_window = gate_window
@@ -341,11 +412,26 @@ class _GatedSampler(BaseSampler):
             gate_window=self._gate_window,
         )
 
-    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Wait for the gate without advancing the durable dispatch cursor."""
         while self._dispatch_index >= trainer_version_fn() + self._gate_window:
             await asyncio.sleep(_GATE_POLL_SECONDS)
+
+    def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:
+        """Advance the cursor after the controller enters its mutation cut."""
+        cut.require_live()
+        return self._commit_admission()
+
+    def _commit_admission(self) -> Optional[int]:
+        """Advance admission for the legacy monolithic API."""
         self._dispatch_index += 1
         return self._stamp()
+
+    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+        await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
+        return self._commit_admission()
 
     def _stamp(self) -> Optional[int]:
         return None
@@ -361,6 +447,9 @@ class ReadyFirstSampler(_GatedSampler):
     selectable, including late stragglers outside the admission window, so no
     rollout is ever discarded.
     """
+
+    # Committed groups retain start_weight, which is sufficient for selection.
+    supports_buffer_checkpoint: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -399,6 +488,9 @@ class WeightFifoSampler(_GatedSampler):
     ``select`` drains the oldest in-window ``start_weight`` first and waits for
     that weight's batch to fill. Evict uses the weight window (default).
     """
+
+    # Committed groups retain start_weight, which is sufficient for selection.
+    supports_buffer_checkpoint: ClassVar[bool] = True
 
     def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
         super().__init__(buffer, gate_window=max_staleness_versions)
@@ -439,11 +531,37 @@ class InOrderSampler(_GatedSampler):
     (the staleness window is not used for selection). ``evict`` is keyed on
     ``target_step`` — not the start weight — so a slot whose target step is still
     upcoming is never dropped early, and evict/select can't disagree.
+
+    warmup_lookahead_versions widens the gate while the PPO policy is frozen, so more
+    batches stay in flight during critic warmup. The driver retunes the window every
+    step and shrinks it back to max_lookahead_versions once the policy starts training,
+    so the widened lookahead does not turn into permanent extra staleness. Buffer
+    capacity is sized for the peak of the two.
     """
 
-    def __init__(self, buffer: TQReplayBuffer, *, max_lookahead_versions: int) -> None:
+    # Committed groups retain target_step, which is sufficient for selection.
+    # The controller checkpoints the exact dispatch cursor separately.
+    supports_buffer_checkpoint: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        buffer: TQReplayBuffer,
+        *,
+        max_lookahead_versions: int,
+        warmup_lookahead_versions: Optional[int] = None,
+    ) -> None:
         super().__init__(buffer, gate_window=max_lookahead_versions)
         self.max_lookahead_versions = max_lookahead_versions
+        self.warmup_lookahead_versions = warmup_lookahead_versions
+
+    def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
+        # Sized for the peak window: otherwise the buffer, not the gate, bounds
+        # the lookahead and widening it during warmup does nothing.
+        if self.warmup_lookahead_versions is None:
+            peak = self.max_lookahead_versions
+        else:
+            peak = self.warmup_lookahead_versions
+        return _gated_required_buffer_capacity(groups_per_step, gate_window=peak)
 
     def _stamp(self) -> Optional[int]:
         return self._dispatch_index
@@ -508,12 +626,36 @@ class InOrderSamplerConfig(BaseModel, extra="allow"):
     name: Literal["in_order"] = "in_order"
     # How far generation may run ahead of the trainer, in dispatch batches.
     max_lookahead_versions: NonNegativeInt = 1
+    # Widened lookahead while the PPO policy is frozen; None keeps the steady value.
+    warmup_lookahead_versions: Optional[NonNegativeInt] = None
+
+    @model_validator(mode="after")
+    def validate_warmup_lookahead(self) -> "InOrderSamplerConfig":
+        if (
+            self.warmup_lookahead_versions is not None
+            and self.warmup_lookahead_versions < self.max_lookahead_versions
+        ):
+            raise ValueError(
+                "warmup_lookahead_versions must be greater than or equal "
+                "to max_lookahead_versions"
+            )
+        return self
+
+    @property
+    def peak_lookahead_versions(self) -> int:
+        """Widest window the run can reach; what buffer capacity must cover."""
+        if self.warmup_lookahead_versions is None:
+            return self.max_lookahead_versions
+        return self.warmup_lookahead_versions
 
 
 class CustomSamplerConfig(BaseModel, extra="allow"):
     name: Literal["custom"] = "custom"
     # "module:ClassName" of a PromptGroupSampler defined outside this repo.
-    # Extra keys are forwarded to the constructor (after ``buffer``).
+    # Extra keys are forwarded to the constructor (after ``buffer``). The
+    # target class must declare a boolean ``supports_buffer_checkpoint`` class
+    # attribute so setup can validate recovery requirements before allocating
+    # cluster resources.
     target: str
 
 
@@ -550,46 +692,106 @@ def required_buffer_capacity_for_config(
     if isinstance(cfg, InOrderSamplerConfig):
         return _gated_required_buffer_capacity(
             groups_per_step,
-            gate_window=cfg.max_lookahead_versions,
+            gate_window=cfg.peak_lookahead_versions,
         )
     return None
+
+
+def _custom_sampler_class(cfg: CustomSamplerConfig) -> type:
+    """Import and return a custom sampler class without constructing it."""
+    module_name, sep, class_name = cfg.target.partition(":")
+    if not sep:
+        raise ValueError(
+            f"custom sampler target must be 'module:ClassName', got {cfg.target!r}"
+        )
+    sampler_cls = getattr(importlib.import_module(module_name), class_name)
+    if not isinstance(sampler_cls, type):
+        raise TypeError(f"custom sampler target is not a class: {cfg.target!r}")
+    return sampler_cls
+
+
+def _sampler_class_for_config(cfg: SamplerConfig) -> type:
+    """Return the sampler class selected by a built-in or custom config."""
+    if isinstance(cfg, CustomSamplerConfig):
+        return _custom_sampler_class(cfg)
+    try:
+        return {
+            WindowedSamplerConfig: WindowedSampler,
+            ReadyFirstSamplerConfig: ReadyFirstSampler,
+            WeightFifoSamplerConfig: WeightFifoSampler,
+            InOrderSamplerConfig: InOrderSampler,
+        }[type(cfg)]
+    except KeyError:
+        raise ValueError(f"unknown sampler config {type(cfg).__name__}") from None
+
+
+def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
+    """Return a sampler class's static replay-checkpoint capability.
+
+    Custom classes are imported but not instantiated, allowing setup to fail
+    before allocating cluster resources or triggering constructor side effects.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+
+    if isinstance(cfg, CustomSamplerConfig):
+        # A custom subclass must opt in explicitly instead of inheriting a
+        # built-in sampler's capability declaration accidentally.
+        capability = sampler_cls.__dict__.get("supports_buffer_checkpoint", False)
+    else:
+        capability = getattr(sampler_cls, "supports_buffer_checkpoint", None)
+    if not isinstance(capability, bool):
+        raise TypeError(
+            f"{sampler_cls.__name__}.supports_buffer_checkpoint must be a "
+            f"boolean class attribute, got {capability!r}"
+        )
+    return capability
 
 
 def create_sampler(
     buffer: TQReplayBuffer,
     cfg: SamplerConfig,
 ) -> PromptGroupSampler:
-    """Build a sampler from its config (or import one by FQN)."""
+    """Build a sampler from its config (or import one by FQN).
+
+    Args:
+        buffer: Shared TQReplayBuffer holding the candidate slots.
+        cfg: Discriminated sampler config selecting the policy.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+    sampler: PromptGroupSampler
     if isinstance(cfg, WindowedSamplerConfig):
-        return WindowedSampler(
+        sampler = sampler_cls(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
         )
-    if isinstance(cfg, ReadyFirstSamplerConfig):
-        return ReadyFirstSampler(
+    elif isinstance(cfg, ReadyFirstSamplerConfig):
+        sampler = sampler_cls(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
         )
-    if isinstance(cfg, WeightFifoSamplerConfig):
-        return WeightFifoSampler(
-            buffer, max_staleness_versions=cfg.max_staleness_versions
+    elif isinstance(cfg, WeightFifoSamplerConfig):
+        sampler = sampler_cls(
+            buffer,
+            max_staleness_versions=cfg.max_staleness_versions,
         )
-    if isinstance(cfg, InOrderSamplerConfig):
-        return InOrderSampler(buffer, max_lookahead_versions=cfg.max_lookahead_versions)
-    if isinstance(cfg, CustomSamplerConfig):
-        module_name, sep, class_name = cfg.target.partition(":")
-        if not sep:
-            raise ValueError(
-                f"custom sampler target must be 'module:ClassName', got {cfg.target!r}"
-            )
-        sampler_cls = getattr(importlib.import_module(module_name), class_name)
+    elif isinstance(cfg, InOrderSamplerConfig):
+        sampler = sampler_cls(
+            buffer,
+            max_lookahead_versions=cfg.max_lookahead_versions,
+            warmup_lookahead_versions=cfg.warmup_lookahead_versions,
+        )
+    elif isinstance(cfg, CustomSamplerConfig):
+        sampler_supports_buffer_checkpoint(cfg)
         sampler = sampler_cls(buffer, **(cfg.model_extra or {}))
         if not isinstance(sampler, PromptGroupSampler):
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
                 f"interface (needs admit/select/evict/should_abort_inflight, "
-                f"set_dispatch_index, is_on_policy, required_buffer_capacity)"
+                f"dispatch_index, set_dispatch_index, restore_dispatch_index, "
+                f"is_on_policy, supports_buffer_checkpoint, "
+                f"required_buffer_capacity)"
             )
-        return sampler
-    raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+    else:
+        raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+    return sampler
