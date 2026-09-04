@@ -34,34 +34,17 @@ run_test() {
     fi
 }
 
-# Megatron Inference currently hits an IMA on Blackwell tests.
-# TODO: remove this guard once the upstream dependency is bumped.
-megatron_generation_supported() {
-    if command -v nvidia-smi &> /dev/null; then
-        local compute_cap
-        compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 2>/dev/null | tr -d '. ' || true)
-        if [[ "${compute_cap:-0}" -ge 100 ]]; then
-            echo "WARNING: Skipping Blackwell x Megatron Inference tests"
-            return 1
-        fi
-    fi
-    return 0
-}
-
-if megatron_generation_supported; then
-    run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
-    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topology.sh
-    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
-    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_reshard.sh
-    run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async_grpo.sh
-    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_reshard_async_grpo.sh
-    run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
-    run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
-    # Disabled: token_mult_prob_error ~2.0 > 1.1 under top_p/top_k after the
-    # Megatron-LM cf2f07d7 -> bacd3404 bump; see #3385.
-    # run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
-    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_gym.sh
-fi
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_reshard.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_gym.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated_gym.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated_async_gym.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_reshard_async_gym.sh
+# Disabled: token_mult_prob_error ~2.0 > 1.1 under top_p/top_k after the
+# Megatron-LM cf2f07d7 -> bacd3404 bump; see #3385.
+# run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

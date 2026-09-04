@@ -47,3 +47,18 @@ tests/test_suites/vlm/mopd-nemotron-super-omni-120ba12b-4n8g-smoke.v1.sh
 # nightly budget is at 3922 of its 3928 GPU-hour cap and this run's ~27
 # GPU-hours would exceed it. Move to nightly.txt when the budget has room.
 tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-ready-first-single-controller.sh
+
+# OOMs on H100 2n8g during the colocated reshard: the colocated training state
+# offload is currently too slow to use; tracked by issue #3976.
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym.sh
+
+# Disabled until NVIDIA/Megatron-LM#6993 is live in this codebase.
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym.sh
+
+# Megatron-Core/Bridge bump-lane smoke legs. Not disabled: they run in the
+# bump-validation lanes via nightly_mcore{,_gb200}.txt rather than in the
+# recurring suites above, and are listed here to keep the accounting 1:1.
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym-quick.sh

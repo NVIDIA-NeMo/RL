@@ -2122,7 +2122,6 @@ class SingleControllerActor:
                         )
 
                     if groups_dispatched == 0 and self._gen is not None:
-                        # Raise here for observability.
                         try:
                             await asyncio.to_thread(self._gen.snapshot_step_metrics)
                         except RayActorError as error:
