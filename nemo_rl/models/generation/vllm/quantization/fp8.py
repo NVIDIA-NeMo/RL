@@ -14,7 +14,7 @@
 
 import os
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from unittest.mock import patch
 
@@ -538,7 +538,12 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
-def load_weights(weights, model_runner):
+def load_weights(
+    weights,
+    model_runner,
+    *,
+    model_load_weights: Callable[..., object] | None = None,
+):
     global global_fp8_config
     weights_quantized = []
     model = model_runner.model
@@ -591,8 +596,11 @@ def load_weights(weights, model_runner):
         else:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_inv", param_scale])
-    # Finally load the weights into vllm
-    model.load_weights(weights_quantized)
+    # Finally load the weights into vllm. Native layerwise reload callers pass
+    # a wrapper that keeps deferred weight-loader tensors off reusable buffers.
+    if model_load_weights is None:
+        model_load_weights = model.load_weights
+    model_load_weights(weights_quantized)
 
 
 def cast_tensor_to_fp8_blockwise(
