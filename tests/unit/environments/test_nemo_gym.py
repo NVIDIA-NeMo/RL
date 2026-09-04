@@ -1652,6 +1652,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path, 
 
 def test_nemo_gym_postprocess_empty_output_returns_masked_placeholder(capsys):
     class _Tokenizer:
+        unk_token_id = 23
         pad_token_id = 17
 
     nemo_gym_row = {
@@ -1678,7 +1679,7 @@ def test_nemo_gym_postprocess_empty_output_returns_masked_placeholder(capsys):
     assert result["full_result"]["response"]["output"] == []
     assert len(result["message_log"]) == 1
     assert result["message_log"][0]["role"] == "user"
-    assert result["message_log"][0]["token_ids"].tolist() == [17]
+    assert result["message_log"][0]["token_ids"].tolist() == [23]
     trace = capsys.readouterr().out
     assert '"event":"actor_empty_response_output_recovered"' in trace
     assert '"task_index":42' in trace

@@ -1861,8 +1861,25 @@ def test_async_grpo_masks_empty_response_before_training(
     master_config.grpo.use_dynamic_sampling = False
     master_config.grpo.overlong_filtering = True
     master_config.env["should_log_nemo_gym_responses"] = True
+    # The containment must materialize its own storage rather than relying on
+    # outer batch padding to provide four token positions.
+    master_config.policy["make_sequence_length_divisible_by"] = 1
+    master_config.policy["megatron_cfg"] = {
+        "enabled": True,
+        "context_parallel_size": 2,
+        "mtp_num_layers": 5,
+    }
 
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["message_log"] = [
+        [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([0]),
+            }
+        ]
+    ]
     mock_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] = torch.tensor([True])
     mock_batch["truncated"] = torch.tensor([True])
     mock_batch["mask_sample"] = torch.tensor([True])
@@ -1888,6 +1905,8 @@ def test_async_grpo_masks_empty_response_before_training(
 
     train_data = mock_grpo_components["policy"].train.call_args.args[0]
     assert train_data["sample_mask"].tolist() == [0.0]
+    assert train_data["input_lengths"].tolist() == [4]
+    assert torch.count_nonzero(train_data["token_mask"]) == 0
 
     metrics = _logged_train_metrics_with_key(
         mock_grpo_components["logger"],

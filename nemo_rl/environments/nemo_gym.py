@@ -1333,9 +1333,15 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             # NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY marker added below is propagated
             # through replay and consumed by async GRPO, which sets this row's
             # loss multiplier to zero before training. A single valid token is
-            # sufficient because the row has no trainable assistant span and its
-            # full Gym response is retained separately for diagnostics.
-            placeholder_token_id = getattr(tokenizer, "pad_token_id", None)
+            # sufficient for rollout/replay transport; async GRPO may extend the
+            # synthetic row to satisfy a policy-side CP/MTP minimum. The full Gym
+            # response is retained separately for diagnostics. Prefer an unknown
+            # token over padding when padding aliases EOS: this row is later fully
+            # masked, but a non-terminating token is the least surprising
+            # structural placeholder.
+            placeholder_token_id = getattr(tokenizer, "unk_token_id", None)
+            if placeholder_token_id is None:
+                placeholder_token_id = getattr(tokenizer, "pad_token_id", None)
             if placeholder_token_id is None:
                 placeholder_token_id = getattr(tokenizer, "eos_token_id", None)
             if placeholder_token_id is None:

@@ -5145,6 +5145,57 @@ def async_grpo_train(
                             sample_mask_metrics.values()
                         )
 
+                    # MCore before f96158a9fe assumes that every CP-local packed
+                    # sequence can be split into the two chunks used by its MTP
+                    # roll. Extend only the synthetic user placeholder before
+                    # flattening so the fully masked row has enough real storage
+                    # for that logical length. This is containment for the empty-
+                    # row case; it can be removed once the MCore padded-boundary
+                    # fix lands.
+                    megatron_cfg = master_config.policy.get("megatron_cfg", {})
+                    context_parallel_size = int(
+                        megatron_cfg.get("context_parallel_size", 1)
+                    )
+                    mtp_num_layers = int(megatron_cfg.get("mtp_num_layers", 0) or 0)
+                    if (
+                        context_parallel_size > 1
+                        and mtp_num_layers > 0
+                        and NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY in repeated_batch
+                    ):
+                        empty_output_mask = torch.as_tensor(
+                            repeated_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY],
+                            device=loss_multiplier.device,
+                            dtype=torch.bool,
+                        ).reshape(-1)
+                        if empty_output_mask.any():
+                            minimum_logical_length = 2 * context_parallel_size
+                            for row_index in torch.nonzero(
+                                empty_output_mask, as_tuple=False
+                            ).flatten().tolist():
+                                message_log = repeated_batch["message_log"][row_index]
+                                placeholder = message_log[0]
+                                token_ids = placeholder["token_ids"]
+                                if token_ids.numel() < minimum_logical_length:
+                                    filler_id = (
+                                        int(token_ids[0].item())
+                                        if token_ids.numel()
+                                        else next(
+                                            int(token_id)
+                                            for token_id in (
+                                                tokenizer.unk_token_id,
+                                                tokenizer.pad_token_id,
+                                                tokenizer.eos_token_id,
+                                                0,
+                                            )
+                                            if token_id is not None
+                                        )
+                                    )
+                                    placeholder["token_ids"] = torch.nn.functional.pad(
+                                        token_ids,
+                                        (0, minimum_logical_length - token_ids.numel()),
+                                        value=filler_id,
+                                    )
+
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
                     # not assistant messages that were part of the prompt history
