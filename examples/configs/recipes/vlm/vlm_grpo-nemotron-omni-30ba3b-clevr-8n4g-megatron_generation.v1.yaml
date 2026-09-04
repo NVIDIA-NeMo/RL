@@ -42,7 +42,6 @@ policy:
     mcore_generation_config:
       buffer_size_gb: 8
       async_sched_mode: async
-      num_cuda_graphs: -1
       use_cuda_graphs_for_non_decode_steps: false
       max_tokens: ${policy.max_total_sequence_length}
       transformer_impl: inference_optimized

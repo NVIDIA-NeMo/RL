@@ -38,7 +38,6 @@ policy:
     mcore_generation_config:
       expose_http_server: true
       buffer_size_gb: 8
-      num_cuda_graphs: -1
       max_tokens: ${policy.max_total_sequence_length}
       transformer_impl: transformer_engine
       activation_checkpointing: false
