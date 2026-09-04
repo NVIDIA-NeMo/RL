@@ -397,7 +397,7 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
 def test_build_hf_to_local_param_map_stages_nemotron_lightning_padded_experts():
     """Receive the logical Nano/Lightning weight instead of its padded runtime form."""
     num_experts, intermediate_size, hidden_size = 128, 928, 2688
-    expert_name = "backbone.layers.0.mlp.experts.gate_proj.weight"
+    expert_name = "backbone.layers.0.mlp.experts.up_proj.weight"
     runtime_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
     refit_info = {
         "gen_tp_size": 1,
@@ -412,7 +412,7 @@ def test_build_hf_to_local_param_map_stages_nemotron_lightning_padded_experts():
                         hidden_size,
                     ],
                     "dtype": "torch.bfloat16",
-                    "grouped_expert_proj": "gate_proj",
+                    "grouped_expert_proj": "up_proj",
                     "dst_mesh_info": MeshInfo(torch.tensor([0])),
                     "dst_placements": [Shard(0)],
                 }
@@ -431,6 +431,7 @@ def test_build_hf_to_local_param_map_stages_nemotron_lightning_padded_experts():
     ext.device = torch.device("meta")
     ext.pp_comm_groups = {0: SimpleNamespace(rank=0)}
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._load_full_hf_weights = MagicMock(return_value={runtime_name})
 
     spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
     assert spec is not None and spec.pre is not None and spec.post is not None
@@ -439,6 +440,13 @@ def test_build_hf_to_local_param_map_stages_nemotron_lightning_padded_experts():
     assert ctx.buf.shape == (num_experts, intermediate_size, hidden_size)
     assert ctx.buf.dtype == torch.bfloat16
     assert ctx.buf.numel() != packed_runtime.numel()
+    spec.post(ctx)
+
+    loaded_weights = ext._load_full_hf_weights.call_args.args[0]
+    assert len(loaded_weights) == num_experts
+    assert loaded_weights[0][0] == "backbone.layers.0.mlp.experts.0.up_proj.weight"
+    assert loaded_weights[-1][0] == "backbone.layers.0.mlp.experts.127.up_proj.weight"
+    assert loaded_weights[0][1].shape == (intermediate_size, hidden_size)
 
 
 def test_build_hf_to_local_param_map_stages_qwen35_wrapped_experts():
