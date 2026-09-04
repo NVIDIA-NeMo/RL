@@ -61,6 +61,7 @@ from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
     RETAINED_TASK_INDICES_KEY,
+    TARGET_WEIGHT_VERSION_KEY,
 )
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 
@@ -2849,6 +2850,10 @@ class TestAsyncTrajectoryCollector:
             )
             assert trajectory_group["rollout_metrics"]["trajectory_duration_s"] >= 0
             assert "_ng_task_index" not in trajectory_group
+            assert (
+                trajectory_group["batch"][TARGET_WEIGHT_VERSION_KEY].tolist()
+                == [target_weight] * 3
+            )
             assert generation_weight == 2
             assert target == target_weight
         assert target_weight not in collector._generating_targets
@@ -2955,6 +2960,7 @@ class TestAsyncTrajectoryCollector:
             }
         )
         rollout_calls = 0
+        rollout_call_attempt_indices = []
 
         def _rollout_result(task_index):
             return SimpleNamespace(
@@ -2973,6 +2979,12 @@ class TestAsyncTrajectoryCollector:
                 low_penalty=1.0,
                 low_ub=15_000,
                 low_string="{reasoning effort: efficient}",
+            )
+            rollout_call_attempt_indices.append(
+                [
+                    row["_ng_attempt_index"]
+                    for row in kwargs["input_batch"]["extra_env_info"]
+                ]
             )
             rollout_calls += 1
             yield _rollout_result(7)
@@ -2999,6 +3011,7 @@ class TestAsyncTrajectoryCollector:
         )
 
         assert rollout_calls == 2
+        assert rollout_call_attempt_indices == [[0, 0, 0, 0], [1, 1, 1, 1]]
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
 

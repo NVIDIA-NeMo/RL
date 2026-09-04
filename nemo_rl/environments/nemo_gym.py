@@ -52,6 +52,7 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.experience.interfaces import NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
@@ -926,6 +927,9 @@ Depending on your data shape, you may want to change these values."""
 
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
+        empty_response_output = (
+            isinstance(response.get("output"), list) and not response["output"]
+        )
         result_input = nemo_gym_result["responses_create_params"].get("input", [])
         request_input = nemo_gym_row.get("responses_create_params", {}).get("input")
         raw_input = (
@@ -1133,6 +1137,49 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 output_item_dict["prompt_str"] = prompt_str
                 output_item_dict["generation_str"] = generation_str
 
+        if not nemo_rl_message_log and empty_response_output:
+            # Some agents intentionally terminate without asking the policy for a
+            # generation. Keep the row structurally valid so one such response
+            # cannot terminate the rollout stream. The
+            # NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY marker added below is propagated
+            # through replay and consumed by async GRPO, which sets this row's
+            # loss multiplier to zero before training. A single valid token is
+            # sufficient because the row has no trainable assistant span and its
+            # full Gym response is retained separately for diagnostics.
+            placeholder_token_id = getattr(tokenizer, "pad_token_id", None)
+            if placeholder_token_id is None:
+                placeholder_token_id = getattr(tokenizer, "eos_token_id", None)
+            if placeholder_token_id is None:
+                placeholder_token_id = 0
+            nemo_rl_message_log.append(
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor(
+                        [int(placeholder_token_id)], dtype=torch.long
+                    ),
+                }
+            )
+            raw_agent_ref = nemo_gym_row.get("agent_ref")
+            compact_agent_ref = (
+                {
+                    str(key): value
+                    for key, value in raw_agent_ref.items()
+                    if value is None or isinstance(value, (bool, float, int, str))
+                }
+                if isinstance(raw_agent_ref, Mapping)
+                else raw_agent_ref
+            )
+            print(
+                "⚠️ Recovered empty NeMo-Gym response.output; "
+                "event=actor_empty_response_output_recovered "
+                f"task_index={nemo_gym_row.get('_ng_task_index')!r} "
+                f"rollout_index={nemo_gym_row.get('_ng_rollout_index')!r} "
+                f"attempt_index={nemo_gym_row.get('_ng_attempt_index')!r} "
+                f"agent_ref={compact_agent_ref!r}",
+                flush=True,
+            )
+
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
             try:
@@ -1175,6 +1222,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
         }
+        if empty_response_output:
+            result[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] = True
         if not include_initial_multimodal_data:
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
