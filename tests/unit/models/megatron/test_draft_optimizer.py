@@ -35,6 +35,7 @@ from nemo_rl.models.megatron.draft.optimizer import (
     DraftOptimizerConfigOverrideProvider,
     build_draft_optimizer_override_provider,
 )
+from nemo_rl.models.megatron.draft.utils import DRAFT_GRAD_NORM_GROUP
 from nemo_rl.models.policy.draft_config import (
     DraftOptimizerConfig,
     Eagle3DraftConfig,
@@ -121,7 +122,7 @@ def test_draft_optimizer_override_is_opt_in() -> None:
 
 def test_draft_optimizer_provider_only_overrides_tagged_parameters() -> None:
     draft_parameter = torch.nn.Parameter(torch.ones(2, 2))
-    draft_parameter.grad_norm_group = "draft"
+    draft_parameter.grad_norm_group = DRAFT_GRAD_NORM_GROUP
     policy_parameter = torch.nn.Parameter(torch.ones(2, 2))
     provider = DraftOptimizerConfigOverrideProvider(
         DraftOptimizerConfig(lr=1.0e-3, min_lr=1.0e-4, weight_decay=0.02)
@@ -148,7 +149,7 @@ def test_draft_weight_decay_override_keeps_norm_and_bias_at_zero_decay() -> None
     from megatron.core.optimizer import get_standard_config_overrides
 
     bias_like = torch.nn.Parameter(torch.ones(4))
-    bias_like.grad_norm_group = "draft"
+    bias_like.grad_norm_group = DRAFT_GRAD_NORM_GROUP
     provider = DraftOptimizerConfigOverrideProvider(
         DraftOptimizerConfig(lr=1.0e-3, weight_decay=0.02)
     )
@@ -177,10 +178,16 @@ def test_draft_weight_decay_override_keeps_norm_and_bias_at_zero_decay() -> None
 
 def test_draft_optimizer_provider_rejects_incompatible_inherited_min_lr() -> None:
     parameter = torch.nn.Parameter(torch.ones(1))
-    parameter.grad_norm_group = "draft"
+    parameter.grad_norm_group = DRAFT_GRAD_NORM_GROUP
     provider = DraftOptimizerConfigOverrideProvider(DraftOptimizerConfig(lr=1.0e-5))
 
-    with pytest.raises(ValueError, match="draft optimizer lr"):
+    # The floor was never configured on the draft block, so the message has to
+    # name the inheritance and the knob that decouples it -- otherwise the user
+    # sees a bound they never set and has nothing to act on.
+    with pytest.raises(
+        ValueError,
+        match=r"inherited from the policy optimizer.*draft\.optimizer\.min_lr",
+    ):
         _combined_overrides_for_parameter(
             provider,
             parameter,
@@ -190,10 +197,29 @@ def test_draft_optimizer_provider_rejects_incompatible_inherited_min_lr() -> Non
         )
 
 
+def test_draft_optimizer_provider_rejects_explicit_min_lr_above_lr() -> None:
+    """The non-inherited branch of the same guard.
+
+    `DraftOptimizerConfig` already rejects `min_lr > lr` at validation, so this
+    state is only reachable if that validator is bypassed; `model_construct`
+    reproduces it so the defensive branch stays covered and does not claim the
+    floor was inherited when the user set it themselves.
+    """
+    parameter = torch.nn.Parameter(torch.ones(1))
+    parameter.grad_norm_group = DRAFT_GRAD_NORM_GROUP
+    provider = DraftOptimizerConfigOverrideProvider(
+        DraftOptimizerConfig.model_construct(lr=1.0e-5, min_lr=2.0e-5)
+    )
+
+    with pytest.raises(ValueError, match="draft optimizer lr") as excinfo:
+        _combined_overrides_for_parameter(provider, parameter, "draft.weight")
+    assert "inherited" not in str(excinfo.value)
+
+
 def test_real_scheduler_applies_distinct_draft_lr_trajectory() -> None:
     policy_parameter = torch.nn.Parameter(torch.ones(1))
     draft_parameter = torch.nn.Parameter(torch.ones(1))
-    draft_parameter.grad_norm_group = "draft"
+    draft_parameter.grad_norm_group = DRAFT_GRAD_NORM_GROUP
     provider = DraftOptimizerConfigOverrideProvider(
         DraftOptimizerConfig(lr=1.0e-3, min_lr=1.0e-4)
     )

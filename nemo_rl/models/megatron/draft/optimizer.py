@@ -23,6 +23,7 @@ from megatron.bridge.training.config import (
 from megatron.core.optimizer import ParamKey, ParamPredicate
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 
+from nemo_rl.models.megatron.draft.utils import DRAFT_GRAD_NORM_GROUP
 from nemo_rl.models.policy.draft_config import DraftOptimizerConfig
 
 
@@ -34,7 +35,7 @@ class DraftOptimizerConfigOwner(Protocol):
 
 
 def _is_draft_parameter(parameter: torch.nn.Parameter) -> bool:
-    return getattr(parameter, "grad_norm_group", None) == "draft"
+    return getattr(parameter, "grad_norm_group", None) == DRAFT_GRAD_NORM_GROUP
 
 
 @dataclass
@@ -52,8 +53,16 @@ class DraftOptimizerConfigOverrideProvider(OptimizerConfigOverrideProvider):
         if minimum_lr is None:
             minimum_lr = context.optimizer_config.min_lr
         if minimum_lr is not None and minimum_lr > self.draft_optimizer.lr:
+            inherited = self.draft_optimizer.min_lr is None
             raise ValueError(
-                "draft optimizer lr must be at least the inherited optimizer min_lr"
+                f"draft optimizer lr ({self.draft_optimizer.lr}) is below "
+                f"min_lr ({minimum_lr})"
+                + (
+                    ", which was inherited from the policy optimizer; set "
+                    "policy.draft.optimizer.min_lr to decouple the draft schedule"
+                    if inherited
+                    else ""
+                )
             )
 
         draft_override = ParamGroupOverride(max_lr=self.draft_optimizer.lr)
