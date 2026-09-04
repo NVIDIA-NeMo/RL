@@ -767,12 +767,8 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     )
 
     layer = torch.nn.Module()
-    layer.w13_weight = torch.nn.Parameter(
-        torch.zeros(2, 128, 512), requires_grad=False
-    )
-    layer.w2_weight = torch.nn.Parameter(
-        torch.zeros(2, 512, 128), requires_grad=False
-    )
+    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 128, 512), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 512, 128), requires_grad=False)
     layer.w13_weight_scale = torch.nn.Parameter(
         torch.zeros(2, 128, 16), requires_grad=False
     )
@@ -1663,6 +1659,8 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     """
     import torch
 
+    from nemo_rl.models.generation.vllm import vllm_backend
+
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         is_mx=True,
@@ -1670,7 +1668,11 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     )
     model = _grouped_expert_model(fp8, monkeypatch, torch.bfloat16, wrap_language_model)
     loaded = []
-    model.load_weights = lambda pairs: loaded.extend(pairs)
+    monkeypatch.setattr(
+        vllm_backend,
+        "load_weights_maybe_cached",
+        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
+    )
 
     gate_up = torch.randn(2, 256, 128).to(torch.bfloat16)
     gate_up_scale = torch.ones(2, 256, 4, dtype=torch.uint8)
@@ -1689,8 +1691,10 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
                 down_scale,
             ),
         ],
-        types.SimpleNamespace(model=model),
-        model_load_weights=model.load_weights,
+        types.SimpleNamespace(
+            model=model,
+            vllm_config=types.SimpleNamespace(additional_config={}),
+        ),
     )
 
     assert [k for k, _ in loaded] == [
@@ -1725,6 +1729,8 @@ def test_load_weights_reroutes_prequantized_grouped_expert_scale_sidecars(
     """
     import torch
 
+    from nemo_rl.models.generation.vllm import vllm_backend
+
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         use_weight_pow2_scale=False,
@@ -1735,6 +1741,11 @@ def test_load_weights_reroutes_prequantized_grouped_expert_scale_sidecars(
         fp8, monkeypatch, torch.float8_e4m3fn, wrap_language_model
     )
     loaded = []
+    monkeypatch.setattr(
+        vllm_backend,
+        "load_weights_maybe_cached",
+        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
+    )
 
     num_experts, intermediate, hidden = 2, 512, 2048
     gate_up = torch.ones(
@@ -1769,8 +1780,10 @@ def test_load_weights_reroutes_prequantized_grouped_expert_scale_sidecars(
                 down_scale,
             ),
         ],
-        types.SimpleNamespace(model=model),
-        model_load_weights=lambda pairs: loaded.extend(pairs),
+        types.SimpleNamespace(
+            model=model,
+            vllm_config=types.SimpleNamespace(additional_config={}),
+        ),
     )
 
     base = f"{layers_prefix}.0.mlp.experts"
