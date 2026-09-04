@@ -1848,7 +1848,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             deduplicate_multimodal_data,
         ):
             assert all("_ng_task_index" in row for row in rows)
-            assert all("_ng_rollout_index" not in row for row in rows)
+            assert [row["_ng_rollout_index"] for row in rows] == [0, 1, 0, 1]
             assert all("_ng_target_weight_version" not in row for row in rows)
 
             del rows, timer_prefix

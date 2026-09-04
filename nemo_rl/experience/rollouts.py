@@ -58,7 +58,10 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -2226,6 +2229,7 @@ def _prepare_nemo_gym_rows(
     sampling_params: GenerationSamplingParams,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    next_rollout_index_by_task: dict[Any, int] = defaultdict(int)
     for row_index, row in enumerate(rows):
         responses_create_params = row.get("responses_create_params")
         if not isinstance(responses_create_params, dict):
@@ -2243,6 +2247,11 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+
+        task_index = row.get(NEMO_GYM_TASK_INDEX_KEY)
+        if task_index is not None:
+            row[NEMO_GYM_ROLLOUT_INDEX_KEY] = next_rollout_index_by_task[task_index]
+            next_rollout_index_by_task[task_index] += 1
 
 
 def _tensorize_nemo_gym_result(result: dict) -> None:
