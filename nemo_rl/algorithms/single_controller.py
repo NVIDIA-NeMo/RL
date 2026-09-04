@@ -83,6 +83,7 @@ from nemo_rl.algorithms.grpo import (
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
+    scale_rewards,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
@@ -3253,6 +3254,16 @@ class SingleControllerActor:
         truncated = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
+
+        # Match the legacy drivers: scale rewards before the estimator reads
+        # them. Algorithm blocks without reward scaling keep their existing
+        # behavior, and a disabled configuration is a no-op in the shared helper.
+        reward_scaling_cfg = getattr(self._algo_cfg, "reward_scaling", None)
+        if reward_scaling_cfg is not None:
+            rewards = scale_rewards(
+                BatchedDataDict({"total_reward": rewards}),
+                reward_scaling_cfg,
+            )["total_reward"]
 
         num_mask_sample_filtered = int(mask_sample.sum().item())
         self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
