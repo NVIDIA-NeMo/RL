@@ -784,10 +784,10 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     experts_cls = types.SimpleNamespace(is_monolithic=lambda: True)
     quant_config_calls = []
 
-    def get_quant_config(_layer):
-        quant_config_calls.append(_layer)
-        quant_config.w1_scale = _layer.w13_weight_scale
-        quant_config.w2_scale = _layer.w2_weight_scale
+    def make_quant_config(**kwargs):
+        quant_config_calls.append(kwargs["layer"])
+        quant_config.w1_scale = kwargs["w1_scale"]
+        quant_config.w2_scale = kwargs["w2_scale"]
         return quant_config
 
     quant_method = types.SimpleNamespace(
@@ -796,7 +796,6 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
         experts_cls=experts_cls,
         weight_block_size=[32, 32],
-        get_fused_moe_quant_config=get_quant_config,
     )
     kernel = object()
     kernel_calls = []
@@ -810,7 +809,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", shuffle)
 
     from vllm.model_executor import parameter as vllm_parameter
-    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+    from vllm.model_executor.layers.fused_moe.oracle import fp8 as vllm_fp8
 
     monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -821,6 +820,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         kernel_calls.append(kwargs)
         return kernel
 
+    monkeypatch.setattr(vllm_fp8, "make_fp8_moe_quant_config", make_quant_config)
     monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
 
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
