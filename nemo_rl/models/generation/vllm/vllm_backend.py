@@ -957,11 +957,11 @@ class VllmInternalWorkerExtension:
             process_weights_after_loading,
         )
 
-        model = self.model_runner.model
-
         def finalize() -> None:
             with set_current_vllm_config(self.model_runner.vllm_config):
-                process_weights_after_loading(model, self.model_config, self.device)
+                process_weights_after_loading(
+                    self.model_runner.model, self.model_config, self.device
+                )
             self._maybe_process_mtp_drafter_after_loading()
 
         yield finalize
