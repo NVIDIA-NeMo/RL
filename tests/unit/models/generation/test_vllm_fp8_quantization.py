@@ -751,7 +751,7 @@ def test_process_mxfp8_moe_refit_rejects_non_flashinfer_backend(fp8_module):
 
     with pytest.raises(
         NotImplementedError,
-        match="MXFP8 MoE refit layout conversion only supports FLASHINFER_TRTLLM",
+        match="requires the monolithic FlashInfer TRTLLM backend",
     ):
         fp8_module.process_weights_after_loading_mxfp8_moe(quant_method, object())
 
@@ -779,12 +779,14 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     layer.w2_weight_scale.weight_loader = object()
     layer._expert_routing_tables = lambda: (None, None, None)
     moe_config = types.SimpleNamespace(is_act_and_mul=False)
-    quant_config = object()
-    experts_cls = object()
+    quant_config = types.SimpleNamespace(w1_scale=None, w2_scale=None)
+    experts_cls = types.SimpleNamespace(is_monolithic=lambda: True)
     quant_config_calls = []
 
     def get_quant_config(_layer):
         quant_config_calls.append(_layer)
+        quant_config.w1_scale = _layer.w13_weight_scale
+        quant_config.w2_scale = _layer.w2_weight_scale
         return quant_config
 
     quant_method = types.SimpleNamespace(
@@ -792,6 +794,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         moe_kernel=None,
         mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
         experts_cls=experts_cls,
+        weight_block_size=[32, 32],
         get_fused_moe_quant_config=get_quant_config,
     )
     kernel = object()
