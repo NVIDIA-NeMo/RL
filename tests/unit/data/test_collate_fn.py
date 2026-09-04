@@ -16,7 +16,11 @@ from unittest.mock import MagicMock
 
 import torch
 
-from nemo_rl.data.collate_fn import preference_collate_fn
+from nemo_rl.data.collate_fn import (
+    eval_collate_fn,
+    preference_collate_fn,
+    rl_collate_fn,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -149,3 +153,23 @@ def test_preference_collate_fn():
     assert torch.equal(
         train_data["input_ids"][1][3:5], torch.tensor([8, 9])
     )  # assistant
+
+
+def test_collate_preserves_native_media_when_vllm_content_is_none():
+    image = object()
+    datum = DatumSpec(
+        message_log=[],
+        length=1,
+        loss_multiplier=1.0,
+        extra_env_info={},
+        idx=0,
+        task_name="vlm",
+        vllm_content=None,
+        vllm_images=[image],
+        vllm_audios=[],
+        vllm_videos=[],
+    )
+
+    for batch in (rl_collate_fn([datum]), eval_collate_fn([datum])):
+        assert batch["vllm_content"] == [None]
+        assert batch["vllm_images"] == [[image]]

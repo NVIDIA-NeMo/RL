@@ -96,6 +96,7 @@ def reduce_advantage_pump_metrics(
     sequence_lengths: list[int],
     *,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    num_mask_sample_filtered: list[int] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
     num_assistant_messages: list[int] | None = None,
@@ -108,13 +109,16 @@ def reduce_advantage_pump_metrics(
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
+        num_mask_sample_filtered: Environment-flagged sample counts, one per
+            streaming chunk.
         num_invalid_tool_calls: Per-sample invalid tool-call counts.
         num_malformed_thinking: Per-sample malformed-thinking counts.
         num_assistant_messages: Per-sample assistant message counts (rate denominator).
 
     Returns:
         Step-level reward, advantage, token-count, optional sequence
-        log-probability error metrics, and per-sample violation counts.
+        log-probability error metrics, the num_mask_sample_filtered count, and
+        per-sample violation counts.
 
     """
     out: dict[str, float] = {}
@@ -132,6 +136,8 @@ def reduce_advantage_pump_metrics(
             out["advantages/min"] = 0.0
     if sequence_lengths:
         out["total_num_tokens"] = float(sum(sequence_lengths))
+    if num_mask_sample_filtered is not None:
+        out["num_mask_sample_filtered"] = float(sum(num_mask_sample_filtered))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     n_asst = sum(num_assistant_messages or [])
@@ -196,6 +202,74 @@ def _reduce_seq_logprob_error_metrics(
         else 0.0
     )
     return reduced
+
+
+def apply_message_level_advantage_penalties(
+    advantages: torch.Tensor,
+    *,
+    invalid_tool_call_mask: torch.Tensor,
+    malformed_thinking_mask: torch.Tensor,
+    invalid_tool_call_advantage: float | None,
+    malformed_thinking_advantage: float | None,
+) -> torch.Tensor:
+    """Overwrite flagged token advantages while leaving valid tokens unchanged.
+
+    Invalid-tool-call penalties take precedence when both masks select the same
+    token, matching the legacy GRPO message-level implementation.
+
+    Args:
+        advantages: Per-token advantages of shape (batch, seq).
+        invalid_tool_call_mask: Bool mask of the same shape as ``advantages``;
+            True at tokens produced by an invalid tool call.
+        malformed_thinking_mask: Bool mask of the same shape as ``advantages``;
+            True at tokens produced by malformed thinking.
+        invalid_tool_call_advantage: Value to overwrite flagged tokens with, or
+            ``None`` to leave the invalid-tool-call branch disabled.
+        malformed_thinking_advantage: Value to overwrite flagged tokens with, or
+            ``None`` to leave the malformed-thinking branch disabled.
+
+    Returns:
+        New tensor with penalties applied. The original ``advantages`` object is
+        returned unchanged when both advantages are ``None``.
+
+    Raises:
+        ValueError: If either mask shape does not match ``advantages``.
+    """
+    if invalid_tool_call_mask.shape != advantages.shape:
+        raise ValueError(
+            "invalid_tool_call_mask shape "
+            f"{tuple(invalid_tool_call_mask.shape)} does not match advantages "
+            f"{tuple(advantages.shape)}"
+        )
+    if malformed_thinking_mask.shape != advantages.shape:
+        raise ValueError(
+            "malformed_thinking_mask shape "
+            f"{tuple(malformed_thinking_mask.shape)} does not match advantages "
+            f"{tuple(advantages.shape)}"
+        )
+
+    result = advantages
+    if malformed_thinking_advantage is not None:
+        result = torch.where(
+            malformed_thinking_mask.bool(),
+            torch.as_tensor(
+                malformed_thinking_advantage,
+                dtype=advantages.dtype,
+                device=advantages.device,
+            ),
+            result,
+        )
+    if invalid_tool_call_advantage is not None:
+        result = torch.where(
+            invalid_tool_call_mask.bool(),
+            torch.as_tensor(
+                invalid_tool_call_advantage,
+                dtype=advantages.dtype,
+                device=advantages.device,
+            ),
+            result,
+        )
+    return result
 
 
 def tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
