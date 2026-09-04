@@ -283,6 +283,31 @@ def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
         assert env_vars["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
 
 
+def test_init_ray_adds_hf_modules_cache_to_cluster_pythonpath():
+    """Direct actors must import trust_remote_code classes while unpickling."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "HF_MODULES_CACHE": "/hf/modules",
+            "PYTHONPATH": "/project",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            init_ray()
+
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert env_vars["HF_MODULES_CACHE"] == "/hf/modules"
+        assert env_vars["PYTHONPATH"].split(os.pathsep) == [
+            "/hf/modules",
+            "/project",
+        ]
+
+
 def test_init_ray_alone_has_no_data_plane_awareness():
     """Every non-data-plane launcher's call (bare init_ray(), no preceding
     maybe_configure_data_plane_env) must not touch mooncake env vars --
