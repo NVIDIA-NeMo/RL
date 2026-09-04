@@ -315,6 +315,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         with init_empty_weights():
             model = AutoModel.from_config(config)
         param_names = [name for name, _ in model.named_parameters()]
+        get_text_config = getattr(config, "get_text_config", None)
+        text_config = (
+            get_text_config()
+            if callable(get_text_config)
+            else getattr(config, "text_config", config)
+        )
+        num_hidden_layers = text_config.num_hidden_layers
 
         bf16_params = []
         if num_first_layers_in_bf16 > 0:
@@ -325,8 +332,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             layers = [
                 l
                 for l in range(
-                    config.num_hidden_layers - num_last_layers_in_bf16,
-                    config.num_hidden_layers,
+                    num_hidden_layers - num_last_layers_in_bf16,
+                    num_hidden_layers,
                 )
             ]
             bf16_params.extend(_get_params_in_layers(param_names, layers))
