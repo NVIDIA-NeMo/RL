@@ -1560,6 +1560,7 @@ def setup_single_controller(
                 pad_token_id=pad_id,
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
+                max_seq_len=_generation_max_seq_len(generation_config),
             ),
             num_workers=token_capture_cfg.num_finalizer_workers,
         )

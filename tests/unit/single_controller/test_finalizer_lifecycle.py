@@ -87,7 +87,6 @@ def _request() -> FinalizationRequest:
         ),
         rewards=(1.0,),
         mask_sample=(False,),
-        truncated=(False,),
         fallback_weight_version=3,
         prompt_idx=0,
     )

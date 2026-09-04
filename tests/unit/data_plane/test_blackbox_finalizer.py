@@ -101,6 +101,10 @@ def _finalizer(tq_client, **overrides) -> BlackboxFinalizer:
         partition_id=CANONICAL_PARTITION,
         staging_partition=STAGING_PARTITION,
         pad_token_id=PAD,
+        # Well above every fixture's real row length (a handful of tokens),
+        # so truncated defaults to False everywhere unless a test overrides
+        # this to exercise the truncation-detection path deliberately.
+        max_seq_len=4096,
     )
     kwargs.update(overrides)
     return BlackboxFinalizer(tq_client, **kwargs)
@@ -197,14 +201,18 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     receipt["terminal_selection"] = "heuristic"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
 
-    finalizer = _finalizer(tq_client)
+    # max_seq_len pinned to the valid row's real length so the finalizer's
+    # own truncation computation (seq_len == max_seq_len) has something real
+    # to detect: the valid row should read truncated, the placeholder
+    # (seq_len floored to 1) should not.
+    valid_len = len(expected.token_ids)
+    finalizer = _finalizer(tq_client, max_seq_len=valid_len)
     finalized = finalizer.finalize_group(
         group_id,
         rollout_ids,
         [receipt, None],  # second rollout lost its receipt -> placeholder
         [1.0, 0.0],
         mask_sample=[True, False],
-        truncated=[False, True],
         fallback_weight_version=9,
         prompt_idx=0,
     )
@@ -222,7 +230,6 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     rows = _fetch_rows(tq_client, rollout_ids)
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()
     assert sample_mask.tolist() == [1.0, 0.0]
-    valid_len = len(expected.token_ids)
     input_ids = torch.as_tensor(rows["input_ids"][0]).flatten()
     assert input_ids[:valid_len].tolist() == expected.token_ids
     # Placeholder borrows the valid sibling's prompt for baseline grouping.
@@ -235,9 +242,12 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     assert placeholder_mask.sum().item() == 0.0
     rewards = torch.as_tensor(rows["total_reward"]).flatten()
     assert rewards.tolist() == [1.0, 0.0]
-    # The advantage-stage flags ride along with the rows on this path too.
+    # mask_sample rides along unchanged from the dispatcher; truncated is
+    # computed here from each row's rebuilt length against max_seq_len (the
+    # valid row's real length, pinned above) -- the placeholder's length is
+    # floored to 1 and never matches, so only the valid row reads truncated.
     assert torch.as_tensor(rows["mask_sample"]).flatten().tolist() == [True, False]
-    assert torch.as_tensor(rows["truncated"]).flatten().tolist() == [False, True]
+    assert torch.as_tensor(rows["truncated"]).flatten().tolist() == [True, False]
 
     # The finalizer cleared its staged rows after publishing.
     with pytest.raises(KeyError):
@@ -258,7 +268,6 @@ def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions
         [None, None],
         [0.0, 0.0],
         mask_sample=[False] * 2,
-        truncated=[False] * 2,
         fallback_weight_version=3,
         prompt_idx=0,
     )
@@ -396,6 +405,7 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         partition_id=_R3_PARTITION,
         staging_partition=_R3_STAGING,
         pad_token_id=PAD,
+        max_seq_len=4096,
         router_replay_enabled=True,
     )
     finalized = finalizer.finalize_group(
@@ -404,7 +414,6 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         [receipt, None],  # second rollout -> placeholder
         [1.0, 0.0],
         mask_sample=[False] * 2,
-        truncated=[False] * 2,
         fallback_weight_version=9,
         prompt_idx=0,
     )
@@ -451,6 +460,7 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
         partition_id=_R3_PARTITION,
         staging_partition=_R3_STAGING,
         pad_token_id=PAD,
+        max_seq_len=4096,
         router_replay_enabled=True,
     )
     with pytest.raises(RuntimeError, match="routed_experts"):
@@ -460,7 +470,6 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
             [receipt.model_dump()],
             [1.0],
             mask_sample=[False],
-            truncated=[False],
             fallback_weight_version=9,
             prompt_idx=0,
         )
@@ -544,6 +553,7 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
         pad_token_id=PAD,
+        max_seq_len=4096,
         router_replay_enabled=True,
         defer_routed_experts_to_policy=True,
     )
@@ -554,7 +564,6 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         [receipt, None],
         [1.0, 0.0],
         mask_sample=[False] * 2,
-        truncated=[False] * 2,
         fallback_weight_version=9,
         prompt_idx=0,
     )
@@ -602,6 +611,7 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
         pad_token_id=PAD,
+        max_seq_len=4096,
         router_replay_enabled=True,
         defer_routed_experts_to_policy=True,
     )
@@ -635,6 +645,7 @@ def _mode_finalizer(tq_client, *, deferred: bool) -> BlackboxFinalizer:
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
         pad_token_id=PAD,
+        max_seq_len=4096,
         router_replay_enabled=True,
         defer_routed_experts_to_policy=deferred,
     )

@@ -114,12 +114,14 @@ class BlackboxFinalizer:
         partition_id: str,
         staging_partition: str,
         pad_token_id: int,
+        max_seq_len: int,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
+        self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
         self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
         if self._defer_routed_experts_to_policy and not self._router_replay_enabled:
@@ -360,7 +362,6 @@ class BlackboxFinalizer:
         rewards: list[float],
         *,
         mask_sample: list[bool],
-        truncated: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
     ) -> FinalizedGroup:
@@ -369,20 +370,21 @@ class BlackboxFinalizer:
         Blocking (TQ round trips); run via ``asyncio.to_thread`` from the
         dispatch task. ``fallback_weight_version`` stamps a group none of
         whose rollouts produced a valid row (placeholder-only groups still
-        need a staleness tag). ``mask_sample`` and ``truncated`` are the
-        per-rollout advantage-stage flags the native ``pack_payload`` path
-        emits from each ``Completion``; they ride along unchanged so the
-        train pump's environment masking and overlong filtering read the same
-        fields on both paths (placeholder rows already train nothing through
-        ``sample_mask`` 0).
+        need a staleness tag). ``mask_sample`` is the per-rollout
+        advantage-stage flag the native ``pack_payload`` path emits from each
+        ``Completion``; it rides along unchanged so the train pump's
+        environment masking reads the same field on both paths (placeholder
+        rows already train nothing through ``sample_mask`` 0). ``truncated``
+        is not carried from the dispatcher -- the receipt path has no real
+        tokens to measure it from at dispatch time -- so it is computed here
+        instead, from each row's rebuilt length against ``max_seq_len``.
         """
         assert (
             len(rollout_ids)
             == len(receipts)
             == len(rewards)
             == len(mask_sample)
-            == len(truncated)
-        ), "rollout_ids, receipts, rewards, mask_sample, and truncated must be parallel"
+        ), "rollout_ids, receipts, rewards, and mask_sample must be parallel"
         _group_t0 = time.perf_counter()
         rows = [
             self.finalize_rollout(rollout_id, receipt, reward=reward)
@@ -430,7 +432,17 @@ class BlackboxFinalizer:
         # on a declaring harness is a regression signal. Failed selections
         # stamp the last stage attempted, so masked rollouts stay visible in
         # their method's bucket (cross-reference finalize/invalid_row_rate).
-        for method in ("declared", "response_id", "content", "heuristic"):
+        # Method list is derived from Gym's own type rather than hand-copied,
+        # so a new resolution method Gym adds gets a bucket automatically
+        # instead of silently missing from these metrics.
+        from typing import get_args
+
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+        terminal_selection_methods = get_args(
+            RolloutReceipt.model_fields["terminal_selection"].annotation
+        )
+        for method in terminal_selection_methods:
             method_receipts = sum(
                 1
                 for receipt in receipts
@@ -513,7 +525,10 @@ class BlackboxFinalizer:
             "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": rewards_t,
             MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
-            TRUNCATED: torch.tensor(truncated, dtype=torch.bool),
+            TRUNCATED: torch.tensor(
+                [seq_len == self._max_seq_len for seq_len in seq_lens],
+                dtype=torch.bool,
+            ),
         }
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)

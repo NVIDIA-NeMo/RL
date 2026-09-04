@@ -58,12 +58,11 @@ class FinalizationRequest:
     fallback_weight_version: int
     # Stable dataset prompt index; pack_payload stamps it on every row's tag.
     prompt_idx: int
-    # Per-rollout advantage-stage flags the receipt path already knows at
-    # dispatch time. The finalizer publishes them with the rebuilt rows so the
-    # train pump reads the same ``mask_sample``/``truncated`` fields as the
-    # native path (SingleController reads both unconditionally).
+    # Per-rollout advantage-stage flag the receipt path already knows at
+    # dispatch time. The finalizer publishes it with the rebuilt rows so the
+    # train pump reads the same ``mask_sample`` field as the native path
+    # (SingleController reads it unconditionally).
     mask_sample: tuple[bool, ...]
-    truncated: tuple[bool, ...]
 
 
 @dataclass(frozen=True)
@@ -75,6 +74,7 @@ class FinalizerActorConfig:
     pad_token_id: int
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
+    max_seq_len: int
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -128,6 +128,7 @@ class FinalizerActor:  # pragma: no cover
             pad_token_id=config.pad_token_id,
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
+            max_seq_len=config.max_seq_len,
         )
 
     def finalize(self, request: FinalizationRequest) -> FinalizedGroup:
@@ -138,11 +139,10 @@ class FinalizerActor:  # pragma: no cover
             == len(request.receipts)
             == len(request.rewards)
             == len(request.mask_sample)
-            == len(request.truncated)
         ):
             raise ValueError(
-                "finalizer request rollout_ids, receipts, rewards, mask_sample, "
-                "and truncated must be parallel"
+                "finalizer request rollout_ids, receipts, rewards, and "
+                "mask_sample must be parallel"
             )
         result = self._finalizer.finalize_group(
             request.group_id,
@@ -150,7 +150,6 @@ class FinalizerActor:  # pragma: no cover
             list(request.receipts),
             list(request.rewards),
             mask_sample=list(request.mask_sample),
-            truncated=list(request.truncated),
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
         )

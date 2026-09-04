@@ -1899,7 +1899,6 @@ class RolloutManager:
                 )
                 for c in record.completions
             )
-            truncated = tuple(bool(c.truncated) for c in record.completions)
             request = FinalizationRequest(
                 group_id=group_id,
                 rollout_ids=rollout_ids,
@@ -1908,7 +1907,6 @@ class RolloutManager:
                 fallback_weight_version=start_version,
                 prompt_idx=record.prompt_idx,
                 mask_sample=mask_sample,
-                truncated=truncated,
             )
             from nemo_rl.experience.finalizer_actor import assert_metadata_only
 
