@@ -35,6 +35,7 @@ pre-publication ``route_assembly:<reason>`` rejection.
 from __future__ import annotations
 
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -452,13 +453,20 @@ class BlackboxFinalizer:
         metrics["finalize/terminal_witness_disagreement_count"] = float(
             witness_disagreements
         )
+        rejection_reasons: Counter[str] = Counter()
         for row in rows:
             if not row.valid:
+                reason_bucket = (row.rejection_reason or "unknown").split(":", 1)[0]
+                rejection_reasons[reason_bucket] += 1
                 print(
                     f"  finalize: rollout {row.rollout_id} rejected "
                     f"({row.rejection_reason}) — placeholder",
                     flush=True,
                 )
+        for reason_bucket, count in rejection_reasons.items():
+            metrics[f"finalize/capture_failure_reason_{reason_bucket}_count"] = float(
+                count
+            )
 
         group_min_wv = min(
             (r.min_wv for r in valid_rows if r.min_wv is not None),
