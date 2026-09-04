@@ -702,12 +702,15 @@ def _apply_vllm_patches(
         )
     elif uses_v1_executor:
         patch_logger.error(
-            "vllm v1 _init_workers_ray patch did NOT apply: the "
-            "'self._init_workers_ray(placement_group)' anchor was not found, "
-            "and VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0 selects the v1 executor "
-            "that depends on it. Ray workers will launch under the wrong "
-            "interpreter. Either the anchor moved upstream, or unset "
-            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND to use RayExecutorV2."
+            "vllm v1 _init_workers_ray patch did NOT apply, and "
+            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0 selects the v1 executor that "
+            "depends on it. Ray workers will launch under the wrong "
+            "interpreter. Either the "
+            "'self._init_workers_ray(placement_group)' anchor moved upstream, "
+            "or the install is read-only and a preceding warning says so -- in "
+            "which case bake the patch into the image. Unsetting "
+            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND to use RayExecutorV2 also avoids "
+            "the dependency."
         )
     else:
         patch_logger.info(
