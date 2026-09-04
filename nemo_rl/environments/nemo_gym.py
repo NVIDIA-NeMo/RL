@@ -36,6 +36,7 @@ from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
     encode_images_in_examples,
     extract_input_image_sources_from_responses_messages,
+    nemo_gym_image_max_num_tiles,
     resolve_to_image,
     uses_image_placeholder,
 )
@@ -608,6 +609,7 @@ def _attach_multimodal_data_to_user_message(
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
+    max_num_tiles: int | None = None,
 ) -> None:
     """Attach per-turn multimodal tensors to ``user_message``.
 
@@ -624,6 +626,7 @@ def _attach_multimodal_data_to_user_message(
         images=images,
         processor=processor,
         pad_dynamic_image_shapes=pad_dynamic_image_shapes,
+        max_num_tiles=max_num_tiles,
     )
 
 
@@ -925,6 +928,7 @@ Depending on your data shape, you may want to change these values."""
         )
 
         processor = getattr(self, "_processor", None)
+        image_max_num_tiles = nemo_gym_image_max_num_tiles(nemo_gym_row)
         response = nemo_gym_result["response"]
         result_input = nemo_gym_result["responses_create_params"].get("input", [])
         request_input = nemo_gym_row.get("responses_create_params", {}).get("input")
@@ -1082,6 +1086,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     pad_dynamic_image_shapes=getattr(
                         self, "_pad_dynamic_image_shapes", False
                     ),
+                    max_num_tiles=image_max_num_tiles,
                 )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,

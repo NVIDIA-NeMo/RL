@@ -116,6 +116,9 @@ class CheckpointingConfig(TypedDict):
     model_repo_id (str): Repository ID for the model (for safetensors format).
     is_peft (bool): Whether the model uses PEFT.
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
+    save_replay_buffer (bool): Whether async GRPO saves the in-flight replay
+        buffer with each checkpoint. Defaults to True. When False, resume
+        regenerates the buffered window from the saved dataloader frontier.
     load_replay_buffer (bool): Whether async GRPO restores replay-buffer state
         when resuming from a checkpoint. Defaults to True. When False the
         buffer starts empty and a frontier-aligned resume regenerates the
@@ -134,6 +137,7 @@ class CheckpointingConfig(TypedDict):
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True
+    save_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
     load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
     # New nemo-automodel integration fields
     model_save_format: NotRequired[str | None]  # Default: "safetensors"

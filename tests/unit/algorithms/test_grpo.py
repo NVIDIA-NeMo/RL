@@ -126,6 +126,20 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
     )
 
 
+def test_save_async_replay_buffer_checkpoint_can_be_disabled(tmp_path):
+    """save_replay_buffer=false avoids serializing a potentially huge buffer."""
+    replay_buffer = MagicMock()
+
+    count = _save_async_replay_buffer_checkpoint(
+        replay_buffer,
+        str(tmp_path),
+        save_replay_buffer=False,
+    )
+
+    assert count == 0
+    replay_buffer.save_to_path.remote.assert_not_called()
+
+
 @pytest.mark.parametrize("load_replay_buffer", [True, None])
 def test_restore_async_replay_buffer_checkpoint_by_default(
     tmp_path, load_replay_buffer

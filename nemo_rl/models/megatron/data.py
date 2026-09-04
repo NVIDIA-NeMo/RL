@@ -28,6 +28,7 @@ from megatron.core.parallel_state import (
 from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.data.routed_experts import materialize_routed_experts_inplace
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
@@ -123,6 +124,10 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
+        # Async R3 can carry a production step's routes as Ray-backed rows.
+        # Resolve only this policy microbatch; resolving on the worker method's
+        # full DP shard can require hundreds of GiB when DP=1.
+        materialize_routed_experts_inplace(data_dict)
         # Move to GPU
         data_dict = data_dict.to("cuda")
 

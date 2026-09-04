@@ -120,6 +120,27 @@ class TestReplayBufferImplCheckpointing:
     tests cover the checkpoint/restore helpers on the local implementation class.
     """
 
+    def test_r3_replay_rejects_trajectory_without_routed_experts(self):
+        buffer = ReplayBufferImpl(
+            max_size=1,
+            drop_incomplete_targets_on_restore=False,
+            require_routed_experts=True,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="requires routed_experts in every async replay group",
+        ):
+            buffer.add(
+                trajectory={"batch": BatchedDataDict({"token_ids": [[1, 2, 3]]})},
+                weight_version=0,
+                target_weight_version=1,
+            )
+
+        assert buffer.trajectories == []
+        assert buffer.trajectory_versions == []
+        assert buffer.target_weight_versions == []
+
     def _state(
         self,
         trajectory_versions: list[int],

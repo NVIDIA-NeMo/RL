@@ -105,6 +105,49 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
     vllm_kwargs["hf_overrides"] = {**fp8_hf_overrides, **existing_hf_overrides}
 
 
+def _deep_merge_dict_overrides(
+    base: dict[str, Any], overrides: dict[str, Any]
+) -> dict[str, Any]:
+    """Return a recursive copy of ``base`` with ``overrides`` applied."""
+    merged = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict_overrides(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _merge_hf_subconfig_overrides(
+    vllm_kwargs: dict[str, Any], subconfig_overrides: dict[str, Any] | None
+) -> None:
+    """Fold vLLM-only nested HF overrides into vLLM's ``hf_overrides``.
+
+    Policy ``hf_config_overrides`` are shared with Megatron and copied into
+    ``vllm_kwargs.hf_overrides`` by the algorithm setup. Some rollout-only
+    settings, however, live in a nested HF sub-config. Passing those through
+    the shared mapping can replace the policy's complete sub-config during
+    ``AutoConfig.from_pretrained``. The generation-level
+    ``hf_subconfig_overrides`` mapping keeps them rollout-only; current vLLM
+    recursively updates nested ``PretrainedConfig`` objects when it consumes
+    the resulting ``hf_overrides`` mapping.
+    """
+    if subconfig_overrides is None:
+        return
+    if not isinstance(subconfig_overrides, dict):
+        raise TypeError("generation.hf_subconfig_overrides must be a mapping")
+
+    existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
+    if not isinstance(existing_hf_overrides, dict):
+        raise TypeError(
+            "vllm_kwargs.hf_overrides must be a mapping when "
+            "hf_subconfig_overrides is configured"
+        )
+    vllm_kwargs["hf_overrides"] = _deep_merge_dict_overrides(
+        existing_hf_overrides, subconfig_overrides
+    )
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -372,6 +415,9 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        _merge_hf_subconfig_overrides(
+            vllm_kwargs, self.cfg.get("hf_subconfig_overrides")
+        )
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
