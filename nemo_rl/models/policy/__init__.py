@@ -299,6 +299,8 @@ class Fp8Config(TypedDict):
     # When True, keep parameters in FP8. Can cause NaN token_mult_prob_error;
     # use with caution (see https://github.com/NVIDIA-NeMo/RL/issues/1164).
     fp8_param: NotRequired[bool]
+    # Python import path for a Transformer Engine custom recipe quantizer factory.
+    fp8_quantizer_factory: NotRequired[str]
     # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
     # buffers in offload_before_refit (before weight transfer to the inference
     # engine). These FP8 workspace tensors anchor large CUDA segments and
