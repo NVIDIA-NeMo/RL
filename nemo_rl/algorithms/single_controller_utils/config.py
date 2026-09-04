@@ -776,8 +776,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward shaping and
-    filtering knobs SC reads on neither path.
+    one a GRPO run carries and would never build. Plus the reward-shaping and
+    sampling knobs SC reads on neither path.
     """
     algo_cfg = algo_config(master_config)
 
@@ -791,8 +791,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "with max_num_steps."
         )
 
-    # SC reads none of these on either path, so an enabled one describes shaping
-    # this run does not do. Async GRPO rejects three of them the same way.
+    # An enabled one here describes shaping this run does not do. An entry leaves
+    # this list once the SC path implements it; overlong_filtering is applied in
+    # the advantage stage from the raw completion flags in the TransferQueue.
     unsupported = [
         name
         for name, enabled in (

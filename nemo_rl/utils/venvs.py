@@ -30,6 +30,25 @@ DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 logger = logging.getLogger(__name__)
 
 
+def add_hf_modules_cache_to_pythonpath(env_vars: dict[str, str]) -> dict[str, str]:
+    """Make Hugging Face ``trust_remote_code`` modules importable by Ray actors."""
+    result = env_vars.copy()
+    modules_cache = result.get("HF_MODULES_CACHE")
+    if modules_cache is None:
+        try:
+            from transformers.utils import HF_MODULES_CACHE
+        except ImportError:
+            return result
+        modules_cache = HF_MODULES_CACHE
+        result["HF_MODULES_CACHE"] = modules_cache
+
+    pythonpath = result.get("PYTHONPATH", "")
+    path_entries = pythonpath.split(os.pathsep) if pythonpath else []
+    if modules_cache not in path_entries:
+        result["PYTHONPATH"] = os.pathsep.join([modules_cache, *path_entries])
+    return result
+
+
 @lru_cache(maxsize=None)
 def create_local_venv(
     py_executable: str, venv_name: str, force_rebuild: bool = False
@@ -193,13 +212,18 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     return paths[0]
 
 
-def make_actor_runtime_env(actor_class_fqn: str) -> dict:
+def make_actor_runtime_env(
+    actor_class_fqn: str,
+    *,
+    extra_env_vars: dict[str, str] | None = None,
+) -> dict:
     """Build a Ray ``runtime_env`` for one of our registered actors.
 
     Resolves the actor's tier-specific py_executable via the registry,
     materializes a per-node venv when uv-managed, and packages it with
     ``VIRTUAL_ENV`` / ``UV_PROJECT_ENVIRONMENT`` env vars so workers see
-    the same interpreter as the driver.
+    the same interpreter as the driver. Additional actor-specific environment
+    variables can be supplied via ``extra_env_vars``.
 
     Used by ReplayBuffer, AsyncTrajectoryCollector, and SyncRolloutActor
     — three actors that need the VLLM tier's venv on every node. Also
@@ -215,11 +239,16 @@ def make_actor_runtime_env(actor_class_fqn: str) -> dict:
     if py_exec.startswith("uv"):
         py_exec = create_local_venv_on_each_node(py_exec, actor_class_fqn)
     venv = os.path.dirname(os.path.dirname(py_exec))  # strip bin/python
-    return {
-        "py_executable": py_exec,
-        "env_vars": {
+    env_vars = add_hf_modules_cache_to_pythonpath(
+        {
             **os.environ,
             "VIRTUAL_ENV": venv,
             "UV_PROJECT_ENVIRONMENT": venv,
-        },
+        }
+    )
+    if extra_env_vars:
+        env_vars.update(extra_env_vars)
+    return {
+        "py_executable": py_exec,
+        "env_vars": env_vars,
     }
