@@ -446,12 +446,18 @@ def setup(
     # Validate batch_multiplier
     batch_multiplier = ppo_config.batch_multiplier
     dataloader_batch_size = ppo_config.num_prompts_per_step
-    if not ppo_config.use_dynamic_sampling:
-        assert batch_multiplier == 1, (
-            "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
+    if ppo_config.use_dynamic_sampling:
+        # PPO never calls its dynamic-sampling helper. Accepting this flag only
+        # enlarged the rollout batch and then trained on every generated sample.
+        raise NotImplementedError(
+            "ppo.use_dynamic_sampling=true is not supported: PPO does not "
+            "implement dynamic sampling, so enabling it would resize the "
+            "rollout batch without filtering it. Set it to false, or use GRPO."
         )
-    else:
-        dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
+    assert batch_multiplier == 1, (
+        "ppo.batch_multiplier>1 only has an effect under dynamic sampling, "
+        "which PPO does not support."
+    )
 
     dataloader = StatefulDataLoader(
         dataset,

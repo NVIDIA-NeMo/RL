@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -2735,3 +2736,62 @@ def test_validate_dispatches_rollout_by_engine_mode(monkeypatch, async_engine):
     unselected_rollout = sync_rollout if async_engine else async_rollout
     selected_rollout.assert_called_once()
     unselected_rollout.assert_not_called()
+
+
+class TestDynamicSamplingIsRejected:
+    """The synchronous PPO path must reject its unimplemented sampling knob."""
+
+    @staticmethod
+    def _master_config(**ppo_overrides):
+        from omegaconf import OmegaConf
+
+        from nemo_rl.algorithms.ppo import MasterConfig
+        from nemo_rl.utils.config import register_omegaconf_resolvers
+
+        register_omegaconf_resolvers()
+        config_path = (
+            pathlib.Path(__file__).parents[3] / "examples/configs/ppo_math_1B.yaml"
+        )
+        cfg = OmegaConf.load(config_path)
+        for key, value in ppo_overrides.items():
+            cfg.ppo[key] = value
+        return MasterConfig(**OmegaConf.to_container(cfg, resolve=True))
+
+    @staticmethod
+    def _run_setup(master_config):
+        from nemo_rl.algorithms.ppo import setup
+
+        return setup(
+            master_config=master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+
+    def test_enabling_it_is_refused_at_setup(self):
+        """Before this guard, setup sized the dataloader and carried on."""
+        with pytest.raises(NotImplementedError, match="use_dynamic_sampling"):
+            self._run_setup(self._master_config(use_dynamic_sampling=True))
+
+    def test_batch_multiplier_is_still_guarded(self):
+        """The multiplier only ever meant anything under dynamic sampling."""
+        with pytest.raises(AssertionError, match="batch_multiplier"):
+            self._run_setup(
+                self._master_config(use_dynamic_sampling=False, batch_multiplier=2.0)
+            )
+
+    def test_the_shipped_default_is_not_refused(self, monkeypatch):
+        """The shipped config must advance past the dynamic-sampling guard."""
+
+        class ReachedDataloader(Exception):
+            pass
+
+        import nemo_rl.algorithms.ppo as ppo_mod
+
+        monkeypatch.setattr(
+            ppo_mod,
+            "StatefulDataLoader",
+            MagicMock(side_effect=ReachedDataloader),
+        )
+        with pytest.raises(ReachedDataloader):
+            self._run_setup(self._master_config())
