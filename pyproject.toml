@@ -366,6 +366,9 @@ override-dependencies = [
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
+  # Gym main audits and pins OpenAI 2.44.0. Override the older exact pin in
+  # sglang 0.5.12.post1 so the universal workspace lock remains resolvable.
+  "openai==2.44.0",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
