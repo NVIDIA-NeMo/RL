@@ -1093,6 +1093,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "train with penalized rewards.",
             stacklevel=2,
         )
+    if token_capture_config.enabled and async_config.rollout_failure.max_skipped_prompts:
+        warnings.warn(
+            "async_rl.rollout_failure.max_skipped_prompts does nothing with "
+            "token_capture.enabled=true: the capture dispatch path re-raises a "
+            "deterministic failure instead of skipping the prompt, so the run "
+            "ends on the first prompt that exhausts max_data_attempts.",
+            stacklevel=2,
+        )
 
     # A non-zero reference-policy KL penalty makes the loss read
     # ``reference_policy_logprobs``, but the SC train pump only computes them
