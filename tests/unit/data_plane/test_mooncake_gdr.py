@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+import logging
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 import nemo_rl.data_plane as data_plane_module
 from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
@@ -96,6 +98,51 @@ def test_cpu_only_client_may_attach_with_gdr_config(monkeypatch) -> None:
     client = tq_adapter.TQDataPlaneClient(_gdr_cfg(), bootstrap=False)
 
     assert client._closed is False
+
+
+def test_gdr_tensor_put_is_confirmed_once_and_never_falls_back(
+    monkeypatch, caplog
+) -> None:
+    """A CUDA client's first tensor PUT must initialize the GDR path."""
+    staging = SimpleNamespace(_initialized=False)
+    storage_client = SimpleNamespace(use_gdr=True, _gdr_staging=None)
+    tq_client = SimpleNamespace(
+        storage_manager=SimpleNamespace(storage_client=storage_client)
+    )
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(
+        tq_adapter, "_patch_mooncake_staging_buffers", lambda *_, **__: None
+    )
+    monkeypatch.setattr(tq_adapter.tq, "get_client", lambda: tq_client)
+    client = tq_adapter.TQDataPlaneClient(_gdr_cfg(), bootstrap=False)
+    fields = TensorDict(
+        {"token_ids": torch.tensor([[1]], dtype=torch.int64)}, batch_size=[1]
+    )
+
+    monkeypatch.setattr(
+        tq_adapter.tq,
+        "kv_batch_put",
+        lambda **kwargs: pytest.fail("CPU RDMA fallback was allowed"),
+    )
+    with pytest.raises(RuntimeError, match="selected CPU RDMA"):
+        client.put_samples(["sample-0"], "rollout_staging", fields)
+
+    storage_client._gdr_staging = staging
+
+    def put_with_gdr(**kwargs) -> None:
+        staging._initialized = True
+
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", put_with_gdr)
+    with caplog.at_level(logging.INFO, logger=tq_adapter.LOGGER.name):
+        client.put_samples(["sample-0"], "rollout_staging", fields)
+        client.put_samples(["sample-1"], "rollout_staging", fields)
+
+    assert caplog.messages.count(
+        "TransferQueue GDR tensor PUT active (partition=rollout_staging)"
+    ) == 1
 
 
 def test_gdr_receiver_requires_cuda_initialized(monkeypatch) -> None:
