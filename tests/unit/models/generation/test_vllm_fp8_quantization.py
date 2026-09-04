@@ -779,6 +779,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     layer.w2_weight_scale.weight_loader = object()
     layer._expert_routing_tables = lambda: (None, None, None)
     moe_config = types.SimpleNamespace(is_act_and_mul=False)
+    layer.moe_config = moe_config
     quant_config = types.SimpleNamespace(w1_scale=None, w2_scale=None)
     experts_cls = types.SimpleNamespace(is_monolithic=lambda: True)
     quant_config_calls = []
