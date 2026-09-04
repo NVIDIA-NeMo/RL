@@ -679,6 +679,34 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+def _mask_gate_receipt_result():
+    return {
+        "message_log": [],
+        "receipt": {"rollout_id": "r0", "manifest": []},
+        "rollout_id": "r0",
+        "full_result": {
+            "reward": 1.0,
+            "instance_config": {"mask_sample": True, "other_key": "kept"},
+        },
+    }
+
+
+def test_receipt_completion_keeps_mask_flag_when_gate_on():
+    completion = _nemo_gym_impl(True)._results_to_completions(
+        [_mask_gate_receipt_result()]
+    )[0][0]
+    assert completion.env_extras["instance_config"]["mask_sample"] is True
+    assert completion.truncated is False
+
+
+def test_receipt_completion_drops_mask_flag_when_gate_off():
+    completion = _nemo_gym_impl(False)._results_to_completions(
+        [_mask_gate_receipt_result()]
+    )[0][0]
+    assert "mask_sample" not in completion.env_extras["instance_config"]
+    assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
     assistant_message = {
         "role": "assistant",
@@ -1373,15 +1401,21 @@ class _FakeCaptureBuffer(_FakeBuffer):
         )
 
 
-def _receipt_record(rollout_ids, receipts):
+def _receipt_record(rollout_ids, receipts, instance_configs=None):
+    instance_configs = instance_configs or [None] * len(rollout_ids)
     completions = [
         Completion(
             message_log=[],
-            env_extras={"reward": 0.5, "ng_receipt": receipt, "ng_rollout_id": rid},
+            env_extras={
+                "reward": 0.5,
+                "ng_receipt": receipt,
+                "ng_rollout_id": rid,
+                **({"instance_config": cfg} if cfg is not None else {}),
+            },
             truncated=False,
             reward=0.5,
         )
-        for rid, receipt in zip(rollout_ids, receipts)
+        for rid, receipt, cfg in zip(rollout_ids, receipts, instance_configs)
     ]
     return PromptGroupRecord(
         prompt_idx=0,
@@ -1399,6 +1433,7 @@ def _make_capture_manager(
     on_run=None,
     num_generations=2,
     retry_policy: RolloutRetryPolicy | None = None,
+    instance_configs=None,
 ):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
@@ -1424,7 +1459,9 @@ def _make_capture_manager(
             if on_run is not None:
                 await on_run(_sample)
             return _receipt_record(
-                rollout_ids, [{"rollout_id": rid} for rid in rollout_ids]
+                rollout_ids,
+                [{"rollout_id": rid} for rid in rollout_ids],
+                instance_configs=instance_configs,
             )
 
     mgr._impl = _CaptureImpl()
@@ -1432,6 +1469,19 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    def test_request_carries_env_mask_flags(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(
+            buf, instance_configs=[{"mask_sample": True}, {"other": 1}]
+        )
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p"}))
+
+        # The gym mask flag is read from env_extras exactly like the token
+        # path's _mask_sample_flags; receipt completions are never truncated.
+        assert request.mask_sample == (True, False)
+        assert request.truncated == (False, False)
+
     def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf)
@@ -1448,6 +1498,8 @@ class TestGenerateForFinalizationFlow:
         assert request.rollout_ids == tuple(expected_ids)
         assert [r["rollout_id"] for r in request.receipts] == expected_ids
         assert request.rewards == (0.5, 0.5)
+        assert request.mask_sample == (False, False)
+        assert request.truncated == (False, False)
         assert request.fallback_weight_version == 7
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.

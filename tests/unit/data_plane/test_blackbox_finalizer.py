@@ -85,6 +85,8 @@ def partitions(tq_client):
             "sample_mask",
             "prompt_ids_for_adv",
             "total_reward",
+            "mask_sample",
+            "truncated",
         ],
         num_samples=64,
         consumer_tasks=["train"],
@@ -192,6 +194,8 @@ def _fetch_rows(tq_client, sample_ids):
             "sample_mask",
             "prompt_ids_for_adv",
             "total_reward",
+            "mask_sample",
+            "truncated",
         ],
     )
 
@@ -213,6 +217,8 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         rollout_ids,
         [receipt, None],  # second rollout lost its receipt -> placeholder
         [1.0, 0.0],
+        mask_sample=[True, False],
+        truncated=[False, True],
         fallback_weight_version=9,
         prompt_idx=0,
     )
@@ -243,6 +249,9 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     assert placeholder_mask.sum().item() == 0.0
     rewards = torch.as_tensor(rows["total_reward"]).flatten()
     assert rewards.tolist() == [1.0, 0.0]
+    # The advantage-stage flags ride along with the rows on this path too.
+    assert torch.as_tensor(rows["mask_sample"]).flatten().tolist() == [True, False]
+    assert torch.as_tensor(rows["truncated"]).flatten().tolist() == [False, True]
 
     # The finalizer cleared its staged rows after publishing.
     with pytest.raises(KeyError):
@@ -258,6 +267,8 @@ def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
         rollout_ids,
         [None, None],
         [0.0, 0.0],
+        mask_sample=[False] * 2,
+        truncated=[False] * 2,
         fallback_weight_version=3,
         prompt_idx=0,
     )
@@ -297,6 +308,8 @@ def r3_partitions(tq_client):
             "sample_mask",
             "prompt_ids_for_adv",
             "total_reward",
+            "mask_sample",
+            "truncated",
             "routed_experts",
         ],
         num_samples=64,
@@ -400,6 +413,8 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         rollout_ids,
         [receipt, None],  # second rollout -> placeholder
         [1.0, 0.0],
+        mask_sample=[False] * 2,
+        truncated=[False] * 2,
         fallback_weight_version=9,
         prompt_idx=0,
     )
@@ -456,6 +471,8 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
             [rollout_id],
             [receipt.model_dump()],
             [1.0],
+            mask_sample=[False],
+            truncated=[False],
             fallback_weight_version=9,
             prompt_idx=0,
         )
@@ -489,6 +506,8 @@ def r3_deferred_partitions(tq_client):
             "sample_mask",
             "prompt_ids_for_adv",
             "total_reward",
+            "mask_sample",
+            "truncated",
         ],
         num_samples=64,
         consumer_tasks=["train"],
@@ -548,6 +567,8 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         rollout_ids,
         [receipt, None],
         [1.0, 0.0],
+        mask_sample=[False] * 2,
+        truncated=[False] * 2,
         fallback_weight_version=9,
         prompt_idx=0,
     )

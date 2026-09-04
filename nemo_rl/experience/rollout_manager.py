@@ -31,6 +31,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.failures import (
@@ -1120,9 +1121,12 @@ class AsyncNemoGymRolloutImpl:
                 "generation_logprobs",
             )
 
-            # Same gate as the batched path: when masking is off, drop the env
-            # mask flag so later batch building never sees it.
-            if not self._mask_env_flagged_samples:
+        # Same gate as the batched path: when masking is off, drop the env mask
+        # flag so later batch building never sees it. Receipt rollouts take the
+        # same gate because the capture finalization request reads the flag
+        # from the completion's env_extras.
+        if not self._mask_env_flagged_samples:
+            for result in results:
                 (result["full_result"].get("instance_config") or {}).pop(
                     "mask_sample", None
                 )
@@ -1868,6 +1872,18 @@ class RolloutManager:
                     inflight_registry.pop(group_id, None)
             receipts = tuple(c.env_extras.get("ng_receipt") for c in record.completions)
             rewards = tuple(float(c.reward) for c in record.completions)
+            # Same read as the token path's ``_mask_sample_flags``; the impl
+            # already applied the ``mask_env_flagged_samples`` gate by popping
+            # the flag from ``instance_config`` when masking is off.
+            mask_sample = tuple(
+                bool(
+                    ((c.env_extras or {}).get("instance_config") or {}).get(
+                        MASK_SAMPLE, False
+                    )
+                )
+                for c in record.completions
+            )
+            truncated = tuple(bool(c.truncated) for c in record.completions)
             request = FinalizationRequest(
                 group_id=group_id,
                 rollout_ids=rollout_ids,
@@ -1875,6 +1891,8 @@ class RolloutManager:
                 rewards=rewards,
                 fallback_weight_version=start_version,
                 prompt_idx=record.prompt_idx,
+                mask_sample=mask_sample,
+                truncated=truncated,
             )
             from nemo_rl.experience.finalizer_actor import assert_metadata_only
 

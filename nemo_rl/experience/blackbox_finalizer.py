@@ -41,7 +41,7 @@ from typing import Any, Optional
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
@@ -357,6 +357,8 @@ class BlackboxFinalizer:
         receipts: list[Optional[dict[str, Any]]],
         rewards: list[float],
         *,
+        mask_sample: list[bool],
+        truncated: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
     ) -> FinalizedGroup:
@@ -365,11 +367,20 @@ class BlackboxFinalizer:
         Blocking (TQ round trips); run via ``asyncio.to_thread`` from the
         dispatch task. ``fallback_weight_version`` stamps a group none of
         whose rollouts produced a valid row (placeholder-only groups still
-        need a staleness tag).
+        need a staleness tag). ``mask_sample`` and ``truncated`` are the
+        per-rollout advantage-stage flags the native ``pack_payload`` path
+        emits from each ``Completion``; they ride along unchanged so the
+        train pump's environment masking and overlong filtering read the same
+        fields on both paths (placeholder rows already train nothing through
+        ``sample_mask`` 0).
         """
-        assert len(rollout_ids) == len(receipts) == len(rewards), (
-            "rollout_ids, receipts, and rewards must be parallel"
-        )
+        assert (
+            len(rollout_ids)
+            == len(receipts)
+            == len(rewards)
+            == len(mask_sample)
+            == len(truncated)
+        ), "rollout_ids, receipts, rewards, mask_sample, and truncated must be parallel"
         _group_t0 = time.perf_counter()
         rows = [
             self.finalize_rollout(rollout_id, receipt, reward=reward)
@@ -512,6 +523,8 @@ class BlackboxFinalizer:
             "sample_mask": sample_mask,
             "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": rewards_t,
+            MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
+            TRUNCATED: torch.tensor(truncated, dtype=torch.bool),
         }
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)

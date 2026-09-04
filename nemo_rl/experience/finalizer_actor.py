@@ -51,6 +51,12 @@ class FinalizationRequest:
     fallback_weight_version: int
     # Stable dataset prompt index; pack_payload stamps it on every row's tag.
     prompt_idx: int
+    # Per-rollout advantage-stage flags the receipt path already knows at
+    # dispatch time. The finalizer publishes them with the rebuilt rows so the
+    # train pump reads the same ``mask_sample``/``truncated`` fields as the
+    # native path (SingleController reads both unconditionally).
+    mask_sample: tuple[bool, ...]
+    truncated: tuple[bool, ...]
 
 
 @dataclass(frozen=True)
@@ -125,16 +131,23 @@ class FinalizerActor:  # pragma: no cover
         """Finalize one request without allowing tensor payloads across Ray RPC."""
         assert_metadata_only(request)
         if not (
-            len(request.rollout_ids) == len(request.receipts) == len(request.rewards)
+            len(request.rollout_ids)
+            == len(request.receipts)
+            == len(request.rewards)
+            == len(request.mask_sample)
+            == len(request.truncated)
         ):
             raise ValueError(
-                "finalizer request rollout_ids, receipts, and rewards must be parallel"
+                "finalizer request rollout_ids, receipts, rewards, mask_sample, "
+                "and truncated must be parallel"
             )
         result = self._finalizer.finalize_group(
             request.group_id,
             list(request.rollout_ids),
             list(request.receipts),
             list(request.rewards),
+            mask_sample=list(request.mask_sample),
+            truncated=list(request.truncated),
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
         )
