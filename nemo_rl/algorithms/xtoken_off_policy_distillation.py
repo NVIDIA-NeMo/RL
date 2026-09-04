@@ -320,6 +320,15 @@ def setup(
         make_seq_div_by_teachers=[
             tc["make_sequence_length_divisible_by"] for tc in teacher_configs
         ],
+        # Chat/instruct knobs; default to the raw-text path.
+        mode=data_config.get("collator_mode", "text"),
+        drop_first_assistant_chunk_kl=data_config.get(
+            "drop_first_assistant_chunk_kl", False
+        ),
+        include_thinking_in_loss=data_config.get("include_thinking_in_loss", False),
+        native_thinking_alignment=data_config.get("native_thinking_alignment", False),
+        kd_alignment_regions=data_config.get("kd_alignment_regions", None),
+        num_packed_rows=data_config.get("num_packed_rows", 1),
     )
 
     # ==========================
