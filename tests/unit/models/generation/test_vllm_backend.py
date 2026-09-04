@@ -215,7 +215,7 @@ def _make_unquantized_moe_model(
     quant_method.unquantized_backend = UnquantizedMoeBackend(moe_backend)
     model = torch.nn.Module()
     module = torch.nn.Module()
-    module.quant_method = quant_method
+    module.__dict__["quant_method"] = quant_method
     module.expert_map_manager = SimpleNamespace(
         placement_strategy=expert_placement_strategy
     )
