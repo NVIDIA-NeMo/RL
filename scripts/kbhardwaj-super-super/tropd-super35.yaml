@@ -1,0 +1,235 @@
+defaults: ../../examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml
+
+_teacher_model: /lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/venkats/training_actual_0603/super_n4_post/conv_wrappers/tbe2e-oraclev1-step0075/evals/hf
+
+checkpointing:
+  checkpoint_dir: results/tropd-super35
+  save_period: 5
+  ft_save_period: 5
+  checkpoint_must_save_by: null
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_epochs: 2
+  max_num_steps: 100
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+  skip_reference_policy_logprobs_calculation: true
+  adv_estimator:
+    name: opd
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    max_generation_failures: 3
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+  seq_logprob_error_threshold: 2
+
+loss_fn:
+  disable_ppo_ratio: true
+  reference_policy_kl_penalty: 0.0
+  use_kl_in_reward: false
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+
+policy:
+  model_name: /lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/venkats/training_actual_0603/super_n4_post/conv_wrappers/super-v24_1mix60-iter6000/evals/hf
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 196608
+  precision: bfloat16
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 32
+    context_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_num_layers: 0
+    mtp_detach_heads: true
+    optimizer:
+      lr: 3.0e-6
+      min_lr: 3.0e-6
+      bf16: true
+      fp16: false
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-7
+  draft:
+    enabled: false
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    vllm_cfg:
+      precision: ${policy.precision}
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enable_prefix_caching: true
+    vllm_kwargs:
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8480
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 8
+
+data:
+  _override_: true
+  use_multiple_dataloader: false
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  train:
+    data_path: /path/to/verified-proxy.jsonl
+    repeat: 3
+  validation: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    uv_venv_dir: ${oc.env:PERSISTENT_CACHE}/gym_venvs
+    skip_venv_if_present: true
+    num_gpu_nodes: 4
+    port_range_low: 5000
+    port_range_high: 5999
+    invalid_tool_call_patterns:
+      - <tool_call>
+      - </tool_call>
+      - <function_call>
+      - </function_call>
+    thinking_tags:
+      - <think>
+      - </think>
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      # ns_tools delegates deterministic answer verification to this local
+      # resource server. Keep its model-backed judge disabled below.
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+      - resources_servers/code_gen/configs/code_gen.yaml
+      - resources_servers/instruction_following/configs/instruction_following.yaml
+      - resources_servers/calendar/configs/calendar_v2.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/toolcall_schema_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/terminus_judge/configs/terminus_judge_string_only.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_v3.yaml
+      - resources_servers/format_verification/configs/freeform_formatting.yaml
+      - resources_servers/format_verification/configs/citation_format.yaml
+      - resources_servers/ns_tools/configs/ns_tools.yaml
+      - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+      - resources_servers/terminal_multi_harness/configs/terminal_multi_harness_opencode.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 16
+          num_groups_nemo_rl: 2
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          should_use_judge: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 2048
+          unit_test_timeout_secs: 10
+          debug: false
+
+logger:
+  wandb:
+    entity: nvidia
+    project: kbhardwaj-tropd-super
+    name: tropd-super35-v24-to-oraclev1-alpha0p2
+    log_nemo_gym_full_result_tables: false
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 28
+
+on_policy_distillation:
+  _override_: true
+  enabled: true
+  use_orm_advantage: false
+  orm_advantage_weight: 0.0
+  proximal_teacher_alpha: 0.2
+  subtract_global_baseline: true
+  log_sample_stats: true
+  sample_stats_log_period: 1
+  log_sample_responses: false
+  sample_response_max_tokens: null
+  log_token_stats: true
+  token_stats_log_period: 1
+  log_topk_stats: false
+  topk_stats_log_period: 5
+  topk_stats_mode: student_online_teacher_deferred
+  topk_stats_k: 16
+  topk_stats_max_tokens: null
+  teacher_model_by_agent_name:
+    calendar_simple_agent: ${_teacher_model}
+    citation_format_simple_agent: ${_teacher_model}
+    code_gen_simple_agent: ${_teacher_model}
+    freeform_formatting_simple_agent: ${_teacher_model}
+    instruction_following_simple_agent: ${_teacher_model}
+    ns_tools_simple_agent: ${_teacher_model}
+    reasoning_gym_simple_agent: ${_teacher_model}
+    search_pivot_single_step_tool_use_with_argument_comparison_agent: ${_teacher_model}
+    single_step_tool_use_with_argument_comparison_agent: ${_teacher_model}
+    structured_outputs_v3_simple_agent: ${_teacher_model}
+    swe_pivot_single_step_tool_use_with_argument_comparison_agent: ${_teacher_model}
+    terminus_judge_string_only_simple_agent: ${_teacher_model}
+    terminal_multi_harness_opencode_agent: ${_teacher_model}
+    toolcall_schema_single_step_tool_use_with_argument_comparison_agent: ${_teacher_model}
+  default_teacher_alias: null
+  strict_agent_name_match: true
+  deduplicate_shared_teacher_checkpoints: true
+  non_colocated_teachers:
+    enabled: true
+    default_teacher_cfg:
+      tensor_model_parallel_size: 4
+      expert_tensor_parallel_size: 1
+      expert_model_parallel_size: 8
+      context_parallel_size: 4
+      pipeline_model_parallel_size: 1
+      sequence_parallel: true
+      megatron_cfg_overrides:
+        moe_token_dispatcher_type: alltoall
+        moe_flex_dispatcher_backend: alltoall
+        mtp_loss_scaling_factor: 0.0
+        mtp_use_repeated_layer: false
+        mtp_num_layers: 0
+      precision: bf16
+      micro_batch_size: 1
+      gpus_per_node: 4
+      num_nodes: 4

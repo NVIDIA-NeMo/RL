@@ -1254,6 +1254,129 @@ class AsyncTrajectoryCollector:
 
         return result, total_time
 
+    def compute_teacher_topk(
+        self, input_ids, agent_refs, input_lengths=None, k: int = 32
+    ):
+        """Compute teacher top-k logits for a driver-selected batch.
+
+        Top-k tensors are large, so this is triggered by the trainer only on
+        OPD logging steps instead of being stored in every replay-buffer entry.
+        """
+        import torch
+
+        from nemo_rl.algorithms.opd import resolve_reference_aliases
+
+        k = int(k)
+        if k <= 0:
+            raise ValueError(f"k must be positive for teacher top-k logging, got {k}")
+        if not self.teacher_worker_groups:
+            raise RuntimeError("No non-colocated teacher worker groups are available")
+
+        opd_cfg = self.on_policy_distillation_cfg
+        teacher_model_by_agent_name = opd_cfg.get("teacher_model_by_agent_name", {})
+        default_teacher_alias = opd_cfg.get("default_teacher_alias")
+        strict = opd_cfg.get("strict_agent_name_match", False)
+
+        reference_aliases = resolve_reference_aliases(
+            agent_refs,
+            teacher_model_by_agent_name,
+            default_teacher_alias=default_teacher_alias,
+            strict_agent_name_match=strict,
+        )
+        group_keys = [self.alias_to_group_alias.get(a, a) for a in reference_aliases]
+
+        group_to_indices: dict[str, list[int]] = defaultdict(list)
+        for i, gk in enumerate(group_keys):
+            group_to_indices[gk].append(i)
+
+        B, S = input_ids.shape
+        result_logits = torch.zeros(B, S, k, dtype=torch.bfloat16)
+        result_indices = torch.full((B, S, k), -1, dtype=torch.int64)
+        result_logsumexp = torch.zeros(B, S, dtype=torch.float32)
+
+        def _normalize_seq_len(
+            tensor: torch.Tensor, value: float | int
+        ) -> torch.Tensor:
+            if tensor.shape[1] == S:
+                return tensor
+            if tensor.shape[1] > S:
+                return tensor[:, :S, ...]
+            pad = (0, S - tensor.shape[1])
+            if tensor.ndim == 3:
+                pad = (0, 0, 0, S - tensor.shape[1])
+            return torch.nn.functional.pad(
+                tensor,
+                pad,
+                mode="constant",
+                value=value,
+            )
+
+        def _get_topk_for_group(group_key, indices):
+            twg = self.teacher_worker_groups[group_key]
+            sub_input_ids = input_ids[indices]
+            sub_lengths = input_lengths[indices] if input_lengths is not None else None
+
+            dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
+            actual_batch_size = sub_input_ids.shape[0]
+            remainder = actual_batch_size % dp_size
+            if remainder != 0:
+                pad_count = dp_size - remainder
+                pad_rows = sub_input_ids[-1:].expand(pad_count, -1)
+                sub_input_ids = torch.cat([sub_input_ids, pad_rows], dim=0)
+                if sub_lengths is not None:
+                    sub_lengths = torch.cat(
+                        [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
+                    )
+
+            sub_data = BatchedDataDict({"input_ids": sub_input_ids})
+            if sub_lengths is not None:
+                sub_data["input_lengths"] = sub_lengths
+
+            t_lock_start = time.time()
+            with self._teacher_locks[group_key]:
+                t_inference_start = time.time()
+                topk_result = twg.get_topk_logits(sub_data, k=k, return_logsumexp=True)
+            t_done = time.time()
+            print(
+                f"[teacher_topk] group={group_key} samples={actual_batch_size} k={k} "
+                f"lock_wait={t_inference_start - t_lock_start:.2f}s "
+                f"inference={t_done - t_inference_start:.2f}s",
+                flush=True,
+            )
+
+            topk_logits = _normalize_seq_len(
+                topk_result["topk_logits"][:actual_batch_size], 0.0
+            )
+            topk_indices = _normalize_seq_len(
+                topk_result["topk_indices"][:actual_batch_size], -1
+            )
+            V_logsumexp = _normalize_seq_len(
+                topk_result["V_logsumexp"][:actual_batch_size], 0.0
+            )
+            return indices, topk_logits, topk_indices, V_logsumexp
+
+        t_total_start = time.time()
+        for gk, idxs in group_to_indices.items():
+            indices, topk_logits, topk_indices, V_logsumexp = _get_topk_for_group(
+                gk, idxs
+            )
+            result_logits[indices] = topk_logits.to(torch.bfloat16)
+            result_indices[indices] = topk_indices.to(torch.int64)
+            result_logsumexp[indices] = V_logsumexp.to(torch.float32)
+
+        total_time = time.time() - t_total_start
+        print(
+            f"[teacher_topk] total={total_time:.2f}s for {B} samples across "
+            f"{len(group_to_indices)} teacher(s), k={k}",
+            flush=True,
+        )
+        return {
+            "topk_logits": result_logits,
+            "topk_indices": result_indices,
+            "V_logsumexp": result_logsumexp,
+            "teacher_topk_time": total_time,
+        }
+
     async def _iter_rollout_groups(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],

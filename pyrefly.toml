@@ -59,6 +59,7 @@ project-includes = [
   "nemo_rl/algorithms/loss/utils.py",
   "nemo_rl/algorithms/metric_utils.py",
   "nemo_rl/algorithms/opd.py",
+  "nemo_rl/algorithms/opd_diagnostics.py",
   "nemo_rl/algorithms/reward_functions.py",
   "nemo_rl/algorithms/single_controller.py",
   "nemo_rl/algorithms/single_controller_utils/__init__.py",
