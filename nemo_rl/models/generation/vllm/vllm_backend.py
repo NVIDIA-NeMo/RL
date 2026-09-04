@@ -178,12 +178,14 @@ def _rebuild_kernel_layouts_after_bulk_writes(
         quant_method.process_weights_after_loading(module)
 
 
-def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
-    """Return whether a model realized the unquantized TRTLLM MoE backend."""
+def _unquantized_flashinfer_trtllm_modules(
+    model: torch.nn.Module,
+) -> list[torch.nn.Module]:
+    """Return modules that realized the unquantized TRTLLM MoE backend."""
     # Import backend types only when inspecting a constructed vLLM model. The
     # module layout is version-sensitive; on vLLM builds without the oracle
-    # package the TRTLLM backend cannot be realized, so absence means False
-    # rather than an ImportError on every unquantized-model refit.
+    # package the TRTLLM backend cannot be realized, so absence means no
+    # matches rather than an ImportError on every unquantized-model refit.
     try:
         from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
             UnquantizedMoeBackend,
@@ -192,16 +194,22 @@ def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
             UnquantizedFusedMoEMethod,
         )
     except ImportError:
-        return False
+        return []
 
-    return any(
-        isinstance(
+    return [
+        module
+        for module in model.modules()
+        if isinstance(
             quant_method := getattr(module, "quant_method", None),
             UnquantizedFusedMoEMethod,
         )
         and quant_method.unquantized_backend is UnquantizedMoeBackend.FLASHINFER_TRTLLM
-        for module in model.modules()
-    )
+    ]
+
+
+def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
+    """Return whether a model realized the unquantized TRTLLM MoE backend."""
+    return bool(_unquantized_flashinfer_trtllm_modules(model))
 
 
 class _IPCWeightManifest:
@@ -899,10 +907,49 @@ class VllmInternalWorkerExtension:
             self._uses_unquantized_flashinfer_trtllm()
         )
 
-    def _validate_native_layerwise_refit(self) -> None:
+    def _validate_native_layerwise_refit(
+        self, transport: WeightUpdateTransport | None = None
+    ) -> None:
         """Reject unsupported features on the native layerwise reload path."""
         if not self._uses_unquantized_flashinfer_trtllm():
             return
+
+        if transport == "nccl_reshard":
+            # nccl_reshard writes MoE weights itself and only runs vLLM's
+            # targeted reload for the native components, so anything the
+            # reload lifecycle would have refreshed as a side effect has to be
+            # rejected here rather than silently kept stale.
+            if self._uses_fp8_kv_cache():
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit does not "
+                    "support an FP8 KV cache because its static scales are "
+                    "outside the targeted MoE reload lifecycle"
+                )
+
+            realized_placements = set()
+            for module in _unquantized_flashinfer_trtllm_modules(
+                self.model_runner.model
+            ):
+                strategy = getattr(
+                    getattr(module, "expert_map_manager", None),
+                    "placement_strategy",
+                    getattr(module, "expert_placement_strategy", None),
+                )
+                if strategy is None:
+                    raise RuntimeError(
+                        "BF16 FlashInfer TRTLLM nccl_reshard refit could "
+                        "not determine the expert placement strategy of "
+                        f"{type(module).__name__}; refusing to assume linear "
+                        "placement"
+                    )
+                realized_placements.add(strategy)
+            unsupported_placements = sorted(realized_placements - {"linear"})
+            if unsupported_placements:
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
+                    "linear expert placement; realized "
+                    f"{unsupported_placements!r}"
+                )
 
         if self._mtp_drafter_refit_enabled():
             raise RuntimeError(
@@ -934,7 +981,7 @@ class VllmInternalWorkerExtension:
         subsequent exception therefore marks this worker permanently unusable.
         """
         if self._uses_native_layerwise_refit(transport):
-            self._validate_native_layerwise_refit()
+            self._validate_native_layerwise_refit(transport)
             previous_failure = self._nrl_layerwise_reload_failure
             if previous_failure is not None:
                 raise RuntimeError(
@@ -1195,6 +1242,12 @@ class VllmInternalWorkerExtension:
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Restore metadata and preflight the selected destination route."""
+        # Runs here, in the once-per-run setup, rather than inside the refit:
+        # the conditions it rejects are properties of how the engine was built,
+        # so raising at the first weight transfer would only mean discovering
+        # them later and mid-flight.
+        self._validate_native_layerwise_refit("nccl_reshard")
+
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )

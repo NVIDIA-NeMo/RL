@@ -201,7 +201,15 @@ def test_init_collective_keeps_generation_ranks_after_the_training_ranks(
     assert recording_group.instances[0].kwargs["rank"] == 4
 
 
-def _unquantized_moe_module(moe_backend: str) -> SimpleNamespace:
+def _unquantized_moe_module(
+    moe_backend: str, expert_placement_strategy: str | None = "linear"
+) -> SimpleNamespace:
+    """A realized unquantized MoE layer.
+
+    ``expert_placement_strategy=None`` builds a module that carries no placement
+    attribute at all, which is the case the nccl_reshard guard must refuse
+    rather than read as linear.
+    """
     from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
         UnquantizedMoeBackend,
     )
@@ -211,7 +219,14 @@ def _unquantized_moe_module(moe_backend: str) -> SimpleNamespace:
 
     quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
     quant_method.unquantized_backend = UnquantizedMoeBackend(moe_backend)
-    return SimpleNamespace(quant_method=quant_method)
+    if expert_placement_strategy is None:
+        return SimpleNamespace(quant_method=quant_method)
+    return SimpleNamespace(
+        quant_method=quant_method,
+        expert_map_manager=SimpleNamespace(
+            placement_strategy=expert_placement_strategy
+        ),
+    )
 
 
 def _quantized_moe_module() -> SimpleNamespace:
@@ -219,8 +234,11 @@ def _quantized_moe_module() -> SimpleNamespace:
     return SimpleNamespace(quant_method=object())
 
 
-def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
-    return SimpleNamespace(modules=lambda: [_unquantized_moe_module(moe_backend)])
+def _make_unquantized_moe_model(
+    moe_backend: str, expert_placement_strategy: str | None = "linear"
+) -> SimpleNamespace:
+    module = _unquantized_moe_module(moe_backend, expert_placement_strategy)
+    return SimpleNamespace(modules=lambda: [module])
 
 
 def _make_quantized_moe_model() -> SimpleNamespace:
@@ -749,6 +767,117 @@ def test_unquantized_reload_rejects_cotrained_mtp_during_prepare():
         ext.prepare_refit_info({"model.weight": object()})
 
     assert not hasattr(ext, "state_dict_info")
+
+
+def _make_nccl_reshard_validation_extension(
+    expert_placement_strategy: str | None = "linear",
+    cache_dtype: str = "auto",
+):
+    """A worker whose only job is to answer ``_validate_native_layerwise_refit``."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model(
+            "FlashInfer TRTLLM", expert_placement_strategy
+        ),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+            cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        ),
+    )
+    ext._mtp_drafter_refit_enabled = lambda: False
+    return ext
+
+
+@pytest.mark.vllm
+def test_native_refit_rejects_round_robin_expert_placement_for_nccl_only():
+    """Placement constrains nccl_reshard staging, not the vLLM-owned reload.
+
+    ``nccl_reshard`` writes the MoE weights itself into expert slots it assumes
+    are laid out linearly. The ``ipc``/``collective`` paths hand that work to
+    vLLM's own loaders, which honour whatever placement the engine realized, so
+    rejecting them too would refuse a configuration that works.
+    """
+    ext = _make_nccl_reshard_validation_extension(
+        expert_placement_strategy="round_robin"
+    )
+
+    ext._validate_native_layerwise_refit("collective")
+
+    with pytest.raises(RuntimeError, match="linear expert placement"):
+        ext._validate_native_layerwise_refit("nccl_reshard")
+
+
+@pytest.mark.vllm
+def test_native_refit_uses_realized_expert_placement():
+    """The realized modules decide, not ``parallel_config``.
+
+    A conflicting ``parallel_config.expert_placement_strategy`` is exactly the
+    trap: reading the config would reject an engine whose modules actually came
+    up linear, which is the same config-versus-realization mistake C5 was.
+    """
+    ext = _make_nccl_reshard_validation_extension(expert_placement_strategy="linear")
+    ext.model_runner.vllm_config.parallel_config = SimpleNamespace(
+        expert_placement_strategy="round_robin"
+    )
+
+    ext._validate_native_layerwise_refit("nccl_reshard")
+
+
+@pytest.mark.vllm
+def test_native_refit_rejects_undeterminable_expert_placement():
+    """An absent placement attribute is refused, never assumed to be linear.
+
+    A vLLM version that renames the attribute would otherwise silently take the
+    linear-staging path on a round-robin engine and write every expert to the
+    wrong slot.
+    """
+    ext = _make_nccl_reshard_validation_extension(expert_placement_strategy=None)
+
+    with pytest.raises(RuntimeError, match="could not determine"):
+        ext._validate_native_layerwise_refit("nccl_reshard")
+
+
+@pytest.mark.vllm
+def test_native_nccl_reshard_refit_rejects_fp8_kv_cache():
+    """An FP8 KV cache is refused on nccl_reshard, and only there.
+
+    ``nccl_reshard`` runs vLLM's targeted reload for the native components
+    only, so the attention loop that recomputes static KV scales never covers
+    the whole model. The ``ipc``/``collective`` paths do make that model-wide
+    pass, so the same engine is fine there.
+    """
+    ext = _make_nccl_reshard_validation_extension(cache_dtype="fp8")
+
+    # The premise: without a real FP8 cache_dtype this would pass vacuously.
+    assert ext._uses_fp8_kv_cache()
+
+    ext._validate_native_layerwise_refit("collective")
+
+    with pytest.raises(RuntimeError, match="FP8 KV cache"):
+        ext._validate_native_layerwise_refit("nccl_reshard")
+
+
+@pytest.mark.vllm
+def test_prepare_nccl_reshard_refit_info_validates_before_any_transfer():
+    """The guard is wired into setup, not merely defined.
+
+    Validation that is never called is the failure mode this pins: the check
+    has to run in ``prepare_nccl_reshard_refit_info``, which happens once
+    before the first weight moves, rather than partway through a refit.
+    """
+    ext = _make_nccl_reshard_validation_extension(
+        expert_placement_strategy="round_robin"
+    )
+
+    with pytest.raises(RuntimeError, match="linear expert placement"):
+        ext.prepare_nccl_reshard_refit_info({})
+
+    assert not hasattr(ext, "nccl_reshard_refit_info")
 
 
 @pytest.mark.vllm
