@@ -1272,11 +1272,12 @@ def test_dsv4_fp8_refit_filters_nonlocal_experts_before_loading(
     import torch
 
     fp8 = fp8_module
-    from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 
     class FakeRoutedExperts:
-        def _map_global_expert_id_to_local_expert_id(self, expert_id):
-            return expert_id if expert_id in {4, 5} else -1
+        def __init__(self):
+            self.expert_map_manager = types.SimpleNamespace(
+                is_local_expert=lambda expert_id: expert_id in {4, 5}
+            )
 
     class DeepSeekV4ForCausalLM:
         def __init__(self):
@@ -1288,7 +1289,7 @@ def test_dsv4_fp8_refit_filters_nonlocal_experts_before_loading(
 
     routed_experts = FakeRoutedExperts()
     model = DeepSeekV4ForCausalLM()
-    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExperts)
+    monkeypatch.setattr(fp8, "RoutedExperts", FakeRoutedExperts)
     monkeypatch.setattr(
         fp8, "_get_module_from_param_name", lambda _model, _name: routed_experts
     )
@@ -1338,12 +1339,33 @@ def test_dsv4_routed_experts_refit_uses_immediate_raw_storage(fp8_module, monkey
                 torch.empty(2, 2, 1), requires_grad=False
             )
             self.quant_method = types.SimpleNamespace(
-                process_weights_after_loading=lambda layer: process_calls.append(layer)
+                block_quant=True,
+                process_weights_after_loading=lambda layer: process_calls.append(layer),
             )
 
-    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExperts)
-    monkeypatch.setattr(meta, "SKIP_TENSORS", set())
     layer = FakeRoutedExperts()
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExperts)
+    monkeypatch.setattr(deepseek_v4_fp8, "Fp8MoEMethod", type(layer.quant_method))
+    monkeypatch.setattr(meta, "SKIP_TENSORS", set())
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    get_layerwise_info(layer).restore_metadata = (
+        {
+            "w13_weight": torch.empty(
+                (2, 6, 4), dtype=torch.float8_e4m3fn, device="meta"
+            ),
+            "w2_weight": torch.empty(
+                (2, 4, 3), dtype=torch.float8_e4m3fn, device="meta"
+            ),
+            "w13_weight_scale_inv": torch.empty(
+                (2, 3, 2), dtype=torch.float32, device="meta"
+            ),
+            "w2_weight_scale_inv": torch.empty(
+                (2, 2, 2), dtype=torch.float32, device="meta"
+            ),
+        },
+        {},
+    )
     model = torch.nn.Sequential(layer)
 
     added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)

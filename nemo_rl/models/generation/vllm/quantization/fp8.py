@@ -27,6 +27,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -596,10 +597,15 @@ def get_quantized_weight_iterator(
         # by the destination loader. Filter them before FP8 quantization and
         # layerwise buffering; the IPC manifest still accounts for the original
         # received keys outside this function.
-        expert_id = deepseek_v4_fp8.get_exported_expert_id(model, k)
+        expert_id = (
+            parse_expert_id(k)
+            if deepseek_v4_fp8.is_model(model) and k.endswith(".weight")
+            else None
+        )
         if expert_id is not None:
             module = _get_module_from_param_name(model, k)
-            if deepseek_v4_fp8.is_nonlocal_expert(module, expert_id):
+            assert isinstance(module, RoutedExperts)
+            if not bool(module.expert_map_manager.is_local_expert(expert_id)):
                 continue
 
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
