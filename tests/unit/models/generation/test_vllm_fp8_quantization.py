@@ -1837,6 +1837,8 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
     """
     import torch
 
+    from nemo_rl.models.generation.vllm import vllm_backend
+
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         use_weight_pow2_scale=False, is_mx=False
@@ -1845,7 +1847,11 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
         fp8, monkeypatch, torch.float8_e4m3fn, wrap_language_model
     )
     loaded = []
-    model.load_weights = lambda pairs: loaded.extend(pairs)
+    monkeypatch.setattr(
+        vllm_backend,
+        "load_weights_maybe_cached",
+        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
+    )
 
     intermediate, hidden = 256, 384
     gate_up = torch.randn(2, 2 * intermediate, hidden).to(torch.bfloat16)
@@ -1855,7 +1861,10 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
             (f"{layers_prefix}.0.mlp.experts.gate_up_proj", gate_up),
             (f"{layers_prefix}.0.mlp.experts.down_proj", down),
         ],
-        types.SimpleNamespace(model=model),
+        types.SimpleNamespace(
+            model=model,
+            vllm_config=types.SimpleNamespace(additional_config={}),
+        ),
     )
 
     base = f"{layers_prefix}.0.mlp.experts"
@@ -1904,5 +1913,8 @@ def test_load_weights_rejects_grouped_experts_for_mxfp8(fp8_module, monkeypatch)
                     torch.randn(2, 512, 384).to(torch.bfloat16),
                 )
             ],
-            types.SimpleNamespace(model=model),
+            types.SimpleNamespace(
+                model=model,
+                vllm_config=types.SimpleNamespace(additional_config={}),
+            ),
         )
