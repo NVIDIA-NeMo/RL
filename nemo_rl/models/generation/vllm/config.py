@@ -289,7 +289,7 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         raise ValueError(
             "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
             f"with refit_transport={transport!r}: this transport's refit path "
-            "does not reset the multimodal encoder cache, so stale vision "
+            "does not reset the multimodal encoder cache, so stale multimodal "
             "embeddings would silently survive weight updates. Supported "
             "transports: null (collective/IPC) and 'nccl_reshard'."
         )

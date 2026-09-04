@@ -1204,6 +1204,7 @@ def test_rollout_pump_writes_expected_tq_data(
         dp_adapter,
         partition_id=_PARTITION_ID,
         pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
+        include_message_violation_fields=False,
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
@@ -1271,6 +1272,8 @@ def test_rollout_pump_writes_expected_tq_data(
         bulk["sample_mask"].float(),
         torch.ones(expected_samples, dtype=torch.float32),
     )
+    assert not bulk["mask_sample"].bool().any()
+    assert not bulk["truncated"].bool().any()
 
     # Same deterministic prompt as test_async_rollout_manager: the model
     # solves the calculator task every time -> reward == 1.0 and decoded

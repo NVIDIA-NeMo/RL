@@ -57,7 +57,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
 
-3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step; a PPO step is `ppo.ppo_epochs` of them over that same batch.
+3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step. A PPO step applies `ppo.ppo_epochs` actor updates and `ppo.critic_ppo_epochs` critic updates over that same batch. Both counts must be at least 1 and can be configured independently; the exemplar defaults the critic count to `${ppo.ppo_epochs}`.
 
     ```python
     num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
@@ -150,7 +150,7 @@ The shipped exemplars cover three of the five modes:
 Field definitions:
 
 - `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking. Sized from the widest window the run ever uses, so `warmup_lookahead_versions` rather than `max_lookahead_versions` when it is set.
-- `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a batch. Set to `num_prompts_per_step` for sync/legacy semantics; lower for streaming. (PPO) Must equal `num_prompts_per_step` — the critic has no split train API, so one `train_from_meta` call is one optimizer step, and streaming a step across chunks would step the critic once per chunk.
+- `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a batch. Set to `num_prompts_per_step` for sync/legacy semantics; lower for streaming. (PPO) Must equal `num_prompts_per_step` — the critic has no split train API, so each critic epoch calls the full-step `train_from_meta` once per chunk. Splitting an RL step across chunks would multiply both models' configured optimizer updates by the number of chunks.
 - `sampler.warmup_lookahead_versions` (PPO) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
 
 ## Implementation Structure
@@ -189,14 +189,14 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 #### 5. `_rollout_pump` and `_train_pump`
 
 - `_rollout_pump`: pulls prompts from the dataloader, calls `sampler.admit`, dispatches `RolloutManager.generate_and_push`, and honours `max_inflight_prompts` as a backpressure cap.
-- `_train_pump`: `sampler.evict → sampler.select → _value_stage (PPO only) → _advantage_stage → _value_train (PPO only) → TQPolicy split API (begin_train_step / train_microbatches_from_meta / finish_train_step) → dp_client.clear_samples`.
+- `_train_pump`: `sampler.evict → sampler.select → _value_stage (PPO only) → _advantage_stage → _value_train_epochs (PPO only) → TQPolicy split API (begin_train_step / train_microbatches_from_meta / finish_train_step) → dp_client.clear_samples`.
 
 ### Coordination Flow
 
 1. **Driver setup**: `setup_single_controller` builds the worker groups, virtual cluster, dp client, dataloader, `TQReplayBuffer`, `RolloutManager`, and weight synchronizer, and packs them into a `SingleControllerActorArgs` that the entrypoint cloudpickles into the actor.
 2. **Actor startup**: `SingleControllerActor` launches `_rollout_pump` and `_train_pump` concurrently as asyncio tasks; both share the same `TQReplayBuffer` and `StalenessSampler`.
 3. **Rollout pump loop**: `sampler.admit` gates dispatch against the current trainer version (returning a `target_step` for `in_order`); the pump then reserves a buffer slot, drives `RolloutManager.generate_and_push`, and commits with the observed `start_weight` / `end_weight`.
-4. **Train pump loop**: `sampler.evict` drops out-of-window groups, `sampler.select` picks the next batch, `_value_stage` and `_value_train` run the critic forward and its optimizer step on a PPO run, `_advantage_stage` computes advantages, and the TQPolicy split API runs one optimizer step per RL step on GRPO, or `ppo.ppo_epochs` of them on PPO.
+4. **Train pump loop**: `sampler.evict` drops out-of-window groups and `sampler.select` picks the next batch. On PPO, `_value_stage` runs the critic forward, `_advantage_stage` computes advantages, and `_value_train_epochs` runs `ppo.critic_ppo_epochs` critic updates. The TQPolicy split API then runs one optimizer step per RL step on GRPO, or `ppo.ppo_epochs` policy updates on PPO.
 5. **Weight sync**: after each optimizer step the pump bumps the trainer version, clears rollout permission, calls the weight synchronizer, and re-opens the rollout pump for the next version.
 
 ## Relation to Legacy Async GRPO
@@ -241,6 +241,6 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Generation backend: vLLM and Megatron generation are supported; SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
-- Reward shaping and sample filtering — `overlong_filtering`, `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping.
+- Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.

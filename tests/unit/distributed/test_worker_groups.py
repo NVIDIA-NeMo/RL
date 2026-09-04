@@ -25,7 +25,32 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     PY_EXECUTABLES,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.distributed.worker_groups import (
+    RayWorkerBuilder,
+    RayWorkerGroup,
+    _get_initializer_env_vars,
+)
+
+
+def test_initializer_env_adds_hf_modules_cache_to_pythonpath(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/driver/pythonpath")
+
+    result = _get_initializer_env_vars({"HF_MODULES_CACHE": "/hf/modules"})
+
+    assert result["HF_MODULES_CACHE"] == "/hf/modules"
+    assert result["PYTHONPATH"].split(os.pathsep) == [
+        "/hf/modules",
+        "/driver/pythonpath",
+    ]
+
+
+def test_initializer_env_does_not_duplicate_hf_modules_cache(monkeypatch):
+    monkeypatch.setenv("HF_MODULES_CACHE", "/hf/modules")
+    monkeypatch.setenv("PYTHONPATH", f"/project{os.pathsep}/hf/modules")
+
+    result = _get_initializer_env_vars({})
+
+    assert result["PYTHONPATH"] == f"/project{os.pathsep}/hf/modules"
 
 
 @ray.remote
