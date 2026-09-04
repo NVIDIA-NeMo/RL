@@ -345,12 +345,15 @@ def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
 
     call_order = []
     model = torch.nn.Module()
-    bf16_moe = torch.nn.Module()
-    bf16_moe.expert_map_manager = SimpleNamespace(placement_strategy="linear")
+    first_bf16_moe = torch.nn.Module()
+    first_bf16_moe.expert_map_manager = SimpleNamespace(placement_strategy="linear")
     mxfp8_moe = torch.nn.Module()
     mxfp8_moe.quant_method = ModelOptMxFp8FusedMoE.__new__(ModelOptMxFp8FusedMoE)
-    model.add_module("first_bf16_moe", bf16_moe)
+    last_bf16_moe = torch.nn.Module()
+    last_bf16_moe.expert_map_manager = SimpleNamespace(placement_strategy="linear")
+    model.add_module("first_bf16_moe", first_bf16_moe)
     model.add_module("middle_mxfp8_moe", mxfp8_moe)
+    model.add_module("last_bf16_moe", last_bf16_moe)
 
     model_config = object()
     vllm_config = SimpleNamespace(quant_config=object())
@@ -367,7 +370,7 @@ def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
     monkeypatch.setattr(
         vllm_backend,
         "_unquantized_flashinfer_trtllm_modules",
-        lambda _model: [bf16_moe],
+        lambda _model: [first_bf16_moe, last_bf16_moe],
     )
     monkeypatch.setattr(
         ModelOptMxFp8FusedMoE,
@@ -408,7 +411,8 @@ def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
 
     assert call_order == [
         "config_enter",
-        ("initialize", bf16_moe),
+        ("initialize", first_bf16_moe),
+        ("initialize", last_bf16_moe),
         "transfer",
         ("finalize", model, model_config),
         ("process_mxfp8", mxfp8_moe),
