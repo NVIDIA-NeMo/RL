@@ -529,7 +529,8 @@ def test_realized_moe_backend_controls_native_refit_lifecycle():
 
 
 @pytest.mark.vllm
-def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
+def test_quantized_model_uses_native_refit_for_realized_bf16_trtllm_modules():
+    """A globally quantized model may still contain ignored BF16 MoE layers."""
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
@@ -540,7 +541,7 @@ def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
         vllm_config=SimpleNamespace(quant_config=object()),
     )
 
-    assert ext._uses_unquantized_flashinfer_trtllm() is False
+    assert ext._uses_unquantized_flashinfer_trtllm() is True
 
 
 @pytest.mark.vllm

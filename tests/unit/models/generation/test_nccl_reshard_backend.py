@@ -449,6 +449,94 @@ def test_build_hf_to_local_param_map_stages_nemotron_lightning_padded_experts():
     assert loaded_weights[0][1].shape == (intermediate_size, hidden_size)
 
 
+def test_build_hf_to_local_param_map_stages_only_bf16_trtllm_experts(
+    monkeypatch,
+):
+    """Mixed MXFP8 models stage only experts realized with the BF16 backend."""
+    num_experts, intermediate_size, hidden_size = 2, 64, 32
+    bf16_name = "backbone.layers.0.mlp.experts.up_proj.weight"
+    mxfp8_name = "backbone.layers.1.mlp.experts.up_proj.weight"
+    bf16_runtime_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    mxfp8_runtime_name = "model.layers.1.mlp.experts.routed_experts.w13_weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["backbone.layers.0", "backbone.layers.1"],
+        "per_layer_params": {
+            "backbone.layers.0": [
+                {
+                    "name": bf16_name,
+                    "global_shape": [num_experts, intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ],
+            "backbone.layers.1": [
+                {
+                    "name": mxfp8_name,
+                    "global_shape": [num_experts, intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ],
+        },
+    }
+    bf16_runtime = torch.empty(
+        num_experts, hidden_size // 16, intermediate_size, 16, dtype=torch.bfloat16
+    )
+    mxfp8_runtime = torch.empty(
+        num_experts, intermediate_size, hidden_size, dtype=torch.float8_e4m3fn
+    )
+    mxfp8_scale = torch.empty(
+        num_experts, intermediate_size, hidden_size // 32, dtype=torch.uint8
+    )
+    ext = _make_ext(
+        {
+            bf16_runtime_name: bf16_runtime,
+            mxfp8_runtime_name: mxfp8_runtime,
+            f"{mxfp8_runtime_name}_scale_from_checkpoint": mxfp8_scale,
+        }
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=0)}
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._unquantized_flashinfer_trtllm_param_ids = lambda: {id(bf16_runtime)}
+    ext._load_full_hf_weights = MagicMock(return_value={bf16_runtime_name})
+
+    def fake_quantize(weight):
+        return (
+            torch.full_like(weight, 3, dtype=torch.float8_e4m3fn),
+            torch.full(
+                (*weight.shape[:-1], weight.shape[-1] // 32),
+                7,
+                dtype=torch.uint8,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.quantization.fp8.quantize_mxfp8_weight",
+        fake_quantize,
+    )
+
+    specs = ext.build_hf_to_local_param_map(refit_info)
+    bf16_spec = specs.get(bf16_name)
+    mxfp8_spec = specs.get(mxfp8_name)
+    assert bf16_spec is not None and bf16_spec.pre is not None
+    assert bf16_spec.post is not None and bf16_spec.base is None
+    assert mxfp8_spec is not None and mxfp8_spec.pre is not None
+    assert mxfp8_spec.post is not None and mxfp8_spec.base is not None
+
+    bf16_spec.post(bf16_spec.pre(bf16_spec.base))
+    mxfp8_spec.post(mxfp8_spec.pre(mxfp8_spec.base))
+
+    assert ext._load_full_hf_weights.call_count == 1
+    assert torch.all(mxfp8_runtime.float() == 3)
+    assert torch.all(mxfp8_scale == 7)
+
+
 def test_build_hf_to_local_param_map_stages_qwen35_wrapped_experts():
     """Qwen3.5 wrapper prefixes and RoutedExperts names survive staged reload."""
     hidden_size, num_experts, intermediate_size = 16, 4, 32
