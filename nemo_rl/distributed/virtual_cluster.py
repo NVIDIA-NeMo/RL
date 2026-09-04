@@ -314,7 +314,13 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
             os.environ.pop(_k, None)
 
-    env_vars = dict(os.environ)
+    # Ray actors deserialize constructor arguments before importing NeMo-RL.
+    # Put Hugging Face's generated ``transformers_modules`` package on the
+    # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
+    # that boundary. This covers both V1 worker groups and direct V2/SC actors.
+    from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
+
+    env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
 
     runtime_env = {
