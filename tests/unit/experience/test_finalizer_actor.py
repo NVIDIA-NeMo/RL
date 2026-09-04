@@ -15,12 +15,15 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.blackbox_finalizer import FinalizedGroup
 from nemo_rl.experience.finalizer_actor import (
+    _FORBIDDEN_RPC_KEYS,
     FinalizationRequest,
     assert_metadata_only,
 )
@@ -80,3 +83,28 @@ def test_finalizer_request_and_result_are_metadata_only() -> None:
 def test_metadata_guard_rejects_tensor_and_heavy_row_payloads(payload) -> None:
     with pytest.raises(TypeError):
         assert_metadata_only(payload)
+
+
+def test_rpc_dataclass_fields_are_classified() -> None:
+    """A new field on either RPC dataclass must be a deliberate choice.
+
+    assert_metadata_only cannot tell a heavy list[int] of token ids from a short
+    list of metadata, so _FORBIDDEN_RPC_KEYS is maintained by hand. Pinning the
+    inventory makes a new field fail here until someone decides whether it is
+    light enough to cross the wire.
+    """
+    assert {f.name for f in fields(FinalizationRequest)} == {
+        "group_id", "rollout_ids", "receipts", "rewards",
+        "fallback_weight_version", "prompt_idx", "mask_sample", "truncated",
+    }
+    assert {f.name for f in fields(FinalizedGroup)} == {
+        "meta", "group_min_wv", "group_max_wv", "staging_keys",
+        "metrics", "dropped", "drop_reason",
+    }
+
+
+@pytest.mark.parametrize("key", sorted(_FORBIDDEN_RPC_KEYS))
+def test_every_forbidden_key_is_rejected(key) -> None:
+    """Removing an entry from the denylist should fail loudly."""
+    with pytest.raises(TypeError, match="forbidden heavy field"):
+        assert_metadata_only({key: [1, 2, 3]})
