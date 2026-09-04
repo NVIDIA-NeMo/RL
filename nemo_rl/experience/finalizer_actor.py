@@ -24,6 +24,12 @@ import torch
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.experience.blackbox_finalizer import BlackboxFinalizer, FinalizedGroup
 
+# Field names whose values are per-token and therefore large, but whose Python
+# type is indistinguishable from metadata -- a list[int] of token ids looks just
+# like a short list of ids. assert_metadata_only() below already rejects tensors
+# and unrecognised types; this list is only for heavy values that would otherwise
+# pass it. Add a name here whenever a new per-token field could reach an RPC
+# boundary, and update the dataclass inventory test that guards this file.
 _FORBIDDEN_RPC_KEYS = frozenset(
     {
         "input_ids",
@@ -34,6 +40,7 @@ _FORBIDDEN_RPC_KEYS = frozenset(
         "generation_logprobs",
         "generation_logprobs_delta",
         "generation_log_probs_delta",
+        "logprobs",
         "logprobs_delta",
         "routed_experts",
     }
