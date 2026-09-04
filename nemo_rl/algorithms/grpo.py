@@ -2333,100 +2333,6 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
-def _as_async_row_mask(
-    value: Any, *, batch_size: int, field_name: str, device: torch.device
-) -> torch.Tensor:
-    """Normalize one row-aligned mask column and validate its size."""
-    mask = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-    mask = mask.reshape(-1)
-    if mask.numel() != batch_size:
-        raise ValueError(f"{field_name} has {mask.numel()} rows; expected {batch_size}")
-    return mask.to(device=device, dtype=torch.bool)
-
-
-def _apply_async_pre_training_sample_masks(
-    repeated_batch: BatchedDataDict[DatumSpec],
-    *,
-    overlong_filtering: bool,
-) -> dict[str, int]:
-    """Apply and log disjoint sample-mask reasons for async GRPO.
-
-    Reasons are attributed in precedence order: an entry-time zero
-    ``loss_multiplier``, recovered empty Gym output, enabled overlong filtering,
-    and the rollout's ``mask_sample`` flag. Each row contributes to at most one
-    reason metric here; logprob-error masking is added later from the remaining
-    eligible rows.
-    """
-    loss_multiplier = repeated_batch["loss_multiplier"].clone()
-    if loss_multiplier.ndim != 1:
-        raise ValueError(
-            "loss_multiplier must be one-dimensional, got "
-            f"shape={tuple(loss_multiplier.shape)}"
-        )
-    batch_size = loss_multiplier.numel()
-    eligible = loss_multiplier != 0
-    metrics = {
-        "num_masked_seqs_by_loss_multiplier": int((~eligible).sum().item()),
-        "num_masked_seqs_by_empty_response_output": 0,
-        "num_masked_seqs_by_overlong_filtering": 0,
-        "num_masked_seqs_by_rollout": 0,
-        "num_masked_seqs_by_logprob_error": 0,
-    }
-
-    for row_index in torch.nonzero(~eligible, as_tuple=False).flatten().tolist():
-        _emit_async_sample_event(
-            "sample_masked",
-            repeated_batch,
-            row_index,
-            reason="loss_multiplier",
-            stage="batch_entry",
-        )
-
-    def apply_reason(field_name: str, reason: str, metric_name: str) -> None:
-        nonlocal eligible
-        if field_name not in repeated_batch:
-            return
-        candidate_mask = _as_async_row_mask(
-            repeated_batch[field_name],
-            batch_size=batch_size,
-            field_name=field_name,
-            device=eligible.device,
-        )
-        newly_masked = eligible & candidate_mask
-        metrics[metric_name] = int(newly_masked.sum().item())
-        for row_index in torch.nonzero(newly_masked, as_tuple=False).flatten().tolist():
-            _emit_async_sample_event(
-                "sample_masked",
-                repeated_batch,
-                row_index,
-                reason=reason,
-                stage="pre_training",
-            )
-        loss_multiplier[newly_masked] = 0
-        eligible = eligible & ~newly_masked
-
-    apply_reason(
-        NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
-        "empty_response_output",
-        "num_masked_seqs_by_empty_response_output",
-    )
-    if overlong_filtering:
-        apply_reason(
-            "truncated",
-            "overlong_filtering",
-            "num_masked_seqs_by_overlong_filtering",
-        )
-    apply_reason(
-        "mask_sample",
-        "rollout",
-        "num_masked_seqs_by_rollout",
-    )
-
-    repeated_batch["loss_multiplier"] = loss_multiplier
-    metrics["num_masked_seqs_total"] = sum(metrics.values())
-    return metrics
-
-
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
@@ -5094,9 +5000,97 @@ def async_grpo_train(
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     with timer.time("async_sample_masking"):
-                        async_mask_metrics = _apply_async_pre_training_sample_masks(
-                            repeated_batch,
-                            overlong_filtering=(master_config.grpo.overlong_filtering),
+                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                        if loss_multiplier.ndim != 1:
+                            raise ValueError(
+                                "loss_multiplier must be one-dimensional, got "
+                                f"shape={tuple(loss_multiplier.shape)}"
+                            )
+                        batch_size = loss_multiplier.numel()
+                        eligible = loss_multiplier != 0
+                        async_mask_metrics = {
+                            "num_masked_seqs_by_loss_multiplier": int(
+                                (~eligible).sum().item()
+                            ),
+                            "num_masked_seqs_by_empty_response_output": 0,
+                            "num_masked_seqs_by_overlong_filtering": 0,
+                            "num_masked_seqs_by_rollout": 0,
+                            "num_masked_seqs_by_logprob_error": 0,
+                        }
+
+                        # Attribute overlapping masks in precedence order so each
+                        # row contributes to exactly one reason metric.
+                        for row_index in (
+                            torch.nonzero(~eligible, as_tuple=False).flatten().tolist()
+                        ):
+                            _emit_async_sample_event(
+                                "sample_masked",
+                                repeated_batch,
+                                row_index,
+                                reason="loss_multiplier",
+                                stage="batch_entry",
+                            )
+
+                        mask_reasons = [
+                            (
+                                NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
+                                "empty_response_output",
+                                "num_masked_seqs_by_empty_response_output",
+                            )
+                        ]
+                        if master_config.grpo.overlong_filtering:
+                            mask_reasons.append(
+                                (
+                                    "truncated",
+                                    "overlong_filtering",
+                                    "num_masked_seqs_by_overlong_filtering",
+                                )
+                            )
+                        mask_reasons.append(
+                            (
+                                "mask_sample",
+                                "rollout",
+                                "num_masked_seqs_by_rollout",
+                            )
+                        )
+
+                        for field_name, reason, metric_name in mask_reasons:
+                            if field_name not in repeated_batch:
+                                continue
+                            candidate_mask = repeated_batch[field_name]
+                            if not isinstance(candidate_mask, torch.Tensor):
+                                candidate_mask = torch.as_tensor(candidate_mask)
+                            candidate_mask = candidate_mask.reshape(-1)
+                            if candidate_mask.numel() != batch_size:
+                                raise ValueError(
+                                    f"{field_name} has {candidate_mask.numel()} rows; "
+                                    f"expected {batch_size}"
+                                )
+                            candidate_mask = candidate_mask.to(
+                                device=eligible.device, dtype=torch.bool
+                            )
+                            newly_masked = eligible & candidate_mask
+                            async_mask_metrics[metric_name] = int(
+                                newly_masked.sum().item()
+                            )
+                            for row_index in (
+                                torch.nonzero(newly_masked, as_tuple=False)
+                                .flatten()
+                                .tolist()
+                            ):
+                                _emit_async_sample_event(
+                                    "sample_masked",
+                                    repeated_batch,
+                                    row_index,
+                                    reason=reason,
+                                    stage="pre_training",
+                                )
+                            loss_multiplier[newly_masked] = 0
+                            eligible &= ~newly_masked
+
+                        repeated_batch["loss_multiplier"] = loss_multiplier
+                        async_mask_metrics["num_masked_seqs_total"] = sum(
+                            async_mask_metrics.values()
                         )
 
                     # Add loss mask to each message
