@@ -631,6 +631,79 @@ def test_fp8_kv_cache_does_not_add_a_second_model_wide_pass(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_the_non_native_finalizer_clears_the_exactly_once_guard(monkeypatch):
+    """Otherwise the model-wide pass is a no-op on every quantized module.
+
+    ``process_weights_after_loading`` guards itself with a sticky attribute so it
+    runs once per load, and vLLM sets that attribute during engine startup --
+    upstream, a load happens once per process. A refit is a second load, and
+    only vLLM's own layerwise reload clears the guard. On the non-native path
+    there is no layerwise reload, so unless the finalizer clears the guard
+    itself the rebuild is skipped and the kernel keeps serving the previous
+    step's layout: no exception, no log, just a policy generating from stale
+    experts.
+
+    The guard is read at call time rather than after the fact, because clearing
+    it *after* the pass would look identical at the end and fix nothing.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    model = _make_mixed_precision_moe_model("FlashInfer TRTLLM")
+    quantized = [
+        module
+        for module in model.modules()
+        if not isinstance(module.quant_method, UnquantizedFusedMoEMethod)
+    ]
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=object(),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=model, vllm_config=vllm_config, model_config=model_config
+    )
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+
+    # The state vLLM leaves behind after building the engine.
+    for module in model.modules():
+        module._already_called_process_weights_after_loading = True
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    still_guarded = []
+
+    def process(*_args, **_kwargs):
+        still_guarded.extend(
+            module
+            for module in model.modules()
+            if hasattr(module, "_already_called_process_weights_after_loading")
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+
+    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+        finalize()
+
+    # The premise: a model with nothing to skip would pass either way.
+    assert quantized
+    assert still_guarded == []
+
+
+@pytest.mark.vllm
 def test_kv_cache_pass_still_runs_when_the_transport_never_finalized(monkeypatch):
     """The skip is conditional on finalize() having run, not on reaching the end.
 
