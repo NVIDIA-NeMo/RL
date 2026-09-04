@@ -30,7 +30,7 @@ no key minting). Workers fetch their slice from TQ via
 from __future__ import annotations
 
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -73,6 +73,15 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         for k, v in r["all_mb_metrics"].items():
             all_mb_metrics[k].extend(v)
     out["all_mb_metrics"] = dict(all_mb_metrics)
+    # Only the replica leader ever populates this (see
+    # TQWorkerMixin._maybe_assemble_routed_experts), so non-leader entries
+    # are always empty and summing every result is safe without an
+    # is_replica_leader filter; each DP replica leader covers disjoint data.
+    route_fallback_counts: Counter[str] = Counter()
+    for r in results:
+        route_fallback_counts.update(r.get("route_fallback_counts") or {})
+    if route_fallback_counts:
+        out["route_fallback_counts"] = dict(route_fallback_counts)
     return out
 
 

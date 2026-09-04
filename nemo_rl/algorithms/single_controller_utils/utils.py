@@ -87,6 +87,15 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
             metrics[k] = float(np.mean(v))
         else:
             metrics[k] = float(np.sum(v))
+
+    # Deferred-mode counterpart to blackbox_finalizer's direct-mode
+    # routed_experts_row_coverage/routed_experts_sentinel_token_fraction:
+    # this step's per-reason count of rows whose route fragments failed to
+    # reassemble at the policy worker (see TQWorkerMixin._route_fallback_counts).
+    # Silent otherwise -- the only other trace is a logging.warning.
+    for reason, count in train_result.get("route_fallback_counts", {}).items():
+        metrics[f"routed_experts_deferred_fallback/{reason}"] = float(count)
+
     return metrics
 
 

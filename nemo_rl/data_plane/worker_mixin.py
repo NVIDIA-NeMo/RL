@@ -849,9 +849,16 @@ class TQWorkerMixin:
         GPU and the metric list ends up TP×CP×PP times too long, which
         inflates every per-token aggregate (gen_kl_error, probs_ratio,
         etc.) by that same factor.
+
+        Also pops this step's deferred-route fallback counts (only the
+        replica leader ever populates them, same as the metrics above) so
+        they report a per-step rate instead of accumulating silently for
+        the worker's lifetime.
         """
         result = self.finish_train_step()  # type: ignore[attr-defined]
         result["is_replica_leader"] = bool(self._is_replica_leader())
+        result["route_fallback_counts"] = dict(self._route_fallback_counts)
+        self._route_fallback_counts = Counter()
         return result
 
     @wrap_with_nvtx_name("policy_worker/abort_train_step_presharded")
