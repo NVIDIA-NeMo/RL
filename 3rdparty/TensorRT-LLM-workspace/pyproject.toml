@@ -147,6 +147,11 @@ backend-path = ["."]
 # tekit is a private GitLab repo, so the url carries a ${GITLAB_CLONE_ACCESS_TOKEN}
 # placeholder that _backend.py expands from the build environment (the token is
 # never committed, and the cache key uses this raw string, not the expanded one).
+# No "user:" prefix here: CI passes the token already as "user:token", and
+# prefixing would give "oauth2:user:token" -- URL userinfo splits on the first
+# colon, so the password becomes "user:token" and the fetch fails with
+# "HTTP Basic: Access denied". Callers holding a bare token add their own
+# username (build-custom-trtllm.sh's caller does).
 # The ref is user/zongfeij/rl @ 1.3.0rc23: 
-url = "https://oauth2:${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git"
+url = "https://${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git"
 ref = "780b94e6557ecbf7451fa47f85412c3de6d2dcd9"   # pragma: allowlist secret
