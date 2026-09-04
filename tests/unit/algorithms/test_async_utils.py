@@ -2223,7 +2223,11 @@ class TestAsyncTrajectoryCollector:
         assert collector.current_weight_version == 2
         assert collector._generation_lead_steps == 3
         assert collector._max_trajectory_age_steps == 5
-        assert collector._calculate_target_weights(2) == [3, 4, 5]
+        assert collector._calculate_target_weights(2, last_consumed_target=2) == [
+            3,
+            4,
+            5,
+        ]
 
     def test_collector_grpo_window_remains_fixed(self):
         collector = self.create_local_collector()
@@ -2231,14 +2235,124 @@ class TestAsyncTrajectoryCollector:
         assert collector.current_weight_version == 0
         assert collector._generation_lead_steps == 2
         assert collector._max_trajectory_age_steps == 2
-        assert collector._calculate_target_weights(0) == [0, 1, 2]
+        # Initial version: the window includes the current version and ignores
+        # last_consumed_target.
+        assert collector._calculate_target_weights(0, last_consumed_target=-1) == [
+            0,
+            1,
+            2,
+        ]
 
         collector.set_weight_version(5)
 
         assert collector.current_weight_version == 5
         assert collector._generation_lead_steps == 2
         assert collector._max_trajectory_age_steps == 2
-        assert collector._calculate_target_weights(5) == [6, 7]
+        # Steady state (training consumed the current version): unchanged
+        # window starting at current + 1.
+        assert collector._calculate_target_weights(5, last_consumed_target=5) == [
+            6,
+            7,
+        ]
+
+    def test_collector_window_extends_to_unconsumed_failed_targets(self):
+        """A short target at or below the current version stays visible.
+
+        A permanently-failed prompt group leaves its target unconsumed; the
+        window must extend down to last_consumed + 1 so gap-filling can
+        regenerate it instead of stalling training (callers skip targets at or
+        below last_consumed_target, so only genuine holes surface).
+        """
+        collector = self.create_local_collector()
+        collector.set_weight_version(5)
+
+        # Training consumed through 2; targets 3..5 are holes left by failed
+        # groups and must be part of the window alongside the lookahead 6..7.
+        assert collector._calculate_target_weights(5, last_consumed_target=2) == [
+            3,
+            4,
+            5,
+            6,
+            7,
+        ]
+
+    def test_generation_limit_pause_recovers_set_racing_clear(self):
+        """A set() racing the clear() must not be lost.
+
+        Interleaving: the collection loop decides to pause, a worker calls
+        set() (e.g. failed-worker cleanup), then the loop's clear() erases the
+        wake. The immediate post-clear re-check must notice the condition no
+        longer holds, restore the event, and return without waiting.
+        """
+        collector = self.create_local_collector()
+        # The worker's set() happened just before the pause path ran; by the
+        # time _pause_for_generation_limits re-checks, a target needs
+        # generation again.
+        collector._should_pause_for_generation_limits = mock.MagicMock(
+            return_value=False
+        )
+        collector._generation_limit_cleared.set()
+
+        start = time.perf_counter()
+        collector._pause_for_generation_limits()
+        elapsed = time.perf_counter() - start
+
+        assert collector._generation_limit_cleared.is_set()
+        assert elapsed < 1.0
+        collector._should_pause_for_generation_limits.assert_called_once()
+
+    def test_generation_limit_pause_rechecks_after_timeout(self):
+        """The bounded wait re-checks the pause condition and resumes.
+
+        With no weight update ever arriving (the failed-group deadlock), the
+        pause must wake on its own once a target needs trajectories again.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        # Skip the once-per-version warning branch (it queries the replay
+        # buffer, which is a bare mock here).
+        collector._last_limit_warning_version = collector.current_weight_version
+        # Pause holds at clear() time and on the first timed re-check, then a
+        # gap opens (failed group) and the pause must release.
+        collector._should_pause_for_generation_limits = mock.MagicMock(
+            side_effect=[True, True, False]
+        )
+        with mock.patch(
+            "nemo_rl.algorithms.async_utils.trajectory_collector._GENERATION_LIMIT_RECHECK_SECONDS",
+            0.05,
+        ):
+            start = time.perf_counter()
+            collector._pause_for_generation_limits()
+            elapsed = time.perf_counter() - start
+
+        assert elapsed < 5.0
+        assert not collector._generation_limit_cleared.is_set()
+        assert collector._should_pause_for_generation_limits.call_count == 3
+
+    def test_generation_limit_pause_wakes_on_event_set(self):
+        """The normal wake path (weight update set()) is unaffected."""
+        collector = self.create_local_collector()
+        collector.running = True
+        # Skip the once-per-version warning branch (it queries the replay
+        # buffer, which is a bare mock here).
+        collector._last_limit_warning_version = collector.current_weight_version
+        collector._should_pause_for_generation_limits = mock.MagicMock(
+            return_value=True
+        )
+
+        def _release() -> None:
+            time.sleep(0.1)
+            collector._generation_limit_cleared.set()
+
+        releaser = threading.Thread(target=_release)
+        releaser.start()
+        start = time.perf_counter()
+        collector._pause_for_generation_limits()
+        elapsed = time.perf_counter() - start
+        releaser.join()
+
+        assert collector._generation_limit_cleared.is_set()
+        assert elapsed < 5.0
 
     def test_collector_rejects_generation_lead_above_validity_age(self):
         collector = self.create_local_collector()
