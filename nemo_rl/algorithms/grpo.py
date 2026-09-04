@@ -2107,7 +2107,7 @@ def _emit_async_sample_event(
     batch: BatchedDataDict,
     row_index: int,
     *,
-    message: Optional[str] = None,
+    message: str,
     **fields: Any,
 ) -> None:
     """Print one human-readable diagnostic with stable sample identity."""
@@ -2117,7 +2117,7 @@ def _emit_async_sample_event(
         **fields,
     }
     details = " ".join(f"{key}={value!r}" for key, value in diagnostic_fields.items())
-    print(f"{message or 'Async GRPO sample diagnostic'}; {details}", flush=True)
+    print(f"{message}; {details}", flush=True)
 
 
 def _apply_message_level_advantage_penalties(
@@ -2765,6 +2765,8 @@ def compute_and_apply_seq_logprob_error_masking(
                 (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
             )
             masked_correct_pct = masked_correct_count / num_masked_seqs
+            # Sync callers retain the aggregate masking message above. Only the
+            # async path has row identity metadata for per-sample diagnostics.
             if sample_metadata is not None:
                 for row_index in (
                     torch.nonzero(diff_mask_bool, as_tuple=False).flatten().tolist()
@@ -2773,6 +2775,10 @@ def compute_and_apply_seq_logprob_error_masking(
                         "sample_masked",
                         sample_metadata,
                         row_index,
+                        message=(
+                            "Masking async GRPO sample because its sequence-level "
+                            "logprob error exceeds the threshold"
+                        ),
                         reason="seq_logprob_error",
                         stage="pre_training",
                         seq_mult_prob_error=float(
@@ -4798,7 +4804,7 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with timer.time("total_step_time"):
-                async_mask_metrics: dict[str, int] = {}
+                sample_mask_metrics: dict[str, int] = {}
 
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
@@ -5008,7 +5014,7 @@ def async_grpo_train(
                             )
                         batch_size = loss_multiplier.numel()
                         eligible = loss_multiplier != 0
-                        async_mask_metrics = {
+                        sample_mask_metrics = {
                             "num_masked_seqs_by_loss_multiplier": int(
                                 (~eligible).sum().item()
                             ),
@@ -5027,6 +5033,10 @@ def async_grpo_train(
                                 "sample_masked",
                                 repeated_batch,
                                 row_index,
+                                message=(
+                                    "Async GRPO sample entered training with a zero "
+                                    "loss multiplier"
+                                ),
                                 reason="loss_multiplier",
                                 stage="batch_entry",
                             )
@@ -5036,6 +5046,7 @@ def async_grpo_train(
                                 NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
                                 "empty_response_output",
                                 "num_masked_seqs_by_empty_response_output",
+                                "Masking async GRPO sample because its response output is empty",
                             )
                         ]
                         if master_config.grpo.overlong_filtering:
@@ -5044,6 +5055,7 @@ def async_grpo_train(
                                     "truncated",
                                     "overlong_filtering",
                                     "num_masked_seqs_by_overlong_filtering",
+                                    "Masking async GRPO sample because of overlong filtering",
                                 )
                             )
                         mask_reasons.append(
@@ -5051,10 +5063,16 @@ def async_grpo_train(
                                 "mask_sample",
                                 "rollout",
                                 "num_masked_seqs_by_rollout",
+                                "Masking async GRPO sample because the rollout marked it for masking",
                             )
                         )
 
-                        for field_name, reason, metric_name in mask_reasons:
+                        for (
+                            field_name,
+                            reason,
+                            metric_name,
+                            diagnostic_message,
+                        ) in mask_reasons:
                             if field_name not in repeated_batch:
                                 continue
                             candidate_mask = repeated_batch[field_name]
@@ -5070,7 +5088,7 @@ def async_grpo_train(
                                 device=eligible.device, dtype=torch.bool
                             )
                             newly_masked = eligible & candidate_mask
-                            async_mask_metrics[metric_name] = int(
+                            sample_mask_metrics[metric_name] = int(
                                 newly_masked.sum().item()
                             )
                             for row_index in (
@@ -5082,6 +5100,7 @@ def async_grpo_train(
                                     "sample_masked",
                                     repeated_batch,
                                     row_index,
+                                    message=diagnostic_message,
                                     reason=reason,
                                     stage="pre_training",
                                 )
@@ -5089,8 +5108,8 @@ def async_grpo_train(
                             eligible &= ~newly_masked
 
                         repeated_batch["loss_multiplier"] = loss_multiplier
-                        async_mask_metrics["num_masked_seqs_total"] = sum(
-                            async_mask_metrics.values()
+                        sample_mask_metrics["num_masked_seqs_total"] = sum(
+                            sample_mask_metrics.values()
                         )
 
                     # Add loss mask to each message
@@ -5192,10 +5211,10 @@ def async_grpo_train(
                 num_logprob_error_masks = int(
                     seq_logprob_error_metrics["num_masked_seqs_by_logprob_error"]
                 )
-                async_mask_metrics["num_masked_seqs_by_logprob_error"] = (
+                sample_mask_metrics["num_masked_seqs_by_logprob_error"] = (
                     num_logprob_error_masks
                 )
-                async_mask_metrics["num_masked_seqs_total"] += num_logprob_error_masks
+                sample_mask_metrics["num_masked_seqs_total"] += num_logprob_error_masks
 
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
@@ -5450,7 +5469,7 @@ def async_grpo_train(
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
-                    **async_mask_metrics,
+                    **sample_mask_metrics,
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
