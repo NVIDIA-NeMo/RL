@@ -144,7 +144,7 @@ def register_env(env_name: str, actor_class_fqn: str) -> None:
 
 def shutdown_environments(
     *env_maps: Optional[Dict[str, EnvironmentInterface]],
-    timeout: float = DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS,
+    timeout: float | None = DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS,
 ) -> None:
     """Gracefully shut down every distinct environment actor in the given maps.
 
@@ -159,7 +159,8 @@ def shutdown_environments(
     Args:
         env_maps: Task-name to environment mappings. ``None`` and empty
             mappings are skipped.
-        timeout: Seconds to wait for each actor's ``shutdown()`` before killing it.
+        timeout: Seconds to wait for each actor's ``shutdown()`` before killing
+            it. ``None`` waits until graceful shutdown finishes.
     """
     seen: set[int] = set()
     for env_map in env_maps:
