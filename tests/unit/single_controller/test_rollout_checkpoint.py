@@ -19,13 +19,9 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from nemo_rl.algorithms.single_controller_utils import rollout_checkpoint
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.single_controller_utils import rollout_checkpoint
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
-from nemo_rl.data import DataConfig
-from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.generation.vllm.config import VllmSpecificArgs
-from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
@@ -38,8 +34,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     prune_bootstrap_snapshots,
     reset_bootstrap_anchor,
     resolve_latest_snapshot,
-    validate_bootstrap_anchor,
 )
+from nemo_rl.data import DataConfig
+from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.vllm.config import VllmSpecificArgs
+from nemo_rl.models.policy import PolicyConfig
 
 
 class _DumpedConfig:
@@ -51,24 +50,179 @@ class _DumpedConfig:
         return self._dumped
 
 
+_BOOTSTRAP_PROJECTION_CASES = (
+    (
+        rollout_checkpoint._BOOTSTRAP_POLICY_FIELDS,
+        frozenset(
+            {
+                "disable_modelopt_layer_spec",
+                "draft",
+                "dtensor_cfg",
+                "dynamic_batching",
+                "generation",
+                "generation_batch_size",
+                "is_vlm",
+                "logprob_batch_size",
+                "logprob_chunk_size",
+                "make_sequence_length_divisible_by",
+                "max_grad_norm",
+                "megatron_cfg",
+                "optimizer",
+                "precision",
+                "quant_batch_size",
+                "quant_calib_data",
+                "quant_calib_size",
+                "quant_cfg",
+                "quant_sequence_length",
+                "refit_buffer_size_gb",
+                "reward_model_cfg",
+                "router_replay",
+                "scheduler",
+                "sequence_packing",
+                "train_global_batch_size",
+                "train_micro_batch_size",
+            }
+        ),
+        PolicyConfig,
+    ),
+    (
+        rollout_checkpoint._BOOTSTRAP_GENERATION_FIELDS,
+        frozenset(
+            {
+                "_debug_payload_metrics",
+                "_mtp_weights_from_refit",
+                "_pad_token_id",
+                "bad_words",
+                "colocated",
+                "model_name",
+                "port_range_high",
+                "port_range_low",
+                "use_async_rollouts",
+                "val_temperature",
+                "val_top_k",
+                "val_top_p",
+            }
+        ),
+        GenerationConfig,
+    ),
+    (
+        rollout_checkpoint._BOOTSTRAP_VLLM_FIELDS,
+        frozenset(
+            {
+                "async_engine",
+                "cap_max_tokens_to_context",
+                "enable_return_routed_experts",
+                "enforce_eager",
+                "env_vars",
+                "expert_parallel_size",
+                "expose_http_server",
+                "gpu_memory_utilization",
+                "http_refit_api_key_env_var",
+                "http_refit_server_port",
+                "is_mx",
+                "kv_cache_dtype",
+                "load_format",
+                "logprobs_mode",
+                "pipeline_parallel_size",
+                "precision",
+                "quantization_ignore_patterns",
+                "quantization_ignored_layer_kws",
+                "reset_encoder_cache_after_weight_update",
+                "skip_tokenizer_init",
+                "tensor_parallel_size",
+                "tool_parser_plugin",
+                "use_tqdm",
+                "video",
+                "zmq_refit_server_port",
+            }
+        ),
+        VllmSpecificArgs,
+    ),
+    (
+        rollout_checkpoint._BOOTSTRAP_GRPO_FIELDS,
+        frozenset(
+            {
+                "adv_estimator",
+                "advantage_clip_high",
+                "advantage_clip_low",
+                "async_grpo",
+                "batch_multiplier",
+                "calculate_advantages_on_gpu",
+                "debug_payload_metrics",
+                "deduplicate_multimodal_data",
+                "dynamic_sampling_max_gen_batches",
+                "invalid_tool_call_advantage",
+                "malformed_thinking_advantage",
+                "max_num_epochs",
+                "max_num_steps",
+                "max_val_samples",
+                "normalize_rewards",
+                "overlong_filtering",
+                "reward_scaling",
+                "reward_shaping",
+                "seq_logprob_error_threshold",
+                "skip_reference_policy_logprobs_calculation",
+                "stop_at_validation_metric",
+                "stop_at_validation_threshold",
+                "use_dynamic_sampling",
+                "use_leave_one_out_baseline",
+                "val_at_end",
+                "val_at_start",
+                "val_batch_size",
+                "val_num_generations_per_prompt",
+                "val_period",
+                "val_start_at",
+            }
+        ),
+        GRPOConfig,
+    ),
+    (
+        rollout_checkpoint._BOOTSTRAP_DATA_FIELDS,
+        frozenset(
+            {
+                "add_bos",
+                "add_eos",
+                "add_generation_prompt",
+                "add_system_prompt",
+                "custom_dataloader",
+                "num_prompts_per_dataloader",
+                "num_workers",
+                "use_multiple_dataloader",
+                "validation",
+            }
+        ),
+        DataConfig,
+    ),
+    (
+        rollout_checkpoint._BOOTSTRAP_TOKEN_CAPTURE_FIELDS,
+        frozenset(
+            {
+                "capture_dir",
+                "control_auth_token",
+                "control_timeout_s",
+                "num_finalizer_workers",
+            }
+        ),
+        TokenCaptureConfig,
+    ),
+)
+
+
 @pytest.mark.parametrize(
-    ("declared", "schema"),
+    ("declared", "ignored", "schema"),
     [
-        (rollout_checkpoint._BOOTSTRAP_POLICY_FIELDS, PolicyConfig),
-        (rollout_checkpoint._BOOTSTRAP_GENERATION_FIELDS, GenerationConfig),
-        (rollout_checkpoint._BOOTSTRAP_VLLM_FIELDS, VllmSpecificArgs),
-        (rollout_checkpoint._BOOTSTRAP_GRPO_FIELDS, GRPOConfig),
-        (rollout_checkpoint._BOOTSTRAP_DATA_FIELDS, DataConfig),
-        (rollout_checkpoint._BOOTSTRAP_TOKEN_CAPTURE_FIELDS, TokenCaptureConfig),
+        pytest.param(declared, ignored, schema, id=schema.__name__)
+        for declared, ignored, schema in _BOOTSTRAP_PROJECTION_CASES
     ],
 )
-def test_bootstrap_projection_fields_exist_in_config_schema(declared, schema):
+def test_bootstrap_projection_covers_config_schema(declared, ignored, schema):
     fields = (
         set(schema.model_fields)
         if hasattr(schema, "model_fields")
         else set(schema.__annotations__)
     )
-    assert declared <= fields
+    assert declared.isdisjoint(ignored)
+    assert declared | ignored == fields
 
 
 def _commit_snapshot(
@@ -98,10 +252,10 @@ def _commit_snapshot(
 
 def test_bootstrap_anchor_rejects_different_initial_state(tmp_path):
     anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
-    validate_bootstrap_anchor(anchor, fingerprint="fingerprint-v1")
+    assert ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1") == anchor
 
     with pytest.raises(ValueError, match="does not match"):
-        validate_bootstrap_anchor(anchor, fingerprint="fingerprint-v2")
+        ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v2")
 
 
 def test_bootstrap_fingerprint_ignores_non_recovery_configuration() -> None:
@@ -138,9 +292,11 @@ def test_bootstrap_fingerprint_ignores_non_recovery_configuration() -> None:
         },
         "reward_penalties": {"penalize_unwanted_tokens": False},
         "token_capture": {
+            "control_timeout_s": 60.0,
             "enabled": True,
-            "staging_partition": "rollout_staging",
+            "num_finalizer_workers": 2,
             "on_capture_failure": "continue",
+            "staging_partition": "rollout_staging",
         },
         "cluster": {"num_nodes": 2},
         "logger": {"log_dir": "/run/one"},
@@ -176,7 +332,8 @@ def test_bootstrap_fingerprint_ignores_non_recovery_configuration() -> None:
         "reward_penalties": {"penalize_unwanted_tokens": True},
         "token_capture": {
             **base["token_capture"],
-            "on_capture_failure": "abort",
+            "control_timeout_s": 15.0,
+            "num_finalizer_workers": 8,
         },
         "cluster": {"num_nodes": 8},
         "logger": {"log_dir": "/run/two"},
@@ -195,6 +352,8 @@ def test_bootstrap_fingerprint_ignores_non_recovery_configuration() -> None:
         ("data", {"train": [{"data_path": "/datasets/other.jsonl"}]}),
         ("grpo", {"num_generations_per_prompt": 8}),
         ("token_capture", {"mixed_weight_version_policy": "reject"}),
+        ("token_capture", {"defer_routed_experts_to_policy": True}),
+        ("token_capture", {"on_capture_failure": "abort"}),
         (
             "async_rl",
             {"sampler": {"name": "windowed", "max_staleness_versions": 2}},
@@ -426,6 +585,75 @@ def test_bootstrap_fingerprint_ignores_declared_environment_runtime_fields(
     )
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["hf_token", "judge_api_key", "policy_api_key", "wandb_api_key"],
+)
+def test_bootstrap_fingerprint_ignores_nested_environment_credentials(
+    field: str,
+) -> None:
+    base = {
+        "env": {
+            "nemo_gym": {
+                "service": {
+                    "model": "model-a",
+                    field: "credential-one",
+                }
+            }
+        }
+    }
+    credential_changed = {
+        "env": {
+            "nemo_gym": {
+                "service": {
+                    "model": "model-a",
+                    field: "credential-two",
+                }
+            }
+        }
+    }
+
+    identity = bootstrap_compatibility_identity(cast(Any, _DumpedConfig(base)))
+    assert field not in identity.environment["nemo_gym"]["service"]
+    assert bootstrap_fingerprint(cast(Any, _DumpedConfig(base))) == (
+        bootstrap_fingerprint(cast(Any, _DumpedConfig(credential_changed)))
+    )
+
+
+def test_bootstrap_fingerprint_keeps_environment_token_semantics() -> None:
+    base = {
+        "env": {
+            "nemo_gym": {
+                "service": {
+                    "model": "model-a",
+                    "max_tokens": 1024,
+                    "tokenizer": "tokenizer-a",
+                }
+            }
+        }
+    }
+    max_tokens_changed = {
+        "env": {
+            "nemo_gym": {
+                "service": {
+                    **base["env"]["nemo_gym"]["service"],
+                    "max_tokens": 2048,
+                }
+            }
+        }
+    }
+
+    identity = bootstrap_compatibility_identity(cast(Any, _DumpedConfig(base)))
+    assert identity.environment["nemo_gym"]["service"] == {
+        "max_tokens": 1024,
+        "model": "model-a",
+        "tokenizer": "tokenizer-a",
+    }
+    assert bootstrap_fingerprint(cast(Any, _DumpedConfig(base))) != (
+        bootstrap_fingerprint(cast(Any, _DumpedConfig(max_tokens_changed)))
+    )
+
+
 def test_prune_bootstrap_snapshots_requires_durable_trainer_checkpoint(tmp_path):
     snapshot_root = tmp_path / "bootstrap" / "rollout_snapshots"
     snapshot_root.mkdir(parents=True)
@@ -458,7 +686,7 @@ def test_reset_bootstrap_anchor_discards_skipped_snapshot_lineage(
 
     assert reset == anchor
     assert not snapshot_root.exists()
-    validate_bootstrap_anchor(anchor, fingerprint="new-fingerprint")
+    assert ensure_bootstrap_anchor(tmp_path, fingerprint="new-fingerprint") == anchor
 
 
 def test_resolver_selects_latest_compatible_committed_snapshot(tmp_path):
