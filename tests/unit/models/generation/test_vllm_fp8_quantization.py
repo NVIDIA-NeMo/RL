@@ -592,7 +592,10 @@ def test_quantize_mxfp8_weight_restores_grouped_logical_shape(
 
     assert value.shape == (2, 3, hidden_size)
     assert scale.shape == (2, 3, hidden_size // 32)
-    torch.testing.assert_close(scale, quantized_scale.reshape(scale.shape))
+    expected_scale = torch.where(
+        quantized_scale == 0, torch.ones_like(quantized_scale), quantized_scale
+    )
+    torch.testing.assert_close(scale, expected_scale.reshape(scale.shape))
 
 
 @pytest.mark.parametrize(
