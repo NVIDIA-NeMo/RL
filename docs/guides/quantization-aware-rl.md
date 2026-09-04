@@ -195,8 +195,12 @@ examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.
 
 This recipe contains the 300-step, 256-example-validation campaign settings.
 The GB200 nightly driver overrides it to a two-step, 32-example smoke test.
-Both paths require the standalone ModelOpt-enabled Megatron-Bridge checkout;
-the embedded NeMo RL checkout does not contain the grouped-MoE W4A4 exporter.
+Before running this MoE recipe, use jointly compatible ModelOpt and embedded
+Megatron-Bridge revisions. ModelOpt must provide
+`modelopt.torch.export.quantized_weight_export`; Megatron-Bridge must import the
+functional APIs from that module and provide
+`AutoBridge.export_hf_weight_groups_modelopt`. Older or independently selected
+revisions are unsupported.
 
 For a BF16 baseline, copy the recipe, remove `policy.quant_cfg`,
 `policy.generation.quant_cfg`, and `policy.generation.real_quant`, and use distinct
@@ -388,5 +392,5 @@ uv run --extra mcore --extra modelopt \
 - **Real-quant rollout**: The native-loader path has end-to-end functional coverage for dense W4A16. W4A4, fused-MoE, and hybrid MoE/Mamba paths require architecture-specific revalidation; fused MoE currently requires all experts local to each vLLM rank. The policy recipe must leave unsupported or sensitive paths in BF16.
 - **Real-quant refit transport**: NIXL, custom checkpoint engines, `nccl_reshard`, and remote sparse-delta transports are not supported because they bypass vLLM's native layerwise reload lifecycle.
 - **Router Replay (R3)**: R3 is supported on the Megatron policy path.
-- **Input quantization**: W4A4 real rollout supports ModelOpt's block-16 E2M1 input format with a global scale per projection; other activation formats remain fake-quant only.
+- **Real-quant activation formats**: Runtime support is the intersection of formats emitted by ModelOpt and complete fused-layer combinations accepted by the pinned vLLM. The architecture supports mixed formats without downstream format branches, but only entries in the validation table above should be treated as empirically validated.
 - **Model support**: Dense Transformer, MoE (Mixture of Experts), and hybrid MoE/Mamba models are supported on the Megatron policy + vLLM generation path when Megatron-Bridge and ModelOpt support the model architecture and quantization recipe.
