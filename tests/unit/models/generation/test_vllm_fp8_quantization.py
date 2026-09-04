@@ -402,7 +402,12 @@ def test_init_fp8_rejects_invalid_bf16_layer_boundaries(
             ]
         ),
     )
-    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+    patch_calls = []
+    monkeypatch.setattr(
+        fp8,
+        "monkey_patch_vllm_ray_executor",
+        lambda config: patch_calls.append(config),
+    )
 
     vllm_cfg = {
         "precision": "fp8",
@@ -416,6 +421,9 @@ def test_init_fp8_rejects_invalid_bf16_layer_boundaries(
 
     with pytest.raises(ValueError, match=error_match):
         fp8.init_fp8(vllm_cfg, "dummy-qwen-model", model_parallel_size=1)
+
+    assert patch_calls == []
+    assert fp8.global_fp8_config is None
 
 
 def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
