@@ -462,20 +462,9 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
-        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
-            "rollout_max_attempts_to_avoid_lp_nan", 1
-        )
-
-        assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
-            "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
-        )
-
         # Ledger-authoritative token capture: enable external staging in the
         # policy model server (via the policy_model global-config override
         # block the env yamls already use) and disable the legacy token echo.
-        # Receipt mode is incompatible with re-dispatching a batch under the
-        # same rollout ids — the retry's calls would resolve against the
-        # first attempt's ledger rows — so the NaN retry must be exactly 1.
         token_capture = self.cfg.get("token_capture") or None
         self._token_capture_enabled = bool(
             token_capture and token_capture.get("enabled")
@@ -484,12 +473,6 @@ Depending on your data shape, you may want to change these values."""
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
-            if self.rollout_max_attempts_to_avoid_lp_nan != 1:
-                raise ValueError(
-                    "token_capture.enabled requires "
-                    "rollout_max_attempts_to_avoid_lp_nan == 1: a NaN retry "
-                    "would resolve against the first attempt's ledger rows"
-                )
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
                 .setdefault("responses_api_models", {})
@@ -518,9 +501,6 @@ Depending on your data shape, you may want to change these values."""
             self._control_headers = {
                 "Authorization": f"Bearer {token_capture['control_auth_token']}"
             }
-            # S5 chaos finding: Gym's shared request() retries connection
-            # errors indefinitely; a dead control plane must surface as a
-            # failed manifest fetch (placeholder row), not a silent stall.
             self._control_timeout_s = float(
                 token_capture.get("control_timeout_s") or 60.0
             )
