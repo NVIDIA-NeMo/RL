@@ -27,6 +27,12 @@ NEMOTRON_VIDEO_PROCESSOR_NAMES = frozenset(
     {
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        # Super Omni new-generation HF pipeline: same video-native family as
+        # the Nano V3 processor (vLLM serves it via nano_nemotron_vl, whose
+        # NanoNemotronVLProcessor rejects the legacy video_as_images kwarg —
+        # job 6905470 died on exactly that).
+        "NemotronH_Omni_Reasoning_V3Processor",
+        "NemotronH_Super_Omni_Reasoning_V3Processor",
     }
 )
 
