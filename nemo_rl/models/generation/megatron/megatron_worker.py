@@ -630,6 +630,21 @@ class MegatronGenerationMixin:
         if self.is_generation_colocated and not release_gpu:
             return
         print(f"[Rank {self.rank}] finishing generation", flush=True)
+
+        # Report how many steps the async scheduler processed. This includes
+        # steps that ran a non-overlapped async ordering because they could
+        # not overlap -- the legacy path never increments this counter.
+        if (
+            self.cfg["generation"]["mcore_generation_config"].get("async_sched_mode")
+            == "async"
+            and self._inference_engine_initialized
+        ):
+            print(
+                f"[Rank {self.rank}] mcore async scheduling steps (cumul): "
+                f"{self.inference_context.async_sched_step_count}",
+                flush=True,
+            )
+
         log_gpu_memory("finish_generation START")
 
         inference_model, media_model = self._inference_model_and_media_parts()

@@ -48,7 +48,16 @@ class MCoreGenerationSpecificArgs(TypedDict):
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
+
+    # Dynamic-batching scheduler mode. Options:
+    # - 'legacy': resolve the previous forward pass before preparing the next one.
+    # - 'async': overlap the scheduling phases by preparing the next forward pass
+    #   before resolving the previous one, hiding scheduler CPU time behind GPU
+    #   compute. For any step it cannot overlap (prefill, paused requests,
+    #   KV-cache pressure) mcore drops to a non-overlapped async ordering --
+    #   not to legacy.
     async_sched_mode: NotRequired[Literal["legacy", "async"]]
+
     vision_embedding_cache_max_bytes: NotRequired[int]
     allow_stale_multimodal_embeddings: NotRequired[bool]
 
