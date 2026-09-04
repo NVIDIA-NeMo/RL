@@ -58,7 +58,16 @@ def _make_ext(vllm_params):
         named_modules=lambda: [],
     )
     ext.model_runner = SimpleNamespace(model=model)
+    ext._unquantized_flashinfer_trtllm_param_ids = lambda: set()
     return ext
+
+
+def _enable_trtllm_staging(ext):
+    """Mark every synthetic model parameter as owned by a BF16 TRTLLM module."""
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._unquantized_flashinfer_trtllm_param_ids = lambda: {
+        id(param) for _, param in ext.model_runner.model.named_parameters()
+    }
 
 
 def _param(*shape):
@@ -365,7 +374,7 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
     )
     ext.device = torch.device("cpu")
     ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
-    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    _enable_trtllm_staging(ext)
     ext._load_full_hf_weights = MagicMock(
         return_value={"model.layers.0.mlp.experts.routed_experts.w13_weight"}
     )
@@ -430,7 +439,7 @@ def test_build_hf_to_local_param_map_stages_nemotron_lightning_padded_experts():
     ext = _make_ext({runtime_name: packed_runtime})
     ext.device = torch.device("meta")
     ext.pp_comm_groups = {0: SimpleNamespace(rank=0)}
-    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    _enable_trtllm_staging(ext)
     ext._load_full_hf_weights = MagicMock(return_value={runtime_name})
 
     spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
@@ -447,6 +456,133 @@ def test_build_hf_to_local_param_map_stages_nemotron_lightning_padded_experts():
     assert loaded_weights[0][0] == "backbone.layers.0.mlp.experts.0.up_proj.weight"
     assert loaded_weights[-1][0] == "backbone.layers.0.mlp.experts.127.up_proj.weight"
     assert loaded_weights[0][1].shape == (intermediate_size, hidden_size)
+
+
+def test_build_hf_to_local_param_map_stages_only_bf16_trtllm_experts(
+    monkeypatch,
+):
+    """Mixed MXFP8 models stage only first/last BF16 expert layers."""
+    num_experts, intermediate_size, hidden_size = 2, 64, 32
+    first_bf16_name = "backbone.layers.0.mlp.experts.up_proj.weight"
+    mxfp8_name = "backbone.layers.1.mlp.experts.up_proj.weight"
+    last_bf16_name = "backbone.layers.2.mlp.experts.up_proj.weight"
+    first_bf16_runtime_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    mxfp8_runtime_name = "model.layers.1.mlp.experts.routed_experts.w13_weight"
+    last_bf16_runtime_name = "model.layers.2.mlp.experts.routed_experts.w13_weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": [
+            "backbone.layers.0",
+            "backbone.layers.1",
+            "backbone.layers.2",
+        ],
+        "per_layer_params": {
+            "backbone.layers.0": [
+                {
+                    "name": first_bf16_name,
+                    "global_shape": [num_experts, intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ],
+            "backbone.layers.1": [
+                {
+                    "name": mxfp8_name,
+                    "global_shape": [num_experts, intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ],
+            "backbone.layers.2": [
+                {
+                    "name": last_bf16_name,
+                    "global_shape": [num_experts, intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ],
+        },
+    }
+    first_bf16_runtime = torch.empty(
+        num_experts, hidden_size // 16, intermediate_size, 16, dtype=torch.bfloat16
+    )
+    last_bf16_runtime = torch.empty(
+        num_experts, hidden_size // 16, intermediate_size, 16, dtype=torch.bfloat16
+    )
+    mxfp8_runtime = torch.empty(
+        num_experts, intermediate_size, hidden_size, dtype=torch.float8_e4m3fn
+    )
+    mxfp8_scale = torch.empty(
+        num_experts, intermediate_size, hidden_size // 32, dtype=torch.uint8
+    )
+    ext = _make_ext(
+        {
+            first_bf16_runtime_name: first_bf16_runtime,
+            mxfp8_runtime_name: mxfp8_runtime,
+            f"{mxfp8_runtime_name}_scale_from_checkpoint": mxfp8_scale,
+            last_bf16_runtime_name: last_bf16_runtime,
+        }
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=0)}
+    _enable_trtllm_staging(ext)
+    ext._unquantized_flashinfer_trtllm_param_ids = lambda: {
+        id(first_bf16_runtime),
+        id(last_bf16_runtime),
+    }
+    ext._load_full_hf_weights = MagicMock(return_value=None)
+
+    def fake_quantize(weight):
+        return (
+            torch.full_like(weight, 3, dtype=torch.float8_e4m3fn),
+            torch.full(
+                (*weight.shape[:-1], weight.shape[-1] // 32),
+                7,
+                dtype=torch.uint8,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.quantization.fp8.quantize_mxfp8_weight",
+        fake_quantize,
+    )
+
+    specs = ext.build_hf_to_local_param_map(refit_info)
+    first_bf16_spec = specs.get(first_bf16_name)
+    mxfp8_spec = specs.get(mxfp8_name)
+    last_bf16_spec = specs.get(last_bf16_name)
+    assert first_bf16_spec is not None and first_bf16_spec.pre is not None
+    assert first_bf16_spec.post is not None and first_bf16_spec.base is None
+    assert mxfp8_spec is not None and mxfp8_spec.pre is not None
+    assert mxfp8_spec.post is not None and mxfp8_spec.base is not None
+    assert last_bf16_spec is not None and last_bf16_spec.pre is not None
+    assert last_bf16_spec.post is not None and last_bf16_spec.base is None
+
+    first_bf16_spec.post(first_bf16_spec.pre(first_bf16_spec.base))
+    mxfp8_spec.post(mxfp8_spec.pre(mxfp8_spec.base))
+    last_bf16_spec.post(last_bf16_spec.pre(last_bf16_spec.base))
+
+    assert ext._load_full_hf_weights.call_count == 2
+    loaded_source_names = {
+        weight_name
+        for call in ext._load_full_hf_weights.call_args_list
+        for weight_name, _ in call.args[0]
+    }
+    assert loaded_source_names == {
+        f"backbone.layers.0.mlp.experts.{expert}.up_proj.weight"
+        for expert in range(num_experts)
+    } | {
+        f"backbone.layers.2.mlp.experts.{expert}.up_proj.weight"
+        for expert in range(num_experts)
+    }
+    assert torch.all(mxfp8_runtime.float() == 3)
+    assert torch.all(mxfp8_scale == 7)
 
 
 def test_build_hf_to_local_param_map_stages_qwen35_wrapped_experts():
@@ -480,7 +616,7 @@ def test_build_hf_to_local_param_map_stages_qwen35_wrapped_experts():
     ext = _make_ext({runtime_name: packed_w2})
     ext.device = torch.device("cpu")
     ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
-    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    _enable_trtllm_staging(ext)
     ext._load_full_hf_weights = MagicMock(return_value={f"{runtime_prefix}.w2_weight"})
 
     spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
@@ -518,7 +654,7 @@ def test_build_hf_to_local_param_map_requires_pp_groups_for_trtllm_staging():
     )
     ext.device = torch.device("cpu")
     ext.pp_comm_groups = None
-    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    _enable_trtllm_staging(ext)
 
     with pytest.raises(RuntimeError, match="before.*per-PP-stage groups"):
         ext.build_hf_to_local_param_map(refit_info)
@@ -557,7 +693,7 @@ def test_build_hf_to_local_param_map_rejects_missing_trtllm_destination():
     )
     ext.device = torch.device("cpu")
     ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
-    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    _enable_trtllm_staging(ext)
     ext._load_full_hf_weights = MagicMock(
         return_value={"model.layers.0.mlp.experts.w13_weight"}
     )
@@ -595,7 +731,7 @@ def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
             ),
         }
     )
-    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    _enable_trtllm_staging(ext)
 
     with pytest.raises(ValueError, match="unsupported tensor shard dimensions"):
         ext.build_hf_to_local_param_map(refit_info)
@@ -697,7 +833,7 @@ def test_legacy_refit_map_is_built_after_comm_groups_exist(monkeypatch):
 def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    model = SimpleNamespace()
+    model = torch.nn.Module()
     trtllm_moe = SimpleNamespace()
     model_config = object()
     vllm_config = object()

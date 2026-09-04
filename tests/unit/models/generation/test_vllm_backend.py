@@ -335,6 +335,95 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_mixed_mxfp8_native_refit_processes_bf16_and_mxfp8_modules(monkeypatch):
+    """Mixed rollout refits rebuild both runtime expert layouts."""
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMxFp8FusedMoE,
+    )
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    model = torch.nn.Module()
+    first_bf16_moe = torch.nn.Module()
+    first_bf16_moe.expert_map_manager = SimpleNamespace(placement_strategy="linear")
+    mxfp8_moe = torch.nn.Module()
+    mxfp8_moe.quant_method = ModelOptMxFp8FusedMoE.__new__(ModelOptMxFp8FusedMoE)
+    last_bf16_moe = torch.nn.Module()
+    last_bf16_moe.expert_map_manager = SimpleNamespace(placement_strategy="linear")
+    model.add_module("first_bf16_moe", first_bf16_moe)
+    model.add_module("middle_mxfp8_moe", mxfp8_moe)
+    model.add_module("last_bf16_moe", last_bf16_moe)
+
+    model_config = object()
+    vllm_config = SimpleNamespace(quant_config=object())
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._mtp_drafter_refit_enabled = lambda: False
+    ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [first_bf16_moe, last_bf16_moe],
+    )
+    monkeypatch.setattr(
+        ModelOptMxFp8FusedMoE,
+        "process_weights_after_loading",
+        lambda _self, module: call_order.append(("process_mxfp8", module)),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    @contextlib.contextmanager
+    def set_current_vllm_config(config):
+        assert config is vllm_config
+        call_order.append("config_enter")
+        try:
+            yield
+        finally:
+            call_order.append("config_exit")
+
+    monkeypatch.setattr("vllm.config.set_current_vllm_config", set_current_vllm_config)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda module: call_order.append(("initialize", module)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        lambda reload_model, config: call_order.append(
+            ("finalize", reload_model, config)
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda reload_model: call_order.append(("hpc", reload_model)),
+    )
+
+    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+        call_order.append("transfer")
+        finalize()
+
+    assert call_order == [
+        "config_enter",
+        ("initialize", first_bf16_moe),
+        ("initialize", last_bf16_moe),
+        "transfer",
+        ("finalize", model, model_config),
+        ("process_mxfp8", mxfp8_moe),
+        ("hpc", model),
+        "mtp",
+        "config_exit",
+    ]
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
 def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypatch):
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 
@@ -450,7 +539,7 @@ def test_layerwise_reload_propagates_detach_error_after_successful_load(monkeypa
 def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    model = object()
+    model = SimpleNamespace(modules=lambda: [])
     model_config = object()
     vllm_config = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
@@ -529,7 +618,8 @@ def test_realized_moe_backend_controls_native_refit_lifecycle():
 
 
 @pytest.mark.vllm
-def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
+def test_quantized_model_uses_native_refit_for_realized_bf16_trtllm_modules():
+    """A globally quantized model may still contain ignored BF16 MoE layers."""
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
@@ -540,7 +630,45 @@ def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
         vllm_config=SimpleNamespace(quant_config=object()),
     )
 
-    assert ext._uses_unquantized_flashinfer_trtllm() is False
+    assert ext._uses_unquantized_flashinfer_trtllm() is True
+
+
+@pytest.mark.vllm
+def test_unquantized_trtllm_param_ids_are_scoped_to_realized_modules(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    bf16_experts = torch.nn.Module()
+    bf16_experts.register_parameter(
+        "w13_weight", torch.nn.Parameter(torch.empty(2, 4, 8), requires_grad=False)
+    )
+    bf16_experts.register_parameter(
+        "w2_weight", torch.nn.Parameter(torch.empty(2, 8, 2), requires_grad=False)
+    )
+    mxfp8_experts = torch.nn.Module()
+    mxfp8_experts.register_parameter(
+        "w13_weight",
+        torch.nn.Parameter(
+            torch.empty(2, 4, 8, dtype=torch.float8_e4m3fn), requires_grad=False
+        ),
+    )
+    model = torch.nn.Module()
+    model.add_module("bf16_experts", bf16_experts)
+    model.add_module("mxfp8_experts", mxfp8_experts)
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model)
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [bf16_experts],
+    )
+
+    assert ext._unquantized_flashinfer_trtllm_param_ids() == {
+        id(bf16_experts.w13_weight),
+        id(bf16_experts.w2_weight),
+    }
 
 
 @pytest.mark.vllm
@@ -549,7 +677,7 @@ def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
     [
         ("FlashInfer TRTLLM", None, True),
         ("TRITON", None, False),
-        ("FlashInfer TRTLLM", object(), False),
+        ("FlashInfer TRTLLM", object(), True),
     ],
 )
 def test_weight_update_errors_are_fatal_only_for_native_trtllm_refit(
