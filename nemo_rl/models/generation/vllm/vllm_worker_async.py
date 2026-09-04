@@ -22,10 +22,12 @@ import uuid
 import warnings
 from typing import Any, AsyncGenerator, Optional, cast
 
+import orjson
 import ray
 import torch
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import Response
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -55,11 +57,35 @@ from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
+from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
 LOGGER = logging.getLogger(__name__)
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
+
+
+def _copy_vllm_chat_messages(messages):
+    """Copy only the request containers that vLLM normalizes in place."""
+    copied_messages = []
+    for message in messages:
+        copied_message = dict(message)
+        if message.get("tool_calls"):
+            copied_message["tool_calls"] = list(message["tool_calls"])
+        copied_messages.append(copied_message)
+    return copied_messages
+
+
+def _parse_orjson_request(request_body: bytes, request_type):
+    return request_type.model_validate(orjson.loads(request_body))
+
+
+def _orjson_response(content, status_code: int = 200) -> Response:
+    return Response(
+        content=orjson.dumps(content),
+        status_code=status_code,
+        media_type="application/json",
+    )
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -73,6 +99,7 @@ class VllmAsyncGenerationWorkerImpl(
         seed=None,
         extra_env_vars: Optional[list[str]] = None,
         defer_model_load: bool = False,
+        use_fastokens: bool = False,
     ):
         """Initialize an async vLLM worker.
 
@@ -89,7 +116,10 @@ class VllmAsyncGenerationWorkerImpl(
             extra_env_vars: Additional environment variable names to forward into
                           the vLLM worker subprocess.
             defer_model_load: If True, skip model loading and only reserve port
+            use_fastokens: Apply Fastokens before vLLM creates its tokenizer.
         """
+        maybe_patch_fastokens(use_fastokens)
+
         # Deferred-loading state. Always initialized so every instance has a
         # consistent set of attributes regardless of init path.
         self._reserved_socket = None
@@ -351,13 +381,14 @@ class VllmAsyncGenerationWorkerImpl(
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
-        from copy import deepcopy
         from logging import Filter as LoggingFilter
         from logging import LogRecord
         from typing import List, Optional, Union
 
         from fastapi import Request
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.encoders import jsonable_encoder
+        from fastapi.responses import StreamingResponse
+        from pydantic import ValidationError
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
@@ -417,6 +448,10 @@ class VllmAsyncGenerationWorkerImpl(
                 if self.required_prefix_token_ids is None:
                     for message in reversed(self.messages):
                         if "prompt_token_ids" in message:
+                            LOGGER.warning(
+                                "Native vLLM used the compatibility prefix fallback; "
+                                "the Gym request did not provide required_prefix_token_ids."
+                            )
                             self.required_prefix_token_ids = (
                                 message["prompt_token_ids"]
                                 + message["generation_token_ids"]
@@ -468,11 +503,7 @@ class VllmAsyncGenerationWorkerImpl(
                 *,
                 skip_mm_cache: bool = False,
             ):
-                for message in messages:
-                    if message.get("tool_calls"):
-                        message["tool_calls"] = list(message["tool_calls"])
-
-                messages_for_replace_prefix_tokens = deepcopy(messages)
+                messages_for_render = _copy_vllm_chat_messages(messages)
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
@@ -491,7 +522,7 @@ class VllmAsyncGenerationWorkerImpl(
                 try:
                     res = await super().preprocess_chat(
                         request=request,
-                        messages=messages,
+                        messages=messages_for_render,
                         default_template=default_template,
                         default_template_content_format=default_template_content_format,
                         default_template_kwargs=default_template_kwargs,
@@ -522,21 +553,17 @@ class VllmAsyncGenerationWorkerImpl(
                     return res
 
                 last_assistant_message_idx = None
-                for i in reversed(range(len(messages_for_replace_prefix_tokens))):
-                    if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
+                for i in reversed(range(len(messages_for_render))):
+                    if messages_for_render[i]["role"] == "assistant":
                         last_assistant_message_idx = i
                         break
 
                 if last_assistant_message_idx is None:
-                    messages_to_last_assistant_message = (
-                        messages_for_replace_prefix_tokens
-                    )
+                    messages_to_last_assistant_message = messages_for_render
                 else:
-                    messages_to_last_assistant_message = (
-                        messages_for_replace_prefix_tokens[
-                            : last_assistant_message_idx + 1
-                        ]
-                    )
+                    messages_to_last_assistant_message = messages_for_render[
+                        : last_assistant_message_idx + 1
+                    ]
 
                 modified_request = request.model_copy(
                     update={"add_generation_prompt": False}
@@ -733,9 +760,28 @@ class VllmAsyncGenerationWorkerImpl(
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
-        async def create_chat_completion(
-            request: NeMoRLChatCompletionRequest, raw_request: Request
-        ):
+        async def create_chat_completion(raw_request: Request):
+            try:
+                request = _parse_orjson_request(
+                    await raw_request.body(), NeMoRLChatCompletionRequest
+                )
+            except orjson.JSONDecodeError as e:
+                return _orjson_response(
+                    {
+                        "error": {
+                            "message": f"Invalid JSON: {e}",
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
+
+            except ValidationError as e:
+                return _orjson_response(
+                    {"detail": jsonable_encoder(e.errors())}, status_code=422
+                )
+
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             # Right now we explicitly assert set this to -1.
             assert request.top_k in (None, -1), (
@@ -786,8 +832,8 @@ class VllmAsyncGenerationWorkerImpl(
                 # max_model_len during tokenization, instead of returning an
                 # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
                 # detect context-length overflow and handle it gracefully.
-                return JSONResponse(
-                    content={
+                return _orjson_response(
+                    {
                         "error": {
                             "message": str(e),
                             "type": "invalid_request_error",
@@ -798,15 +844,13 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             if isinstance(generator, ErrorResponse):
-                return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.error.code
+                return _orjson_response(
+                    generator.model_dump(), status_code=generator.error.code
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(
-                    content=model_dump_chat_response_with_dynamic_message_fields(
-                        generator
-                    )
+                return _orjson_response(
+                    model_dump_chat_response_with_dynamic_message_fields(generator)
                 )
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
