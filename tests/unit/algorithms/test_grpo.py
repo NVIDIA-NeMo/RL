@@ -37,7 +37,6 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
-    _apply_async_pre_training_sample_masks,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
@@ -264,60 +263,6 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
-
-
-def test_apply_async_pre_training_sample_masks_logs_disjoint_reasons(capsys):
-    repeated_batch = BatchedDataDict(
-        {
-            "loss_multiplier": torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
-            NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY: torch.tensor(
-                [False, True, False, False, False, False]
-            ),
-            "truncated": torch.tensor([False, True, True, False, False, False]),
-            "mask_sample": torch.tensor([True, True, True, True, False, False]),
-            NEMO_GYM_TASK_INDEX_KEY: torch.arange(100, 106),
-            NEMO_GYM_ROLLOUT_INDEX_KEY: torch.arange(6),
-            NEMO_GYM_ATTEMPT_INDEX_KEY: torch.zeros(6, dtype=torch.long),
-            TARGET_WEIGHT_VERSION_KEY: torch.full((6,), 9, dtype=torch.long),
-            "agent_ref": [{"name": f"agent-{i}"} for i in range(6)],
-        }
-    )
-
-    metrics = _apply_async_pre_training_sample_masks(
-        repeated_batch, overlong_filtering=True
-    )
-
-    assert metrics == {
-        "num_masked_seqs_by_loss_multiplier": 1,
-        "num_masked_seqs_by_empty_response_output": 1,
-        "num_masked_seqs_by_overlong_filtering": 1,
-        "num_masked_seqs_by_rollout": 1,
-        "num_masked_seqs_by_logprob_error": 0,
-        "num_masked_seqs_total": 4,
-    }
-    torch.testing.assert_close(
-        repeated_batch["loss_multiplier"],
-        torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 1.0]),
-    )
-    events = [
-        event
-        for event in _nemo_gym_trace_events(capsys.readouterr().out)
-        if event["event"] == "sample_masked"
-    ]
-    assert [event["reason"] for event in events] == [
-        "loss_multiplier",
-        "empty_response_output",
-        "overlong_filtering",
-        "rollout",
-    ]
-    assert [event["task_index"] for event in events] == [100, 101, 102, 103]
-    assert [event["agent_name"] for event in events] == [
-        "agent-0",
-        "agent-1",
-        "agent-2",
-        "agent-3",
-    ]
-    assert all(event["target_weight_version"] == 9 for event in events)
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -702,6 +647,10 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans(
     assert [event["task_index"] for event in events] == [7, 8]
     assert [event["agent_name"] for event in events] == ["agent-a", "agent-b"]
     assert [event["target_weight_version"] for event in events] == [3, 3]
+    assert [event["message"] for event in events] == [
+        "Setting negative advantage (-5.0) for invalid tool call in assistant message 0 1",
+        "Setting negative advantage (-7.0) for malformed thinking in assistant message 1 1",
+    ]
 
 
 def test_apply_message_level_advantage_penalties_materializes_broadcasted_advantages():
@@ -1897,6 +1846,71 @@ def test_async_initial_buffer_wait_is_included_in_first_step_timing(
     assert first_step_counts["total_step_time"] == 2
     # Startup wait + replay sample coordination + pre-refit collector wait.
     assert first_step_counts["exposed_generation"] == 3
+
+
+def test_async_grpo_masks_empty_response_before_training(
+    mock_grpo_components,
+    capsys,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.grpo.overlong_filtering = True
+    master_config.env["should_log_nemo_gym_responses"] = True
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] = torch.tensor([True])
+    mock_batch["truncated"] = torch.tensor([True])
+    mock_batch["mask_sample"] = torch.tensor([True])
+
+    with mock_async_grpo_infrastructure(
+        mock_batch,
+        {"mean_gen_tokens_per_sample": 2.0},
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    train_data = mock_grpo_components["policy"].train.call_args.args[0]
+    assert train_data["sample_mask"].tolist() == [0.0]
+
+    metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"],
+        "num_masked_seqs_by_empty_response_output",
+    )
+    assert metrics["num_masked_seqs_by_loss_multiplier"] == 0
+    assert metrics["num_masked_seqs_by_empty_response_output"] == 1
+    assert metrics["num_masked_seqs_by_overlong_filtering"] == 0
+    assert metrics["num_masked_seqs_by_rollout"] == 0
+    assert metrics["num_masked_seqs_by_logprob_error"] == 0
+    assert metrics["num_masked_seqs_total"] == 1
+
+    events = [
+        event
+        for event in _nemo_gym_trace_events(capsys.readouterr().out)
+        if event["event"] == "sample_masked"
+    ]
+    assert len(events) == 1
+    assert events[0]["reason"] == "empty_response_output"
+    assert (
+        events[0]["message"]
+        == "Masking async GRPO sample because its response output is empty"
+    )
 
 
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:
@@ -5471,6 +5485,14 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert [event["task_index"] for event in events] == [102, 103]
         assert [event["agent_name"] for event in events] == ["agent-b", "agent-b"]
         assert all(event["target_weight_version"] == 11 for event in events)
+        assert all(
+            event["message"]
+            == (
+                "Masking async GRPO sample because its sequence-level logprob error "
+                "exceeds the threshold"
+            )
+            for event in events
+        )
 
     def test_no_sequences_masked_when_all_below_threshold(self):
         """Test that no sequences are masked when all are below threshold."""

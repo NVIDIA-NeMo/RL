@@ -1329,10 +1329,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         if not nemo_rl_message_log and empty_response_output:
             # Some agents intentionally terminate without asking the policy for a
             # generation. Keep the row structurally valid so one such response
-            # cannot terminate the rollout stream, but mark it for unconditional
-            # masking by async GRPO. A single valid token is sufficient because
-            # the row has no trainable assistant span and its full Gym response is
-            # retained separately for diagnostics.
+            # cannot terminate the rollout stream. The
+            # NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY marker added below is propagated
+            # through replay and consumed by async GRPO, which sets this row's
+            # loss multiplier to zero before training. A single valid token is
+            # sufficient because the row has no trainable assistant span and its
+            # full Gym response is retained separately for diagnostics.
             placeholder_token_id = getattr(tokenizer, "pad_token_id", None)
             if placeholder_token_id is None:
                 placeholder_token_id = getattr(tokenizer, "eos_token_id", None)
