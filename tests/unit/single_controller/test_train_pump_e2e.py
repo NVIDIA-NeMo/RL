@@ -58,6 +58,8 @@ _REGISTERED_FIELDS = [
     "advantages",
     "token_mask",
     "sample_mask",
+    "mask_sample",
+    "truncated",
     "total_reward",
     "prompt_ids_for_adv",
 ]
@@ -94,6 +96,8 @@ def _populate_group(
             "input_lengths": torch.tensor([seq_len] * group_size).long(),
             "token_mask": torch.ones(group_size, seq_len, dtype=torch.long),
             "sample_mask": torch.ones(group_size, dtype=torch.long),
+            "mask_sample": torch.zeros(group_size, dtype=torch.bool),
+            "truncated": torch.zeros(group_size, dtype=torch.bool),
             "generation_logprobs": torch.zeros(
                 group_size, seq_len, dtype=torch.float32
             ),
@@ -279,6 +283,7 @@ def test_train_pump_drives_mcore_training_step(
             dp_client,
             partition_id=_PARTITION_ID,
             pad_value_dict={"input_ids": int(tokenizer.pad_token_id or 0)},
+            include_message_violation_fields=False,
         )
         for step in range(train_steps):
             for g in range(num_prompts):

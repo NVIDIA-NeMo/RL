@@ -27,6 +27,10 @@ tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-vid
 # budget has room.
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g-megatron-tp2ep8.v1.sh
 
+# TODO(@cspades): Run and validate this multimodal Megatron generation
+# functional test before moving it to a recurring suite.
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-count-1n4g-megatron_generation.v1.sh
+
 # Nemotron Super Omni: 16-node topology, and the checkpoint and multimodal Gym
 # blend are too large to ship with the repo, so these are invoked manually via
 # examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh rather than run

@@ -134,12 +134,44 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
-        if draft_enabled and bool(
-            config.get("sequence_packing", {}).get("enabled", False)
-        ):
+        if draft_enabled and config["megatron_cfg"]["context_parallel_size"] > 1:
+            # Sequence packing itself is supported with the draft; CP is not:
+            # the hidden-state capture and the per-segment shifts assume each
+            # packed sequence lives whole on one rank.
             raise ValueError(
-                "policy.draft.enabled=true does not support sequence packing yet. "
-                "Disable policy.sequence_packing.enabled or policy.draft."
+                "policy.draft.enabled=true does not support context parallelism "
+                "yet. Set policy.megatron_cfg.context_parallel_size=1 or disable "
+                "policy.draft."
+            )
+        if (
+            draft_enabled
+            # sequence_packing is NotRequired in PolicyConfig, so tolerate its
+            # absence; the parallel sizes are required megatron_cfg keys.
+            and bool(config.get("sequence_packing", {}).get("enabled", False))
+            and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+        ):
+            # The packed draft path re-embeds the per-segment-shifted token ids
+            # via the model's embedding, which MCore constructs only on the
+            # first pipeline stage while the draft runs on the last.
+            raise ValueError(
+                "policy.draft.enabled=true with sequence packing does not "
+                "support pipeline parallelism yet. Set "
+                "policy.megatron_cfg.pipeline_model_parallel_size=1, or disable "
+                "policy.sequence_packing or policy.draft."
+            )
+        if draft_enabled and bool(
+            # use_fused_linear_logprobs is NotRequired in MegatronConfig.
+            config["megatron_cfg"].get("use_fused_linear_logprobs", False)
+        ):
+            # The fused path returns per-token logprobs and never materializes
+            # the full next-token logits the draft's teacher distribution
+            # needs, in either the packed or the unpacked layout.
+            raise ValueError(
+                "policy.draft.enabled=true is not supported with "
+                "policy.megatron_cfg.use_fused_linear_logprobs=true: draft "
+                "training needs the full next-token logits for the teacher, "
+                "which the fused path never materializes. Disable one of the "
+                "two."
             )
         if megatron_enable:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
