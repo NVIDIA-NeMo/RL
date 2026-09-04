@@ -14,7 +14,9 @@
 
 import os
 import tempfile
+import time
 from copy import deepcopy
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -91,9 +93,9 @@ class _FakeModelOptBridge:
         self.calls.append(("plan", args, kwargs))
         return self.plan
 
-    def export_hf_weights_modelopt(self, *args, **kwargs):
-        self.calls.append(("export", args, kwargs))
-        yield "model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)
+    def export_hf_weight_groups_modelopt(self, *args, **kwargs):
+        self.calls.append(("export_groups", args, kwargs))
+        yield (("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)),)
 
 
 def _make_real_quant_worker():
@@ -113,6 +115,7 @@ def _make_real_quant_worker():
     worker.refit_conversion_tasks = ["task"]
     worker.megatron_bridge = _FakeModelOptBridge()
     worker.rank = 0
+    worker._real_quant_refit_sync_group = None
     return worker
 
 
@@ -458,24 +461,12 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
 
 
 @requires_weight_folding
-def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
-    monkeypatch,
-):
+def test_real_quant_refit_rendezvouses_between_materialized_groups(monkeypatch):
     from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
-    from nemo_rl.models.policy import utils as policy_utils
 
     worker = _make_real_quant_worker()
-    worker.zmq_socket = object()
     worker._real_quant_refit_sync_group = object()
-    calls = []
     events = []
-
-    monkeypatch.setattr(worker, "maybe_init_zmq", lambda: calls.append("init_zmq"))
-
-    def fail_move_model(*args, **kwargs):
-        raise AssertionError("stream_weights_via_ipc_zmq should not move the model")
-
-    monkeypatch.setattr(worker, "move_model", fail_move_model)
 
     monkeypatch.setattr(
         megatron_quant_policy_worker.torch.distributed,
@@ -483,42 +474,32 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
         lambda **kwargs: events.append(("barrier", kwargs)),
     )
 
-    def export_params(kv_scales=None):
-        events.append(("export", "weight_0"))
-        yield "model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)
-        events.append(("export", "weight_1"))
-        yield "model.layers.1.mlp.down_proj.weight", torch.ones(2, 2)
+    def export_groups(*args, **kwargs):
+        events.append(("export", "group_0"))
+        yield (
+            ("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)),
+            ("model.layers.0.mlp.down_proj.weight_scale", torch.ones(1)),
+        )
+        events.append(("export", "empty_group"))
+        yield ()
+        events.append(("export", "group_2"))
+        yield (("model.layers.1.mlp.down_proj.weight", torch.ones(2, 2)),)
 
-    monkeypatch.setattr(
-        worker,
-        "_iter_params_with_optional_kv_scales",
-        export_params,
-    )
+    worker.megatron_bridge.export_hf_weight_groups_modelopt = export_groups
+    params = iter(worker._iter_real_quant_refit_params())
 
-    def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
-        calls.append(kwargs)
-        params = iter(kwargs["params_generator"])
-        assert next(params)[0] == "model.layers.0.mlp.down_proj.weight"
-        events.append(("ack_wait", None))
-        assert next(params)[0] == "model.layers.1.mlp.down_proj.weight"
-        assert list(params) == []
+    assert next(params)[0] == "model.layers.0.mlp.down_proj.weight"
+    events.append(("ack_wait", None))
+    assert next(params)[0] == "model.layers.0.mlp.down_proj.weight_scale"
+    assert next(params)[0] == "model.layers.1.mlp.down_proj.weight"
+    assert list(params) == []
 
-    monkeypatch.setattr(
-        policy_utils,
-        "stream_weights_via_ipc_zmq_impl",
-        fake_stream_weights_via_ipc_zmq_impl,
-    )
-
-    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123)
-
-    assert calls[0] == "init_zmq"
-    assert calls[1]["buffer_size_bytes"] == 123
-    assert calls[1]["zmq_socket"] is worker.zmq_socket
-    assert calls[1]["rank"] == 0
     assert [event[0] for event in events] == [
         "barrier",
         "export",
         "ack_wait",
+        "barrier",
+        "export",
         "barrier",
         "export",
         "barrier",
@@ -535,7 +516,122 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
                 "wait_all_ranks": True,
             }
         ]
-        * 3
+        * 4
+    )
+
+
+@requires_weight_folding
+def test_ipc_ack_backpressure_cannot_advance_an_unmaterialized_group(monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+    from nemo_rl.models.policy import utils as policy_utils
+
+    worker = _make_real_quant_worker()
+    worker._real_quant_refit_sync_group = object()
+    events = []
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker.torch.distributed,
+        "monitored_barrier",
+        lambda **_kwargs: events.append("barrier"),
+    )
+
+    def export_groups(*args, **kwargs):
+        events.append("export_group_0")
+        yield tuple(
+            (f"group_0.weight_{index}", torch.ones(1, dtype=torch.uint8))
+            for index in range(5)
+        )
+        events.append("export_group_1")
+        yield (("group_1.weight", torch.ones(1, dtype=torch.uint8)),)
+
+    worker.megatron_bridge.export_hf_weight_groups_modelopt = export_groups
+
+    class FakeStream:
+        def synchronize(self):
+            events.append("synchronize")
+
+    class FakeSocket:
+        def send_pyobj(self, _payload):
+            events.append("send")
+
+        def recv(self):
+            events.append("recv_ack")
+            return b"ack"
+
+    monkeypatch.setattr(policy_utils.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(policy_utils.torch.cuda, "current_stream", lambda: FakeStream())
+    monkeypatch.setattr(policy_utils.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        policy_utils, "get_handle_from_tensor", lambda _tensor: ("handle",)
+    )
+
+    policy_utils.stream_weights_via_ipc_zmq_impl(
+        params_generator=worker._iter_real_quant_refit_params(),
+        buffer_size_bytes=2048,
+        zmq_socket=FakeSocket(),
+        rank=0,
+        worker_name="test-worker",
+    )
+
+    assert events.index("recv_ack") < events.index("export_group_1")
+
+
+def _distributed_refit_group_rendezvous_worker(rank, world_size, init_file):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=10),
+    )
+    try:
+        tp_groups = (
+            torch.distributed.new_group(ranks=[0, 1], backend="gloo"),
+            torch.distributed.new_group(ranks=[2, 3], backend="gloo"),
+        )
+        tp_group = tp_groups[rank // 2]
+        timestamps = {}
+
+        class DistributedFakeBridge(_FakeModelOptBridge):
+            def export_hf_weight_groups_modelopt(self, *args, **kwargs):
+                if rank == 2:
+                    time.sleep(0.2)
+                torch.distributed.barrier(group=tp_group)
+                yield ((f"rank_{rank}.epoch_0", torch.ones(1)),)
+                timestamps["epoch_1_enter"] = time.monotonic()
+                torch.distributed.barrier(group=tp_group)
+                yield ((f"rank_{rank}.epoch_1", torch.ones(1)),)
+
+        worker = _make_real_quant_worker()
+        worker.megatron_bridge = DistributedFakeBridge()
+        worker._real_quant_refit_sync_group = torch.distributed.group.WORLD
+        params = iter(worker._iter_real_quant_refit_params())
+
+        assert next(params)[0] == f"rank_{rank}.epoch_0"
+        if rank == 0:
+            time.sleep(0.4)
+        timestamps["epoch_0_drained"] = time.monotonic()
+        assert next(params)[0] == f"rank_{rank}.epoch_1"
+        assert list(params) == []
+
+        gathered = [None] * world_size
+        torch.distributed.all_gather_object(gathered, timestamps)
+        if rank == 0:
+            assert min(item["epoch_1_enter"] for item in gathered) >= max(
+                item["epoch_0_drained"] for item in gathered
+            )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@requires_weight_folding
+@pytest.mark.timeout(60)
+def test_four_rank_refit_group_rendezvous_blocks_cross_tp_skew(tmp_path):
+    torch.multiprocessing.spawn(
+        _distributed_refit_group_rendezvous_worker,
+        args=(4, str(tmp_path / "refit-group-rendezvous")),
+        nprocs=4,
+        join=True,
     )
 
 
