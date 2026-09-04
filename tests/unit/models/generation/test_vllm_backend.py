@@ -1322,6 +1322,47 @@ def test_read_mtp_layer_weights_from_checkpoint_filters_and_reads(tmp_path):
 
 
 @pytest.mark.vllm
+def test_read_mtp_layer_weights_from_checkpoint_reads_local_mtp_namespace(tmp_path):
+    """Read locally numbered MTP layers and their top-level tensors."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _read_mtp_layer_weights_from_checkpoint,
+    )
+
+    model_dir = tmp_path / "ckpt"
+    local_layer = torch.randn(4, 4)
+    projection = torch.randn(4, 4)
+    norm = torch.randn(4)
+    base_layer = torch.randn(4, 4)
+    _write_sharded_checkpoint(
+        model_dir,
+        {
+            "model-00001-of-00002.safetensors": {
+                "model.mtp.layers.0.mlp.experts.up_proj.weight": local_layer,
+                "model.mtp.fc.weight": projection,
+                "model.layers.0.mlp.experts.up_proj.weight": base_layer,
+            },
+            "model-00002-of-00002.safetensors": {
+                "language_model.mtp.norm.weight": norm,
+            },
+        },
+    )
+
+    weights = _read_mtp_layer_weights_from_checkpoint(str(model_dir), {52})
+
+    by_name = dict(weights)
+    assert set(by_name) == {
+        "model.mtp.layers.0.mlp.experts.up_proj.weight",
+        "model.mtp.fc.weight",
+        "language_model.mtp.norm.weight",
+    }
+    assert torch.equal(
+        by_name["model.mtp.layers.0.mlp.experts.up_proj.weight"], local_layer
+    )
+    assert torch.equal(by_name["model.mtp.fc.weight"], projection)
+    assert torch.equal(by_name["language_model.mtp.norm.weight"], norm)
+
+
+@pytest.mark.vllm
 def test_load_mtp_weights_from_disk_loads_only_mtp_layer(tmp_path, monkeypatch):
     """Success path: only MTP-layer weights are handed to the drafter, then post-loaded."""
     model_dir = tmp_path / "ckpt"
@@ -1503,6 +1544,18 @@ def test_mtp_drafter_refit_enabled(method, from_disk, has_drafter, expected):
         method=method, from_disk=from_disk, has_drafter=has_drafter
     )
     assert ext._mtp_drafter_refit_enabled() is expected
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("weights_from_refit", [False, True])
+def test_configure_mtp_drafter_weight_source(weights_from_refit):
+    """Checkpoint-loaded MTP stays static for both dummy and auto model loads."""
+    ext, _ = _make_mtp_refit_extension(method="mtp", from_disk=False)
+
+    ext.configure_mtp_drafter_weight_source(weights_from_refit)
+
+    assert ext._mtp_drafter_weights_from_refit is weights_from_refit
+    assert ext._mtp_drafter_refit_enabled() is weights_from_refit
 
 
 @pytest.mark.vllm

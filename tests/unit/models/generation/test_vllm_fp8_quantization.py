@@ -329,13 +329,15 @@ def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
             text_config=types.SimpleNamespace(num_hidden_layers=num_hidden_layers)
         ),
     )
-    monkeypatch.setattr(
-        fp8.AutoModel,
-        "from_config",
-        lambda *_args, **_kwargs: types.SimpleNamespace(
+    from_config_calls = []
+
+    def from_config(config, **kwargs):
+        from_config_calls.append((config, kwargs))
+        return types.SimpleNamespace(
             named_parameters=lambda: [(name, None) for name in param_names]
-        ),
-    )
+        )
+
+    monkeypatch.setattr(fp8.AutoModel, "from_config", from_config)
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
     vllm_kwargs = fp8.init_fp8(
@@ -359,6 +361,7 @@ def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
     assert "model.layers.6.mlp.experts.up_proj" in ignored_layers
     assert "model.layers.7.mlp.experts.up_proj" in ignored_layers
     assert "model.layers.2.mlp.experts.up_proj" not in ignored_layers
+    assert from_config_calls[0][1] == {"trust_remote_code": True}
 
 
 @pytest.mark.parametrize(
