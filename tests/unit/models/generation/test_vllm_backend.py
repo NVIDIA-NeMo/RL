@@ -342,7 +342,9 @@ def test_batched_bf16_trtllm_layout_is_scoped_to_reload_lifecycle(monkeypatch):
     with ext._weight_update_lifecycle("collective") as finalize:
         call_results.append(("transfer", invoke_converter()))
         thread_results = []
-        thread = threading.Thread(target=lambda: thread_results.append(invoke_converter()))
+        thread = threading.Thread(
+            target=lambda: thread_results.append(invoke_converter())
+        )
         thread.start()
         thread.join()
         finalize()
