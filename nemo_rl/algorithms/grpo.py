@@ -2658,9 +2658,7 @@ def _placeholder_seq_logprob_error_metrics() -> dict[str, float]:
     }
 
 
-def _validate_training_bounds(
-    grpo_config: GRPOConfig, train_sample_count: int
-) -> None:
+def _validate_training_bounds(grpo_config: GRPOConfig, train_sample_count: int) -> None:
     """Reject bounds that would train zero steps, before anything is allocated.
 
     Both trainers gate on ``current_epoch < max_num_epochs`` and the async one
