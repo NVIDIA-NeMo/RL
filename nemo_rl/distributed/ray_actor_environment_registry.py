@@ -13,9 +13,15 @@
 # limitations under the License.
 
 import os
+import tomllib
+from pathlib import Path
 
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
-from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, uv_py_executable
+from nemo_rl.distributed.virtual_cluster import (
+    PY_EXECUTABLES,
+    git_root,
+    uv_py_executable,
+)
 
 # NEMO_RL_PY_EXECUTABLES_SYSTEM=1 (single-environment images such as Dockerfile.ngc_pytorch)
 # runs every actor on the driver's interpreter instead of a per-actor uv venv.
@@ -30,6 +36,32 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     else uv_py_executable(extras)
     for actor_fqn, extras in ACTOR_ENVIRONMENTS.items()
 }
+
+
+def _reject_undeclared_extras() -> None:
+    """Fail at import if an actor names an extra that does not exist.
+
+    Without this a typo like "mcore2" builds a valid-looking
+    ``uv run --locked --extra mcore2 ...`` and only fails when that actor first
+    launches -- and during an image build not even then, because
+    nemo_rl/utils/prefetch_venvs.py catches the per-actor error and exits 0.
+    The check lives here rather than in actor_environments.py because that module
+    must stay dependency-free: docker/Dockerfile runs it from a layer where the
+    rest of the source tree does not exist.
+    """
+    with open(Path(git_root) / "pyproject.toml", "rb") as f:
+        declared = set(tomllib.load(f)["project"]["optional-dependencies"])
+    for actor_fqn, extras in ACTOR_ENVIRONMENTS.items():
+        unknown = set(extras or ()) - declared
+        if unknown:
+            raise ValueError(
+                f"{actor_fqn!r} in nemo_rl/distributed/actor_environments.py names "
+                f"extras {sorted(unknown)} that are not in "
+                "[project.optional-dependencies] of pyproject.toml"
+            )
+
+
+_reject_undeclared_extras()
 
 
 def get_actor_python_env(actor_class_fqn: str) -> str:
