@@ -69,8 +69,9 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
-_MAX_NEMO_GYM_STREAM_RETRIES = 3
+_MAX_NEMO_GYM_STREAM_RETRIES = 1
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
+_NEMO_GYM_ATTEMPT_INDEX_KEY = "_ng_attempt_index"
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
 
@@ -1624,6 +1625,13 @@ class AsyncTrajectoryCollector:
                     )
                 ]
                 attempt_batch = repeated_batch.select_indices(pending_row_indices)
+
+            if use_nemo_gym:
+                # A stream retry always contains complete prompt groups. Give the
+                # retry a fresh cohort identity so a partial GenRM cohort from the
+                # previous attempt cannot absorb the regenerated responses.
+                for row in attempt_batch["extra_env_info"]:
+                    row[_NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt - 1
 
             push_tasks: list[asyncio.Task[None]] = []
             scheduled_group_indices: set[int] = set()

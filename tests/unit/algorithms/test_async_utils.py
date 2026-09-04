@@ -2956,6 +2956,7 @@ class TestAsyncTrajectoryCollector:
         )
         rollout_calls = 0
         rollout_call_task_indices = []
+        rollout_call_attempt_indices = []
 
         def _rollout_result(task_index):
             return SimpleNamespace(
@@ -2978,6 +2979,12 @@ class TestAsyncTrajectoryCollector:
             rollout_call_task_indices.append(
                 [
                     row["_ng_task_index"]
+                    for row in kwargs["input_batch"]["extra_env_info"]
+                ]
+            )
+            rollout_call_attempt_indices.append(
+                [
+                    row["_ng_attempt_index"]
                     for row in kwargs["input_batch"]["extra_env_info"]
                 ]
             )
@@ -3007,6 +3014,7 @@ class TestAsyncTrajectoryCollector:
 
         assert rollout_calls == 2
         assert rollout_call_task_indices == [[7, 7, 8, 8], [8, 8]]
+        assert rollout_call_attempt_indices == [[0, 0, 0, 0], [1, 1]]
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
 
@@ -3111,8 +3119,6 @@ class TestAsyncTrajectoryCollector:
 
         assert rollout_call_task_indices == [
             [7, 7, 8, 8],
-            [8, 8],
-            [8, 8],
             [8, 8],
         ]
         assert replay_buffer.add.task_indices == [7]
