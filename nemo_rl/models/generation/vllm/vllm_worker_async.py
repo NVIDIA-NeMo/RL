@@ -557,12 +557,12 @@ class VllmAsyncGenerationWorkerImpl(
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
 
-        Fail-closed (§ 3.5): the sink write happens inside complete_call —
+        Fail-closed: the sink write happens inside complete_call —
         the coords exist only after the bytes are durable, and any capture
         failure degrades to capture_failed coords without breaking the
         completion. Token ids and logprobs are stripped: the staged delta is
         the only token store on this path, so the worker->gate hop carries
-        text + delta ids + coords only (§ 3.2).
+        text + delta ids + coords only.
         """
         state = self._capture_calls.pop(id(request), None)
         if state is None:

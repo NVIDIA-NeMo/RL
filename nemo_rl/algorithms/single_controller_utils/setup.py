@@ -679,7 +679,7 @@ def _spinup_gym(
         enable_router_replay=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
-        # Ledger config rides into Gym's policy model server (§ 9.1).
+        # Ledger config rides into Gym's policy model server.
         token_capture=(
             master_config.token_capture.model_dump()
             if master_config.token_capture.enabled
@@ -1004,8 +1004,9 @@ def setup_single_controller(
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
-    # Token capture: validate the MVP matrix loudly at setup (§ 6, § 10) and
-    # give capture-enabled vLLM workers a venv that carries nemo_gym (the
+    # Token capture: validate the supported combination loudly at setup
+    # (NeMo-Gym rollout path, vLLM backend, async_engine=true) and give
+    # capture-enabled vLLM workers a venv that carries nemo_gym (the
     # worker hosts Gym's capture core + adapter in-process).
     token_capture_cfg = master_config.token_capture
     if token_capture_cfg.enabled:
