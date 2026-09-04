@@ -232,11 +232,9 @@ class TQWorkerMixin:
         # entrypoints then delegate to the same ``train`` / ``get_logprobs``
         # that carry the flag into ``models/megatron/data.py``.
         #
-        # ``train_microbatch_presharded`` is the exception: it lands in
-        # ``_train_microbatch_body``, which passes none of the capability flags
-        # and never attaches the media-token validity mask. That path is
-        # SingleController-only, so ``train_microbatch`` raises for a
-        # multimodal model rather than training on rows it mis-describes.
+        # ``train_microbatch_presharded`` lands in ``_train_microbatch_body``,
+        # which applies the same media-token validity mask and model packing/CP
+        # capability flags as the regular training path.
         if self._dp_client is not None:
             return
         from nemo_rl.data_plane import build_data_plane_client
