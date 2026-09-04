@@ -1,7 +1,7 @@
 # Tests that are temporarily disabled
-# Pending the first 8-node GB200 native Automodel + vLLM 0.25.1 DeepSeek V4
-# correctness run. Keep disabled until FP8 refit and CP8/EP64 are validated end-to-end.
-tests/test_suites/llm/grpo-deepseek-v4-flash-base-8n8g-automodel-cp8ep64.sh
+# The native Automodel + vLLM 0.25.1 DeepSeek V4 run requires a manual
+# 16-node H100 allocation and is too large for the recurring test suite.
+tests/test_suites/llm/grpo-deepseek-v4-flash-base-16n8g-automodel-cp8ep128.sh
 
 # Still hangs in sample_tokens on vLLM 0.25.1, unlike the AutoModel variants of
 # https://github.com/vllm-project/vllm/issues/36237, which the bump does fix.
