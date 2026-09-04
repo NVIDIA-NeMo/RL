@@ -78,6 +78,7 @@ class TQDriverMixin:
         *,
         fields: list[str],
         task_name: str,
+        include_multimodal: bool = True,
     ) -> KVBatchMeta:
         """Narrow ``meta`` for one model's dispatch and mint it a fresh pad target.
 
@@ -88,15 +89,24 @@ class TQDriverMixin:
 
         ``fields`` is the dispatch's *static* column list; the multimodal
         columns the rollout actually wrote are unioned in here rather than at
-        each call site. Every forward-running dispatch needs them -- omitting
-        them runs a VLM forward image-blind while the sibling dispatches saw
-        the images -- and nothing in a static list forces the next caller to
-        remember. The union is a no-op for text-only runs, since
+        each call site. Every forward-running dispatch of the *policy* needs
+        them -- omitting them runs a VLM forward image-blind while the sibling
+        dispatches saw the images -- and nothing in a static list forces the
+        next caller to remember. The union is a no-op for text-only runs, since
         ``present_multimodal_fields`` intersects with ``meta.fields``.
+
+        ``include_multimodal=False`` opts a dispatch out. A value model is the
+        case that exists: its inputs are a fixed list and it never consumes
+        pixels, so unioning them in would fetch and broadcast a column the
+        forward discards.
         """
         extra_info = dict(meta.extra_info)
         extra_info.pop(GLOBAL_FORWARD_PAD_SEQLEN, None)
-        multimodal = [f for f in present_multimodal_fields(meta) if f not in fields]
+        multimodal = (
+            [f for f in present_multimodal_fields(meta) if f not in fields]
+            if include_multimodal
+            else []
+        )
         isolated = replace(
             meta,
             fields=[*fields, *multimodal],
