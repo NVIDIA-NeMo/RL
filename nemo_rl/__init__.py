@@ -85,13 +85,14 @@ def _is_build_isolation():
     """Detect if we're running in a uv build isolation environment.
 
     When running uv lock/sync, uv creates a temporary isolated environment
-    in ~/.cache/uv/builds-v*/ to build packages and introspect metadata.
+    under the active uv cache's builds-v*/ directory to build packages and
+    introspect metadata.
     We skip the fingerprint check in this context since the user is updating dependencies.
 
     Returns True if in build isolation, False otherwise.
     """
     # Check if we're in uv's build isolation directory
-    # uv always uses paths like: /root/.cache/uv/builds-v0/.tmp*/
+    # uv uses paths like: ${UV_CACHE_DIR}/builds-v*/.tmp*/
     return "/builds-v" in sys.prefix
 
 
