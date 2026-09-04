@@ -11,16 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import gc
 import logging
 import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import torch
 import zmq
+
+if TYPE_CHECKING:
+    from modelexpress_rl import ModelExpressGeneratorClient
 
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineMixin,
@@ -262,6 +267,7 @@ class VllmInternalWorkerExtension:
     # None until init_collective builds it. Declared so a rebuild can release the
     # previous group without probing for the attribute's existence.
     model_update_group: Any = None
+    _model_express: ModelExpressGeneratorClient | None = None
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -269,6 +275,42 @@ class VllmInternalWorkerExtension:
             params = dict(self.model_runner.model.named_parameters())
             self._nrl_named_parameters = params
         return params
+
+    def initialize_model_express(self, server_url: str | None = None) -> None:
+        """Initialize ModelExpress inside the vLLM rank that owns live weights."""
+        if self._model_express is not None:
+            return
+        from modelexpress_rl import (
+            ModelExpressGeneratorClient,
+            ModelExpressGeneratorConfig,
+            VllmGeneratorContext,
+        )
+
+        self._model_express = ModelExpressGeneratorClient.initialize(
+            ModelExpressGeneratorConfig(
+                engine_context=VllmGeneratorContext(
+                    model=self.model_runner.get_model(),
+                    vllm_config=self.model_runner.vllm_config,
+                ),
+                model_name=self.model_runner.model_config.model,
+                server_url=server_url,
+            )
+        )
+
+    def update_weights_from_model_express(self, version_id: str) -> bool:
+        """Stage, verify, and install an exact MX version at a safe point."""
+        if self._model_express is None:
+            raise RuntimeError("ModelExpress generator client is not initialized")
+        from modelexpress_rl import WeightVersionRef
+
+        staged = self._model_express.stage_weight(
+            version=WeightVersionRef(version_id)
+        )
+        try:
+            self._model_express.apply_weight(staged)
+        finally:
+            staged.release()
+        return True
 
     def _load_full_hf_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]
@@ -1557,6 +1599,9 @@ class VllmInternalWorkerExtension:
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
+        if self._model_express is not None:
+            self._model_express.close()
+            self._model_express = None
         # Close ZMQ socket and context if they exist
         if hasattr(self, "zmq_socket"):
             self.zmq_socket.close()

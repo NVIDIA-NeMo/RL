@@ -1411,6 +1411,30 @@ class VllmAsyncGenerationWorkerImpl(
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    async def initialize_model_express_async(
+        self, *, server_url: str | None = None
+    ) -> None:
+        """Initialize the rank-local MX clients owned by this vLLM engine."""
+        assert self.llm is not None, "vLLM must be initialized before ModelExpress"
+        await self.llm.collective_rpc(
+            "initialize_model_express",
+            args=(server_url,),
+        )
+
+    async def update_weights_from_model_express_async(self, *, version: Any) -> bool:
+        """Apply one exact MX version on every internal vLLM rank."""
+        assert self.llm is not None, "vLLM must be initialized before ModelExpress"
+        results = await self.llm.collective_rpc(
+            "update_weights_from_model_express", args=(version.version_id,)
+        )
+        if asyncio.iscoroutine(results):
+            results = await results
+        worker_results = cast(list[bool], results)
+        if not worker_results or not all(worker_results):
+            raise RuntimeError(f"ModelExpress update failed: {worker_results}")
+        await self._reset_encoder_cache_after_weight_update()
+        return True
+
     async def _reset_encoder_cache_after_weight_update(self) -> None:
         """Invalidate weight-dependent multimodal encoder outputs when enabled."""
         if not self.cfg["vllm_cfg"].get(

@@ -18,7 +18,8 @@
 
 import contextlib
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -37,6 +38,67 @@ def _make_collective_update_extension(backend):
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
+
+
+@pytest.mark.vllm
+def test_initialize_model_express_uses_unwrapped_vllm_model(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = torch.nn.Module()
+    model_runner = MagicMock()
+    model_runner.get_model.return_value = model
+    model_runner.vllm_config = object()
+    model_runner.model_config.model = "test/model"
+
+    context = MagicMock()
+    config = MagicMock()
+    client = MagicMock()
+    client.initialize.return_value = object()
+    modelexpress_rl = ModuleType("modelexpress_rl")
+    modelexpress_rl.ModelExpressGeneratorClient = client
+    modelexpress_rl.ModelExpressGeneratorConfig = config
+    modelexpress_rl.VllmGeneratorContext = context
+    monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
+
+    worker = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    worker.model_runner = model_runner
+    worker.initialize_model_express(server_url="mx-server:8000")
+
+    model_runner.get_model.assert_called_once_with()
+    context.assert_called_once_with(
+        model=model,
+        vllm_config=model_runner.vllm_config,
+    )
+
+
+@pytest.mark.vllm
+def test_model_express_update_reconstructs_version_ref(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    class WeightVersionRef:
+        def __init__(self, version_id):
+            self.version_id = version_id
+
+    modelexpress_rl = ModuleType("modelexpress_rl")
+    modelexpress_rl.WeightVersionRef = WeightVersionRef
+    monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
+
+    staged = MagicMock()
+    client = MagicMock()
+    client.stage_weight.return_value = staged
+    worker = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    worker._model_express = client
+
+    assert worker.update_weights_from_model_express("version-1") is True
+
+    version = client.stage_weight.call_args.kwargs["version"]
+    assert isinstance(version, WeightVersionRef)
+    assert version.version_id == "version-1"
+    staged.release.assert_called_once_with()
 
 
 def _write_sharded_checkpoint(model_dir, shards):
