@@ -31,10 +31,133 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.inflight_profiler import (
+    InflightProfiler,
+    find_vllm_scheduler,
+    inflight_interval_s,
+    inflight_profiling_enabled,
+    read_scheduler_sample,
+)
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+
+_VLLM_INNER_NSYS_MODE_ENV = "NRL_VLLM_INNER_NSYS_MODE"
+_VLLM_INNER_NSYS_MODES = frozenset(
+    {"cuda_graph", "cuda_hw", "cuda_node"}
+)
+_RAY_ENABLE_UV_RUN_RUNTIME_ENV = "RAY_ENABLE_UV_RUN_RUNTIME_ENV"
+_VLLM_NCCL_RUNTIME_ENV_VARS = (
+    "NCCL_CUMEM_ENABLE",
+    "NCCL_NVLS_ENABLE",
+)
+
+
+def _get_vllm_inner_nsys_mode() -> str | None:
+    """Return the validated inner vLLM Ray-worker Nsight mode."""
+
+    mode = os.environ.get(_VLLM_INNER_NSYS_MODE_ENV)
+    if mode is None or mode == "":
+        return None
+    if mode not in _VLLM_INNER_NSYS_MODES:
+        choices = ", ".join(sorted(_VLLM_INNER_NSYS_MODES))
+        raise ValueError(
+            f"{_VLLM_INNER_NSYS_MODE_ENV} must be one of {choices}; "
+            f"got {mode!r}"
+        )
+    return mode
+
+
+def _get_vllm_inner_nsys_config(mode: str) -> dict[str, str]:
+    """Build a bounded Nsight config for vLLM's inner Ray workers."""
+
+    if mode not in _VLLM_INNER_NSYS_MODES:
+        choices = ", ".join(sorted(_VLLM_INNER_NSYS_MODES))
+        raise ValueError(
+            f"inner vLLM Nsight mode must be one of {choices}; got {mode!r}"
+        )
+    config = {
+        "t": (
+            "cuda,nvtx"
+            if mode in {"cuda_graph", "cuda_node"}
+            else "cuda-hw,nvtx"
+        ),
+        "o": "'worker_process_%p'",
+        "stop-on-exit": "true",
+        "capture-range": "cudaProfilerApi",
+        "capture-range-end": "stop",
+    }
+    if mode in {"cuda_graph", "cuda_node"}:
+        config["cuda-graph-trace"] = (
+            "node" if mode == "cuda_node" else "graph"
+        )
+    return config
+
+
+def _build_vllm_nested_runtime_env(
+    python_executable: str,
+) -> dict[str, Any]:
+    """Build the runtime environment passed to vLLM's model workers."""
+
+    runtime_env: dict[str, Any] = {
+        "py_executable": python_executable,
+        "env_vars": {
+            _RAY_ENABLE_UV_RUN_RUNTIME_ENV: os.environ.get(
+                _RAY_ENABLE_UV_RUN_RUNTIME_ENV, "0"
+            )
+        },
+    }
+    for env_name in _VLLM_NCCL_RUNTIME_ENV_VARS:
+        if env_name in os.environ:
+            runtime_env["env_vars"][env_name] = os.environ[env_name]
+    if os.environ.get("NRL_VLLM_PROPAGATE_PYTHONPATH") == "1":
+        pythonpath = os.environ.get("PYTHONPATH")
+        if not pythonpath:
+            raise RuntimeError(
+                "NRL_VLLM_PROPAGATE_PYTHONPATH=1 requires PYTHONPATH"
+            )
+        runtime_env["env_vars"].update(
+            {
+                "PYTHONPATH": pythonpath,
+                "NRL_VLLM_PROPAGATE_PYTHONPATH": "1",
+            }
+        )
+        if os.environ.get("NRL_FORCED_SEQUENCE_AUDIT") == "1":
+            runtime_env["env_vars"]["NRL_FORCED_SEQUENCE_AUDIT"] = "1"
+
+    inner_nsys_mode = _get_vllm_inner_nsys_mode()
+    if inner_nsys_mode is not None:
+        runtime_env["nsight"] = _get_vllm_inner_nsys_config(
+            inner_nsys_mode
+        )
+        runtime_env.setdefault("env_vars", {})[
+            _VLLM_INNER_NSYS_MODE_ENV
+        ] = inner_nsys_mode
+    return runtime_env
+
+
+def _configure_vllm_ray_worker_nsight(
+    vllm_kwargs: dict[str, Any],
+    *,
+    profiling_requested: bool,
+) -> str | None:
+    """Select custom bounded or legacy vLLM-managed Ray-worker profiling."""
+
+    inner_nsys_mode = _get_vllm_inner_nsys_mode()
+    if vllm_kwargs.get("distributed_executor_backend") != "ray":
+        return inner_nsys_mode
+    if inner_nsys_mode is not None:
+        # The custom runtime_env.nsight entry is injected by
+        # NemoRayDistributedExecutor. Enabling vLLM's flag as well would
+        # overwrite it with vLLM's unbounded node-level CUDA Graph trace.
+        vllm_kwargs["ray_workers_use_nsight"] = False
+    elif profiling_requested:
+        # Preserve the existing vLLM-managed behavior when the opt-in mode is
+        # unset.
+        vllm_kwargs["ray_workers_use_nsight"] = True
+    return inner_nsys_mode
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -144,6 +267,10 @@ class BaseVllmGenerationWorker:
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
+        self._vllm_nested_runtime_env: dict[str, Any] | None = None
+        self._vllm_env_copy_layout: str | None = None
+        self._vllm_nested_runtime_env_patch_verified = False
+        self._vllm_nested_runtime_env_contract_sha256: str | None = None
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
@@ -193,44 +320,6 @@ class BaseVllmGenerationWorker:
                 )
 
             return file_path
-
-        def _patch_vllm_init_workers_ray():
-            """Patch the vLLM ray_distributed_executor.py file.
-
-            1. Pass custom runtime_env in _init_workers_ray call.
-                - This allows passing custom py_executable to worker initialization.
-            2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
-                - This is a workaround to fix async vllm in some scenarios.
-                - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
-            """
-            file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            old_lines = [
-                "self._init_workers_ray(placement_group)",
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
-            ]
-
-            new_lines = [
-                f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
-            ]
-
-            need_replace = False
-            for old_line, new_line in zip(old_lines, new_lines):
-                if new_line in content or old_line not in content:
-                    continue
-                content = content.replace(old_line, new_line)
-                need_replace = True
-
-            if not need_replace:
-                return
-
-            # Write back the patched content
-            with open(file_to_patch, "w") as f:
-                f.write(content)
 
         def _patch_vllm_llama_eagle3_own_lm_head():
             """Patch LlamaEagle3 to keep truncated draft lm_head ownership."""
@@ -406,9 +495,6 @@ class BaseVllmGenerationWorker:
 
             logger.info("Successfully patched hermes tool parser for thread-safety.")
 
-        _patch_vllm_init_workers_ray()
-        logger.info("Successfully patched vllm _init_workers_ray.")
-
         _patch_vllm_llama_eagle3_own_lm_head()
         _patch_vllm_hermes_tool_parser_thread_safety()
 
@@ -472,17 +558,46 @@ class BaseVllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
+        profiling_requested = (
+            len(
+                get_nsight_config_if_pattern_matches(
+                    "vllm_generation_worker"
+                )
+            )
+            > 0
+        )
+        inner_nsys_mode = _configure_vllm_ray_worker_nsight(
+            vllm_kwargs,
+            profiling_requested=profiling_requested,
+        )
         if (
-            len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0
+            profiling_requested
+            and vllm_kwargs["distributed_executor_backend"] == "ray"
+        ):
+            if inner_nsys_mode is not None:
+                logger.warning(
+                    "Bounded Nsight profiling is enabled for inner vLLM Ray "
+                    "workers with mode %s. Bypassing vLLM's hardcoded "
+                    "node-level Nsight configuration.",
+                    inner_nsys_mode,
+                )
+            else:
+                logger.warning(
+                    "Nsight profiling is enabled for vllm generation worker through the vllm ray distributed executor. "
+                    "The nsight command-line args and output file names are automatically picked by the ray distributed "
+                    "executor. Refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 "
+                    "for more information."
+                )
+        elif (
+            inner_nsys_mode is not None
             and vllm_kwargs["distributed_executor_backend"] == "ray"
         ):
             logger.warning(
-                "Nsight profiling is enabled for vllm generation worker through the vllm ray distributed executor. "
-                "The nsight command-line args and output file names are automatically picked by the ray distributed "
-                "executor. Refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 "
-                "for more information."
+                "Inner vLLM Ray-worker Nsight mode %s is configured without "
+                "an outer worker pattern; capture must be controlled by "
+                "explicit profiler RPCs.",
+                inner_nsys_mode,
             )
-            vllm_kwargs["ray_workers_use_nsight"] = True
 
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
@@ -496,6 +611,38 @@ class BaseVllmGenerationWorker:
             vllm_kwargs.update(fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
+
+        # Keep the exact string backend until all existing Ray-specific policy
+        # and profiling decisions above have run. A top-level class object is
+        # then serialized with EngineArgs into vLLM's spawned EngineCore, where
+        # it can inject the inner TP-worker runtime_env without mutating the
+        # installed vLLM package.
+        if vllm_kwargs["distributed_executor_backend"] == "ray":
+            from nemo_rl.models.generation.vllm.nested_runtime_env import (
+                export_nested_runtime_env_contract,
+            )
+            from nemo_rl.models.generation.vllm.ray_executor import (
+                NemoRayDistributedExecutor,
+            )
+
+            nested_runtime_env = _build_vllm_nested_runtime_env(
+                self.py_executable
+            )
+            (
+                nested_runtime_env,
+                contract_sha256,
+            ) = export_nested_runtime_env_contract(nested_runtime_env)
+            self._vllm_nested_runtime_env = copy.deepcopy(
+                nested_runtime_env
+            )
+            self._vllm_nested_runtime_env_contract_sha256 = (
+                contract_sha256
+            )
+            self._vllm_env_copy_layout = "custom_executor_class"
+            self._vllm_nested_runtime_env_patch_verified = True
+            vllm_kwargs["distributed_executor_backend"] = (
+                NemoRayDistributedExecutor
+            )
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
@@ -594,6 +741,9 @@ class BaseVllmGenerationWorker:
         greedy: bool,
         stop_strings,
         max_new_tokens: Optional[int] = None,
+        force_generation_length: bool = False,
+        allowed_token_ids: Optional[list[int]] = None,
+        forced_generation_token_ids: Optional[list[int]] = None,
     ):
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
@@ -604,7 +754,7 @@ class BaseVllmGenerationWorker:
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
 
-        return self.SamplingParams(
+        sampling_kwargs = dict(
             temperature=temperature,
             top_p=self.cfg["top_p"],
             top_k=top_k_val,
@@ -614,6 +764,30 @@ class BaseVllmGenerationWorker:
             stop=stop_strings,
             include_stop_str_in_output=True,
         )
+        if force_generation_length and forced_generation_token_ids is None:
+            # Used by deterministic trace replay.  Keeping this opt-in means
+            # normal rollout semantics (EOS and stop strings) are unchanged.
+            sampling_kwargs.update(min_tokens=max_tokens, ignore_eos=True)
+        elif force_generation_length:
+            # Exact-sequence replay must preserve a recorded EOS/EOT at the
+            # final position.  min_tokens=max_tokens would suppress that token
+            # when len(output_ids) == max_tokens - 1.  The per-position logits
+            # processor plus max_tokens already determines the replay length.
+            assert forced_generation_token_ids is not None
+        if allowed_token_ids is not None:
+            # Benchmark-only deterministic-content replay can constrain every
+            # generated position to the same explicit token.  The default
+            # remains unconstrained for normal rollout semantics.
+            sampling_kwargs["allowed_token_ids"] = allowed_token_ids
+        if forced_generation_token_ids is not None:
+            if allowed_token_ids is not None:
+                raise ValueError(
+                    "single-token and exact-sequence forcing are mutually exclusive"
+                )
+            sampling_kwargs["extra_args"] = {
+                "nrl_forced_token_ids": forced_generation_token_ids
+            }
+        return self.SamplingParams(**sampling_kwargs)
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
@@ -668,6 +842,30 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
+        self._maybe_start_inflight_profiler()
+
+    def _maybe_start_inflight_profiler(self) -> None:
+        """Start the in-flight batch profiler when NRL_PROFILE_INFLIGHT is set.
+
+        Only model-owner workers hold a live ``self.llm`` (and thus an in-process
+        scheduler), so the profiler is a no-op elsewhere.
+        """
+        self._inflight_profiler: Optional[InflightProfiler] = None
+        if not (self.is_model_owner and inflight_profiling_enabled()):
+            return
+        self._inflight_profiler = InflightProfiler(
+            sample_fn=lambda: read_scheduler_sample(find_vllm_scheduler(self.llm)),
+            dp_label=repr(self),
+            interval_s=inflight_interval_s(),
+        )
+        self._inflight_profiler.start()
+
+    def get_inflight_timeline(self) -> list[dict[str, Any]]:
+        """Return the in-flight samples captured during the last generate() call."""
+        profiler = getattr(self, "_inflight_profiler", None)
+        if profiler is None:
+            return []
+        return profiler.snapshot()
 
     def init_collective(
         self,
@@ -705,8 +903,15 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 - generation_lengths: Lengths of each response
                 - unpadded_sequence_lengths: Lengths of each input + generated sequence
         """
+        # Open the in-flight profiling window for this call (no-op when disabled).
+        inflight_profiler = getattr(self, "_inflight_profiler", None)
+        if inflight_profiler is not None:
+            inflight_profiler.mark_call_start()
+
         # Handle empty input case
         if len(data["input_ids"]) == 0:
+            if inflight_profiler is not None:
+                inflight_profiler.mark_call_end()
             # Return empty BatchedDataDict with all required fields
             return BatchedDataDict[GenerationOutputSpec](
                 {
@@ -716,6 +921,19 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                     "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
                     "truncated": torch.zeros(0, dtype=torch.bool),
                 }
+            )
+
+        if "_nrl_forced_generation_token_id" in data:
+            raise RuntimeError(
+                "_nrl_forced_generation_token_id is supported only by the "
+                "async vLLM worker; refusing to claim a forced-content "
+                "contract on the synchronous path"
+            )
+        if "_nrl_forced_generation_token_ids" in data:
+            raise RuntimeError(
+                "_nrl_forced_generation_token_ids is supported only by the "
+                "async vLLM worker; refusing exact-sequence replay on the "
+                "synchronous path"
             )
 
         input_ids = data["input_ids"]
@@ -820,6 +1038,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
+
+        if inflight_profiler is not None:
+            inflight_profiler.mark_call_end()
 
         return return_data
 

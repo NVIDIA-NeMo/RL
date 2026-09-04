@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import os
 import threading
 import time
 import uuid
@@ -34,8 +35,75 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.inflight_profiler import (
+    InflightProfiler,
+    inflight_interval_s,
+    inflight_profiling_enabled,
+)
+from nemo_rl.models.generation.vllm.vllm_metric_sampler import (
+    metric_capture_timing,
+    read_restricted_vllm_metrics,
+)
+from nemo_rl.models.generation.vllm.lfs.concurrency import (
+    get_engine_kv_cache_shape,
+)
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
-from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
+    _get_vllm_inner_nsys_mode,
+)
+
+
+async def _await_model_worker_collective_rpc(
+    llm: Any, method: str
+) -> None:
+    """Await an AsyncLLM collective RPC when its engine is initialized."""
+    if llm is not None:
+        await llm.collective_rpc(method, args=tuple())
+
+
+async def _submit_vllm_request(
+    llm: Any,
+    *,
+    prompt: Any,
+    sampling_params: Any,
+    request_id: str,
+    priority: int,
+) -> tuple[Any, float, float, str]:
+    """Submit to EngineCore and return the causal frontend boundary."""
+    request_output_collector = await llm.add_request(
+        request_id=request_id,
+        prompt=prompt,
+        params=sampling_params,
+        priority=priority,
+    )
+    submitted_at_unix_s = time.time()
+    submitted_at_monotonic_s = time.monotonic()
+    submitted_hostname = os.uname().nodename
+    return (
+        request_output_collector,
+        submitted_at_unix_s,
+        submitted_at_monotonic_s,
+        submitted_hostname,
+    )
+
+
+async def _iterate_request_output_collector(
+    request_output_collector: Any,
+    stream_finished: Any,
+) -> AsyncGenerator[Any, None]:
+    """Mirror AsyncLLM.generate's terminal-sentinel loop."""
+    finished = False
+    while not finished:
+        req_output = (
+            request_output_collector.get_nowait()
+            or await request_output_collector.get()
+        )
+        # STREAM_FINISHED is itself terminal. Read `finished` before deciding
+        # whether to yield it, exactly as AsyncLLM.generate does.
+        finished = bool(req_output.finished)
+        if req_output is not stream_finished:
+            yield req_output
 
 
 def _replace_prefix_tokens(
@@ -148,6 +216,136 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
+    async def start_gpu_profiling_async(self) -> None:
+        """Start profiling on every async-engine model worker."""
+        await _await_model_worker_collective_rpc(
+            self.llm, "start_gpu_profiling"
+        )
+
+    async def stop_gpu_profiling_async(self) -> None:
+        """Stop profiling on every async-engine model worker."""
+        await _await_model_worker_collective_rpc(
+            self.llm, "stop_gpu_profiling"
+        )
+
+    async def arm_model_step_gpu_profile_async(
+        self,
+        start_step: int,
+        stop_step: int,
+    ) -> list[dict[str, Any]]:
+        """Arm the same exact model-step range on every nested TP worker."""
+
+        if self.llm is None:
+            raise RuntimeError("async vLLM engine is not initialized")
+        result = await self.llm.collective_rpc(
+            "arm_model_step_gpu_profile",
+            args=(start_step, stop_step),
+        )
+        if not isinstance(result, list):
+            raise RuntimeError(
+                "vLLM collective arm RPC did not return one proof list"
+            )
+        return result
+
+    async def get_model_step_gpu_profile_async(
+        self,
+    ) -> list[dict[str, Any]]:
+        """Collect completed exact-range proofs from every nested TP worker."""
+
+        if self.llm is None:
+            raise RuntimeError("async vLLM engine is not initialized")
+        result = await self.llm.collective_rpc(
+            "get_model_step_gpu_profile",
+            args=tuple(),
+        )
+        if not isinstance(result, list):
+            raise RuntimeError(
+                "vLLM collective proof RPC did not return one proof list"
+            )
+        return result
+
+    def report_replay_runtime_provenance(self) -> dict[str, Any]:
+        """Report actual worker source, engine arguments, and processors."""
+        nested_runtime_env = getattr(
+            self, "_vllm_nested_runtime_env", None
+        )
+        inner_nsys_config = (
+            copy.deepcopy(nested_runtime_env.get("nsight"))
+            if isinstance(nested_runtime_env, dict)
+            and isinstance(nested_runtime_env.get("nsight"), dict)
+            else None
+        )
+        return {
+            "worker_module_file": __file__,
+            # Preserve the user-facing identifier before vLLM resolves a
+            # Hugging Face repository ID to its concrete cache snapshot.
+            "configured_model_name": self.model_name,
+            "pythonpath": os.environ.get("PYTHONPATH"),
+            "propagate_pythonpath": os.environ.get(
+                "NRL_VLLM_PROPAGATE_PYTHONPATH"
+            ),
+            "engine_logits_processors": list(
+                map(
+                    str,
+                    self.llm_async_engine_args.logits_processors or [],
+                )
+            ),
+            "inner_nsys_mode": _get_vllm_inner_nsys_mode(),
+            "inner_nsys_config": inner_nsys_config,
+            "vllm_nested_runtime_env": copy.deepcopy(
+                nested_runtime_env
+            ),
+            "vllm_nested_runtime_env_contract_sha256": getattr(
+                self,
+                "_vllm_nested_runtime_env_contract_sha256",
+                None,
+            ),
+            "vllm_nested_runtime_env_contract_exported": bool(
+                getattr(
+                    self,
+                    "_vllm_nested_runtime_env_patch_verified",
+                    False,
+                )
+            ),
+            # Backward-compatible observability alias used by the bounded
+            # inner-Nsight replay finalizer. The implementation is now the
+            # custom executor contract rather than an installed-source patch.
+            "inner_nsys_runtime_env_patch_verified": bool(
+                getattr(
+                    self,
+                    "_vllm_nested_runtime_env_patch_verified",
+                    False,
+                )
+            ),
+            "vllm_env_copy_layout": getattr(
+                self, "_vllm_env_copy_layout", None
+            ),
+            "model_worker_runtime_provenance": copy.deepcopy(
+                getattr(
+                    self,
+                    "vllm_model_worker_runtime_provenance",
+                    None,
+                )
+            ),
+            "ray_workers_use_nsight": bool(
+                self.llm_async_engine_args.ray_workers_use_nsight
+            ),
+            "async_engine_args": {
+                "enable_prefix_caching": (
+                    self.llm_async_engine_args.enable_prefix_caching
+                ),
+                "enforce_eager": getattr(
+                    self.llm_async_engine_args, "enforce_eager", None
+                ),
+                "max_num_seqs": self.llm_async_engine_args.max_num_seqs,
+                "max_num_batched_tokens": (
+                    self.llm_async_engine_args.max_num_batched_tokens
+                ),
+                "model": self.llm_async_engine_args.model,
+                "revision": self.llm_async_engine_args.revision,
+            },
+        }
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -175,15 +373,80 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 )
             llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
 
-        self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.stat_loggers = (
-            [PrometheusStatLogger]
-            if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
-            else []
+        # Experimental engine-level group-LFS waiting order (env-gated by
+        # NRL_VLLM_LFS_SCHED=1). This reorders whole requests only. The group
+        # id is carried in `priority`, so vLLM's own scheduling policy remains
+        # FCFS instead of using its priority heap.
+        if os.environ.get("NRL_VLLM_LFS_SCHED") == "1":
+            llm_kwargs["scheduler_cls"] = (
+                "nemo_rl.models.generation.vllm.lfs.engine_schedulers.ProbeLfsScheduler"
+            )
+        # Apply the same explicit per-engine concurrency cap to both A/B arms.
+        max_num_seqs = os.environ.get("NRL_VLLM_MAX_NUM_SEQS")
+        if max_num_seqs:
+            llm_kwargs["max_num_seqs"] = int(max_num_seqs)
+
+        # Falsification arm for the length-homogeneity effect measured on the
+        # TRTLLM-gen decode kernel. Setting attention_config.use_trtllm_attention
+        # to False makes can_use_trtllm_attention() return False, so decode falls
+        # back to FlashInfer's BatchDecodeWithPagedKVCacheWrapper, whose kernel
+        # time is driven by the batch's summed context rather than its longest
+        # member. Prefill selection is unchanged. Off by default.
+        if os.environ.get("NRL_VLLM_DISABLE_TRTLLM_ATTENTION") == "1":
+            from vllm.config import AttentionConfig
+
+            llm_kwargs["attention_config"] = AttentionConfig(
+                use_trtllm_attention=False
+            )
+
+        step_trace_enabled = bool(
+            self.cfg["vllm_cfg"].get("enable_vllm_step_trace", False)
         )
+        step_trace_logger_class = None
+        if step_trace_enabled:
+            if os.environ.get("VLLM_DEBUG_MFU_METRICS") != "1":
+                raise RuntimeError(
+                    "enable_vllm_step_trace requires worker environment "
+                    "VLLM_DEBUG_MFU_METRICS=1"
+                )
+            # These are observability-only engine arguments. PerfStats supplies
+            # exact scheduled composition aggregates and CUDAGraphStat supplies
+            # the actual unpadded/padded token batch for the same step.
+            llm_kwargs["enable_mfu_metrics"] = True
+            llm_kwargs["cudagraph_metrics"] = True
+            from nemo_rl.models.generation.vllm.vllm_step_trace import (
+                get_vllm_step_trace_logger_class,
+            )
+
+            step_trace_logger_class = get_vllm_step_trace_logger_class()
+
+        self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
+        self.stat_loggers: list[Any] = []
+        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            self.stat_loggers.append(PrometheusStatLogger)
+        if step_trace_logger_class is not None:
+            self.stat_loggers.append(step_trace_logger_class)
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
+        self._vllm_step_trace_logger = None
+        if step_trace_enabled:
+            logger_manager = self.llm.logger_manager
+            if logger_manager is None:
+                raise RuntimeError(
+                    "vLLM did not create a StatLoggerManager for step tracing"
+                )
+            matching_loggers = [
+                logger
+                for logger in logger_manager.stat_loggers
+                if getattr(logger, "_nrl_vllm_step_trace_logger", False)
+            ]
+            if len(matching_loggers) != 1:
+                raise RuntimeError(
+                    "expected exactly one vLLM step trace logger, found "
+                    f"{len(matching_loggers)}"
+                )
+            self._vllm_step_trace_logger = matching_loggers[0]
 
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
@@ -197,13 +460,39 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
 
+    def get_kv_cache_shape(self) -> dict[str, int]:
+        """Return the initialized per-engine KV cache capacity."""
+        kv_cache_tokens, block_size = get_engine_kv_cache_shape(self.llm)
+        return {
+            "kv_cache_tokens": kv_cache_tokens,
+            "block_size": block_size,
+        }
+
+    def get_vllm_step_trace(self) -> dict[str, Any]:
+        """Return a consistent copy of the current per-step trace window."""
+        if not self.cfg["vllm_cfg"].get("enable_vllm_step_trace", False):
+            return {}
+        logger = getattr(self, "_vllm_step_trace_logger", None)
+        if logger is None:
+            raise RuntimeError("vLLM step tracing is enabled but logger is missing")
+        return logger.snapshot()
+
+    def clear_vllm_step_trace(self) -> None:
+        """Open a fresh per-step trace window."""
+        if not self.cfg["vllm_cfg"].get("enable_vllm_step_trace", False):
+            return
+        logger = getattr(self, "_vllm_step_trace_logger", None)
+        if logger is None:
+            raise RuntimeError("vLLM step tracing is enabled but logger is missing")
+        logger.clear()
+
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
 
         Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
         Runs only on the model-owner actor.
         """
-        from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
+        from prometheus_client import REGISTRY
 
         assert self.cfg["vllm_cfg"].get("async_engine", False), (
             "vLLM metrics logger is only supported with async engine enabled"
@@ -228,34 +517,137 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
         self.generation_tokens: list[int] = []
+        self.num_preemptions: list[int] = []
+        # Keep one structured record per collector pass.  The legacy metric
+        # lists above are retained for compatibility, but they cannot be
+        # aligned reliably by list index: collecting a snapshot takes
+        # non-zero time and individual metrics may occasionally be absent.
+        self.vllm_metric_samples: list[dict[str, Any]] = []
+        self.vllm_metric_source_series: dict[str, dict[str, Any]] | None = None
+        self.vllm_metric_sampler_errors: list[dict[str, Any]] = []
+        self.vllm_metric_sampler_interval_s = float(interval_s)
+        self.generation_tokens_baseline = 0
+        self.num_preemptions_baseline = 0
+
+        def _capture_sample(
+            anchor_kind: str = "periodic",
+            *,
+            scheduled_at_monotonic_s: float | None = None,
+            attempted_at_monotonic_s: float | None = None,
+        ) -> dict[str, Any]:
+            if attempted_at_monotonic_s is None:
+                attempted_at_monotonic_s = time.monotonic()
+            started_at_monotonic_s = time.monotonic()
+            values, source_series = read_restricted_vllm_metrics(REGISTRY)
+            finished_at_monotonic_s = time.monotonic()
+
+            if self.vllm_metric_source_series is None:
+                self.vllm_metric_source_series = copy.deepcopy(source_series)
+            elif source_series != self.vllm_metric_source_series:
+                raise RuntimeError(
+                    "vLLM Prometheus source series changed during sampling: "
+                    f"expected={self.vllm_metric_source_series!r}, "
+                    f"observed={source_series!r}"
+                )
+
+            # Record the observation time after reading the snapshot.
+            # Same-host benchmark processes align on monotonic time; Unix time
+            # is retained to diagnose clock adjustments and for display.
+            sample: dict[str, Any] = {
+                "anchor_kind": anchor_kind,
+                **values,
+                **metric_capture_timing(
+                    interval_s=interval_s,
+                    scheduled_at_monotonic_s=scheduled_at_monotonic_s,
+                    attempted_at_monotonic_s=attempted_at_monotonic_s,
+                    started_at_monotonic_s=started_at_monotonic_s,
+                    finished_at_monotonic_s=finished_at_monotonic_s,
+                ),
+            }
+            sample["sampled_at_unix_s"] = time.time()
+            sample["sampled_at_monotonic_s"] = finished_at_monotonic_s
+            sample["hostname"] = os.uname().nodename
+            return sample
+
+        def _append_sample(sample: dict[str, Any]) -> None:
+            self.vllm_metric_samples.append(sample)
+            if "inflight_batch_size" in sample:
+                self.inflight_batch_sizes.append(sample["inflight_batch_size"])
+            if "num_pending" in sample:
+                self.num_pending_samples.append(sample["num_pending"])
+            if "kv_cache_usage_perc" in sample:
+                self.kv_cache_usage_perc.append(sample["kv_cache_usage_perc"])
+            if "generation_tokens" in sample:
+                self.generation_tokens.append(sample["generation_tokens"])
+            if "num_preemptions" in sample:
+                self.num_preemptions.append(sample["num_preemptions"])
+
+        # clear() and get() use synchronous anchors from the same reader as the
+        # periodic sampler. All calls are serialized by _vllm_metrics_lock.
+        self._capture_vllm_metric_sample = _capture_sample
+        self._append_vllm_metric_sample = _append_sample
 
         def _logger_loop():
             # Delay a little to let engine settle
-            time.sleep(min(2.0, interval_s))
-            while True:
-                try:
-                    for m in get_metrics_snapshot():
-                        with self._vllm_metrics_lock:
-                            if isinstance(m, Gauge):
-                                # Log the vllm inflight batch sizes
-                                if m.name == "vllm:num_requests_running":
-                                    self.inflight_batch_sizes.append(int(m.value))
-                                # Log the vllm pending number of requests in the queue
-                                elif m.name == "vllm:num_requests_waiting":
-                                    self.num_pending_samples.append(int(m.value))
-                                # Log the vllm kv cache usage
-                                elif m.name == "vllm:kv_cache_usage_perc":
-                                    self.kv_cache_usage_perc.append(float(m.value))
-                            elif isinstance(m, Counter):
-                                if m.name == "vllm:generation_tokens":
-                                    self.generation_tokens.append(int(m.value))
-                except Exception:
+            if stop_event.wait(min(2.0, interval_s)):
+                return
+            next_sample_monotonic = time.monotonic()
+            while not stop_event.is_set():
+                scheduled_at_monotonic_s = next_sample_monotonic
+                attempted_at_monotonic_s = time.monotonic()
+                capture_error: Exception | None = None
+                # Snapshot, append, and error attribution share the same lock
+                # as clear(). If clear() ran between a failed warmup capture
+                # and recording that failure, the warmup error could otherwise
+                # be attributed to the measured rollout epoch.
+                with self._vllm_metrics_lock:
+                    try:
+                        _append_sample(
+                            _capture_sample(
+                                scheduled_at_monotonic_s=(
+                                    scheduled_at_monotonic_s
+                                ),
+                                attempted_at_monotonic_s=(
+                                    attempted_at_monotonic_s
+                                ),
+                            )
+                        )
+                    except Exception as error:
+                        capture_error = error
+                        self.vllm_metric_sampler_errors.append(
+                            {
+                                "error_type": type(error).__name__,
+                                "error": str(error),
+                                "scheduled_at_monotonic_s": (
+                                    scheduled_at_monotonic_s
+                                ),
+                                "attempted_at_monotonic_s": (
+                                    attempted_at_monotonic_s
+                                ),
+                                "failed_at_monotonic_s": time.monotonic(),
+                            }
+                        )
+                        if len(self.vllm_metric_sampler_errors) > 1000:
+                            del self.vllm_metric_sampler_errors[:100]
+                if capture_error is not None:
                     print(
-                        "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
+                        "⚠️[vLLM Metric Logger] Exception in restricted "
+                        f"vLLM metrics sampler: {capture_error!r}",
                         flush=True,
                     )
-                    pass
-                time.sleep(interval_s)
+                # Use a deadline instead of sleep(interval) after collection;
+                # otherwise collector overhead accumulates into large timeline
+                # drift during long rollouts.
+                next_sample_monotonic += interval_s
+                now_monotonic = time.monotonic()
+                if next_sample_monotonic <= now_monotonic:
+                    # Do not burst through every missed deadline after a long
+                    # snapshot or lock pause. One fresh sample per interval is
+                    # sufficient and avoids perturbing the engine.
+                    next_sample_monotonic = now_monotonic + interval_s
+                stop_event.wait(
+                    max(0.0, next_sample_monotonic - time.monotonic())
+                )
 
         t = threading.Thread(
             target=_logger_loop, name="vllm-metrics-logger", daemon=True
@@ -271,27 +663,158 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return {}
 
+        attempted_at_monotonic_s = time.monotonic()
         with self._vllm_metrics_lock:
+            # Capture an exact query-time terminal anchor instead of relying on
+            # the periodic thread to happen to sample after the final request.
+            self._append_vllm_metric_sample(
+                self._capture_vllm_metric_sample(
+                    "query_terminal",
+                    attempted_at_monotonic_s=attempted_at_monotonic_s,
+                )
+            )
             metric = {
                 "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
+                "num_preemptions": copy.deepcopy(self.num_preemptions),
+                "metric_samples": copy.deepcopy(self.vllm_metric_samples),
+                "metric_source_series": copy.deepcopy(
+                    self.vllm_metric_source_series
+                ),
+                "metric_sampler_errors": copy.deepcopy(
+                    self.vllm_metric_sampler_errors
+                ),
+                "metric_sampler_interval_s": (
+                    self.vllm_metric_sampler_interval_s
+                ),
+                "generation_tokens_baseline": self.generation_tokens_baseline,
+                "num_preemptions_baseline": self.num_preemptions_baseline,
             }
         return metric
 
-    def clear_vllm_logger_metrics(self) -> None:
+    def clear_vllm_logger_metrics(self) -> dict[str, Any] | None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return
 
+        attempted_at_monotonic_s = time.monotonic()
         with self._vllm_metrics_lock:
+            # Errors before this point belong to engine startup or warmup, not
+            # the measured rollout window.
+            self.vllm_metric_sampler_errors = []
+            # Synchronously sample while holding the same lock as the periodic
+            # thread. This is both the exact cumulative-counter baseline and a
+            # pre-measurement gauge anchor.
+            anchor = self._capture_vllm_metric_sample(
+                "measurement_start",
+                attempted_at_monotonic_s=attempted_at_monotonic_s,
+            )
+            self.num_preemptions_baseline = int(
+                anchor.get(
+                    "num_preemptions",
+                    max(
+                        self.num_preemptions,
+                        default=self.num_preemptions_baseline,
+                    ),
+                )
+            )
+            self.generation_tokens_baseline = int(
+                anchor.get(
+                    "generation_tokens",
+                    max(
+                        self.generation_tokens,
+                        default=self.generation_tokens_baseline,
+                    ),
+                )
+            )
             self.inflight_batch_sizes = []
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
             self.generation_tokens = []
+            self.num_preemptions = []
+            self.vllm_metric_samples = []
+            self._append_vllm_metric_sample(anchor)
+            return copy.deepcopy(anchor)
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+        self.vllm_model_worker_runtime_provenance = (
+            await self.report_model_worker_runtime_environment_async()
+        )
+        self._maybe_start_inflight_profiler()
+
+    def _maybe_start_inflight_profiler(self) -> None:
+        """Start the in-flight batch profiler for the async engine.
+
+        The async engine runs its scheduler out-of-process, so (unlike the sync
+        worker) we cannot read ``scheduler.running`` directly. Instead we maintain
+        a live map of in-flight requests from the streamed RequestOutputs in this
+        front-end process (see generate_async) and sample that. Always created
+        (live map + lock) so the streaming hooks are safe; the sampler only runs
+        when NRL_PROFILE_INFLIGHT is set on a model-owner actor.
+        """
+        # request_id -> (input_len, generated_len_so_far); maintained by the
+        # _inflight_* hooks in generate_async, sampled by the profiler thread.
+        self._inflight_live: dict[str, tuple[int, int]] = {}
+        self._inflight_live_lock = threading.Lock()
+        self._inflight_profiler: Optional[InflightProfiler] = None
+        if not (
+            getattr(self, "is_model_owner", False) and inflight_profiling_enabled()
+        ):
+            return
+
+        def _live_sample() -> dict[str, Any]:
+            with self._inflight_live_lock:
+                items = list(self._inflight_live.values())
+            return {
+                "batch_size": len(items),
+                "waiting": -1,  # not visible from the front-end in async mode
+                "ctx_lens": [il + gl for il, gl in items],
+                "prompt_lens": [il for il, _ in items],
+                "gen_lens": [gl for _, gl in items],
+            }
+
+        self._inflight_profiler = InflightProfiler(
+            sample_fn=_live_sample,
+            dp_label=repr(self),
+            interval_s=inflight_interval_s(),
+        )
+        self._inflight_profiler.start()
+        self._inflight_profiler.mark_call_start()  # open the first window
+
+    def _inflight_register(self, request_id: str, input_len: int) -> None:
+        if getattr(self, "_inflight_profiler", None) is None:
+            return
+        with self._inflight_live_lock:
+            self._inflight_live[request_id] = (int(input_len), 0)
+
+    def _inflight_update(self, request_id: str, gen_len: int) -> None:
+        if getattr(self, "_inflight_profiler", None) is None:
+            return
+        with self._inflight_live_lock:
+            prev = self._inflight_live.get(request_id)
+            if prev is not None:
+                self._inflight_live[request_id] = (prev[0], int(gen_len))
+
+    def _inflight_unregister(self, request_id: str) -> None:
+        if getattr(self, "_inflight_profiler", None) is None:
+            return
+        with self._inflight_live_lock:
+            self._inflight_live.pop(request_id, None)
+
+    def get_inflight_timeline(self) -> list[dict[str, Any]]:
+        """Return the in-flight samples collected for the current window."""
+        profiler = getattr(self, "_inflight_profiler", None)
+        if profiler is None:
+            return []
+        return profiler.snapshot()
+
+    def clear_inflight_timeline(self) -> None:
+        """Open a fresh sampling window (called per training step before rollout)."""
+        profiler = getattr(self, "_inflight_profiler", None)
+        if profiler is not None:
+            profiler.mark_call_start()
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
@@ -686,12 +1209,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
+        cross_dp_frontend_submission: dict[str, Any] | None = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
 
         Args:
             data: BatchedDataDict with input_ids and input_lengths
             greedy: Whether to use greedy decoding instead of sampling
+            cross_dp_frontend_submission: Dispatcher acknowledgement metadata.
+                When present, this worker holds the per-DP dispatcher gate until
+                vLLM's ``add_request`` has returned, which means EngineCore has
+                accepted this request.
 
         Yields:
             Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
@@ -717,6 +1245,56 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             f"but received batch_size={batch_size}. Please handle batching outside this method."
         )
 
+        if cross_dp_frontend_submission is not None:
+            required_submission_keys = {
+                "dispatcher",
+                "session_id",
+                "request_id",
+                "assignment_sequence",
+                "dp_assignment_ordinal",
+                "session_dp_assignment_ordinal",
+            }
+            missing_submission_keys = required_submission_keys.difference(
+                cross_dp_frontend_submission
+            )
+            if missing_submission_keys:
+                raise ValueError(
+                    "Cross-DP frontend submission metadata is missing "
+                    f"{sorted(missing_submission_keys)}"
+                )
+
+            def first_cross_dp_data_value(key: str) -> str:
+                if key not in data or len(data[key]) != 1:
+                    raise ValueError(
+                        "Cross-DP frontend submission requires singleton "
+                        f"{key} request metadata"
+                    )
+                item = data[key][0]
+                if hasattr(item, "item"):
+                    item = item.item()
+                return str(item)
+
+            data_session_id = first_cross_dp_data_value(
+                "_cross_dp_session_id"
+            )
+            data_request_id = first_cross_dp_data_value(
+                "_cross_dp_request_id"
+            )
+            if data_session_id != str(
+                cross_dp_frontend_submission["session_id"]
+            ):
+                raise ValueError(
+                    "Cross-DP worker session metadata does not match its "
+                    "dispatcher lease"
+                )
+            if data_request_id != str(
+                cross_dp_frontend_submission["request_id"]
+            ):
+                raise ValueError(
+                    "Cross-DP worker request metadata does not match its "
+                    "dispatcher lease"
+                )
+
         batch_specific_stop_strings_list = data.get(
             "stop_strings", [[] for _ in range(batch_size)]
         )
@@ -740,7 +1318,74 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             remaining_ctx = (
                 self.cfg["vllm_cfg"]["max_model_len"] - current_input_actual_length
             )
-            allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+            request_max_new_tokens = self.cfg["max_new_tokens"]
+            if "_nrl_max_new_tokens" in data:
+                raw_request_max = data["_nrl_max_new_tokens"][sample_idx]
+                if hasattr(raw_request_max, "item"):
+                    raw_request_max = raw_request_max.item()
+                request_max_new_tokens = int(raw_request_max)
+                if request_max_new_tokens <= 0:
+                    raise ValueError(
+                        "_nrl_max_new_tokens must be positive, got "
+                        f"{request_max_new_tokens}"
+                    )
+                if request_max_new_tokens > self.cfg["max_new_tokens"]:
+                    raise ValueError(
+                        "_nrl_max_new_tokens cannot exceed the configured "
+                        f"max_new_tokens ({self.cfg['max_new_tokens']}), got "
+                        f"{request_max_new_tokens}"
+                    )
+
+            force_generation_length = False
+            if "_nrl_force_generation_length" in data:
+                raw_force_length = data["_nrl_force_generation_length"][sample_idx]
+                if hasattr(raw_force_length, "item"):
+                    raw_force_length = raw_force_length.item()
+                force_generation_length = bool(raw_force_length)
+                if force_generation_length and "_nrl_max_new_tokens" not in data:
+                    raise ValueError(
+                        "_nrl_force_generation_length requires "
+                        "_nrl_max_new_tokens"
+                    )
+
+            allowed_token_ids = None
+            forced_generation_token_ids = None
+            if "_nrl_forced_generation_token_id" in data:
+                raw_forced_token = data[
+                    "_nrl_forced_generation_token_id"
+                ][sample_idx]
+                if hasattr(raw_forced_token, "item"):
+                    raw_forced_token = raw_forced_token.item()
+                forced_token_id = int(raw_forced_token)
+                if forced_token_id < 0:
+                    raise ValueError(
+                        "_nrl_forced_generation_token_id must be "
+                        f"nonnegative, got {forced_token_id}"
+                    )
+                allowed_token_ids = [forced_token_id]
+            if "_nrl_forced_generation_token_ids" in data:
+                if allowed_token_ids is not None:
+                    raise ValueError(
+                        "single-token and exact-sequence forcing are mutually exclusive"
+                    )
+                raw_sequence = data["_nrl_forced_generation_token_ids"][sample_idx]
+                if hasattr(raw_sequence, "tolist"):
+                    raw_sequence = raw_sequence.tolist()
+                forced_generation_token_ids = [int(item) for item in raw_sequence]
+                if (
+                    not forced_generation_token_ids
+                    or any(item < 0 for item in forced_generation_token_ids)
+                    or len(forced_generation_token_ids)
+                    != request_max_new_tokens
+                ):
+                    raise ValueError(
+                        "_nrl_forced_generation_token_ids must contain exactly "
+                        "request_max_new_tokens non-negative token IDs"
+                    )
+
+            allowed_new_tokens = max(
+                0, min(request_max_new_tokens, remaining_ctx)
+            )
 
             # Handle case where no tokens can be generated due to length constraints
             if allowed_new_tokens == 0:
@@ -789,24 +1434,180 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 greedy=greedy,
                 stop_strings=final_stop_strings_for_sample,
                 max_new_tokens=allowed_new_tokens,
+                force_generation_length=force_generation_length,
+                allowed_token_ids=allowed_token_ids,
+                forced_generation_token_ids=forced_generation_token_ids,
             )
 
             request_id = str(uuid.uuid4())
 
-            # Generate using vLLM async engine
-            vllm_request_generator = self.llm.generate(
-                prompt=prompt,
-                sampling_params=sampling_params_for_request,
-                request_id=request_id,
+            # Carry the prompt-group id in vLLM's `priority` for the
+            # whole-request waiting order in lfs/engine_schedulers.py.
+            # This field defaults to zero when the rollout has no group id.
+            lfs_group = 0
+            if "lfs_group" in data:
+                group_value = data["lfs_group"][sample_idx]
+                lfs_group = (
+                    int(group_value.item())
+                    if hasattr(group_value, "item")
+                    else int(group_value)
+                )
+
+            # The causal benchmark opts into same-host monotonic timestamps
+            # that distinguish middleware admission from first engine progress.
+            record_engine_progress = (
+                os.environ.get("CROSS_DP_PERF_REQUEST_TIMELINE", "0") == "1"
+            )
+            engine_frontend_submit_at_monotonic_s = None
+            engine_frontend_submit_at_unix_s = None
+            engine_frontend_hostname = (
+                os.uname().nodename if record_engine_progress else None
             )
 
-            # Get the final result from the generator
+            async def record_frontend_submission(
+                submitted_at_unix_s: float,
+                submitted_at_monotonic_s: float,
+                submitted_hostname: str,
+            ) -> None:
+                nonlocal engine_frontend_submit_at_monotonic_s
+                nonlocal engine_frontend_submit_at_unix_s
+                nonlocal engine_frontend_hostname
+
+                if record_engine_progress:
+                    engine_frontend_submit_at_monotonic_s = (
+                        submitted_at_monotonic_s
+                    )
+                    engine_frontend_submit_at_unix_s = submitted_at_unix_s
+                    engine_frontend_hostname = submitted_hostname
+                if cross_dp_frontend_submission is None:
+                    return
+
+                dispatcher = cross_dp_frontend_submission["dispatcher"]
+                await dispatcher.confirm_engine_frontend_submitted.remote(
+                    str(cross_dp_frontend_submission["request_id"]),
+                    int(
+                        cross_dp_frontend_submission[
+                            "assignment_sequence"
+                        ]
+                    ),
+                    int(
+                        cross_dp_frontend_submission[
+                            "dp_assignment_ordinal"
+                        ]
+                    ),
+                    int(
+                        cross_dp_frontend_submission[
+                            "session_dp_assignment_ordinal"
+                        ]
+                    ),
+                    submitted_at_unix_s,
+                    submitted_at_monotonic_s,
+                    submitted_hostname,
+                )
+
+            # Use one explicit add_request/collector path for vanilla and
+            # cross-DP requests. Besides making timestamps comparable, this is
+            # required for a causal gate: constructing AsyncLLM.generate's
+            # async generator does not execute its add_request call.
+            async def generate_after_engine_submission():
+                from vllm.outputs import STREAM_FINISHED
+                from vllm.v1.engine.async_llm import InputStreamError
+                from vllm.v1.engine.exceptions import (
+                    EngineDeadError,
+                    EngineGenerateError,
+                )
+
+                request_output_collector = None
+
+                async def abort_registered_request() -> None:
+                    if request_output_collector is not None:
+                        await self.llm.abort(
+                            request_output_collector.request_id,
+                            internal=True,
+                        )
+
+                try:
+                    (
+                        request_output_collector,
+                        submitted_at_unix_s,
+                        submitted_at_monotonic_s,
+                        submitted_hostname,
+                    ) = await _submit_vllm_request(
+                        self.llm,
+                        prompt=prompt,
+                        sampling_params=sampling_params_for_request,
+                        request_id=request_id,
+                        priority=lfs_group,
+                    )
+                    await record_frontend_submission(
+                        submitted_at_unix_s,
+                        submitted_at_monotonic_s,
+                        submitted_hostname,
+                    )
+                    async for req_output in _iterate_request_output_collector(
+                        request_output_collector,
+                        STREAM_FINISHED,
+                    ):
+                        yield req_output
+                except (asyncio.CancelledError, GeneratorExit):
+                    await abort_registered_request()
+                    raise
+                except EngineDeadError:
+                    raise
+                except ValueError:
+                    await abort_registered_request()
+                    raise
+                except InputStreamError as error:
+                    await abort_registered_request()
+                    raise error.cause from error
+                except Exception as error:
+                    await abort_registered_request()
+                    raise EngineGenerateError() from error
+                finally:
+                    if request_output_collector is not None:
+                        request_output_collector.close()
+
+            vllm_request_generator = generate_after_engine_submission()
+
+            # Track this request's live context length for the in-flight profiler.
+            # The async scheduler is out-of-process, so we reconstruct the in-flight
+            # state from the streamed RequestOutputs here in the front-end.
+            self._inflight_register(request_id, current_input_actual_length)
+            # Get the final result from the generator while updating the profiler's
+            # front-end view of the request's generated length.
             final_request_output = None
-            async for req_output in vllm_request_generator:
-                final_request_output = req_output
+            engine_first_token_at_monotonic_s = None
+            engine_first_token_at_unix_s = None
+            engine_first_observed_generated_tokens = None
+            try:
+                async for req_output in vllm_request_generator:
+                    final_request_output = req_output
+                    if req_output.outputs:
+                        if (
+                            record_engine_progress
+                            and engine_first_token_at_monotonic_s is None
+                            and req_output.outputs[0].token_ids
+                        ):
+                            engine_first_token_at_monotonic_s = time.monotonic()
+                            engine_first_token_at_unix_s = time.time()
+                            engine_first_observed_generated_tokens = len(
+                                req_output.outputs[0].token_ids
+                            )
+                        self._inflight_update(
+                            request_id, len(req_output.outputs[0].token_ids)
+                        )
+            finally:
+                self._inflight_unregister(request_id)
 
             if final_request_output is None:
                 raise RuntimeError(f"No output received for request {request_id}")
+            if (
+                record_engine_progress
+                and engine_first_token_at_monotonic_s is None
+            ):
+                raise RuntimeError(
+                    f"Request {request_id} completed without an observed token"
+                )
 
             # Process the output
             generation_details = final_request_output.outputs[0]
@@ -887,15 +1688,37 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 device=original_input_ids_single_row.device,
             )
 
-            result_batch = BatchedDataDict[GenerationOutputSpec](
-                {
-                    "output_ids": output_ids_single_item_batched,
-                    "logprobs": logprobs_single_item,
-                    "generation_lengths": generation_lengths_tensor,
-                    "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                    "truncated": truncated_tensor,
-                }
-            )
+            result_data: dict[str, Any] = {
+                "output_ids": output_ids_single_item_batched,
+                "logprobs": logprobs_single_item,
+                "generation_lengths": generation_lengths_tensor,
+                "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                "truncated": truncated_tensor,
+            }
+            if record_engine_progress:
+                result_data.update(
+                    {
+                        "gen_engine_frontend_submit_at_monotonic_s": [
+                            engine_frontend_submit_at_monotonic_s
+                        ],
+                        "gen_engine_frontend_submit_at_unix_s": [
+                            engine_frontend_submit_at_unix_s
+                        ],
+                        "gen_engine_first_token_at_monotonic_s": [
+                            engine_first_token_at_monotonic_s
+                        ],
+                        "gen_engine_first_token_at_unix_s": [
+                            engine_first_token_at_unix_s
+                        ],
+                        "gen_engine_first_observed_generated_tokens": [
+                            engine_first_observed_generated_tokens
+                        ],
+                        "gen_engine_frontend_hostname": [
+                            engine_frontend_hostname
+                        ],
+                    }
+                )
+            result_batch = BatchedDataDict[GenerationOutputSpec](result_data)
 
             return (sample_idx, result_batch)
 
@@ -1038,6 +1861,24 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         return cast(list[str], list_of_worker_results)
 
+    async def report_model_worker_runtime_environment_async(
+        self,
+    ) -> list[dict[str, Any]]:
+        """Collect non-secret environment proof from every TP worker."""
+
+        assert self.llm is not None, (
+            "Attempting to inspect an uninitialized vLLM"
+        )
+        result_or_coro = await self.llm.collective_rpc(
+            "report_runtime_environment",
+            args=tuple(),
+        )
+        if asyncio.iscoroutine(result_or_coro):
+            worker_results = await result_or_coro
+        else:
+            worker_results = result_or_coro
+        return cast(list[dict[str, Any]], worker_results)
+
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
@@ -1178,6 +2019,20 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            metrics_stop_event = getattr(
+                self, "_vllm_metrics_logger_stop_event", None
+            )
+            if metrics_stop_event is not None:
+                metrics_stop_event.set()
+            metrics_thread = getattr(self, "_vllm_metrics_logger_thread", None)
+            if metrics_thread is not None and metrics_thread.is_alive():
+                metrics_thread.join(timeout=2.0)
+                if metrics_thread.is_alive():
+                    print(
+                        "Warning: vLLM metrics logger did not stop within 2s",
+                        flush=True,
+                    )
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())
@@ -1196,7 +2051,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             gc.collect()
             torch.cuda.empty_cache()
 
-            if self.server_thread is not None:
+            # getattr: non-model-owner workers never run _create_engine, which
+            # is where server_thread is initialized.
+            if getattr(self, "server_thread", None) is not None:
                 from threading import Thread
 
                 from uvicorn import Server

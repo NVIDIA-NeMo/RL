@@ -225,7 +225,7 @@ class CheckpointManager:
         self.remove_old_checkpoints()
 
     def remove_old_checkpoints(self, exclude_latest: bool = True) -> None:
-        """Remove checkpoints that are not in the top-k or latest based on the (optional) metric.
+        """Remove checkpoints that are not in the top-k or latest.
 
         If keep_top_k is set, this method removes all checkpoints except the top-k
         best ones. The "best" checkpoints are determined by:
@@ -233,6 +233,10 @@ class CheckpointManager:
           When multiple checkpoints have the same metric value, more recent checkpoints
           (higher step numbers) are preferred.
         - If no metric is provided: the step number. The most recent k checkpoints are kept.
+        Checkpoints whose training metadata contains
+        ``"preserve_checkpoint": true`` are never removed and do not consume a
+        top-k slot. Algorithms use this for semantic boundaries such as the end
+        of an epoch while retaining only one rolling recovery checkpoint.
 
         Args:
             exclude_latest (bool): Whether to exclude the latest checkpoint from deletion. (may result in K+1 checkpoints)
@@ -246,24 +250,30 @@ class CheckpointManager:
             else None
         )
 
+        removable_history = [
+            checkpoint
+            for checkpoint in checkpoint_history
+            if not checkpoint[2].get("preserve_checkpoint", False)
+        ]
+
         if self.metric_name is None:
-            checkpoint_history.sort(key=lambda x: x[0], reverse=True)
+            removable_history.sort(key=lambda x: x[0], reverse=True)
         else:
             # sort by metric value first, then by step number (for equal metrics, prefer more recent)
             if self.higher_is_better:
                 # For higher_is_better=True: higher metric values first, then higher step numbers
-                checkpoint_history.sort(
+                removable_history.sort(
                     key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
                     reverse=True,
                 )
             else:
                 # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-                checkpoint_history.sort(
+                removable_history.sort(
                     key=lambda x: (x[2].get(self.metric_name, float("inf")), -x[0])
                 )
 
         # remove checkpoints that are not in the top-k
-        for checkpoint in checkpoint_history[self.keep_top_k :]:
+        for checkpoint in removable_history[self.keep_top_k :]:
             if exclude_latest and checkpoint[0] == latest_step:
                 continue
             print(

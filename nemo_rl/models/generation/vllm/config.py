@@ -39,6 +39,9 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # Capture exact per-scheduler-step batch composition from vLLM's MFU debug
+    # stats. This is a read-only benchmark/debugging facility.
+    enable_vllm_step_trace: NotRequired[bool]
 
 
 class VllmConfig(GenerationConfig):

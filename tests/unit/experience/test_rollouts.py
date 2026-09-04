@@ -448,6 +448,9 @@ def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async):
     )
     max_rollout_turns = initial_batch["extra_env_info"][0]["max_steps"] + 1
     max_seq_len = 1024
+    # Use non-positional IDs so the test detects accidental replacement with
+    # the per-batch sample index inside the async rollout implementation.
+    initial_batch["idx"] = [101, 202]
 
     print("\nRunning async rollout with async generation engine (VLLM)...")
     vllm_generation.prepare_for_generation()
@@ -469,6 +472,7 @@ def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async):
     assert "message_log" in final_batch
     assert "total_reward" in final_batch
     assert len(final_batch["message_log"]) == len(initial_batch["message_log"])
+    assert final_batch["idx"] == initial_batch["idx"]
 
     for i in range(len(final_batch["message_log"])):
         sample_log = final_batch["message_log"][i]

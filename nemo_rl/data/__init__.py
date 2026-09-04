@@ -31,6 +31,12 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
+    # DAPO-Math-17k was accidentally published with roughly 100 copies of
+    # each prompt. These options expose the cleaned, prompt-unique view used
+    # for multi-epoch experiments.
+    deduplicate_prompts: NotRequired[bool]
+    drop_conflicting_rewards: NotRequired[bool]
+    expected_num_prompts: NotRequired[int]
 
 
 class PreferenceDatasetConfig(TypedDict):
@@ -62,6 +68,11 @@ class DataConfig(TypedDict):
     use_multiple_dataloader: NotRequired[bool]
     num_prompts_per_dataloader: NotRequired[int]
     custom_dataloader: NotRequired[str]
+    # Optional deterministic subset of real training prompts. Repeating this
+    # cohort across epochs is useful for measuring how the same prompts change
+    # as the policy is updated.
+    train_prompt_cohort_size: NotRequired[int | None]
+    train_prompt_cohort_seed: NotRequired[int]
     # dataset configs
     train: ResponseDatasetConfig | PreferenceDatasetConfig | list[ResponseDatasetConfig]
     validation: NotRequired[

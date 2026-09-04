@@ -28,6 +28,9 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.vllm.lfs import (
+    build_async_cross_dp_group_ids,
+)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -50,7 +53,18 @@ class ReplayBuffer:
         self.target_weight_versions = []  # it is the weight-version of the trainer where this trajectory will be used.
 
         self.last_target_weight_already_generated = -1
+        self.fatal_error: str | None = None
         self._lock = _threading.Lock()
+
+    def _raise_if_failed(self) -> None:
+        if self.fatal_error is not None:
+            raise RuntimeError(self.fatal_error)
+
+    def set_fatal_error(self, error: str) -> None:
+        """Publish a generation failure to every trainer-side buffer poll."""
+        with self._lock:
+            if self.fatal_error is None:
+                self.fatal_error = str(error)
 
     def push_with_wait_signal(
         self,
@@ -66,6 +80,7 @@ class ReplayBuffer:
             target_weight_version: version of the model weights this trajectory is intended for training
         """
         with self._lock:
+            self._raise_if_failed()
             if len(self.trajectories) >= self.max_size:
                 return "full"
 
@@ -83,6 +98,7 @@ class ReplayBuffer:
 
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
+        self._raise_if_failed()
         return {
             "total_trajectories": len(self.trajectories),
             "trajectory_versions": self.trajectory_versions,
@@ -92,11 +108,13 @@ class ReplayBuffer:
 
     def get_last_target_weight_already_generated(self) -> int:
         with self._lock:
+            self._raise_if_failed()
             return self.last_target_weight_already_generated
 
     def get_existing_target_weights(self) -> set[int]:
         """Get set of target weight versions that already have trajectories."""
         with self._lock:
+            self._raise_if_failed()
             return set(self.target_weight_versions)
 
     def sample(
@@ -116,6 +134,7 @@ class ReplayBuffer:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
         """
         with self._lock:
+            self._raise_if_failed()
             if not self.trajectories:
                 return None
 
@@ -225,6 +244,7 @@ class ReplayBuffer:
     def size(self) -> int:
         """Return current buffer size."""
         with self._lock:
+            self._raise_if_failed()
             return len(self.trajectories)
 
     def clear(self) -> None:
@@ -290,6 +310,22 @@ class AsyncTrajectoryCollector:
         self._generation_check_lock: _threading.Lock = _threading.Lock()
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
+
+    def _publish_fatal_error(self, error: BaseException) -> None:
+        """Stop collection and make the trainer's next buffer poll fail."""
+        message = f"Async trajectory generation failed: {error!r}"
+        self.running = False
+        # Wake every possible collection wait so its background thread exits.
+        self._manual_pause_cleared.set()
+        self._refit_pause_cleared.set()
+        self._generation_limit_cleared.set()
+        try:
+            ray.get(self.replay_buffer.set_fatal_error.remote(message))
+        except Exception as publish_error:
+            print(
+                f"❌ Failed to publish collector fatal error: {publish_error}",
+                flush=True,
+            )
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -450,7 +486,19 @@ class AsyncTrajectoryCollector:
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
+        cross_dp_session = None
+        launched_cross_dp_participants = 0
+        launched_workers = 0
+        reserved_inflight_tokens = 0
+        target_weight = None
         try:
+            # Do not reserve a target, semaphore tokens, or dispatcher slots
+            # while a refit has already paused new generations.
+            if not self._refit_pause_cleared.is_set() and self.running:
+                self._refit_pause_cleared.wait()
+                if not self.running:
+                    return
+
             generation_weight_version = self.current_weight_version
             num_generations = self.master_config["grpo"]["num_generations_per_prompt"]
             num_prompts = batch.size
@@ -469,6 +517,42 @@ class AsyncTrajectoryCollector:
             print(
                 f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
             )
+
+            if getattr(
+                self.policy_generation, "cross_dp_scheduler_enabled", False
+            ):
+                from nemo_rl.algorithms.grpo import _should_use_nemo_gym
+
+                if _should_use_nemo_gym(self.master_config):
+                    raise RuntimeError(
+                        "Cross-DP middleware scheduling is not implemented for "
+                        "NeMo-Gym rollouts"
+                    )
+                # Open one catalog before any prompt-group thread starts.  The
+                # contiguous A0,A1,... input order can therefore not hide B/C
+                # groups from the first probe wave.
+                all_group_ids = build_async_cross_dp_group_ids(
+                    batch, num_generations=num_generations
+                )
+                participant_indices = [
+                    prompt_idx
+                    for prompt_idx in range(num_prompts)
+                    for _ in range(num_generations)
+                ]
+                # Reserve every prompt-group thread before the dispatcher can
+                # assign this session. Otherwise a catalog for threads blocked
+                # on the semaphore could occupy all DP slots while older
+                # threads wait for a later-turn lease.
+                for _ in range(num_prompts):
+                    self._inflight_sema.acquire()
+                    reserved_inflight_tokens += 1
+                cross_dp_session = (
+                    self.policy_generation.open_cross_dp_session_sync(
+                        all_group_ids,
+                        participant_count=num_prompts,
+                        participant_indices=participant_indices,
+                    )
+                )
 
             # Generate for all prompts in this batch for the target weight
             for prompt_idx in range(num_prompts):
@@ -489,8 +573,25 @@ class AsyncTrajectoryCollector:
 
                 single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
+                prompt_cross_dp_session = None
+                if cross_dp_session is not None:
+                    start = prompt_idx * num_generations
+                    end = start + num_generations
+                    prompt_cross_dp_session = {
+                        "session_id": cross_dp_session["session_id"],
+                        "request_ids": cross_dp_session["request_ids"][start:end],
+                        "group_ids": cross_dp_session["group_ids"][start:end],
+                        "request_participant_ids": cross_dp_session[
+                            "request_participant_ids"
+                        ][start:end],
+                        "participant_id": cross_dp_session["participant_ids"][
+                            prompt_idx
+                        ],
+                    }
 
-                self._inflight_sema.acquire()
+                if cross_dp_session is None:
+                    self._inflight_sema.acquire()
+                    reserved_inflight_tokens += 1
                 worker = _threading.Thread(
                     target=self._run_prompt_group_worker,
                     args=(
@@ -498,12 +599,24 @@ class AsyncTrajectoryCollector:
                         generation_weight_version,
                         target_weight,
                         prompt_idx,
+                        prompt_cross_dp_session,
                     ),
                     daemon=True,
                 )
                 with self._threads_lock:
                     self._inflight_threads.add(worker)
-                worker.start()
+                try:
+                    worker.start()
+                except BaseException:
+                    with self._threads_lock:
+                        self._inflight_threads.discard(worker)
+                    raise
+                launched_workers += 1
+                # Every successfully started worker releases exactly one token
+                # in its finally block, regardless of scheduling mode.
+                reserved_inflight_tokens -= 1
+                if prompt_cross_dp_session is not None:
+                    launched_cross_dp_participants += 1
 
             self._cleanup_finished_threads()
 
@@ -512,6 +625,29 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
+            if cross_dp_session is not None:
+                for participant_index in range(
+                    launched_cross_dp_participants, num_prompts
+                ):
+                    try:
+                        self.policy_generation.close_cross_dp_session_participant_sync(
+                            cross_dp_session["session_id"],
+                            cross_dp_session["participant_ids"][participant_index],
+                        )
+                    except Exception:
+                        traceback.print_exc()
+            for _ in range(reserved_inflight_tokens):
+                self._inflight_sema.release()
+            # _get_next_target_for_generation reserves before validation and
+            # dispatcher setup. With no worker to own that reservation, this
+            # exception path must release it itself.
+            if launched_workers == 0 and target_weight is not None:
+                with self._generation_check_lock:
+                    self._generating_targets.discard(target_weight)
+            if getattr(
+                self.policy_generation, "cross_dp_scheduler_enabled", False
+            ):
+                self._publish_fatal_error(e)
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -640,7 +776,9 @@ class AsyncTrajectoryCollector:
         generation_weight_version: int,
         target_weight_version: int,
         prompt_idx: int,
+        cross_dp_session: dict[str, Any] | None = None,
     ) -> None:
+        cross_dp_session_handed_off = False
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
@@ -665,6 +803,7 @@ class AsyncTrajectoryCollector:
                 final_batch = nemo_gym_rollout_result.final_batch
                 rollout_metrics = nemo_gym_rollout_result.rollout_metrics
             else:
+                cross_dp_session_handed_off = cross_dp_session is not None
                 final_batch, rollout_metrics = run_async_multi_turn_rollout(
                     policy_generation=self.policy_generation,
                     input_batch=repeated_batch,
@@ -675,6 +814,7 @@ class AsyncTrajectoryCollector:
                     ],
                     max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
+                    cross_dp_session=cross_dp_session,
                 )
 
             # Move to CPU and push to buffer (avoid blocking on GC/push)
@@ -731,7 +871,20 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
+            if cross_dp_session is not None:
+                self._publish_fatal_error(e)
         finally:
+            if cross_dp_session is not None and not cross_dp_session_handed_off:
+                try:
+                    self.policy_generation.close_cross_dp_session_participant_sync(
+                        cross_dp_session["session_id"],
+                        cross_dp_session["participant_id"],
+                    )
+                except Exception:
+                    import traceback
+
+                    traceback.print_exc()
+
             # Clean up reservation in case of error (if not already cleaned up)
             with self._generation_check_lock:
                 if target_weight_version in self._generating_targets:

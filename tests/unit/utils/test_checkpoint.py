@@ -312,6 +312,33 @@ def test_checkpoint_without_keep_top_k(tmp_path):
     assert len(remaining_dirs) == len(steps)
 
 
+def test_preserved_checkpoints_survive_rolling_cleanup(tmp_path):
+    checkpoint_dir = tmp_path.resolve() / "checkpoints"
+    manager = CheckpointManager(
+        {
+            "enabled": True,
+            "checkpoint_dir": checkpoint_dir,
+            "metric_name": None,
+            "higher_is_better": True,
+            # Keep no ordinary historical checkpoints. The latest remains a
+            # rolling recovery point via exclude_latest=True.
+            "keep_top_k": 0,
+            "save_optimizer": True,
+        }
+    )
+
+    for step, preserve in [(10, True), (12, False), (20, True)]:
+        tmp_dir = manager.init_tmp_checkpoint(
+            step, {"preserve_checkpoint": preserve}
+        )
+        manager.finalize_checkpoint(tmp_dir)
+
+    remaining_steps = {
+        int(path.name.split("_")[1]) for path in checkpoint_dir.glob("step_*")
+    }
+    assert remaining_steps == {10, 20}
+
+
 def test_load_checkpoint_empty_dir(checkpoint_manager, checkpoint_dir):
     """Test that loading from an empty checkpoint directory returns None."""
     # Get latest checkpoint path from empty directory

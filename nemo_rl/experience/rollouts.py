@@ -19,7 +19,9 @@ import asyncio
 import copy
 import json
 import math
+import os
 import statistics
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -229,6 +231,14 @@ async def generate_responses_async(
             )
         except Exception as e:
             print(f"Error occurred while extracting gen_leader_worker_idx: {e}")
+    if "gen_dp_shard_idx" in generation_outputs:
+        value = generation_outputs["gen_dp_shard_idx"][0]
+        try:
+            gen_metrics["gen_dp_shard_idx"] = (
+                int(value[0]) if isinstance(value, list) else int(value)
+            )
+        except Exception as e:
+            print(f"Error occurred while extracting gen_dp_shard_idx: {e}")
 
     # Add response_truncated to gen_metrics for use by caller
     if response_truncated is not None:
@@ -603,6 +613,8 @@ async def async_generate_response_for_sample_turn(
     tokenizer: TokenizerType,
     max_seq_len: int,
     greedy: bool = False,
+    lfs_group: int | None = None,
+    cross_dp_request: dict[str, str] | None = None,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
     """Generate a response for a single sample's turn using async generation.
 
@@ -636,6 +648,22 @@ async def async_generate_response_for_sample_turn(
             "stop_strings": [sample_stop_strings],
         }
     )
+    # Carry the prompt-group id to the engine-level LFS scheduler.
+    if lfs_group is not None:
+        generation_input_data["lfs_group"] = torch.tensor([lfs_group])
+    if cross_dp_request is not None:
+        generation_input_data["_cross_dp_session_id"] = [
+            cross_dp_request["session_id"]
+        ]
+        generation_input_data["_cross_dp_participant_id"] = [
+            cross_dp_request["participant_id"]
+        ]
+        generation_input_data["_cross_dp_request_id"] = [
+            cross_dp_request["request_id"]
+        ]
+        generation_input_data["_cross_dp_group_id"] = [
+            cross_dp_request["group_id"]
+        ]
 
     # Create a dummy batch for generate_responses_async
     dummy_batch = BatchedDataDict[DatumSpec](
@@ -672,6 +700,7 @@ async def run_sample_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    cross_dp_request: dict[str, str] | None = None,
 ) -> tuple[dict, dict[str, Any]]:
     """Run a multi-turn rollout for a single sample.
 
@@ -717,6 +746,7 @@ async def run_sample_multi_turn_rollout(
     turn_total_tokens = []
     # Track per-turn per-worker token accounting if available
     per_worker_token_counts = {}  # worker_idx -> token_count
+    per_dp_token_counts = {}  # dp_shard_idx -> token_count
 
     for turn in range(max_rollout_turns):
         if terminated or truncated:
@@ -725,6 +755,22 @@ async def run_sample_multi_turn_rollout(
         turn_count += 1
 
         # Generate response for this sample using async generation
+        lfs_group_size = (
+            os.environ.get("NRL_VLLM_LFS_SCHED_G")
+            if os.environ.get("NRL_VLLM_LFS_SCHED") == "1"
+            and cross_dp_request is None
+            else None
+        )
+        lfs_group = (
+            sample_idx // int(lfs_group_size) if lfs_group_size else None
+        )
+        turn_cross_dp_request = None
+        if cross_dp_request is not None:
+            turn_cross_dp_request = dict(cross_dp_request)
+            if turn > 0:
+                turn_cross_dp_request["request_id"] = (
+                    f"{cross_dp_request['request_id']}:turn:{turn}"
+                )
         try:
             (
                 updated_message_log,
@@ -738,6 +784,8 @@ async def run_sample_multi_turn_rollout(
                 tokenizer,
                 max_seq_len,
                 greedy=greedy,
+                lfs_group=lfs_group,
+                cross_dp_request=turn_cross_dp_request,
             )
             current_message_log = updated_message_log
 
@@ -759,9 +807,19 @@ async def run_sample_multi_turn_rollout(
                 per_worker_token_counts[worker_idx] = (
                     per_worker_token_counts.get(worker_idx, 0) + gen_token_count
                 )
+            if "gen_dp_shard_idx" in gen_metrics:
+                dp_idx = int(gen_metrics["gen_dp_shard_idx"])
+                per_dp_token_counts[dp_idx] = (
+                    per_dp_token_counts.get(dp_idx, 0) + gen_token_count
+                )
 
         except Exception as e:
             print(f"Error generating response for sample {sample_idx}: {e}")
+            if cross_dp_request is not None:
+                # A dispatcher failure affects global admission state. Returning
+                # a partial trajectory would make async-GRPO buffer invalid
+                # training data and hide the real scheduling failure.
+                raise
             break
 
         # Create single-sample batch for environment interaction
@@ -833,7 +891,10 @@ async def run_sample_multi_turn_rollout(
         "task_name": task_name,
         "total_reward": torch.tensor(total_reward),
         "stop_strings": current_stop_strings,
-        "idx": sample_idx,
+        # Preserve the dataset identity supplied by the caller. sample_idx is
+        # only the position inside this rollout batch; replacing idx with it
+        # breaks prompt-group identity after repeat_interleave(G).
+        "idx": initial_sample_state.get("idx", sample_idx),
     }
     if multi_reward_seen:
         for j in range(len(reward_acc_list)):
@@ -854,6 +915,7 @@ async def run_sample_multi_turn_rollout(
         "turn_total_tokens": turn_total_tokens,
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
+        "per_dp_token_counts": per_dp_token_counts,
     }
 
     return final_sample_state, sample_metrics
@@ -867,6 +929,7 @@ def run_async_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    cross_dp_session: dict[str, Any] | None = None,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run multi-turn rollouts with sample-level processing.
 
@@ -888,9 +951,27 @@ def run_async_multi_turn_rollout(
             - Dictionary of rollout metrics
     """
 
-    async def _async_rollout_implementation():
-        """Internal async implementation."""
+    async def _async_rollout_with_session(
+        scheduling_session: dict[str, Any] | None,
+    ):
+        """Run one rollout after its optional scheduling session is open."""
         batch_size = len(input_batch["message_log"])
+
+        if scheduling_session is not None:
+            request_ids = scheduling_session["request_ids"]
+            group_ids = scheduling_session["group_ids"]
+            request_participant_ids = scheduling_session["request_participant_ids"]
+            if (
+                len(request_ids) != batch_size
+                or len(group_ids) != batch_size
+                or len(request_participant_ids) != batch_size
+            ):
+                raise ValueError(
+                    "Cross-DP session size does not match rollout batch: "
+                    f"requests={len(request_ids)} groups={len(group_ids)} "
+                    f"participants={len(request_participant_ids)} "
+                    f"batch={batch_size}"
+                )
 
         # Prepare initial states for each sample
         sample_initial_states = []
@@ -902,6 +983,15 @@ def run_async_multi_turn_rollout(
                 "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
                 "idx": input_batch.get("idx", list(range(batch_size)))[i],
             }
+            if scheduling_session is not None:
+                sample_state["cross_dp_request"] = {
+                    "session_id": scheduling_session["session_id"],
+                    "participant_id": scheduling_session[
+                        "request_participant_ids"
+                    ][i],
+                    "request_id": scheduling_session["request_ids"][i],
+                    "group_id": scheduling_session["group_ids"][i],
+                }
             sample_initial_states.append(sample_state)
 
         # Run all samples concurrently
@@ -917,19 +1007,63 @@ def run_async_multi_turn_rollout(
                     max_seq_len=max_seq_len,
                     max_rollout_turns=max_rollout_turns,
                     greedy=greedy,
+                    cross_dp_request=sample_state.get("cross_dp_request"),
                 )
                 return result
             except Exception as e:
                 raise RuntimeError(f"Error in sample {i} rollout: {e}") from e
 
-        # Create tasks for all samples and run them concurrently
+        # Submit every sample immediately. NRL_ROLLOUT_TIMING=1 records per-sample
+        # completion times for engine-scheduler A/B comparisons without imposing a
+        # separate client-side admission limit.
+        timing_enabled = os.environ.get("NRL_ROLLOUT_TIMING") == "1"
+        rollout_start = time.monotonic()
+        finish_times: list[float | None] = [None] * len(sample_initial_states)
+
+        async def timed_rollout(sample_index: int, sample_state: dict):
+            result = await run_single_sample_with_error_handling(
+                sample_index, sample_state
+            )
+            if timing_enabled:
+                finish_times[sample_index] = time.monotonic() - rollout_start
+            return result
+
         sample_tasks = [
-            run_single_sample_with_error_handling(i, sample_state)
+            asyncio.create_task(timed_rollout(i, sample_state))
             for i, sample_state in enumerate(sample_initial_states)
         ]
-
-        # Execute all sample rollouts concurrently
-        sample_results = await asyncio.gather(*sample_tasks, return_exceptions=False)
+        try:
+            sample_results = await asyncio.gather(
+                *sample_tasks, return_exceptions=False
+            )
+        except BaseException:
+            # Drain every sibling before the outer session finally closes its
+            # participant. Each task then gets a chance to cancel or resolve
+            # its dispatcher lease in _async_generate_base.
+            for task in sample_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*sample_tasks, return_exceptions=True)
+            raise
+        if timing_enabled:
+            completed_finish_times = sorted(
+                finish_time for finish_time in finish_times if finish_time is not None
+            )
+            request_count = len(completed_finish_times)
+            makespan = time.monotonic() - rollout_start
+            p90_index = max(0, math.ceil(0.9 * request_count) - 1)
+            p90 = (
+                completed_finish_times[p90_index] if request_count else makespan
+            )
+            print(
+                "[ROLLOUT-TIMING "
+                f"lfs_sched={os.environ.get('NRL_VLLM_LFS_SCHED', '0')} "
+                "cross_dp_sched="
+                f"{os.environ.get('NRL_VLLM_CROSS_DP_SCHED', 'off')}] "
+                f"makespan={makespan:.1f}s "
+                f"tail_last10pct={makespan - p90:.1f}s N={request_count}",
+                flush=True,
+            )
 
         # Process results
         final_sample_states = []
@@ -1036,6 +1170,14 @@ def run_async_multi_turn_rollout(
                 for k, v in m["per_worker_token_counts"].items():
                     per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
+        if "per_dp_token_counts" in all_sample_metrics[0]:
+            per_dp_token_counts = {}
+            for metrics in all_sample_metrics:
+                for dp_idx, token_count in metrics["per_dp_token_counts"].items():
+                    per_dp_token_counts[dp_idx] = (
+                        per_dp_token_counts.get(dp_idx, 0) + token_count
+                    )
+            rollout_metrics["per_dp_token_counts"] = per_dp_token_counts
 
         # Collect ISL, OSL, and ISL+OSL metrics for all samples
         rollout_metrics["histogram/gen_tokens_length"] = [
@@ -1049,6 +1191,68 @@ def run_async_multi_turn_rollout(
         ]
 
         return final_batch, rollout_metrics
+
+    async def _async_rollout_implementation():
+        """Open/close one middleware session around the complete rollout."""
+        scheduling_session = cross_dp_session
+        primary_error: BaseException | None = None
+        try:
+            cross_dp_enabled = bool(
+                getattr(policy_generation, "cross_dp_scheduler_enabled", False)
+            )
+            if scheduling_session is not None and not cross_dp_enabled:
+                raise RuntimeError(
+                    "A cross-DP rollout session was supplied to a generation "
+                    "backend without cross-DP scheduling enabled"
+                )
+            if cross_dp_enabled and scheduling_session is None:
+                batch_size = len(input_batch["message_log"])
+                if "idx" in input_batch:
+                    raw_group_ids = input_batch["idx"]
+                    group_ids = [
+                        str(value.item() if hasattr(value, "item") else value)
+                        for value in raw_group_ids
+                    ]
+                else:
+                    group_size = int(
+                        os.environ.get("NRL_VLLM_LFS_SCHED_G", "1")
+                    )
+                    if group_size <= 0:
+                        raise ValueError(
+                            "NRL_VLLM_LFS_SCHED_G must be positive when cross-DP "
+                            f"scheduling is enabled, got {group_size}"
+                        )
+                    group_ids = [
+                        str(index // group_size)
+                        for index in range(batch_size)
+                    ]
+                scheduling_session = (
+                    await policy_generation.open_cross_dp_session(
+                        group_ids, participant_count=1
+                    )
+                )
+                scheduling_session["participant_id"] = scheduling_session[
+                    "participant_ids"
+                ][0]
+            return await _async_rollout_with_session(scheduling_session)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if scheduling_session is not None:
+                try:
+                    await policy_generation.close_cross_dp_session_participant(
+                        scheduling_session["session_id"],
+                        scheduling_session["participant_id"],
+                    )
+                except Exception as close_error:
+                    if primary_error is None:
+                        raise
+                    print(
+                        "Failed to close cross-DP rollout participant after "
+                        f"{primary_error!r}: {close_error}",
+                        flush=True,
+                    )
 
     return asyncio.run(_async_rollout_implementation())
 

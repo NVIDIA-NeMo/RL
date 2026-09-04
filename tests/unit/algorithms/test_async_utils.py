@@ -103,6 +103,24 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_replay_buffer_fatal_error_reaches_trainer_polls(self):
+        """A background generation failure must not look like an empty buffer."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        ray.get(buffer.set_fatal_error.remote("dispatcher lost remote state"))
+
+        with pytest.raises(RuntimeError, match="dispatcher lost remote state"):
+            ray.get(buffer.size.remote())
+        with pytest.raises(RuntimeError, match="dispatcher lost remote state"):
+            ray.get(
+                buffer.sample.remote(
+                    num_prompt_groups=1,
+                    current_weight_version=0,
+                    max_age_steps=1,
+                )
+            )
+
+        ray.kill(buffer)
+
     def test_replay_buffer_push_and_size(self):
         """Test pushing trajectories to buffer."""
         buffer = ReplayBuffer.remote(max_size=3)

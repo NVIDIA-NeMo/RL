@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import json
 import os
+import random
+import shutil
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -180,6 +183,8 @@ class GRPOSaveState(TypedDict):
     val_reward: NotRequired[
         float
     ]  # Optional field - may not be present during training
+    preserve_checkpoint: NotRequired[bool]
+    completed_epoch: NotRequired[int]
 
 
 def _default_grpo_save_state() -> GRPOSaveState:
@@ -303,6 +308,38 @@ def setup(
         )
 
     # Load train dataset
+    cohort_size = data_config.get("train_prompt_cohort_size")
+    if cohort_size is not None:
+        if data_config["use_multiple_dataloader"]:
+            raise ValueError(
+                "data.train_prompt_cohort_size is only supported with one dataloader"
+            )
+        cohort_size = int(cohort_size)
+        if cohort_size < dataloader_batch_size:
+            raise ValueError(
+                "data.train_prompt_cohort_size must be at least one dataloader "
+                f"batch ({dataloader_batch_size}), got {cohort_size}"
+            )
+        if cohort_size > len(dataset):
+            raise ValueError(
+                "data.train_prompt_cohort_size exceeds the training dataset: "
+                f"{cohort_size} > {len(dataset)}"
+            )
+        cohort_seed = int(
+            data_config.get("train_prompt_cohort_seed", grpo_config["seed"])
+        )
+        cohort_indices = random.Random(cohort_seed).sample(
+            range(len(dataset)), cohort_size
+        )
+        # Subset forwards the original dataset index into __getitem__, so the
+        # resulting DatumSpec.idx remains a stable prompt identity across epochs.
+        dataset = torch.utils.data.Subset(dataset, cohort_indices)
+        print(
+            "  ✓ Fixed real-prompt training cohort enabled: "
+            f"size={cohort_size} seed={cohort_seed}",
+            flush=True,
+        )
+
     def init_train_dataloader(dataset, suffix: str = ""):
         dataloader = StatefulDataLoader(
             dataset,
@@ -1566,6 +1603,48 @@ def grpo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
+                    # Persist history_lfs observations independently of the
+                    # best-effort trajectory logger. A checkpoint copies this
+                    # exact step-aligned state for causal recovery.
+                    _scheduler_snapshot_for_step = None
+                    _cross_dp_history_path = os.environ.get(
+                        "NRL_VLLM_GROUP_HISTORY_PATH"
+                    )
+                    if policy_generation is not None and (
+                        _cross_dp_history_path
+                        or os.environ.get("NRL_DUMP_ROLLOUT_LENGTHS")
+                    ):
+                        _snapshot_fn = getattr(
+                            policy_generation,
+                            "get_cross_dp_scheduler_snapshot",
+                            None,
+                        )
+                        if _snapshot_fn is not None:
+                            _scheduler_snapshot_for_step = _snapshot_fn()
+                    if _cross_dp_history_path:
+                        if _scheduler_snapshot_for_step is None:
+                            raise RuntimeError(
+                                "NRL_VLLM_GROUP_HISTORY_PATH requires an active "
+                                "cross-DP scheduler"
+                            )
+                        _history_payload = {
+                            "step": int(total_steps + 1),
+                            "group_history": _scheduler_snapshot_for_step.get(
+                                "group_history", {}
+                            ),
+                        }
+                        os.makedirs(
+                            os.path.dirname(
+                                os.path.abspath(_cross_dp_history_path)
+                            ),
+                            exist_ok=True,
+                        )
+                        _history_tmp = (
+                            f"{_cross_dp_history_path}.tmp.{os.getpid()}"
+                        )
+                        with open(_history_tmp, "w") as _history_file:
+                            json.dump(_history_payload, _history_file)
+                        os.replace(_history_tmp, _cross_dp_history_path)
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
@@ -1717,6 +1796,84 @@ def grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    # Env-gated per-step rollout length dump. Records
+                    # per-(prompt, sample) generation lengths grouped by prompt (batch is
+                    # repeat_interleave(G), so every G contiguous rows are one prompt group)
+                    # so we can measure whether the intra-group length similarity persists as
+                    # the policy weights update. Best-effort; never breaks training.
+                    _rollout_length_dump = os.environ.get("NRL_DUMP_ROLLOUT_LENGTHS")
+                    if _rollout_length_dump:
+                        try:
+                            import json as _json
+
+                            _gen_len = (
+                                flat_messages["token_loss_mask"]
+                                .sum(dim=1)
+                                .to(torch.int64)
+                                .tolist()
+                            )
+                            _rec = {
+                                "step": int(total_steps + 1),
+                                "G": int(
+                                    master_config["grpo"]["num_generations_per_prompt"]
+                                ),
+                                "cap": int(
+                                    master_config["policy"]["max_total_sequence_length"]
+                                ),
+                                "gen_len": _gen_len,
+                                "prompt_len": repeated_batch["length"]
+                                .to(torch.int64)
+                                .tolist(),
+                                "reward": repeated_batch["total_reward"]
+                                .to(torch.float32)
+                                .tolist(),
+                                # Stable identity from the underlying real dataset.
+                                # It is repeated G times in exactly the same order as
+                                # gen_len, enabling strictly causal cross-step history.
+                                "prompt_id": [
+                                    int(_v.item() if hasattr(_v, "item") else _v)
+                                    for _v in repeated_batch["idx"]
+                                ],
+                            }
+                            _scheduler_snapshot = _scheduler_snapshot_for_step
+                            if _scheduler_snapshot is not None:
+                                _assignments = _scheduler_snapshot.get(
+                                    "assignment_history", []
+                                )
+                                _session_id = (
+                                    _assignments[-1]["session_id"]
+                                    if _assignments
+                                    else None
+                                )
+                                _rec["scheduler_mode"] = _scheduler_snapshot.get(
+                                    "mode"
+                                )
+                                _rec["scheduler_assignments"] = [
+                                    _item
+                                    for _item in _assignments
+                                    if _item.get("session_id") == _session_id
+                                ]
+                                _rec["scheduler_history_updates"] = [
+                                    _item
+                                    for _item in _scheduler_snapshot.get(
+                                        "history_update_history", []
+                                    )
+                                    if _item.get("session_id") == _session_id
+                                ]
+                            os.makedirs(
+                                os.path.dirname(os.path.abspath(_rollout_length_dump)),
+                                exist_ok=True,
+                            )
+                            with open(_rollout_length_dump, "a") as _f:
+                                _f.write(_json.dumps(_rec) + "\n")
+                            print(
+                                f"[length dump] step {total_steps + 1}: "
+                                f"{len(_gen_len)} samples -> {_rollout_length_dump}",
+                                flush=True,
+                            )
+                        except Exception as _e:  # noqa: BLE001 - best-effort profiling
+                            print(f"[length dump] skipped: {_e}", flush=True)
+
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -1967,6 +2124,18 @@ def grpo_train(
                     grpo_save_state["total_steps"] = total_steps + 1
                     grpo_save_state["current_epoch"] = current_epoch
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
+                    is_epoch_end = (
+                        not master_config["data"]["use_multiple_dataloader"]
+                        and current_step + 1 == len(wrapped_dataloader)
+                    )
+                    # Epoch-boundary checkpoints are semantic experiment
+                    # artifacts, while timeout checkpoints are rolling recovery
+                    # points. CheckpointManager keeps the former permanently.
+                    grpo_save_state["preserve_checkpoint"] = is_epoch_end
+                    if is_epoch_end:
+                        grpo_save_state["completed_epoch"] = current_epoch + 1
+                    else:
+                        grpo_save_state.pop("completed_epoch", None)
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in grpo_save_state:
@@ -2040,6 +2209,22 @@ def grpo_train(
                             torch.save(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            )
+                        cross_dp_history_path = os.environ.get(
+                            "NRL_VLLM_GROUP_HISTORY_PATH"
+                        )
+                        if cross_dp_history_path:
+                            if not os.path.exists(cross_dp_history_path):
+                                raise FileNotFoundError(
+                                    "Cross-DP history file is missing at checkpoint "
+                                    f"time: {cross_dp_history_path}"
+                                )
+                            shutil.copyfile(
+                                cross_dp_history_path,
+                                os.path.join(
+                                    checkpoint_path,
+                                    "cross_dp_group_history.json",
+                                ),
                             )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 

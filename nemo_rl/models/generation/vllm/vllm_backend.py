@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import os
+import sys
 import traceback
 from typing import Any
 
@@ -37,6 +39,69 @@ except ImportError:
     )
 
 
+_RUNTIME_ENV_PROOF_ENV_NAMES = (
+    "RAY_ENABLE_UV_RUN_RUNTIME_ENV",
+    "NCCL_CUMEM_ENABLE",
+    "NCCL_NVLS_ENABLE",
+    "NRL_VLLM_RUNTIME_ENV_CONTRACT_SHA256",
+    "PYTHONPATH",
+    "NRL_VLLM_PROPAGATE_PYTHONPATH",
+    "NRL_FORCED_SEQUENCE_AUDIT",
+    "NRL_VLLM_INNER_NSYS_MODE",
+)
+
+
+def _sanitize_ray_runtime_env(raw_runtime_env: object) -> dict[str, Any]:
+    """Return only the non-secret fields used to prove the worker contract."""
+    if not isinstance(raw_runtime_env, dict):
+        return {}
+
+    sanitized_runtime_env: dict[str, Any] = {}
+    py_executable = raw_runtime_env.get("py_executable")
+    if isinstance(py_executable, str):
+        sanitized_runtime_env["py_executable"] = py_executable
+
+    # Ray's public runtime_env input is named ``nsight``, but RuntimeEnv stores
+    # and serializes it as ``_nsight``. Accept the public spelling as well for
+    # forward/backward compatibility, while refusing an ambiguous proof.
+    public_nsight_present = "nsight" in raw_runtime_env
+    internal_nsight_present = "_nsight" in raw_runtime_env
+    if (
+        public_nsight_present
+        and internal_nsight_present
+        and raw_runtime_env["nsight"] != raw_runtime_env["_nsight"]
+    ):
+        raise RuntimeError(
+            "Ray runtime_env contains conflicting 'nsight' and '_nsight' "
+            "configurations"
+        )
+    raw_nsight = (
+        raw_runtime_env["_nsight"]
+        if internal_nsight_present
+        else raw_runtime_env.get("nsight")
+    )
+    if raw_nsight is not None:
+        if not isinstance(raw_nsight, dict):
+            raise RuntimeError(
+                "Ray runtime_env Nsight configuration must be a mapping"
+            )
+        sanitized_runtime_env["nsight"] = dict(raw_nsight)
+
+    raw_runtime_env_vars = raw_runtime_env.get("env_vars")
+    if isinstance(raw_runtime_env_vars, dict):
+        sanitized_runtime_env_vars = {
+            name: value
+            for name in _RUNTIME_ENV_PROOF_ENV_NAMES
+            if isinstance(
+                (value := raw_runtime_env_vars.get(name)),
+                str,
+            )
+        }
+        if sanitized_runtime_env_vars:
+            sanitized_runtime_env["env_vars"] = sanitized_runtime_env_vars
+    return sanitized_runtime_env
+
+
 def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor:
     """Apply GPT-OSS down_proj transpose fix to the weight.
 
@@ -52,6 +117,153 @@ def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor
 
 
 class VllmInternalWorkerExtension:
+    def report_runtime_environment(self) -> dict[str, Any]:
+        """Report a sanitized proof of the nested Ray worker environment."""
+        import ray
+        from ray._private import ray_constants
+
+        selected_env = {
+            name: value
+            for name in _RUNTIME_ENV_PROOF_ENV_NAMES
+            if (value := os.environ.get(name)) is not None
+        }
+
+        runtime_context = ray.get_runtime_context()
+        sanitized_runtime_env = _sanitize_ray_runtime_env(
+            runtime_context.runtime_env
+        )
+
+        def _runtime_context_id(method_name: str) -> str | None:
+            method = getattr(runtime_context, method_name, None)
+            if not callable(method):
+                return None
+            try:
+                identifier = method()
+            except Exception:  # pragma: no cover - depends on Ray context
+                return None
+            if identifier is None:
+                return None
+            return str(identifier)
+
+        return {
+            "python_executable": sys.executable,
+            "worker_module_file": __file__,
+            "hostname": os.uname().nodename,
+            "pid": os.getpid(),
+            "selected_env": selected_env,
+            "ray_enable_uv_import_constant": getattr(
+                ray_constants,
+                "RAY_ENABLE_UV_RUN_RUNTIME_ENV",
+                None,
+            ),
+            "ray_runtime_env": sanitized_runtime_env,
+            "actor_id": _runtime_context_id("get_actor_id"),
+            "node_id": _runtime_context_id("get_node_id"),
+        }
+
+    def arm_model_step_gpu_profile(
+        self,
+        start_step: int,
+        stop_step: int,
+    ) -> dict[str, Any]:
+        """Arm one exact, one-shot model-step capture on this TP worker.
+
+        This method is called through vLLM ``collective_rpc`` so every tensor
+        parallel rank installs its own wrapper before the frontend submits any
+        request. Pipeline parallelism is deliberately rejected: one ordinal
+        must identify the same complete model step on every captured worker.
+        """
+        from nemo_rl.models.generation.vllm.model_step_gpu_profiler import (
+            DeterministicModelStepGpuProfiler,
+        )
+
+        if hasattr(self, "_nrl_model_step_gpu_profiler"):
+            raise RuntimeError(
+                "the model-step GPU profiler is one-shot per nested worker"
+            )
+        parallel_config = getattr(self, "parallel_config", None)
+        pipeline_parallel_size = getattr(
+            parallel_config,
+            "pipeline_parallel_size",
+            None,
+        )
+        tensor_parallel_size = getattr(
+            parallel_config,
+            "tensor_parallel_size",
+            None,
+        )
+        if pipeline_parallel_size != 1:
+            raise RuntimeError(
+                "exact model-step profiling requires pipeline_parallel_size=1; "
+                f"observed {pipeline_parallel_size!r}"
+            )
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            raise RuntimeError("nested vLLM worker has no model_runner")
+
+        controller = DeterministicModelStepGpuProfiler(model_runner)
+        # Store before arming so a partial collective failure can never permit
+        # a second controller to be installed in this worker process.
+        self._nrl_model_step_gpu_profiler = controller
+        controller.arm(start_step, stop_step)
+        return self._model_step_gpu_profile_proof(
+            controller.snapshot(),
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+        )
+
+    def get_model_step_gpu_profile(self) -> dict[str, Any]:
+        """Require completion and return this TP worker's exact-range proof."""
+        controller = getattr(
+            self,
+            "_nrl_model_step_gpu_profiler",
+            None,
+        )
+        if controller is None:
+            raise RuntimeError("model-step GPU profiler was not armed")
+        parallel_config = getattr(self, "parallel_config", None)
+        return self._model_step_gpu_profile_proof(
+            controller.require_complete(),
+            tensor_parallel_size=getattr(
+                parallel_config,
+                "tensor_parallel_size",
+                None,
+            ),
+            pipeline_parallel_size=getattr(
+                parallel_config,
+                "pipeline_parallel_size",
+                None,
+            ),
+        )
+
+    @staticmethod
+    def _model_step_gpu_profile_proof(
+        proof: dict[str, Any],
+        *,
+        tensor_parallel_size: Any,
+        pipeline_parallel_size: Any,
+    ) -> dict[str, Any]:
+        """Attach distributed identity without mutating controller proof."""
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            raise RuntimeError(
+                "exact model-step profiling requires initialized torch.distributed"
+            )
+        return {
+            **proof,
+            "distributed": {
+                "rank": torch.distributed.get_rank(),
+                "world_size": torch.distributed.get_world_size(),
+                "tensor_parallel_size": tensor_parallel_size,
+                "pipeline_parallel_size": pipeline_parallel_size,
+                "cuda_visible_devices": os.environ.get(
+                    "CUDA_VISIBLE_DEVICES"
+                ),
+            },
+        }
+
     def init_collective(
         self,
         rank_prefix: int,
