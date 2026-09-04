@@ -561,6 +561,50 @@ class TQWorkerMixin:
         )
         del result
 
+    @wrap_with_nvtx_name("policy_worker/get_topk_logits_presharded")
+    def get_topk_logits_presharded(
+        self,
+        meta: "KVBatchMeta",
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> None:
+        """Per-rank teacher top-k forward entrypoint.
+
+        Same contract as ``get_logprobs_presharded``, with one difference worth
+        naming: ``get_topk_logits`` returns two tensors rather than one, so this
+        writes back twice. Both are ``[B, S, k]`` -- the write-back only checks
+        the batch dimension, so the extra axis passes through unchanged.
+
+        Only a distillation teacher mixes this in. The teacher never trains, so
+        there is no split begin/microbatch/finish counterpart: one call is one
+        forward.
+
+        Args:
+            meta: Per-rank ``KVBatchMeta`` for this slice.
+            k: Number of top logits to keep per position.
+            micro_batch_size: Inference micro batch size; None uses the config default.
+        """
+        data = self._fetch(meta)
+        data = self._attach_or_repack_pack_metadata(data, meta)
+        result: BatchedDataDict[Any] = self.get_topk_logits(  # type: ignore[attr-defined]
+            data=data,
+            k=k,
+            micro_batch_size=micro_batch_size,
+        )
+        self._write_back_result_field(
+            meta,
+            result,
+            result_key="topk_logits",
+            tq_field="teacher_topk_logits",
+        )
+        self._write_back_result_field(
+            meta,
+            result,
+            result_key="topk_indices",
+            tq_field="teacher_topk_indices",
+        )
+        del result
+
     @wrap_with_nvtx_name("value_worker/get_values_presharded")
     def get_values_presharded(
         self,
