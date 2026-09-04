@@ -60,6 +60,22 @@ def test_disabled_draft_config_resolves_to_none() -> None:
 
     assert resolve_draft_speculator(Eagle3DraftConfig(enabled=False)) is None
     assert resolve_draft_speculator(None) is None
+    assert resolve_draft_speculator({"enabled": False}) is None
+
+
+def test_raw_mapping_draft_config_resolves_to_speculator() -> None:
+    """A hand-built PolicyConfig carries a plain dict under "draft".
+
+    Only ``Policy.__init__`` normalizes that entry into a model, so setup paths
+    reached without it would otherwise hit ``AttributeError: 'dict' object has
+    no attribute 'enabled'``.
+    """
+    from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
+
+    speculator = resolve_draft_speculator({"enabled": True, "model_name": "draft"})
+    assert speculator is not None
+    assert isinstance(speculator.config, Eagle3DraftConfig)
+    assert speculator.config.model_name == "draft"
 
 
 @patch("nemo_rl.models.megatron.draft.training.build_draft_model")

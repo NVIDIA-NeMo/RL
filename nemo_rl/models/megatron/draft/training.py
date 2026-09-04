@@ -14,14 +14,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 
 from nemo_rl.models.megatron.draft.utils import build_draft_model
-from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.models.policy.draft_config import (
+    Eagle3DraftConfig,
+    coerce_draft_config,
+)
 
 if TYPE_CHECKING:
     from megatron.bridge.models.model_provider import ModelProviderMixin
@@ -70,12 +74,19 @@ _SPECULATOR_FACTORIES: dict[str, type[Eagle3Speculator]] = {
 
 
 def resolve_draft_speculator(
-    config: Eagle3DraftConfig | None,
+    config: Eagle3DraftConfig | Mapping[str, Any] | None,
 ) -> DraftSpeculator | None:
-    """Resolve an enabled draft configuration to its speculator."""
-    if config is None or not config.enabled:
+    """Resolve an enabled draft configuration to its speculator.
+
+    ``PolicyConfig`` is a TypedDict, so ``policy_cfg["draft"]`` is only an
+    ``Eagle3DraftConfig`` because ``Policy.__init__`` normalizes it in place.
+    Coerce here as well so this stays correct for callers that build a
+    ``PolicyConfig`` by hand and never go through that path.
+    """
+    coerced = coerce_draft_config(config)
+    if coerced is None or not coerced.enabled:
         return None
     return cast(
         DraftSpeculator,
-        _SPECULATOR_FACTORIES[config.speculator_type](config),
+        _SPECULATOR_FACTORIES[coerced.speculator_type](coerced),
     )
