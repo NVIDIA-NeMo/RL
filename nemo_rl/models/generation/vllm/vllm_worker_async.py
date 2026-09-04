@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import warnings
+from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -62,6 +63,89 @@ LOGGER = logging.getLogger(__name__)
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 
 
+class _AsyncLLMHTTPClient:
+    """Keep HTTP generation on the loop that owns AsyncLLM request state.
+
+    The engine-client surface is explicit. Do not add a ``__getattr__`` fallback.
+    Add each new member here and decide whether it must run on the engine loop.
+    """
+
+    def __init__(self, engine_client: Any, engine_loop: asyncio.AbstractEventLoop):
+        self._engine_client = engine_client
+        self._engine_loop = engine_loop
+        self.model_config = engine_client.model_config
+        self.renderer = engine_client.renderer
+        self.input_processor = engine_client.input_processor
+        self.vllm_config = engine_client.vllm_config
+
+    async def _run_on_engine_loop(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        if asyncio.get_running_loop() is self._engine_loop:
+            return await operation()
+
+        future = asyncio.run_coroutine_threadsafe(operation(), self._engine_loop)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
+    def generate(
+        self,
+        prompt: Any,
+        sampling_params: Any,
+        request_id: str,
+        **kwargs: Any,
+    ) -> AsyncGenerator[Any, None]:
+        return self._generate(prompt, sampling_params, request_id, kwargs)
+
+    async def _generate(
+        self,
+        prompt: Any,
+        sampling_params: Any,
+        request_id: str,
+        kwargs: dict[str, Any],
+    ) -> AsyncGenerator[Any, None]:
+        iterator = None
+        completed = False
+
+        async def next_output() -> Any:
+            nonlocal iterator
+            if iterator is None:
+                iterator = self._engine_client.generate(
+                    prompt, sampling_params, request_id, **kwargs
+                )
+            return await anext(iterator)
+
+        try:
+            while True:
+                try:
+                    yield await self._run_on_engine_loop(next_output)
+                except StopAsyncIteration:
+                    completed = True
+                    return
+        finally:
+            if not completed:
+                try:
+                    await self._run_on_engine_loop(
+                        lambda: self._engine_client.abort(request_id)
+                    )
+                except Exception:
+                    LOGGER.exception("Failed to abort vLLM request %s", request_id)
+
+    # These members only read engine status or immutable configuration. Running
+    # them on the engine loop added a cross-thread wait to each HTTP request.
+    @property
+    def errored(self) -> bool:
+        return self._engine_client.errored
+
+    @property
+    def dead_error(self) -> BaseException:
+        return self._engine_client.dead_error
+
+    async def is_tracing_enabled(self) -> bool:
+        return await self._engine_client.is_tracing_enabled()
+
+
 class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
 ):
@@ -98,11 +182,12 @@ class VllmAsyncGenerationWorkerImpl(
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
-        # Defaults for HTTP server state; overwritten by _create_engine()
-        # when the worker is a model owner and the model is actually loaded.
+        # Defaults for HTTP server state; populated after the actor loop starts.
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._engine_loop = None
+        self._http_engine_client = None
 
         super().__init__(
             config,
@@ -203,37 +288,11 @@ class VllmAsyncGenerationWorkerImpl(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        if self.cfg["vllm_cfg"].get("expose_http_server"):
-            # Must run after AsyncLLM.from_engine_args and before
-            # _setup_vllm_server spawns the uvicorn thread.
-            self._install_engine_input_socket_lock()
-            self.server_thread, self.base_url, self.http_server = (
-                self._setup_vllm_server()
-            )
-
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
-
-    def _install_engine_input_socket_lock(self) -> None:
-        """Serialise sends on AsyncMPClient.input_socket across OS threads
-        to prevent race conditions that block the vLLM engine (e.g. during
-        in flight weight updates in async grpo).
-        """
-        shadow_sock = self.llm.engine_core.input_socket._shadow_sock
-
-        lock = threading.Lock()
-        original_send_multipart = shadow_sock.send_multipart
-
-        def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
-            with lock:
-                return original_send_multipart(*args, **kwargs)
-
-        # Replace the bound method on this socket instance only; other zmq
-        # sockets in the process are unaffected.
-        shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
@@ -329,6 +388,9 @@ class VllmAsyncGenerationWorkerImpl(
             self.generation_tokens = []
 
     async def post_init_async(self):
+        self._engine_loop = asyncio.get_running_loop()
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
@@ -339,6 +401,11 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
+        if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._http_engine_client = _AsyncLLMHTTPClient(self.llm, self._engine_loop)
+            self.server_thread, self.base_url, self.http_server = (
+                self._setup_vllm_server()
+            )
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -395,7 +462,9 @@ class VllmAsyncGenerationWorkerImpl(
                 maybe_reasoning_parser_plugin
             )
 
-        engine_client = self.llm
+        engine_client = self._http_engine_client
+        if engine_client is None:
+            raise RuntimeError("The HTTP engine client is not initialized.")
         model_config = self.llm_async_engine_args.create_model_config()
         base_model_paths = [
             BaseModelPath(
@@ -967,9 +1036,7 @@ class VllmAsyncGenerationWorkerImpl(
         if reserved_sock is not None:
             # Hand the pre-bound listening socket directly to uvicorn's asyncio
             # server via server.serve(sockets=). No close-and-rebind needed.
-            import asyncio
-
-            def _run_with_socket():
+            def _run_with_socket() -> None:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(server.serve(sockets=[reserved_sock]))
@@ -1676,6 +1743,11 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self.server_thread is not None:
+                self.http_server.should_exit = True
+                await asyncio.to_thread(self.server_thread.join)
+                self.server_thread = None
+
             if self._sparse_refit_receiver is not None:
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
 
@@ -1696,17 +1768,6 @@ class VllmAsyncGenerationWorkerImpl(
             # Force garbage collection
             gc.collect()
             torch.cuda.empty_cache()
-
-            if self.server_thread is not None:
-                from threading import Thread
-
-                from uvicorn import Server
-
-                self.http_server: Server
-                self.server_thread: Thread
-
-                self.http_server.should_exit = True
-                self.server_thread.join()
 
             return True
         except Exception as e:
