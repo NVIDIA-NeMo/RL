@@ -539,10 +539,18 @@ _GROUPED_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
 )
+_SCALE_FROM_CHECKPOINT_SUFFIX = "_scale_from_checkpoint"
 
 
 def _is_grouped_expert_weight(name: str) -> bool:
     return name.endswith(_GROUPED_EXPERT_WEIGHT_SUFFIXES)
+
+
+def _grouped_expert_weight_name_from_scale(name: str) -> str | None:
+    if not name.endswith(_SCALE_FROM_CHECKPOINT_SUFFIX):
+        return None
+    weight_name = name.removesuffix(_SCALE_FROM_CHECKPOINT_SUFFIX)
+    return weight_name if _is_grouped_expert_weight(weight_name) else None
 
 
 def _is_fp8_weight(name, model):
@@ -592,11 +600,23 @@ def load_weights(weights, model_runner):
     model = model_runner.model
 
     for k, v in weights:
-        # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
-        # (so `_is_fp8_weight` would skip them) and vLLM's grouped loader cannot
-        # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
-        # layout, then reshape to 2D [num_experts, out_features, in_features] -> [num_experts*out_features, in_features]
-        # so the block scales can be quantized and routed correctly.
+        grouped_weight_name = _grouped_expert_weight_name_from_scale(k)
+        if grouped_weight_name is not None:
+            is_prequantized_mx = (
+                global_fp8_config is not None
+                and global_fp8_config.is_mx
+                and global_fp8_config.refit_prequantize
+            )
+            if is_prequantized_mx and _is_fp8_weight(grouped_weight_name, model):
+                weights_quantized.extend(_reroute_grouped_moe_expert_scale(k, v))
+            else:
+                weights_quantized.append((k, v))
+            continue
+        # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix,
+        # and vLLM's grouped loader cannot load receiver-quantized per-block
+        # scales. Expand them into the per-expert FP8 layout so the block scales
+        # can be quantized and routed correctly. Prequantized MXFP8 weights stay
+        # fused; their scale sidecars are rerouted by the branch above.
         if _is_grouped_expert_weight(k):
             # Quantize only if vLLM built this layer's experts as FP8. Experts
             # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
@@ -857,6 +877,48 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
             entries.append((name, weight_fp8[expert_id]))
             entries.append((name + "_scale_inv", scale_inv[expert_id]))
     return entries
+
+
+def _reroute_grouped_moe_expert_scale(
+    key: str, scale: torch.Tensor
+) -> list[tuple[str, torch.Tensor]]:
+    """Route suffixless grouped MXFP8 scales through vLLM's expert mapping.
+
+    vLLM 0.25.1 treats every 3D expert tensor as a fused weight and applies
+    weight-orientation heuristics that transpose the K-compressed W13 scale.
+    Match the ModelOpt refit backend: emit W13 as per-expert 2D gate/up scales
+    and keep W2 batched behind the expert-zero checkpoint route.
+    """
+    if scale.ndim != 3:
+        raise ValueError(f"Grouped MXFP8 scale {key!r} must be 3D, got {scale.ndim}D.")
+
+    weight_name = key.removesuffix(_SCALE_FROM_CHECKPOINT_SUFFIX)
+    base, projection = weight_name.rsplit(".", 1)
+    if projection == "down_proj":
+        return [
+            (
+                f"{base}.0.down_proj.weight_scale_from_checkpoint",
+                scale,
+            )
+        ]
+
+    if scale.shape[1] % 2 != 0:
+        raise ValueError(
+            f"Grouped gate/up MXFP8 scale {key!r} must have an even projection "
+            f"dimension, got {tuple(scale.shape)}."
+        )
+    gate_scale, up_scale = scale.chunk(2, dim=1)
+    return [
+        (
+            f"{base}.{expert_id}.{shard_name}.weight_scale_from_checkpoint",
+            expert_scale,
+        )
+        for shard_name, grouped_scale in (
+            ("gate_proj", gate_scale),
+            ("up_proj", up_scale),
+        )
+        for expert_id, expert_scale in enumerate(grouped_scale.unbind(0))
+    ]
 
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175

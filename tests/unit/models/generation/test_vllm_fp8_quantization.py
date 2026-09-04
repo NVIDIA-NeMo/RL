@@ -1660,26 +1660,45 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     import torch
 
     fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        is_mx=True,
+        refit_prequantize=True,
+    )
     model = _grouped_expert_model(fp8, monkeypatch, torch.bfloat16, wrap_language_model)
     loaded = []
     model.load_weights = lambda pairs: loaded.extend(pairs)
 
     gate_up = torch.randn(2, 256, 128).to(torch.bfloat16)
+    gate_up_scale = torch.ones(2, 256, 4, dtype=torch.uint8)
     down = torch.randn(2, 128, 128).to(torch.bfloat16)
+    down_scale = torch.ones(2, 128, 4, dtype=torch.uint8)
     fp8.load_weights(
         [
             (f"{layers_prefix}.0.mlp.experts.gate_up_proj", gate_up),
+            (
+                f"{layers_prefix}.0.mlp.experts.gate_up_proj_scale_from_checkpoint",
+                gate_up_scale,
+            ),
             (f"{layers_prefix}.0.mlp.experts.down_proj", down),
+            (
+                f"{layers_prefix}.0.mlp.experts.down_proj_scale_from_checkpoint",
+                down_scale,
+            ),
         ],
         types.SimpleNamespace(model=model),
+        model_load_weights=model.load_weights,
     )
 
     assert [k for k, _ in loaded] == [
         f"{layers_prefix}.0.mlp.experts.gate_up_proj",
+        f"{layers_prefix}.0.mlp.experts.gate_up_proj_scale_from_checkpoint",
         f"{layers_prefix}.0.mlp.experts.down_proj",
+        f"{layers_prefix}.0.mlp.experts.down_proj_scale_from_checkpoint",
     ]
     assert loaded[0][1] is gate_up
-    assert loaded[1][1] is down
+    assert loaded[1][1] is gate_up_scale
+    assert loaded[2][1] is down
+    assert loaded[3][1] is down_scale
     # Pass-through is also what a failed lookup produces, so pin that the
     # bf16 RoutedExperts was actually resolved.
     assert isinstance(
@@ -1688,6 +1707,85 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
         ),
         fp8.RoutedExperts,
     )
+
+
+@GROUPED_EXPERT_KEY_SHAPES
+def test_load_weights_reroutes_prequantized_grouped_expert_scale_sidecars(
+    fp8_module, monkeypatch, layers_prefix, wrap_language_model
+):
+    """Avoid vLLM 0.25.1's fused-3D transpose for grouped MXFP8 scales.
+
+    Qwen3.5's W13 sidecar is [E, 1024, 64]. The fused loader transposes it
+    to [E, 64, 1024], then fails copying a shard whose dim 1 is 1024 into
+    expert scale storage whose dim 1 is 64.
+    """
+    import torch
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        use_weight_pow2_scale=False,
+        is_mx=True,
+        refit_prequantize=True,
+    )
+    model = _grouped_expert_model(
+        fp8, monkeypatch, torch.float8_e4m3fn, wrap_language_model
+    )
+    loaded = []
+
+    num_experts, intermediate, hidden = 2, 512, 2048
+    gate_up = torch.ones(
+        num_experts,
+        2 * intermediate,
+        hidden,
+        dtype=torch.float8_e4m3fn,
+    )
+    gate_up_scale = torch.arange(
+        num_experts * 2 * intermediate * (hidden // 32), dtype=torch.uint8
+    ).reshape(num_experts, 2 * intermediate, hidden // 32)
+    down = torch.ones(
+        num_experts,
+        hidden,
+        intermediate,
+        dtype=torch.float8_e4m3fn,
+    )
+    down_scale = torch.arange(
+        num_experts * hidden * (intermediate // 32), dtype=torch.uint8
+    ).reshape(num_experts, hidden, intermediate // 32)
+
+    fp8.load_weights(
+        [
+            (f"{layers_prefix}.0.mlp.experts.gate_up_proj", gate_up),
+            (
+                f"{layers_prefix}.0.mlp.experts.gate_up_proj_scale_from_checkpoint",
+                gate_up_scale,
+            ),
+            (f"{layers_prefix}.0.mlp.experts.down_proj", down),
+            (
+                f"{layers_prefix}.0.mlp.experts.down_proj_scale_from_checkpoint",
+                down_scale,
+            ),
+        ],
+        types.SimpleNamespace(model=model),
+        model_load_weights=lambda pairs: loaded.extend(pairs),
+    )
+
+    base = f"{layers_prefix}.0.mlp.experts"
+    assert [name for name, _ in loaded] == [
+        f"{base}.gate_up_proj",
+        f"{base}.0.gate_proj.weight_scale_from_checkpoint",
+        f"{base}.1.gate_proj.weight_scale_from_checkpoint",
+        f"{base}.0.up_proj.weight_scale_from_checkpoint",
+        f"{base}.1.up_proj.weight_scale_from_checkpoint",
+        f"{base}.down_proj",
+        f"{base}.0.down_proj.weight_scale_from_checkpoint",
+    ]
+    assert loaded[0][1] is gate_up
+    torch.testing.assert_close(loaded[1][1], gate_up_scale[0, :intermediate])
+    torch.testing.assert_close(loaded[2][1], gate_up_scale[1, :intermediate])
+    torch.testing.assert_close(loaded[3][1], gate_up_scale[0, intermediate:])
+    torch.testing.assert_close(loaded[4][1], gate_up_scale[1, intermediate:])
+    assert loaded[5][1] is down
+    assert loaded[6][1] is down_scale
 
 
 def _assert_dequant_close(weight_fp8, scale_inv, source_bf16):
