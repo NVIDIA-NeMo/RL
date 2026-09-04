@@ -372,6 +372,7 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/sampling-params.md
 design-docs/dynamo-integration.md
 design-docs/sparse-delta-refit.md
 design-docs/checkpoint-engines.md
