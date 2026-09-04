@@ -92,6 +92,9 @@ def _controller(*, shard_count=3, router=None, unhealthy_threshold=3):
         base_urls=_urls(shard_count),
     )
     ctrl._generation_router = router
+    # The probe pump also ticks the engine supervisor in this part of the stack. None is
+    # its "restart_dead_shards is off" value, which is what these tests want.
+    ctrl._engine_supervisor = None
     ctrl._async_cfg = SimpleNamespace(
         generation_fleet_health=SimpleNamespace(
             probe_interval_s=0.001, probe_timeout_s=1.0

@@ -79,6 +79,10 @@ from nemo_rl.package_info import (
 
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+# Reaping a dead generation worker's EngineCore needs a raylet setting too, but it is NOT
+# set here: it is a raylet-wide behaviour change that only fleet-health runs need, and
+# importing nemo_rl is not consent to it. See
+# nemo_rl.models.generation.maybe_configure_engine_reaping_env.
 
 
 def _is_build_isolation():

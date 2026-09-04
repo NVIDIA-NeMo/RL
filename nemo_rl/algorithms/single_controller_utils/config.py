@@ -340,6 +340,11 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # measurement, so a frontier-scale model needs this raised or it will abort a healthy
     # refit. Set it explicitly there; set it to None to disarm the watchdog entirely.
     refit_timeout_s: Optional[PositiveFloat] = 300.0
+    # Restart dead shards and re-admit them at the next refit. Off by default: without
+    # it the fleet only ever shrinks, which is safe but means a long run ends smaller
+    # than it started. Recreating a vLLM worker mid-run is the most invasive thing this
+    # feature does, so it is opt-in rather than implied by fleet_health.enabled.
+    restart_dead_shards: bool = False
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "FleetHealthConfig":

@@ -370,6 +370,13 @@ class RayWorkerGroup:
         """
         self._workers: list[ray.actor.ActorHandle] = []
         self._worker_metadata: list[dict[str, Any]] = []
+        # worker_idx -> the arguments its creation call was made with, so a single
+        # worker can be rebuilt without redoing group-wide setup. Populated during
+        # creation; see _create_workers_from_bundle_indices.
+        self._worker_specs: dict[int, dict[str, Any]] = {}
+        # How many times each worker has been recreated. Only used to keep Ray actor
+        # names unique, since a dead actor's name can linger in the GCS.
+        self._worker_incarnations: dict[int, int] = {}
         self.cluster = cluster
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
@@ -619,6 +626,19 @@ class RayWorkerGroup:
 
                 # Store the future and metadata
                 worker_idx = len(worker_futures)
+                # Everything needed to build this exact worker again. Captured rather
+                # than re-derived, because re-deriving means reproducing the placement
+                # group, bundle, venv and rank bookkeeping above -- a second
+                # implementation that would drift from this one. Replaying the recorded
+                # call is the only way a restart is guaranteed to reproduce the original.
+                self._worker_specs[worker_idx] = {
+                    "pg_idx": pg_idx,
+                    "pg": pg,
+                    "bundle_idx": bundle_idx,
+                    "num_gpus": num_gpus,
+                    "worker_bundle_indices": worker_bundle_indices,
+                    "extra_options": extra_options,
+                }
                 worker_futures.append(worker_future)
                 worker_info.append(
                     {
@@ -685,6 +705,57 @@ class RayWorkerGroup:
                     "dp_shard_idx": info["group_idx"],
                 }
             )
+
+    def recreate_worker(self, worker_idx: int) -> ray.actor.ActorHandle:
+        """Rebuild one worker in place, replaying the call that created it.
+
+        Used to bring a dead generation shard back without disturbing the rest of the
+        fleet. The placement-group bundle the old actor held is still reserved -- Ray
+        does not release a bundle when an actor dies -- so the replacement lands on the
+        same GPU.
+
+        The old actor is killed first with ``no_restart=True``. It is usually already
+        dead, but a worker can be unresponsive rather than gone, and creating its
+        replacement while it still holds the GPU would fail on memory rather than on
+        anything informative.
+
+        Returns:
+            The new actor handle, also installed at ``workers[worker_idx]``.
+        """
+        if worker_idx not in self._worker_specs:
+            raise KeyError(
+                f"no creation spec recorded for worker {worker_idx}; "
+                f"known workers: {sorted(self._worker_specs)}"
+            )
+        spec = self._worker_specs[worker_idx]
+
+        old = self._workers[worker_idx]
+        if old is not None:
+            try:
+                ray.kill(old, no_restart=True)
+            except Exception as e:  # noqa: BLE001 - already-dead actors raise variously
+                print(f"  recreate_worker({worker_idx}): old actor not killable: {e}")
+
+        # A fresh name each incarnation: Ray rejects a duplicate named actor, and the
+        # dead one's registration can outlive the process.
+        incarnation = self._worker_incarnations.get(worker_idx, 0) + 1
+        self._worker_incarnations[worker_idx] = incarnation
+        extra_options = dict(spec["extra_options"])
+        extra_options["name"] = f"{extra_options['name']}-r{incarnation}"
+
+        initializer = self._initializer_pool[spec["pg_idx"]]
+        worker = ray.get(
+            initializer.create_worker.remote(
+                spec["pg"],
+                spec["bundle_idx"],
+                spec["num_gpus"],
+                spec["worker_bundle_indices"],
+                num_gpus_per_node=self.cluster.num_gpus_per_node,
+                **extra_options,
+            )
+        )
+        self._workers[worker_idx] = worker
+        return worker
 
     @property
     def workers(self) -> list[ray.actor.ActorHandle]:

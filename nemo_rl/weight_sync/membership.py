@@ -52,6 +52,31 @@ class NoSurvivingShards(RuntimeError):
     """Every generation shard is gone, so there is nothing to rebuild onto."""
 
 
+def desired_membership(
+    *,
+    absent_shards: Sequence[int],
+    dp_size: int,
+    total_gen_workers: int,
+    train_world_size: int,
+) -> RefitMembership:
+    """The membership the refit communicator *should* have, given who is absent.
+
+    Phrased as "what it should be" rather than "what changed", so the same call answers
+    both directions: a shard leaving and a restarted shard rejoining are both just a
+    different desired set. Comparing this against what was actually built is what lets a
+    recovered engine be re-admitted -- keyed off the absent set alone, an empty absent set
+    is indistinguishable from "nothing to do", and a restarted shard would stay excluded
+    forever.
+    """
+    absent = set(absent_shards)
+    return plan_refit_membership(
+        surviving_shards=[idx for idx in range(dp_size) if idx not in absent],
+        dp_size=dp_size,
+        total_gen_workers=total_gen_workers,
+        train_world_size=train_world_size,
+    )
+
+
 def plan_refit_membership(
     *,
     surviving_shards: Sequence[int],

@@ -405,11 +405,25 @@ class GenerationFleetHealth:
             return
         self._transition(shard, ShardState.RESTARTING)
 
-    def mark_loaded(self, shard_idx: int) -> None:
-        """The replacement finished loading. It holds stale weights until refit."""
+    def mark_loaded(self, shard_idx: int, *, base_url: Optional[str] = None) -> None:
+        """The replacement finished loading. It holds stale weights until refit.
+
+        Args:
+            base_url: the replacement's URL. A restarted engine binds a new port, so
+                without this the monitor keeps publishing the dead one -- and
+                ``serving_base_urls()`` feeds the NeMo-Gym router, which would send every
+                rollout to a socket nobody is listening on.
+        """
         shard = self._shards[shard_idx]
         if shard.state is ShardState.RETIRED:
             return
+        if base_url:
+            shard.base_url = base_url
+        # Cleared because the shard reached DEAD by accumulating failures; carrying that
+        # count into a fresh engine would let a single unlucky probe re-condemn it
+        # immediately, burning a restart attempt for nothing.
+        shard.consecutive_probe_failures = 0
+        shard.consecutive_probe_successes = 0
         self._transition(shard, ShardState.STALE)
 
     def mark_weights_partial(self, shard_idx: int) -> None:
@@ -435,6 +449,20 @@ class GenerationFleetHealth:
             # streak precisely because such an engine still answers is_alive.
             shard.state_before_partial = shard.state
         self._transition(shard, ShardState.STALE)
+
+    def mark_restart_failed(self, shard_idx: int) -> None:
+        """A restart attempt did not bring the engine up. Back to DEAD.
+
+        Needed as its own transition because ``record_probe`` deliberately ignores
+        non-serving states -- a probe must never resurrect a shard -- so a failed restart
+        reported that way would leave the shard stuck in RESTARTING: never retried,
+        because it is no longer DEAD, and never retired, because retirement is driven by
+        restart attempts.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state is ShardState.RETIRED:
+            return
+        self._transition(shard, ShardState.DEAD)
 
     def report_refit(self, shard_idx: int, *, weight_version: int) -> None:
         """A completed refit is the only way back into the serving set."""

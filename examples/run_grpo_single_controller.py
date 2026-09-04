@@ -41,7 +41,10 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
-from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    maybe_configure_engine_reaping_env,
+)
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -124,6 +127,7 @@ def main() -> None:
 
     # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
     maybe_configure_data_plane_env(config.data_plane)
+    maybe_configure_engine_reaping_env(config.async_rl.generation_fleet_health)
     init_ray()
 
     tokenizer = get_tokenizer(config.policy["tokenizer"])

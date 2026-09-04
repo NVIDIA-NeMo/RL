@@ -684,6 +684,76 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    # RESTORED. This method was written in a47e2032e and silently deleted on 2026-08-17 by
+    # merge b18740f73, which resolved a conflict in this region -- PR3's _refit_membership
+    # declaration landed on the same lines -- by taking one side wholesale. The call site in
+    # engine_supervisor.py and the unit-test fake both survived, and the supervisor catches
+    # the resulting AttributeError, marks the shard restart-failed and retries until the
+    # attempt budget retires it. So restart never worked and never said so. See
+    # test_every_supervised_backend_can_restart_a_shard, which now fails if it goes missing
+    # again.
+    def restart_shard(self, shard_idx: int) -> Optional[str]:
+        """Rebuild one data-parallel shard's workers and bring its engine back up.
+
+        Blocking and slow -- it reloads the model -- so callers run it off the control
+        loop. Only this shard's workers are touched; the rest of the fleet keeps serving
+        throughout.
+
+        Mirrors the startup sequence (`create workers -> load_model -> post_init ->
+        report URL`) rather than inventing a shorter one, because anything the deferred-
+        load path does at startup is equally required for a replacement.
+
+        Returns:
+            The replacement's OpenAI base URL, or None for a sync engine that exposes no
+            HTTP server. **The URL is expected to differ from the old one**: the new
+            engine binds its own port, so callers must publish it rather than assume the
+            fleet's URL list is still accurate.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
+        # A shard is model_parallel_size workers; all of them died with the engine.
+        worker_indices = range(leader_idx, leader_idx + self.model_parallel_size)
+        for worker_idx in worker_indices:
+            self.worker_group.recreate_worker(worker_idx)
+
+        leader = self.worker_group.workers[leader_idx]
+        # load_model ONLY on the deferred path, because only there is the model still
+        # unloaded after __init__.
+        #
+        # The two startup paths are not the same sequence. With defer_model_load=True the
+        # worker reserves a port and stashes its bundle_indices and seed for later, and
+        # load_and_start() does the heavy lifting. With the default False -- which is what
+        # every SingleController config uses -- __init__ loads the model itself, and
+        # _deferred_seed is left at the None it was initialised to, because the branch that
+        # assigns it returns early:
+        #
+        #     if not self.is_model_owner or not defer_model_load:
+        #         return
+        #     self._deferred_seed = seed
+        #
+        # Calling load_model there re-enters _create_engine with seed=None, and vLLM's
+        # ModelConfig requires an int: job 6722014 failed five restarts with
+        # "ValidationError: seed - Input should be a valid integer". The recreated worker
+        # already had a working engine; this call broke it.
+        #
+        # post_init and the URL report stay unconditional -- eager startup runs both too,
+        # from VllmGeneration.__init__ rather than from load_and_start.
+        if self._defer_model_load:
+            ray.get(leader.load_model.remote())
+        method_name = (
+            "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
+        )
+        ray.get(getattr(leader, method_name).remote())
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return None
+        url = ray.get(leader.report_dp_openai_server_base_url.remote())
+        if shard_idx < len(self.dp_openai_server_base_urls):
+            self.dp_openai_server_base_urls[shard_idx] = url
+        return url
+
     def set_refit_membership(self, membership: "RefitMembership") -> None:
         """Record which shards take part in refits from now on.
 
@@ -1179,14 +1249,21 @@ class VllmGeneration(GenerationInterface):
             else "prepare_refit_info"
         )
 
-        # Use run_all_workers_single_data to send data to all workers
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            state_dict_info=state_dict_info,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-
-        # Wait for all futures to complete
+        # Surviving leaders only, like update_weights_from_collective and the reshard
+        # plan distribution. run_all_workers_single_data walks the WHOLE group, so once a
+        # shard is lost this called its dead actor and raised ActorDiedError -- out of
+        # reconcile_communicator, past the recovery, and into the run. Job 6718090: the
+        # rebuild had just succeeded ("rebuilding communicator over shards [1]") and this
+        # line killed the run 20s later. It is reached on the recovery path precisely
+        # because a shard is absent, so the whole-group fan-out is wrong exactly when it
+        # runs.
+        #
+        # rank_0_only over tensor_parallel/pipeline_parallel is what the group call did,
+        # and _refit_leader_workers is the same set restricted to the live membership.
+        futures = [
+            getattr(worker, method_name).remote(state_dict_info=state_dict_info)
+            for worker in self._refit_leader_workers()
+        ]
         ray.get(futures)
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:

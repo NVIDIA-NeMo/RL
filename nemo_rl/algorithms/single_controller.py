@@ -125,6 +125,7 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
+from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -289,6 +290,14 @@ class SingleControllerActor:
             self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
         else:
             self._teacher_coordinator = None
+        # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
+        # is nothing for a supervisor to restart.
+        self._engine_supervisor = (
+            EngineSupervisor(generation=self._gen, monitor=self._gen_fleet)
+            if self._gen_fleet is not None
+            and master_config.async_rl.generation_fleet_health.restart_dead_shards
+            else None
+        )
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -2263,6 +2272,8 @@ class SingleControllerActor:
             metrics["rollout/train_steps"] = float(self._train_steps)
             if self._gen_fleet is not None:
                 metrics.update(self._gen_fleet.as_metrics())
+            if self._engine_supervisor is not None:
+                metrics.update(self._engine_supervisor.metrics())
             if self._generation_router is not None:
                 # router/* counters are exactly what you want when a backend starts
                 # failing; computed since P2 landed but never published until now.
@@ -2336,6 +2347,12 @@ class SingleControllerActor:
         while True:
             await asyncio.sleep(interval_s)
             await self._probe_generation_fleet()
+            # Between probing and publishing: a shard condemned by the probe above starts
+            # restarting on this tick rather than the next, and moving to RESTARTING
+            # before the router push keeps a shard that is coming back out of the
+            # serving set.
+            if self._engine_supervisor is not None:
+                self._engine_supervisor.tick()
             # Both of these are best-effort: they talk to a max_restarts=-1 actor that
             # may be mid-recreation, and run() awaits this task and re-raises, so an
             # unguarded RayActorError here would end the training job over a push that

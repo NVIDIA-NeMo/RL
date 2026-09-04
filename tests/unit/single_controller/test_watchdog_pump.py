@@ -94,6 +94,8 @@ def _make_controller(
     # These tests cover stall detection, not fleet health or gym routing.
     ctrl._gen_fleet = None
     ctrl._generation_router = None
+    # No fleet health, so nothing ever reaches DEAD and there is nothing to restart.
+    ctrl._engine_supervisor = None
     return ctrl
 
 
@@ -258,6 +260,7 @@ class TestGenerationFleetProbe:
             stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0, **kwargs
         )
         ctrl._gen_fleet = monitor
+        ctrl._engine_supervisor = None
         # A confirmed death stands the trainers' refit deadline down, so the fixture has to
         # carry the trainer handle it fans out over. Without it the probe's except clause
         # would swallow an AttributeError and the feature would silently no-op -- which is

@@ -296,6 +296,14 @@ class TestFleetHealthValidation:
         with pytest.raises(ValidationError, match="probe_timeout_s"):
             FleetHealthConfig(probe_interval_s=2.0, probe_timeout_s=2.0)
 
+    def test_restarting_dead_shards_is_off_by_default(self):
+        """Recreating a vLLM worker mid-run is the most invasive thing this does, so it
+        is opt-in rather than implied by enabling fleet health."""
+        assert AsyncRLConfig().generation_fleet_health.restart_dead_shards is False
+
+    def test_restarting_can_be_enabled(self):
+        assert FleetHealthConfig(restart_dead_shards=True).restart_dead_shards is True
+
     def test_unimplemented_recovery_modes_are_rejected(self):
         """They need the communicator rebuild; accepting them would do nothing."""
         with pytest.raises(ValidationError):
