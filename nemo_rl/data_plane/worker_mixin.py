@@ -82,7 +82,6 @@ def _broadcast_batched_data_dict(
     if is_leader:
         assert data is not None, "leader must provide non-None data"
         descriptor: list[Any] = []
-        empty_packed: list[str] = []
         for k, v in data.items():
             if isinstance(v, torch.Tensor):
                 descriptor.append(
@@ -97,10 +96,14 @@ def _broadcast_batched_data_dict(
                 # needs to match media to placeholders (job 17652563).
                 nested, shapes = v.to_wire()
                 if nested is None:
-                    # Every row empty. ``reassemble_packed_multimodal`` drops
-                    # the key in this case; do the same on both sides so the
-                    # ranks agree.
-                    empty_packed.append(k)
+                    # Every row empty -- a shard holding only media-free
+                    # samples. The key still has to cross: consumers branch on
+                    # the key set (``len(get_multimodal_dict(...)) > 0`` decides
+                    # whether the caller's position_ids are used), and the
+                    # independent-fetch path keeps it. Ship geometry alone.
+                    descriptor.append(
+                        (k, "empty_packed", len(v), v.dim_to_pack, v.pad_to_max_shape)
+                    )
                     continue
                 values = nested.values()
                 leader_flat[k] = values
@@ -135,8 +138,6 @@ def _broadcast_batched_data_dict(
                     "PackedTensor, np.ndarray[object] and scalars; a bulk "
                     "wrapper must get its own branch rather than being pickled."
                 )
-        for k in empty_packed:
-            del data[k]
         payload: list[Any] = [descriptor]
     else:
         payload = [None]
@@ -177,6 +178,10 @@ def _broadcast_batched_data_dict(
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 flat = torch.empty(offsets[-1], dtype=dtype, device=bcast_device)
             torch.distributed.broadcast(flat, src=src, group=group)
+            # Drop the cached CPU concat now it has shipped: holding it to
+            # the end of the loop keeps three copies of the largest column
+            # live at once (segments, concat, device copy).
+            leader_flat.pop(key, None)
             if not is_leader:
                 nested = torch.nested.nested_tensor_from_jagged(
                     flat, torch.tensor(offsets, dtype=torch.int64, device=flat.device)
@@ -185,6 +190,16 @@ def _broadcast_batched_data_dict(
                     nested = nested.to(src_device)
                 out[key] = PackedTensor.from_wire(
                     nested, shapes, pad_to_max_shape=pad_to_max_shape
+                )
+        elif kind == "empty_packed":
+            # Structural only: no payload, so followers rebuild from the
+            # geometry and land on the leader's key set.
+            n_rows, dim_to_pack, pad_to_max_shape = entry[2:]
+            if not is_leader:
+                out[key] = PackedTensor(
+                    [None] * n_rows,
+                    dim_to_pack,
+                    pad_to_max_shape=pad_to_max_shape,
                 )
         else:
             if not is_leader:
@@ -213,9 +228,15 @@ class TQWorkerMixin:
         # leader-fetches one DP slice and NCCL-broadcasts it across the
         # replica group, which is TP x CP x PP siblings of a single DP rank,
         # so every CP sibling sees identical full rows and the model applies
-        # its own post-embedding slice. The presharded entrypoints then
-        # delegate to the same ``train`` / ``get_logprobs`` that carry the flag
-        # into ``models/megatron/data.py``.
+        # its own post-embedding slice. ``train_presharded`` and both logprob
+        # entrypoints then delegate to the same ``train`` / ``get_logprobs``
+        # that carry the flag into ``models/megatron/data.py``.
+        #
+        # ``train_microbatch_presharded`` is the exception: it lands in
+        # ``_train_microbatch_body``, which passes none of the capability flags
+        # and never attaches the media-token validity mask. That path is
+        # SingleController-only, so ``train_microbatch`` raises for a
+        # multimodal model rather than training on rows it mis-describes.
         if self._dp_client is not None:
             return
         from nemo_rl.data_plane import build_data_plane_client
