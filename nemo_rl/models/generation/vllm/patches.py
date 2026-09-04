@@ -685,9 +685,7 @@ def _apply_vllm_patches(
     # Reporting the same way in both cases either cries wolf or hides a real
     # break, so branch on it.
     uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-    applied = _patch_vllm_init_workers_ray(
-        py_executable, extra_env_vars, patch_logger
-    )
+    applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars, patch_logger)
 
     if applied and uses_v1_executor:
         patch_logger.info(

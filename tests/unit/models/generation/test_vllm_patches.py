@@ -246,7 +246,7 @@ def test_ray_extra_env_vars_merge_is_additive(
     else:
         monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", existing)
 
-    patches._patch_vllm_init_workers_ray("py", extra)
+    patches._patch_vllm_init_workers_ray("py", extra, logging.getLogger(__name__))
 
     assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == expected
 
@@ -258,7 +258,10 @@ def test_init_workers_ray_reports_a_missing_anchor(monkeypatch, tmp_path):
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
     monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
 
-    assert patches._patch_vllm_init_workers_ray("py", None) is False
+    assert (
+        patches._patch_vllm_init_workers_ray("py", None, logging.getLogger(__name__))
+        is False
+    )
     # The env merge still has to happen; it is independent of the file patch.
     assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == (
         "RAY_ENABLE_UV_RUN_RUNTIME_ENV"
@@ -271,11 +274,21 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
     ray_executor.write_text("self._init_workers_ray(placement_group)\n")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
 
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
+    assert (
+        patches._patch_vllm_init_workers_ray(
+            "py-exec", None, logging.getLogger(__name__)
+        )
+        is True
+    )
     once = ray_executor.read_text()
     assert 'runtime_env={"py_executable": "py-exec"}' in once
 
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
+    assert (
+        patches._patch_vllm_init_workers_ray(
+            "py-exec", None, logging.getLogger(__name__)
+        )
+        is True
+    )
     assert ray_executor.read_text() == once
 
 
@@ -284,9 +297,10 @@ def test_locked_file_patch_writes_under_lock_on_writable_install(tmp_path):
     target = tmp_path / "target.py"
     target.write_text("ORIGINAL")
 
-    with patches._locked_file_patch(
-        str(target), logging.getLogger(__name__)
-    ) as (content, write_back):
+    with patches._locked_file_patch(str(target), logging.getLogger(__name__)) as (
+        content,
+        write_back,
+    ):
         assert content == "ORIGINAL"
         write_back("PATCHED")
 
@@ -315,9 +329,10 @@ def test_locked_file_patch_degrades_to_lockless_read_on_read_only_install(
     monkeypatch.setattr(builtins, "open", refuse_the_lock)
 
     with caplog.at_level(logging.WARNING):
-        with patches._locked_file_patch(
-            str(target), logging.getLogger(__name__)
-        ) as (content, write_back):
+        with patches._locked_file_patch(str(target), logging.getLogger(__name__)) as (
+            content,
+            write_back,
+        ):
             assert content == "ORIGINAL"
             assert write_back("MUST_NOT_LAND") is False
 
