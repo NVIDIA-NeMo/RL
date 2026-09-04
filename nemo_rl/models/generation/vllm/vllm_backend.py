@@ -112,6 +112,72 @@ def _refresh_hpc_modules_after_layerwise_reload(model: torch.nn.Module) -> None:
             module.process_weights_after_loading(model)
 
 
+def _rebuild_kernel_layouts_after_bulk_writes(
+    model: torch.nn.Module,
+    bulk_param_ids: set[int],
+    native_param_ids: set[int],
+) -> None:
+    """Process modules a mixed native refit wrote to outside the reload loaders.
+
+    vLLM's layerwise reload only runs ``process_weights_after_loading`` for a
+    module whose parameters arrived through the wrapped weight loaders. A mixed
+    refit binds its bulk destinations to the live runtime tensors *before*
+    ``initialize_layerwise_reload`` saves them, so those writes land in
+    ``info.kernel_tensors`` and leave ``load_numel`` at zero. The finalizer then
+    takes its "failed to load" branch: it puts the kernel tensors back, fresh
+    values and all, and never processes the module.
+
+    For an unquantized linear that is invisible, since the pass is a no-op. For
+    an unquantized FlashInfer TRTLLM MoE it is not: the bulk mapping writes
+    canonical ``[gate; up]`` on the understanding that a later pass produces the
+    kernel's private ``[w3; w1]`` repack, and on the native path there is no
+    later pass.
+
+    Only modules that actually received bulk data are rebuilt, and only if no
+    native component also targeted them. Both narrowings matter: these
+    transforms are read-modify-write on the weight, so processing a module the
+    reload already processed double-applies the shuffle, and processing one that
+    received nothing re-shuffles weights that were already in kernel layout.
+
+    Attention is excluded because vLLM's own finalizer processes it in a
+    deferred second pass, and ``HpcModule`` because
+    ``_refresh_hpc_modules_after_layerwise_reload`` covers it.
+
+    Dispatch goes through the generic ``QuantizeMethodBase`` contract rather
+    than a list of quantization classes, so widening the quantization scope
+    (QKVO, dense MLP, lm_head) needs no change here.
+    """
+    if not bulk_param_ids:
+        return
+
+    # Import quantization internals only when a realized model needs them; the
+    # module layout is version-sensitive and this runs on a live engine only.
+    # Deliberately not guarded by try/ImportError. Failing to identify attention
+    # would silently widen the rebuild to modules vLLM's finalizer already
+    # processed, which double-applies their transforms; a vLLM that no longer
+    # exports these has moved the ground under this pass and must stop the refit.
+    from vllm.model_executor.layers.attention import Attention, MLAAttention
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+
+    attention_types: tuple[type, ...] = (Attention, MLAAttention)
+
+    for module in model.modules():
+        if isinstance(module, attention_types):
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if not isinstance(quant_method, QuantizeMethodBase):
+            continue
+        owned = {id(param) for param in module.parameters(recurse=False)}
+        if not owned & bulk_param_ids or owned & native_param_ids:
+            continue
+        # vLLM guards some transforms with a sticky attribute that its own
+        # reload clears before reprocessing. Clear it the same way, otherwise
+        # this rebuild is silently skipped on an unpatched vLLM build.
+        if hasattr(module, "_already_called_process_weights_after_loading"):
+            delattr(module, "_already_called_process_weights_after_loading")
+        quant_method.process_weights_after_loading(module)
+
+
 def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
     """Return whether a model realized the unquantized TRTLLM MoE backend."""
     # Import backend types only when inspecting a constructed vLLM model. The
@@ -1665,12 +1731,23 @@ class VllmInternalWorkerExtension:
                         "vLLM refit destination plan has duplicate components: "
                         f"{sorted(duplicate_keys)!r}"
                     )
+                # Captured before the merge: the bulk specs are the ones bound
+                # to runtime tensors outside the reload's weight loaders, so
+                # their modules are exactly the ones the finalizer will leave
+                # holding fresh values in checkpoint layout.
+                bulk_param_ids = {
+                    id(spec.base) for spec in destination_map.specs.values()
+                }
+                native_param_ids = {id(spec.base) for spec in native_specs.values()}
                 for key, spec in native_specs.items():
                     destination_map.specs[key] = spec
                 self.hf_to_local_param_map = destination_map
                 _receive_bulk_components()
                 _receive_misc()
                 adapter.finish_update()
+                _rebuild_kernel_layouts_after_bulk_writes(
+                    self.model_runner.model, bulk_param_ids, native_param_ids
+                )
                 _refresh_hpc_modules_after_layerwise_reload(self.model_runner.model)
                 self._maybe_process_mtp_drafter_after_loading()
                 # vLLM's layerwise finalizer already reprocesses attention

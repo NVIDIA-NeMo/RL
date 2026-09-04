@@ -1332,3 +1332,152 @@ def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypat
     ext._maybe_process_mtp_drafter_after_loading()
 
     process_weights.assert_not_called()
+
+
+def _recording_quant_method():
+    """A minimal real ``QuantizeMethodBase`` that records what it processed."""
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+
+    class _RecordingQuantMethod(QuantizeMethodBase):
+        def __init__(self):
+            self.processed = []
+
+        def create_weights(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def apply(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            self.processed.append(layer)
+
+    return _RecordingQuantMethod()
+
+
+def _module_with_params(count: int = 1) -> torch.nn.Module:
+    module = torch.nn.Module()
+    for index in range(count):
+        module.register_parameter(
+            f"w{index}", torch.nn.Parameter(torch.empty(2), requires_grad=False)
+        )
+    module.quant_method = _recording_quant_method()
+    return module
+
+
+def _attention_module_with_param() -> torch.nn.Module:
+    """An ``Attention`` instance without running its heavyweight constructor."""
+    from vllm.model_executor.layers.attention import Attention
+
+    module = Attention.__new__(Attention)
+    torch.nn.Module.__init__(module)
+    module.register_parameter(
+        "w0", torch.nn.Parameter(torch.empty(2), requires_grad=False)
+    )
+    module.quant_method = _recording_quant_method()
+    return module
+
+
+def _param_ids(module: torch.nn.Module) -> set[int]:
+    return {id(param) for param in module.parameters(recurse=False)}
+
+
+@pytest.mark.vllm
+def test_bulk_written_modules_are_the_only_ones_rebuilt():
+    """The mixed-precision nccl_reshard hole: BF16 boundary layers stay unprocessed.
+
+    Their weights arrive through destinations bound to the runtime tensors, so
+    the layerwise finalizer restores the fresh values but never runs
+    ``process_weights_after_loading``. For an unquantized TRTLLM MoE that leaves
+    canonical ``[gate; up]`` where the kernel expects its own repack.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    bulk = _module_with_params()
+    native = _module_with_params()
+    untouched = _module_with_params()
+
+    model = torch.nn.Module()
+    model.add_module("bulk", bulk)
+    model.add_module("native", native)
+    model.add_module("untouched", untouched)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, _param_ids(bulk), _param_ids(native)
+    )
+
+    assert bulk.quant_method.processed == [bulk]
+    # Already processed inside the reload; a second pass double-applies the
+    # shuffle while the block scales move only once.
+    assert native.quant_method.processed == []
+    # Received nothing, so its kernel layout still matches its weights.
+    assert untouched.quant_method.processed == []
+
+
+@pytest.mark.vllm
+def test_a_module_holding_both_bulk_and_native_params_is_left_to_the_reload():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    module = _module_with_params(count=2)
+    value, scale = module.parameters(recurse=False)
+
+    model = torch.nn.Module()
+    model.add_module("mixed", module)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, {id(value)}, {id(scale)}
+    )
+
+    assert module.quant_method.processed == []
+
+
+@pytest.mark.vllm
+def test_attention_is_left_to_the_finalizers_deferred_pass():
+    """vLLM processes attention after the linears; rebuilding it here repeats that."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    attention = _attention_module_with_param()
+
+    model = torch.nn.Module()
+    model.add_module("attn", attention)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, _param_ids(attention), set()
+    )
+
+    assert attention.quant_method.processed == []
+
+
+@pytest.mark.vllm
+def test_the_sticky_process_guard_is_cleared_before_rebuilding():
+    """Stock vLLM latches this flag, so leaving it set makes the rebuild a no-op."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    module = _module_with_params()
+    module._already_called_process_weights_after_loading = True
+
+    model = torch.nn.Module()
+    model.add_module("bulk", module)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, _param_ids(module), set()
+    )
+
+    assert module.quant_method.processed == [module]
+    assert not hasattr(module, "_already_called_process_weights_after_loading")
+
+
+@pytest.mark.vllm
+def test_a_fully_native_refit_rebuilds_nothing():
+    """No bulk destinations means every module went through the reload loaders."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    module = _module_with_params()
+
+    model = torch.nn.Module()
+    model.add_module("native", module)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, set(), _param_ids(module)
+    )
+
+    assert module.quant_method.processed == []
