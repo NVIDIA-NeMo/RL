@@ -2066,8 +2066,6 @@ def get_distillation_topk_logprobs_from_logits(
             "topk=0 is not supported as it would result in empty tensor operations."
         )
 
-    # Ensure float32 for stability
-    student_logits = student_logits.to(torch.float32)
     # Move teacher topk indices to the same device as student logits
     teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
 
@@ -2116,6 +2114,24 @@ def get_distillation_topk_logprobs_from_logits(
     else:
         student_logits = student_logits
         parallel_group = None
+
+    # Two different reasons to keep the full [B, S, V] fp32 copy here:
+    #
+    #   * ``zero_outside_topk`` takes a log_softmax over the whole vocabulary,
+    #     so it genuinely reads every column;
+    #   * the TP/CP paths reach ``ChunkedDistributedGatherLogprob``, whose
+    #     ``backward`` builds its grad as
+    #     ``torch.zeros_like(vocab_parallel_logits, dtype=torch.float32)`` and
+    #     returns it. Hand it a bf16 input and autograd rejects the fp32
+    #     gradient. (The forward would be fine either way -- it upcasts each
+    #     chunk itself -- so this is a backward-side constraint, and narrowing
+    #     the guard further would mean changing that autograd.Function.)
+    #
+    # The remaining path reads K columns, so it upcasts the gathered [B, S, K]
+    # instead -- gather-then-cast is equivalent to cast-then-gather there, and
+    # avoids materializing the full-vocab fp32 tensor.
+    if zero_outside_topk or parallel_group is not None or cp_size > 1:
+        student_logits = student_logits.to(torch.float32)
 
     # Automodel owns the sequence layout: shard the teacher indices into the
     # model's local layout. The legacy CP state was neutralized above so its
@@ -2205,9 +2221,25 @@ def get_distillation_topk_logprobs_from_logits(
 
         # Non-distributed processing
         else:
+            # Gathering K columns and then widening is bitwise equal to
+            # widening the whole vocab axis first: bf16 -> fp32 is exact and
+            # gather is pure selection.
+            #
+            # Duplicate indices do occur -- padded sequence positions carry K
+            # copies of index 0, because dtensor_policy_worker.py pads
+            # topk_indices with value=0 -- so the gather backward accumulates
+            # there rather than scattering. The equality holds anyway, because
+            # DistillationLossFn masks those positions to exactly 0.0 before
+            # reduction, so the accumulated gradient is zero either way.
+            # That is enforced, not assumed: DistillationLossFn rejects data
+            # without ``token_mask``/``sample_mask`` rather than falling back to
+            # an unmasked mean, which would give those positions real gradient.
+            # ``cp_sharder.shard_token_tensor(..., fill=0)`` above is a second
+            # source of duplicate indices, on the padded tail; the same masking
+            # covers them.
             student_topk_logits = student_logits.gather(
                 dim=-1, index=indices_for_logits
-            )
+            ).to(torch.float32)
 
         student_topk_logprobs = torch.nn.functional.log_softmax(
             student_topk_logits, dim=-1
