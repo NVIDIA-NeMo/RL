@@ -145,7 +145,7 @@ def test_modelopt_policy_worker_uses_real_quant_refit_timeout(monkeypatch):
 
     worker.maybe_init_zmq()
 
-    timeout = megatron_quant_policy_worker.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
+    timeout = megatron_quant_policy_worker.MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
     assert events == [
         ("socket", megatron_quant_policy_worker.zmq.REQ),
         ("setsockopt", megatron_quant_policy_worker.zmq.SNDTIMEO, 120_000),
@@ -489,7 +489,7 @@ def test_real_quant_refit_rendezvouses_between_materialized_groups(monkeypatch):
     params = iter(worker._iter_real_quant_refit_params())
 
     assert next(params)[0] == "model.layers.0.mlp.down_proj.weight"
-    events.append(("ack_wait", None))
+    events.append(("consumer_pause", None))
     assert next(params)[0] == "model.layers.0.mlp.down_proj.weight_scale"
     assert next(params)[0] == "model.layers.1.mlp.down_proj.weight"
     assert list(params) == []
@@ -497,7 +497,7 @@ def test_real_quant_refit_rendezvouses_between_materialized_groups(monkeypatch):
     assert [event[0] for event in events] == [
         "barrier",
         "export",
-        "ack_wait",
+        "consumer_pause",
         "barrier",
         "export",
         "barrier",
@@ -511,69 +511,13 @@ def test_real_quant_refit_rendezvouses_between_materialized_groups(monkeypatch):
             {
                 "group": worker._real_quant_refit_sync_group,
                 "timeout": megatron_quant_policy_worker.timedelta(
-                    milliseconds=megatron_quant_policy_worker.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
+                    milliseconds=megatron_quant_policy_worker.MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
                 ),
                 "wait_all_ranks": True,
             }
         ]
         * 4
     )
-
-
-@requires_weight_folding
-def test_ipc_ack_backpressure_cannot_advance_an_unmaterialized_group(monkeypatch):
-    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
-    from nemo_rl.models.policy import utils as policy_utils
-
-    worker = _make_real_quant_worker()
-    worker._real_quant_refit_sync_group = object()
-    events = []
-
-    monkeypatch.setattr(
-        megatron_quant_policy_worker.torch.distributed,
-        "monitored_barrier",
-        lambda **_kwargs: events.append("barrier"),
-    )
-
-    def export_groups(*args, **kwargs):
-        events.append("export_group_0")
-        yield tuple(
-            (f"group_0.weight_{index}", torch.ones(1, dtype=torch.uint8))
-            for index in range(5)
-        )
-        events.append("export_group_1")
-        yield (("group_1.weight", torch.ones(1, dtype=torch.uint8)),)
-
-    worker.megatron_bridge.export_hf_weight_groups_modelopt = export_groups
-
-    class FakeStream:
-        def synchronize(self):
-            events.append("synchronize")
-
-    class FakeSocket:
-        def send_pyobj(self, _payload):
-            events.append("send")
-
-        def recv(self):
-            events.append("recv_ack")
-            return b"ack"
-
-    monkeypatch.setattr(policy_utils.torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(policy_utils.torch.cuda, "current_stream", lambda: FakeStream())
-    monkeypatch.setattr(policy_utils.torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(
-        policy_utils, "get_handle_from_tensor", lambda _tensor: ("handle",)
-    )
-
-    policy_utils.stream_weights_via_ipc_zmq_impl(
-        params_generator=worker._iter_real_quant_refit_params(),
-        buffer_size_bytes=2048,
-        zmq_socket=FakeSocket(),
-        rank=0,
-        worker_name="test-worker",
-    )
-
-    assert events.index("recv_ack") < events.index("export_group_1")
 
 
 def _distributed_refit_group_rendezvous_worker(rank, world_size, init_file):

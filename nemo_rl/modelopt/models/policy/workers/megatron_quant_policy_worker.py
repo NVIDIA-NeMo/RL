@@ -42,7 +42,7 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
     quantize_model,
     symlink_pre_quantized_model,
 )
-from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
+from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -150,8 +150,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         """Use a longer timeout only for ModelOpt real-quant refits."""
         super().maybe_init_zmq()
         if self._use_real_quant_refit():
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
+            self.zmq_socket.setsockopt(
+                zmq.SNDTIMEO, MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
+            )
+            self.zmq_socket.setsockopt(
+                zmq.RCVTIMEO, MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
+            )
 
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""
@@ -184,13 +188,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
         super().__init__(config, *args, **kwargs)
 
-        # ModelOpt export is lazy and enters model-parallel NCCL collectives.
-        # IPC backpressure is rank-local, so synchronize exporter advancement
-        # on CPU before any rank can enter the next collective.
+        # Each materialized export group is one collective-complete conversion
+        # task. Rendezvous on CPU before advancing so rank-local consumers cannot
+        # make policy ranks enter the next model-parallel task out of order.
         self._real_quant_refit_sync_group = (
             torch.distributed.new_group(
                 backend="gloo",
-                timeout=timedelta(milliseconds=MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS),
+                timeout=timedelta(milliseconds=MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS),
             )
             if self._use_real_quant_refit() and torch.distributed.get_world_size() > 1
             else None
@@ -520,7 +524,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if self._real_quant_refit_sync_group is not None:
                 torch.distributed.monitored_barrier(
                     group=self._real_quant_refit_sync_group,
-                    timeout=timedelta(milliseconds=MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS),
+                    timeout=timedelta(
+                        milliseconds=MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
+                    ),
                     wait_all_ranks=True,
                 )
             try:

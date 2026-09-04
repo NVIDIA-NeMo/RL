@@ -19,7 +19,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS = 600_000
+MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS = 600_000
 
 
 def prepare_real_quant_generation_config(policy: Any, generation_config: dict) -> None:

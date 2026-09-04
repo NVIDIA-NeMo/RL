@@ -577,12 +577,12 @@ def test_real_quant_backend_uses_modelopt_refit_timeout(monkeypatch):
         (
             "setsockopt",
             backend.zmq.SNDTIMEO,
-            modelopt_utils.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
+            modelopt_utils.MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS,
         ),
         (
             "setsockopt",
             backend.zmq.RCVTIMEO,
-            modelopt_utils.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
+            modelopt_utils.MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS,
         ),
     ]
 

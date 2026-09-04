@@ -20,7 +20,7 @@ import vllm  # noqa: F401
 import zmq
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
-from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
+from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
 from nemo_rl.models.generation.vllm.checkpoint_engine import VllmCheckpointEngineMixin
 from nemo_rl.models.generation.vllm.vllm_backend import (
     VllmInternalWorkerExtension,
@@ -42,8 +42,12 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         """Use a longer timeout only for ModelOpt real-quant refits."""
         super().maybe_init_zmq()
         if self._is_real_quant_model():
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
+            self.zmq_socket.setsockopt(
+                zmq.SNDTIMEO, MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
+            )
+            self.zmq_socket.setsockopt(
+                zmq.RCVTIMEO, MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
+            )
 
     def _is_real_quant_model(self) -> bool:
         quantization = self.model_runner.vllm_config.model_config.quantization
