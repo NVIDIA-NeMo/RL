@@ -140,7 +140,15 @@ def import_bridge_plugins(module_names: list[str] | None) -> None:
     ``vllm_cfg.reasoning_parser_plugin``.
     """
     for module_name in module_names or []:
-        importlib.import_module(module_name)
+        try:
+            importlib.import_module(module_name)
+        except ImportError as e:
+            raise ImportError(
+                f"policy.megatron_cfg.bridge_plugins lists {module_name!r}, which "
+                "could not be imported. These are dotted module paths, not file "
+                "paths, and must be importable from the process that resolves the "
+                "model -- the Megatron policy worker, or the HF converter."
+            ) from e
 
 
 def resolve_model_class(model_name: str) -> Any:

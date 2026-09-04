@@ -645,6 +645,21 @@ class TestImportBridgePlugins:
     def test_absent_and_empty_are_noops(self, module_names):
         import_bridge_plugins(module_names)
 
-    def test_missing_module_raises(self):
-        with pytest.raises(ModuleNotFoundError):
+    def test_missing_module_names_the_config_key(self):
+        with pytest.raises(ImportError, match="bridge_plugins") as excinfo:
             import_bridge_plugins(["nemo_rl_no_such_bridge_plugin"])
+        assert "nemo_rl_no_such_bridge_plugin" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, ModuleNotFoundError)
+
+    def test_a_plugin_that_fails_to_import_names_the_config_key(
+        self, tmp_path, monkeypatch
+    ):
+        """The realistic failure: the plugin exists but its own imports are broken."""
+        mod = tmp_path / "broken_bridge_plugin.py"
+        mod.write_text("import nemo_rl_no_such_dependency\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        try:
+            with pytest.raises(ImportError, match="bridge_plugins"):
+                import_bridge_plugins(["broken_bridge_plugin"])
+        finally:
+            sys.modules.pop("broken_bridge_plugin", None)
