@@ -18,9 +18,13 @@ These run in the default L0 suite. Keep this module free of heavy imports
 """
 
 import copy
+import sys
+import types
+from contextlib import contextmanager
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from omegaconf import DictConfig
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
@@ -300,3 +304,90 @@ def test_nemo_gym_shutdown_before_spinup_is_a_noop():
     actor.__init__({})
 
     actor.shutdown()  # must not raise
+
+
+@contextmanager
+def _stub_gym_resolved_config(resolved):
+    """Stand in for nemo_gym.global_config, which lives in the actor's venv."""
+    package = types.ModuleType("nemo_gym")
+    module = types.ModuleType("nemo_gym.global_config")
+    module.get_global_config_dict = lambda: resolved
+    with patch.dict(
+        sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
+    ):
+        yield
+
+
+def _spun_up_actor():
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({})
+    actor.rh = MagicMock()
+    return actor
+
+
+def test_list_entries_reports_entry_names_and_server_types():
+    resolved = DictConfig(
+        {
+            "math_agent": {
+                "responses_api_agents": {"simple_agent": {"entrypoint": "app.py"}}
+            },
+            "math_env": {"resources_servers": {"math": {"entrypoint": "app.py"}}},
+            # An entry can carry more than one server type.
+            "judge": {
+                "responses_api_models": {"local_vllm_model": {"entrypoint": "app.py"}},
+                "resources_servers": {"judge_tools": {"entrypoint": "app.py"}},
+            },
+            # Plain Gym settings are not entries.
+            "port_range_low": 5000,
+            "default_host": "10.0.0.1",
+            "config_paths": ["a.yaml"],
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {
+        "math_agent": ["responses_api_agents"],
+        "math_env": ["resources_servers"],
+        "judge": ["responses_api_models", "resources_servers"],
+    }
+
+
+def test_list_entries_skips_dicts_that_hold_no_server_type():
+    """A dict-shaped setting is not an entry unless it nests a server type."""
+    resolved = DictConfig(
+        {
+            "real_entry": {"resources_servers": {"env": {"entrypoint": "app.py"}}},
+            "some_setting": {"nested": "value"},
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {"real_entry": ["resources_servers"]}
+
+
+def test_list_entries_skips_an_entry_that_starts_no_server():
+    resolved = DictConfig(
+        {
+            "math_env": {"resources_servers": {"math": {"entrypoint": "app.py"}}},
+            "code_gen": {"resources_servers": {"code": {"host": "10.0.0.1"}}},
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {"math_env": ["resources_servers"]}
+
+
+def test_list_entries_before_spinup_raises():
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({})
+
+    with pytest.raises(RuntimeError, match="call _spinup"):
+        actor.list_entries()
