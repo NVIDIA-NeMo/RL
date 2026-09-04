@@ -161,6 +161,8 @@ Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
 
+_MAX_CONSECUTIVE_ROLLOUT_CHECKPOINT_FAILURES = 3
+
 
 @dataclass(frozen=True)
 class _RolloutCheckpointCut:
@@ -546,12 +548,9 @@ class SingleControllerActor:
         train_task = asyncio.create_task(self._train_pump())
         watchdog_task = asyncio.create_task(self._stall_watchdog_pump())
         tasks = [rollout_task, train_task, watchdog_task]
-        rollout_checkpoint_cfg = getattr(
-            self._master_config, "rollout_checkpointing", None
-        )
         rollout_checkpoint_task = (
             asyncio.create_task(self._rollout_checkpoint_pump())
-            if getattr(rollout_checkpoint_cfg, "interval_s", None) is not None
+            if self._master_config.rollout_checkpointing.interval_s is not None
             else None
         )
         if rollout_checkpoint_task is not None:
@@ -1203,6 +1202,10 @@ class SingleControllerActor:
     async def _save_data_plane_checkpoint(
         self,
         checkpoint_path: PathLike,
+        *,
+        train_steps: int,
+        trainer_version: int,
+        current_epoch: int,
         replay_metadata: Optional[TQReplayMetadataState] = None,
         rollout_recovery_payload_sha256: Optional[str] = None,
         rollout_recovery_group_count: Optional[int] = None,
@@ -1219,20 +1222,13 @@ class SingleControllerActor:
             checkpoint_path,
             DATA_PLANE_CHECKPOINT_DIR,
         )
-        save_state = self._save_state
-        checkpoint_trainer_version = save_state.trainer_version
-        if checkpoint_trainer_version is None:
-            raise RuntimeError(
-                "Cannot save a data-plane checkpoint before trainer_version "
-                "is captured in the controller save state"
-            )
         metadata: DataPlaneCheckpointMetadata = {
             "data_plane_checkpoint_schema_version": (
                 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
             ),
-            "single_controller_train_steps": save_state.current_step,
-            "single_controller_trainer_version": checkpoint_trainer_version,
-            "single_controller_epoch": save_state.current_epoch,
+            "single_controller_train_steps": train_steps,
+            "single_controller_trainer_version": trainer_version,
+            "single_controller_epoch": current_epoch,
             "partition_id": self._partition_id,
             "sampler_name": self._async_cfg.sampler.name,
             "mode": "authoritative" if replay_metadata is not None else "shadow",
@@ -3399,6 +3395,7 @@ class SingleControllerActor:
 
     async def _capture_rollout_checkpoint_cut(
         self,
+        cut: DataPlaneMutationCut,
         checkpoint_path: PathLike,
     ) -> _RolloutCheckpointCut:
         """Save TQ and capture matching restart state under the barrier.
@@ -3407,16 +3404,7 @@ class SingleControllerActor:
         replay index but remain in TQ. Re-index them only in this persisted cut;
         the live trainer keeps accumulating gradients without modification.
         """
-        save_state = self._save_state
-        save_state.current_step = self._train_steps
-        save_state.total_steps = self._train_steps
-        save_state.trainer_version = self._trainer_version
-        save_state.current_epoch = self._current_epoch
-        save_state.consumed_samples = self._consumed_samples
-        save_state.total_valid_tokens = self._total_valid_tokens
-        save_state.sampler_name = self._async_cfg.sampler.name
-        save_state.sampler_dispatch_index = self._sampler.dispatch_index
-
+        cut.require_live()
         dataloader_state = self._dataloader.state_dict()
         replacement_reserve = list(self._replacement_reserve)
         training_owned_groups = self._buffer.training_owned_replay_groups()
@@ -3444,11 +3432,15 @@ class SingleControllerActor:
 
         if self._master_config.token_capture.enabled:
             await self._validate_rollout_recovery_inventory(
+                cut,
                 replay_metadata=replay_metadata,
                 clear_unreferenced=False,
             )
         await self._save_data_plane_checkpoint(
             checkpoint_path,
+            train_steps=self._train_steps,
+            trainer_version=self._trainer_version,
+            current_epoch=self._current_epoch,
             replay_metadata=replay_metadata,
             rollout_recovery_payload_sha256=recovery_digest,
             rollout_recovery_group_count=len(recovery_state["groups"]),
@@ -3568,7 +3560,7 @@ class SingleControllerActor:
                 prepare_snapshot_paths, anchor
             )
             try:
-                async with self._data_plane_checkpoint_barrier.checkpoint():
+                async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
                     if (
                         self._optimizer_commit_in_progress
                         or self._train_steps != expected_train_step
@@ -3577,17 +3569,21 @@ class SingleControllerActor:
                         await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                         return False
                     snapshot_epoch = self._current_epoch
-                    cut = await self._capture_rollout_checkpoint_cut(tmp_path)
+                    snapshot_cut = await self._capture_rollout_checkpoint_cut(
+                        cut, tmp_path
+                    )
 
-                await self._write_rollout_checkpoint_sidecars(tmp_path, cut)
+                await self._write_rollout_checkpoint_sidecars(tmp_path, snapshot_cut)
                 manifest = RolloutSnapshotManifest(
                     schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
                     base_train_step=expected_train_step,
                     trainer_version=expected_trainer_version,
                     current_epoch=snapshot_epoch,
-                    sampler_dispatch_index=cut.sampler_dispatch_index,
-                    mutation_version=cut.mutation_version,
-                    rolled_back_train_group_count=(cut.rolled_back_train_group_count),
+                    sampler_dispatch_index=snapshot_cut.sampler_dispatch_index,
+                    mutation_version=snapshot_cut.mutation_version,
+                    rolled_back_train_group_count=(
+                        snapshot_cut.rolled_back_train_group_count
+                    ),
                     bootstrap_fingerprint=snapshot_fingerprint,
                 )
                 await asyncio.to_thread(
@@ -3607,13 +3603,13 @@ class SingleControllerActor:
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                 raise
 
-            self._last_rollout_snapshot_mutation_version = cut.mutation_version
+            self._last_rollout_snapshot_mutation_version = snapshot_cut.mutation_version
             self._last_missing_rollout_snapshot_anchor = None
             print(
                 "rollout checkpoint save completed: "
                 f"{final_path} (step={expected_train_step}, "
                 f"trainer_version={expected_trainer_version}, "
-                f"ledger_groups={cut.rollout_recovery_group_count or 0})",
+                f"ledger_groups={snapshot_cut.rollout_recovery_group_count or 0})",
                 flush=True,
             )
             return True
@@ -3642,6 +3638,11 @@ class SingleControllerActor:
                     f"{type(error).__name__}: {error}",
                     flush=True,
                 )
+                if consecutive_failures >= _MAX_CONSECUTIVE_ROLLOUT_CHECKPOINT_FAILURES:
+                    raise RuntimeError(
+                        "periodic rollout checkpoint failed "
+                        f"{consecutive_failures} consecutive times"
+                    ) from error
                 continue
             consecutive_failures = 0
             if deadline_due and saved and self._timeout.check_save():
@@ -3789,6 +3790,9 @@ class SingleControllerActor:
 
                 await self._save_data_plane_checkpoint(
                     checkpoint_path,
+                    train_steps=save_state.current_step,
+                    trainer_version=self._trainer_version,
+                    current_epoch=save_state.current_epoch,
                     replay_metadata=replay_metadata,
                     rollout_recovery_payload_sha256=(rollout_recovery_payload_sha256),
                     rollout_recovery_group_count=(

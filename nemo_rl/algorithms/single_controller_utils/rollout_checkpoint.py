@@ -28,7 +28,7 @@ from typing import Any, Mapping, Optional
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 2
-BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 3
+BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 4
 BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
 ROLLOUT_SNAPSHOTS_DIRNAME = "rollout_snapshots"
@@ -85,9 +85,11 @@ _BOOTSTRAP_DATA_FIELDS = frozenset(
 )
 _BOOTSTRAP_TOKEN_CAPTURE_FIELDS = frozenset(
     {
+        "defer_routed_experts_to_policy",
         "enabled",
         "min_valid_fraction_per_group",
         "mixed_weight_version_policy",
+        "on_capture_failure",
         "staging_partition",
     }
 )
@@ -96,29 +98,70 @@ _BOOTSTRAP_TOKEN_CAPTURE_FIELDS = frozenset(
 # neighbors such as model names, parser settings, timeouts, and reward config.
 _BOOTSTRAP_ENV_RUNTIME_FIELDS = frozenset(
     {
+        "_copy",
+        "_inherit_from",
+        "allow_openai_version_skew",
         "api_key",
         "api_server_count",
         "apptainer_memory_limit_mb",
+        "cache_dir",
+        "component_name",
         "concurrency",
+        "config_paths",
         "debug",
         "default_host",
+        "disallowed_ports",
+        "dry_run",
+        "entrypoint",
         "global_aiohttp_connector_limit",
         "global_aiohttp_connector_limit_per_host",
+        "head_server",
+        "head_server_deps",
+        "hf_token",
+        "json",
+        "model_call_capture_dir",
+        "model_endpoint_readiness_timeout_seconds",
         "nemo_gym_log_dir",
         "num_gpu_nodes",
         "num_processes",
         "num_workers",
+        "observability_enabled",
+        "pip_install_verbose",
         "policy_base_url",
         "port_range_high",
         "port_range_low",
+        "python_version",
+        "query",
         "ray_head_node_address",
         "ray_worker_py_executable",
+        "results_dir",
         "should_log_nemo_gym_responses",
         "skip_venv_if_present",
+        "token_id_capture",
         "use_absolute_ip",
         "uv_cache_dir",
+        "uv_pip_set_python",
         "uv_venv_dir",
+        "verbose",
     }
+)
+# Gym is optional in NeMo-RL, so keep credential recognition local rather than
+# importing its global-config helpers. Match credential-shaped leaves without
+# dropping semantic neighbors such as ``max_tokens`` or ``tokenizer``.
+_BOOTSTRAP_ENV_CREDENTIAL_FIELDS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "password",
+        "secret",
+        "token",
+    }
+)
+_BOOTSTRAP_ENV_CREDENTIAL_FIELD_SUFFIXES = (
+    "_api_key",
+    "_password",
+    "_secret",
+    "_token",
 )
 # These remote services keep their model identity in the fingerprint, but the
 # endpoint may legitimately move when a Slurm job is restarted.
@@ -152,6 +195,14 @@ def _select_fields(
     return {key: mapping[key] for key in sorted(fields) if key in mapping}
 
 
+def _is_environment_credential_field(field: str) -> bool:
+    """Whether one environment leaf is credential-shaped, not semantic config."""
+    normalized = field.casefold()
+    return normalized in _BOOTSTRAP_ENV_CREDENTIAL_FIELDS or normalized.endswith(
+        _BOOTSTRAP_ENV_CREDENTIAL_FIELD_SUFFIXES
+    )
+
+
 def _drop_runtime_fields(
     value: Any,
     runtime_fields: frozenset[str],
@@ -159,7 +210,7 @@ def _drop_runtime_fields(
     runtime_paths: frozenset[tuple[str, ...]],
     path: tuple[str, ...] = (),
 ) -> Any:
-    """Recursively strip known operational leaves and paths from an environment."""
+    """Recursively strip operational and credential leaves from an environment."""
     if isinstance(value, Mapping):
         return {
             key: _drop_runtime_fields(
@@ -169,7 +220,9 @@ def _drop_runtime_fields(
                 path=(*path, key),
             )
             for key, child in value.items()
-            if key not in runtime_fields and (*path, key) not in runtime_paths
+            if key not in runtime_fields
+            and not _is_environment_credential_field(key)
+            and (*path, key) not in runtime_paths
         }
     if isinstance(value, list):
         return [
@@ -442,27 +495,6 @@ def reset_bootstrap_anchor(checkpoint_dir: Path, *, fingerprint: str) -> Path:
     if manifest_path.exists():
         manifest_path.unlink()
     return ensure_bootstrap_anchor(checkpoint_dir, fingerprint=fingerprint)
-
-
-def validate_bootstrap_anchor(anchor: Path, *, fingerprint: str) -> None:
-    """Fail loudly when bootstrap snapshots belong to different initial state."""
-    manifest_path = anchor / BOOTSTRAP_MANIFEST_FILENAME
-    if not manifest_path.is_file():
-        raise FileNotFoundError(
-            f"rollout bootstrap manifest is missing at {manifest_path}"
-        )
-    raw = json.loads(manifest_path.read_text())
-    expected = {
-        "schema_version": ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
-        "base_train_step": 0,
-        "trainer_version": 0,
-        "bootstrap_fingerprint": fingerprint,
-    }
-    if raw != expected:
-        raise ValueError(
-            "rollout bootstrap anchor does not match the current trainer "
-            f"configuration: checkpoint={raw!r}, expected={expected!r}"
-        )
 
 
 def prepare_snapshot_paths(anchor: Path) -> tuple[Path, Path, int]:
