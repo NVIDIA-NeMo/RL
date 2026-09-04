@@ -152,6 +152,11 @@ def _make_worker(loss_type):
     # pre-hook back after the first optimizer step.
     w._first_train_step_forward_pre_hook_disabled = False
     w._first_train_step_param_sync_func = None
+    # Also set in __init__, from the loaded model. train_microbatch reads both
+    # to reject a multimodal model, so they must exist before the first call.
+    # These values are the text-only case, which is what this mock fabric is.
+    w.media_placeholder_token_id = None
+    w.model_slices_context_parallel_inputs = False
     # Pure telemetry, and it resets the CUDA peak counters — keep it out of the
     # way so these tests stay hermetic on GPU shards.
     w._log_gpu_mem = MagicMock()
