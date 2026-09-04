@@ -18,6 +18,14 @@ source "$SCRIPT_DIR/common-tq.env"
 export EXP_NAME="$TQ_EXP_NAME"
 bash "$SCRIPT_DIR/$BASE_RECIPE.sh" "$@"
 
-# No TQ-specific gate: turning the data plane on must not change what the recipe
-# is held to, so the logprob check lives on the base recipe, where both the
-# data-plane and no-data-plane paths inherit it.
+# TQ-owned logprob gate: the base recipe's gate runs under this wrapper too,
+# but it is not a data-plane check -- it would pass or fail the same way with
+# data_plane.enabled=false. This one covers the mooncake_cpu wire itself.
+#
+# median, not max or mean: a single long outlier sequence dominates both. On
+# this recipe mooncake measured 1.031-1.041 over nine steps with one at 1.371,
+# median ~1.033, and the no-data-plane control sits in the same band -- so 1.05
+# passes both and still catches a wire that corrupts the logprob inputs.
+source "$SCRIPT_DIR/common.env"
+uv run tests/check_metrics.py "$JSON_METRICS" \
+    'median(data["train/token_mult_prob_error"]) < 1.05'

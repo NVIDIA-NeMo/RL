@@ -30,7 +30,13 @@ bash "$SCRIPT_DIR/$BASE_RECIPE.sh" "$@"
 # Deliberately NOT applied to recipes with >1 inner step: there the ratio
 # measures policy drift, and its max swings 5.85-29.21 run to run on identical
 # code (it does so on the non-data-plane path too).
+#
+# The logprob bound is a median, not a mean: on this recipe the per-step value
+# is ~1.02 but spikes on a third of the steps (measured 20-step data-plane run:
+# 5.05, 5.09, 4.13, 1.79, 1.34, 1.17), so the mean is 1.65 and a mean bound
+# would have to sit above 2.0 to pass. The median is 1.026.
 source "$SCRIPT_DIR/common.env"
 uv run tests/check_metrics.py "$JSON_METRICS" \
     'max(data["train/probs_ratio_max"]) < 1.0001' \
-    'min(data["train/probs_ratio_min"]) > 0.9999'
+    'min(data["train/probs_ratio_min"]) > 0.9999' \
+    'median(data["train/token_mult_prob_error"]) < 1.05'
