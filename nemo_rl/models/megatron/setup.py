@@ -1173,7 +1173,26 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         # In mcore, mtp_num_layers is both the number of MTP layers (when
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
-        model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
+        mtp_num_layers = megatron_cfg["mtp_num_layers"]
+        model_cfg.mtp_num_layers = mtp_num_layers
+
+        if mtp_num_layers == 0:
+            # Bridge checkpoints can already contain the unified hybrid pattern
+            # produced from their HF MTP metadata, for example ``MEME/*E``.
+            # Overriding only the depth leaves that suffix in place, so MCore
+            # still constructs an MTP block and eventually sees the impossible
+            # combination ``mtp_process=True`` with ``mtp_num_layers=0``.
+            # NeMo RL documents zero as disabled; remove both legacy and unified
+            # MTP pattern metadata to make that contract complete.
+            from megatron.core.models.hybrid.layers.utils import Symbols
+
+            if hasattr(model_cfg, "mtp_hybrid_override_pattern"):
+                model_cfg.mtp_hybrid_override_pattern = None
+            hybrid_layer_pattern = getattr(model_cfg, "hybrid_layer_pattern", None)
+            if hybrid_layer_pattern:
+                model_cfg.hybrid_layer_pattern = hybrid_layer_pattern.split(
+                    Symbols.MTP_SEPARATOR, 1
+                )[0]
     if "mtp_loss_scaling_factor" in megatron_cfg:
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
     if "mtp_use_repeated_layer" in megatron_cfg:
