@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -94,6 +95,33 @@ def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
     assert metrics["draft_loss"] == draft_loss.item()
 
 
+@patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
+def test_draft_loss_wrapper_forwards_token_chunk_size(mock_draft_loss_cls):
+    """The configured tile size must reach the loss fn, not just the wrapper.
+
+    ``policy.draft.token_chunk_size`` only bounds peak activation memory if it
+    survives the wrapper hand-off; a default swallowed here would look like a
+    silent OOM regression at the tile boundary.
+    """
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    data = BatchedDataDict({})
+    DraftLossWrapper(
+        loss_fn=MagicMock(),
+        prepare_fn=MagicMock(),
+        data_dict=data,
+        token_chunk_size=512,
+    )
+    assert mock_draft_loss_cls.call_args.kwargs["token_chunk_size"] == 512
+
+    mock_draft_loss_cls.reset_mock()
+    DraftLossWrapper(loss_fn=MagicMock(), prepare_fn=MagicMock(), data_dict=data)
+    assert (
+        mock_draft_loss_cls.call_args.kwargs["token_chunk_size"]
+        == DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
+    )
+
+
 @patch("nemo_rl.algorithms.loss.loss_functions.streaming_vocab_parallel_soft_ce")
 def test_draft_cross_entropy_loss_uses_streaming_path(
     mock_streaming_ce,
@@ -122,7 +150,7 @@ def test_draft_cross_entropy_loss_uses_streaming_path(
     call_kwargs = mock_streaming_ce.call_args.kwargs
     assert call_kwargs["student_logits"] is student_logits
     assert call_kwargs["teacher_logits"] is teacher_logits
-    assert call_kwargs["token_chunk_size"] == 4096
+    assert call_kwargs["token_chunk_size"] == DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
     assert call_kwargs["tp_group"] is loss_fn.vocab_parallel_group
     torch.testing.assert_close(
         call_kwargs["mask"],

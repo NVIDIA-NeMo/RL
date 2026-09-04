@@ -19,6 +19,14 @@ from typing import Any
 
 import torch
 
+# Tokens per FP32 vocab tile. The streaming kernel materializes
+# ``token_chunk_size x vocab`` FP32 probabilities at a time, so this trades peak
+# activation memory against launch count: 4096 keeps the tile near 0.5 GiB at a
+# 32k vocabulary while still saturating a modern GPU. Exposed as
+# ``policy.draft.token_chunk_size`` for models whose vocabulary makes that tile
+# too large (lower it) or too small to keep the GPU busy (raise it).
+DEFAULT_DRAFT_TOKEN_CHUNK_SIZE = 4096
+
 
 @dataclass(frozen=True, slots=True)
 class DraftLossStats:
@@ -276,7 +284,9 @@ class _StreamingVocabParallelSoftCE(torch.autograd.Function):
         )
         # pyrefly: ignore[implicitly-defined-attribute]
         ctx.token_chunk_size = token_chunk_size
-        ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
+        # tp_group is deliberately not saved: backward rebuilds both
+        # distributions from the already TP-reduced log-normalizers, so the
+        # gradient is purely local and needs no collective.
         return numerators
 
     @staticmethod
