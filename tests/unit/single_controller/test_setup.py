@@ -758,6 +758,80 @@ class TestSetup:
         with pytest.raises(ValueError, match="supports training-claim ownership"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_periodic_checkpointing_warns_without_per_step_trainer_anchors(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config(colocated=False, backend="vllm")
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 2,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.logger = {"log_dir": str(tmp_path / "logs")}
+        mc.token_capture.enabled = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(interval_s=1.0)
+        fake_finalizers = [MagicMock(name="finalizer")]
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+
+        with (
+            pytest.warns(UserWarning, match="checkpointing.save_period=2"),
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch(
+                "nemo_rl.experience.finalizer_actor.create_finalizer_actors",
+                return_value=fake_finalizers,
+            ),
+        ):
+            actor_args, _ = setup_single_controller(
+                mc,
+                MagicMock(pad_token_id=0),
+            )
+
+        assert actor_args.finalizer_actors == fake_finalizers
+
+    def test_disabled_periodic_checkpointing_ignores_existing_snapshots(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config()
+        checkpoint_dir = tmp_path / "checkpoints"
+        mc.checkpointing["checkpoint_dir"] = str(checkpoint_dir)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            interval_s=None,
+            restore_mode="latest",
+        )
+        (checkpoint_dir / "bootstrap" / "rollout_snapshots").mkdir(parents=True)
+
+        with patch.object(sc_setup_mod, "resolve_latest_snapshot") as resolve:
+            actor_args, _ = setup_single_controller(
+                mc,
+                MagicMock(pad_token_id=0),
+            )
+
+        resolve.assert_not_called()
+        assert actor_args.last_checkpoint_path is None
+
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
