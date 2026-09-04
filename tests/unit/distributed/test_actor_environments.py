@@ -144,6 +144,56 @@ def test_script_output_matches_the_registry():
     assert listed == expected
 
 
+def test_script_rejects_a_typo_instead_of_printing_nothing():
+    """A mistyped stage or skip extra must fail, not emit an empty list.
+
+    The Dockerfile pipes this into a loop, so silently printing zero rows would
+    build zero venvs. `test -s` catches that in the deps layer, but the guard is
+    what makes the failure say which word was wrong.
+    """
+    for argv in (["badstage"], ["all", "notanextra"]):
+        proc = subprocess.run(
+            [sys.executable, str(MODULE_PATH), *argv],
+            capture_output=True,
+            text=True,
+            cwd=git_root,
+        )
+        assert proc.returncode == 2, f"{argv} should be rejected, got {proc.returncode}"
+        assert not proc.stdout.strip(), f"{argv} printed rows despite being invalid"
+
+
+def test_registry_import_rejects_an_undeclared_extra(monkeypatch):
+    """A typo'd extra must fail while IMPORTING the registry, not at venv creation.
+
+    On the image-build path `prefetch_venvs.py` catches the per-actor error and
+    exits 0, so without this guard a typo ships a green image missing one venv.
+    Importing the module fresh is the point -- calling the check directly would
+    still pass if nothing invoked it at import.
+    """
+    import nemo_rl.distributed.actor_environments as table
+
+    registry_path = (
+        Path(git_root) / "nemo_rl" / "distributed" / "ray_actor_environment_registry.py"
+    )
+
+    def _import_registry_fresh(name):
+        spec = importlib.util.spec_from_file_location(name, registry_path)
+        spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+    _import_registry_fresh("_registry_clean")  # real table: must not raise
+
+    monkeypatch.setattr(
+        table,
+        "ACTOR_ENVIRONMENTS",
+        {
+            **table.ACTOR_ENVIRONMENTS,
+            "nemo_rl.fake.Worker": ["definitely_not_an_extra"],
+        },
+    )
+    with pytest.raises(ValueError, match="definitely_not_an_extra"):
+        _import_registry_fresh("_registry_typo")
+
+
 def test_script_emits_the_stage_and_extra_flags_each_actor_needs():
     """The Dockerfile builds each venv from columns 2 and 3, not just the name.
 
