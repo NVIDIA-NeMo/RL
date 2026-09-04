@@ -170,7 +170,6 @@ project-includes = [
   "nemo_rl/modelopt/models/policy/workers/__init__.py",
   "nemo_rl/modelopt/models/policy/workers/dtensor_quant_policy_worker.py",
   "nemo_rl/modelopt/models/policy/workers/dtensor_quant_policy_worker_v2.py",
-  "nemo_rl/modelopt/registry.py",
   "nemo_rl/models/__init__.py",
   "nemo_rl/models/automodel/__init__.py",
   "nemo_rl/models/dtensor/__init__.py",

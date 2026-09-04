@@ -13,58 +13,43 @@
 # limitations under the License.
 
 import os
+import tomllib
+from pathlib import Path
 
-from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+from nemo_rl.distributed.virtual_cluster import (
+    PY_EXECUTABLES,
+    git_root,
+    uv_py_executable,
+)
 
+# NEMO_RL_PY_EXECUTABLES_SYSTEM=1 (single-environment images such as Dockerfile.ngc_pytorch)
+# runs every actor on the driver's interpreter instead of a per-actor uv venv.
 USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
-VLLM_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.VLLM
-)
-SGLANG_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.SGLANG
-)
-MCORE_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MCORE
-)
-TRTLLM_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.TRTLLM
-)
-ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
-    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
-    "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": VLLM_EXECUTABLE,
-    "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": SGLANG_EXECUTABLE,
-    "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": PY_EXECUTABLES.FSDP,
-    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": PY_EXECUTABLES.AUTOMODEL,
-    "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2": PY_EXECUTABLES.AUTOMODEL,
-    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
-    "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": MCORE_EXECUTABLE,
-    "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": TRTLLM_EXECUTABLE,
-    "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.math_environment.MathMultiRewardEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.vlm_environment.VLMEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.code_environment.CodeEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.reward_model_environment.RewardModelEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv": PY_EXECUTABLES.SYSTEM,
-    # AsyncTrajectoryCollector needs vLLM environment to handle exceptions from VllmGenerationWorker
-    "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": PY_EXECUTABLES.VLLM,
-    # ReplayBuffer needs vLLM environment to handle trajectory data from VllmGenerationWorker
-    "nemo_rl.algorithms.async_utils.ReplayBuffer": PY_EXECUTABLES.VLLM,
-    # SyncRolloutActor doesn't import vllm directly — policy_generation is a
-    # Ray actor handle. The VLLM env is needed because (1) transfer_queue is
-    # bundled into the VLLM venv (and the policy training venvs), and the
-    # actor writes flattened tensors to TQ via dp_client.put_samples;
-    # (2) same-node colocation with VllmGenerationWorker avoids duplicate
-    # venv caches.
-    "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
-    "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
-}
 
-from nemo_rl.modelopt.registry import MODELOPT_ACTOR_REGISTRY
 
-ACTOR_ENVIRONMENT_REGISTRY.update(MODELOPT_ACTOR_REGISTRY)
+def _load_actor_environments() -> dict[str, str]:
+    """Build actor FQN -> py_executable from pyproject.toml's [tool.nemo_rl.actor_environments]."""
+    with open(Path(git_root) / "pyproject.toml", "rb") as f:
+        pyproject = tomllib.load(f)
+    declared_extras = set(pyproject["project"]["optional-dependencies"])
+    registry: dict[str, str] = {}
+    for actor_fqn, extras in pyproject["tool"]["nemo_rl"]["actor_environments"].items():
+        if extras == "system":
+            registry[actor_fqn] = PY_EXECUTABLES.SYSTEM
+            continue
+        unknown = set(extras) - declared_extras
+        if unknown:
+            raise ValueError(
+                f"[tool.nemo_rl.actor_environments] {actor_fqn!r} names extras "
+                f"{sorted(unknown)} that are not in [project.optional-dependencies]"
+            )
+        registry[actor_fqn] = (
+            PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else uv_py_executable(extras)
+        )
+    return registry
+
+
+ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = _load_actor_environments()
 
 
 def get_actor_python_env(actor_class_fqn: str) -> str:
@@ -75,8 +60,7 @@ def get_actor_python_env(actor_class_fqn: str) -> str:
             f"No actor environment registered for {actor_class_fqn}. "
             f"You're attempting to create an actor ({actor_class_fqn}) "
             "without specifying a python environment for it. Please either"
-            "specify a python environment in the registry "
-            "(nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY) "
+            "add the actor to the [tool.nemo_rl.actor_environments] table in pyproject.toml "
             "or pass a py_executable to the RayWorkerBuilder. If you're unsure about which "
             "environment to use, a good default is PY_EXECUTABLES.SYSTEM for ray actors that "
             "don't have special dependencies. If you do have special dependencies (say, you're "

@@ -708,6 +708,77 @@ name = "drain3"
 version = "0.9.11"
 requires-dist = ["jsonpickle", "cachetools>=4.2.1"]
 
+# Ray actor -> uv extras of the venv it runs in; "system" = the driver's interpreter.
+# nemo_rl.distributed.ray_actor_environment_registry builds ACTOR_ENVIRONMENT_REGISTRY from
+# this table, and docker/Dockerfile reads it to prefetch one venv per actor into the image.
+# Extras must exist in [project.optional-dependencies].
+[tool.nemo_rl.actor_environments]
+"nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker" = ["vllm"]
+"nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker" = [
+  "vllm",
+]
+"nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker" = [
+  "sglang",
+]
+"nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker" = "system"
+"nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker" = [
+  "fsdp",
+]
+"nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2" = [
+  "automodel",
+]
+"nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2" = [
+  "automodel",
+]
+"nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker" = [
+  "mcore",
+]
+"nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker" = [
+  "mcore",
+]
+"nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker" = [
+  "trtllm",
+]
+"nemo_rl.environments.math_environment.MathEnvironment" = "system"
+"nemo_rl.environments.math_environment.MathMultiRewardEnvironment" = "system"
+"nemo_rl.environments.vlm_environment.VLMEnvironment" = "system"
+"nemo_rl.environments.code_environment.CodeEnvironment" = "system"
+"nemo_rl.environments.reward_model_environment.RewardModelEnvironment" = "system"
+"nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment" = "system"
+"nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv" = "system"
+# AsyncTrajectoryCollector needs the vLLM environment to handle exceptions from VllmGenerationWorker
+"nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector" = ["vllm"]
+# ReplayBuffer needs the vLLM environment to handle trajectory data from VllmGenerationWorker
+"nemo_rl.algorithms.async_utils.ReplayBuffer" = ["vllm"]
+# SyncRolloutActor doesn't import vllm directly -- policy_generation is a Ray actor handle.
+# The vLLM env is needed because (1) transfer_queue is bundled into the vLLM venv (and the
+# policy training venvs), and the actor writes flattened tensors to TQ via dp_client.put_samples;
+# (2) same-node colocation with VllmGenerationWorker avoids duplicate venv caches.
+"nemo_rl.experience.sync_rollout_actor.SyncRolloutActor" = ["vllm"]
+"nemo_rl.environments.tools.retriever.RAGEnvironment" = "system"
+"nemo_rl.environments.nemo_gym.NemoGym" = ["nemo_gym"]
+# ModelOpt quantization-aware workers
+"nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker" = [
+  "modelopt",
+  "vllm",
+]
+"nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantAsyncGenerationWorker" = [
+  "modelopt",
+  "vllm",
+]
+"nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker" = [
+  "modelopt",
+  "automodel",
+]
+"nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2" = [
+  "modelopt",
+  "automodel",
+]
+"nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker" = [
+  "modelopt",
+  "mcore",
+]
+
 [tool.black]
 line-length = 120
 include = '\.pyi?$'

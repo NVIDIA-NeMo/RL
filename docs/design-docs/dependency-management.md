@@ -94,15 +94,14 @@ Within the driver script, NeMo RL starts multiple [`RayWorkerGroup`](https://git
 - **Generation workers** (e.g., vLLM): Require `vllm` dependencies  
 - **Environment workers** (e.g., math evaluation): Use system/base dependencies
 
-Each worker type is mapped to a specific Python executable configuration in the [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py#L27-L46). This registry defines which virtual environment should be used for each actor type:
+Each worker type is mapped to the uv extras its virtual environment needs in the `[tool.nemo_rl.actor_environments]` table of `pyproject.toml`. [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py) is built from that table at import time, and the release container reads the same table to prefetch one virtual environment per worker type:
 
-```python
-ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
-    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
-    "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
-    "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
-    # ... more mappings
-}
+```toml
+[tool.nemo_rl.actor_environments]
+"nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker" = ["vllm"]
+"nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker" = ["mcore"]
+"nemo_rl.environments.math_environment.MathEnvironment" = "system"
+# ... more mappings
 ```
 
 > [!NOTE]
