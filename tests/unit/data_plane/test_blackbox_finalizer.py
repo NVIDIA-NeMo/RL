@@ -101,7 +101,6 @@ def _finalizer(tq_client, **overrides) -> BlackboxFinalizer:
         partition_id=CANONICAL_PARTITION,
         staging_partition=STAGING_PARTITION,
         pad_token_id=PAD,
-        min_valid_fraction_per_group=None,
     )
     kwargs.update(overrides)
     return BlackboxFinalizer(tq_client, **kwargs)
@@ -245,10 +244,14 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
-def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
+def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions):
+    """The finalizer no longer drops a low-valid-fraction group itself --
+    only the controller can source a replacement, so it reports the counts
+    and always finalizes (see min_valid_fraction_per_group's removal from
+    BlackboxFinalizer; the threshold now lives in single_controller.py)."""
     group_id = "grp2"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
-    finalizer = _finalizer(tq_client, min_valid_fraction_per_group=0.5)
+    finalizer = _finalizer(tq_client)
     finalized = finalizer.finalize_group(
         group_id,
         rollout_ids,
@@ -259,12 +262,14 @@ def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
         fallback_weight_version=3,
         prompt_idx=0,
     )
-    assert finalized.dropped
-    assert finalized.meta is None
+    assert not finalized.dropped
+    assert finalized.meta is not None
+    assert finalized.valid_row_count == 0
+    assert finalized.total_row_count == 2
     assert (finalized.group_min_wv, finalized.group_max_wv) == (3, 3)
-    with pytest.raises((KeyError, RuntimeError, ValueError)):
-        rows = _fetch_rows(tq_client, rollout_ids)
-        assert not rows  # nothing published
+    rows = _fetch_rows(tq_client, rollout_ids)
+    sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()
+    assert sample_mask.tolist() == [0.0, 0.0]  # published as placeholders, not dropped
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +396,6 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         partition_id=_R3_PARTITION,
         staging_partition=_R3_STAGING,
         pad_token_id=PAD,
-        min_valid_fraction_per_group=None,
         router_replay_enabled=True,
     )
     finalized = finalizer.finalize_group(
@@ -447,7 +451,6 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
         partition_id=_R3_PARTITION,
         staging_partition=_R3_STAGING,
         pad_token_id=PAD,
-        min_valid_fraction_per_group=None,
         router_replay_enabled=True,
     )
     with pytest.raises(RuntimeError, match="routed_experts"):
@@ -541,7 +544,6 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
         pad_token_id=PAD,
-        min_valid_fraction_per_group=None,
         router_replay_enabled=True,
         defer_routed_experts_to_policy=True,
     )
@@ -600,7 +602,6 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
         pad_token_id=PAD,
-        min_valid_fraction_per_group=None,
         router_replay_enabled=True,
         defer_routed_experts_to_policy=True,
     )
@@ -634,7 +635,6 @@ def _mode_finalizer(tq_client, *, deferred: bool) -> BlackboxFinalizer:
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
         pad_token_id=PAD,
-        min_valid_fraction_per_group=None,
         router_replay_enabled=True,
         defer_routed_experts_to_policy=deferred,
     )

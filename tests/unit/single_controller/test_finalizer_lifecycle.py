@@ -136,7 +136,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
 
     committed = asyncio.run(ctrl._finalize_with_actor(request))
 
-    assert committed is True
+    assert committed is result
     assert finalize.calls == [request]
     assert ctrl._available_finalizers.get_nowait() is actor
     assert ctrl._active_finalizers == 0
@@ -192,6 +192,10 @@ def test_missing_actor_metadata_cleans_known_canonical_and_staging_ownership() -
 
 
 def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
+    # A finalizer-side structural drop (e.g. router replay with no routed
+    # data yet) -- not a low valid-row fraction, which the controller now
+    # decides, not the finalizer (see min_valid_fraction_per_group's removal
+    # from BlackboxFinalizer).
     result = FinalizedGroup(
         meta=None,
         group_min_wv=3,
@@ -199,14 +203,17 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
         staging_keys=["group_g0/call"],
         metrics={},
         dropped=True,
-        drop_reason="min_valid_fraction_per_group: 0.000 < 0.5",
+        drop_reason=(
+            "router replay on, no rollout carried routed_experts, "
+            "and (L, K) is unknown yet"
+        ),
     )
     actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
     ctrl = _controller(actor)
 
     committed = asyncio.run(ctrl._finalize_with_actor(_request()))
 
-    assert committed is False
+    assert committed is None
     assert ctrl._dp_client.clear_calls == [
         {"sample_ids": ["group_g0"], "partition_id": "canonical"},
         {"sample_ids": ["group_g0/call"], "partition_id": "staging"},

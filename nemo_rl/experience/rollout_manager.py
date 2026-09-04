@@ -1378,6 +1378,22 @@ class RolloutManager:
         """Return the prompt-group ownership ledger shared with the controller."""
         return self._recovery_ledger
 
+    def record_finalizer_dropped_prompt(self) -> None:
+        """Count a controller-side drop after generation and finalization succeeded.
+
+        A group whose valid-row fraction fell below
+        ``token_capture.min_valid_fraction_per_group`` is not an infra failure
+        of the kind the retry loop above tracks, but it is the same signal
+        for an operator watching ``max_consecutive_dropped_prompts`` -- no
+        rollout got committed for this prompt -- so it shares that budget's
+        counters rather than going uncounted.
+        """
+        self._consecutive_infra_drops += 1
+        self._stats.record_infra_drop(
+            "finalizer_min_valid_fraction", self._consecutive_infra_drops
+        )
+        self._stats.skipped += 1
+
     def reserve_prompt_group(
         self,
         cut: DataPlaneMutationCut,

@@ -139,6 +139,7 @@ from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 if TYPE_CHECKING:
+    from nemo_rl.experience.blackbox_finalizer import FinalizedGroup
     from nemo_rl.experience.finalizer_actor import FinalizationRequest
 
 Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
@@ -1220,12 +1221,18 @@ class SingleControllerActor:
             )
         self._buffer.abort(request.group_id)
 
-    async def _finalize_with_actor(self, request: "FinalizationRequest") -> bool:
+    async def _finalize_with_actor(
+        self, request: "FinalizationRequest"
+    ) -> Optional["FinalizedGroup"]:
         """Submit one metadata request to the bounded fixed actor pool.
 
-        Returns True once the group is committed to the replay buffer, or
-        False when the finalizer dropped it as a policy outcome (ownership
-        already cleaned up; the caller credits the step short).
+        Returns the committed FinalizedGroup once the group is committed to
+        the replay buffer (callers may read valid_row_count/total_row_count
+        off it to decide whether the group is worth keeping), or None when
+        the finalizer itself dropped it as a structural outcome (ownership
+        already cleaned up; the caller credits the step short). A low
+        valid-row fraction is no longer a finalizer-side drop -- the caller
+        decides that, since only the caller can source a replacement.
         """
         self._finalizer_waiters += 1
         queue_depth = max(
@@ -1274,7 +1281,7 @@ class SingleControllerActor:
                 f"({finalized.drop_reason or 'unspecified reason'})",
                 flush=True,
             )
-            return False
+            return None
         if finalized.meta is None:
             try:
                 await self._cleanup_known_finalization_request(request)
@@ -1313,7 +1320,7 @@ class SingleControllerActor:
             }
         )
         self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
-        return True
+        return finalized
 
     async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
         """Clear canonical rows and full-manifest staging keys after train success.
@@ -1423,34 +1430,103 @@ class SingleControllerActor:
                     # hand the metadata-only request to the finalizer actor pool.
                     ownership_transferred = False
                     try:
-                        request = await self._rollout_manager.generate_for_finalization(
-                            prompt,
-                            target_step=target_step,
-                            inflight_registry=self._inflight_by_group_id,
-                        )
-                        self._inflight_rollouts -= 1
-                        inflight_count_released = True
-                        sem.release()
-                        generation_permit_released = True
-                        if request is None:
-                            # Dropped within the infra budget: nothing was
-                            # committed, so the train pump will never release
-                            # this permit, and the step it was stamped for
-                            # must be allowed to close short.
-                            self._buffer_capacity.release()
-                            self._credit_shortfall(target_step)
-                            return
-                        committed = await self._finalize_with_actor(request)
-                        if not committed:
-                            # Finalizer dropped the group as a policy outcome;
-                            # ownership was already cleaned up, so like the
-                            # dropped-prompt path above the train pump will
-                            # never release this permit and the step must be
-                            # allowed to close short.
-                            self._buffer_capacity.release()
-                            self._credit_shortfall(target_step)
-                            return
-                        ownership_transferred = True
+                        while True:
+                            request = (
+                                await self._rollout_manager.generate_for_finalization(
+                                    prompt,
+                                    target_step=target_step,
+                                    inflight_registry=self._inflight_by_group_id,
+                                )
+                            )
+                            if not inflight_count_released:
+                                self._inflight_rollouts -= 1
+                                inflight_count_released = True
+                            if not generation_permit_released:
+                                sem.release()
+                                generation_permit_released = True
+                            if request is None:
+                                # Dropped within the infra budget: nothing was
+                                # committed, so the train pump will never release
+                                # this permit, and the step it was stamped for
+                                # must be allowed to close short.
+                                self._buffer_capacity.release()
+                                self._credit_shortfall(target_step)
+                                return
+                            finalized = await self._finalize_with_actor(request)
+                            if finalized is None:
+                                # Finalizer dropped the group as a structural
+                                # outcome (e.g. router replay with no routed
+                                # data yet); ownership was already cleaned up,
+                                # so like the dropped-prompt path above the
+                                # train pump will never release this permit
+                                # and the step must be allowed to close short.
+                                self._buffer_capacity.release()
+                                self._credit_shortfall(target_step)
+                                return
+                            min_valid_fraction = (
+                                self._master_config.token_capture
+                                .min_valid_fraction_per_group
+                            )
+                            below_threshold = (
+                                min_valid_fraction is not None
+                                and finalized.total_row_count > 0
+                                and finalized.valid_row_count
+                                / finalized.total_row_count
+                                < min_valid_fraction
+                            )
+                            if not below_threshold:
+                                ownership_transferred = True
+                                break
+                            # Enough rows verified to publish, but too few to
+                            # be worth training on. Unlike the finalizer's own
+                            # structural drops above, this is a policy call
+                            # only the controller can act on: it is the one
+                            # component that can source a replacement.
+                            try:
+                                await self._cleanup_known_finalization_request(
+                                    request
+                                )
+                            except BaseException as cleanup_error:
+                                raise RuntimeError(
+                                    "finalizer group fell below "
+                                    "min_valid_fraction_per_group and "
+                                    "known-key cleanup failed for group "
+                                    f"{request.group_id}"
+                                ) from cleanup_error
+                            print(
+                                f"  finalize: group {request.group_id} below "
+                                "min_valid_fraction_per_group "
+                                f"({finalized.valid_row_count}/"
+                                f"{finalized.total_row_count} < "
+                                f"{min_valid_fraction}); seeking a replacement",
+                                flush=True,
+                            )
+                            replacement = self._take_replacement(
+                                target_step, replacements
+                            )
+                            if replacement is None:
+                                self._rollout_manager.record_finalizer_dropped_prompt()
+                                self._buffer_capacity.release()
+                                self._credit_shortfall(target_step)
+                                return
+                            replacements += 1
+                            prompt = replacement
+                            # A substitution is a fresh rollout, not a
+                            # continuation of the one that fell short, so it
+                            # observes the same pause a first dispatch does
+                            # instead of pushing new generation into a
+                            # weight-sync window.
+                            await self._rollout_permitted.wait()
+                            # The next generate_for_finalization call is a
+                            # brand-new generation and must be re-counted
+                            # against the same concurrency limiter a first
+                            # dispatch would hold; both permits were released
+                            # early above, right after the attempt that fell
+                            # short finished generating.
+                            await sem.acquire()
+                            self._inflight_rollouts += 1
+                            inflight_count_released = False
+                            generation_permit_released = False
                     except BaseException:
                         # On success ownership transfers to the train pump, which
                         # releases this permit after consuming the committed group.

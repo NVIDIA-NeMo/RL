@@ -1557,7 +1557,6 @@ def setup_single_controller(
                 partition_id=partition_id,
                 staging_partition=token_capture_cfg.staging_partition,
                 pad_token_id=pad_id,
-                min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
             ),

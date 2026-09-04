@@ -89,11 +89,18 @@ class FinalizedGroup:
     group_max_wv: int
     staging_keys: list[str]
     metrics: dict[str, float] = field(default_factory=dict)
-    # True when the finalizer rejected the whole group as a policy outcome
+    # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
+    # Policy decisions like a low valid-row fraction are no longer made here --
+    # the caller reads valid_row_count/total_row_count and decides whether to
+    # replace the group, since only the caller can source a replacement.
     dropped: bool = False
     # Which policy dropped the group, for the caller's log line.
     drop_reason: Optional[str] = None
+    # Rows that verified vs. total rows in the group. 0/0 on a dropped group
+    # (the caller does not read these when dropped is True).
+    valid_row_count: int = 0
+    total_row_count: int = 0
 
 
 class BlackboxFinalizer:
@@ -106,14 +113,12 @@ class BlackboxFinalizer:
         partition_id: str,
         staging_partition: str,
         pad_token_id: int,
-        min_valid_fraction_per_group: Optional[float],
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
-        self._min_valid_fraction = min_valid_fraction_per_group
         self._router_replay_enabled = router_replay_enabled
         self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
         if self._defer_routed_experts_to_policy and not self._router_replay_enabled:
@@ -464,26 +469,6 @@ class BlackboxFinalizer:
             default=fallback_weight_version,
         )
 
-        valid_fraction = len(valid_rows) / len(rows)
-        if (
-            self._min_valid_fraction is not None
-            and valid_fraction < self._min_valid_fraction
-        ):
-            self._clear_staging(staging_keys)
-            metrics["finalize/group_dropped"] = 1.0
-            return FinalizedGroup(
-                meta=None,
-                group_min_wv=group_min_wv,
-                group_max_wv=group_max_wv,
-                staging_keys=[],
-                metrics=metrics,
-                dropped=True,
-                drop_reason=(
-                    f"min_valid_fraction_per_group: {valid_fraction:.3f} < "
-                    f"{self._min_valid_fraction}"
-                ),
-            )
-
         _tensorize_t0 = time.perf_counter()
         # Placeholders borrow a valid sibling's prompt ids so per-prompt
         # baselines group correctly; an all-placeholder group uses a single
@@ -548,6 +533,8 @@ class BlackboxFinalizer:
                         "router replay on, no rollout carried routed_experts, "
                         "and (L, K) is unknown yet"
                     ),
+                    valid_row_count=0,
+                    total_row_count=0,
                 )
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
@@ -624,6 +611,8 @@ class BlackboxFinalizer:
             group_max_wv=group_max_wv,
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
             metrics=metrics,
+            valid_row_count=len(valid_rows),
+            total_row_count=len(rows),
         )
 
     # ── internals ───────────────────────────────────────────────────────────
