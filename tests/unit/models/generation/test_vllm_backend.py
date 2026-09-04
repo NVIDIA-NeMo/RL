@@ -396,7 +396,10 @@ def test_unquantized_nccl_reshard_keeps_existing_refit_lifecycle(monkeypatch):
 
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
-    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+    # finalize() already made the model-wide pass, and vLLM's attention loop
+    # inside it is the KV-scale pass, so the post-ACK call is skipped as
+    # redundant. See test_fp8_kv_cache_does_not_add_a_second_model_wide_pass.
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
 @pytest.mark.vllm
@@ -548,7 +551,65 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
 
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
-    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_fp8_kv_cache_does_not_add_a_second_model_wide_pass(monkeypatch):
+    """One refit runs ``process_weights_after_loading`` exactly once.
+
+    ``_maybe_process_fp8_kv_cache`` calls the same model-wide helper that
+    ``finalize()`` already ran, and vLLM's second loop in that helper -- over the
+    attention modules -- *is* the KV-scale pass it wants. So with an FP8 KV cache
+    the non-native lifecycle made two full passes, and the first loop of the
+    second pass re-enters every FusedMoE quant method. The quantized ones survive
+    that on vLLM's sticky ``_already_called_process_weights_after_loading`` flag.
+    ``UnquantizedFusedMoEMethod`` has no such flag and its ``_setup_kernel``
+    re-reads the live ``w13_weight``/``w2_weight``, so the extra pass silently
+    repeats the FlashInfer TRTLLM block permutation on exactly the BF16 boundary
+    experts of a mixed-precision model -- no exception, just wrong numerics.
+
+    Nothing on the worker is stubbed here: the real ``_uses_fp8_kv_cache`` reads a
+    real ``cache_config``, and the model answers ``parameters()``, so a
+    regression surfaces as a second call rather than as a mock never asked to
+    fire. That mock is what hid this in the two lifecycle tests above.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = _make_mixed_precision_moe_model("FlashInfer TRTLLM")
+    model.parameters = lambda: iter([torch.zeros(1)])
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=object(),
+        cache_config=SimpleNamespace(cache_dtype="fp8"),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=model, vllm_config=vllm_config, model_config=model_config
+    )
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+
+    # The premise: without this the test would pass for the wrong reason.
+    assert ext._uses_fp8_kv_cache()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+
+    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+        finalize()
+
+    process.assert_called_once_with(model, model_config, ext.device)
 
 
 @pytest.mark.vllm

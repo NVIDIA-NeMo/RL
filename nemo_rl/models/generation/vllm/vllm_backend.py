@@ -975,17 +975,32 @@ class VllmInternalWorkerExtension:
             process_weights_after_loading,
         )
 
+        processed_weights_after_loading = False
+
         def finalize() -> None:
+            nonlocal processed_weights_after_loading
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device
                 )
+            processed_weights_after_loading = True
             self._maybe_process_mtp_drafter_after_loading()
 
         yield finalize
         # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
         # this optional second pass, just as it was before lifecycle hooks.
-        self._maybe_process_fp8_kv_cache()
+        # Skip it once finalize() has run, because _maybe_process_fp8_kv_cache
+        # calls the same model-wide process_weights_after_loading, whose second
+        # loop over the attention modules is the KV-scale pass it wants. A
+        # second full pass also re-enters every FusedMoE quant method. The
+        # quantized ones survive on vLLM's sticky
+        # _already_called_process_weights_after_loading flag;
+        # UnquantizedFusedMoEMethod has none, and its _setup_kernel re-reads the
+        # live w13/w2 weights, so the pass silently repeats the FlashInfer
+        # TRTLLM block permutation on the BF16 boundary experts of a
+        # mixed-precision model.
+        if not processed_weights_after_loading:
+            self._maybe_process_fp8_kv_cache()
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
