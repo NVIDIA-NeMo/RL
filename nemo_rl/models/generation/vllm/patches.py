@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import os
 from contextlib import contextmanager
 from importlib.util import find_spec
@@ -47,21 +48,46 @@ def _get_vllm_file(relative_path: str) -> str:
 
 
 @contextmanager
-def _locked_file_patch(file_path: str):
-    """Yield (content, writer) under an exclusive file lock."""
+def _locked_file_patch(file_path: str, logger):
+    """Yield (content, writer) under an exclusive file lock.
+
+    The writer reports whether it wrote, so a caller only claims a patch landed
+    when it did. On a read-only install (a baked container venv) the lock cannot
+    be created -- but neither can any concurrent writer, so the read proceeds
+    lockless and the writer declines: the patch has to be baked into the image
+    instead, and the caller says so rather than logging success.
+    """
     import fcntl
 
     lock_path = file_path + ".patch_lock"
-    lock_fd = open(lock_path, "w")
+    try:
+        lock_fd = open(lock_path, "w")
+    except OSError as e:
+        if e.errno not in (errno.EROFS, errno.EACCES):
+            raise
+        with open(file_path, "r") as f:
+            content = f.read()
+
+        def decline(new_content: str) -> bool:
+            logger.warning(
+                "Read-only install: cannot patch %s at runtime. Bake the patch "
+                "into the image; its effect is absent from this process.",
+                file_path,
+            )
+            return False
+
+        yield content, decline
+        return
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
         with open(file_path, "r") as f:
             content = f.read()
 
-        def write_back(new_content: str):
+        def write_back(new_content: str) -> bool:
             with open(file_path, "w") as f:
                 f.write(new_content)
+            return True
 
         yield content, write_back
     finally:
@@ -70,7 +96,7 @@ def _locked_file_patch(file_path: str):
 
 
 def _patch_vllm_init_workers_ray(
-    py_executable: str, extra_env_vars: list[str] | None
+    py_executable: str, extra_env_vars: list[str] | None, logger
 ) -> bool:
     """Patch vLLM's Ray executor env propagation and worker runtime_env.
 
@@ -116,12 +142,11 @@ def _patch_vllm_init_workers_ray(
     )
 
     applied = False
-    with _locked_file_patch(file_to_patch) as (content, write_back):
+    with _locked_file_patch(file_to_patch, logger) as (content, write_back):
         if new_line in content:
             applied = True  # already patched by another worker on this node
         elif old_line in content:
-            write_back(content.replace(old_line, new_line))
-            applied = True
+            applied = write_back(content.replace(old_line, new_line))
 
     env_vars_to_copy = ["RAY_ENABLE_UV_RUN_RUNTIME_ENV", *(extra_env_vars or [])]
     existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
@@ -164,7 +189,7 @@ def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
         "        self.logits_processor = LogitsProcessor(\n"
     )
 
-    with _locked_file_patch(file_to_patch) as (content, write_back):
+    with _locked_file_patch(file_to_patch, logger) as (content, write_back):
         if "self.has_own_lm_head = (" in content:
             logger.info("llama_eagle3 lm_head ownership patch already applied.")
             return
@@ -179,9 +204,10 @@ def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
             return
 
         content = content.replace(old_snippet, new_snippet, 1)
-        write_back(content)
+        written = write_back(content)
 
-    logger.info("Successfully patched llama_eagle3 lm_head ownership.")
+    if written:
+        logger.info("Successfully patched llama_eagle3 lm_head ownership.")
 
 
 def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
@@ -226,7 +252,7 @@ def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
         "\n"
     )
 
-    with _locked_file_patch(file_to_patch) as (content, write_back):
+    with _locked_file_patch(file_to_patch, logger) as (content, write_back):
         if "except ImportError:  # openai < 2.25.0 predates namespace tools" in content:
             logger.info("vLLM NamespaceTool openai compat patch already applied.")
             return
@@ -241,9 +267,10 @@ def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
             return
 
         content = content.replace(old_snippet, new_snippet, 1)
-        write_back(content)
+        written = write_back(content)
 
-    logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
+    if written:
+        logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
 
 
 def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
@@ -322,7 +349,7 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
         "            return get_open_port()\n"
     )
 
-    with _locked_file_patch(file_to_patch) as (content, write_back):
+    with _locked_file_patch(file_to_patch, logger) as (content, write_back):
         if marker in content:
             logger.info("vLLM RayExecutorV2 TCPStore port patch already applied.")
             return
@@ -455,7 +482,7 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
         "                    )\n"
     )
 
-    with _locked_file_patch(file_to_patch) as (content, write_back):
+    with _locked_file_patch(file_to_patch, logger) as (content, write_back):
         if marker in content:
             logger.info("vLLM MessageQueue bind-retry patch already applied.")
             return
@@ -550,7 +577,7 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         return loaded_params
 """
 
-    with _locked_file_patch(file_to_patch) as (content, write_back):
+    with _locked_file_patch(file_to_patch, logger) as (content, write_back):
         if new_snippet in content:
             logger.info("vLLM RADIO LayerScale loader patch already applied.")
             return
@@ -561,9 +588,10 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
                 file_to_patch,
             )
             return
-        write_back(content.replace(old_snippet, new_snippet, 1))
+        written = write_back(content.replace(old_snippet, new_snippet, 1))
 
-    logger.info("Successfully patched vLLM RADIO LayerScale loading.")
+    if written:
+        logger.info("Successfully patched vLLM RADIO LayerScale loading.")
 
 
 def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
@@ -606,7 +634,7 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
         )
 """
 
-    with _locked_file_patch(file_to_patch) as (content, write_back):
+    with _locked_file_patch(file_to_patch, logger) as (content, write_back):
         if new_snippet in content:
             logger.info("vLLM GLM decoder SP-MoE patch already applied.")
             return
@@ -617,9 +645,10 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
                 file_to_patch,
             )
             return
-        write_back(content.replace(old_snippet, new_snippet, 1))
+        written = write_back(content.replace(old_snippet, new_snippet, 1))
 
-    logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
+    if written:
+        logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
 
 
 def ensure_vllm_source_compat() -> None:
@@ -656,7 +685,7 @@ def _apply_vllm_patches(
     # Reporting the same way in both cases either cries wolf or hides a real
     # break, so branch on it.
     uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-    applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
+    applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars, patch_logger)
 
     if applied and uses_v1_executor:
         patch_logger.info(
@@ -673,12 +702,15 @@ def _apply_vllm_patches(
         )
     elif uses_v1_executor:
         patch_logger.error(
-            "vllm v1 _init_workers_ray patch did NOT apply: the "
-            "'self._init_workers_ray(placement_group)' anchor was not found, "
-            "and VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0 selects the v1 executor "
-            "that depends on it. Ray workers will launch under the wrong "
-            "interpreter. Either the anchor moved upstream, or unset "
-            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND to use RayExecutorV2."
+            "vllm v1 _init_workers_ray patch did NOT apply, and "
+            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0 selects the v1 executor that "
+            "depends on it. Ray workers will launch under the wrong "
+            "interpreter. Either the "
+            "'self._init_workers_ray(placement_group)' anchor moved upstream, "
+            "or the install is read-only and a preceding warning says so -- in "
+            "which case bake the patch into the image. Unsetting "
+            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND to use RayExecutorV2 also avoids "
+            "the dependency."
         )
     else:
         patch_logger.info(

@@ -31,6 +31,8 @@ The two port patches ship their own suites. These cover the remaining patches:
 """
 
 import ast
+import builtins
+import errno
 import logging
 import os
 
@@ -244,7 +246,7 @@ def test_ray_extra_env_vars_merge_is_additive(
     else:
         monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", existing)
 
-    patches._patch_vllm_init_workers_ray("py", extra)
+    patches._patch_vllm_init_workers_ray("py", extra, logging.getLogger(__name__))
 
     assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == expected
 
@@ -256,7 +258,10 @@ def test_init_workers_ray_reports_a_missing_anchor(monkeypatch, tmp_path):
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
     monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
 
-    assert patches._patch_vllm_init_workers_ray("py", None) is False
+    assert (
+        patches._patch_vllm_init_workers_ray("py", None, logging.getLogger(__name__))
+        is False
+    )
     # The env merge still has to happen; it is independent of the file patch.
     assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == (
         "RAY_ENABLE_UV_RUN_RUNTIME_ENV"
@@ -269,9 +274,77 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
     ray_executor.write_text("self._init_workers_ray(placement_group)\n")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
 
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
+    assert (
+        patches._patch_vllm_init_workers_ray(
+            "py-exec", None, logging.getLogger(__name__)
+        )
+        is True
+    )
     once = ray_executor.read_text()
     assert 'runtime_env={"py_executable": "py-exec"}' in once
 
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
+    assert (
+        patches._patch_vllm_init_workers_ray(
+            "py-exec", None, logging.getLogger(__name__)
+        )
+        is True
+    )
     assert ray_executor.read_text() == once
+
+
+def test_locked_file_patch_writes_under_lock_on_writable_install(tmp_path):
+    """The normal path still locks, yields content, and lands the write."""
+    target = tmp_path / "target.py"
+    target.write_text("ORIGINAL")
+
+    with patches._locked_file_patch(str(target), logging.getLogger(__name__)) as (
+        content,
+        write_back,
+    ):
+        assert content == "ORIGINAL"
+        write_back("PATCHED")
+
+    assert target.read_text() == "PATCHED"
+
+
+@pytest.mark.parametrize("lock_errno", [errno.EROFS, errno.EACCES])
+def test_locked_file_patch_degrades_to_lockless_read_on_read_only_install(
+    tmp_path, caplog, monkeypatch, lock_errno
+):
+    """EROFS/EACCES on the lock file yields the content and a declining writer.
+
+    The errno is injected rather than simulated with chmod: a read-only *mount*
+    raises EROFS, which no mode bit reproduces, and CI runs the container as
+    root, where mode bits are ignored entirely.
+    """
+    target = tmp_path / "target.py"
+    target.write_text("ORIGINAL")
+    real_open = builtins.open
+
+    def refuse_the_lock(file, mode="r", *args, **kwargs):
+        if str(file).endswith(".patch_lock"):
+            raise OSError(lock_errno, os.strerror(lock_errno), str(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", refuse_the_lock)
+
+    with caplog.at_level(logging.WARNING):
+        with patches._locked_file_patch(str(target), logging.getLogger(__name__)) as (
+            content,
+            write_back,
+        ):
+            assert content == "ORIGINAL"
+            assert write_back("MUST_NOT_LAND") is False
+
+    assert target.read_text() == "ORIGINAL"
+    assert not (tmp_path / "target.py.patch_lock").exists()
+    assert "Read-only install" in caplog.text
+
+
+def test_locked_file_patch_still_raises_on_unrelated_oserror(tmp_path):
+    """Only EROFS/EACCES trigger the fallback; anything else propagates."""
+    with pytest.raises(FileNotFoundError):
+        with patches._locked_file_patch(
+            str(tmp_path / "missing" / "target.py"), logging.getLogger(__name__)
+        ):
+            pass
