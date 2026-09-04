@@ -61,6 +61,7 @@ from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
     RETAINED_TASK_INDICES_KEY,
+    TARGET_WEIGHT_VERSION_KEY,
 )
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 
@@ -2849,6 +2850,13 @@ class TestAsyncTrajectoryCollector:
             )
             assert trajectory_group["rollout_metrics"]["trajectory_duration_s"] >= 0
             assert "_ng_task_index" not in trajectory_group
+            assert (
+                trajectory_group["batch"][TARGET_WEIGHT_VERSION_KEY].tolist()
+                == [
+                    target_weight,
+                ]
+                * 3
+            )
             assert generation_weight == 2
             assert target == target_weight
         assert target_weight not in collector._generating_targets

@@ -45,6 +45,12 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
@@ -2094,11 +2100,16 @@ def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     rows = [
-        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
-        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
+        {
+            "agent_ref": {"name": "agent"},
+            NEMO_GYM_TASK_INDEX_KEY: 42,
+            NEMO_GYM_ROLLOUT_INDEX_KEY: rollout_index,
+            NEMO_GYM_ATTEMPT_INDEX_KEY: 1,
+        }
+        for rollout_index in range(2)
     ]
     results = []
-    for reward in (1.0, 2.0):
+    for result_index, reward in enumerate((1.0, 2.0)):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -2117,6 +2128,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                     },
                 ],
                 "full_result": {"reward": reward},
+                NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY: result_index == 1,
             }
         )
 
@@ -2137,6 +2149,13 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
 
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert rollout_result.final_batch[NEMO_GYM_TASK_INDEX_KEY].tolist() == [42, 42]
+    assert rollout_result.final_batch[NEMO_GYM_ROLLOUT_INDEX_KEY].tolist() == [0, 1]
+    assert rollout_result.final_batch[NEMO_GYM_ATTEMPT_INDEX_KEY].tolist() == [1, 1]
+    assert rollout_result.final_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY].tolist() == [
+        False,
+        True,
+    ]
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
@@ -2196,6 +2215,7 @@ def test_postprocess_nemo_gym_group_reports_per_agent_truncation_rate():
         1.0
     )
     assert rollout_result.final_batch["truncated"].tolist() == is_truncated
+    assert not rollout_result.final_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY].any()
 
 
 def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):

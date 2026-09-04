@@ -63,8 +63,10 @@ from nemo_rl.environments.nemo_gym import (
     summarize_nemo_gym_row,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
@@ -3005,6 +3007,27 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
+    empty_response_output = torch.tensor(
+        [bool(r.get(NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY, False)) for r in results],
+        dtype=torch.bool,
+    )
+    # Keep this column on every NeMo-Gym prompt group. Async replay collation is
+    # intentionally strict about non-packed keys, so conditionally omitting an
+    # all-false group would make a later mixed normal/recovered batch fail.
+    final_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] = empty_response_output
+    # Preserve compact, row-aligned rollout identity through dynamic sampling
+    # and the async replay buffer. Missing fields are omitted rather than
+    # guessed, retaining compatibility with native and legacy rollout inputs.
+    for identity_key in (
+        NEMO_GYM_TASK_INDEX_KEY,
+        NEMO_GYM_ROLLOUT_INDEX_KEY,
+        NEMO_GYM_ATTEMPT_INDEX_KEY,
+    ):
+        identity_values = [row.get(identity_key) for row in nemo_gym_rows]
+        if identity_values and all(value is not None for value in identity_values):
+            final_batch[identity_key] = torch.tensor(
+                [int(value) for value in identity_values], dtype=torch.long
+            )
     # Env/agent mask flag: flagged samples are dropped from the loss but still
     # count for advantages. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:

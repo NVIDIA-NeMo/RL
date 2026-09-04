@@ -54,9 +54,11 @@ from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
+    TARGET_WEIGHT_VERSION_KEY,
 )
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
@@ -75,7 +77,6 @@ from nemo_rl.utils.timer import ThreadSafeTimer
 TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 1
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
-_NEMO_GYM_ATTEMPT_INDEX_KEY = "_ng_attempt_index"
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
 
@@ -1463,6 +1464,12 @@ class AsyncTrajectoryCollector:
     ) -> None:
         """Push one prompt group to the replay buffer with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
+        if isinstance(self.master_config, GRPOMasterConfig):
+            final_batch_cpu[TARGET_WEIGHT_VERSION_KEY] = torch.full(
+                (final_batch_cpu.size,),
+                int(target_weight_version),
+                dtype=torch.long,
+            )
         rollout_metrics = rollout_result.rollout_metrics
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
@@ -1646,7 +1653,7 @@ class AsyncTrajectoryCollector:
                 # retry a fresh cohort identity so a partial GenRM cohort from the
                 # previous attempt cannot absorb the regenerated responses.
                 for row in attempt_batch["extra_env_info"]:
-                    row[_NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt - 1
+                    row[NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt - 1
 
             emit_nemo_gym_trace(
                 "collector_attempt_started",
