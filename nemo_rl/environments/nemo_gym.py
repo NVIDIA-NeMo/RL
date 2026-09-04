@@ -1199,6 +1199,7 @@ class NemoGymShardSet:
     handles: Dict[str, List[Any]]
     agent_to_shard: Dict[str, str] = field(default_factory=dict)
     placement_group: Any = None
+    _next_replica: Dict[str, int] = field(default_factory=dict, repr=False)
 
     @property
     def is_sharded(self) -> bool:
@@ -1207,6 +1208,58 @@ class NemoGymShardSet:
     @property
     def all_handles(self) -> List[Any]:
         return [handle for replicas in self.handles.values() for handle in replicas]
+
+    @property
+    def hosted_agents(self) -> frozenset[str]:
+        """Agent entry names this set can route to."""
+        return frozenset(self.agent_to_shard)
+
+    def shard_for_agent(self, agent_name: str) -> str:
+        """Name the shard hosting an agent.
+
+        Unsharded jobs have one actor and no map, so every agent resolves to
+        it; nothing was discovered because nothing could have conflicted.
+
+        Raises:
+            ShardSetupError: No shard hosts the agent, so its rows have nowhere
+                to go. Startup validates the datasets against this same map, so
+                reaching it here means the row named an agent the datasets did
+                not declare.
+        """
+        if not self.agent_to_shard:
+            return next(iter(self.handles))
+        try:
+            return self.agent_to_shard[agent_name]
+        except KeyError:
+            raise ShardSetupError(
+                f"No NeMo-Gym shard hosts agent '{agent_name}'. Hosted agents: "
+                f"{sorted(self.agent_to_shard)}."
+            ) from None
+
+    def pick_handle(self, agent_name: str) -> Any:
+        """Choose the actor instance to serve an agent's next prompt group.
+
+        The shard is fixed by the data; the replica rotates round-robin. Round
+        robin is deterministic and easy to reason about, which matters more
+        than adaptivity here: within a synchronous step there is no completion
+        feedback to adapt on, so an even split is the best available policy.
+        Least-in-flight would pay off on the async path, where dispatch is
+        continuous, and can replace this without touching callers.
+        """
+        shard_name = self.shard_for_agent(agent_name)
+        replicas = self.handles[shard_name]
+        if len(replicas) == 1:
+            return replicas[0]
+        index = self._next_replica.get(shard_name, 0)
+        self._next_replica[shard_name] = (index + 1) % len(replicas)
+        return replicas[index]
+
+    def shard_name_of(self, handle: Any) -> str:
+        """Reverse-look up a handle's shard, for error messages and metric tags."""
+        for shard_name, replicas in self.handles.items():
+            if any(replica is handle for replica in replicas):
+                return shard_name
+        raise ShardSetupError("Handle does not belong to this NeMo-Gym shard set")
 
     def sole_handle(self) -> Any:
         """The only actor, for callers that predate routing.
@@ -1247,6 +1300,19 @@ def _shard_instances(plan: ShardPlan) -> List[tuple[ShardSpec, int]]:
     return [
         (shard, replica) for shard in plan.shards for replica in range(shard.replicas)
     ]
+
+
+def as_nemo_gym_shard_set(environment: Any) -> NemoGymShardSet:
+    """Read the NeMo-Gym entry of ``task_to_env`` as a shard set either way.
+
+    Call sites that predate sharding put a bare actor handle there. Rather than
+    make every one of them build a set first, treat a lone handle as the
+    one-shard, one-replica case it already is, so the routing path is identical
+    whether or not the job is sharded.
+    """
+    if isinstance(environment, NemoGymShardSet):
+        return environment
+    return NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [environment]})
 
 
 def build_nemo_gym_actors(

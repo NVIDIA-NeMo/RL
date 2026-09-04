@@ -1467,6 +1467,9 @@ def ppo_train(
                             ),
                             max_rollout_turns=None,
                             greedy=False,
+                            num_generations_per_prompt=master_config.ppo[
+                                "num_generations_per_prompt"
+                            ],
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
