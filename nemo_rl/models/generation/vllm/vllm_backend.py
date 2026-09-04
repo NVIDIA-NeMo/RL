@@ -127,12 +127,14 @@ def _refresh_hpc_modules_after_layerwise_reload(model: torch.nn.Module) -> None:
             module.process_weights_after_loading(model)
 
 
-def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
-    """Return whether a model realized the unquantized TRTLLM MoE backend."""
+def _unquantized_flashinfer_trtllm_modules(
+    model: torch.nn.Module,
+) -> list[torch.nn.Module]:
+    """Return modules that realized the unquantized TRTLLM MoE backend."""
     # Import backend types only when inspecting a constructed vLLM model. The
     # module layout is version-sensitive; on vLLM builds without the oracle
-    # package the TRTLLM backend cannot be realized, so absence means False
-    # rather than an ImportError on every unquantized-model refit.
+    # package the TRTLLM backend cannot be realized, so absence means no
+    # matches rather than an ImportError on every unquantized-model refit.
     try:
         from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
             UnquantizedMoeBackend,
@@ -141,15 +143,61 @@ def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
             UnquantizedFusedMoEMethod,
         )
     except ImportError:
-        return False
+        return []
 
-    return any(
-        isinstance(
+    return [
+        module
+        for module in model.modules()
+        if isinstance(
             quant_method := getattr(module, "quant_method", None),
             UnquantizedFusedMoEMethod,
         )
         and quant_method.unquantized_backend is UnquantizedMoeBackend.FLASHINFER_TRTLLM
-        for module in model.modules()
+    ]
+
+
+def _process_mxfp8_modules_after_native_reload(model: torch.nn.Module) -> None:
+    """Rebuild MXFP8 runtime layouts skipped by the partial native reload."""
+    try:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8FusedMoE,
+            ModelOptMxFp8LinearMethod,
+        )
+    except ImportError:
+        return
+
+    mxfp8_methods = (ModelOptMxFp8FusedMoE, ModelOptMxFp8LinearMethod)
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, mxfp8_methods):
+            quant_method.process_weights_after_loading(module)
+
+
+def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
+    """Return whether a model realized the unquantized TRTLLM MoE backend."""
+    return bool(_unquantized_flashinfer_trtllm_modules(model))
+
+
+def _local_shard_slices(param_info: dict[str, Any], rank: int) -> tuple[slice, ...]:
+    """Return this destination rank's slices in an HF-global tensor."""
+    from nemo_rl.weight_sync.xferdtensor_python import _compute_shard_slices
+
+    dst_mesh = param_info["dst_mesh_info"]
+    mesh_tensor = getattr(dst_mesh, "mesh", None)
+    if mesh_tensor is None:
+        mesh_tensor = getattr(dst_mesh, "_mesh", None)
+    if mesh_tensor is None:
+        raise ValueError("Destination DeviceMesh does not expose mesh ranks.")
+    coordinates = (mesh_tensor == rank).nonzero(as_tuple=False)
+    if coordinates.numel() == 0:
+        raise ValueError(f"Rank {rank} is absent from the destination mesh")
+    return tuple(
+        _compute_shard_slices(
+            param_info["global_shape"],
+            list(mesh_tensor.shape),
+            coordinates[0].tolist(),
+            param_info["dst_placements"],
+        )
     )
 
 
@@ -758,24 +806,72 @@ class VllmInternalWorkerExtension:
         if not self._supports_unquantized_flashinfer_trtllm_refit():
             return False
         model_runner = getattr(self, "model_runner", None)
-        vllm_config = getattr(model_runner, "vllm_config", None)
-        if vllm_config is None:
-            return False
-        if getattr(vllm_config, "quant_config", None) is not None:
+        model = getattr(model_runner, "model", None)
+        if model is None:
             return False
 
-        return _model_uses_unquantized_flashinfer_trtllm(self.model_runner.model)
+        return _model_uses_unquantized_flashinfer_trtllm(model)
+
+    def _unquantized_flashinfer_trtllm_param_ids(self) -> set[int]:
+        """Return parameters owned by realized unquantized TRTLLM MoE modules."""
+        if not self._supports_unquantized_flashinfer_trtllm_refit():
+            return set()
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None)
+        if model is None:
+            return set()
+
+        return {
+            id(param)
+            for module in _unquantized_flashinfer_trtllm_modules(model)
+            for param in module.parameters(recurse=False)
+        }
 
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         """Return whether this transport needs vLLM's layerwise lifecycle."""
-        return transport in ("ipc", "collective") and (
+        return transport in ("ipc", "collective", "nccl_reshard") and (
             self._uses_unquantized_flashinfer_trtllm()
         )
 
-    def _validate_native_layerwise_refit(self) -> None:
+    def _validate_native_layerwise_refit(
+        self, transport: WeightUpdateTransport | None = None
+    ) -> None:
         """Reject unsupported features on the native layerwise reload path."""
         if not self._uses_unquantized_flashinfer_trtllm():
             return
+
+        if transport == "nccl_reshard":
+            if self._uses_fp8_kv_cache():
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit does not "
+                    "support an FP8 KV cache because its static scales are "
+                    "outside the targeted MoE reload lifecycle"
+                )
+
+            realized_placements = set()
+            for module in _unquantized_flashinfer_trtllm_modules(
+                self.model_runner.model
+            ):
+                strategy = getattr(
+                    getattr(module, "expert_map_manager", None),
+                    "placement_strategy",
+                    getattr(module, "expert_placement_strategy", None),
+                )
+                if strategy is None:
+                    raise RuntimeError(
+                        "BF16 FlashInfer TRTLLM nccl_reshard refit could "
+                        "not determine the expert placement strategy of "
+                        f"{type(module).__name__}; refusing to assume linear "
+                        "placement"
+                    )
+                realized_placements.add(strategy)
+            unsupported_placements = sorted(realized_placements - {"linear"})
+            if unsupported_placements:
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
+                    "linear expert placement; realized "
+                    f"{unsupported_placements!r}"
+                )
 
         if self._mtp_drafter_refit_enabled():
             raise RuntimeError(
@@ -807,7 +903,7 @@ class VllmInternalWorkerExtension:
         subsequent exception therefore marks this worker permanently unusable.
         """
         if self._uses_native_layerwise_refit(transport):
-            self._validate_native_layerwise_refit()
+            self._validate_native_layerwise_refit(transport)
             previous_failure = self._nrl_layerwise_reload_failure
             if previous_failure is not None:
                 raise RuntimeError(
@@ -821,10 +917,16 @@ class VllmInternalWorkerExtension:
             )
 
             model = self.model_runner.model
+            reload_targets = (
+                _unquantized_flashinfer_trtllm_modules(model)
+                if transport == "nccl_reshard"
+                else [model]
+            )
 
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
+                    _process_mxfp8_modules_after_native_reload(model)
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
@@ -832,7 +934,8 @@ class VllmInternalWorkerExtension:
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     with torch.device(self.device):
-                        initialize_layerwise_reload(model)
+                        for reload_target in reload_targets:
+                            initialize_layerwise_reload(reload_target)
                     self._nrl_layerwise_reload_active = True
                     yield finalize
             except Exception as error:
@@ -1029,6 +1132,8 @@ class VllmInternalWorkerExtension:
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Restore metadata and preflight the selected destination route."""
+        self._validate_native_layerwise_refit("nccl_reshard")
+
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
@@ -1139,10 +1244,17 @@ class VllmInternalWorkerExtension:
         vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
         vllm_params = dict(self.model_runner.model.named_parameters())
         vllm_names_by_id = {id(param): name for name, param in vllm_params.items()}
+        unquantized_trtllm_param_ids = self._unquantized_flashinfer_trtllm_param_ids()
         for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
             if hf_name in native_names:
                 continue
-            wire_dtype_value = param_info_by_name[hf_name].get("dtype")
+            param_info = param_info_by_name[hf_name]
+            if id(vllm_param) in unquantized_trtllm_param_ids and param_info.get(
+                "grouped_expert_proj"
+            ):
+                specs[hf_name] = _trtllm_grouped_expert_spec(param_info, vllm_param)
+                continue
+            wire_dtype_value = param_info.get("dtype")
             wire_dtype = (
                 wire_dtype_value
                 if isinstance(wire_dtype_value, torch.dtype)
