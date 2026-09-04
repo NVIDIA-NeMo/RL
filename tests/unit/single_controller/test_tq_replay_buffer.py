@@ -396,6 +396,44 @@ class TestDataPlaneCheckpointBarrier:
 
         asyncio.run(exercise())
 
+    @pytest.mark.parametrize(
+        ("outer_section", "inner_section"),
+        [
+            ("mutation", "mutation"),
+            ("mutation", "checkpoint"),
+            ("checkpoint", "mutation"),
+            ("checkpoint", "checkpoint"),
+        ],
+    )
+    def test_same_task_cannot_nest_barrier_sections(
+        self, outer_section: str, inner_section: str
+    ):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            outer = (
+                barrier.mutation()
+                if outer_section == "mutation"
+                else barrier.checkpoint()
+            )
+            inner = (
+                barrier.mutation()
+                if inner_section == "mutation"
+                else barrier.checkpoint()
+            )
+
+            async with outer:
+                with pytest.raises(
+                    RuntimeError, match="already holds a data-plane barrier section"
+                ):
+                    async with inner:
+                        pytest.fail("nested barrier section unexpectedly opened")
+
+            # A rejected nested section must not poison later acquisitions.
+            async with barrier.mutation() as cut:
+                cut.require_live()
+
+        asyncio.run(exercise())
+
 
 class TestTQReplayBufferReserveCommit:
     def test_reserve_rejects_duplicate_live_group_id(self):

@@ -230,19 +230,35 @@ class DataPlaneCheckpointBarrier:
         self._condition = asyncio.Condition()
         self._checkpoint_active = False
         self._active_mutations = 0
+        self._section_holders: set[asyncio.Task[Any]] = set()
+
+    def _current_task(self) -> asyncio.Task[Any]:
+        """Return the task entering a barrier section and reject reentrancy."""
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("data-plane barrier sections require an asyncio task")
+        if task in self._section_holders:
+            raise RuntimeError(
+                "this task already holds a data-plane barrier section; pass the "
+                "DataPlaneMutationCut you already have instead of opening another"
+            )
+        return task
 
     @asynccontextmanager
     async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
         """Yield a live cut after any active checkpoint exits."""
         async with self._condition:
+            task = self._current_task()
             await self._condition.wait_for(lambda: not self._checkpoint_active)
             self._active_mutations += 1
+            self._section_holders.add(task)
             cut = DataPlaneMutationCut(self)
         try:
             yield cut
         finally:
             cut._invalidate()
             async with self._condition:
+                self._section_holders.discard(task)
                 self._active_mutations -= 1
                 if self._active_mutations == 0:
                     self._condition.notify_all()
@@ -251,6 +267,7 @@ class DataPlaneCheckpointBarrier:
     async def checkpoint(self) -> AsyncIterator[DataPlaneMutationCut]:
         """Yield a live capability after blocking and draining all mutations."""
         async with self._condition:
+            task = self._current_task()
             await self._condition.wait_for(lambda: not self._checkpoint_active)
             self._checkpoint_active = True
             try:
@@ -259,12 +276,14 @@ class DataPlaneCheckpointBarrier:
                 self._checkpoint_active = False
                 self._condition.notify_all()
                 raise
+            self._section_holders.add(task)
         cut = DataPlaneMutationCut(self)
         try:
             yield cut
         finally:
             cut._invalidate()
             async with self._condition:
+                self._section_holders.discard(task)
                 self._checkpoint_active = False
                 self._condition.notify_all()
 
@@ -1150,7 +1169,7 @@ class TQReplayBuffer:
                 "the async message-log flattening path."
             )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
             try:
                 await call_data_plane(
                     self._dp_client,
@@ -1199,6 +1218,7 @@ class TQReplayBuffer:
                 # deterministic IDs while retaining the barrier mutation slot.
                 try:
                     await self._clear_samples_unlocked(
+                        cut,
                         sample_ids=list(sample_ids),
                     )
                 except BaseException as rollback_error:
@@ -1439,7 +1459,7 @@ class TQReplayBuffer:
             if dropped_sample_ids:
                 try:
                     await self._clear_samples_unlocked(
-                        sample_ids=dropped_sample_ids,
+                        cut, sample_ids=dropped_sample_ids
                     )
                 except Exception as error:
                     raise RuntimeError(
@@ -1760,8 +1780,11 @@ class TQReplayBuffer:
     def __len__(self) -> int:
         return len(self.meta_list)
 
-    async def _clear_samples_unlocked(self, *, sample_ids: list[str]) -> None:
+    async def _clear_samples_unlocked(
+        self, cut: DataPlaneMutationCut, *, sample_ids: list[str]
+    ) -> None:
         """Clear rows while the caller holds a barrier mutation slot."""
+        cut.require_live()
         await call_data_plane(
             self._dp_client,
             "clear_samples",
