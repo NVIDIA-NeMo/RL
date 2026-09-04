@@ -46,7 +46,13 @@ def configure_generation_config(
     # vLLM setting shared by the standard and managed Dynamo backends.
     if config["backend"] in ("vllm", "dynamo"):
         vllm_backed_config = cast(VllmConfig, config)
-        vllm_backed_config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        # Respect an explicit recipe override. VLM training needs "auto": the
+        # trainer freezes (and therefore never refits) the vision tower, so a
+        # dummy-initialized engine keeps a random vision encoder forever and
+        # rewards on visual tasks collapse.
+        vllm_backed_config["vllm_cfg"].setdefault(
+            "load_format", "auto" if is_eval else "dummy"
+        )
 
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
