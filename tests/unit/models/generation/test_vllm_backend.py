@@ -434,7 +434,7 @@ def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypa
     ext.model_config = None
     ext.device = torch.device("cpu")
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
-    ext._validate_native_layerwise_refit = lambda: None
+    ext._validate_native_layerwise_refit = lambda _transport=None: None
     ext._maybe_process_mtp_drafter_after_loading = MagicMock()
 
     monkeypatch.setattr(
@@ -628,6 +628,48 @@ def test_fp8_kv_cache_does_not_add_a_second_model_wide_pass(monkeypatch):
         finalize()
 
     process.assert_called_once_with(model, model_config, ext.device)
+
+
+@pytest.mark.vllm
+def test_kv_cache_pass_still_runs_when_the_transport_never_finalized(monkeypatch):
+    """The skip is conditional on finalize() having run, not on reaching the end.
+
+    A transport that returns without calling ``finalize`` -- an early bail, an
+    empty manifest -- did not run ``process_weights_after_loading``, so the
+    KV-scale pass is still owed. Making the skip unconditional would trade a
+    double application for a missing one, which is the worse of the two: stale
+    KV scales produce wrong attention numerics with nothing in the log.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = SimpleNamespace(modules=lambda: [])
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=object(),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+
+    with ext._weight_update_lifecycle("collective"):
+        pass
+
+    process.assert_not_called()
+    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
 
 
 @pytest.mark.vllm
@@ -1080,7 +1122,9 @@ def test_update_weights_from_collective_processes_weights_after_loading(
     if with_mtp:
         expected_process_calls.append((draft_model, draft_model_config, ext.device))
         expected_call_order.extend(["config_enter", "process_mtp", "config_exit"])
-    expected_call_order.extend(["kv", "gc", "empty_cache"])
+    # No "kv" step: finalize() ran the model-wide process_weights_after_loading,
+    # which already includes vLLM's KV-scale loop over the attention modules.
+    expected_call_order.extend(["gc", "empty_cache"])
 
     assert process_calls == expected_process_calls
     assert call_order == expected_call_order
