@@ -144,8 +144,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         Four cases per (k, v):
           * ``PackedTensor`` — in-memory form, keep as-is.
-          * ``k`` in ``PACKED_MULTIMODAL_FIELDS`` — data-plane wire form
-            (a nested tensor), reassemble via ``PackedTensor.from_wire``.
+          * ``k`` in ``PACKED_MULTIMODAL_FIELDS`` — data-plane wire form,
+            which cannot be rebuilt here: raises. ``codec.materialize``
+            reassembles it earlier via ``reassemble_packed_multimodal``.
           * ``k`` in ``PER_TOKEN_MULTIMODAL_FIELDS`` — plain per-token
             tensor, keep as-is.
           * anything else — not multimodal, skip.

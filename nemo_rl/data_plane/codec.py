@@ -324,12 +324,14 @@ def materialize(
             )
         # Multimodal packed fields stay nested. Their rows are per-sample
         # media, not a padded sequence: ``to_padded_tensor`` would
-        # rectangularize to ``[B, max_rows, ...]`` and the row boundaries
-        # would then have to be recovered from a companion field. TQ
-        # already stores one entry per row and reassembles them
-        # (``extract_field_schema`` records ``per_sample_shapes``), so the
-        # nested value handed back here carries the true per-row shapes —
-        # ``PackedTensor.from_wire`` just unbinds it.
+        # rectangularize to ``[B, max_rows, ...]`` and lose the row boundaries
+        # the model matches media to placeholders with.
+        #
+        # Staying nested does not preserve the per-segment shapes, though:
+        # ``to_wire`` flattens each row before TQ sees it, so
+        # ``per_sample_shapes`` records flat lengths and the true shapes ride
+        # ``KVBatchMeta.tags`` (see ``multimodal_row_tags``). Hence the ``tags``
+        # argument to ``reassemble_packed_multimodal`` below.
         if val.is_nested and layout == "padded" and key not in PACKED_MULTIMODAL_FIELDS:
             pad = pads.get(key, 0)
             padded = torch.nested.to_padded_tensor(val, padding=pad)
@@ -363,8 +365,9 @@ def materialize(
             ]
             padded = torch.nn.functional.pad(padded, pad_spec, value=pad)
         out[key] = padded
-    # Packed multimodal fields arrive flattened with a companion shape column.
-    # The multimodal layer owns that encoding; the codec only asks it to fix up
-    # its own fields so no raw nested value reaches a BatchedDataDict consumer.
+    # Packed multimodal fields arrive flattened, with their shapes on the
+    # per-sample ``tags`` rows. The multimodal layer owns that encoding; the
+    # codec only asks it to fix up its own fields so no raw nested value
+    # reaches a BatchedDataDict consumer.
     reassemble_packed_multimodal(out, tags)
     return BatchedDataDict(out)

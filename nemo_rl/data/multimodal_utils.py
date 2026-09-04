@@ -162,9 +162,8 @@ def row_shapes_key(field: str) -> str:
     return field + ROW_SHAPES_SUFFIX
 
 
-# Keys inside the :func:`row_shapes_key` tag value. Kept a plain dict rather
-# than a record because ``tags`` is TQ's own per-sample channel and rides its
-# serializer; both halves are read back by name, never defaulted.
+# Keys inside the :func:`row_shapes_key` tag value. A plain dict rather than a
+# record because ``tags`` rides TQ's own serializer.
 ROW_GEOMETRY_SHAPES = "shapes"
 ROW_GEOMETRY_PAD = "pad"
 
@@ -273,9 +272,6 @@ def reassemble_packed_multimodal(
                 + ". to_wire flattens each row, so without the companion the "
                 "true per-segment shapes are unrecoverable."
             )
-        # ``from_wire`` returns ``None`` only for a zero-row value, which the
-        # guard above already excludes: a non-empty ``present`` means at least
-        # one tag row, and a row-count disagreement raises inside ``from_wire``.
         # Indexed, not ``.get``-with-default: a producer-side rename of either
         # key must fail here rather than silently restore ``pad=False``, which
         # changes what ``as_tensor`` hands the vision encoder.
@@ -868,10 +864,8 @@ class PackedTensor:
     # representations.
     #
     # The geometry rides on ``KVBatchMeta.tags``, not as a companion column:
-    # ``to_wire`` flattens each row, so the shapes TQ records on the
-    # controller (``metadata.py::extract_field_schema`` -> ``per_sample_shapes``)
-    # are the flat lengths, not the true per-segment shapes. See
-    # :func:`multimodal_row_tags`.
+    # ``to_wire`` flattens each row, so the shapes TQ records are flat lengths,
+    # not the true per-segment ones. See :func:`multimodal_row_tags`.
 
     def _row_segments(self) -> list[list[torch.Tensor]]:
         """Per logical row, its non-empty physical segments.
@@ -1048,9 +1042,8 @@ class PackedTensor:
         segments_flat: list[torch.Tensor] = []
         row_offsets: list[int] = [0]
         for flat, row_shapes in zip(unbound, shapes):
-            # ``torch.split`` cuts the whole row in one dispatch; slicing each
-            # segment individually costs O(segments) Python-level ops per row,
-            # and this runs per packed field on every fetch.
+            # ``torch.split`` cuts the whole row in one dispatch; per-segment
+            # slicing costs O(segments) Python ops per row, on every fetch.
             numels = [torch.Size(shape).numel() for shape in row_shapes]
             segments_flat.extend(
                 view.reshape(shape)
