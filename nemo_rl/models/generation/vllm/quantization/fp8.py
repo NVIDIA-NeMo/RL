@@ -297,6 +297,23 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = (
+        get_text_config()
+        if callable(get_text_config)
+        else getattr(config, "text_config", config)
+    )
+    num_hidden_layers = text_config.num_hidden_layers
+    for field_name, value in (
+        ("num_first_layers_in_bf16", num_first_layers_in_bf16),
+        ("num_last_layers_in_bf16", num_last_layers_in_bf16),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{field_name} must be an integer")
+        if not 0 <= value <= num_hidden_layers:
+            raise ValueError(
+                f"{field_name} must be between 0 and {num_hidden_layers}, got {value}"
+            )
     if global_fp8_config.is_mx:
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
@@ -305,13 +322,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         with init_empty_weights():
             model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [name for name, _ in model.named_parameters()]
-        get_text_config = getattr(config, "get_text_config", None)
-        text_config = (
-            get_text_config()
-            if callable(get_text_config)
-            else getattr(config, "text_config", config)
-        )
-        num_hidden_layers = text_config.num_hidden_layers
 
         bf16_params = []
         if num_first_layers_in_bf16 > 0:
