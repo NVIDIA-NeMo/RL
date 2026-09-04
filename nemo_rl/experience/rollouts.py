@@ -349,7 +349,7 @@ def _dummy_routed_experts_for_tokens(
 
 def backfill_missing_routed_experts(
     message_logs: Sequence[list[dict]],
-) -> None:
+) -> list[int]:
     """Give every tokenized message a ``routed_experts`` row, in place.
 
     Routes are attached only where generation ran, so a trajectory whose first
@@ -362,21 +362,28 @@ def backfill_missing_routed_experts(
     No-op when the batch carries no routes at all — that is the router-replay-off
     case, and on the TQ paths the producer-side guard must still see the field
     missing so it can report a capture failure.
+
+    Returns:
+        One count per entry in ``message_logs``: how many of its messages were
+        sentinel-filled. A replay_buffer-level "field entirely absent" guard
+        cannot see this — it only catches total absence across the whole
+        batch, not a message backfilled inside an otherwise-routed rollout.
     """
+    backfilled_counts = [0] * len(message_logs)
     template = None
     for message_log in message_logs:
         template = _find_routed_experts_template(message_log)
         if template is not None:
             break
     if template is None:
-        return
+        return backfilled_counts
     if template.dim() != 3:
         raise ValueError(
             "routed_experts messages must have shape [tokens, layers, topk], "
             f"got {tuple(template.shape)}"
         )
 
-    for message_log in message_logs:
+    for log_index, message_log in enumerate(message_logs):
         for msg in message_log:
             token_ids = msg.get("token_ids")
             if not isinstance(token_ids, torch.Tensor):
@@ -389,6 +396,8 @@ def backfill_missing_routed_experts(
                 dtype=template.dtype,
                 device=template.device,
             )
+            backfilled_counts[log_index] += 1
+    return backfilled_counts
 
 
 class EffortLevelsConfig(BaseModel, extra="allow"):

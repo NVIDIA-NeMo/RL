@@ -110,6 +110,7 @@ def reduce_advantage_pump_metrics(
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
     num_assistant_messages: list[int] | None = None,
+    num_routed_experts_backfilled: list[int] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -174,6 +175,12 @@ def reduce_advantage_pump_metrics(
         out["num_invalid_tool_calls"] = float(n_invalid)
         out["num_malformed_thinking"] = float(n_malformed)
         out["num_assistant_messages"] = float(n_asst)
+        # Router-replay partial loss: a message sentinel-filled inside an
+        # otherwise-routed rollout, invisible to the replay_buffer's
+        # field-entirely-absent guard (see backfill_missing_routed_experts).
+        n_backfilled = sum(num_routed_experts_backfilled or [])
+        out["routed_experts_backfilled_rate"] = n_backfilled / n_asst
+        out["num_routed_experts_backfilled"] = float(n_backfilled)
     return out
 
 
