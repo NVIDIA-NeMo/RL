@@ -330,7 +330,7 @@ def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
     fp8 = fp8_module
     num_hidden_layers = 8
     param_names = [
-        f"model.layers.{layer_idx}.mlp.experts.up_proj.weight"
+        f"layers.{layer_idx}.mlp.experts.up_proj.weight"
         for layer_idx in range(num_hidden_layers)
     ]
 
@@ -366,11 +366,11 @@ def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
     ignored_layers = vllm_kwargs["hf_overrides"]["quantization_config"][
         "ignored_layers"
     ]
-    assert "model.layers.0.mlp.experts.up_proj.weight" in ignored_layers
-    assert "model.layers.1.mlp.experts.up_proj.weight" in ignored_layers
-    assert "model.layers.6.mlp.experts.up_proj.weight" in ignored_layers
-    assert "model.layers.7.mlp.experts.up_proj.weight" in ignored_layers
-    assert "model.layers.2.mlp.experts.up_proj.weight" not in ignored_layers
+    assert "model.layers.0.mlp.experts.up_proj" in ignored_layers
+    assert "model.layers.1.mlp.experts.up_proj" in ignored_layers
+    assert "model.layers.6.mlp.experts.up_proj" in ignored_layers
+    assert "model.layers.7.mlp.experts.up_proj" in ignored_layers
+    assert "model.layers.2.mlp.experts.up_proj" not in ignored_layers
 
 
 @pytest.mark.parametrize(
