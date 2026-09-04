@@ -1235,11 +1235,11 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
 
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(
-        torch.arange(30, dtype=torch.float32).reshape(2, 3, 5),
+        torch.arange(192, dtype=torch.float32).reshape(2, 3, 32),
         requires_grad=False,
     )
     layer.w2_weight = torch.nn.Parameter(
-        torch.arange(30, dtype=torch.float32).reshape(2, 5, 3),
+        torch.arange(192, dtype=torch.float32).reshape(2, 32, 3),
         requires_grad=False,
     )
     layer.w13_weight_scale = torch.nn.Parameter(
@@ -1247,7 +1247,7 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
         requires_grad=False,
     )
     layer.w2_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 5, 1, dtype=torch.uint8),
+        torch.zeros(2, 32, 1, dtype=torch.uint8),
         requires_grad=False,
     )
     layer.w13_weight_scale_from_checkpoint = torch.nn.Parameter(
@@ -1255,7 +1255,7 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
         requires_grad=False,
     )
     layer.w2_weight_scale_from_checkpoint = torch.nn.Parameter(
-        torch.zeros(2, 5, 1, dtype=torch.uint8),
+        torch.zeros(2, 32, 1, dtype=torch.uint8),
         requires_grad=False,
     )
     moe_config = types.SimpleNamespace(
@@ -1289,7 +1289,7 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
 
     torch.testing.assert_close(layer.w13_weight, original_w13)
     torch.testing.assert_close(layer.w2_weight, original_w2)
-    assert layer.mxfp8_unpadded_hidden_size == 5
+    assert layer.mxfp8_unpadded_hidden_size == 32
     assert layer.mxfp8_padded_hidden_size == 512
     assert layer.mxfp8_unpadded_intermediate_size_per_partition == 3
     assert layer.mxfp8_padded_intermediate_size_per_partition == 128
