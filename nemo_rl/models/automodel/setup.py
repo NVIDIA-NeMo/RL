@@ -37,7 +37,6 @@ from nemo_automodel.components.distributed.config import (
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
-from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import (
     AutoConfig,
@@ -328,24 +327,10 @@ def validate_and_prepare_config(
         else ("sdpa" if cp_size_cfg > 1 else None)
     )
 
-    # Load weights in float32 so the optimizer can keep fp32 master weights.
-    # Exception: TE FusedAdam with master_weights=True keeps its own fp32 master
-    # internally (bf16 params + int16 remainder), so an fp32 load is redundant and
-    # roughly doubles both model- and master-weight memory. In that case load in the
-    # compute dtype instead. See https://github.com/NVIDIA-NeMo/RL/issues/2865.
-    optimizer_cfg = config.get("optimizer") or {}
-    optimizer_kwargs = optimizer_cfg.get("kwargs") or {}
-    optimizer_keeps_fp32_master = (
-        optimizer_cfg.get("name")
-        == "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam"
-        and optimizer_kwargs.get("master_weights") is True
-    )
-    model_load_dtype = dtype if optimizer_keeps_fp32_master else torch.float32
-
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
-        torch_dtype=model_load_dtype,
+        torch_dtype=torch.float32,  # Always load in float32 for master weights
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
@@ -789,21 +774,21 @@ def setup_model_and_optimizer(
     # Initialize optimizer
     optimizer = None
     if init_optimizer:
-        optimizer_config = build_optimizer_config(
-            config["optimizer"]["name"],
-            dict(config["optimizer"]["kwargs"]),
+        optimizer_cls = get_class(config["optimizer"]["name"])
+        optimizer_kwargs = dict(config["optimizer"]["kwargs"])
+        # Resolve string-valued torch dtypes (e.g. "torch.bfloat16" -> torch.bfloat16)
+        for key, value in optimizer_kwargs.items():
+            if isinstance(value, str) and value.startswith("torch."):
+                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
+        # Only pass trainable params to the optimizer. TE FusedAdam's step()
+        # allocates per-param state (exp_avg/exp_avg_sq/master_param) before the
+        # p.grad-is-None check, so passing frozen params (e.g. the visual
+        # encoder in text-only training) causes DCP to save unused state that
+        # later fails to reshard on resume.
+        optimizer = optimizer_cls(
+            (p for p in model.parameters() if p.requires_grad),
+            **optimizer_kwargs,
         )
-        optimizers = optimizer_config.build(
-            model,
-            device_mesh=device_mesh,
-            is_peft=lora_enabled,
-        )
-        if len(optimizers) != 1:
-            raise ValueError(
-                "NeMo-RL's AutoModel backend expects exactly one optimizer, "
-                f"but AutoModel built {len(optimizers)}."
-            )
-        optimizer = optimizers[0]
 
     # Initialize scheduler
     scheduler = None

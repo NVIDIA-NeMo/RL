@@ -3,7 +3,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=8
+NUM_NODES=16
 GPUS_PER_NODE=8
 STEPS_PER_RUN=2
 MAX_STEPS=2
@@ -13,8 +13,7 @@ NUM_MINUTES=240
 
 exit_if_max_steps_reached
 
-# This is initially tracked in disabled.txt while the native Automodel + vLLM
-# 0.25.1 DeepSeek V4 correctness run is brought up on GB200 hardware.
+# This remains manual-only because it requires a 16-node H100 allocation.
 cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
