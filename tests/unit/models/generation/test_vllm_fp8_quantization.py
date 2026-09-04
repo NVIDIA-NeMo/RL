@@ -1344,6 +1344,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
 def test_process_mxfp8_moe_padding_preserves_refit_tensors(
     fp8_module, monkeypatch, is_gated, tp_size
 ):
+    from vllm.model_executor import parameter as vllm_parameter
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
     fp8 = fp8_module
@@ -1351,6 +1352,10 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
         use_fp8_weights=True,
         model_parallel_size=1,
         is_mx=True,
+    )
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: tp_size
     )
 
     def make_parameter(value):
