@@ -126,45 +126,7 @@ def set_refit_manifest_names(names: set[str] | None) -> None:
     fp8_state.refit_manifest_names = names
 
 
-def _patch_ray_executor_v2_worker(ray_executor_v2: Any, fp8_config: FP8Config) -> None:
-    """Install FP8 patches inside RayExecutorV2 workers before model loading."""
-    original_ray_worker_proc = ray_executor_v2.RayWorkerProc
-    if getattr(original_ray_worker_proc, "_nrl_fp8_patched", False):
-        original_ray_worker_proc._nrl_fp8_config = fp8_config
-        return
-
-    class NRLFP8RayWorkerProc(original_ray_worker_proc):
-        _nrl_fp8_patched = True
-        _nrl_fp8_config = fp8_config
-
-        def initialize_worker(
-            self,
-            local_rank: int,
-            env_vars: dict[str, str],
-            driver_env_vars: dict[str, str] | None = None,
-            assigned_physical_gpu_ids: list[int] | None = None,
-        ) -> Any:
-            global fp8_patches_applied
-            if not fp8_patches_applied:
-                apply_fp8_patches(None, type(self)._nrl_fp8_config)
-            return super().initialize_worker(
-                local_rank,
-                env_vars,
-                driver_env_vars,
-                assigned_physical_gpu_ids,
-            )
-
-    ray_executor_v2.RayWorkerProc = NRLFP8RayWorkerProc
-
-
 def monkey_patch_vllm_ray_executor(fp8_config):
-    try:
-        from vllm.v1.executor import ray_executor_v2
-    except ImportError:
-        pass
-    else:
-        _patch_ray_executor_v2_worker(ray_executor_v2, fp8_config)
-
     if fp8_config.model_parallel_size > 1:
         if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
             from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
@@ -573,11 +535,21 @@ def _get_module_from_param_name(model, name: str):
     return current_module
 
 
+_GROUPED_EXPERT_WEIGHT_SUFFIXES = (
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+)
+
+
+def _is_grouped_expert_weight(name: str) -> bool:
+    return name.endswith(_GROUPED_EXPERT_WEIGHT_SUFFIXES)
+
+
 def _is_fp8_weight(name, model):
     if name not in fp8_state.seen_params:
         fp8_state.seen_params.add(name)
         # Filter out bias params
-        if name.endswith("weight"):
+        if name.endswith("weight") or _is_grouped_expert_weight(name):
             module = _get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
@@ -625,9 +597,7 @@ def load_weights(weights, model_runner):
         # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
         # layout, then reshape to 2D [num_experts, out_features, in_features] -> [num_experts*out_features, in_features]
         # so the block scales can be quantized and routed correctly.
-        if k.endswith("mlp.experts.gate_up_proj") or k.endswith(
-            "mlp.experts.down_proj"
-        ):
+        if _is_grouped_expert_weight(k):
             # Quantize only if vLLM built this layer's experts as FP8. Experts
             # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
             # quantization_ignored_layer_kws) are built unquantized, with bf16

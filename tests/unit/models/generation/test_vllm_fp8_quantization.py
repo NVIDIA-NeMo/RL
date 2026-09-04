@@ -16,7 +16,6 @@ import types
 from pathlib import Path
 from typing import Any
 
-import cloudpickle
 import pytest
 import torch
 import yaml
@@ -92,60 +91,6 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert fp8.global_fp8_config.is_mx is True
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
-
-
-def test_ray_executor_v2_worker_applies_fp8_patches_before_model_load(
-    fp8_module, monkeypatch
-):
-    fp8 = fp8_module
-    monkeypatch.setattr(fp8, "_test_applied_configs", [], raising=False)
-    config = fp8.FP8Config(
-        use_fp8_weights=True,
-        model_parallel_size=2,
-        is_mx=True,
-    )
-
-    class FakeRayWorkerProc:
-        def initialize_worker(
-            self,
-            local_rank,
-            env_vars,
-            driver_env_vars=None,
-            assigned_physical_gpu_ids=None,
-        ):
-            assert fp8.fp8_patches_applied
-            return (
-                local_rank,
-                env_vars,
-                driver_env_vars,
-                assigned_physical_gpu_ids,
-            )
-
-    def fake_apply_fp8_patches(_self, fp8_config):
-        fp8._test_applied_configs.append(fp8_config)
-        fp8.fp8_patches_applied = True
-
-    monkeypatch.setattr(fp8, "apply_fp8_patches", fake_apply_fp8_patches)
-    ray_executor_v2 = types.SimpleNamespace(RayWorkerProc=FakeRayWorkerProc)
-    fp8._patch_ray_executor_v2_worker(ray_executor_v2, config)
-    patched_worker_cls = cloudpickle.loads(
-        cloudpickle.dumps(ray_executor_v2.RayWorkerProc)
-    )
-
-    result = patched_worker_cls().initialize_worker(
-        1,
-        {"WORKER_ENV": "1"},
-        {"DRIVER_ENV": "1"},
-        assigned_physical_gpu_ids=[2, 3],
-    )
-
-    assert fp8._test_applied_configs == [config]
-    assert result == (
-        1,
-        {"WORKER_ENV": "1"},
-        {"DRIVER_ENV": "1"},
-        [2, 3],
-    )
 
 
 def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
@@ -1461,6 +1406,8 @@ def test_apply_monolithic_mxfp8_moe_uses_vllm_025_moe_config(
     assert captured["e_score_correction_bias"] is None
     assert captured["routed_scaling_factor"] == 1.0
     assert output.shape == x.shape
+
+
 @pytest.mark.parametrize(
     "use_ray_v2", ["1", "0"], ids=["ray_executor_v2", "ray_executor_v1"]
 )
@@ -1668,6 +1615,30 @@ GROUPED_EXPERT_KEY_SHAPES = pytest.mark.parametrize(
     [("model.layers", False), ("model.language_model.layers", True)],
     ids=["flat", "vl-wrapper"],
 )
+
+
+@GROUPED_EXPERT_KEY_SHAPES
+@pytest.mark.parametrize(
+    "experts_dtype, expected",
+    [
+        pytest.param(torch.float8_e4m3fn, True, id="mxfp8-middle-layer"),
+        pytest.param(torch.bfloat16, False, id="bf16-boundary-layer"),
+    ],
+)
+def test_is_fp8_weight_classifies_suffixless_grouped_expert_slabs(
+    fp8_module,
+    monkeypatch,
+    layers_prefix,
+    wrap_language_model,
+    experts_dtype,
+    expected,
+):
+    fp8 = fp8_module
+    model = _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model)
+
+    for suffix in ("gate_up_proj", "down_proj"):
+        name = f"{layers_prefix}.0.mlp.experts.{suffix}"
+        assert fp8._is_fp8_weight(name, model) is expected
 
 
 @GROUPED_EXPERT_KEY_SHAPES
