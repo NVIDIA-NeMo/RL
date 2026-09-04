@@ -50,9 +50,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
+    TARGET_WEIGHT_VERSION_KEY,
 )
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
@@ -1453,6 +1455,12 @@ class AsyncTrajectoryCollector:
     ) -> None:
         """Push one prompt group to the replay buffer with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
+        if isinstance(self.master_config, GRPOMasterConfig):
+            final_batch_cpu[TARGET_WEIGHT_VERSION_KEY] = torch.full(
+                (final_batch_cpu.size,),
+                int(target_weight_version),
+                dtype=torch.long,
+            )
         rollout_metrics = rollout_result.rollout_metrics
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
@@ -1605,6 +1613,14 @@ class AsyncTrajectoryCollector:
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
+            if use_nemo_gym:
+                # Give every Gym submission a retry identity. This branch retries
+                # the full batch, so stamp the repeated rows immediately before
+                # each submission rather than relying on the source branch's
+                # pending-group-only retry implementation.
+                for row in repeated_batch["extra_env_info"]:
+                    row[NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt - 1
+
             push_tasks: list[asyncio.Task[None]] = []
             scheduled_group_indices: set[int] = set()
             stream_error: Exception | None = None

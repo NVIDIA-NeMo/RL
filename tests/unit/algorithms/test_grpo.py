@@ -36,6 +36,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _apply_async_pre_training_sample_masks,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
@@ -78,11 +79,15 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
     RESUME_BASE_ORDINAL_KEY,
     RETAINED_TASK_INDICES_KEY,
+    TARGET_WEIGHT_VERSION_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
 from nemo_rl.experience.rollouts import calculate_rewards
@@ -258,6 +263,58 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+def test_apply_async_pre_training_sample_masks_logs_disjoint_reasons(capsys):
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+            NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY: torch.tensor(
+                [False, True, False, False, False, False]
+            ),
+            "truncated": torch.tensor([False, True, True, False, False, False]),
+            "mask_sample": torch.tensor([True, True, True, True, False, False]),
+            NEMO_GYM_TASK_INDEX_KEY: torch.arange(100, 106),
+            NEMO_GYM_ROLLOUT_INDEX_KEY: torch.arange(6),
+            NEMO_GYM_ATTEMPT_INDEX_KEY: torch.zeros(6, dtype=torch.long),
+            TARGET_WEIGHT_VERSION_KEY: torch.full((6,), 9, dtype=torch.long),
+            "agent_ref": [{"name": f"agent-{i}"} for i in range(6)],
+        }
+    )
+
+    metrics = _apply_async_pre_training_sample_masks(
+        repeated_batch, overlong_filtering=True
+    )
+
+    assert metrics == {
+        "num_masked_seqs_by_loss_multiplier": 1,
+        "num_masked_seqs_by_empty_response_output": 1,
+        "num_masked_seqs_by_overlong_filtering": 1,
+        "num_masked_seqs_by_rollout": 1,
+        "num_masked_seqs_by_logprob_error": 0,
+        "num_masked_seqs_total": 4,
+    }
+    torch.testing.assert_close(
+        repeated_batch["loss_multiplier"],
+        torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 1.0]),
+    )
+    lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "event='sample_masked'" in line
+    ]
+    assert len(lines) == 4
+    for line, reason, task_index, agent_name in zip(
+        lines,
+        ("loss_multiplier", "empty_response_output", "overlong_filtering", "rollout"),
+        range(100, 104),
+        ("agent-0", "agent-1", "agent-2", "agent-3"),
+        strict=True,
+    ):
+        assert f"reason={reason!r}" in line
+        assert f"task_index={task_index}" in line
+        assert f"agent_name={agent_name!r}" in line
+        assert "target_weight_version=9" in line
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -547,7 +604,9 @@ def _logged_train_metrics_with_key(logger, key: str):
     raise AssertionError(f"No train metrics payload contained {key}")
 
 
-def test_apply_message_level_advantage_penalties_targets_flagged_message_spans():
+def test_apply_message_level_advantage_penalties_targets_flagged_message_spans(
+    capsys,
+):
     train_data = BatchedDataDict(
         {
             "advantages": torch.tensor(
@@ -560,6 +619,11 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
     )
     repeated_batch = BatchedDataDict(
         {
+            NEMO_GYM_TASK_INDEX_KEY: torch.tensor([7, 8]),
+            NEMO_GYM_ROLLOUT_INDEX_KEY: torch.tensor([0, 1]),
+            NEMO_GYM_ATTEMPT_INDEX_KEY: torch.tensor([0, 0]),
+            TARGET_WEIGHT_VERSION_KEY: torch.tensor([3, 3]),
+            "agent_ref": [{"name": "agent-a"}, {"name": "agent-b"}],
             "message_log": [
                 [
                     {
@@ -596,7 +660,7 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
                         "generation_logprobs": torch.tensor([0.8, 0.9]),
                     },
                 ],
-            ]
+            ],
         }
     )
     _apply_message_level_advantage_penalties(
@@ -604,6 +668,7 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
         message_logs=repeated_batch["message_log"],
         invalid_tool_call_advantage=-5.0,
         malformed_thinking_advantage=-7.0,
+        sample_metadata=repeated_batch,
     )
 
     expected = torch.tensor(
@@ -613,6 +678,25 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
         ]
     )
     torch.testing.assert_close(train_data["advantages"], expected)
+    lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "event='message_advantage_overridden'" in line
+    ]
+    assert len(lines) == 2
+    for line, reason, task_index, agent_name, advantage in zip(
+        lines,
+        ("invalid_tool_call", "malformed_thinking"),
+        (7, 8),
+        ("agent-a", "agent-b"),
+        (-5.0, -7.0),
+        strict=True,
+    ):
+        assert f"reason={reason!r}" in line
+        assert f"task_index={task_index}" in line
+        assert f"agent_name={agent_name!r}" in line
+        assert "target_weight_version=3" in line
+        assert f"advantage={advantage}" in line
 
 
 def test_apply_message_level_advantage_penalties_materializes_broadcasted_advantages():
@@ -5310,7 +5394,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         # Verify sample_mask is unchanged
         assert torch.equal(train_data["sample_mask"], original_sample_mask)
 
-    def test_masking_with_threshold(self):
+    def test_masking_with_threshold(self, capsys):
         """Test that sequences exceeding threshold are masked."""
         batch_size, seq_length = 4, 10
 
@@ -5338,7 +5422,22 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 
         # Use threshold 1.2 which should mask sequences 2 and 3
         result = compute_and_apply_seq_logprob_error_masking(
-            train_data, rewards, seq_logprob_error_threshold=1.2
+            train_data,
+            rewards,
+            seq_logprob_error_threshold=1.2,
+            sample_metadata=BatchedDataDict(
+                {
+                    NEMO_GYM_TASK_INDEX_KEY: torch.tensor([100, 101, 102, 103]),
+                    NEMO_GYM_ROLLOUT_INDEX_KEY: torch.tensor([0, 1, 2, 3]),
+                    TARGET_WEIGHT_VERSION_KEY: torch.full((4,), 11),
+                    "agent_ref": [
+                        {"name": "agent-a"},
+                        {"name": "agent-a"},
+                        {"name": "agent-b"},
+                        {"name": "agent-b"},
+                    ],
+                }
+            ),
         )
 
         # Verify masking occurred
@@ -5355,6 +5454,18 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert torch.allclose(train_data["sample_mask"], expected_mask), (
             "Should mask sequences 2 and 3"
         )
+        lines = [
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if "event='sample_masked'" in line
+        ]
+        assert len(lines) == 2
+        for line, task_index in zip(lines, (102, 103), strict=True):
+            assert "reason='seq_logprob_error'" in line
+            assert f"task_index={task_index}" in line
+            assert "agent_name='agent-b'" in line
+            assert "target_weight_version=11" in line
+            assert "threshold=1.2" in line
 
     def test_no_sequences_masked_when_all_below_threshold(self):
         """Test that no sequences are masked when all are below threshold."""
