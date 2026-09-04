@@ -17,7 +17,7 @@ from enum import Enum, auto
 from typing import Optional, Tuple, TypeVar
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -48,10 +48,15 @@ class ModelFlag(Enum):
     VLLM_LOAD_FORMAT_AUTO = auto()
 
     def matches(self, model_name: str) -> bool:
+        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        return self.matches_config(hf_config)
+
+    def matches_config(self, hf_config: PretrainedConfig) -> bool:
+        """Match an already-loaded config, including vLLM custom configs."""
         match self:
             case ModelFlag.VLLM_LOAD_FORMAT_AUTO:
-                return is_gemma_model(model_name) or is_nano_nemotron_vl_model(
-                    model_name
+                return is_gemma_config(hf_config) or is_nano_nemotron_vl_config(
+                    hf_config
                 )
             case _:
                 raise ValueError(f"Unknown ModelFlag: {self}")
@@ -59,6 +64,10 @@ class ModelFlag(Enum):
 
 def is_gemma_model(model_name: str) -> bool:
     hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    return is_gemma_config(hf_config)
+
+
+def is_gemma_config(hf_config: PretrainedConfig) -> bool:
     return hasattr(hf_config, "model_type") and hf_config.model_type in [
         "gemma2",
         "gemma3",
@@ -68,6 +77,10 @@ def is_gemma_model(model_name: str) -> bool:
 
 def is_nano_nemotron_vl_model(model_name: str) -> bool:
     hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    return is_nano_nemotron_vl_config(hf_config)
+
+
+def is_nano_nemotron_vl_config(hf_config: PretrainedConfig) -> bool:
     return hasattr(hf_config, "model_type") and hf_config.model_type in [
         "NemotronH_Nano_VL_V2",
         "NemotronH_Nano_Omni_Reasoning_V3",

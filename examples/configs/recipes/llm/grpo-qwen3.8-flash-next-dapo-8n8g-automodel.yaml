@@ -1,0 +1,144 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  max_num_epochs: 1000
+  max_num_steps: 10000
+  use_leave_one_out_baseline: false
+  val_period: 5
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: 960
+  val_batch_size: 960
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: 3072
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-qwen3.8-flash-next-dapo-8n8g-automodel
+  keep_top_k: 2
+  save_period: 5
+  checkpoint_must_save_by: 00:03:45:00
+policy:
+  model_name: "path/to/qwen3.8-next-checkpoint"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: false
+  hf_config_overrides:
+    language_model_only: true
+    text_config:
+      router_aux_loss_coef: 0.0
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # Keep the two IPC staging buffers bounded while each physical PLE
+  # checkpoint shard is replicated and streamed independently.
+  refit_buffer_size_gb: 1
+  max_total_sequence_length: 4096
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      betas: [0.9, 0.95]
+      adam_w_mode: true
+      bias_correction: true
+      master_weights: true
+      master_weight_dtype: torch.float32
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+    param_group_overrides:
+    - pattern: '\.ple\.ple_embedding\.ngram_embedding\.weight$'
+      lr_mult: 5.0
+      wd_mult: 0.0
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  dtensor_cfg:
+    expert_parallel_size: 64
+    activation_checkpointing: true
+    env_vars:
+      NCCL_NET_PLUGIN: none
+      NCCL_NET: IB
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: flex
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: torch
+        rope_fusion: false
+        fake_balanced_gate: false
+        gate_precision: float32
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  make_sequence_length_divisible_by: 64
+  generation:
+    max_new_tokens: 3072
+    vllm_cfg:
+      # BrightDelta has 24 attention heads, so TP must divide 24. Keep rollout
+      # EP equal to TP: the qwen38next HC rejects the sequence-parallel MoE mode
+      # that vLLM enables when both TP and internal DP exceed one. The 64-GPU
+      # allocation therefore runs eight independent TP8/EP8 rollout replicas.
+      # Bounded refit broadcasts all 128 physical PLE views so each replica can
+      # populate its TP-sharded PLE without materializing the 190 GiB table.
+      tensor_parallel_size: 8
+      expert_parallel_size: 8
+      gpu_memory_utilization: 0.72
+      max_model_len: 4096
+      enforce_eager: true
+      enable_prefix_caching: true
+    vllm_kwargs:
+      language_model_only: true
+      mamba_cache_mode: align
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: Bright-delta-support
+    name: grpo-qwen3.8-flash-next-dapo-8n8g-automodel
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8

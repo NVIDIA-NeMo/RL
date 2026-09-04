@@ -489,7 +489,9 @@ class GenerationInterface(ABC):
         """Whether the generation backend requires KV cache scales synchronization."""
         return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any] | list[dict[str, Any]]
+    ) -> None:
         """Prepare the info for refit."""
         raise NotImplementedError
 

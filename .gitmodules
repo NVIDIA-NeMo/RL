@@ -5,9 +5,10 @@
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
+	# NVIDIA upstream main contains the Qwen3.8-Flash-Next/Engram implementation,
+	# including the legacy qwen4_exp aliases used by the immutable checkpoint.
 	url = https://github.com/NVIDIA-NeMo/Automodel.git
-	branch = r0.6.0
-	shallow = true
+	branch = main
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/NVIDIA-NeMo/Gym.git

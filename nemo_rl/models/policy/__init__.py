@@ -39,25 +39,30 @@ def _patch_transformers_tokenizer_class_set():
     DTensor v2 all import from nemo_rl.models.policy) without polluting nemo_rl
     consumers that don't touch tokenizers.
     """
-    import transformers
-    from packaging.version import Version as PkgVersion
-
-    # Transformers 5.12.1 still ships both registry entries, so the patch remains
-    # load-bearing across the currently supported backend environments.
-    # TODO: remove this patch (and the assert below) once the deepseek_v3
-    # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
-        f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
-        "Check if the upstream fix now applies and remove this patch if so."
-    )
-
+    #
+    # This used to assert transformers < 5.13 as a tripwire to force a re-check on
+    # every upgrade. The entries are present in the supported 5.12.1 build and
+    # in at least one partner 5.15.1 build, while other newer builds may remove
+    # them. The observable registry state, rather than the version, determines
+    # whether this workaround is needed.
+    #
+    # Gate on whether the blocklist entry actually exists rather than on a version
+    # ceiling. The version check turned a harmless no-op into a hard crash on any
+    # transformers past 5.13 -- it took down an 8-node run at import time -- while
+    # the condition it really cares about is observable directly.
     from transformers import AutoTokenizer
     from transformers.models.auto.tokenization_auto import (
         MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
         TOKENIZER_MAPPING_NAMES,
     )
+
+    if (
+        "deepseek_v3" not in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS
+        and "deepseek_v3" not in TOKENIZER_MAPPING_NAMES
+    ):
+        # Upstream fixed it; wrapping from_pretrained would buy nothing.
+        return
 
     _original_from_pretrained = AutoTokenizer.from_pretrained
 
@@ -528,6 +533,15 @@ class TokenizerConfig(TypedDict):
 class PytorchOptimizerConfig(TypedDict):
     name: str
     kwargs: dict[str, Any]
+    param_group_overrides: NotRequired[list["OptimizerParamGroupOverride"]]
+
+
+class OptimizerParamGroupOverride(TypedDict):
+    """Name-matched optimizer multipliers applied before scheduler creation."""
+
+    pattern: str
+    lr_mult: float
+    wd_mult: float
 
 
 class SinglePytorchSchedulerConfig(TypedDict):

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import math
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -82,46 +83,294 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
 
 
-def _refit_tensor_dtype(
-    fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
-) -> torch.dtype:
-    """Preserve the FP32 dtype used by inference-critical MoE router state."""
-    is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
-        "e_score_correction_bias"
+_MODEL_OWNED_GRAD_DIVISOR_ATTR = "_nemo_model_owned_grad_divisor"
+
+
+def _get_model_owned_grad_divisor(parameter: nn.Parameter | None) -> float | None:
+    """Read and validate AutoModel's model-owned DTensor marker."""
+    if parameter is None:
+        return None
+    raw_divisor = getattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, None)
+    if raw_divisor is None:
+        return None
+    if isinstance(raw_divisor, bool) or not isinstance(raw_divisor, (int, float)):
+        raise TypeError(
+            f"{_MODEL_OWNED_GRAD_DIVISOR_ATTR} must be a positive number, "
+            f"got {type(raw_divisor).__name__}"
+        )
+    divisor = float(raw_divisor)
+    if not math.isfinite(divisor) or divisor <= 0:
+        raise ValueError(
+            f"{_MODEL_OWNED_GRAD_DIVISOR_ATTR} must be finite and positive, "
+            f"got {raw_divisor!r}"
+        )
+    return divisor
+
+
+def _get_model_owned_process_group(
+    parameter: nn.Parameter,
+) -> torch.distributed.ProcessGroup:
+    """Resolve the owner group from a marked model-owned DTensor's mesh."""
+    if not isinstance(parameter, DTensor):
+        raise TypeError(
+            f"A parameter marked with {_MODEL_OWNED_GRAD_DIVISOR_ATTR} must be "
+            f"a DTensor, got {type(parameter).__name__}"
+        )
+    if parameter.device_mesh.ndim != 1:
+        raise ValueError(
+            "Model-owned DTensor refit requires a one-dimensional owner mesh, "
+            f"got ndim={parameter.device_mesh.ndim}"
+        )
+    return parameter.device_mesh.get_group()
+
+
+def _gather_model_owned_manifest(
+    local_manifest: dict[str, tuple[torch.Size, torch.dtype]],
+    process_group: torch.distributed.ProcessGroup,
+) -> dict[str, tuple[torch.Size, torch.dtype]]:
+    """Collect the disjoint HF views of one model-owned DTensor.
+
+    Model-owned parameters such as BrightDelta's PLE table are intentionally
+    kept as rank-local checkpoint views.  Rollout replicas can nevertheless
+    require every physical checkpoint view, so exchange only the small
+    metadata dictionaries here; tensor payloads remain sharded.
+    """
+    gathered: list[dict[str, tuple[torch.Size, torch.dtype]] | None] = [
+        None
+    ] * torch.distributed.get_world_size(process_group)
+    torch.distributed.all_gather_object(
+        gathered,
+        local_manifest,
+        group=process_group,
     )
-    if is_router_correction_bias and tensor.dtype == torch.float32:
-        return tensor.dtype
-    return default_dtype
+
+    merged: dict[str, tuple[torch.Size, torch.dtype]] = {}
+    for owner_rank, manifest in enumerate(gathered):
+        if manifest is None:
+            raise RuntimeError(
+                f"Missing model-owned refit manifest from owner rank {owner_rank}"
+            )
+        for name, metadata in manifest.items():
+            if name in merged:
+                raise ValueError(
+                    "Model-owned HF checkpoint views must have one owner; "
+                    f"{name!r} was exported by multiple ranks"
+                )
+            merged[name] = metadata
+    return merged
+
+
+def _replicate_model_owned_hf_tensors(
+    local_tensors: list[tuple[str, torch.Tensor]],
+    *,
+    process_group: torch.distributed.ProcessGroup,
+    target_dtype: torch.dtype,
+    device: torch.device,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Broadcast disjoint checkpoint views one at a time for rollout refit.
+
+    This is deliberately a bounded replication path: a rank holds at most one
+    remote physical checkpoint view in addition to its normal refit staging
+    buffers.  In particular, it never calls ``DTensor.full_tensor()`` on a
+    model-owned parameter and therefore never materializes BrightDelta's
+    roughly 190 GiB global PLE table on one device.
+    """
+    local_by_name = dict(local_tensors)
+    if len(local_by_name) != len(local_tensors):
+        raise ValueError("Model-owned HF checkpoint view names must be unique per rank")
+    local_metadata = [(name, tuple(tensor.shape)) for name, tensor in local_tensors]
+    owner_world_size = torch.distributed.get_world_size(process_group)
+    gathered_metadata: list[list[tuple[str, tuple[int, ...]]] | None] = [
+        None
+    ] * owner_world_size
+    torch.distributed.all_gather_object(
+        gathered_metadata,
+        local_metadata,
+        group=process_group,
+    )
+
+    owner_global_ranks = torch.distributed.get_process_group_ranks(process_group)
+    owner_group_rank = torch.distributed.get_rank(process_group)
+    seen_names: set[str] = set()
+    ordered_metadata: list[tuple[int, str, tuple[int, ...]]] = []
+    for source_group_rank, source_metadata in enumerate(gathered_metadata):
+        if source_metadata is None:
+            raise RuntimeError(
+                "Missing model-owned tensor metadata from owner rank "
+                f"{source_group_rank}"
+            )
+        for name, shape in source_metadata:
+            if name in seen_names:
+                raise ValueError(
+                    "Model-owned HF checkpoint views must have one owner; "
+                    f"{name!r} was exported by multiple ranks"
+                )
+            seen_names.add(name)
+            ordered_metadata.append((source_group_rank, name, shape))
+
+    if owner_group_rank == 0:
+        tensor_bytes = [
+            torch.Size(shape).numel() * target_dtype.itemsize
+            for _, _, shape in ordered_metadata
+        ]
+        total_gib = sum(tensor_bytes) / 1024**3
+        max_mib = max(tensor_bytes, default=0) / 1024**2
+        print(
+            "Model-owned refit: broadcasting "
+            f"{len(ordered_metadata)} checkpoint views ({total_gib:.2f} GiB "
+            f"logical total, {max_mib:.2f} MiB largest view) across "
+            f"{owner_world_size} owner ranks one view at a time",
+            flush=True,
+        )
+
+    for source_group_rank, name, shape in ordered_metadata:
+        if source_group_rank == owner_group_rank:
+            tensor = (
+                local_by_name[name].to(target_dtype, non_blocking=True).contiguous()
+            )
+            if tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"Local model-owned tensor shape changed for {name!r}: "
+                    f"{tuple(tensor.shape)} != {shape}"
+                )
+        else:
+            tensor = torch.empty(shape, dtype=target_dtype, device=device)
+
+        torch.distributed.broadcast(
+            tensor,
+            src=owner_global_ranks[source_group_rank],
+            group=process_group,
+        )
+        yield name, tensor
+        del tensor
+
+
+def _uses_model_owned_ipc_replication(config: PolicyConfig) -> bool:
+    """Whether this worker's refit transport consumes globally replicated views."""
+    generation = config["generation"]
+    return (
+        generation["backend"] == "vllm"
+        and generation["colocated"]["enabled"]
+        and generation.get("refit_transport") in (None, "ipc")
+    )
+
+
+def _refit_wire_dtype(
+    tensor: torch.Tensor, _target_dtype: torch.dtype
+) -> torch.dtype:
+    """Preserve the dtype selected by the AutoModel state-dict adapter.
+
+    Models may intentionally mix parameter dtypes even when their main rollout
+    precision is BF16. Casting every floating-point tensor to the rollout dtype
+    before refit would irreversibly quantize FP32 state such as GatedDeltaNet
+    ``A_log`` and ``dt_bias``. The destination loader remains responsible for
+    casting when the live rollout parameter uses a different storage dtype.
+    """
+    return tensor.dtype
 
 
 def dtensor_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
+    model: nn.Module,
+    target_dtype: torch.dtype,
+    *,
+    replicate_model_owned_dtensors: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The default dtype for refit tensors. Source-FP32
-            ``e_score_correction_bias`` tensors retain FP32.
+        target_dtype: Rollout dtype used by model-owned replication. Ordinary
+            tensors preserve the dtype exported by the model adapter.
+        replicate_model_owned_dtensors: Broadcast model-owned checkpoint views
+            one at a time to every owner rank. This is required when each
+            colocated rollout rank needs a complete checkpoint-key stream.
 
     Yields:
-        Tuples of (fully_qualified_name, tensor) where tensors are converted to
-        the refit dtype and made contiguous.
+        Tuples of ``(fully_qualified_name, tensor)`` with the adapter-selected
+        dtype and contiguous storage.
     """
     module_map = dict(model.named_modules())
+    parameter_map = dict(model.named_parameters())
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
-        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-        merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
+        parameter = parameter_map.get(name)
+        model_owned_grad_divisor = _get_model_owned_grad_divisor(parameter)
+        is_model_owned_dtensor = model_owned_grad_divisor is not None
+        if is_model_owned_dtensor:
+            if not isinstance(tensor, DTensor):
+                raise TypeError(
+                    f"Model-owned parameter {name!r} must remain a DTensor in state_dict()"
+                )
+            # Model-owned DTensors intentionally export rank-local HF views
+            # (for example Qwen4-Exp's 190 GiB PLE table). Calling full_tensor()
+            # would materialize the global parameter on one GPU.
+            adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, tensor)
+            if any(
+                isinstance(adapted_tensor, DTensor)
+                for _, adapted_tensor in adapted_fqn_tensors
+            ):
+                raise TypeError(
+                    "State-dict adapter must export model-owned parameter "
+                    f"{name!r} as rank-local tensors"
+                )
+            if replicate_model_owned_dtensors:
+                assert parameter is not None
+                yield from _replicate_model_owned_hf_tensors(
+                    adapted_fqn_tensors,
+                    process_group=_get_model_owned_process_group(parameter),
+                    target_dtype=target_dtype,
+                    device=tensor.to_local().device,
+                )
+                del adapted_fqn_tensors
+                continue
+            full_tensor = None
+            merged_tensor = None
+        else:
+            full_tensor = None
+            merged_tensor = None
+            adapted_fqn_tensors = None
+            adapted_dtensors = None
 
-        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
-        for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
-            yield (
-                adapted_fqn,
-                adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
+            # Apply DTensor-aware layout transforms before gathering whenever the
+            # adapter keeps the result as one DTensor.  Grouped MoE checkpoints
+            # commonly transpose a multi-GiB expert tensor on export.  Gathering
+            # first would hold both the gathered native tensor and a second
+            # contiguous HF-layout copy, which can OOM during colocated refit.
+            # A pre-gather transpose lets DTensor materialize the final layout
+            # directly.  Preserve the established path for adapters that split a
+            # tensor, materialize local tensors, or need a LoRA merge.
+            module_name = name.removesuffix(".weight")
+            can_adapt_before_gather = isinstance(tensor, DTensor) and not isinstance(
+                module_map.get(module_name), LinearLoRA
             )
+            if can_adapt_before_gather:
+                adapted_dtensors = _maybe_adapt_tensor_to_hf(model, name, tensor)
+                if len(adapted_dtensors) == 1 and isinstance(
+                    adapted_dtensors[0][1], DTensor
+                ):
+                    adapted_fqn, adapted_dtensor = adapted_dtensors[0]
+                    adapted_fqn_tensors = [(adapted_fqn, adapted_dtensor.full_tensor())]
+
+            if adapted_fqn_tensors is None:
+                # An adapter that materialized local tensors cannot use this
+                # optimization; release those speculative results before the
+                # established gather-then-adapt path allocates anything large.
+                del adapted_dtensors
+                full_tensor = (
+                    tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                )
+                merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
+                adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
+                    model, name, merged_tensor
+                )
+        for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
+            wire_dtype = _refit_wire_dtype(adapted_tensor, target_dtype)
+            refit_tensor = adapted_tensor.to(
+                wire_dtype, non_blocking=True
+            ).contiguous()
+            yield adapted_fqn, refit_tensor
+            del refit_tensor
             del adapted_tensor
         del adapted_fqn_tensors
         del merged_tensor
@@ -379,6 +628,27 @@ class DTensorPolicyWorkerV2Impl(
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
 
+    def _step_optimizer_with_deferred_state(self) -> None:
+        """Run one optimizer step while minimizing the training-forward peak.
+
+        When logprob inference offloads optimizer state, keep that state on CPU
+        through forward/backward and restore it only for ``optimizer.step()``.
+        This avoids overlapping the optimizer state with the activation peak.
+        """
+        defer_optimizer_state = (
+            not self.cpu_offload and self.offload_optimizer_for_logprob
+        )
+        if defer_optimizer_state:
+            self.move_optimizer_to_device("cuda")
+
+        try:
+            self.optimizer.step()
+            self._update_moe_gate_bias_if_supported()
+        finally:
+            if defer_optimizer_state:
+                self.move_optimizer_to_device("cpu")
+                torch.cuda.empty_cache()
+
     def _autocast_context(self) -> AbstractContextManager[Any]:
         """Return the worker-owned precision context for one microbatch."""
         if not self.autocast_enabled:
@@ -539,8 +809,7 @@ class DTensorPolicyWorkerV2Impl(
                     warn_if_inf_grad_norm(grad_norm)
 
                     # Update parameters and the non-gradient MoE routing bias.
-                    self.optimizer.step()
-                    self._update_moe_gate_bias_if_supported()
+                    self._step_optimizer_with_deferred_state()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
@@ -1044,20 +1313,53 @@ class DTensorPolicyWorkerV2Impl(
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
+        replicate_model_owned_dtensors = _uses_model_owned_ipc_replication(self.cfg)
+        parameter_map = dict(self.model.named_parameters())
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 continue
-            full_tensor = (
-                tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+            parameter = parameter_map.get(name)
+            model_owned_grad_divisor = _get_model_owned_grad_divisor(parameter)
+            is_model_owned_dtensor = model_owned_grad_divisor is not None
+            if is_model_owned_dtensor and not isinstance(tensor, DTensor):
+                raise TypeError(
+                    f"Model-owned parameter {name!r} must remain a DTensor in state_dict()"
+                )
+            refit_tensor = (
+                tensor
+                if is_model_owned_dtensor or not isinstance(tensor, DTensor)
+                else tensor.full_tensor()
             )
             adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
-                self.model, name, full_tensor
+                self.model, name, refit_tensor
             )
-            for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                refit_dtype = _refit_tensor_dtype(
-                    adapted_fqn, adapted_tensor, self.dtype
+            if is_model_owned_dtensor and any(
+                isinstance(adapted_tensor, DTensor)
+                for _, adapted_tensor in adapted_fqn_tensors
+            ):
+                raise TypeError(
+                    "State-dict adapter must export model-owned parameter "
+                    f"{name!r} as rank-local tensors"
                 )
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
+            adapted_manifest = {
+                adapted_fqn: (
+                    adapted_tensor.shape,
+                    _refit_wire_dtype(adapted_tensor, self.dtype),
+                )
+                for adapted_fqn, adapted_tensor in adapted_fqn_tensors
+            }
+            if is_model_owned_dtensor and replicate_model_owned_dtensors:
+                assert parameter is not None
+                adapted_manifest = _gather_model_owned_manifest(
+                    adapted_manifest,
+                    _get_model_owned_process_group(parameter),
+                )
+            for adapted_fqn, metadata in adapted_manifest.items():
+                if adapted_fqn in state_dict_info:
+                    raise ValueError(
+                        f"Duplicate HF refit key exported by the policy: {adapted_fqn!r}"
+                    )
+                state_dict_info[adapted_fqn] = metadata
 
         return state_dict_info
 
@@ -1097,7 +1399,13 @@ class DTensorPolicyWorkerV2Impl(
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
+            params_generator=dtensor_params_generator(
+                self.model,
+                self.dtype,
+                replicate_model_owned_dtensors=_uses_model_owned_ipc_replication(
+                    self.cfg
+                ),
+            ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1265,10 +1573,14 @@ class DTensorPolicyWorkerV2Impl(
             self.model = self.move_buffer_to_device(self.model, "cuda")
 
         self.model.train()
-        # Training expects optimizer state on CUDA. Restore unconditionally rather
-        # than tracking which path offloaded it; move_optimizer_to_device is a no-op
-        # when the state is already resident.
-        if self.optimizer is not None and not self.cpu_offload:
+        # Keep offloaded optimizer state on CPU through forward/backward. It is
+        # restored just in time by _step_optimizer_with_deferred_state so its
+        # memory does not overlap the activation peak.
+        if (
+            self.optimizer is not None
+            and not self.cpu_offload
+            and not self.offload_optimizer_for_logprob
+        ):
             self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()
@@ -1315,8 +1627,39 @@ class DTensorPolicyWorkerV2Impl(
                     state[k] = v.to(device)
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
+        # ``Module.to`` may replace or swap tensor-subclass Parameters. Arbitrary
+        # Python attributes are not guaranteed to survive that conversion, but
+        # model-owned DTensors rely on their attached contract to stay outside
+        # ordinary FSDP gathering (Qwen3.8-Flash-Next's PLE table is 190 GiB
+        # globally).
+        # Snapshot the model-agnostic contract by stable FQN and restore it on
+        # the converted Parameter before any subsequent gradient or refit path
+        # inspects the model.
+        model_owned_grad_divisors = {
+            name: divisor
+            for name, parameter in model.named_parameters()
+            if (divisor := _get_model_owned_grad_divisor(parameter)) is not None
+        }
         model = self.move_buffer_to_device(model, device)
-        return model.to(device)
+        model = model.to(device)
+
+        if model_owned_grad_divisors:
+            parameter_map = dict(model.named_parameters())
+            for name, divisor in model_owned_grad_divisors.items():
+                parameter = parameter_map.get(name)
+                if parameter is None:
+                    raise RuntimeError(
+                        "Model device conversion removed model-owned parameter "
+                        f"{name!r}"
+                    )
+                if not isinstance(parameter, DTensor):
+                    raise TypeError(
+                        "Model-owned parameter must remain a DTensor after device "
+                        f"conversion: {name!r} became {type(parameter).__name__}"
+                    )
+                setattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, divisor)
+
+        return model
 
     def move_buffer_to_device(
         self, model: nn.Module, device: str | torch.device

@@ -1026,16 +1026,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self,
+    ) -> Optional[dict[str, Any] | list[dict[str, Any]]]:
         """Prepare the info for refit.
 
         Returns:
-            dict: A dictionary containing the info for refit.
+            A shared state-dict manifest when every policy rank exports the
+            same HF keys, otherwise one manifest per policy rank. Rank-specific
+            manifests are required for model-owned parameters whose global
+            tensor must never be materialized on one device.
         """
         futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
         results = ray.get(futures)
-        # Only get the first worker's info since all workers will have the same result
-        return results[0]
+        if not results:
+            return None
+        if all(result == results[0] for result in results[1:]):
+            return results[0]
+        return results
 
     def finish_inference(self) -> None:
         """Offload policy model to CPU after inference."""

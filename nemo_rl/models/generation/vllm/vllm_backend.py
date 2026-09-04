@@ -263,6 +263,202 @@ class VllmInternalWorkerExtension:
     # previous group without probing for the attribute's existence.
     model_update_group: Any = None
 
+    def install_brightdelta_ngram_context_fix(self) -> str:
+        """Keep PLE n-gram context in sync with GPU-side decode tokens.
+
+        The vLLM async scheduler can expose ``-1`` output placeholders through
+        ``RequestState.all_token_ids`` even though ``input_batch.input_ids``
+        already contains the sampled token being decoded. BrightDelta's PLE
+        must therefore roll its short token history from the actual model
+        inputs instead of rereading those placeholder slots.
+        """
+        import types
+
+        model_runner = self.model_runner
+        if getattr(model_runner, "uses_ngram_embedding", False) and hasattr(
+            model_runner, "_prepare_ngram_context"
+        ):
+            original_prepare = model_runner._prepare_ngram_context
+
+            def _prepare_v1_ngram_context(model_runner, num_reqs, num_reqs_padded):
+                # Preserve the official CPU path as the fallback for prefill,
+                # prefix-cache hits, and discontinuous request positions.
+                context = original_prepare(num_reqs, num_reqs_padded)
+                if num_reqs == 0:
+                    return context
+
+                history = getattr(model_runner, "_nrl_ngram_history", None)
+                if history is None:
+                    history = torch.full(
+                        (model_runner.max_num_reqs, model_runner.ngram_context_len),
+                        model_runner.ngram_eos_token_id,
+                        dtype=torch.int32,
+                        device=model_runner.device,
+                    )
+                    history_end = torch.full(
+                        (model_runner.max_num_reqs,),
+                        -1,
+                        dtype=torch.int64,
+                        device=model_runner.device,
+                    )
+                    model_runner._nrl_ngram_history = history
+                    model_runner._nrl_ngram_history_end = history_end
+                    model_runner._nrl_ngram_history_slots = {}
+                else:
+                    history_end = model_runner._nrl_ngram_history_end
+
+                slots = model_runner._nrl_ngram_history_slots
+                live_req_ids = set(model_runner.input_batch.req_id_to_index)
+                for stale_req_id in set(slots).difference(live_req_ids):
+                    del slots[stale_req_id]
+                used_slots = set(slots.values())
+                free_slots = iter(
+                    slot
+                    for slot in range(model_runner.max_num_reqs)
+                    if slot not in used_slots
+                )
+                req_ids = model_runner.input_batch.req_ids[:num_reqs]
+                for req_id in req_ids:
+                    if req_id not in slots:
+                        slot = next(free_slots)
+                        slots[req_id] = slot
+                        history_end[slot] = -1
+
+                slot_indices = torch.tensor(
+                    [slots[req_id] for req_id in req_ids],
+                    dtype=torch.int64,
+                    device=model_runner.device,
+                )
+                context_end = torch.as_tensor(
+                    model_runner.input_batch.num_computed_tokens_cpu[:num_reqs],
+                    dtype=torch.int64,
+                    device=model_runner.device,
+                )
+                cached = history.index_select(0, slot_indices)
+                sequential = history_end.index_select(0, slot_indices) == context_end
+                base_history = torch.where(
+                    sequential.unsqueeze(1), cached, context[:num_reqs]
+                )
+                context[:num_reqs].copy_(base_history)
+
+                query_starts = model_runner.query_start_loc.gpu[:num_reqs].long()
+                query_ends = model_runner.query_start_loc.gpu[1 : num_reqs + 1].long()
+                query_lengths = query_ends - query_starts
+                offsets = torch.arange(
+                    -model_runner.ngram_context_len,
+                    0,
+                    dtype=torch.int64,
+                    device=model_runner.device,
+                )
+                relative = query_lengths.unsqueeze(1) + offsets
+                query_indices = query_starts.unsqueeze(1) + relative.clamp_min(0)
+                query_indices.clamp_max_(model_runner.input_ids.gpu.numel() - 1)
+                query_tokens = model_runner.input_ids.gpu[query_indices]
+                history_indices = (model_runner.ngram_context_len + relative).clamp(
+                    0, model_runner.ngram_context_len - 1
+                )
+                history_tokens = base_history.gather(1, history_indices)
+                next_history = torch.where(
+                    relative >= 0, query_tokens, history_tokens
+                ).to(history.dtype)
+                history.index_copy_(0, slot_indices, next_history)
+                history_end.index_copy_(0, slot_indices, context_end + query_lengths)
+                return context
+
+            model_runner._prepare_ngram_context = types.MethodType(
+                _prepare_v1_ngram_context, model_runner
+            )
+            return f"v1:{type(model_runner).__module__}.{type(model_runner).__name__}"
+
+        model_state = getattr(model_runner, "model_state", None)
+        if model_state is None or not getattr(
+            model_state, "uses_ngram_embedding", False
+        ):
+            return (
+                "not-installed:"
+                f"runner={type(model_runner).__module__}.{type(model_runner).__name__},"
+                f"state={type(model_state).__module__}.{type(model_state).__name__}"
+            )
+
+        def _prepare_ngram_context(model_state, input_batch, req_states):
+            num_reqs = input_batch.num_reqs
+            num_reqs_padded = input_batch.num_reqs_after_padding
+            context = model_state.ngram_context[:num_reqs_padded]
+            context.fill_(model_state.ngram_eos_token_id)
+            if num_reqs == 0:
+                return context
+
+            request_indices = input_batch.idx_mapping[:num_reqs].long()
+            context_end = req_states.num_computed_tokens.gpu[request_indices].long()
+
+            history = getattr(model_state, "_nrl_ngram_history", None)
+            if history is None:
+                history = torch.full_like(
+                    model_state.ngram_context, model_state.ngram_eos_token_id
+                )
+                history_end = torch.full(
+                    (model_state.max_num_reqs,),
+                    -1,
+                    dtype=torch.int64,
+                    device=model_state.device,
+                )
+                model_state._nrl_ngram_history = history
+                model_state._nrl_ngram_history_end = history_end
+                model_state._nrl_ngram_history_req_ids = {}
+            else:
+                history_end = model_state._nrl_ngram_history_end
+
+            history_req_ids = model_state._nrl_ngram_history_req_ids
+            for req_id, request_index in zip(
+                input_batch.req_ids[:num_reqs],
+                input_batch.idx_mapping_np[:num_reqs],
+                strict=True,
+            ):
+                request_index = int(request_index)
+                if history_req_ids.get(request_index) != req_id:
+                    history_end[request_index] = -1
+                    history_req_ids[request_index] = req_id
+
+            token_indices = context_end.unsqueeze(1) + model_state.ngram_context_offsets
+            valid_tokens = token_indices >= 0
+            token_indices.clamp_min_(0)
+            fallback = req_states.all_token_ids.gpu[
+                request_indices.unsqueeze(1), token_indices
+            ]
+            fallback = torch.where(
+                valid_tokens,
+                fallback,
+                fallback.new_full((), model_state.ngram_eos_token_id),
+            )
+
+            cached = history.index_select(0, request_indices)
+            sequential = history_end.index_select(0, request_indices) == context_end
+            base_history = torch.where(sequential.unsqueeze(1), cached, fallback)
+            context[:num_reqs].copy_(base_history)
+
+            query_starts = input_batch.query_start_loc[:num_reqs].long()
+            query_ends = input_batch.query_start_loc[1 : num_reqs + 1].long()
+            query_lengths = query_ends - query_starts
+            relative = query_lengths.unsqueeze(1) + model_state.ngram_context_offsets
+            query_indices = query_starts.unsqueeze(1) + relative.clamp_min(0)
+            query_indices.clamp_max_(input_batch.input_ids.numel() - 1)
+            query_tokens = input_batch.input_ids[query_indices]
+            history_indices = (model_state.ngram_context_len + relative).clamp(
+                0, model_state.ngram_context_len - 1
+            )
+            history_tokens = base_history.gather(1, history_indices)
+            next_history = torch.where(relative >= 0, query_tokens, history_tokens).to(
+                history.dtype
+            )
+            history.index_copy_(0, request_indices, next_history)
+            history_end.index_copy_(0, request_indices, context_end + query_lengths)
+            return context
+
+        model_state._prepare_ngram_context = types.MethodType(
+            _prepare_ngram_context, model_state
+        )
+        return f"v2:{type(model_state).__module__}.{type(model_state).__name__}"
+
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
         if params is None:
@@ -478,19 +674,25 @@ class VllmInternalWorkerExtension:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any] | list[dict[str, Any]]
+    ) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
         Args:
-            state_dict_info (dict): A dictionary containing the info for refit.
-                e.g. {tensor_name: (shape, dtype)}
-
-        Raises:
-            RuntimeError: If the model realizes the unquantized FlashInfer TRTLLM
-                MoE backend while a co-trained MTP drafter is enabled (unsupported
-                by the native layerwise refit lifecycle).
+            state_dict_info: A shared manifest or one manifest per internal
+                model-parallel rank. The latter keeps model-owned parameters
+                sharded during point-to-point IPC refit.
         """
         self._validate_native_layerwise_refit()
+        if isinstance(state_dict_info, list):
+            rank = torch.distributed.get_rank()
+            if rank >= len(state_dict_info):
+                raise ValueError(
+                    "Rank-specific refit metadata does not cover vLLM rank "
+                    f"{rank}: received {len(state_dict_info)} manifests"
+                )
+            state_dict_info = state_dict_info[rank]
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     def prepare_sparse_delta_refit_info(
@@ -1091,9 +1293,6 @@ class VllmInternalWorkerExtension:
         self._reject_unsupported_native_refit("sparse_delta")
         applier = self._get_sparse_delta_applier()
         return applier.update_weights_from_decoded_sparse_payload(*payloads)
-
-    def synchronize_device(self) -> None:
-        self._get_sparse_delta_applier().synchronize_device()
 
     def finish_sparse_delta_refit(self) -> dict[str, Any]:
         return self._get_sparse_delta_applier().finish_sparse_delta_refit()

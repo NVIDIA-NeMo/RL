@@ -22,7 +22,7 @@ from typing import Any, Optional, cast
 
 import ray
 import torch
-from transformers import AutoConfig
+from transformers import PretrainedConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -207,6 +207,35 @@ def _log_effective_quantization_ignore_patterns(
         "ignore", []
     )
     print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
+
+
+def _resolve_hf_config_source(model_name: str, vllm_kwargs: dict[str, Any]) -> str:
+    """Use vLLM's compatibility config for NeMo-RL's architecture checks."""
+    hf_config_path = vllm_kwargs.get("hf_config_path")
+    return hf_config_path if isinstance(hf_config_path, str) else model_name
+
+
+def _load_vllm_hf_config(
+    model_name: str, vllm_kwargs: dict[str, Any]
+) -> PretrainedConfig:
+    """Load the effective config through vLLM so custom types are registered."""
+    from vllm.transformers_utils.config import get_config
+
+    return get_config(
+        _resolve_hf_config_source(model_name, vllm_kwargs),
+        trust_remote_code=True,
+    )
+
+
+def _resolve_vllm_load_format(
+    vllm_cfg: dict[str, Any],
+    hf_config: PretrainedConfig,
+) -> str:
+    """Apply model-specific load rules using vLLM's effective HF config."""
+    load_format = vllm_cfg["load_format"]
+    if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches_config(hf_config):
+        return "auto"
+    return load_format
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -481,6 +510,7 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        hf_config = _load_vllm_hf_config(self.model_name, vllm_kwargs)
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
@@ -552,9 +582,10 @@ class BaseVllmGenerationWorker:
             os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
             os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
 
-        load_format = self.cfg["vllm_cfg"]["load_format"]
-        if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
-            load_format = "auto"
+        load_format = _resolve_vllm_load_format(
+            self.cfg["vllm_cfg"],
+            hf_config,
+        )
 
         # MTP speculative decoding with load_format="dummy" gets its policy
         # weights via refit, but the MTP draft layer is not covered by refit, so
@@ -602,7 +633,6 @@ class BaseVllmGenerationWorker:
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
-        hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
         self.routed_experts_dtype = resolve_routed_experts_dtype(
             get_num_routed_experts(hf_config)
         )
@@ -621,6 +651,8 @@ class BaseVllmGenerationWorker:
                 "Mistral3ForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_8FlashNextForConditionalGeneration",
+                "Qwen4ExpForConditionalGeneration",
             )
         ):
             detected_arch = [
@@ -633,6 +665,8 @@ class BaseVllmGenerationWorker:
                     "Mistral3ForConditionalGeneration",
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
+                    "Qwen3_8FlashNextForConditionalGeneration",
+                    "Qwen4ExpForConditionalGeneration",
                 )
             ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
@@ -932,6 +966,15 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
     def post_init(self):
         if self.llm is not None:
+            model_config = self.llm.llm_engine.model_config
+            if bool(getattr(model_config.hf_text_config, "ple_layer_ids", ())):
+                installed = self.llm.collective_rpc(
+                    "install_brightdelta_ngram_context_fix", args=tuple()
+                )
+                print(
+                    f"  • BrightDelta PLE rolling-context fix installed: {installed}",
+                    flush=True,
+                )
             self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
         if self._mtp_load_from_disk:
@@ -1266,7 +1309,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         return cast(list[str], list_of_worker_results)
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any] | list[dict[str, Any]]
+    ) -> None:
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
