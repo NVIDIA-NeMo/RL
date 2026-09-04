@@ -32,9 +32,8 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import torch
 
-FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
-
 from nemo_rl.data.llm_message_utils import attach_message_log_view
+from nemo_rl.data_plane.interfaces import backend_config
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -49,6 +48,8 @@ from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 if TYPE_CHECKING:
     from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
     from nemo_rl.data_plane.interfaces import DataPlaneClient
+
+FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 
 def _broadcast_batched_data_dict(
@@ -144,6 +145,15 @@ class TQWorkerMixin:
         if self._dp_client is not None:
             return
         from nemo_rl.data_plane import build_data_plane_client
+
+        if (
+            cfg["backend"] == "mooncake_cpu"
+            and backend_config(cfg).use_gdr
+            and not torch.cuda.is_initialized()
+        ):
+            raise RuntimeError(
+                "CUDA must be initialized before attaching TransferQueue with GDR"
+            )
 
         # bootstrap=False — the driver already created the named
         # controller actor; this process attaches as a client.

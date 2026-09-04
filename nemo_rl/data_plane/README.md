@@ -437,6 +437,8 @@ data_plane:
     local_buffer_size:    4294967296   # 4 GiB/process
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
     staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
+    use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024         # persistent MiB per active GDR client
   # observability:                     # NotRequired
   #   enabled: false
 ```
@@ -445,13 +447,29 @@ These keys used to sit directly under `data_plane:`. That spelling is not
 rejected — it is simply never read. A config still using it silently gets
 this backend's defaults instead of its own values: an inherited config
 supplies the nested block, so a surviving flat key always loses the merge,
-with no warning either way.
+with no warning either way. Earlier revisions of PR #3501 also used flat
+`use_gdr` and `gdr_staging_buffer_mb` keys; those two spellings are rejected
+with a migration error because silently disabling GDR would invalidate a run.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
   and small runs.
-- **`mooncake_cpu`** — Mooncake transfer engine; higher throughput at
-  scale. Required for multi-node clusters with large bulk volume.
+- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine. By default,
+  tensors transfer through registered CPU staging. Set
+  `mooncake_cpu.use_gdr: true` to let CUDA-initialized clients use
+  TransferQueue's GDR staging path. CPU-only clients, such as a
+  SingleController producer, continue to use CPU RDMA. GDR changes the
+  client-side tensor transfer and staging path; queued objects still reside in
+  Mooncake-managed host-memory segments.
+
+The CPU host staging pool's `staging_buffer_size` is independent of the GDR
+buffer. `gdr_staging_buffer_mb` is the persistent GPU staging capacity per
+active CUDA client and defaults to 1024 MiB. Transfers through that per-client
+buffer are serialized. Aggregate fetches may exceed the buffer and are split
+into groups. In the mixed CPU-producer/GDR-receiver flow used by
+SingleController, however, each individual tensor must currently fit because
+the CPU PUT path does not create the chunk metadata required by an oversized
+GDR GET.
 
 Capacity rule of thumb (any backend):
 
