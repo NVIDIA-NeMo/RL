@@ -477,16 +477,6 @@ EOF
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 ARG BASE_IMAGE
 RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
-NEGATIVE_FILTERS=""
-if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
-fi
-if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
-fi
-if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS trtllm"
-fi
 # Reuse the custom wheel produced by the hermetic stage. Normal uv artifacts
 # stay in /root/.cache/uv, which remains available to symlinked environments.
 # Mirror only the current content-addressed TRT-LLM wheel into the image so
@@ -504,11 +494,13 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 #
 # This is why the venvs cannot simply be built here in one pass: hardlinking against the
 # dependency layer's cache from this layer would make overlayfs copy every wheel up.
-if [[ -n "$NEGATIVE_FILTERS" ]]; then
-    UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
-else
-    UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py
-fi
+# Build exactly the venvs phase 1 built, by name. Re-deriving the list here would
+# mean filtering on the actor name again, which cannot tell that e.g.
+# AsyncTrajectoryCollector needs the vLLM extra -- so under SKIP_VLLM_BUILD the two
+# passes would disagree and this layer would build three venvs the dependency layer
+# deliberately skipped. prefetch_venvs.py matches these positionally as substrings,
+# and a full FQN matches only itself.
+UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py $(cut -f1 /opt/actor_venvs.tsv)
 EOF
 
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)

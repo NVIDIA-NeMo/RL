@@ -33,6 +33,8 @@ the image build in its most expensive layer.
 # runs under interpreters older than the one the image pins.
 from __future__ import annotations
 
+import sys
+
 # Actor fully-qualified name -> the uv extras its virtual environment needs.
 # ``None`` means the actor runs on the driver's interpreter and gets no venv.
 # Every extra must exist in ``[project.optional-dependencies]`` of pyproject.toml.
@@ -124,7 +126,14 @@ def main(argv: list[str]) -> int:
     AsyncTrajectoryCollector, whose name contains no "vllm".
     """
     stage = argv[1] if len(argv) > 1 and argv[1] != "all" else None
+    if stage not in (None, "deps", "trtllm"):
+        print(f"unknown stage: {stage!r}", file=sys.stderr)
+        return 2
     skip = set(argv[2:])
+    unknown = skip - {e for extras in ACTOR_ENVIRONMENTS.values() for e in extras or ()}
+    if unknown:
+        print(f"unknown extras: {sorted(unknown)}", file=sys.stderr)
+        return 2
     for actor_fqn, extras in sorted(ACTOR_ENVIRONMENTS.items()):
         if extras is None or skip & set(extras):
             continue
@@ -137,6 +146,4 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    import sys
-
     raise SystemExit(main(sys.argv))
