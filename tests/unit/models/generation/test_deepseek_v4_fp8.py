@@ -129,41 +129,14 @@ def test_remap_packed_module_path_leaves_other_architectures_alone(deepseek_v4_f
     )
 
 
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("model.layers.3.ffn.experts.17.w1.weight", 17),
-        ("ffn.experts.0.w2.weight", 0),
-        ("model.layers.3.ffn.experts.17.w1.weight_scale_inv", None),
-        ("model.layers.3.ffn.shared_experts.w1.weight", None),
-        ("model.layers.3.ffn.gate.weight", None),
-    ],
-)
-def test_get_exported_expert_id(deepseek_v4_fp8, name, expected):
-    assert deepseek_v4_fp8.get_exported_expert_id(DeepSeekV4ForCausalLM(), name) == (
-        expected
-    )
+class FakeFp8MoEMethod:
+    def __init__(self, block_quant, process_calls=None):
+        self.block_quant = block_quant
+        self.process_calls = process_calls
 
-
-def test_get_exported_expert_id_is_none_for_other_architectures(deepseek_v4_fp8):
-    assert (
-        deepseek_v4_fp8.get_exported_expert_id(
-            OtherForCausalLM(), "model.layers.3.ffn.experts.17.w1.weight"
-        )
-        is None
-    )
-
-
-def test_is_nonlocal_expert(deepseek_v4_fp8, monkeypatch):
-    class FakeRoutedExperts(torch.nn.Module):
-        def _map_global_expert_id_to_local_expert_id(self, expert_id):
-            return 0 if expert_id == 4 else -1
-
-    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExperts)
-    experts = FakeRoutedExperts()
-
-    assert deepseek_v4_fp8.is_nonlocal_expert(experts, 4) is False
-    assert deepseek_v4_fp8.is_nonlocal_expert(experts, 5) is True
+    def process_weights_after_loading(self, layer):
+        if self.process_calls is not None:
+            self.process_calls.append(layer)
 
 
 class FakeRoutedExpertsLayer(torch.nn.Module):
@@ -188,11 +161,60 @@ class FakeRoutedExpertsLayer(torch.nn.Module):
         self.w2_weight_scale_inv = torch.nn.Parameter(
             torch.zeros(2, 1, 1), requires_grad=False
         )
-        self.quant_method = types.SimpleNamespace(
-            process_weights_after_loading=lambda layer: (
-                process_calls.append(layer) if process_calls is not None else None
-            )
+        self.quant_method = FakeFp8MoEMethod(
+            block_quant=weight_block_size is not None,
+            process_calls=process_calls,
         )
+
+
+@pytest.fixture(autouse=True)
+def fake_fp8_moe_method(deepseek_v4_fp8, monkeypatch):
+    monkeypatch.setattr(deepseek_v4_fp8, "Fp8MoEMethod", FakeFp8MoEMethod)
+
+
+def _record_raw_expert_metadata(layer):
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    block_m, block_n = layer.weight_block_size
+    w13_shape = (
+        layer.num_experts,
+        2 * layer.intermediate_size_per_partition,
+        layer.hidden_size,
+    )
+    w2_shape = (
+        layer.num_experts,
+        layer.hidden_size,
+        layer.intermediate_size_per_partition,
+    )
+    get_layerwise_info(layer).restore_metadata = (
+        {
+            "w13_weight": torch.empty(
+                w13_shape, dtype=torch.float8_e4m3fn, device="meta"
+            ),
+            "w2_weight": torch.empty(
+                w2_shape, dtype=torch.float8_e4m3fn, device="meta"
+            ),
+            "w13_weight_scale_inv": torch.empty(
+                (
+                    w13_shape[0],
+                    (w13_shape[1] + block_m - 1) // block_m,
+                    (w13_shape[2] + block_n - 1) // block_n,
+                ),
+                dtype=torch.float32,
+                device="meta",
+            ),
+            "w2_weight_scale_inv": torch.empty(
+                (
+                    w2_shape[0],
+                    (w2_shape[1] + block_m - 1) // block_m,
+                    (w2_shape[2] + block_n - 1) // block_n,
+                ),
+                dtype=torch.float32,
+                device="meta",
+            ),
+        },
+        {},
+    )
 
 
 def test_prepare_refit_restores_raw_expert_shapes_and_dtypes(
@@ -200,6 +222,7 @@ def test_prepare_refit_restores_raw_expert_shapes_and_dtypes(
 ):
     monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
     layer = FakeRoutedExpertsLayer(weight_block_size=[2, 2])
+    _record_raw_expert_metadata(layer)
     model = torch.nn.Sequential(layer)
 
     added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
@@ -219,7 +242,9 @@ def test_prepare_refit_marks_expert_and_sink_tensors_for_immediate_load(
     deepseek_v4_fp8, monkeypatch, skip_tensors
 ):
     monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
-    model = torch.nn.Sequential(FakeRoutedExpertsLayer(weight_block_size=[2, 2]))
+    layer = FakeRoutedExpertsLayer(weight_block_size=[2, 2])
+    _record_raw_expert_metadata(layer)
+    model = torch.nn.Sequential(layer)
 
     added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
 
@@ -237,7 +262,9 @@ def test_restore_refit_preserves_preexisting_global_skip_names(
     monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
     baseline = set(skip_tensors)
     skip_tensors.update({"attn_sink", "preexisting"})
-    model = torch.nn.Sequential(FakeRoutedExpertsLayer(weight_block_size=[2, 2]))
+    layer = FakeRoutedExpertsLayer(weight_block_size=[2, 2])
+    _record_raw_expert_metadata(layer)
+    model = torch.nn.Sequential(layer)
 
     added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
     deepseek_v4_fp8.restore_refit(added_skip_tensors)
@@ -256,3 +283,18 @@ def test_finalize_refit_requantizes_block_scaled_experts(deepseek_v4_fp8, monkey
     deepseek_v4_fp8.finalize_refit(model)
 
     assert process_calls == [quantized]
+
+
+def test_refit_ignores_unquantized_routed_experts(
+    deepseek_v4_fp8, monkeypatch, skip_tensors
+):
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
+    layer = FakeRoutedExpertsLayer(weight_block_size=None)
+    model = torch.nn.Sequential(layer)
+
+    added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
+
+    assert added_skip_tensors == {"attn_sink"}
+    assert "w13_weight" not in skip_tensors
+    deepseek_v4_fp8.finalize_refit(model)
+    deepseek_v4_fp8.restore_refit(added_skip_tensors)
