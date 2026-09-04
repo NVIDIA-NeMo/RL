@@ -501,6 +501,29 @@ def test_mixed_native_refit_preserves_post_load_mxfp8_scale(monkeypatch, transpo
 
 
 @pytest.mark.vllm
+def test_fp8_load_uses_buffer_safe_model_loader(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    weights = [("model.weight", torch.ones(2))]
+    load_weights = MagicMock()
+
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+    monkeypatch.setattr(fp8, "load_weights", load_weights)
+
+    ext._load_hf_weights(weights)
+
+    args = load_weights.call_args.args
+    assert args[:2] == (weights, ext.model_runner)
+    assert args[2].__self__ is ext
+    assert args[2].__func__ is ext._load_full_hf_weights.__func__
+
+
+@pytest.mark.vllm
 def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypatch):
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 
@@ -713,6 +736,24 @@ def test_quantized_model_uses_native_refit_for_realized_bf16_trtllm_modules():
     )
 
     assert ext._uses_unquantized_flashinfer_trtllm() is True
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("transport", ["ipc", "collective", "nccl_reshard"])
+def test_mixed_native_refit_rejects_fp8_kv_cache(transport):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM")
+    )
+    ext._uses_fp8_kv_cache = lambda: True
+    ext._mtp_drafter_refit_enabled = lambda: False
+
+    with pytest.raises(RuntimeError, match="FP8 KV cache"):
+        ext._validate_native_layerwise_refit(transport)
 
 
 @pytest.mark.vllm
