@@ -686,11 +686,12 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Frequent rollout-state snapshots anchored to durable trainer state.
 
-    ``interval_s=None`` disables periodic snapshots. A snapshot taken before
-    the first trainer checkpoint is anchored to the initial model and a
-    rollout-semantic configuration fingerprint. Later snapshots require the
-    durable trainer checkpoint for the controller's current completed step;
-    interval attempts are skipped until that exact anchor exists.
+    ``interval_s=None`` disables saving and restoring periodic snapshots. A
+    snapshot taken before the first trainer checkpoint is anchored to the
+    initial model and a rollout-semantic configuration fingerprint. Later
+    snapshots require the durable trainer checkpoint for the controller's
+    current completed step; interval attempts are skipped until that exact
+    anchor exists.
 
     ``restore_mode="latest"`` selects the newest compatible periodic snapshot.
     ``trainer_checkpoint`` ignores newer periodic snapshots and restores the

@@ -76,7 +76,6 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ensure_bootstrap_anchor,
     reset_bootstrap_anchor,
     resolve_latest_snapshot,
-    validate_bootstrap_anchor,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -991,6 +990,16 @@ def setup_single_controller(
                 "rollout checkpointing requires a sampler that explicitly "
                 "supports training-claim ownership"
             )
+        if master_config.checkpointing["save_period"] != 1:
+            warnings.warn(
+                "rollout checkpointing is enabled with "
+                f"checkpointing.save_period={master_config.checkpointing['save_period']}; "
+                "periodic rollout snapshots can only be saved while a matching "
+                "trainer checkpoint exists. Set checkpointing.save_period=1 for "
+                "continuous post-step coverage.",
+                UserWarning,
+                stacklevel=2,
+            )
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
             raise ValueError(
@@ -1065,9 +1074,9 @@ def setup_single_controller(
     restore_mode = rollout_checkpoint_cfg.restore_mode
     recovery_checkpoint_path = trainer_checkpoint_path
     bootstrap_anchor = checkpointer.checkpoint_dir / BOOTSTRAP_DIRNAME
-    needs_bootstrap_identity = trainer_checkpoint_path is None and (
-        rollout_checkpoint_cfg.interval_s is not None
-        or (restore_mode == "latest" and bootstrap_anchor.is_dir())
+    needs_bootstrap_identity = (
+        trainer_checkpoint_path is None
+        and rollout_checkpoint_cfg.interval_s is not None
     )
     bootstrap_digest = (
         bootstrap_fingerprint(master_config) if needs_bootstrap_identity else None
@@ -1078,7 +1087,11 @@ def setup_single_controller(
         if save_state.trainer_version is not None
         else save_state.current_step
     )
-    if trainer_checkpoint_path is not None and restore_mode == "latest":
+    if (
+        trainer_checkpoint_path is not None
+        and rollout_checkpoint_cfg.interval_s is not None
+        and restore_mode == "latest"
+    ):
         resolved_snapshot = resolve_latest_snapshot(
             Path(trainer_checkpoint_path),
             expected_train_step=save_state.current_step,
@@ -1108,13 +1121,11 @@ def setup_single_controller(
                         f"rollout_checkpointing.restore_mode={restore_mode!r}.",
                         flush=True,
                     )
-        elif restore_mode == "latest" and bootstrap_anchor.is_dir():
-            assert bootstrap_digest is not None
-            validate_bootstrap_anchor(
-                bootstrap_anchor,
-                fingerprint=bootstrap_digest,
-            )
-        if restore_mode == "latest" and bootstrap_anchor.is_dir():
+        if (
+            rollout_checkpoint_cfg.interval_s is not None
+            and restore_mode == "latest"
+            and bootstrap_anchor.is_dir()
+        ):
             resolved_snapshot = resolve_latest_snapshot(
                 bootstrap_anchor,
                 expected_train_step=0,

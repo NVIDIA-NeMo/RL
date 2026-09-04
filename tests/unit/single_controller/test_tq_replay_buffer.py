@@ -1133,8 +1133,7 @@ class TestTQReplayBufferStateDict:
             )
             unready_group_id = buf.reserve(weight_version=0, group_id="unready")
             ready_group_ids = [
-                buf.reserve(weight_version=i, group_id=f"ready-{i}")
-                for i in (1, 2)
+                buf.reserve(weight_version=i, group_id=f"ready-{i}") for i in (1, 2)
             ]
             for i, group_id in enumerate(ready_group_ids, start=1):
                 await buf.commit(

@@ -79,6 +79,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     RolloutCheckpointConfig,
     setup_single_controller,
 )
+from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_DIRNAME,
     ROLLOUT_SNAPSHOT_COMMITTED_FILENAME,
@@ -115,6 +116,7 @@ from tests.unit.single_controller.test_setup import (
 _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
 
 _PARTITION_ID = "rollout_data"
+_STAGING_PARTITION_ID = "rollout_staging"
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────
@@ -313,8 +315,11 @@ class _FakeDPClient:
         self.sample_ids = list(sample_ids or [])
 
     def list_sample_ids(self, partition_id: str) -> list[str]:
-        assert partition_id == _PARTITION_ID
-        return sorted(self.sample_ids)
+        if partition_id == _PARTITION_ID:
+            return sorted(self.sample_ids)
+        if partition_id == _STAGING_PARTITION_ID:
+            return []
+        raise AssertionError(f"unexpected partition_id={partition_id!r}")
 
     def clear_samples(self, sample_ids: list[str], partition_id: str) -> None:
         self.clear_thread_ids.append(threading.get_ident())
@@ -530,6 +535,7 @@ def _actor_master_config(
     buffer_checkpoint: bool = False,
     data_plane_checkpoint: bool = True,
     rollout_checkpoint_interval_s: Optional[float] = None,
+    token_capture_enabled: bool = False,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -592,6 +598,7 @@ def _actor_master_config(
         rollout_checkpointing=RolloutCheckpointConfig(
             interval_s=rollout_checkpoint_interval_s
         ),
+        token_capture=TokenCaptureConfig(enabled=token_capture_enabled),
     )
 
 
@@ -1079,6 +1086,7 @@ class TestPeriodicRolloutCheckpoint:
             tmp_path,
             buffer_checkpoint=True,
             rollout_checkpoint_interval_s=120.0,
+            token_capture_enabled=True,
         )
         return _ACTOR_CLS(
             config,
@@ -1205,9 +1213,41 @@ class TestPeriodicRolloutCheckpoint:
         assert "consecutive_failures=1" in output
         assert "consecutive_failures=2" in output
 
+    def test_periodic_pump_aborts_after_repeated_failures(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        actor = self._actor(tmp_path)
+        actor._master_config.rollout_checkpointing.interval_s = 0.001
+        actor._train_steps = 1
+
+        async def _main() -> None:
+            async def _failing_save(*, force: bool = False) -> bool:
+                del force
+                raise OSError("storage unavailable")
+
+            actor._save_rollout_checkpoint = _failing_save
+            with pytest.raises(
+                RuntimeError,
+                match="periodic rollout checkpoint failed 3 consecutive times",
+            ):
+                await asyncio.wait_for(
+                    actor._rollout_checkpoint_pump(),
+                    timeout=1.0,
+                )
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        output = capsys.readouterr().out
+        assert output.count("Periodic rollout checkpoint failed") == 3
+
 
 class TestDataPlaneCheckpoint:
-    def test_metadata_uses_pre_await_save_state_snapshot(self, tmp_path):
+    def test_metadata_uses_explicit_snapshot_identity(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=1,
@@ -1225,12 +1265,16 @@ class TestDataPlaneCheckpoint:
                 _make_actor_args(save_state=save_state, dp_client=dp_client),
                 SetupTimingMetrics(),
             )
-            # Simulate live fields diverging after _save_checkpoint captured
-            # save_state. The rollout pump can advance _current_epoch while
-            # checkpoint I/O awaits; both fields must come from one snapshot.
+            # The helper receives one explicit identity instead of reading
+            # mutable controller fields after checkpoint I/O has started.
             actor._trainer_version = 11
             actor._current_epoch = 5
-            await actor._save_data_plane_checkpoint(str(tmp_path / "tmp_step_3"))
+            await actor._save_data_plane_checkpoint(
+                str(tmp_path / "tmp_step_3"),
+                train_steps=3,
+                trainer_version=7,
+                current_epoch=2,
+            )
             actor._checkpointer.shutdown()
 
         asyncio.run(_main())
@@ -1839,6 +1883,30 @@ def _write_checkpoint(
     return step_dir
 
 
+def _write_periodic_snapshot(step_dir: Path) -> Path:
+    """Write one committed rollout snapshot newer than its trainer anchor."""
+    tmp_snapshot, final_snapshot, _ = prepare_snapshot_paths(step_dir)
+    torch.save(
+        {"fake_position": 7},
+        tmp_snapshot / "train_dataloader.pt",
+    )
+    manifest = RolloutSnapshotManifest(
+        schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        base_train_step=3,
+        trainer_version=3,
+        current_epoch=4,
+        sampler_dispatch_index=6,
+        mutation_version=9,
+        rolled_back_train_group_count=0,
+        bootstrap_fingerprint=None,
+    )
+    (tmp_snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
+        json.dumps(manifest.to_dict())
+    )
+    commit_snapshot(tmp_snapshot, final_snapshot, keep_latest_k=2)
+    return final_snapshot
+
+
 def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
     """Partially-populated MasterConfig for setup_single_controller tests.
 
@@ -1965,32 +2033,74 @@ class TestSetupResumeWiring:
             _STEP_3_SAVE_STATE,
             dataloader_state={"fake_position": 3},
         )
-        tmp_snapshot, final_snapshot, _ = prepare_snapshot_paths(step_3)
-        torch.save(
-            {"fake_position": 7},
-            tmp_snapshot / "train_dataloader.pt",
-        )
-        manifest = RolloutSnapshotManifest(
-            schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
-            base_train_step=3,
-            trainer_version=3,
-            current_epoch=4,
-            sampler_dispatch_index=6,
-            mutation_version=9,
-            rolled_back_train_group_count=0,
-            bootstrap_fingerprint=None,
-        )
-        (tmp_snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
-            json.dumps(manifest.to_dict())
-        )
-        commit_snapshot(tmp_snapshot, final_snapshot, keep_latest_k=2)
+        final_snapshot = _write_periodic_snapshot(step_3)
         mc = _setup_master_config(str(ckpt_dir))
+        mc.checkpointing["save_period"] = 1
+        mc.rollout_checkpointing = RolloutCheckpointConfig(interval_s=120.0)
+        mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.logger = {"log_dir": str(tmp_path / "logs")}
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
 
-        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        with (
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.setup.should_use_nemo_gym",
+                return_value=True,
+            ),
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.setup.spinup_nemo_gym_actor",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.setup.router_replay_enabled",
+                return_value=False,
+            ),
+            patch(
+                "nemo_rl.experience.finalizer_actor.create_finalizer_actors",
+                return_value=[MagicMock(name="finalizer")],
+            ),
+        ):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.save_state.current_epoch == 4
         assert actor_args.save_state.sampler_dispatch_index == 6
         assert actor_args.last_checkpoint_path == str(final_snapshot)
+
+    def test_disabled_periodic_checkpointing_uses_trainer_anchor(
+        self,
+        patched_factories,  # noqa: F811
+        tmp_path,
+    ):
+        ckpt_dir = tmp_path / "ckpts"
+        step_3 = _write_checkpoint(
+            ckpt_dir,
+            3,
+            _STEP_3_SAVE_STATE,
+            dataloader_state={"fake_position": 3},
+        )
+        _write_periodic_snapshot(step_3)
+        mc = _setup_master_config(str(ckpt_dir))
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            interval_s=None,
+            restore_mode="latest",
+        )
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.save_state.current_epoch == 1
+        assert actor_args.save_state.sampler_dispatch_index is None
+        assert actor_args.last_checkpoint_path == str(step_3)
 
     def test_setup_fresh_start_passes_none_paths(
         self,
