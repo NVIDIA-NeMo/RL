@@ -809,13 +809,23 @@ class VllmInternalWorkerExtension:
         if not self._supports_unquantized_flashinfer_trtllm_refit():
             return False
         model_runner = getattr(self, "model_runner", None)
-        vllm_config = getattr(model_runner, "vllm_config", None)
-        if vllm_config is None:
-            return False
-        if getattr(vllm_config, "quant_config", None) is not None:
+        model = getattr(model_runner, "model", None)
+        if model is None:
             return False
 
-        return _model_uses_unquantized_flashinfer_trtllm(self.model_runner.model)
+        # Deliberately not short-circuited on `vllm_config.quant_config`. A
+        # mixed-precision model has a quant_config *and* unquantized TRTLLM MoE
+        # modules: the layers inside the first/last BF16 boundary are excluded
+        # from the recipe, so they realize UnquantizedFusedMoEMethod on the
+        # TRTLLM backend and need the same layerwise reload lifecycle as a
+        # fully-BF16 model. Reading the config instead of the realized modules
+        # sends exactly that case down the bulk process_weights_after_loading
+        # path, which never rebuilds the TRTLLM kernel's private layout.
+        #
+        # The narrowing is asked of the module walk instead, which is where the
+        # answer actually lives: a fully-quantized model has no such modules and
+        # is unaffected, and so is a fully-unquantized one.
+        return _model_uses_unquantized_flashinfer_trtllm(model)
 
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         """Return whether this transport needs vLLM's layerwise lifecycle."""

@@ -201,7 +201,7 @@ def test_init_collective_keeps_generation_ranks_after_the_training_ranks(
     assert recording_group.instances[0].kwargs["rank"] == 4
 
 
-def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
+def _unquantized_moe_module(moe_backend: str) -> SimpleNamespace:
     from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
         UnquantizedMoeBackend,
     )
@@ -211,8 +211,38 @@ def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
 
     quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
     quant_method.unquantized_backend = UnquantizedMoeBackend(moe_backend)
-    module = SimpleNamespace(quant_method=quant_method)
-    return SimpleNamespace(modules=lambda: [module])
+    return SimpleNamespace(quant_method=quant_method)
+
+
+def _quantized_moe_module() -> SimpleNamespace:
+    """A MoE layer inside the quantization recipe, so not an unquantized method."""
+    return SimpleNamespace(quant_method=object())
+
+
+def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
+    return SimpleNamespace(modules=lambda: [_unquantized_moe_module(moe_backend)])
+
+
+def _make_quantized_moe_model() -> SimpleNamespace:
+    return SimpleNamespace(modules=lambda: [_quantized_moe_module()])
+
+
+def _make_mixed_precision_moe_model(moe_backend: str) -> SimpleNamespace:
+    """The production layout: BF16 boundary layers beside quantized ones.
+
+    ``keep_bf16_first_layers``/``keep_bf16_last_layers`` put the boundary layers
+    outside the recipe, so they realize an unquantized method while the rest of
+    the stack realizes the quantized one. The engine still carries a
+    ``quant_config``, which is why reading the config rather than the realized
+    modules gets this case wrong.
+    """
+    modules = [
+        _unquantized_moe_module(moe_backend),
+        _quantized_moe_module(),
+        _quantized_moe_module(),
+        _unquantized_moe_module(moe_backend),
+    ]
+    return SimpleNamespace(modules=lambda: modules)
 
 
 @pytest.mark.vllm
@@ -485,7 +515,7 @@ def test_layerwise_reload_propagates_detach_error_after_successful_load(monkeypa
 def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    model = object()
+    model = _make_quantized_moe_model()
     model_config = object()
     vllm_config = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
@@ -564,14 +594,14 @@ def test_realized_moe_backend_controls_native_refit_lifecycle():
 
 
 @pytest.mark.vllm
-def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
+def test_a_fully_quantized_model_does_not_use_the_unquantized_lifecycle():
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
+        model=_make_quantized_moe_model(),
         vllm_config=SimpleNamespace(quant_config=object()),
     )
 
@@ -579,16 +609,51 @@ def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
 
 
 @pytest.mark.vllm
+def test_a_bf16_boundary_layer_pulls_a_quantized_model_into_the_lifecycle():
+    """The first/last-BF16 case: quant_config set, some MoE layers unquantized.
+
+    This is the layout production runs. Deciding on ``quant_config`` alone reads
+    it as fully quantized and sends it down the bulk
+    ``process_weights_after_loading`` path, which never rebuilds the TRTLLM
+    kernel's private layout for the boundary layers that actually need it.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_mixed_precision_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(quant_config=object()),
+    )
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is True
+
+    # And only because of the backend, not because the model is mixed: a mixed
+    # model on TRITON has nothing the native lifecycle is needed for.
+    ext.model_runner.model = _make_mixed_precision_moe_model("TRITON")
+    assert ext._uses_unquantized_flashinfer_trtllm() is False
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
-    ("moe_backend", "quant_config", "expected"),
+    ("make_model", "quant_config", "expected"),
     [
-        ("FlashInfer TRTLLM", None, True),
-        ("TRITON", None, False),
-        ("FlashInfer TRTLLM", object(), False),
+        (lambda: _make_unquantized_moe_model("FlashInfer TRTLLM"), None, True),
+        (lambda: _make_unquantized_moe_model("TRITON"), None, False),
+        (lambda: _make_quantized_moe_model(), object(), False),
+        # Mixed precision is fatal for the same reason a BF16 model is: the
+        # boundary layers ran through the native lifecycle, so a failed update
+        # leaves their kernel layout describing weights that no longer exist.
+        (
+            lambda: _make_mixed_precision_moe_model("FlashInfer TRTLLM"),
+            object(),
+            True,
+        ),
     ],
 )
 def test_weight_update_errors_are_fatal_only_for_native_trtllm_refit(
-    moe_backend, quant_config, expected
+    make_model, quant_config, expected
 ):
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -596,7 +661,7 @@ def test_weight_update_errors_are_fatal_only_for_native_trtllm_refit(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=_make_unquantized_moe_model(moe_backend),
+        model=make_model(),
         vllm_config=SimpleNamespace(quant_config=quant_config),
     )
 
