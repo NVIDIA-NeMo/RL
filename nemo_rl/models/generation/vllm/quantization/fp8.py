@@ -458,9 +458,7 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-def _get_module_from_param_name(
-    model: torch.nn.Module, name: str
-) -> torch.nn.Module | None:
+def _get_module_from_param_name(model, name: str):
     name = deepseek_v4_fp8.map_checkpoint_name(model, name)
 
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
