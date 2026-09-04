@@ -17,11 +17,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import threading
 from typing import Any
 
 import pytest
 import torch
+from wandb import Table
 
 import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -35,7 +37,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
@@ -982,6 +985,54 @@ class TestTQReplayBufferStateDict:
             }
         ]
         assert restored_dp.put_calls == []
+
+    def test_checkpoint_serialization_preserves_full_result_table(self):
+        """Opt-in NeMo Gym tables remain usable after the torch checkpoint round trip."""
+        gym_impl = AsyncNemoGymRolloutImpl(
+            tokenizer=None,
+            task_to_env={},
+            num_generations_per_prompt=1,
+            max_seq_len=16,
+            max_rollout_turns=1,
+            generation_config={
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+            },
+            log_full_result_tables=True,
+        )
+        rollout_metrics = gym_impl._compute_rollout_metrics(
+            [
+                Completion(
+                    message_log=[
+                        {"role": "user", "token_ids": [1]},
+                        {"role": "assistant", "token_ids": [2]},
+                    ],
+                    env_extras={"reward": 1.0, "status": "completed"},
+                    truncated=False,
+                    reward=1.0,
+                )
+            ],
+            "agent",
+        )
+        assert isinstance(rollout_metrics["agent/full_result"], Table)
+
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=1, rollout_metrics=rollout_metrics)
+
+        payload = io.BytesIO()
+        torch.save(buf.metadata_state_dict(saved_capacity=8), payload)
+        payload.seek(0)
+        restored_state = torch.load(payload, weights_only=False)
+
+        restored_buf = _make_buffer(FakeDataPlaneClient())
+        assert _load(restored_buf, restored_state) == 1
+        restored_table = restored_buf.meta_list[0].extra_info[ROLLOUT_METRICS][0][
+            "agent/full_result"
+        ]
+        assert isinstance(restored_table, Table)
+        assert restored_table.columns == ["Full result"]
+        assert restored_table.data == [['{"reward":1.0,"status":"completed"}']]
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
         # start != end and a non-None target_step must survive the round-trip:
