@@ -340,7 +340,12 @@ class DTensorPolicyWorkerImpl(
                 raise ValueError(f"Unknown reward model type: {rm_type}")
         else:
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
-            model_class = resolve_model_class(model_config.model_type)
+            # This worker loads weights on rank 0 and applies FSDP itself. NeMo
+            # AutoModel wrappers may run collectives while the other ranks wait.
+            model_class = resolve_model_class(
+                model_config.model_type,
+                use_nemo_automodel=False,
+            )
 
         full_state_dict = None
         if self.rank == 0:
