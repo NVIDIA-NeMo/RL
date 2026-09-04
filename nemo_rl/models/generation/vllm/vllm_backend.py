@@ -140,6 +140,23 @@ def _unquantized_flashinfer_trtllm_modules(
     ]
 
 
+def _process_mxfp8_modules_after_native_reload(model: torch.nn.Module) -> None:
+    """Rebuild MXFP8 runtime layouts skipped by the partial native reload."""
+    try:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8FusedMoE,
+            ModelOptMxFp8LinearMethod,
+        )
+    except ImportError:
+        return
+
+    mxfp8_methods = (ModelOptMxFp8FusedMoE, ModelOptMxFp8LinearMethod)
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, mxfp8_methods):
+            quant_method.process_weights_after_loading(module)
+
+
 def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
     """Return whether a model realized the unquantized TRTLLM MoE backend."""
     return bool(_unquantized_flashinfer_trtllm_modules(model))
@@ -962,6 +979,7 @@ class VllmInternalWorkerExtension:
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
+                    _process_mxfp8_modules_after_native_reload(model)
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
