@@ -142,6 +142,10 @@ policy:
       - <so_start>
       - <so_end>
     vllm_cfg:
+      # The frozen vision tower is not covered by trainer->vLLM refit, so the
+      # engine must load real checkpoint weights at boot (see
+      # nemo_rl/models/generation/__init__.py).
+      load_format: auto
       tensor_parallel_size: 4
       logprobs_mode: raw_logprobs
       gpu_memory_utilization: 0.7
