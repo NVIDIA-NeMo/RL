@@ -306,7 +306,11 @@ def _read_mtp_layer_weights_from_checkpoint(
     shard_to_names: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
         match = layer_re.search(name)
-        if match is not None and int(match.group(1)) in mtp_layer_indices:
+        is_mtp_namespace = "mtp" in name.split(".")
+        is_trailing_mtp_layer = (
+            match is not None and int(match.group(1)) in mtp_layer_indices
+        )
+        if is_mtp_namespace or is_trailing_mtp_layer:
             shard_to_names.setdefault(shard, []).append(name)
 
     weights: list[tuple[str, torch.Tensor]] = []
@@ -320,9 +324,14 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
-    # True once the MTP drafter has been served by a one-time disk load (see
-    # load_mtp_weights_from_disk); refit then leaves those static weights alone.
-    _mtp_drafter_from_disk: bool = False
+    # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
+    # Declared rather than sprung into existence so a rebuild can release the previous
+    # ones without probing, matching AbstractPolicyWorker.model_update_group. None and
+    # not {} because a mutable class-level default is shared by every instance.
+    pp_comm_groups: Optional[dict[int, Any]] = None
+    # False for a checkpoint-loaded static MTP drafter; True only when the
+    # trainer exports MTP weights in every policy refit stream.
+    _mtp_drafter_weights_from_refit: bool = True
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
     _nrl_layerwise_reload_active: bool = False
@@ -615,6 +624,10 @@ class VllmInternalWorkerExtension:
         draft_owner = getattr(self.model_runner, "drafter", None)
         return getattr(draft_owner, "model", None) if draft_owner else None
 
+    def configure_mtp_drafter_weight_source(self, weights_from_refit: bool) -> None:
+        """Record whether the trainer owns and refreshes the MTP weights."""
+        self._mtp_drafter_weights_from_refit = weights_from_refit
+
     def _load_draft_weights(
         self, draft_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
@@ -643,7 +656,7 @@ class VllmInternalWorkerExtension:
         does not co-train the MTP layer — to avoid clobbering and re-processing
         those static weights.
         """
-        if self._mtp_drafter_from_disk:
+        if not self._mtp_drafter_weights_from_refit:
             return False
         spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
         method = getattr(spec_config, "method", None) if spec_config else None
@@ -767,9 +780,8 @@ class VllmInternalWorkerExtension:
                 process_weights_after_loading(
                     draft_model, draft_model_config, self.device
                 )
-        # Mark that the MTP drafter is served from a one-time disk load so refit
-        # does not re-load or re-process these static weights.
-        self._mtp_drafter_from_disk = True
+        # This drafter is served by the checkpoint rather than the refit stream.
+        self._mtp_drafter_weights_from_refit = False
         logger.info(
             "[mtp] Loaded MTP draft weights for layers %s from %s",
             sorted(mtp_layer_indices),
