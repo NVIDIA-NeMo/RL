@@ -263,16 +263,10 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="the `ppo` block is absent"):
             validate_single_controller_config(mc)
 
-    def test_rejects_multi_chunk_streaming(self):
-        """PPO cannot spread one full-batch optimizer epoch across chunks."""
+    def test_accepts_multi_chunk_streaming(self):
+        """The split APIs accumulate one full PPO step across rollout chunks."""
         mc = _ppo_master_config(min_groups_for_streaming_train=1)
-
-        with pytest.raises(
-            ValueError,
-            match=r"min_groups_for_streaming_train \(1\) == "
-            rf"num_prompts_per_step \({_NUM_PROMPTS_PER_STEP}\)",
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_value_global_batch_size_mismatch(self):
         mc = _ppo_master_config(value=_value_config(train_global_batch_size=4))
@@ -366,7 +360,7 @@ class TestPPOValidation:
         "field", ["max_skipped_prompts", "max_consecutive_dropped_prompts"]
     )
     def test_rejects_a_drop_budget_under_ppo(self, field):
-        """A drop shortens the step; the critic shards against the configured size."""
+        """A shortened step is not guaranteed to divide across critic DP."""
         mc = _ppo_master_config()
         setattr(mc.async_rl.rollout_failure, field, 1)
 

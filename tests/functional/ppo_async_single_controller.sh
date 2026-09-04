@@ -54,7 +54,9 @@ TRAIN_CMD=(
     async_rl.sampler.name=in_order
     async_rl.sampler.max_lookahead_versions=1
     async_rl.sampler.warmup_lookahead_versions=2
-    async_rl.min_groups_for_streaming_train=2
+    # Force two one-group chunks so every actor/critic epoch exercises the
+    # split accumulation path instead of receiving the full step at once.
+    async_rl.min_groups_for_streaming_train=1
     async_rl.max_inflight_prompts=6
     async_rl.max_buffered_rollouts=6
     cluster.gpus_per_node=2
