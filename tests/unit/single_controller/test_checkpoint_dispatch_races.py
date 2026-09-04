@@ -60,6 +60,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
+    RecoveryGranularity,
     RolloutRecoveryLedger,
     build_rollout_recovery_state,
 )
@@ -251,6 +252,12 @@ class _BlockingRolloutManager:
     def set_weight_version(self, version: int) -> None:
         self.weight_version = version
 
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        """Accept the controller-owned barrier used by the production manager."""
+        del barrier
+
     def reserve_prompt_group(
         self,
         cut: DataPlaneMutationCut | None,
@@ -354,6 +361,8 @@ class _LedgerFacade:
             expected_generations=2,
             target_step=target_step,
             start_weight_version=7,
+            agent_name=None,
+            recovery_granularity=RecoveryGranularity.SIBLING,
             admitted=admitted,
             admission_id=admission_id,
         )
@@ -904,6 +913,9 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         controller = object.__new__(controller_cls)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
+        controller._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(enabled=False)
+        )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -1011,6 +1023,9 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         controller = object.__new__(controller_cls)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
+        controller._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(enabled=False)
+        )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -1164,6 +1179,9 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         controller = object.__new__(controller_cls)
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._rollout_manager = rollout_manager
+        controller._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(enabled=False)
+        )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,

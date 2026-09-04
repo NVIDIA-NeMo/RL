@@ -451,7 +451,12 @@ def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
     """
     row: dict[str, torch.Tensor] = {}
     for field in rows.keys():
-        row[str(field)] = rows.get(field)[index].unsqueeze(0)
+        value = rows.get(field)
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"staging field {field!r} must be a tensor, got {type(value).__name__}"
+            )
+        row[str(field)] = value[index].unsqueeze(0)
     return row
 
 
@@ -515,31 +520,31 @@ def _row_to_snapshot(row: Any, *, include_routes: bool) -> StagedCallSnapshot:
     ):
         raise ValueError(f"unknown routed_experts_encoding {routed_encoding}")
 
-    values = dict(
-        schema_version=int(_leaf("schema_version")[0].item()),
-        digest_version=int(_leaf("digest_version")[0].item()),
-        extras_digest_version=int(_leaf("extras_digest_version")[0].item()),
-        rollout_id=_text("rollout_id_utf8"),
-        model_call_id=_text("model_call_id_utf8"),
-        parent_call_id=parent_call_id,
-        mode=mode,
-        prev_len=int(_leaf("prev_len")[0].item()),
-        delta_len=int(_leaf("delta_len")[0].item()),
-        cum_len=int(_leaf("cum_len")[0].item()),
-        weight_version=int(_leaf("weight_version")[0].item()),
-        digest=_digest("digest_bytes"),
-        token_ids_delta=[int(t) for t in _leaf("token_ids_delta").tolist()],
-        token_mask_delta=[float(m) for m in _leaf("token_mask_delta").tolist()],
-        generation_log_probs_delta=[
+    values: dict[str, Any] = {
+        "schema_version": int(_leaf("schema_version")[0].item()),
+        "digest_version": int(_leaf("digest_version")[0].item()),
+        "extras_digest_version": int(_leaf("extras_digest_version")[0].item()),
+        "rollout_id": _text("rollout_id_utf8"),
+        "model_call_id": _text("model_call_id_utf8"),
+        "parent_call_id": parent_call_id,
+        "mode": mode,
+        "prev_len": int(_leaf("prev_len")[0].item()),
+        "delta_len": int(_leaf("delta_len")[0].item()),
+        "cum_len": int(_leaf("cum_len")[0].item()),
+        "weight_version": int(_leaf("weight_version")[0].item()),
+        "digest": _digest("digest_bytes"),
+        "token_ids_delta": [int(t) for t in _leaf("token_ids_delta").tolist()],
+        "token_mask_delta": [float(m) for m in _leaf("token_mask_delta").tolist()],
+        "generation_log_probs_delta": [
             float(p) for p in _leaf("generation_logprobs_delta").tolist()
         ],
-        extras=extras,
-        extras_digest=_digest("extras_digest_bytes"),
-        chain_hash=_optional_digest("chain_hash_bytes", "chain_hash_present"),
-        cumulative_hash=_optional_digest(
+        "extras": extras,
+        "extras_digest": _digest("extras_digest_bytes"),
+        "chain_hash": _optional_digest("chain_hash_bytes", "chain_hash_present"),
+        "cumulative_hash": _optional_digest(
             "cumulative_hash_bytes", "cumulative_hash_present"
         ),
-    )
+    }
     if include_routes or routed_encoding == _ROUTE_ENCODING_NONE:
         return StagedCallSnapshot(**values)
     # Metadata-only deferred finalization deliberately leaves the heavy route

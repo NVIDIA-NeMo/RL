@@ -53,10 +53,18 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.algorithms.single_controller_utils.config import (
+    validate_single_controller_config,
+)
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 
 class _CheckpointingCustomSampler(WindowedSampler):
@@ -424,6 +432,85 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
     )
 
 
+def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
+    tmp_path: Path,
+) -> None:
+    """The two-phase Gym recovery fixture must pass SC config validation."""
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    config = load_config(
+        repo_root / "examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml"
+    )
+    overrides = [
+        "policy.model_name=Qwen/Qwen3-0.6B",
+        "policy.dtensor_cfg.enabled=false",
+        "policy.megatron_cfg.enabled=true",
+        "policy.megatron_cfg.tensor_model_parallel_size=1",
+        "policy.megatron_cfg.pipeline_model_parallel_size=1",
+        "policy.megatron_cfg.expert_model_parallel_size=1",
+        "policy.megatron_cfg.context_parallel_size=1",
+        "policy.megatron_cfg.sequence_parallel=false",
+        "policy.generation.vllm_cfg.tensor_parallel_size=1",
+        "policy.generation.vllm_cfg.async_engine=true",
+        "policy.max_total_sequence_length=512",
+        "policy.generation.colocated.enabled=false",
+        "policy.generation.colocated.resources.num_nodes=1",
+        "policy.generation.colocated.resources.gpus_per_node=1",
+        "grpo.num_prompts_per_step=4",
+        "grpo.num_generations_per_prompt=2",
+        "grpo.max_num_steps=2",
+        "grpo.val_period=-1",
+        "grpo.val_at_start=false",
+        "grpo.async_grpo=null",
+        "policy.train_global_batch_size=8",
+        "policy.train_micro_batch_size=1",
+        "cluster.gpus_per_node=2",
+        "loss_fn.reference_policy_kl_penalty=0.01",
+        "grpo.skip_reference_policy_logprobs_calculation=false",
+        "loss_fn.use_importance_sampling_correction=true",
+        "checkpointing.enabled=true",
+        f"checkpointing.checkpoint_dir={tmp_path / 'sibling-recovery-checkpoints'}",
+        "checkpointing.metric_name=null",
+        "checkpointing.save_period=1",
+        "+checkpointing.save_data_plane=true",
+        "++data_plane.enabled=true",
+        "++data_plane.impl=transfer_queue",
+        "++data_plane.backend=simple",
+        "++data_plane.simple.storage_capacity=1000000",
+        "++data_plane.simple.num_storage_units=2",
+        "++data_plane.claim_meta_poll_interval_s=0.5",
+        "++token_capture.enabled=true",
+        "++rollout_recovery.default_granularity=prompt_group",
+        "++async_rl.sampler.name=in_order",
+        "++async_rl.sampler.max_lookahead_versions=1",
+        "++async_rl.min_groups_for_streaming_train=4",
+        "++async_rl.max_inflight_prompts=8",
+        "++async_rl.max_buffered_rollouts=8",
+        "++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=120",
+        "++async_rl.stall_watchdog.interval_s=10",
+        "++async_rl.stall_watchdog.stall_timeout_s=300",
+        "++async_rl.stall_watchdog.stall_action=abort",
+    ]
+
+    resolved = OmegaConf.to_container(
+        parse_hydra_overrides(config, overrides),
+        resolve=True,
+    )
+
+    assert isinstance(resolved, dict)
+    master_config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(master_config)
+    assert master_config.checkpointing["metric_name"] is None
+    assert master_config.checkpointing["save_data_plane"] is True
+    assert master_config.token_capture.enabled is True
+    assert (
+        master_config.rollout_recovery.default_granularity
+        is RecoveryGranularity.PROMPT_GROUP
+    )
+    assert master_config.async_rl.rollout_failure.native.generation_timeout_s is None
+    assert master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s == 120
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
@@ -636,6 +723,14 @@ class TestSetup:
                 "deferred_routes_without_capture",
                 "defer_routed_experts_to_policy requires",
             ),
+            (
+                "prompt_group_recovery_without_capture",
+                "non-default rollout_recovery policies require",
+            ),
+            (
+                "recovery_override_without_capture",
+                "non-default rollout_recovery policies require",
+            ),
         ],
     )
     def test_invalid_config_fails_before_setup_factories(
@@ -653,6 +748,12 @@ class TestSetup:
             mc.async_rl.max_buffered_rollouts = 7
         elif invalid_case == "deferred_routes_without_capture":
             mc.token_capture.defer_routed_experts_to_policy = True
+        elif invalid_case == "prompt_group_recovery_without_capture":
+            mc.rollout_recovery.default_granularity = RecoveryGranularity.PROMPT_GROUP
+        elif invalid_case == "recovery_override_without_capture":
+            mc.rollout_recovery.task_granularity_overrides = {
+                "genrm": RecoveryGranularity.PROMPT_GROUP
+            }
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
 
@@ -969,7 +1070,7 @@ class TestSetup:
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
     def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
-        mc = _make_master_config(colocated=True, backend="vllm")
+        mc = _make_master_config(colocated=False, backend="vllm")
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",

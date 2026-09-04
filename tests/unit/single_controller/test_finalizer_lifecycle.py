@@ -19,10 +19,11 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
@@ -72,7 +73,9 @@ class _DataPlaneClient:
 def _request() -> FinalizationRequest:
     return FinalizationRequest(
         group_id="group",
+        prompt_idx=17,
         rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
         receipts=(
             {
                 "manifest": [
@@ -95,13 +98,19 @@ def _controller(actor: object) -> Any:
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
     ctrl._finalizer_metrics_by_group = {}
+    ctrl._rollout_recovery_ledger = MagicMock()
+    ctrl._rollout_recovery_ledger.__contains__.return_value = False
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging")
+        token_capture=SimpleNamespace(staging_partition="staging"),
+        grpo=SimpleNamespace(num_prompts_per_step=1),
     )
+    ctrl._trainer_version = 3
+    ctrl._train_steps = 3
     return ctrl
 
 
@@ -134,6 +143,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
     assert ctrl._active_finalizers == 0
     assert ctrl._finalizer_unknown_outcomes == 0
     ctrl._buffer.commit_finalized.assert_awaited_once_with(
+        ANY,
         "group",
         meta,
         3,

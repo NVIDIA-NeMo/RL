@@ -2202,6 +2202,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
@@ -2276,6 +2277,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
@@ -2283,6 +2285,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
+    manager._effort_config = None
 
     with pytest.raises(ValueError, match="duplicate row index 0"):
         asyncio.run(

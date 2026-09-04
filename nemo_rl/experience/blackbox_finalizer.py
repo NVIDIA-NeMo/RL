@@ -506,7 +506,9 @@ class BlackboxFinalizer:
         receipts: list[Optional[dict[str, Any]]],
         rewards: list[float],
         *,
+        prompt_idx: int,
         fallback_weight_version: int,
+        canonical_sample_ids: Optional[list[str]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -517,6 +519,11 @@ class BlackboxFinalizer:
         """
         assert len(rollout_ids) == len(receipts) == len(rewards), (
             "rollout_ids, receipts, and rewards must be parallel"
+        )
+        if canonical_sample_ids is None:
+            canonical_sample_ids = rollout_ids
+        assert len(canonical_sample_ids) == len(rollout_ids), (
+            "canonical_sample_ids must be one per rollout"
         )
         _group_t0 = time.perf_counter()
         rows = [
@@ -596,12 +603,18 @@ class BlackboxFinalizer:
                     flush=True,
                 )
 
-        group_min_wv = min(
-            (r.min_wv for r in valid_rows), default=fallback_weight_version
-        )
-        group_max_wv = max(
-            (r.max_wv for r in valid_rows), default=fallback_weight_version
-        )
+        min_weight_versions = [
+            row.min_wv for row in valid_rows if row.min_wv is not None
+        ]
+        max_weight_versions = [
+            row.max_wv for row in valid_rows if row.max_wv is not None
+        ]
+        if len(min_weight_versions) != len(valid_rows) or len(
+            max_weight_versions
+        ) != len(valid_rows):
+            raise RuntimeError("valid finalized rows must carry weight versions")
+        group_min_wv = min(min_weight_versions, default=fallback_weight_version)
+        group_max_wv = max(max_weight_versions, default=fallback_weight_version)
 
         valid_fraction = len(valid_rows) / len(rows)
         if (
@@ -690,7 +703,10 @@ class BlackboxFinalizer:
                 rows, max_len=max_len, metrics=metrics
             )
         sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=group_min_wv, group_id=group_id
+            train_batch,
+            weight_version=group_min_wv,
+            group_id=group_id,
+            prompt_idx=prompt_idx,
         )
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
@@ -725,9 +741,9 @@ class BlackboxFinalizer:
             train_batch=train_batch,
             weight_version=group_min_wv,
         )
-        assert sample_ids == rollout_ids, (
-            "canonical sample ids must equal the ledger-registered rollout ids: "
-            f"{sample_ids} != {rollout_ids}"
+        assert sample_ids == canonical_sample_ids, (
+            "canonical sample ids must equal the stable logical rollout ids: "
+            f"{sample_ids} != {canonical_sample_ids}"
         )
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()

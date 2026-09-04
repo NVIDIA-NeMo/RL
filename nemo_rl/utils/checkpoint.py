@@ -322,7 +322,9 @@ class CheckpointManager:
         # save config
         if run_config is not None:
             with open(save_dir / "config.yaml", "w") as f:
-                yaml.safe_dump(run_config.model_dump(), f)
+                # JSON mode converts enums and other Pydantic-supported scalar
+                # types to the primitive values expected by safe YAML.
+                yaml.safe_dump(run_config.model_dump(mode="json"), f)
 
         return Path(os.path.abspath(save_dir))
 

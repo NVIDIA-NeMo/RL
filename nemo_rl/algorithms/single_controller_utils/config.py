@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, Optional
 
@@ -43,6 +44,7 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -613,6 +615,74 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     num_finalizer_workers: PositiveInt = 2
 
 
+@dataclass(frozen=True)
+class RecoveryGranularityResolution:
+    """Recovery granularity selected for a prompt-group reservation.
+
+    ``agent_name`` is copied from the prompt when present. ``granularity`` is
+    selected from an agent override, task override, or the global default.
+    """
+
+    agent_name: Optional[str]
+    granularity: RecoveryGranularity
+
+
+class RolloutRecoveryConfig(BaseModel, extra="allow"):
+    """Retry and restore policy for unfinished token-capture prompt groups.
+
+    ``sibling`` (the default) preserves completed generations and retries only
+    the missing ones. Prefer it when reusing work and avoiding repeated long-tail
+    generations matters more than keeping a group on one policy version.
+
+    ``prompt_group`` discards and regenerates every sibling when any generation
+    is unfinished. It costs a full group per recovery, but keeps the regenerated
+    group on the policy weights live at redispatch instead of mixing those results
+    with older sealed siblings.
+
+    The resolved value is persisted on each ledger group, so restoring a saved
+    group does not reinterpret it using a newer configuration. The same
+    granularity governs failures handled in-process and after a process restart.
+    """
+
+    default_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING
+    # NeMo-Gym agent_ref.name takes precedence over task_name when both match.
+    agent_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+        default_factory=dict
+    )
+    task_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+        default_factory=dict
+    )
+
+    def resolve_for_prompt(
+        self, prompt: Mapping[str, Any]
+    ) -> RecoveryGranularityResolution:
+        """Resolve one new group using agent, then task, then the global default."""
+        extra_env_info = prompt.get("extra_env_info")
+        agent_name: Optional[str] = None
+        if isinstance(extra_env_info, Mapping):
+            agent_ref = extra_env_info.get("agent_ref")
+            if agent_ref is not None and not isinstance(agent_ref, Mapping):
+                raise TypeError("prompt agent_ref must be a mapping or None")
+            if isinstance(agent_ref, Mapping):
+                raw_agent_name = agent_ref.get("name")
+                if raw_agent_name is not None and not isinstance(raw_agent_name, str):
+                    raise TypeError("prompt agent_ref.name must be a string or None")
+                agent_name = raw_agent_name
+        if agent_name is not None:
+            override = self.agent_granularity_overrides.get(agent_name)
+            if override is not None:
+                return RecoveryGranularityResolution(agent_name, override)
+
+        task_name = prompt.get("task_name")
+        if task_name is not None and not isinstance(task_name, str):
+            raise TypeError("prompt task_name must be a string or None")
+        if task_name is not None:
+            override = self.task_granularity_overrides.get(task_name)
+            if override is not None:
+                return RecoveryGranularityResolution(agent_name, override)
+        return RecoveryGranularityResolution(agent_name, self.default_granularity)
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -630,6 +700,9 @@ class MasterConfig(BaseModel, extra="allow"):
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
+    rollout_recovery: RolloutRecoveryConfig = Field(
+        default_factory=RolloutRecoveryConfig
+    )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
     @model_validator(mode="after")
@@ -1034,6 +1107,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     token_capture_config = master_config.token_capture
+    recovery_config = master_config.rollout_recovery
+    if not token_capture_config.enabled and (
+        recovery_config.default_granularity is not RecoveryGranularity.SIBLING
+        or recovery_config.agent_granularity_overrides
+        or recovery_config.task_granularity_overrides
+    ):
+        raise ValueError(
+            "non-default rollout_recovery policies require "
+            "token_capture.enabled=true; without token capture, unfinished Gym "
+            "siblings have no durable receipts to recover"
+        )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):

@@ -215,19 +215,35 @@ class DataPlaneCheckpointBarrier:
         self._condition = asyncio.Condition()
         self._checkpoint_active = False
         self._active_mutations = 0
+        self._section_holders: set[asyncio.Task[Any]] = set()
+
+    def _current_task(self) -> asyncio.Task[Any]:
+        """Return the task entering a barrier section and reject reentrancy."""
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("data-plane barrier sections require an asyncio task")
+        if task in self._section_holders:
+            raise RuntimeError(
+                "this task already holds a data-plane barrier section; pass the "
+                "DataPlaneMutationCut you already have instead of opening another"
+            )
+        return task
 
     @asynccontextmanager
     async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
-        """Yield a live mutation capability after any active checkpoint exits."""
+        """Yield a live cut after any active checkpoint exits."""
         async with self._condition:
+            task = self._current_task()
             await self._condition.wait_for(lambda: not self._checkpoint_active)
             self._active_mutations += 1
-        cut = DataPlaneMutationCut(self)
+            self._section_holders.add(task)
+            cut = DataPlaneMutationCut(self)
         try:
             yield cut
         finally:
             cut._invalidate()
             async with self._condition:
+                self._section_holders.discard(task)
                 self._active_mutations -= 1
                 if self._active_mutations == 0:
                     self._condition.notify_all()
@@ -236,6 +252,7 @@ class DataPlaneCheckpointBarrier:
     async def checkpoint(self) -> AsyncIterator[DataPlaneMutationCut]:
         """Yield a live capability after blocking and draining all mutations."""
         async with self._condition:
+            task = self._current_task()
             await self._condition.wait_for(lambda: not self._checkpoint_active)
             self._checkpoint_active = True
             try:
@@ -244,12 +261,14 @@ class DataPlaneCheckpointBarrier:
                 self._checkpoint_active = False
                 self._condition.notify_all()
                 raise
+            self._section_holders.add(task)
         cut = DataPlaneMutationCut(self)
         try:
             yield cut
         finally:
             cut._invalidate()
             async with self._condition:
+                self._section_holders.discard(task)
                 self._checkpoint_active = False
                 self._condition.notify_all()
 
@@ -1035,6 +1054,11 @@ class TQReplayBuffer:
         """Install the required enrichment stage run before slots become ready."""
         self._post_write_enricher = enricher
 
+    @property
+    def group_ids(self) -> tuple[str, ...]:
+        """Return a stable snapshot of controller-local replay ownership."""
+        return tuple(self._group_ids)
+
     def reserve(
         self,
         *,
@@ -1060,6 +1084,8 @@ class TQReplayBuffer:
         """
         if group_id is None:
             group_id = str(uuid.uuid4())
+        if group_id in self._group_ids:
+            raise ValueError(f"duplicate live group_id={group_id!r}")
         self.meta_list.append(None)
         self.start_weight_list.append(weight_version)
         self.end_weight_list.append(-1)
@@ -1129,7 +1155,7 @@ class TQReplayBuffer:
             weight_version=start_weight_version,
         )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
             try:
                 await call_data_plane(
                     self._dp_client,
@@ -1177,6 +1203,7 @@ class TQReplayBuffer:
                 # deterministic IDs while retaining the barrier mutation slot.
                 try:
                     await self._clear_samples_unlocked(
+                        cut,
                         sample_ids=list(sample_ids),
                     )
                 except BaseException as rollback_error:
@@ -1196,7 +1223,8 @@ class TQReplayBuffer:
             remove_in_dp: Whether to clear rows referenced by a committed slot.
 
         Returns:
-            Number of removed slots (always one on success).
+            One when this call removes the slot, or zero if another concurrent
+            mutation removed it while DataPlane cleanup was awaiting.
 
         Raises:
             ValueError: ``group_id`` has no live slot.
@@ -1206,15 +1234,41 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before removing a group"
             )
-        async with self._data_plane_checkpoint_barrier.mutation():
-            try:
-                idx = self._group_ids.index(group_id)
-            except ValueError as error:
-                raise ValueError(f"unknown group_id={group_id!r}") from error
-            return await self._remove_unlocked([idx], clear_data_plane=remove_in_dp)
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
+            return await self._remove_groups_unlocked(
+                cut, [group_id], clear_data_plane=remove_in_dp
+            )
+
+    async def clear_staging_keys(
+        self,
+        cut: DataPlaneMutationCut,
+        staging_keys: list[str],
+    ) -> None:
+        """Clear known token-capture staging rows under a caller-owned cut."""
+        cut.require_live()
+        if not staging_keys:
+            return
+        if self._staging_partition_id is None:
+            raise RuntimeError(
+                "cannot clear token-capture staging keys without a staging partition"
+            )
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before clearing staging samples"
+            )
+        unique_keys = list(dict.fromkeys(staging_keys))
+        await call_data_plane(
+            self._dp_client,
+            "clear_samples",
+            offload_sync=True,
+            sample_ids=unique_keys,
+            partition_id=self._staging_partition_id,
+        )
 
     async def commit_finalized(
         self,
+        cut: DataPlaneMutationCut,
         group_id: str,
         meta: KVBatchMeta,
         group_min_wv: int,
@@ -1231,6 +1285,7 @@ class TQReplayBuffer:
         rollout straddles a refit.
 
         Args:
+            cut: Live cut acquired by the owner coordinating finalization.
             group_id: group_id returned by the matching reserve call.
             meta: KVBatchMeta the finalizer built over its published rows.
             group_min_wv: Oldest weight version any call in the group used.
@@ -1241,6 +1296,7 @@ class TQReplayBuffer:
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
         """
+        cut.require_live()
         try:
             idx = self._group_ids.index(group_id)
         except ValueError:
@@ -1334,22 +1390,49 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before removing groups"
             )
-        async with self._data_plane_checkpoint_barrier.mutation():
-            drop_idxs = sorted(idxs, reverse=True)
-            if drop_idxs[0] >= len(self.meta_list):
-                raise IndexError(
-                    f"TQReplayBuffer.remove: indices out of range: {drop_idxs[0]}; "
-                    f"size={len(self.meta_list)}"
-                )
-            return await self._remove_unlocked(drop_idxs, clear_data_plane=remove_in_dp)
+        if len(idxs) != len(set(idxs)):
+            raise ValueError("replay removal contains duplicate indices")
+        if min(idxs) < 0:
+            raise IndexError("replay removal indices must be non-negative")
+        drop_idxs = sorted(idxs, reverse=True)
+        if drop_idxs[0] >= len(self.meta_list):
+            raise IndexError(
+                f"TQReplayBuffer.remove: indices out of range: {drop_idxs[0]}; "
+                f"size={len(self.meta_list)}"
+            )
+        # Convert the caller's transient list coordinates into durable ownership
+        # coordinates before the first await. Mutations are concurrent, so another
+        # removal may shift every list index while this task waits for the barrier
+        # or for DataPlane cleanup.
+        drop_group_ids = [self._group_ids[i] for i in drop_idxs]
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
+            return await self._remove_groups_unlocked(
+                cut, drop_group_ids, clear_data_plane=remove_in_dp
+            )
 
-    async def _remove_unlocked(
-        self, drop_idxs: list[int], *, clear_data_plane: bool
+    async def _remove_groups_unlocked(
+        self,
+        cut: DataPlaneMutationCut,
+        group_ids: list[str],
+        *,
+        clear_data_plane: bool,
     ) -> int:
-        """Remove validated indices while the caller owns any required lock."""
+        """Remove stable groups while the caller owns a live mutation cut."""
+        cut.require_live()
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("replay removal contains duplicate group IDs")
+        index_by_group_id = {group_id: i for i, group_id in enumerate(self._group_ids)}
+        if len(index_by_group_id) != len(self._group_ids):
+            raise RuntimeError("replay buffer contains duplicate live group IDs")
+        missing_group_ids = [
+            group_id for group_id in group_ids if group_id not in index_by_group_id
+        ]
+        if missing_group_ids:
+            raise ValueError(f"unknown group_ids={missing_group_ids!r}")
         dropped_sample_ids: list[str] = []
         dropped_staging_keys: list[str] = []
-        for i in drop_idxs:
+        for group_id in group_ids:
+            i = index_by_group_id[group_id]
             meta = self.meta_list[i]
             if meta is not None:
                 dropped_sample_ids.extend(meta.sample_ids)
@@ -1360,7 +1443,9 @@ class TQReplayBuffer:
         if clear_data_plane:
             if dropped_sample_ids:
                 try:
-                    await self._clear_samples_unlocked(sample_ids=dropped_sample_ids)
+                    await self._clear_samples_unlocked(
+                        cut, sample_ids=dropped_sample_ids
+                    )
                 except Exception as error:
                     raise RuntimeError(
                         "canonical cleanup failed; retained replay-buffer ownership "
@@ -1383,10 +1468,25 @@ class TQReplayBuffer:
                         "may already be cleared"
                     ) from error
 
-        for i in drop_idxs:
+        # A different mutation may have removed a lower list slot while the
+        # DataPlane calls were awaiting. Resolve the original stable IDs again;
+        # never apply pre-await indices to the now-shifted parallel lists. A group
+        # already removed concurrently needs no second local deletion.
+        current_index_by_group_id = {
+            group_id: i for i, group_id in enumerate(self._group_ids)
+        }
+        current_drop_idxs = sorted(
+            (
+                current_index_by_group_id[group_id]
+                for group_id in group_ids
+                if group_id in current_index_by_group_id
+            ),
+            reverse=True,
+        )
+        for i in current_drop_idxs:
             self._delete_slot(i)
 
-        return len(drop_idxs)
+        return len(current_drop_idxs)
 
     def metadata_state_dict(self, *, saved_capacity: int) -> TQReplayMetadataState:
         """Capture the controller index for ready groups without tensor payloads.
@@ -1581,12 +1681,30 @@ class TQReplayBuffer:
 
         for group in groups:
             meta = group["meta"]
+            staging_keys: list[str] = []
+            for tag in meta.tags or []:
+                encoded_plan = tag.get(ROUTE_PLAN_TAG)
+                if encoded_plan is None:
+                    continue
+                from nemo_rl.experience.route_plan import decode_route_plan
+
+                staging_keys.extend(
+                    decode_route_plan(encoded_plan).cleanup_staging_keys
+                )
             self.meta_list.append(meta)
             self.start_weight_list.append(group["start_weight"])
             self.end_weight_list.append(group["end_weight"])
             self.target_step_list.append(group["target_step"])
             self.ready_list.append(True)
             self._group_ids.append(group["group_id"])
+            # Live token-capture reservations retain physical rollout IDs. Once a
+            # group is canonical, only stable sample IDs are durable and sufficient
+            # for replay ownership; staging cleanup is reconstructed from the route
+            # plans stored in canonical row tags.
+            self._rollout_ids_list.append(list(meta.sample_ids))
+            self._staging_keys_list.append(
+                list(dict.fromkeys(staging_keys)) if staging_keys else None
+            )
 
         print(
             f"📦 Restored {len(groups)} replay group(s) from checkpoint",
@@ -1650,8 +1768,11 @@ class TQReplayBuffer:
     def __len__(self) -> int:
         return len(self.meta_list)
 
-    async def _clear_samples_unlocked(self, *, sample_ids: list[str]) -> None:
+    async def _clear_samples_unlocked(
+        self, cut: DataPlaneMutationCut, *, sample_ids: list[str]
+    ) -> None:
         """Clear rows while the caller holds a barrier mutation slot."""
+        cut.require_live()
         await call_data_plane(
             self._dp_client,
             "clear_samples",

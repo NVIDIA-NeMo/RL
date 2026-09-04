@@ -87,7 +87,25 @@ On resume, Single-Controller validates the TQ snapshot against the trainer check
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
 :::{note}
-Completed groups are restored directly from the TQ snapshot. Prompt groups whose generations were still in flight at the checkpoint boundary are recovered by ownership: `rollout_recovery.pt` records them, and on resume they are redispatched and regenerated from the same dataset rows. Only rows already committed to TQ preserve their exact generated tokens; redispatched groups produce new samples from the same prompts.
+Completed groups are restored directly from the TQ snapshot. For unfinished
+token-capture groups, `rollout_recovery.default_granularity` controls both live
+failure and restart behavior:
+
+- `sibling` preserves each sealed sibling and redispatches only unfinished ones.
+- `prompt_group` retries every sibling in the group when any sibling is unfinished.
+
+`sibling` is the default and avoids regenerating completed work. Use
+`prompt_group` when every generation in a recovered group must come from the
+policy weights live at redispatch.
+
+`agent_granularity_overrides` and `task_granularity_overrides` can select the
+policy per Gym agent or dataset task; agent overrides take precedence. These
+non-default policies require `token_capture.enabled: true`. The resolved policy
+is persisted in `rollout_recovery.pt`, so recovery does not reinterpret an
+existing group using changed configuration. A generation that already finished
+keeps its tokens in the token-capture staging area, so `sibling` reuses them
+unchanged; a redispatched sibling produces a new sample from the same prompt.
+Neither becomes a training row until every generation in the group has finished.
 :::
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.

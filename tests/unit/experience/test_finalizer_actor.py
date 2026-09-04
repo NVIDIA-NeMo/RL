@@ -29,7 +29,9 @@ from nemo_rl.experience.finalizer_actor import (
 def _request() -> FinalizationRequest:
     return FinalizationRequest(
         group_id="group",
+        prompt_idx=17,
         rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
         receipts=(
             {
                 "rollout_id": "group_g0",
