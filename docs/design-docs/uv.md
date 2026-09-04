@@ -40,7 +40,7 @@ This section outlines how workers define their required executables, details the
 
 ### Worker Configuration
 
-In our codebase, workers (classes decorated with `@ray.remote`, e.g., `PolicyWorker`) are associated with a `PY_EXECUTABLE` which specifies what dependencies the worker needs. These are declared in the `[tool.nemo_rl.actor_environments]` table of `pyproject.toml`, from which the global registry [`ACTOR_ENVIRONMENT_REGISTRY`](../../nemo_rl/distributed/ray_actor_environment_registry.py) is built. This allows different parts of our application to have their own tailored environments.
+In our codebase, workers (classes decorated with `@ray.remote`, e.g., `PolicyWorker`) are associated with a `PY_EXECUTABLE` which specifies what dependencies the worker needs. These are declared in `ACTOR_ENVIRONMENTS` in [`nemo_rl/distributed/actor_environments.py`](../../nemo_rl/distributed/actor_environments.py), from which the global registry [`ACTOR_ENVIRONMENT_REGISTRY`](../../nemo_rl/distributed/ray_actor_environment_registry.py) is built. Workers defined outside this repo register themselves by assigning into `ACTOR_ENVIRONMENT_REGISTRY` at runtime -- see `research/template_project`. This allows different parts of our application to have their own tailored environments.
 
 ### Supported Python Executables
 
@@ -70,7 +70,7 @@ When a NeMo RL job is started:
 1. The driver script creates several {py:class}`RayWorkerGroup <nemo_rl.distributed.worker_groups.RayWorkerGroup>`s.
 2. Each worker group will create their workers which are wrapped in a {py:class}`RayWorkerBuilder <nemo_rl.distributed.worker_groups.RayWorkerBuilder>` where the fully qualified name (FQN) of the worker class is passed as a string.
 3. {py:class}`RayWorkerBuilder <nemo_rl.distributed.worker_groups.RayWorkerBuilder>` launches the worker under {py:class}`RayWorkerBuilder <nemo_rl.distributed.worker_groups.RayWorkerBuilder. IsolatedWorkerInitializer>` which allows us to initialize the class without importing packages not available in the base environment.
-4. Before the worker class is instantiated by the `RayWorkerBuilder`, the FQN is used to lookup -- in a [global registry](../../nemo_rl/distributed/ray_actor_environment_registry.py) built from `pyproject.toml`'s `[tool.nemo_rl.actor_environments]` -- to determine which member of `PY_EXECUTABLES` should be used to launch that set of workers. If the chosen `PY_EXECUTABLES.*` starts with `uv`; a `venv` is created with all the dependencies it needs and the `runtime_env["py_executable"]` is replaced with the `venv`'s python interpreter.
+4. Before the worker class is instantiated by the `RayWorkerBuilder`, the FQN is used to lookup -- in a [global registry](../../nemo_rl/distributed/ray_actor_environment_registry.py) built from [`ACTOR_ENVIRONMENTS`](../../nemo_rl/distributed/actor_environments.py) -- to determine which member of `PY_EXECUTABLES` should be used to launch that set of workers. If the chosen `PY_EXECUTABLES.*` starts with `uv`; a `venv` is created with all the dependencies it needs and the `runtime_env["py_executable"]` is replaced with the `venv`'s python interpreter.
 
 This approach allows a fast start-up and maintains dependency isolation. It also has the added benefit of having all the virtual environments local under `./venvs`.
 
