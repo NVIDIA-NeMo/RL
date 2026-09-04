@@ -254,12 +254,28 @@ UV_LINK_MODE=hardlink uv sync --frozen --extra automodel --no-install-project
 UV_LINK_MODE=hardlink uv sync --frozen --extra modelopt --no-install-project
 UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
 
-# Worker-venv prefetch, phase 1:
-# Materialize each actor venv's third-party packages in THIS layer, hardlinked against the above cache,
-# so the N worker venvs cost directory entries instead of N wheel copies.
-# nemo_rl/distributed/actor_environments.py is the single source of truth for which extras each
-# actor needs; the runtime registry imports the same dict. It is run as a script (not imported)
-# because nemo_rl/__init__.py cannot execute in this layer -- the source tree is not here yet.
+# Worker-venv prefetch, phase 1: third-party packages only.
+#
+# Each Ray actor runs in its own venv under NEMO_RL_VENV_DIR. Build them HERE, in the same
+# layer as the uv cache above, because a hardlink into an already-finished layer makes
+# overlayfs copy the file up -- so building them later would trade ~1.5M symlinks for
+# gigabytes of duplicated wheels. Built here, the N venvs cost directory entries and share
+# one copy of every wheel with the cache.
+#
+# Why not just run nemo_rl/utils/prefetch_venvs.py, which already knows how to build these?
+# Because it installs the nemo_rl project into each venv, and the source tree does not exist
+# yet -- this layer has only pyproject.toml, uv.lock and a couple of standalone files (see
+# the COPY above). The source arrives much later, in the release stage, deliberately: copying
+# it earlier would make every source edit invalidate this hour-long dependency build.
+# So the work is split. Here we do the expensive, cacheable half: every third-party package,
+# hardlinked, with --no-install-project so nemo_rl itself is left out. prefetch_venvs.py then
+# runs in the release stage and does the cheap half -- the editable nemo_rl install (a .pth
+# file) plus the python-<ClassName> wrapper scripts. Same venvs, finished in two places.
+#
+# nemo_rl/distributed/actor_environments.py is the single source of truth for which extras
+# each actor needs; the runtime registry imports the same dict. It is run as a script rather
+# than imported, because importing it would execute nemo_rl/__init__.py, which does real work
+# (fingerprint check, sys.path setup) that cannot run in this layer.
 SKIP_EXTRAS=""
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
     SKIP_EXTRAS="$SKIP_EXTRAS vllm"
@@ -478,9 +494,16 @@ fi
 export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
 export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
-# Worker-venv prefetch, phase 2:
-# all venvs have by now been materialized in hardlink-mode;
-# add the editable project install per venv.
+# Worker-venv prefetch, phase 2: the nemo_rl project itself.
+#
+# The other half of the split described in the dependency stage. Every venv already holds
+# its third-party packages, hardlinked in the layer that owns the uv cache. What was missing
+# is nemo_rl, because the source did not exist back there. It does now (COPY above), so
+# prefetch_venvs.py adds the editable install to each venv -- a .pth file, so this stays
+# cheap -- and writes the python-<ClassName> wrapper scripts into /usr/local/bin.
+#
+# This is why the venvs cannot simply be built here in one pass: hardlinking against the
+# dependency layer's cache from this layer would make overlayfs copy every wheel up.
 if [[ -n "$NEGATIVE_FILTERS" ]]; then
     UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
 else
@@ -491,7 +514,10 @@ EOF
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
 # into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
 # source COPY above so examples/nemo_gym/prefetch_venvs.py is present.
-# Gym server venvs use symlinks, not the hardlink scheme used for worker venvs.
+# UV_LINK_MODE=symlink below applies to this outer `uv run` only. The gym server venvs
+# themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
+# UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
+# out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
 # Gym pins vllm==0.24.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
