@@ -435,6 +435,7 @@ class AsyncRolloutImpl:
             prompt=input_sample["message_log"],
             extra_env_info=input_sample["extra_env_info"],
             metadata={"task_name": input_sample["task_name"]},
+            loss_multiplier=float(input_sample["loss_multiplier"]),
             completions=completions,
             rollout_metrics=rollout_metrics,
         )
@@ -830,6 +831,7 @@ class AsyncNemoGymRolloutImpl:
             prompt=prompt_message_log,
             extra_env_info=input_sample["extra_env_info"],
             metadata={"task_name": "nemo_gym"},
+            loss_multiplier=float(input_sample["loss_multiplier"]),
             completions=completions,
             rollout_metrics=rollout_metrics,
         )
