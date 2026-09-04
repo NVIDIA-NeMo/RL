@@ -200,7 +200,7 @@ def apply_fp8_patches(self, fp8_config):
                     )
                 )
 
-            # Preserve separately refittable static KV scales.
+            # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
             if global_fp8_config.kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
                 func5_path = (
                     "vllm.model_executor.layers.quantization.kv_cache."
@@ -328,7 +328,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
-
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
             model = AutoModel.from_config(config)
@@ -850,6 +849,9 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
 
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
+# Patches this method to not create new torch.nn.Parameter for layer weights
+# to maintain weight loaders.
+# BMM layouts are the exception because their post-processed tensor shape changes.
 def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     assert layer.weight_block_size is not None
 
@@ -870,6 +872,8 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
         layer.orig_dtype, tuple(layer.weight.shape)
     )
     if should_use_deepgemm:
+        # vLLM 0.25 keeps the block scale under weight_scale_inv (see
+        # Fp8BlockScaledMMLinearKernel/DeepGemm process_weights_after_loading).
         bmm_batch_size = getattr(layer, "bmm_batch_size", 0)
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
             wq=layer.weight.data,
@@ -888,6 +892,7 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
                 prefer_copy=True,
             )
         else:
+            # Instead of creating new torch.nn.Parameter, we update the data in place.
             layer.weight.data.copy_(dg_weight)
             layer.weight_scale_inv.data.copy_(dg_weight_scale)
 
@@ -1141,6 +1146,9 @@ def create_weights_mxfp8_moe(
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
+    Compared to the original process_weights_after_loading in vllm, compatible
+    Parameters are updated in place while preserving their storage for refit.
+
     Updated for vLLM 0.25 which passes a RoutedExperts module as `layer` and
     sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=..., layer=...).
     """
@@ -1168,6 +1176,8 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
+    # Preserve Parameter storage when compatible; replacement retains the
+    # weight_loader when a backend changes the runtime layout.
     replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
     replace_parameter(layer, "w2_weight", w2, prefer_copy=True)
     replace_parameter(
@@ -1183,10 +1193,10 @@ def process_weights_after_loading_moe(self, layer) -> None:
         prefer_copy=True,
     )
 
-    # Set up the MoE kernel on initial load only. Gate on is None, not hasattr,
-    # because FusedMoEMethodBase.__init__ always sets moe_kernel=None. Also skips
-    # refit calls (finalize_layerwise_reload) which lack set_current_vllm_config
-    # context.
+    # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
+    # using reload-aware replace_parameter). Gate on is None, not hasattr, because
+    # FusedMoEMethodBase.__init__ always sets moe_kernel=None. Also skips refit
+    # calls (finalize_layerwise_reload) which lack set_current_vllm_config context.
     self.moe_quant_config = self.get_fused_moe_quant_config(layer)
     if self.moe_quant_config and self.moe_kernel is None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
