@@ -104,7 +104,7 @@ class FinalizedGroup:
     total_row_count: int = 0
 
 
-class BlackboxFinalizer:
+class RolloutReassembler:
     """Receipts -> verified rows -> N-row publish, off the generation hot path."""
 
     def __init__(

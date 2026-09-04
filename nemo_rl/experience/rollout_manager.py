@@ -79,7 +79,7 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 if TYPE_CHECKING:
-    from nemo_rl.experience.finalizer_actor import FinalizationRequest
+    from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 
 def _contains_post_write_enrichment_error(error: BaseException) -> bool:
@@ -1731,7 +1731,7 @@ class RolloutManager:
         *,
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
-    ) -> Optional["FinalizationRequest"]:
+    ) -> Optional["ReassemblyRequest"]:
         """Run capture generation with the same retry budgets as the legacy path.
 
         ``generate_and_push`` re-dispatches infrastructure failures onto a
@@ -1850,14 +1850,14 @@ class RolloutManager:
         *,
         target_step: Optional[int],
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
-    ) -> "FinalizationRequest":
+    ) -> "ReassemblyRequest":
         """One capture-generation attempt; the retry loop above owns budgets.
 
         The replay-buffer slot remains reserved and unready. The caller owns
         finalizer submission and must either commit the returned group or stop
         the validation run on an unknown publication outcome.
         """
-        from nemo_rl.experience.finalizer_actor import FinalizationRequest
+        from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
@@ -1899,7 +1899,7 @@ class RolloutManager:
                 )
                 for c in record.completions
             )
-            request = FinalizationRequest(
+            request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=rollout_ids,
                 receipts=receipts,
@@ -1908,7 +1908,7 @@ class RolloutManager:
                 prompt_idx=record.prompt_idx,
                 mask_sample=mask_sample,
             )
-            from nemo_rl.experience.finalizer_actor import assert_metadata_only
+            from nemo_rl.experience.rollout_reassembler_actor import assert_metadata_only
 
             assert_metadata_only(request)
             return request

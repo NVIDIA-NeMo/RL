@@ -618,7 +618,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # workers from strict staged-fragment plans.
     defer_routed_experts_to_policy: bool = False
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
-    num_finalizer_workers: PositiveInt = 2
+    num_reassembler_workers: PositiveInt = 2
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -1059,11 +1059,11 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
     if (
         token_capture_config.enabled
-        and token_capture_config.num_finalizer_workers
+        and token_capture_config.num_reassembler_workers
         > async_config.max_buffered_rollouts
     ):
         warnings.warn(
-            "token_capture.num_finalizer_workers exceeds "
+            "token_capture.num_reassembler_workers exceeds "
             "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
             stacklevel=2,
         )
@@ -1156,7 +1156,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     )
     if penalties_enabled and token_capture_config.enabled:
         # TODO(token-capture): thread the per-message violation flags through
-        # capture receipts/staging so BlackboxFinalizer can emit
+        # capture receipts/staging so RolloutReassembler can emit
         # invalid_tool_call_mask/malformed_thinking_mask; then drop this guard.
         # Checked before the gym-path validation: the conflict exists
         # regardless of how the rollout path is configured.

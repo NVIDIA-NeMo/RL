@@ -1172,7 +1172,7 @@ class TestSetup:
         )
         mc.logger = {"log_dir": "/tmp/test-token-capture"}
         mc.token_capture.enabled = True
-        mc.token_capture.num_finalizer_workers = 3
+        mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -1186,7 +1186,7 @@ class TestSetup:
             ),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch(
-                "nemo_rl.experience.finalizer_actor.create_finalizer_actors",
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
                 return_value=fake_actors,
             ) as mock_create_finalizer_actors,
         ):

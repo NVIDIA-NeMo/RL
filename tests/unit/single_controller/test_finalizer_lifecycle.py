@@ -30,8 +30,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
-from nemo_rl.experience.blackbox_finalizer import FinalizedGroup
-from nemo_rl.experience.finalizer_actor import FinalizationRequest
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
     RouteAssemblyPlan,
@@ -49,9 +49,9 @@ class _RemoteFinalize:
     ) -> None:
         self._result = result
         self._error = error
-        self.calls: list[FinalizationRequest] = []
+        self.calls: list[ReassemblyRequest] = []
 
-    def remote(self, request: FinalizationRequest) -> Any:
+    def remote(self, request: ReassemblyRequest) -> Any:
         self.calls.append(request)
 
         async def _result():
@@ -73,8 +73,8 @@ class _DataPlaneClient:
         )
 
 
-def _request() -> FinalizationRequest:
-    return FinalizationRequest(
+def _request() -> ReassemblyRequest:
+    return ReassemblyRequest(
         group_id="group",
         rollout_ids=("group_g0",),
         receipts=(
@@ -194,7 +194,7 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
     # A finalizer-side structural drop (e.g. router replay with no routed
     # data yet) -- not a low valid-row fraction, which the controller now
     # decides, not the finalizer (see min_valid_fraction_per_group's removal
-    # from BlackboxFinalizer).
+    # from RolloutReassembler).
     result = FinalizedGroup(
         meta=None,
         group_min_wv=3,

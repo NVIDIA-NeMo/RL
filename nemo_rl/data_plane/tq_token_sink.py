@@ -146,7 +146,7 @@ class TQTokenSink:
     write, so the capture layer's fail-closed ordering (bytes durable before
     the model call is acked) holds by construction. Failures are reported in
     the ``StageResult``; the finalizer turns a poisoned rollout into a
-    placeholder row (see ``BlackboxFinalizer.finalize_group``).
+    placeholder row (see ``RolloutReassembler.finalize_group``).
 
     ``stage`` is thread-safe per the ``StagingSink`` contract: it holds no
     per-call mutable state, so the capture host may run writes for unrelated

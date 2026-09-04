@@ -139,8 +139,8 @@ from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 if TYPE_CHECKING:
-    from nemo_rl.experience.blackbox_finalizer import FinalizedGroup
-    from nemo_rl.experience.finalizer_actor import FinalizationRequest
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+    from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 
@@ -1154,7 +1154,7 @@ class SingleControllerActor:
         )
 
     @staticmethod
-    def _request_staging_keys(request: "FinalizationRequest") -> list[str]:
+    def _request_staging_keys(request: "ReassemblyRequest") -> list[str]:
         """Return the full receipt-manifest staging ownership for a request."""
         keys: list[str] = []
         for receipt in request.receipts:
@@ -1171,7 +1171,7 @@ class SingleControllerActor:
         return list(dict.fromkeys(keys))
 
     async def _cleanup_known_finalization_request(
-        self, request: "FinalizationRequest"
+        self, request: "ReassemblyRequest"
     ) -> None:
         """Clear known request ownership after a pre-publication/known outcome."""
         errors: list[BaseException] = []
@@ -1222,7 +1222,7 @@ class SingleControllerActor:
         self._buffer.abort(request.group_id)
 
     async def _finalize_with_actor(
-        self, request: "FinalizationRequest"
+        self, request: "ReassemblyRequest"
     ) -> Optional["FinalizedGroup"]:
         """Submit one metadata request to the bounded fixed actor pool.
 

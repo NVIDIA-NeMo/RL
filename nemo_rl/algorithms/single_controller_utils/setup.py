@@ -1547,14 +1547,14 @@ def setup_single_controller(
     )
     finalizer_actors: list[Any] = []
     if token_capture_cfg.enabled:
-        from nemo_rl.experience.finalizer_actor import (
-            FinalizerActorConfig,
-            create_finalizer_actors,
+        from nemo_rl.experience.rollout_reassembler_actor import (
+            RolloutReassemblerActorConfig,
+            create_rollout_reassembler_actors,
         )
 
-        finalizer_actors = create_finalizer_actors(
+        finalizer_actors = create_rollout_reassembler_actors(
             dp_config,
-            FinalizerActorConfig(
+            RolloutReassemblerActorConfig(
                 partition_id=partition_id,
                 staging_partition=token_capture_cfg.staging_partition,
                 pad_token_id=pad_id,
@@ -1562,7 +1562,7 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
             ),
-            num_workers=token_capture_cfg.num_finalizer_workers,
+            num_workers=token_capture_cfg.num_reassembler_workers,
         )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,

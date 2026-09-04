@@ -21,16 +21,16 @@ import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.experience.blackbox_finalizer import FinalizedGroup
-from nemo_rl.experience.finalizer_actor import (
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler_actor import (
     _FORBIDDEN_RPC_KEYS,
-    FinalizationRequest,
+    ReassemblyRequest,
     assert_metadata_only,
 )
 
 
-def _request() -> FinalizationRequest:
-    return FinalizationRequest(
+def _request() -> ReassemblyRequest:
+    return ReassemblyRequest(
         group_id="group",
         rollout_ids=("group_g0",),
         receipts=(
@@ -92,7 +92,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     inventory makes a new field fail here until someone decides whether it is
     light enough to cross the wire.
     """
-    assert {f.name for f in fields(FinalizationRequest)} == {
+    assert {f.name for f in fields(ReassemblyRequest)} == {
         "group_id", "rollout_ids", "receipts", "rewards",
         "fallback_weight_version", "prompt_idx", "mask_sample",
     }

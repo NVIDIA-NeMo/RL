@@ -22,7 +22,7 @@ import ray
 import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
-from nemo_rl.experience.blackbox_finalizer import BlackboxFinalizer, FinalizedGroup
+from nemo_rl.experience.rollout_reassembler import RolloutReassembler, FinalizedGroup
 
 # Field names whose values are per-token and therefore large, but whose Python
 # type is indistinguishable from metadata -- a list[int] of token ids looks just
@@ -48,7 +48,7 @@ _FORBIDDEN_RPC_KEYS = frozenset(
 
 
 @dataclass(frozen=True)
-class FinalizationRequest:
+class ReassemblyRequest:
     """Metadata-only input for one prompt group's finalization."""
 
     group_id: str
@@ -66,7 +66,7 @@ class FinalizationRequest:
 
 
 @dataclass(frozen=True)
-class FinalizerActorConfig:
+class RolloutReassemblerActorConfig:
     """Internal constructor values shared by every finalizer actor."""
 
     partition_id: str
@@ -112,16 +112,16 @@ def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
     max_restarts=0,
     max_task_retries=0,
 )
-class FinalizerActor:  # pragma: no cover
+class RolloutReassemblerActor:  # pragma: no cover
     """Own a connect-only TQ client and lightweight finalizer in one process."""
 
     def __init__(
         self,
         dp_config: DataPlaneConfig,
-        config: FinalizerActorConfig,
+        config: RolloutReassemblerActorConfig,
     ) -> None:
         dp_client = build_data_plane_client(dp_config, bootstrap=False)
-        self._finalizer = BlackboxFinalizer(
+        self._finalizer = RolloutReassembler(
             dp_client,
             partition_id=config.partition_id,
             staging_partition=config.staging_partition,
@@ -131,7 +131,7 @@ class FinalizerActor:  # pragma: no cover
             max_seq_len=config.max_seq_len,
         )
 
-    def finalize(self, request: FinalizationRequest) -> FinalizedGroup:
+    def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
         """Finalize one request without allowing tensor payloads across Ray RPC."""
         assert_metadata_only(request)
         if not (
@@ -157,13 +157,13 @@ class FinalizerActor:  # pragma: no cover
         return result
 
 
-def create_finalizer_actors(
+def create_rollout_reassembler_actors(
     dp_config: DataPlaneConfig,
-    config: FinalizerActorConfig,
+    config: RolloutReassemblerActorConfig,
     *,
     num_workers: int,
 ) -> list[Any]:
     """Construct the fixed validation pool after TQ partitions are registered."""
     if num_workers <= 0:
-        raise ValueError(f"num_finalizer_workers must be positive, got {num_workers}")
-    return [FinalizerActor.remote(dp_config, config) for _ in range(num_workers)]
+        raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
+    return [RolloutReassemblerActor.remote(dp_config, config) for _ in range(num_workers)]

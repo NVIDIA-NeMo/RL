@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""S4: BlackboxFinalizer against a live TQ simple backend.
+"""S4: RolloutReassembler against a live TQ simple backend.
 
 Drives the S1 golden call sequences end to end: stage the fixture's delta
 rows via TQTokenSink, hand the fixture receipt to the finalizer, and require
@@ -53,7 +53,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
-from nemo_rl.experience.blackbox_finalizer import BlackboxFinalizer  # noqa: E402
+from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
@@ -96,7 +96,7 @@ def partitions(tq_client):
     tq_client.clear_samples(sample_ids=None, partition_id=CANONICAL_PARTITION)
 
 
-def _finalizer(tq_client, **overrides) -> BlackboxFinalizer:
+def _finalizer(tq_client, **overrides) -> RolloutReassembler:
     kwargs = dict(
         partition_id=CANONICAL_PARTITION,
         staging_partition=STAGING_PARTITION,
@@ -107,7 +107,7 @@ def _finalizer(tq_client, **overrides) -> BlackboxFinalizer:
         max_seq_len=4096,
     )
     kwargs.update(overrides)
-    return BlackboxFinalizer(tq_client, **kwargs)
+    return RolloutReassembler(tq_client, **kwargs)
 
 
 def _stage_fixture(tq_client, name: str, *, rollout_id: str | None = None):
@@ -258,7 +258,7 @@ def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions
     """The finalizer no longer drops a low-valid-fraction group itself --
     only the controller can source a replacement, so it reports the counts
     and always finalizes (see min_valid_fraction_per_group's removal from
-    BlackboxFinalizer; the threshold now lives in single_controller.py)."""
+    RolloutReassembler; the threshold now lives in single_controller.py)."""
     group_id = "grp2"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
     finalizer = _finalizer(tq_client)
@@ -400,7 +400,7 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         tq_client, "worked_example", rollout_id=rollout_ids[0]
     )
 
-    finalizer = BlackboxFinalizer(
+    finalizer = RolloutReassembler(
         tq_client,
         partition_id=_R3_PARTITION,
         staging_partition=_R3_STAGING,
@@ -455,7 +455,7 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
     for record in records:
         assert sink.stage(record).ok  # no extras staged
 
-    finalizer = BlackboxFinalizer(
+    finalizer = RolloutReassembler(
         tq_client,
         partition_id=_R3_PARTITION,
         staging_partition=_R3_STAGING,
@@ -548,7 +548,7 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
     receipt, expected, routes_by_call = _stage_deferred_fixture(
         tq_client, rollout_id=rollout_ids[0]
     )
-    finalizer = BlackboxFinalizer(
+    finalizer = RolloutReassembler(
         tq_client,
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
@@ -606,7 +606,7 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
 
     rollout_id = "bad_route_len_g0"
     receipt, _, _ = _stage_deferred_fixture(tq_client, rollout_id=rollout_id)
-    finalizer = BlackboxFinalizer(
+    finalizer = RolloutReassembler(
         tq_client,
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
@@ -639,8 +639,8 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
 # ---------------------------------------------------------------------------
 
 
-def _mode_finalizer(tq_client, *, deferred: bool) -> BlackboxFinalizer:
-    return BlackboxFinalizer(
+def _mode_finalizer(tq_client, *, deferred: bool) -> RolloutReassembler:
+    return RolloutReassembler(
         tq_client,
         partition_id=_R3_DEFERRED_PARTITION,
         staging_partition=_R3_DEFERRED_STAGING,
