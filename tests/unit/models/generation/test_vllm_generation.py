@@ -233,6 +233,66 @@ def test_vllm_generation_rejects_partial_refit_pause_and_resume(
         generation.resume_generation_after_refit()
 
 
+def _url_reporting_generation(*, async_engine: bool) -> VllmGeneration:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": async_engine}}
+    generation.worker_group = MagicMock()
+    return generation
+
+
+def test_sync_engine_reports_no_openai_server_urls() -> None:
+    """A sync engine runs no HTTP server, so there is no URL to report."""
+    generation = _url_reporting_generation(async_engine=False)
+
+    assert generation._report_dp_openai_server_base_urls() == []
+    assert generation._collect_reserved_urls() == []
+
+
+def test_async_engine_without_http_server_reports_no_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workers answer None unless expose_http_server started a server.
+
+    The list used to keep those Nones, which made a plain truth test read as
+    "we have URLs" when every entry stood for the absence of one.
+    """
+    generation = _url_reporting_generation(async_engine=True)
+    monkeypatch.setattr(ray, "get", MagicMock(return_value=[None, None]))
+
+    assert generation._report_dp_openai_server_base_urls() == []
+    assert generation._collect_reserved_urls() == []
+
+
+def test_async_engine_with_http_server_reports_served_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = _url_reporting_generation(async_engine=True)
+    served = ["http://10.0.0.1:8000/v1", "http://10.0.0.2:8000/v1"]
+    monkeypatch.setattr(ray, "get", MagicMock(return_value=list(served)))
+
+    assert generation._report_dp_openai_server_base_urls() == served
+    assert generation._collect_reserved_urls() == served
+
+
+def test_partially_reported_urls_keep_one_entry_per_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report emptiness as a whole list, never by dropping individual entries.
+
+    ``expose_http_server`` is one config value for every worker, so a mixed answer
+    is not reachable today. Asserted anyway because ``GenerationFleetHealth``
+    indexes these URLs by shard and rejects a list whose length does not match
+    ``shard_count``: shortening one would turn a degraded shard into a startup
+    failure with a length error that names neither cause.
+    """
+    generation = _url_reporting_generation(async_engine=True)
+    partial = ["http://10.0.0.1:8000/v1", None]
+    monkeypatch.setattr(ray, "get", MagicMock(return_value=list(partial)))
+
+    assert generation._report_dp_openai_server_base_urls() == partial
+    assert generation._collect_reserved_urls() == partial
+
+
 def test_sampling_params_preserve_bad_words():
     worker = object.__new__(VllmGenerationWorkerImpl)
     worker.cfg = {
