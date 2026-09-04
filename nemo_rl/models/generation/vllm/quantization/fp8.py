@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
+from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -510,11 +511,13 @@ def _get_module_from_param_name(
             if isinstance(current_module, RoutedExperts):
                 return current_module
             if part == "model" and not hasattr(current_module, part):
-                # Some model classes expose the decoder directly while refit
-                # parameter names still carry vLLM's synthetic ``model.`` prefix.
+                # Some HF/vLLM model classes expose the decoder directly (for
+                # example ``language_model``) while parameter names still carry
+                # vLLM's synthetic ``model.`` prefix.
                 continue
             if part == "layers" and not hasattr(current_module, part):
-                # Qwen3.5-MoE VL keeps its decoder stack below a CausalLM wrapper.
+                # Qwen3.5-MoE VL exposes ``language_model`` as a CausalLM
+                # wrapper; its decoder stack lives under ``language_model.model``.
                 wrapped_model = getattr(current_module, "model", None)
                 if wrapped_model is not None and hasattr(wrapped_model, part):
                     current_module = wrapped_model
@@ -846,18 +849,7 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
     return entries
 
 
-def _assign_param_data(param, value: torch.Tensor) -> None:
-    """Update tensor data while preserving the Parameter and its weight loader."""
-    if param.data.shape == value.shape and param.data.dtype == value.dtype:
-        if param.data.data_ptr() != value.data_ptr():
-            param.data.copy_(value)
-    else:
-        param.data = value
-
-
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
-# Patches this method to not create new torch.nn.Parameter for layer weights
-# to maintain weight loaders.
 def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     assert layer.weight_block_size is not None
 
@@ -887,8 +879,17 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
             is_bmm=is_bmm,
             bmm_batch_size=bmm_batch_size,
         )
-        _assign_param_data(layer.weight, dg_weight)
-        _assign_param_data(layer.weight_scale_inv, dg_weight_scale)
+        if is_bmm:
+            replace_parameter(layer, "weight", dg_weight, prefer_copy=True)
+            replace_parameter(
+                layer,
+                "weight_scale_inv",
+                dg_weight_scale,
+                prefer_copy=True,
+            )
+        else:
+            layer.weight.data.copy_(dg_weight)
+            layer.weight_scale_inv.data.copy_(dg_weight_scale)
 
 
 def process_weights_after_loading(self, layer) -> None:
@@ -920,8 +921,22 @@ def process_weights_after_loading(self, layer) -> None:
     # "CUDA Error: out of memory at csrc/cumem_allocator.cpp" ~75 steps
     # into fp8-rollouts runs). The first call may change shapes (layout
     # transforms), so fall back to rebinding then.
-    _assign_param_data(layer.weight, weight.data)
-    _assign_param_data(layer.weight_scale_inv, weight_scale.data)
+    if (
+        layer.weight.data.shape == weight.shape
+        and layer.weight.data.dtype == weight.dtype
+    ):
+        if layer.weight.data.data_ptr() != weight.data_ptr():
+            layer.weight.data.copy_(weight)
+    else:
+        layer.weight.data = weight.data
+    if (
+        layer.weight_scale_inv.data.shape == weight_scale.shape
+        and layer.weight_scale_inv.data.dtype == weight_scale.dtype
+    ):
+        if layer.weight_scale_inv.data.data_ptr() != weight_scale.data_ptr():
+            layer.weight_scale_inv.data.copy_(weight_scale)
+    else:
+        layer.weight_scale_inv.data = weight_scale.data
 
     maybe_post_process_fp8_weight_block(layer)
 
@@ -1126,9 +1141,6 @@ def create_weights_mxfp8_moe(
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
-    Compared to vLLM, processed values are copied into compatible Parameters to
-    preserve their identity and storage across refits.
-
     Updated for vLLM 0.25 which passes a RoutedExperts module as `layer` and
     sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=..., layer=...).
     """
@@ -1156,15 +1168,25 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    _assign_param_data(layer.w13_weight, w13)
-    _assign_param_data(layer.w2_weight, w2)
-    _assign_param_data(getattr(layer, f"w13_{self.weight_scale_name}"), w13_scale)
-    _assign_param_data(getattr(layer, f"w2_{self.weight_scale_name}"), w2_scale)
+    replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
+    replace_parameter(layer, "w2_weight", w2, prefer_copy=True)
+    replace_parameter(
+        layer,
+        f"w13_{self.weight_scale_name}",
+        w13_scale,
+        prefer_copy=True,
+    )
+    replace_parameter(
+        layer,
+        f"w2_{self.weight_scale_name}",
+        w2_scale,
+        prefer_copy=True,
+    )
 
-    # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
-    # but without replace_parameter). Gate on is None, not hasattr, because
-    # FusedMoEMethodBase.__init__ always sets moe_kernel=None. Also skips refit
-    # calls (finalize_layerwise_reload) which lack set_current_vllm_config context.
+    # Set up the MoE kernel on initial load only. Gate on is None, not hasattr,
+    # because FusedMoEMethodBase.__init__ always sets moe_kernel=None. Also skips
+    # refit calls (finalize_layerwise_reload) which lack set_current_vllm_config
+    # context.
     self.moe_quant_config = self.get_fused_moe_quant_config(layer)
     if self.moe_quant_config and self.moe_kernel is None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel

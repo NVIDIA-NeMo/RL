@@ -1394,6 +1394,15 @@ def test_dsv4_bmm_post_process_uses_vllm_bmm_layout(fp8_module, monkeypatch):
     fp8 = fp8_module
     weight = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
     scale = torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+
+    def weight_loader(*_args, **_kwargs):
+        pass
+
+    def scale_loader(*_args, **_kwargs):
+        pass
+
+    weight.weight_loader = weight_loader
+    scale.weight_loader = scale_loader
     layer = types.SimpleNamespace(
         weight=weight,
         weight_scale_inv=scale,
@@ -1421,10 +1430,10 @@ def test_dsv4_bmm_post_process_uses_vllm_bmm_layout(fp8_module, monkeypatch):
 
     fp8.maybe_post_process_fp8_weight_block(layer)
 
-    assert layer.weight is weight
-    assert layer.weight_scale_inv is scale
     assert layer.weight.shape == (2, 2, 4)
     assert layer.weight_scale_inv.shape == (2, 1, 2)
+    assert layer.weight.weight_loader is weight_loader
+    assert layer.weight_scale_inv.weight_loader is scale_loader
     assert calls[0]["is_bmm"] is True
     assert calls[0]["bmm_batch_size"] == 2
 
