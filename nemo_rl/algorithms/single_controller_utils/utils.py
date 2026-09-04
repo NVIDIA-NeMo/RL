@@ -104,6 +104,7 @@ def reduce_advantage_pump_metrics(
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
     *,
+    sample_masks: list[torch.Tensor] | None = None,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
     num_mask_sample_filtered: list[int] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
@@ -116,6 +117,11 @@ def reduce_advantage_pump_metrics(
         rewards: One tensor per advantage_stage call; each row a sample reward.
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
+        sample_masks: Row validity for each ``rewards`` entry (token-capture
+            placeholders and mask_sample/overlong/seq-logprob-error rows carry
+            0). Weights ``reward`` so it averages over trained rows only,
+            matching what the advantage estimator's baseline already excludes.
+            None keeps the legacy unweighted mean.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
         num_mask_sample_filtered: Environment-flagged sample counts, one per
@@ -132,7 +138,17 @@ def reduce_advantage_pump_metrics(
     """
     out: dict[str, float] = {}
     if rewards:
-        out["reward"] = float(torch.cat([r.flatten() for r in rewards]).mean())
+        cat_rewards = torch.cat([r.flatten() for r in rewards])
+        if sample_masks:
+            cat_masks = torch.cat([m.flatten() for m in sample_masks])
+            mask_sum = cat_masks.sum()
+            out["reward"] = (
+                float((cat_rewards * cat_masks).sum() / mask_sum)
+                if mask_sum > 0
+                else 0.0
+            )
+        else:
+            out["reward"] = float(cat_rewards.mean())
     if masked_advantages:
         cat = torch.cat([a.flatten() for a in masked_advantages])
         if cat.numel() > 0:
