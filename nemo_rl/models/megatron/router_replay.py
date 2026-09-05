@@ -32,6 +32,7 @@ from nemo_rl.utils.r3_trace import (
 )
 
 _ROUTER_REPLAY_VALIDATE_ENV = "NRL_ROUTER_REPLAY_VALIDATE"
+_ROUTER_REPLAY_EXCLUDE_MTP_ENV = "NRL_ROUTER_REPLAY_EXCLUDE_MTP"
 _MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 _MISSING_ROUTE_FALLBACK_PATCH_ATTR = "_nrl_missing_route_fallback_patch"
 
@@ -70,17 +71,38 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
     _install_missing_route_fallback_patch()
 
 
-def _iter_model_modules(model: Any) -> Iterable[Any]:
+def _iter_model_modules_with_mtp_ancestry(
+    model: Any, *, beneath_mtp: bool = False
+) -> Iterable[tuple[Any, bool]]:
+    """Yield modules and whether MCore identifies them as part of an MTP layer."""
     if isinstance(model, (list, tuple)):
         for item in model:
-            yield from _iter_model_modules(item)
+            yield from _iter_model_modules_with_mtp_ancestry(
+                item, beneath_mtp=beneath_mtp
+            )
         return
 
-    modules = getattr(model, "modules", None)
-    if callable(modules):
-        yield from modules()
-    else:
-        yield model
+    beneath_mtp = beneath_mtp or bool(getattr(model, "is_mtp_layer", False))
+    yield model, beneath_mtp
+
+    children = getattr(model, "children", None)
+    if callable(children):
+        for child in children():
+            yield from _iter_model_modules_with_mtp_ancestry(
+                child, beneath_mtp=beneath_mtp
+            )
+
+
+def _router_replay_exclude_mtp_enabled() -> bool:
+    value = os.getenv(_ROUTER_REPLAY_EXCLUDE_MTP_ENV, "1").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid {_ROUTER_REPLAY_EXCLUDE_MTP_ENV}={value!r}; expected one of "
+        "{'1','true','yes','on','0','false','no','off'}."
+    )
 
 
 def _unwrap_model_config(model: Any) -> Optional[Any]:
@@ -125,7 +147,10 @@ def _global_moe_layer_numbers(model_config: Any) -> list[int]:
 def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:
     instances: list[tuple[Any, int]] = []
     seen: set[int] = set()
-    for module in _iter_model_modules(model):
+    exclude_mtp = _router_replay_exclude_mtp_enabled()
+    for module, beneath_mtp in _iter_model_modules_with_mtp_ancestry(model):
+        if exclude_mtp and beneath_mtp:
+            continue
         replay = getattr(module, "router_replay", None)
         layer_number = getattr(module, "layer_number", None)
         if replay is None or layer_number is None:
@@ -139,7 +164,10 @@ def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:
 
 def _local_layer_numbers_for_model(model: Any) -> set[int]:
     layer_numbers: set[int] = set()
-    for module in _iter_model_modules(model):
+    exclude_mtp = _router_replay_exclude_mtp_enabled()
+    for module, beneath_mtp in _iter_model_modules_with_mtp_ancestry(model):
+        if exclude_mtp and beneath_mtp:
+            continue
         layer_number = getattr(module, "layer_number", None)
         if layer_number is None:
             continue
