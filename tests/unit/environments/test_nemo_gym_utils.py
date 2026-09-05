@@ -238,6 +238,7 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
     actor.set_tokenizer.remote.return_value = "tokenizer-ref"
     tokenizer = MagicMock()
     runtime_env = {"py_executable": "/venv/bin/python"}
+    token_capture = {"enabled": True, "capture_dir": "/tmp/cap"}
 
     with (
         patch.object(
@@ -256,6 +257,7 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
             tokenizer=tokenizer,
             enable_router_replay=False,
             use_fastokens=True,
+            token_capture=token_capture,
         )
 
     assert result is actor
@@ -274,6 +276,9 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
 
     cfg = mock_cls.options.return_value.remote.call_args.args[0]
     assert cfg["use_fastokens"] is True
+    # The ledger config must ride through to the actor; a refactor of this
+    # wrapper once dropped it without any type or test catching it.
+    assert cfg["token_capture"] == token_capture
 
     # Spinup is deferred from __init__, so the factory must await it.
     actor._spinup.remote.assert_called_once_with()

@@ -1335,6 +1335,7 @@ def spinup_nemo_gym_actor(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    token_capture: Optional[dict[str, Any]] = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -1347,6 +1348,9 @@ def spinup_nemo_gym_actor(
             rollout call. See ``NemoGym.set_tokenizer`` for why that
             distinction is the difference between a working run and a stalled
             one.
+        token_capture: Dumped ``TokenCaptureConfig`` when ledger-authoritative
+            token capture is enabled, else ``None``. Forwarded to
+            ``build_nemo_gym_config``.
 
     Returns:
         The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
@@ -1357,6 +1361,7 @@ def spinup_nemo_gym_actor(
         model_name=model_name,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        token_capture=token_capture,
     )
 
     nemo_gym_opts: dict[str, Any] = {

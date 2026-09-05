@@ -93,13 +93,24 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     light enough to cross the wire.
     """
     assert {f.name for f in fields(ReassemblyRequest)} == {
-        "group_id", "rollout_ids", "receipts", "rewards",
-        "fallback_weight_version", "prompt_idx", "mask_sample",
+        "group_id",
+        "rollout_ids",
+        "receipts",
+        "rewards",
+        "fallback_weight_version",
+        "prompt_idx",
+        "mask_sample",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
-        "meta", "group_min_wv", "group_max_wv", "staging_keys",
-        "metrics", "dropped", "drop_reason",
-        "valid_row_count", "total_row_count",
+        "meta",
+        "group_min_wv",
+        "group_max_wv",
+        "staging_keys",
+        "metrics",
+        "dropped",
+        "drop_reason",
+        "valid_row_count",
+        "total_row_count",
     }
 
 

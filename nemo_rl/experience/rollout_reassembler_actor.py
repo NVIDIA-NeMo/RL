@@ -166,4 +166,6 @@ def create_rollout_reassembler_actors(
     """Construct the fixed validation pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
-    return [RolloutReassemblerActor.remote(dp_config, config) for _ in range(num_workers)]
+    return [
+        RolloutReassemblerActor.remote(dp_config, config) for _ in range(num_workers)
+    ]

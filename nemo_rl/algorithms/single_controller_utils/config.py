@@ -1093,7 +1093,10 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "train with penalized rewards.",
             stacklevel=2,
         )
-    if token_capture_config.enabled and async_config.rollout_failure.max_skipped_prompts:
+    if (
+        token_capture_config.enabled
+        and async_config.rollout_failure.max_skipped_prompts
+    ):
         warnings.warn(
             "async_rl.rollout_failure.max_skipped_prompts does nothing with "
             "token_capture.enabled=true: the capture dispatch path re-raises a "

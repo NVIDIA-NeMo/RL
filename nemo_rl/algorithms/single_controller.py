@@ -1464,10 +1464,7 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
-                            min_valid_fraction = (
-                                self._master_config.token_capture
-                                .min_valid_fraction_per_group
-                            )
+                            min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
                             below_threshold = (
                                 min_valid_fraction is not None
                                 and finalized.total_row_count > 0
@@ -1484,9 +1481,7 @@ class SingleControllerActor:
                             # only the controller can act on: it is the one
                             # component that can source a replacement.
                             try:
-                                await self._cleanup_known_finalization_request(
-                                    request
-                                )
+                                await self._cleanup_known_finalization_request(request)
                             except BaseException as cleanup_error:
                                 raise RuntimeError(
                                     "finalizer group fell below "

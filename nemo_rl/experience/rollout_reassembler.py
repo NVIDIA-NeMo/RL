@@ -379,12 +379,9 @@ class RolloutReassembler:
         tokens to measure it from at dispatch time -- so it is computed here
         instead, from each row's rebuilt length against ``max_seq_len``.
         """
-        assert (
-            len(rollout_ids)
-            == len(receipts)
-            == len(rewards)
-            == len(mask_sample)
-        ), "rollout_ids, receipts, rewards, and mask_sample must be parallel"
+        assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
+            "rollout_ids, receipts, rewards, and mask_sample must be parallel"
+        )
         _group_t0 = time.perf_counter()
         rows = [
             self.finalize_rollout(rollout_id, receipt, reward=reward)

@@ -1913,7 +1913,9 @@ class RolloutManager:
                 prompt_idx=record.prompt_idx,
                 mask_sample=mask_sample,
             )
-            from nemo_rl.experience.rollout_reassembler_actor import assert_metadata_only
+            from nemo_rl.experience.rollout_reassembler_actor import (
+                assert_metadata_only,
+            )
 
             assert_metadata_only(request)
             return request
