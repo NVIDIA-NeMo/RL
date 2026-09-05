@@ -21,10 +21,10 @@ IS truncation lives in loss_functions.ClippedPGLoss (ICE-POP mode).
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import ray
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PositiveInt
 
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -68,6 +68,23 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
     enabled: bool = False
+    use_orm_advantage: bool = False
+    orm_advantage_weight: float = 0.0
+    proximal_teacher_alpha: float = Field(default=1.0, gt=0.0, le=1.0)
+    subtract_global_baseline: bool = False
+    log_sample_stats: bool = False
+    sample_stats_log_period: PositiveInt = 1
+    log_sample_responses: bool = False
+    sample_response_max_tokens: Optional[PositiveInt] = None
+    log_token_stats: bool = False
+    token_stats_log_period: PositiveInt = 1
+    log_topk_stats: bool = False
+    topk_stats_log_period: PositiveInt = 1
+    topk_stats_mode: Literal["student_online_teacher_deferred", "online"] = (
+        "student_online_teacher_deferred"
+    )
+    topk_stats_k: PositiveInt = 32
+    topk_stats_max_tokens: Optional[PositiveInt] = None
     teacher_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
     default_teacher_alias: Optional[str] = None
     strict_agent_name_match: bool = False
