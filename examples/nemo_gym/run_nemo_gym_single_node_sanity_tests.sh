@@ -41,7 +41,16 @@ uv run python -c "import ray; ray.shutdown()"
 ./tests/run_unit.sh unit/environments/test_math_environment.py::test_math_env_step_basic
 
 # NeMo Gym integrates directly into NeMo RL as an Environment since that is the cleanest way. This tests the NeMo Gym integration logic and correctness.
-./tests/run_unit.sh unit/environments/test_nemo_gym.py::test_nemo_gym_sanity
+./tests/run_unit.sh \
+    unit/environments/test_nemo_gym.py::test_nemo_gym_sanity \
+    --nemo-gym-only
 
 # NeMo Gym uses a separate rollout loop inside grpo_train in NeMo RL. This tests the e2e rollout functionality and correctness.
-./tests/run_unit.sh unit/experience/test_rollouts.py::test_run_async_nemo_gym_rollout
+./tests/run_unit.sh \
+    unit/experience/test_rollouts.py::test_run_async_nemo_gym_rollout \
+    --nemo-gym-only
+
+# Exercise one pinned Gym example from each P0 environment through the real NeMo RL rollout boundary.
+./tests/run_unit.sh \
+    unit/environments/test_nemo_gym_rollout_acceptance.py::test_p0_gym_environments_roll_out_through_nemo_rl \
+    --nemo-gym-only
