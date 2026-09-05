@@ -1143,6 +1143,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         def __init__(self) -> None:
             self.generated = 0
             self.two_generated = asyncio.Event()
+            self.stats = SimpleNamespace(committed=0)
 
         async def generate_for_finalization(
             self,
