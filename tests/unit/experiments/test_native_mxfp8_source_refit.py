@@ -104,6 +104,8 @@ def test_ntrace_image_builder_pins_native_runtime_in_immutable_image() -> None:
     assert "--target /opt/ntrace-runtime" in builder
     assert "selected_backend_name()" in builder
     assert "--container-save=${OUTPUT_IMAGE}" in builder
+    assert "BUILD_COMMAND_B64=" in builder
+    assert "base64 -d | bash" in builder
 
 
 def test_launcher_selects_qwen235_native_mxfp8_arm() -> None:

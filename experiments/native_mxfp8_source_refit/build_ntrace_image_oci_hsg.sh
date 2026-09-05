@@ -64,6 +64,7 @@ PYTHONPATH=/opt/ntrace-runtime /opt/nemo_rl_venv/bin/python -c \
   'import ntrace, pyarrow; from ntrace.backends import get_backend, selected_backend_name; assert selected_backend_name() == "cpp"; get_backend()'
 EOF
 )
+BUILD_COMMAND_B64=$(printf '%s' "${BUILD_COMMAND}" | base64 | tr -d '\n')
 
 SBATCH_ACTION=()
 if [[ "${ACTION}" == test-only ]]; then
@@ -89,4 +90,4 @@ exec sbatch \
     --container-workdir=/tmp \
     --container-writable \
     --container-save=${OUTPUT_IMAGE} \
-    bash -lc $(printf '%q' "${BUILD_COMMAND}")"
+    bash -lc 'printf %s ${BUILD_COMMAND_B64} | base64 -d | bash'"
