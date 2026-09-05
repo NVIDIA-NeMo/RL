@@ -2,12 +2,16 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
+# Two-node sibling of the 1n8g recipe -- see the matching yaml for why one node
+# does not fit. Identical otherwise, including the max(train/reward) > 0.5 gate.
+
 # ===== BEGIN CONFIG =====
 NUM_NODES=2
-STEPS_PER_RUN=20
-MAX_STEPS=20
+GPUS_PER_NODE=8
+STEPS_PER_RUN=10
+MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=240
+NUM_MINUTES=120
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -32,13 +36,10 @@ uv run examples/run_vlm_grpo.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
-# Logprob gate copied from vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.sh -- same
-# geo3k task, same AutoModel backend, same reward bound. Median rather than
-# max: a single long outlier sequence dominates the step value, so max() would
-# gate on the outlier rather than on train/inference consistency.
+# Gates match the 1n8g recipe: see it for why the logprob check is a median.
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'max(data["train/reward"]) > 0.45' \
+        'max(data["train/reward"]) > 0.5' \
         'median(data["train/token_mult_prob_error"]) < 1.05'
 
     # Clean up checkpoint directory after successful run to save space.
