@@ -74,7 +74,7 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     MALFORMED_THINKING_MASK,
 )
 
-# Subset fetched by logprob / ref-logprob workers.
+# Core fields the logprob workers require; multimodal extras added by TQPolicy._logprob_dispatch.
 LP_SEED_FIELDS = (
     "input_ids",
     "input_lengths",
@@ -106,33 +106,12 @@ VALUE_SEED_FIELDS = LP_SEED_FIELDS
 # calibration only handles seq-dim tensor inputs, so we name them
 # explicitly. Train-side deltas (logprobs/advantages/masks) and
 # wire-only message-log bulk fields are skipped by virtue of not being
-# in this list. ``multi_modal_inputs`` covers VLM extras (pixel values,
-# grid metadata, etc.) when present; it's harmlessly absent for
-# text-only models so the filter skips it on those.
-DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
+# in this list. VLM extras are not named here — they are per-batch, so
+# callers add the ones actually present via
+# ``multimodal_utils.present_multimodal_fields``.
+DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
-
-# Per-sample 1D scalar fields. The TQ adapter promotes these to ``(N, 1)``
-# on write to work around TQ v0.1.9's KVStorageManager schema/data mismatch on
-# the Mooncake backend, and squeezes them back to ``(N,)`` on read. This is the
-# authoritative user-level schema; no per-row shape metadata is carried.
-#
-# Fields listed here must be dense ``(N,)`` tensors when written through the
-# Mooncake adapter. Dense 1D fields not listed here are rejected on that path so
-# a new field cannot silently reintroduce the upstream shape mismatch.
-#
-# Delete this set and the corresponding adapter transforms when upstream TQ
-# fixes 1D field schema extraction.
-PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
-    {
-        INPUT_LENGTHS,
-        MASK_SAMPLE,
-        "total_reward",
-        SAMPLE_MASK,
-        TRUNCATED,
-    }
-)
 
 
 def fields_with_optional_routed_experts(

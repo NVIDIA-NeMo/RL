@@ -149,18 +149,29 @@ def test_model_cp_slicing_capability_is_detected():
     assert not _model_slices_context_parallel_inputs(object())
 
 
-def test_model_cp_slicing_rejects_transfer_queue_setup():
+def test_model_cp_slicing_accepts_transfer_queue_setup(monkeypatch):
+    """Media-before-CP models are served by the leader-broadcast fetch.
+
+    ``_fetch`` broadcasts one DP slice across the replica group (TP x CP x PP
+    siblings of a DP rank), so every CP sibling gets identical full THD rows and
+    the model applies its own post-embedding slice. Setup used to reject these
+    models outright; the contract is satisfied, so it must not.
+    """
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model_slices_context_parallel_inputs = True
+    worker._dp_client = None
 
-    with pytest.raises(
-        NotImplementedError, match="TransferQueue/SingleController does not yet support"
-    ):
-        worker.setup_data_plane(MagicMock())
+    client = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client", lambda cfg, bootstrap: client
+    )
+    worker.setup_data_plane(MagicMock())
+
+    assert worker._dp_client is client
 
 
 def test_refit_size_estimate_preserves_integral_buffer_dtype():
