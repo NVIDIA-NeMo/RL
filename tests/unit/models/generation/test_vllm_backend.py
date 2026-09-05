@@ -1007,10 +1007,11 @@ def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(monkeypatch):
 
 @pytest.mark.vllm
 def test_weight_update_lifecycle_uses_native_reload_for_dsv4(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8, fp8
     from vllm.model_executor.model_loader import reload as layerwise_reload
     from vllm.model_executor.model_loader.reload import meta
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8, fp8
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension

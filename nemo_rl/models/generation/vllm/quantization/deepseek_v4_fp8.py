@@ -17,7 +17,6 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
 
-
 _PACKED_MODULES = {
     "attn.fused_wqa_wkv": ["attn.wq_a", "attn.wkv"],
     "compressor.fused_wkv_wgate": ["compressor.wkv", "compressor.wgate"],

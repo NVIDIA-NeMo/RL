@@ -858,6 +858,7 @@ class TestSetupDistributed:
         with pytest.raises(ValueError, match="dp_replicate_size"):
             setup_distributed(mock_config, mock_runtime_config)
 
+
 @pytest.mark.automodel
 class TestSetupModelAndOptimizer:
     """Test suite for setup_model_and_optimizer function."""
