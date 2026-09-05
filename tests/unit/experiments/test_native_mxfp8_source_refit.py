@@ -156,7 +156,11 @@ def test_qwen235_twenty_step_arms_match_except_training_and_rollout_precision() 
     assert "te_nano_routed_fp8param.yaml" in candidate
     assert "qwen235:bf16:false" in launcher
     assert "CONFIG=experiments/native_mxfp8_source_refit/qwen235-bf16.yaml" in launcher
-    assert "grpo-qwen3-235b-32n4g-async-1off.yaml" in baseline
+    common_recipe = (
+        "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml"
+    )
+    assert common_recipe in candidate
+    assert common_recipe in baseline
     assert "te_precision_config_file: null" in baseline
     assert "fp8_cfg:\n      enabled: false" in baseline
     assert "refit_transport: nccl_reshard" in baseline
