@@ -506,6 +506,10 @@ class DraftConfig(TypedDict):
     loss_weight: NotRequired[float]
     num_layers: NotRequired[int | None]
     aux_layer_indices: NotRequired[list[int] | None]
+    # Tokens per FP32 vocab tile in the streaming draft soft-CE. Trades peak
+    # activation memory against kernel-launch count; see
+    # DEFAULT_DRAFT_TOKEN_CHUNK_SIZE in nemo_rl/algorithms/loss/draft.py.
+    token_chunk_size: NotRequired[int]
 
 
 class TokenizerConfig(TypedDict):

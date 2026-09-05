@@ -17,6 +17,10 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 import torch
 from pydantic import BaseModel, Field
 
+from nemo_rl.algorithms.loss.draft import (
+    DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+    streaming_vocab_parallel_soft_ce,
+)
 from nemo_rl.algorithms.loss.interfaces import (
     LossFunction,
     LossInputType,
@@ -39,7 +43,6 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    DistributedCrossEntropy,
     cp_shift_next,
     group_all_reduce_sum,
     group_all_reduce_sum_with_grad,
@@ -54,6 +57,9 @@ Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 class DraftCrossEntropyLossConfig(TypedDict):
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
+    # Tokens per FP32 vocab tile in the streaming soft-CE reduction. Defaults to
+    # DEFAULT_DRAFT_TOKEN_CHUNK_SIZE; see policy.draft.token_chunk_size.
+    token_chunk_size: NotRequired[int]
 
 
 class DraftCrossEntropyLossDataDict(TypedDict):
@@ -73,8 +79,10 @@ class DraftCrossEntropyLossFn(LossFunction):
     def __init__(
         self,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        token_chunk_size: int = DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
     ):
         self.vocab_parallel_group = vocab_parallel_group
+        self.token_chunk_size = token_chunk_size
 
     def __call__(
         self,
@@ -86,26 +94,16 @@ class DraftCrossEntropyLossFn(LossFunction):
         global_valid_toks: torch.Tensor,
     ) -> torch.Tensor:
         """Reduce the masked per-token draft loss to a scalar."""
-        if self.vocab_parallel_group is not None:
-            # Soft cross entropy matches the forward-KL student gradient.
-            per_token_loss = DistributedCrossEntropy.apply(
-                student_logits,
-                teacher_logits,
-                self.vocab_parallel_group,
-                False,
-            )
-        else:
-            # teacher_logits is already detached at the call site (utils.py);
-            # match DistributedCrossEntropy semantics.
-            teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
-            student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
-            per_token_loss = -(teacher_probs * student_log_probs).sum(dim=-1)
-
         mask = token_mask * data["sample_mask"].unsqueeze(-1)
-        return masked_mean(
-            per_token_loss,
-            mask,
-            global_normalization_factor=global_valid_toks,
+        stats = streaming_vocab_parallel_soft_ce(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
+            token_chunk_size=self.token_chunk_size,
+            tp_group=self.vocab_parallel_group,
+        )
+        return stats.normalized(
+            normalization_counts=global_valid_toks.reshape(1),
         )
 
 
