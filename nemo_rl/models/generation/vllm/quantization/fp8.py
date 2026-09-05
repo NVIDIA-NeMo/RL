@@ -614,6 +614,8 @@ def get_quantized_weight_iterator(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Convert trainer weights to the checkpoint tensors expected by vLLM."""
     model = model_runner.model
+    weights = list(weights)
+    weight_names = {name for name, _tensor in weights}
 
     for k, v in weights:
         grouped_weight_name = _grouped_expert_weight_name_from_scale(k)
