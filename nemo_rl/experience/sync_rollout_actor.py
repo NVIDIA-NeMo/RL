@@ -217,7 +217,10 @@ class SyncRolloutActor:
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
         # ``_policy_dtype`` sizes the VLM pixel tensors below.
         from nemo_rl.algorithms.grpo import _policy_dtype
-        from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
+        from nemo_rl.algorithms.utils import (
+            get_gdpo_reward_component_keys,
+            grouping_ids_from_identifiers,
+        )
         from nemo_rl.data.llm_message_utils import (
             MESSAGE_LOG_BULK_FIELDS,
             decompose_message_log,
@@ -249,7 +252,8 @@ class SyncRolloutActor:
         )
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
-        if should_use_nemo_gym(cfg):
+        use_nemo_gym = should_use_nemo_gym(cfg)
+        if use_nemo_gym:
             r = run_nemo_gym_rollout_sync(
                 **common,
                 max_seq_len=None,
@@ -360,6 +364,23 @@ class SyncRolloutActor:
                 else np.asarray(v, dtype=object)
             )
 
+        n_samples = int(bulk_batch["sample_mask"].shape[0])
+        input_size = int(input_batch.size)
+        if group_size <= 0 or input_size % group_size != 0:
+            raise ValueError(
+                f"input_batch.size={input_size} is not divisible by group_size={group_size}"
+            )
+        n_prompts = input_size // group_size
+        if n_prompts == 0 or n_samples % n_prompts != 0:
+            raise ValueError(
+                f"bulk_batch has {n_samples} samples; not divisible by n_prompts={n_prompts}"
+            )
+        n_per_prompt = n_samples // n_prompts
+        uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
+        prompt_ids_for_adv = prompt_flat["token_ids"]
+        if use_nemo_gym:
+            prompt_ids_for_adv = grouping_ids_from_identifiers(uids, n_per_prompt)
+
         # Slice — only what the driver can't derive from a TQ slice fetch
         # (anything containing `message_log` or per-token data would
         # force a fetch). Driver does scale_rewards / reward_shaping /
@@ -376,7 +397,7 @@ class SyncRolloutActor:
             "truncated": truncated,
             "length": length,
             "input_lengths": input_lengths,
-            "prompt_ids_for_adv": prompt_flat["token_ids"],
+            "prompt_ids_for_adv": prompt_ids_for_adv,
             # Computed by decompose_message_log above; feeds
             # apply_reward_shaping on the driver without a TQ fetch.
             "response_token_lengths": decomposed["response_token_lengths"],
@@ -399,19 +420,6 @@ class SyncRolloutActor:
                 )
             driver_carry = {k: driver_carry[k] for k in carry_keys}
 
-        n_samples = int(bulk_batch["sample_mask"].shape[0])
-        input_size = int(input_batch.size)
-        if group_size <= 0 or input_size % group_size != 0:
-            raise ValueError(
-                f"input_batch.size={input_size} is not divisible by group_size={group_size}"
-            )
-        n_prompts = input_size // group_size
-        if n_prompts == 0 or n_samples % n_prompts != 0:
-            raise ValueError(
-                f"bulk_batch has {n_samples} samples; not divisible by n_prompts={n_prompts}"
-            )
-        n_per_prompt = n_samples // n_prompts
-        uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
         sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
         trace_rollout_payload(keys=sample_ids, data=bulk_batch)
         meta = kv_first_write(

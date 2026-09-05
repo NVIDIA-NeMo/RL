@@ -2370,6 +2370,25 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+def _prompt_grouping_ids(
+    prompt_token_ids: torch.Tensor,
+    *,
+    num_prompts: int,
+    num_generations_per_prompt: int,
+    use_nemo_gym: bool,
+    group_offset: int = 0,
+) -> torch.Tensor:
+    """Return identities for generations originating from the same prompt."""
+    if not use_nemo_gym:
+        return prompt_token_ids
+
+    return (
+        torch.arange(group_offset, group_offset + num_prompts)
+        .repeat_interleave(num_generations_per_prompt)
+        .unsqueeze(1)
+    )
+
+
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
@@ -3005,6 +3024,7 @@ def grpo_train(
         batch_cache: BatchedDataDict[DatumSpec] = None
         # This is the number of batches we processed so far at each step to generate responses whose std is non-zero. Maximum threshold is set by dynamic_sampling_max_gen_batches. Used in the case of dynamic sampling.
         dynamic_sampling_num_gen_batches = 0
+        prompt_grouping_id_offset = 0
 
         # Run grpo/dapo training loop (single-turn)
         for batch in wrapped_dataloader:
@@ -3078,7 +3098,14 @@ def grpo_train(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
-                    input_ids = batched_flat["token_ids"]
+                    prompt_grouping_ids = _prompt_grouping_ids(
+                        batched_flat["token_ids"],
+                        num_prompts=batch.size,
+                        num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
+                        use_nemo_gym=should_use_nemo_gym(master_config),
+                        group_offset=prompt_grouping_id_offset,
+                    )
+                    prompt_grouping_id_offset += batch.size
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 memory_tracker.snapshot_start_of_stage("Generation", dir())
@@ -3194,7 +3221,6 @@ def grpo_train(
                                 master_config.grpo.debug_payload_metrics
                             ),
                         )
-                        input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
@@ -3284,7 +3310,7 @@ def grpo_train(
                         # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            prompt_grouping_ids.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
@@ -3298,12 +3324,15 @@ def grpo_train(
                         std = std.cpu()
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            prompt_grouping_ids,
                             rewards,
                             torch.ones_like(rewards),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             std_rewards=std_rewards,
                         )
+
+                    # Keep source prompt identity aligned with dynamic-sampling rows.
+                    repeated_batch["prompt_grouping_ids"] = prompt_grouping_ids
 
                     # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
                     repeated_batch, is_batch_complete, batch_cache, ds_metrics = (
@@ -3341,24 +3370,12 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
+                    # Must precede the training flatten because it reuses the same message dicts.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
 
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
-                    del input_ids
+                    prompt_ids_for_adv = repeated_batch["prompt_grouping_ids"]
+                    del repeated_batch["prompt_grouping_ids"]
+                    del prompt_grouping_ids
                     del baseline
                     del std
 
@@ -4026,6 +4043,7 @@ def grpo_train(
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
+            prompt_grouping_id_offset = 0
 
             # Clear mem
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
@@ -5068,8 +5086,17 @@ def async_grpo_train(
                         f"✅ Sampled {len(trajectories)} trajectory groups from buffer (avg age: {avg_trajectory_age:.2f} steps)"
                     )
 
-                    # Concatenate per-prompt groups into a single training batch
-                    per_prompt_batches = [t["batch"] for t in trajectories]
+                    # Concatenate per-prompt groups into a single training batch.
+                    # Reconstruct grouping from the replay buffer's prompt groups.
+                    # This also repairs groups loaded from older checkpoints.
+                    per_prompt_batches = []
+                    for group_index, trajectory in enumerate(trajectories):
+                        prompt_batch = trajectory["batch"]
+                        if NEMO_GYM_TASK_INDEX_KEY in trajectory:
+                            prompt_batch["prompt_grouping_ids"] = torch.full(
+                                (prompt_batch.size, 1), group_index, dtype=torch.int64
+                            )
+                        per_prompt_batches.append(prompt_batch)
                     repeated_batch = BatchedDataDict.from_batches(
                         per_prompt_batches,
                         allow_missing_packed_tensors=(
@@ -5127,24 +5154,24 @@ def async_grpo_train(
                         RLSpanGroup.REWARD, "rl.grpo.reward_calculation", tracer=_tracer
                     ),
                 ):
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
 
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
+                    if "prompt_grouping_ids" in repeated_batch:
+                        prompt_ids_for_adv = repeated_batch["prompt_grouping_ids"]
+                        del repeated_batch["prompt_grouping_ids"]
+                    else:
+                        # Native rollouts group by the tokenized source prompt.
+                        initial_prompt_message_logs = extract_initial_prompt_messages(
+                            repeated_batch["message_log"],
+                            repeated_batch["length"],
+                        )
+                        prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                            initial_prompt_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                        prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                        del initial_prompt_message_logs
+                        del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
 

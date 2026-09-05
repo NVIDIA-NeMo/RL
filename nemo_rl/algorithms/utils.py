@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import math
 import random
 import warnings
+from collections.abc import Sequence
 from functools import partial, wraps
 from typing import Any, Optional
 
@@ -30,6 +32,42 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
+
+
+def grouping_ids_from_identifiers(
+    identifiers: Sequence[str], repeats_per_group: int
+) -> torch.Tensor:
+    """Return stable tensor identities for explicitly formed prompt groups."""
+    if repeats_per_group <= 0:
+        raise ValueError("repeats_per_group must be positive")
+
+    rows = []
+    for identifier in identifiers:
+        digest = hashlib.sha256(identifier.encode()).digest()[:16]
+        rows.append(
+            [
+                int.from_bytes(digest[:8], byteorder="big", signed=True),
+                int.from_bytes(digest[8:], byteorder="big", signed=True),
+            ]
+        )
+    if not rows:
+        return torch.empty((0, 2), dtype=torch.int64)
+    return torch.tensor(rows, dtype=torch.int64).repeat_interleave(
+        repeats_per_group, dim=0
+    )
+
+
+def grouping_ids_from_sample_ids(sample_ids: Sequence[str]) -> torch.Tensor:
+    """Derive prompt-group identities from ``{group_id}_g{index}`` sample IDs."""
+    group_ids = []
+    for sample_id in sample_ids:
+        group_id, separator, generation_index = sample_id.rpartition("_g")
+        if not separator or not generation_index.isdigit():
+            raise ValueError(
+                f"Invalid grouped sample ID {sample_id!r}; expected '{{group_id}}_g{{index}}'"
+            )
+        group_ids.append(group_id)
+    return grouping_ids_from_identifiers(group_ids, 1)
 
 
 def get_gdpo_reward_component_keys(batch) -> list[str]:

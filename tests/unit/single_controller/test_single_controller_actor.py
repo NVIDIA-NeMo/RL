@@ -542,10 +542,12 @@ class _AdvantageDataPlane:
 class _MaskRecordingAdvantageEstimator:
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
+        self.prompt_ids: torch.Tensor | None = None
 
-    def compute_advantage(self, *, rewards, mask, **kwargs) -> torch.Tensor:
+    def compute_advantage(self, *, prompt_ids, rewards, mask, **kwargs) -> torch.Tensor:
         del kwargs
         self.mask = mask.clone()
+        self.prompt_ids = prompt_ids.clone()
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
@@ -610,7 +612,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        sample_ids=["first_g0", "first_g1", "second_g0", "second_g1"],
         fields=list(data.keys()),
     )
 
@@ -638,6 +640,10 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert estimator.mask is not None
     assert estimator.mask[0].all()
     assert estimator.mask[1:].count_nonzero() == 0
+    assert estimator.prompt_ids is not None
+    assert torch.equal(estimator.prompt_ids[0], estimator.prompt_ids[1])
+    assert torch.equal(estimator.prompt_ids[2], estimator.prompt_ids[3])
+    assert not torch.equal(estimator.prompt_ids[0], estimator.prompt_ids[2])
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [1]
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1

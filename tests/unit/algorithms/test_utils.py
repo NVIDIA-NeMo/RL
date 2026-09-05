@@ -28,12 +28,36 @@ from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
+    grouping_ids_from_identifiers,
+    grouping_ids_from_sample_ids,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_grouping_ids_from_identifiers_are_stable_and_distinct() -> None:
+    grouping_ids = grouping_ids_from_identifiers(["group-a", "group-b"], 2)
+
+    assert grouping_ids.shape == (4, 2)
+    assert torch.equal(grouping_ids[0], grouping_ids[1])
+    assert torch.equal(grouping_ids[2], grouping_ids[3])
+    assert not torch.equal(grouping_ids[0], grouping_ids[2])
+    assert torch.equal(
+        grouping_ids,
+        grouping_ids_from_identifiers(["group-a", "group-b"], 2),
+    )
+
+
+def test_grouping_ids_from_sample_ids_restore_group_boundaries() -> None:
+    grouping_ids = grouping_ids_from_sample_ids(
+        ["first-group_g0", "first-group_g1", "second-group_g0"]
+    )
+
+    assert torch.equal(grouping_ids[0], grouping_ids[1])
+    assert not torch.equal(grouping_ids[0], grouping_ids[2])
 
 
 @pytest.fixture

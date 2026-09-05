@@ -103,6 +103,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.algorithms.utils import grouping_ids_from_sample_ids
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -3246,6 +3247,15 @@ class SingleControllerActor:
         )
 
         prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        if not self._is_ppo:
+            # Replay sample IDs preserve explicit prompt-group boundaries.
+            # Harness prompt rewrites and checkpoint restores cannot change them.
+            try:
+                prompt_ids = grouping_ids_from_sample_ids(meta.sample_ids)
+            except ValueError:
+                # Keep compatibility with custom producers that do not use the
+                # replay buffer's ``{group_id}_g{index}`` sample-ID contract.
+                pass
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
