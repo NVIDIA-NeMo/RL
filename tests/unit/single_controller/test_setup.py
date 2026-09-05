@@ -56,6 +56,9 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.algorithms.single_controller_utils.config import (
+    validate_single_controller_config,
+)
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollouts import EffortLevelsConfig
@@ -158,6 +161,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        logger={"wandb_enabled": False, "wandb": {}},
         cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
@@ -408,6 +412,7 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
 
     assert isinstance(resolved, dict)
     config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
     assert config.grpo.async_grpo is None
     assert config.grpo.adv_estimator.name == "opd"
     assert config.grpo.skip_reference_policy_logprobs_calculation is True
@@ -426,6 +431,24 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
         config.on_policy_distillation.teacher_model_by_agent_name["default_teacher"]
         == config.policy["model_name"]
     )
+
+
+def test_single_controller_ppo_recipe_inherits_overlong_filtering():
+    """The SC nightly exercises the overlong filtering inherited from its parent."""
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-"
+        "noncolocated-async-single-controller.yaml"
+    )
+    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
+    assert config.ppo is not None
+    assert config.ppo.overlong_filtering is True
 
 
 @pytest.mark.parametrize(
@@ -945,6 +968,29 @@ class TestSetup:
         )
 
     @pytest.mark.parametrize(
+        ("wandb_enabled", "table_flag", "expected"),
+        [(False, True, False), (True, False, False), (True, True, True)],
+    )
+    def test_full_result_table_gate_reaches_the_rollout_manager(
+        self,
+        wandb_enabled: bool,
+        table_flag: bool,
+        expected: bool,
+        patched_factories,
+    ):
+        mc = _make_master_config()
+        mc.logger = {
+            "wandb_enabled": wandb_enabled,
+            "wandb": {"log_nemo_gym_full_result_tables": table_flag},
+        }
+
+        with patch.object(sc_setup_mod, "RolloutManager") as mock_rollout_manager:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        _, call_kwargs = mock_rollout_manager.call_args
+        assert call_kwargs["log_full_result_tables"] is expected
+
+    @pytest.mark.parametrize(
         "env",
         [
             pytest.param({}, id="no_nemo_gym_section"),
@@ -1107,7 +1153,6 @@ class TestSetup:
             # run_rollouts call.
             tokenizer=tokenizer,
             enable_router_replay=False,
-            routed_experts_dtype="int16",
             use_fastokens=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
