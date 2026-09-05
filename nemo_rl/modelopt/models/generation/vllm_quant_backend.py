@@ -600,6 +600,10 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         ``_patch_named_parameters_to_include_buffers`` no longer fires and
         quantizer amax buffers arrive without a loader (AttributeError:
         'Tensor' object has no attribute 'weight_loader').
+
+        It also aliases the MoE amax buffers under the dotted name vLLM's
+        ``RoutedExperts.load_weights`` looks up; see
+        ``_alias_moe_quantizer_amax_buffers``.
         """
 
         def input_amax_loader(param, loaded_weight, *args, **kwargs):
@@ -612,11 +616,65 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             if not hasattr(buf, "weight_loader"):
                 buf.weight_loader = input_amax_loader
                 attached.append(buf)
+        aliased = self._alias_moe_quantizer_amax_buffers(model)
         try:
             yield
         finally:
+            for module, alias in aliased:
+                delattr(module, alias)
             for buf in attached:
                 del buf.weight_loader
+
+    def _alias_moe_quantizer_amax_buffers(
+        self, model
+    ) -> list[tuple[torch.nn.Module, str]]:
+        """Expose MoE amax buffers under the dotted name vLLM resolves.
+
+        vLLM's two refit loaders disagree on how deep a target name may be.
+        ``LinearBase.load_weights`` rpartitions the name and walks into the
+        submodule, so ``in_proj.input_quantizer._amax`` resolves. vLLM 0.26's
+        ``RoutedExperts.load_weights`` instead does a single
+        ``getattr(self, param_name)``. Its expert mapping rewrites an incoming
+        ``experts.<E>.up_proj.input_quantizer._amax`` key into the relative name
+        ``w13_input_quantizer._amax``, which is one level deeper than a plain
+        ``w13_weight``, so the single getattr raises AttributeError and the
+        whole refit fails.
+
+        vLLM <= 0.25.1 never hit this because the models that own MoE experts
+        (e.g. ``NemotronHForCausalLM``) carried a hand-written ``load_weights``
+        that looked targets up in ``dict(self.named_parameters())`` — a dict
+        lookup takes the full dotted key. 0.26 replaced those with
+        ``AutoWeightsLoader``, which delegates to the per-module loader.
+
+        Aliasing the buffer onto its owning module under the dotted name is
+        enough to bridge that: the alias is the *same* tensor, so the
+        ``max()`` fan-in in ``input_amax_loader`` still writes the real buffer,
+        and because the name is not a valid identifier chain it lands in
+        ``__dict__`` and leaves ``named_buffers()``/``state_dict()`` untouched.
+
+        Only ``w13_``/``w2_`` quantizers are aliased: those are the MoE layout
+        owned by RoutedExperts, and every other quantizer is reached through
+        LinearBase, which already resolves dotted names.
+
+        Returns:
+            The ``(module, alias)`` pairs to delete once loading is done.
+        """
+        aliased: list[tuple[torch.nn.Module, str]] = []
+        for module in model.modules():
+            for child_name, child in module.named_children():
+                if not child_name.startswith(("w13_", "w2_")):
+                    continue
+                if not child_name.endswith("_quantizer"):
+                    continue
+                for buf_name, buf in child.named_buffers(recurse=False):
+                    if not buf_name.endswith("_amax"):
+                        continue
+                    alias = f"{child_name}.{buf_name}"
+                    if hasattr(module, alias):
+                        continue
+                    setattr(module, alias, buf)
+                    aliased.append((module, alias))
+        return aliased
 
     def _load_weights(self, weights):
         """Load pre-folded weights and activation-quantizer amax buffers.
