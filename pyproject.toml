@@ -64,6 +64,8 @@ dependencies = [
   "pyzmq",
   "soundfile>=0.13.1",
   "nccl4py; sys_platform != 'darwin'",                                                                                       # for non-colocated refit
+  # Native M2N refit operations used by the nccl_reshard transport.
+  "nccl-extensions==0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-bindings; sys_platform != 'darwin'",                                                                                 # for non-colocated refit
   # Worker venvs run a base sync before backend extras, so NIXL must be available here.
   "nixl==1.3.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
