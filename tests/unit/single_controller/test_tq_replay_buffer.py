@@ -1250,6 +1250,7 @@ class TestTQReplayBufferStateDict:
             partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
             staging_partition_id="rollout_staging",
+            include_message_violation_fields=False,
         )
         assert _load(restored, state) == 1
 
@@ -1723,8 +1724,11 @@ class TestTQReplayBufferEvictedCommit:
                 result = FakeDataPlaneClient.put_samples(
                     self, sample_ids, partition_id, fields=fields, tags=tags
                 )
-                # Simulate the sampler evicting the slot mid-write.
-                await self.buf.remove([0], remove_in_dp=False)
+                # Simulate another task evicting the slot mid-write. Barrier
+                # sections are deliberately non-reentrant within one task, but
+                # independent mutation tasks may overlap when no checkpoint is
+                # active.
+                await asyncio.create_task(self.buf.remove([0], remove_in_dp=False))
                 return result
 
         dp = EvictDuringPut()

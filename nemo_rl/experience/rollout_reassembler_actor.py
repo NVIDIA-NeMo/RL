@@ -52,7 +52,6 @@ class ReassemblyRequest:
     """Metadata-only input for one prompt group's finalization."""
 
     group_id: str
-    prompt_idx: int
     rollout_ids: tuple[str, ...]
     canonical_sample_ids: tuple[str, ...]
     receipts: tuple[Optional[dict[str, Any]], ...]
