@@ -78,6 +78,7 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
+    GENERATION_WEIGHT_VERSION_KEY,
     NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -5431,6 +5432,9 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         train_data = self._create_train_data(
             batch_size, seq_length, prev_logprobs, generation_logprobs
         )
+        train_data["input_ids"] = torch.arange(
+            batch_size * seq_length
+        ).reshape(batch_size, seq_length)
         rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
 
         # Use threshold 1.2 which should mask sequences 2 and 3
@@ -5442,6 +5446,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
                 {
                     NEMO_GYM_TASK_INDEX_KEY: torch.tensor([100, 101, 102, 103]),
                     NEMO_GYM_ROLLOUT_INDEX_KEY: torch.tensor([0, 1, 2, 3]),
+                    GENERATION_WEIGHT_VERSION_KEY: torch.full((4,), 10),
                     TARGET_WEIGHT_VERSION_KEY: torch.full((4,), 11),
                     "agent_ref": [
                         {"name": "agent-a"},
@@ -5477,8 +5482,21 @@ class TestComputeAndApplySeqLogprobErrorMasking:
             assert "reason='seq_logprob_error'" in line
             assert f"task_index={task_index}" in line
             assert "agent_name='agent-b'" in line
+            assert "generation_weight_version=10" in line
             assert "target_weight_version=11" in line
+            assert "trajectory_age=1" in line
             assert "threshold=1.2" in line
+            assert "loss_token_count=9" in line
+            assert "max_error_token_position=1" in line
+
+        assert "max_abs_logprob_delta=0.5" in lines[0]
+        assert "generation_logprob_at_max_error=0.5" in lines[0]
+        assert "prev_logprob_at_max_error=0.0" in lines[0]
+        assert "max_error_token_id=21" in lines[0]
+        assert "max_abs_logprob_delta=1.0" in lines[1]
+        assert "generation_logprob_at_max_error=1.0" in lines[1]
+        assert "prev_logprob_at_max_error=0.0" in lines[1]
+        assert "max_error_token_id=31" in lines[1]
 
     def test_no_sequences_masked_when_all_below_threshold(self):
         """Test that no sequences are masked when all are below threshold."""

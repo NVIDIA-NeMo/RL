@@ -57,6 +57,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.experience.interfaces import (
+    GENERATION_WEIGHT_VERSION_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
@@ -2871,6 +2872,10 @@ class TestAsyncTrajectoryCollector:
             )
             assert trajectory_group["rollout_metrics"]["trajectory_duration_s"] >= 0
             assert "_ng_task_index" not in trajectory_group
+            assert (
+                trajectory_group["batch"][GENERATION_WEIGHT_VERSION_KEY].tolist()
+                == [2] * 3
+            )
             assert (
                 trajectory_group["batch"][TARGET_WEIGHT_VERSION_KEY].tolist()
                 == [target_weight] * 3

@@ -27,6 +27,10 @@ NEMO_GYM_ATTEMPT_INDEX_KEY = "_ng_attempt_index"
 # RL-local marker for a successful Gym response with no output items. Such rows
 # are retained for batch shape/accounting but must never contribute training loss.
 NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY = "_nemo_rl_empty_response_output"
+# Generator version/step whose weights produced an async rollout. This is
+# internal replay metadata and is deliberately not sent to Gym or the
+# generation backend.
+GENERATION_WEIGHT_VERSION_KEY = "generation_weight_version"
 # Trainer version/step for which an async rollout was reserved. This is internal
 # replay metadata and is deliberately not sent to Gym or the generation backend.
 TARGET_WEIGHT_VERSION_KEY = "target_weight_version"
