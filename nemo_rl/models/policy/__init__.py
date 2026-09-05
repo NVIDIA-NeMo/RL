@@ -15,6 +15,7 @@
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -492,22 +493,6 @@ class MegatronConfig(TypedDict):
     freeze_config: NotRequired[dict[str, Any]]
 
 
-class DraftConfigDisabled(TypedDict):
-    """Configuration shape for the disabled draft-model training path."""
-
-    enabled: Literal[False]
-
-
-class DraftConfig(TypedDict):
-    """Configuration for Eagle draft-model training alongside the policy model."""
-
-    enabled: Literal[True]
-    model_name: NotRequired[str | None]
-    loss_weight: NotRequired[float]
-    num_layers: NotRequired[int | None]
-    aux_layer_indices: NotRequired[list[int] | None]
-
-
 class TokenizerConfig(TypedDict):
     name: str
     # None selects NeMo-RL's passthrough prompt/response template.
@@ -584,7 +569,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    draft: NotRequired[DraftConfig | DraftConfigDisabled]
+    draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
