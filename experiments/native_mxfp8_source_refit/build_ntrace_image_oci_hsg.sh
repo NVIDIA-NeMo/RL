@@ -36,7 +36,8 @@ test -s "${BASE_IMAGE}"
 test -d "${NTRACE_REPO}/src/ntrace"
 test -f "${NTRACE_REPO}/pyproject.toml"
 
-SRUN=${SRUN:-$(command -v srun 2>/dev/null || true)}
+SRUN_CANDIDATE=$(command -v srun 2>/dev/null || true)
+SRUN=${SRUN:-$(readlink -f "${SRUN_CANDIDATE}" 2>/dev/null || true)}
 if [[ -z "${SRUN}" || "${SRUN}" != /* || ! -x "${SRUN}" ]]; then
   echo "Set SRUN to the absolute path of the Slurm srun executable" >&2
   exit 2
