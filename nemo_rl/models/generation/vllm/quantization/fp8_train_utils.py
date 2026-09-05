@@ -136,9 +136,7 @@ def iter_mxfp8_prequantized_params(
     if scratch_cache is None:
         scratch_cache = {}
 
-    pending: list[
-        tuple[int, str, str, torch.Tensor, torch.cuda.Stream | None]
-    ] = []
+    pending: list[tuple[int, str, str, torch.Tensor, torch.cuda.Stream | None]] = []
     pending_expert_ids: set[int] = set()
     current_prefix: str | None = None
 
@@ -182,9 +180,7 @@ def iter_mxfp8_prequantized_params(
         tensor: torch.Tensor,
         source_stream: torch.cuda.Stream | None = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        value, scale, producer_stream = quantize_one_result(
-            name, tensor, source_stream
-        )
+        value, scale, producer_stream = quantize_one_result(name, tensor, source_stream)
         yield from yield_on_current_stream(
             ((name, value), (name + "_scale_from_checkpoint", scale)),
             producer_stream,
@@ -210,9 +206,9 @@ def iter_mxfp8_prequantized_params(
                 ]
                 chunk = [pending[index] for index in chunk_indices]
                 tensors = [tensor for _id, _proj, _name, tensor, _stream in chunk]
-                batchable = len(chunk) > 1 and len(
-                    {item[0] for item in chunk}
-                ) == len(chunk)
+                batchable = len(chunk) > 1 and len({item[0] for item in chunk}) == len(
+                    chunk
+                )
                 if batchable:
                     first = tensors[0]
                     batchable = all(

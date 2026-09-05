@@ -1084,9 +1084,7 @@ def test_load_weights_accepts_prequantized_mxfp8_split_across_batches(
     )
     weight = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
     scale = torch.ones(2, 1, dtype=torch.uint8)
-    fp8.set_refit_manifest_names(
-        {"model.weight", "model.weight_scale_from_checkpoint"}
-    )
+    fp8.set_refit_manifest_names({"model.weight", "model.weight_scale_from_checkpoint"})
     loaded = []
     monkeypatch.setattr(
         fp8, "_is_fp8_weight", lambda name, _model: name.endswith(".weight")
