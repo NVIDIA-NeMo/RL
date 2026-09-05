@@ -3,7 +3,7 @@ grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 8
 checkpointing:
-  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-fsdp2
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-fsdp2.v2
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
   tokenizer:
@@ -12,12 +12,22 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 2048
+  optimizer:
+    kwargs:
+      foreach: false
+      fused: false
   hf_config_overrides:
     # Keep as 0.0, not 0: Hugging Face strict config validation declares
     # router_aux_loss_coef as float and rejects YAML's integer 0.
     router_aux_loss_coef: 0.0
   dtensor_cfg:
     expert_parallel_size: 8
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+      reshard_after_forward: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
@@ -39,6 +49,7 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-nanov3-30BA3B-2n8g-fsdp2
+    name: grpo-nanov3-30BA3B-2n8g-fsdp2.v2
 cluster:
+  num_nodes: 1
   gpus_per_node: 8

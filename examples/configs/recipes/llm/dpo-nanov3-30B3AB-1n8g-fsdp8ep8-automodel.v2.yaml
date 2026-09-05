@@ -18,10 +18,15 @@ policy:
     router_aux_loss_coef: 0.0
   dtensor_cfg:
     _v2: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    context_parallel_size: 1
     expert_parallel_size: 8
     # Recompute activations to fit 30B-A3B on 1n8g: avoids the full-vocab
     # log_softmax OOM in DPO loss-input prep (~step 8) on 80 GiB GPUs.
     activation_checkpointing: true
+    moe_parallelizer:
+      reshard_after_forward: true
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
@@ -38,10 +43,10 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
+    name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.v2
   tensorboard:
-    log_dir: tb_logs-dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
+    log_dir: tb_logs-dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.v2
   mlflow:
-    run_name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
+    run_name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.v2
 cluster:
   gpus_per_node: 8
