@@ -14,6 +14,7 @@
 
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -37,6 +38,7 @@ try:
     )
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
         DTensorPolicyWorkerV2Impl,
+        _is_ep_sharded_merged_expert,
         _maybe_adapt_tensor_to_hf,
         dtensor_params_generator,
     )
@@ -842,6 +844,48 @@ class TestDTensorParamsGenerator:
             assert tensor.dtype == target_dtype
             assert tensor.is_contiguous()
 
+    def test_plain_tensor_is_not_ep_sharded_merged_expert(self):
+        tensor = torch.randn(4, 8, 16)
+        model = Mock(state_dict_adapter=object())
+
+        assert not _is_ep_sharded_merged_expert(
+            model, "model.layers.0.mlp.experts.gate_and_up_projs", tensor
+        )
+
+    def test_detects_ep_sharded_merged_expert(self):
+        class FakeShard:
+            def __init__(self, dim):
+                self.dim = dim
+
+        class FakeMesh:
+            mesh_dim_names = ("ep_shard", "ep")
+
+        class FakeDTensor:
+            device_mesh = FakeMesh()
+            placements = (FakeShard(1), FakeShard(0))
+
+        with (
+            patch(
+                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensor",
+                FakeDTensor,
+            ),
+            patch(
+                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.Shard",
+                FakeShard,
+            ),
+        ):
+            model = Mock(state_dict_adapter=object())
+            assert _is_ep_sharded_merged_expert(
+                model,
+                "model.layers.0.mlp.experts.gate_and_up_projs",
+                FakeDTensor(),
+            )
+            assert not _is_ep_sharded_merged_expert(
+                Mock(state_dict_adapter=None),
+                "model.layers.0.mlp.experts.gate_and_up_projs",
+                FakeDTensor(),
+            )
+
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
@@ -895,7 +939,12 @@ class TestAutocastContext:
 
 
 def _init_v2_worker_mocked(
-    monkeypatch, *, init_reference_model, weights_path, optimizer_path
+    monkeypatch,
+    *,
+    init_reference_model,
+    weights_path,
+    optimizer_path,
+    model_type=None,
 ):
     """Run DTensorPolicyWorkerV2Impl.__init__ with all heavy deps mocked.
 
@@ -916,7 +965,7 @@ def _init_v2_worker_mocked(
     # Unpacked as runtime config at the end of __init__.
     runtime_config = RuntimeConfig(
         model_class="model_class",
-        model_config="model_config",
+        model_config=SimpleNamespace(model_type=model_type),
         hf_config_overrides={},
         allow_flash_attn_args=False,
         attn_impl="attn_impl",
@@ -943,6 +992,7 @@ def _init_v2_worker_mocked(
     )
 
     def fake_init_checkpoint_manager(self, config_updates=None, checkpoint_root=None):
+        self._test_checkpoint_config_updates = config_updates
         self.checkpoint_manager = MagicMock()
         self.checkpoint_manager.load_checkpoint = load_checkpoint_mock
 
@@ -996,6 +1046,26 @@ def _init_v2_worker_mocked(
         init_reference_model=init_reference_model,
     )
     return worker, call_log, setup_mock, load_checkpoint_mock
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize(
+    ("model_type", "expected_async"),
+    [("deepseek_v4", False), ("deepseek_v3", True)],
+)
+def test_dtensor_v2_scopes_synchronous_checkpointing_to_dsv4(
+    monkeypatch, model_type, expected_async
+):
+    worker, *_ = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=False,
+        weights_path=None,
+        optimizer_path=None,
+        model_type=model_type,
+    )
+
+    assert worker._test_checkpoint_config_updates["is_async"] is expected_async
 
 
 @pytest.mark.automodel

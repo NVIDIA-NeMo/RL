@@ -47,6 +47,10 @@ from transformers import (
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.deepseek_v4_tokenizer import (
+    get_deepseek_v4_tokenizer,
+    should_use_deepseek_v4_chat_template,
+)
 from nemo_rl.models.automodel.config import (
     DistributedContext,
     ModelAndOptimizerState,
@@ -187,7 +191,18 @@ def get_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if "chat_template" in tokenizer_config:
+    use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(tokenizer_config)
+    chat_template_kwargs = tokenizer_config.get("chat_template_kwargs")
+    if chat_template_kwargs is not None:
+        assert isinstance(chat_template_kwargs, dict), (
+            "chat_template_kwargs should be a dictionary"
+        )
+    if use_deepseek_v4_tokenizer:
+        print("Using vLLM 0.25.1's DeepSeek V4 chat renderer")
+        tokenizer = get_deepseek_v4_tokenizer(tokenizer, chat_template_kwargs)
+        if processor is not None:
+            processor.tokenizer = tokenizer
+    elif "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
@@ -204,15 +219,9 @@ def get_tokenizer(
     else:
         print("No chat template provided, using tokenizer's default")
 
-    if (
-        "chat_template_kwargs" in tokenizer_config
-        and tokenizer_config["chat_template_kwargs"] is not None
-    ):
-        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
-            "chat_template_kwargs should be a dictionary"
-        )
+    if chat_template_kwargs is not None and not use_deepseek_v4_tokenizer:
         tokenizer.apply_chat_template = partial(
-            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+            tokenizer.apply_chat_template, **chat_template_kwargs
         )
 
     if processor is not None:

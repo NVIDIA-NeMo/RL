@@ -19,6 +19,7 @@ from typing import Any, Generator, Iterable, Optional
 
 import ray
 import torch
+import torch.distributed as dist
 from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
@@ -26,7 +27,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -94,6 +95,86 @@ def _refit_tensor_dtype(
     return default_dtype
 
 
+_MERGED_EXPERT_PARAM_SUFFIXES = (
+    ".mlp.experts.gate_and_up_projs",
+    ".mlp.experts.down_projs",
+)
+
+
+def _is_ep_sharded_merged_expert(
+    model: nn.Module, name: str, tensor: torch.Tensor
+) -> bool:
+    """Return whether an adapter can split this DTensor before EP gathering."""
+    if (
+        getattr(model, "state_dict_adapter", None) is None
+        or not isinstance(tensor, DTensor)
+        or not name.endswith(_MERGED_EXPERT_PARAM_SUFFIXES)
+    ):
+        return False
+
+    mesh_dim_names = tensor.device_mesh.mesh_dim_names
+    if "ep" not in mesh_dim_names:
+        return False
+    ep_dim = mesh_dim_names.index("ep")
+    placement = tensor.placements[ep_dim]
+    return isinstance(placement, Shard) and placement.dim == 0
+
+
+def _iter_ep_sharded_expert_tensors(
+    model: nn.Module,
+    name: str,
+    tensor: DTensor,
+    target_dtype: torch.dtype,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Gather one expert at a time instead of materializing the merged tensor.
+
+    AutoModel's MoE state-dict adapters can split an EP-sharded merged expert
+    DTensor using only its local shard. Each policy rank still has to stream all
+    experts to its colocated rollout worker, so gather corresponding local
+    experts across the EP group one at a time. This preserves the refit manifest
+    while avoiding a full merged tensor whose peak size is 16 GiB for DSV4.
+    """
+    local_tensors = _maybe_adapt_tensor_to_hf(model, name, tensor)
+    ep_mesh = tensor.device_mesh["ep"]
+    ep_group = ep_mesh.get_group()
+    ep_size = ep_mesh.size()
+
+    local_names = [local_name for local_name, _ in local_tensors]
+    gathered_name_lists: list[Optional[list[str]]] = [None] * ep_size
+    dist.all_gather_object(gathered_name_lists, local_names, group=ep_group)
+    if any(
+        gathered_names is None or len(gathered_names) != len(local_tensors)
+        for gathered_names in gathered_name_lists
+    ):
+        raise RuntimeError("EP expert refit gathered inconsistent parameter names")
+
+    for local_index, (_, local_tensor) in enumerate(local_tensors):
+        if isinstance(local_tensor, DTensor):
+            local_tensor = local_tensor.full_tensor()
+        local_tensor = local_tensor.to(target_dtype, non_blocking=True).contiguous()
+
+        gathered_shape = (ep_size * local_tensor.shape[0], *local_tensor.shape[1:])
+        gathered_tensor = torch.empty(
+            gathered_shape,
+            dtype=local_tensor.dtype,
+            device=local_tensor.device,
+        )
+        dist.all_gather_into_tensor(
+            gathered_tensor,
+            local_tensor,
+            group=ep_group,
+        )
+
+        for rank_names, expert_tensor in zip(
+            gathered_name_lists, gathered_tensor.chunk(ep_size, dim=0)
+        ):
+            assert rank_names is not None
+            yield rank_names[local_index], expert_tensor
+
+        del gathered_tensor
+        del local_tensor
+
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -111,6 +192,14 @@ def dtensor_params_generator(
     module_map = dict(model.named_modules())
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+            continue
+        if _is_ep_sharded_merged_expert(model, name, tensor):
+            yield from _iter_ep_sharded_expert_tensors(
+                model,
+                name,
+                tensor,
+                target_dtype,
+            )
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
@@ -294,6 +383,9 @@ class DTensorPolicyWorkerV2Impl(
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
+        requires_synchronous_checkpoint = (
+            getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
+        )
         self._init_checkpoint_manager(
             config_updates={
                 "model_repo_id": config["model_name"],
@@ -301,7 +393,10 @@ class DTensorPolicyWorkerV2Impl(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
-                "is_async": True,
+                # Automodel's process-based async DCP cannot serialize the
+                # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
+                # the pre-existing async checkpoint path.
+                "is_async": not requires_synchronous_checkpoint,
             },
         )
 
@@ -1366,9 +1461,8 @@ class DTensorPolicyWorkerV2Impl(
     def finalize_async_save(self) -> None:
         """Block until this worker's in-flight async checkpoint writes complete.
 
-        Overrides the base no-op: this worker initializes the checkpoint manager
-        with ``is_async=True``, so the caller-side rename of ``tmp_step_N`` to
-        ``step_N`` must wait for the staged writes to land.
+        Overrides the base no-op so async configurations wait for staged writes
+        before the caller renames ``tmp_step_N`` to ``step_N``.
         """
         if self.checkpoint_manager is None:
             return
