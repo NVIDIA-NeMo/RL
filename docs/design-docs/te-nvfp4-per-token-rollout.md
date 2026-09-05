@@ -155,10 +155,13 @@ end-to-end validation:
 | Training parallelism | Megatron TP=2, EP=8, PP=1 |
 | Rollout parallelism | Colocated vLLM TP=1, EP=1, PP=1 |
 | Policy state | BF16 parameters, FP32 optimizer states, `fp4_param=false` |
+| Router replay | `policy.router_replay.enabled=true`. Both measured runs and both shipped recipes enable it: keeping the training and rollout routers in agreement lets NVFP4 training stay stable for longer |
 | Refit | BF16 CUDA IPC stream into native vLLM `reload_weights` |
 
-The validation recipe is a long-running configuration with periodic synchronous
-checkpoints. Short smoke coverage remains available in
+The validation recipe is
+`grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.yaml`, a long-running
+configuration with periodic synchronous checkpoints. Short smoke coverage
+remains available in
 `grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml`.
 
 ## Current Limitations
@@ -179,6 +182,7 @@ models, but this release has the following enforced or validated boundaries:
 | Refit transport | Default colocated CUDA IPC/ZMQ path (`refit_transport: null`) |
 | Configuration | `generation.quant_cfg`, `generation.real_quant`, and explicit vLLM quantization/load-format overrides are mutually exclusive with this mode |
 | Layer exclusions | Derived from the Megatron BF16 boundary; legacy `additional_ignore` must describe exactly the same complete expert layers |
+| Algorithm coverage | End-to-end validation is GRPO only. PPO and distillation reuse the same Megatron training worker and vLLM refit path and are expected to work, but are unvalidated and warn at setup. The SingleController path is unsupported: it requires non-colocated rollout, which this mode rejects |
 
 An additional architecture is eligible only when Megatron-Bridge can export its
 HF-named BF16 weights and the pinned vLLM model exposes a complete compatible
