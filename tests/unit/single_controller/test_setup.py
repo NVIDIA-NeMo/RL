@@ -1193,7 +1193,9 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger = {"log_dir": "/tmp/test-token-capture"}
+        # Extend, don't replace: setup_single_controller also indexes the
+        # wandb keys that _make_master_config populates.
+        mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
         mc.token_capture.enabled = True
         mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
