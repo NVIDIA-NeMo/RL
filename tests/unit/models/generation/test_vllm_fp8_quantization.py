@@ -1226,48 +1226,6 @@ def test_module_lookup_preserves_base_packed_and_mapper_handling(fp8_module):
     assert module is model.model.layers[0].attn.qkv_proj
 
 
-def test_dsv4_fp8_refit_filters_nonlocal_experts_before_loading(
-    fp8_module, monkeypatch
-):
-    import torch
-
-    fp8 = fp8_module
-
-    class FakeRoutedExperts:
-        def __init__(self):
-            self.expert_map_manager = types.SimpleNamespace(
-                is_local_expert=lambda expert_id: expert_id in {4, 5}
-            )
-
-    class DeepSeekV4ForCausalLM:
-        def __init__(self):
-            self.config = types.SimpleNamespace(model_type="deepseek_v4")
-            self.loaded_weights = None
-
-        def load_weights(self, weights):
-            self.loaded_weights = weights
-
-    routed_experts = FakeRoutedExperts()
-    model = DeepSeekV4ForCausalLM()
-    monkeypatch.setattr(fp8, "RoutedExperts", FakeRoutedExperts)
-    monkeypatch.setattr(
-        fp8, "_get_module_from_param_name", lambda _model, _name: routed_experts
-    )
-    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: False)
-
-    weights = [
-        ("layers.0.ffn.experts.3.w1.weight", torch.ones(2, 2)),
-        ("layers.0.ffn.experts.4.w1.weight", torch.ones(2, 2)),
-        ("layers.0.attn_norm.weight", torch.ones(2)),
-    ]
-    fp8.load_weights(weights, types.SimpleNamespace(model=model))
-
-    assert [name for name, _tensor in model.loaded_weights] == [
-        "layers.0.ffn.experts.4.w1.weight",
-        "layers.0.attn_norm.weight",
-    ]
-
-
 def test_dsv4_routed_experts_refit_uses_immediate_raw_storage(fp8_module, monkeypatch):
     import torch
     from vllm.model_executor.model_loader.reload import meta

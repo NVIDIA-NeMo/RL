@@ -27,7 +27,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
@@ -572,23 +571,6 @@ def load_weights(weights, model_runner):
     model = model_runner.model
 
     for k, v in weights:
-        # vLLM's layerwise loader retains every source tensor until the whole
-        # RoutedExperts module is ready. Under EP, buffering experts owned by
-        # other ranks can consume several GiB per layer before they are rejected
-        # by the destination loader. Filter them before FP8 quantization and
-        # layerwise buffering; the IPC manifest still accounts for the original
-        # received keys outside this function.
-        expert_id = (
-            parse_expert_id(k)
-            if deepseek_v4_fp8.is_model(model) and k.endswith(".weight")
-            else None
-        )
-        if expert_id is not None:
-            module = _get_module_from_param_name(model, k)
-            assert isinstance(module, RoutedExperts)
-            if not bool(module.expert_map_manager.is_local_expert(expert_id)):
-                continue
-
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
         # (so `_is_fp8_weight` would skip them) and vLLM's grouped loader cannot
         # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
