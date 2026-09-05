@@ -217,8 +217,16 @@ def _maybe_restore_async_replay_buffer_checkpoint(
 def _save_async_replay_buffer_checkpoint(
     replay_buffer: Any,
     checkpoint_path: str,
+    *,
+    save_replay_buffer: bool | None = None,
 ) -> int:
-    """Checkpoint replay state inside its actor."""
+    """Checkpoint replay state inside its actor unless explicitly disabled."""
+    if save_replay_buffer is False:
+        print(
+            "📦 Skipping replay buffer save (checkpointing.save_replay_buffer=false)"
+        )
+        return 0
+
     print("📦 Saving replay buffer state...")
     num_buffered_trajectories = ray.get(
         replay_buffer.save_to_path.remote(
@@ -4445,6 +4453,7 @@ def async_grpo_train(
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,
         drop_incomplete_targets_on_restore=False,
+        require_routed_experts=router_replay_enabled(master_config.policy),
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
@@ -5619,6 +5628,9 @@ def async_grpo_train(
                         _save_async_replay_buffer_checkpoint(
                             replay_buffer,
                             checkpoint_path,
+                            save_replay_buffer=master_config.checkpointing.get(
+                                "save_replay_buffer"
+                            ),
                         )
                         if dataloader_snapshot["frontier_aligned"]:
                             # Persist the (possibly lowered) cut as the

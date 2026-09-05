@@ -48,7 +48,10 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     attach_image_model_inputs_to_message,
     extract_input_images_from_responses_messages,
+    nemo_gym_image_max_num_tiles,
+    reconcile_message_media_placeholder_runs,
 )
+from nemo_rl.data.routed_experts import RoutedExpertsTensorRef
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -136,6 +139,7 @@ def attach_initial_nemo_gym_image_payloads(
             images=images,
             processor=processor,
             pad_dynamic_image_shapes=pad_dynamic_image_shapes,
+            max_num_tiles=nemo_gym_image_max_num_tiles(extra_env_info),
         )
 
 
@@ -238,8 +242,18 @@ def attach_static_multimodal_payload(
         )
     for source, target in zip(source_users, target_users):
         for key, value in source.items():
-            if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
+            if (
+                isinstance(value, PackedTensor)
+                or key in NATIVE_MULTIMODAL_KEYS
+                or key
+                in {
+                    "_media_placeholder_token_id",
+                    "_media_placeholder_run_lengths",
+                    "_media_placeholder_require_exact_match",
+                }
+            ):
                 target[key] = value
+        reconcile_message_media_placeholder_runs(target)
 
 
 def _add_r3_fallback_metrics(
@@ -300,10 +314,12 @@ def _attach_routed_experts_to_message_log_prefix(
     return cursor
 
 
-def _find_routed_experts_template(message_log: list[dict]) -> Optional[torch.Tensor]:
+def _find_routed_experts_template(
+    message_log: list[dict],
+) -> Optional[torch.Tensor | RoutedExpertsTensorRef]:
     for msg in message_log:
         routed_experts = msg.get("routed_experts")
-        if isinstance(routed_experts, torch.Tensor):
+        if isinstance(routed_experts, (torch.Tensor, RoutedExpertsTensorRef)):
             return routed_experts
     return None
 
@@ -349,10 +365,11 @@ def backfill_missing_routed_experts(
             break
     if template is None:
         return
-    if template.dim() != 3:
+    template_shape = tuple(template.shape)
+    if len(template_shape) != 3:
         raise ValueError(
             "routed_experts messages must have shape [tokens, layers, topk], "
-            f"got {tuple(template.shape)}"
+            f"got {template_shape}"
         )
 
     for message_log in message_logs:
@@ -360,14 +377,28 @@ def backfill_missing_routed_experts(
             token_ids = msg.get("token_ids")
             if not isinstance(token_ids, torch.Tensor):
                 continue
-            if isinstance(msg.get("routed_experts"), torch.Tensor):
+            if isinstance(
+                msg.get("routed_experts"),
+                (torch.Tensor, RoutedExpertsTensorRef),
+            ):
                 continue
-            msg["routed_experts"] = torch.full(
-                (int(token_ids.shape[0]), template.shape[1], template.shape[2]),
-                ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
-                dtype=template.dtype,
-                device=template.device,
-            )
+            if isinstance(template, RoutedExpertsTensorRef):
+                msg["routed_experts"] = RoutedExpertsTensorRef.filled_like(
+                    num_tokens=int(token_ids.shape[0]),
+                    template=template,
+                    fill_value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+                )
+            else:
+                msg["routed_experts"] = torch.full(
+                    (
+                        int(token_ids.shape[0]),
+                        template.shape[1],
+                        template.shape[2],
+                    ),
+                    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+                    dtype=template.dtype,
+                    device=template.device,
+                )
 
 
 class EffortLevelsConfig(BaseModel, extra="allow"):

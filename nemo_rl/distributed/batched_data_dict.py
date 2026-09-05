@@ -37,6 +37,7 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
+from nemo_rl.data.routed_experts import RoutedExpertsBatch
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
@@ -294,6 +295,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 ]
             elif isinstance(list_of_tensors[0], PackedTensor):
                 tensor_or_list = PackedTensor.concat(list_of_tensors)
+            elif isinstance(list_of_tensors[0], RoutedExpertsBatch):
+                tensor_or_list = RoutedExpertsBatch.concat(list_of_tensors)
             elif all(x.ndim == 1 for x in list_of_tensors):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
@@ -390,7 +393,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for k in self.data:
             if torch.is_tensor(self.data[k]):
                 chunked_batch[k] = self.data[k][indices].clone()
-            elif isinstance(self.data[k], PackedTensor):
+            elif isinstance(self.data[k], (PackedTensor, RoutedExpertsBatch)):
                 chunked_batch[k] = self.data[k].slice(indices)
             else:
                 chunked_batch[k] = [self.data[k][i] for i in indices]
@@ -421,7 +424,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 sorted_v = v.index_select(
                     dim=0, index=torch.IntTensor(reordered_indices)
                 )
-            elif isinstance(v, PackedTensor):
+            elif isinstance(v, (PackedTensor, RoutedExpertsBatch)):
                 sorted_v = v.slice(reordered_indices)
             else:
                 sorted_v = [v[i] for i in reordered_indices]
@@ -582,7 +585,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     sorted_v = v.index_select(
                         dim=0, index=torch.IntTensor(batch_sorted_indices)
                     )
-                elif isinstance(v, PackedTensor):
+                elif isinstance(v, (PackedTensor, RoutedExpertsBatch)):
                     sorted_v = v.slice(batch_sorted_indices)
                 else:
                     sorted_v = [v[i] for i in batch_sorted_indices]
@@ -753,6 +756,13 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                         offset += span
 
                     aggregated_shards[shard_idx][k] = shard_tensor
+                elif isinstance(v, RoutedExpertsBatch):
+                    route_slices = [
+                        v.slice(list(range(start, end))) for start, end in shard_ranges
+                    ]
+                    aggregated_shards[shard_idx][k] = RoutedExpertsBatch.concat(
+                        route_slices
+                    )
                 elif isinstance(v, PackedTensor):
                     # PackedTensor is collected per chunk then concatenated once
                     packed_slices = [
@@ -896,7 +906,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         sliced_batch = SlicedDataDict()
         for k in self.data:
-            if isinstance(self.data[k], PackedTensor):
+            if isinstance(self.data[k], (PackedTensor, RoutedExpertsBatch)):
                 sliced_batch[k] = self.data[k].slice(list(range(start, end)))
                 continue
 
@@ -1033,7 +1043,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for k, v in self.data.items():
             if torch.is_tensor(v):
                 self.data[k] = v.to(device)
-            elif isinstance(v, PackedTensor):
+            elif isinstance(v, (PackedTensor, RoutedExpertsBatch)):
                 self.data[k] = v.to(device)
         return self
 
@@ -1050,7 +1060,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for k, v in self.data.items():
             if torch.is_tensor(v):
                 selected_batch[k] = v[indices]
-            elif isinstance(v, PackedTensor):
+            elif isinstance(v, (PackedTensor, RoutedExpertsBatch)):
                 selected_batch[k] = v.slice(indices)
             elif isinstance(v, list):
                 selected_batch[k] = [v[i] for i in indices]

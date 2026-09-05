@@ -108,6 +108,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.data.routed_experts import RoutedExpertsBatch
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -1818,6 +1819,11 @@ class MegatronPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        if not require_router_replay and isinstance(
+            data.get("routed_experts"), RoutedExpertsBatch
+        ):
+            # Reference-policy scoring intentionally does not replay routes.
+            del data["routed_experts"]
         self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
         no_grad.__enter__()
