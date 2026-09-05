@@ -38,9 +38,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
+from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tensordict import TensorDict
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
@@ -180,6 +180,22 @@ class ObservabilityConfig(TypedDict):
 
     enabled: bool
     callback: NotRequired[Callable[[dict[str, Any]], None]]
+
+
+class LocalDataPlaneConfig(BaseModel, extra="allow"):
+    """User configuration for process-local data transfer.
+
+    ``max_partitions`` limits retained step batches. Set it to ``1`` for only
+    the active step or ``2`` to retain one prefetched step as well.
+    """
+
+    enabled: Literal[True] = True
+    impl: Literal["local"] = "local"
+    max_partitions: Annotated[int, Field(ge=1)] = 2
+    observability: ObservabilityConfig | None = None
+
+
+DataPlaneRuntimeConfig = DataPlaneConfig | LocalDataPlaneConfig
 
 
 @dataclass

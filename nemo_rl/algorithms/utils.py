@@ -15,6 +15,7 @@
 import math
 import random
 import warnings
+from copy import deepcopy
 from functools import partial, wraps
 from typing import Any, Optional
 
@@ -27,6 +28,7 @@ from transformers import (
 )
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
@@ -481,48 +483,27 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
     min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
     if min_padding > 0:
         print(f"Padding last validation batch with {min_padding} padding samples")
-        # Pad input_ids
-        batch["input_ids"] = torch.cat(
-            [
-                batch["input_ids"],
-                batch["input_ids"][-1].unsqueeze(0).repeat(min_padding, 1),
-            ]
-        )
-        # Pad input_lengths
-        batch["input_lengths"] = torch.cat(
-            [
-                batch["input_lengths"],
-                batch["input_lengths"][-1].unsqueeze(0).repeat(min_padding),
-            ]
-        )
-        if "token_mask" in batch:
-            # Pad token_mask
-            batch["token_mask"] = torch.cat(
-                [
-                    batch["token_mask"],
-                    batch["token_mask"][-1].unsqueeze(0).repeat(min_padding, 1),
-                ]
-            )
-        # Pad sample_mask
-        batch["sample_mask"] = torch.cat(
-            [
-                batch["sample_mask"],
-                torch.zeros_like(batch["sample_mask"][-1])
-                .unsqueeze(0)
-                .repeat(min_padding),
-            ]
-        )
-
-        if "reference_policy_logprobs" in batch:
-            # Pad reference_policy_logprobs
-            batch["reference_policy_logprobs"] = torch.cat(
-                [
-                    batch["reference_policy_logprobs"],
-                    batch["reference_policy_logprobs"][-1]
-                    .unsqueeze(0)
-                    .repeat(min_padding, 1),
-                ]
-            )
+        original_size = batch.size
+        for key, value in list(batch.items()):
+            if isinstance(value, torch.Tensor):
+                if key == "sample_mask":
+                    padding = torch.zeros_like(value[-1:]).repeat(
+                        (min_padding,) + (1,) * (value.ndim - 1)
+                    )
+                else:
+                    padding = value[-1:].repeat(
+                        (min_padding,) + (1,) * (value.ndim - 1)
+                    )
+                batch[key] = torch.cat([value, padding], dim=0)
+            elif isinstance(value, PackedTensor):
+                padding = value.slice([original_size - 1] * min_padding)
+                batch[key] = PackedTensor.concat([value, padding])
+            elif isinstance(value, list):
+                batch[key] = value + [deepcopy(value[-1]) for _ in range(min_padding)]
+            else:
+                raise TypeError(
+                    f"Cannot pad batch field {key!r} with type {type(value).__name__}."
+                )
     return batch
 
 

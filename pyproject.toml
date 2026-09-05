@@ -115,6 +115,7 @@ dependencies = [
   "mooncake-transfer-engine-cuda13==0.3.11.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
+
 [project.optional-dependencies]
 fsdp = [
   "transformers==5.12.1",
@@ -223,6 +224,12 @@ mcore = [
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
+  # megatron-energon already flows in transitively (megatron-core[dev,mlm] declares it), so
+  # this is not a mirror in the sense forbidden above -- it is a deliberately tighter floor:
+  # Megatron-LM pins ~=7.0, and the energon SFT path requires 7.3+.
+  # tests/unit/test_dependency_pins.py fails if Megatron-LM's own pin moves, so a
+  # Megatron-Bridge bump forces a re-check of this floor.
+  "megatron-energon[av-decode]~=7.3", # for energon backend
 ]
 # TRT-LLM is built from source via 3rdparty/TensorRT-LLM-workspace's custom PEP 517
 # backend (_backend.py). The path source lets uv lock resolve the dep graph
@@ -440,7 +447,7 @@ override-dependencies = [
   # av (PyAV) carries CVE-bundled codec libs (libx264, libx265, libopenh264, libmp3lame).
   # It is only needed by megatron-bridge's optional WAN diffusion path, which installs it
   # at test time via scripts/install_diffusion_deps.sh. Exclude from the shipped container.
-  "av; sys_platform == 'never'",
+  # "av; sys_platform == 'never'", # need it for energon
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",

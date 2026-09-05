@@ -1833,8 +1833,13 @@ def test_nemo_gym_sanity(
                 message["prompt_str"] = "dummy prompt_str"
             if "generation_str" in message:
                 message["generation_str"] = "dummy generation_str"
-            message.setdefault("is_invalid_tool_call", False)
-            message.setdefault("has_malformed_thinking", False)
+            for generation_flag in (
+                "is_invalid_tool_call",
+                "has_malformed_thinking",
+            ):
+                if generation_flag in message:
+                    assert isinstance(message[generation_flag], bool)
+                    message.pop(generation_flag)
 
         return d
 

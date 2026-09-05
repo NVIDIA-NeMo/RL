@@ -201,6 +201,7 @@ tests/test_suites/llm/dapo-gemma4-e2b-it-1n8g-fsdp2-automodel.sh
 
 # Functional Gemma 4 E4B VLM GRPO run
 tests/test_suites/vlm/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.sh
+
 #######
 # SFT #
 #######
