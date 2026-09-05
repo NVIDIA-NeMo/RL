@@ -797,7 +797,8 @@ def test_iter_params_batches_expert_prequantization(monkeypatch):
     assert calls[0][1] == {name}
 
 
-def test_enable_refit_prequantize_rejects_blockwise_fp8_storage():
+@pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
+def test_enable_refit_prequantize_rejects_fp8_param_storage(fp8_recipe):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -805,7 +806,7 @@ def test_enable_refit_prequantize_rejects_blockwise_fp8_storage():
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.fp8_cfg = {
         "fp8_param": True,
-        "fp8_recipe": "blockwise",
+        "fp8_recipe": fp8_recipe,
     }
 
     with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
