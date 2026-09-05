@@ -255,7 +255,9 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
             elif "Task Update on Develop prototype" in serialized_body:
                 content = "Done"
             else:
-                raise AssertionError("L0 rejected policy received an unrecognized prompt")
+                raise AssertionError(
+                    "L0 rejected policy received an unrecognized prompt"
+                )
             return {"role": "assistant", "content": content}, content
         if "1000 digit numbers" in serialized_body:
             content = r"\boxed{32}"
