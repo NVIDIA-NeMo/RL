@@ -179,11 +179,7 @@ def test_batched_expert_prequantization_preserves_wire_entries_and_reuses_scratc
         torch.testing.assert_close(output[name], tensor)
         scale_name = name + "_scale_from_checkpoint"
         scale_columns = tensor.shape[-1] // MXFP8_BLOCK_SIZE
-        expected_scale_shape = (
-            tensor.shape[:-1]
-            if scale_columns == 1
-            else (*tensor.shape[:-1], scale_columns)
-        )
+        expected_scale_shape = (*tensor.shape[:-1], scale_columns)
         assert output[scale_name].shape == expected_scale_shape
         assert torch.all(output[scale_name] == 1)
 
@@ -202,7 +198,7 @@ def test_batched_expert_prequantization_preserves_wire_entries_and_reuses_scratc
     assert next(iter(scratch_cache.values())).data_ptr() == first_scratch_ptr
 
 
-def test_batched_expert_prequantization_bounds_batch_and_has_stable_order():
+def test_batched_expert_prequantization_bounds_batch_and_preserves_source_order():
     from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
 
     calls = []
@@ -233,21 +229,11 @@ def test_batched_expert_prequantization_bounds_batch_and_has_stable_order():
         )
     )
 
-    expected_names = []
-    for expert_ids, projection in (
-        ((0, 1), "gate"),
-        ((0, 1), "up"),
-        ((0, 1), "down"),
-        ((2, 3), "gate"),
-        ((2, 3), "up"),
-        ((2, 3), "down"),
-        ((4,), "gate"),
-        ((4,), "up"),
-        ((4,), "down"),
-    ):
-        for expert_id in expert_ids:
-            name = expert_name(expert_id, projection)
-            expected_names.extend((name, name + "_scale_from_checkpoint"))
+    expected_names = [
+        output_name
+        for name, _tensor in params
+        for output_name in (name, name + "_scale_from_checkpoint")
+    ]
 
     assert [name for name, _tensor in output] == expected_names
     assert calls == [
