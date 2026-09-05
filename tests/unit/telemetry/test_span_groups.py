@@ -5,10 +5,12 @@
 
 import pytest
 
-# ``resolve()`` requires the real nemo-lens SpanGroup base class.
+# ``resolve()`` goes through lens's real SpanRegistry.
 pytest.importorskip("nemo.lens")
 
-from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo.lens.groups import SpanRegistry
+
+from nemo_rl.telemetry.span_groups import NAMESPACE, RLSpanGroup, register_span_groups
 
 RL_GROUPS = frozenset(
     {
@@ -134,6 +136,57 @@ def test_resolve_is_case_insensitive():
     assert RLSpanGroup.resolve("DEFAULT") == RLSpanGroup.resolve("default")
 
 
-def test_resolve_unknown_raises():
-    with pytest.raises(ValueError):
-        RLSpanGroup.resolve("nonexistent_group")
+def test_resolve_unknown_is_pending_rather_than_fatal():
+    """An unknown entry must not raise, and must not silently vanish either.
+
+    Lens cannot treat one as an error: a registry is per-process while a
+    ``span_groups`` spec is job-wide, so a spawned process that imports fewer
+    libraries would die on a value that is perfectly valid in the trainer. It
+    comes back as ``pending`` instead, which is what lets the driver report a
+    NeMo-RL typo without ending the run.
+    """
+    enabled, pending = RLSpanGroup.resolve_with_pending("nonexistent_group")
+    assert enabled == frozenset()
+    assert pending == frozenset({"nonexistent_group"})
+
+
+def test_an_unknown_entry_does_not_discard_the_valid_ones():
+    """A typo should cost the user that one entry, not the whole spec."""
+    enabled, pending = RLSpanGroup.resolve_with_pending("generation,nonsense,reward")
+    assert enabled == frozenset({"generation", "reward"})
+    assert pending == frozenset({"nonsense"})
+
+
+def test_importing_the_module_registers_the_groups():
+    """Registration is an import side effect, and the whole scheme rests on it.
+
+    Lens ships no group names, so nothing is selectable until NeMo-RL registers;
+    a spec resolved before that silently enables nothing. ``setup.py`` imports
+    this module ahead of ``setup_telemetry`` for exactly this reason.
+    """
+    assert NAMESPACE in SpanRegistry.namespaces()
+    assert RLSpanGroup.ALL_GROUPS <= SpanRegistry.groups()
+
+
+def test_registration_is_repeatable():
+    """A cleared registry, or a re-import, must be able to re-register.
+
+    ``register`` refuses a namespace it already holds unless told otherwise, so
+    without ``allow_override`` this would raise the second time -- which in a
+    test suite means the first test to clear the registry breaks every later
+    one.
+    """
+    register_span_groups()
+    register_span_groups()
+    assert RLSpanGroup.ALL_GROUPS <= SpanRegistry.groups()
+
+
+def test_the_all_preset_is_not_registered_as_a_preset():
+    """``all`` is lens's reserved wildcard; registering it raises.
+
+    It still has to resolve, and to everything -- it is computed from the live
+    registry rather than the snapshot NeMo-RL took at import, which is what
+    makes it correct when another library registers alongside.
+    """
+    assert "all" not in RLSpanGroup._PRESETS
+    assert RLSpanGroup.resolve("all") == RLSpanGroup.ALL_GROUPS

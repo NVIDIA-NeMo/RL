@@ -131,7 +131,6 @@ def _start_exporting_telemetry():
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
     import nemo_rl.telemetry.setup as setup_mod
-    from nemo_rl.telemetry.span_groups import RLSpanGroup
 
     # Every rl.* series is declared through lens's consumer-driven metric
     # registry, so nothing is emitted at all on a lens that predates it.
@@ -142,10 +141,8 @@ def _start_exporting_telemetry():
         pytest.skip("installed nemo-lens has no metric registry (lens PR #46)")
 
     reader = InMemoryMetricReader()
-    cfg = NemoLensConfig(enabled=True, _span_group_cls=RLSpanGroup)
-    setup_mod._TELEMETRY_HANDLE = setup_telemetry(
-        cfg, rank=0, world_size=1, metric_reader=reader
-    )
+    cfg = NemoLensConfig(enabled=True)
+    setup_mod._TELEMETRY_HANDLE = setup_telemetry(cfg, metric_reader=reader)
     return reader
 
 

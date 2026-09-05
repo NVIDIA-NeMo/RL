@@ -263,13 +263,14 @@ def _exporting(span_groups: str):
     test looks at it.
     """
     import nemo_rl.telemetry.setup as setup_mod
-    from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+    # Importing span_groups is what registers the names ``span_groups`` resolves
+    # against; lens ships none of its own.
+    import nemo_rl.telemetry.span_groups  # noqa: F401
 
     exporter = InMemorySpanExporter()
-    cfg = NemoLensConfig(
-        enabled=True, span_groups=span_groups, _span_group_cls=RLSpanGroup
-    )
-    handle = setup_telemetry(cfg, rank=0, world_size=1, span_exporter=exporter)
+    cfg = NemoLensConfig(enabled=True, span_groups=span_groups)
+    handle = setup_telemetry(cfg, span_exporter=exporter)
     setup_mod._TELEMETRY_HANDLE = handle
 
     def _spans():

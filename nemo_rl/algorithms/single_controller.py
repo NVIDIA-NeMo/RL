@@ -235,10 +235,9 @@ class SingleControllerActor:
 
         # The driver here only sets up and launches; the whole run happens inside
         # this actor, so this is the process that has to open the job span. It is
-        # rank 0 of 1 in its own right, so ``always_export`` keeps the run's only
-        # source of driver-side spans from being filtered out by an export
-        # strategy or sample rate aimed at large training fleets.
-        init_telemetry_worker(rank=0, world_size=1, always_export=True)
+        # rank 0 of 1 in its own right, which is what it reports rather than
+        # inheriting a stray RANK from the driver's environment.
+        init_telemetry_worker(rank=0, world_size=1)
         _telemetry = get_telemetry_handle()
         self._tracer = _telemetry.tracer if _telemetry is not None else None
 

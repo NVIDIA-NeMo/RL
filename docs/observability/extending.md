@@ -199,11 +199,11 @@ rather than threading a flag through the signatures.
 
 If nothing fits, add a group to `RLSpanGroup` in `nemo_rl/telemetry/span_groups.py`:
 
-1. Add the constant, add it to `ALL_GROUPS`, and slot it into the right preset(s) in `_PRESETS`. Decide per preset: `default` is coarse (rarely add here); `per_step` for per-step spans; `all` always includes it. A group whose span count scales with dataset size rather than step count belongs in `all` only — see `per_prompt`, and add it to `PER_PROMPT_GROUPS` rather than `EMITTED_GROUPS` in the test below.
-2. **Leave the fallback stub alone.** The stub `SpanGroup` in that file mirrors only lens's *base* groups and presets, for when nemo-lens is absent; `RLSpanGroup` overrides both `ALL_GROUPS` and `_PRESETS`, so an RL group belongs there and nowhere else. Touch the stub only when lens's own base contract changes.
+1. Add the constant and add it to `ALL_GROUPS`. `ALL_GROUPS` is what `register_span_groups()` declares to lens, so a group missing from it is never selectable — not even under `all`.
+2. Slot it into the right preset(s) in `_PRESETS`. Decide per preset: `default` is coarse (rarely add here); `per_step` for per-step spans. There is no `all` to edit — lens resolves `all` as a wildcard over whatever is registered, so a group in `ALL_GROUPS` is reachable that way automatically. A group whose span count scales with dataset size rather than step count belongs in `all` only — see `per_prompt`, and add it to `PER_PROMPT_GROUPS` rather than `EMITTED_GROUPS` in the test below.
 3. Document the new group in [Span Groups](span-groups.md), and add it to `EMITTED_GROUPS` in `tests/unit/telemetry/test_span_groups.py` so the preset-reachability test covers it.
 
-Keep the base-class contract — shared with lens and its other consumers — consistent when you do this.
+Group names live in one flat namespace shared with every other library in the process, so a name Megatron also registers is *shared*: enabling it enables both libraries' spans. That is intended for the phases both genuinely have (`step`, `optimizer`), and worth avoiding otherwise — lens logs a warning naming the other claimant.
 
 ## Adding a metric
 

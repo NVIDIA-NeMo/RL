@@ -91,79 +91,86 @@ def test_init_worker_returns_none_when_disabled():
     assert get_telemetry_handle() is None
 
 
-def test_config_rejects_an_unknown_export_strategy_at_parse_time():
+def test_config_rejects_an_unknown_exporter_at_parse_time():
     # The Literal is what a user actually hits: it fires wherever the YAML is
     # read, in every process, and regardless of `enabled` -- so a typo cannot
     # sit dormant in a disabled block until someone switches telemetry on.
     with pytest.raises(ValidationError):
-        TelemetryConfig(enabled=True, export_strategy="single_ranks")
-
-
-def test_init_driver_rejects_a_strategy_lens_does_not_register():
-    # Second line of defence, for drift between the Literal above and lens's
-    # registry rather than for user typos. It matters because the driver
-    # overrides the strategy with _always_export, which bypasses the registry
-    # lookup that would otherwise reject an unknown name. model_construct skips
-    # validation, standing in for a Literal that has gained a value lens
-    # dropped.
-    pytest.importorskip("nemo.lens")
-    tel = TelemetryConfig.model_construct(enabled=True, export_strategy="single_ranks")
-    config = SimpleNamespace(telemetry=tel)
-    with pytest.raises(ValueError, match="Unknown telemetry.export_strategy"):
-        init_telemetry_driver(config, algorithm="grpo")
-    # Again, because the init guard must not be set by a path that raised:
-    # otherwise the second call reports success-with-nothing instead of the bug.
-    with pytest.raises(ValueError, match="Unknown telemetry.export_strategy"):
-        init_telemetry_driver(config, algorithm="grpo")
-
-
-def test_config_rejects_out_of_range_export_bounds():
-    # export_rank had no check anywhere before, and setup.py documents the
-    # failure it causes: a rank that never matches silently mutes the actor.
-    with pytest.raises(ValidationError):
-        TelemetryConfig(export_rank=-2)
-    with pytest.raises(ValidationError):
-        TelemetryConfig(export_sample_rate=1.5)
-    with pytest.raises(ValidationError):
         TelemetryConfig(exporter="consoel")
 
 
-def test_init_driver_rejects_unknown_span_group():
-    # Lens resolves span_groups only after installing the global tracer
-    # provider, so without this check a typo kills the run mid-setup.
+def test_config_has_no_rank_filtering_fields():
+    """Rank filtering left with lens; the config must not imply it still works.
+
+    Lens deleted its export-strategy registry and rank-aware sampler, so a
+    ``telemetry.export_strategy`` in a YAML now reaches nothing. ``extra="allow"``
+    means such a key is silently accepted rather than rejected, which is exactly
+    how a field that quietly does nothing survives -- so the guard is here
+    instead.
+    """
+    fields = set(TelemetryConfig.model_fields)
+    assert not fields & {
+        "export_strategy",
+        "export_rank",
+        "export_sample_rate",
+        "sampler_enabled",
+    }
+
+
+def test_init_driver_warns_about_an_unknown_span_group_without_raising(caplog):
+    """A typo has to be reported, but must not end the run.
+
+    Lens returns an unrecognised spec entry as ``pending`` rather than raising,
+    because a registry is per-process while a spec is job-wide. NeMo-RL registers
+    everything it emits at import, so on the driver a pending entry really is a
+    typo -- and the user would otherwise get silence and an empty trace.
+    """
     pytest.importorskip("nemo.lens")
     config = SimpleNamespace(
-        telemetry=TelemetryConfig(enabled=True, span_groups="per_stp")
+        telemetry=TelemetryConfig(
+            enabled=True, exporter="console", span_groups="per_stp"
+        )
     )
-    with pytest.raises(ValueError):
-        init_telemetry_driver(config, algorithm="grpo")
+    with caplog.at_level(logging.WARNING, logger="nemo_rl.telemetry.setup"):
+        handle = init_telemetry_driver(config, algorithm="grpo")
 
-
-def test_documented_export_strategies_are_registered():
-    pytest.importorskip("nemo.lens")
-    from nemo.lens import registered_strategies
-
-    documented = {"single_rank", "all_ranks", "sampled", "first_rank_per_node"}
-    assert documented <= set(registered_strategies()), (
-        "TelemetryConfig.export_strategy docstring lists a strategy lens does "
-        "not register"
-    )
-
-
-@pytest.mark.parametrize(
-    "strategy",
-    ["single_rank", "all_ranks", "sampled", "first_rank_per_node"],
-)
-def test_init_driver_accepts_every_documented_export_strategy(strategy):
-    # Exercises init end to end rather than just the registry: a documented
-    # value has to survive the validation branch and lens's own setup. (Whether
-    # the strategy *selects* this process is not in play here -- the driver
-    # overrides it -- see the worker tests for that.)
-    pytest.importorskip("nemo.lens")
-    cfg = TelemetryConfig(enabled=True, exporter="console", export_strategy=strategy)
-    handle = init_telemetry_driver(_FakeMasterConfig(cfg), "grpo")
     assert handle is not None
-    assert handle.is_exporting
+    assert "per_stp" in caplog.text
+
+
+def test_init_driver_does_not_warn_for_a_valid_spec(caplog):
+    pytest.importorskip("nemo.lens")
+    cfg = TelemetryConfig(enabled=True, exporter="console", span_groups="per_step")
+    with caplog.at_level(logging.WARNING, logger="nemo_rl.telemetry.setup"):
+        assert init_telemetry_driver(_FakeMasterConfig(cfg), "grpo") is not None
+
+    assert "match no registered" not in caplog.text
+
+
+def test_init_driver_tags_itself_as_rank_zero_of_one(monkeypatch):
+    """Lens has no rank of its own, so the driver has to state one.
+
+    It is a singleton rather than a member of a group, and rank 0 of 1 is both
+    the honest description and what silences lens's warning about a process that
+    cannot be identified by rank downstream.
+    """
+    pytest.importorskip("nemo.lens")
+    from nemo.lens.semconv import NV_DL_RANK, NV_DL_WORLD_SIZE
+
+    captured = {}
+
+    def _fake_setup_telemetry(config, **kwargs):
+        captured.update(kwargs.get("resource_attributes") or {})
+        return SimpleNamespace(is_exporting=True, tracer=None)
+
+    monkeypatch.setattr("nemo.lens.setup_telemetry", _fake_setup_telemetry)
+    cfg = TelemetryConfig(enabled=True, exporter="console")
+
+    assert init_telemetry_driver(_FakeMasterConfig(cfg), "grpo") is not None
+    assert captured[NV_DL_RANK] == 0
+    assert captured[NV_DL_WORLD_SIZE] == 1
+    # The run-identifying attributes still have to survive the merge.
+    assert captured["rl.algorithm"] == "grpo"
 
 
 def test_init_driver_publishes_default_service_name_to_env():
@@ -218,31 +225,6 @@ def test_vllm_native_tracing_needs_the_master_switch(monkeypatch):
     assert telemetry_enabled_in_env()
 
 
-def test_init_driver_disables_the_rank_sampler(monkeypatch):
-    # The driver is not one of the ranks the user asked to sample; leaving the
-    # sampler on drops the training loop's own spans.
-    pytest.importorskip("nemo.lens")
-    captured = {}
-
-    def _fake_setup_telemetry(config, **kwargs):
-        captured["sampler_enabled"] = config.sampler_enabled
-        return SimpleNamespace(is_exporting=True, tracer=None)
-
-    monkeypatch.setattr("nemo.lens.setup_telemetry", _fake_setup_telemetry)
-    cfg = TelemetryConfig(
-        enabled=True,
-        exporter="console",
-        sampler_enabled=True,
-        export_sample_rate=0.1,
-    )
-
-    assert init_telemetry_driver(_FakeMasterConfig(cfg), "grpo") is not None
-    assert captured["sampler_enabled"] is False
-    # Process-local: what ranked workers inherit must still say the user asked
-    # for sampling.
-    assert os.environ["NEMO_RL_OTEL_SAMPLER_ENABLED"] == "1"
-
-
 def test_worker_resource_attributes_carries_worker_group(monkeypatch):
     monkeypatch.setenv("NRL_WORKER_GROUP", "vllm_policy")
     assert _worker_resource_attributes(None) == {"rl.worker_group": "vllm_policy"}
@@ -275,9 +257,13 @@ def test_init_worker_sets_worker_group_attribute(monkeypatch):
 
     handle = init_telemetry_worker()
     assert handle is not None
-    assert captured["rank"] == 3
-    assert captured["world_size"] == 8
-    assert captured["resource_attributes"] == {"rl.worker_group": "vllm_policy"}
+    # Rank reaches lens as a resource attribute now, alongside the group name:
+    # RANK is group-local, so the two are only useful together.
+    assert captured["resource_attributes"] == {
+        "rl.worker_group": "vllm_policy",
+        "nv.dl.rank": 3,
+        "nv.dl.world_size": 8,
+    }
 
 
 def test_init_worker_explicit_rank_overrides_env(monkeypatch):
@@ -300,97 +286,46 @@ def test_init_worker_explicit_rank_overrides_env(monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "8")
 
     assert init_telemetry_worker(rank=0, world_size=1) is not None
-    assert captured["rank"] == 0
-    assert captured["world_size"] == 1
+    assert captured["resource_attributes"]["nv.dl.rank"] == 0
+    assert captured["resource_attributes"]["nv.dl.world_size"] == 1
 
 
-def test_init_worker_honours_export_strategy_by_default(monkeypatch):
-    # The baseline for the always_export test below: a ranked worker must obey
-    # whatever the user configured.
-    pytest.importorskip("nemo.lens")
-    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORTER", "console")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORT_STRATEGY", "single_rank")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORT_RANK", "3")
+def test_every_worker_that_gets_here_exports(monkeypatch):
+    """No rank is filtered out any more, so every initialised worker exports.
 
-    handle = init_telemetry_worker(rank=0, world_size=1)
-    assert handle is not None
-    assert not handle.is_exporting
-
-
-def test_init_worker_always_export_overrides_export_rank(monkeypatch):
-    """A singleton actor's synthetic rank must not be subject to the strategy.
-
-    The trajectory collector reports ``rank=0, world_size=1`` because it is not
-    a member of a ranked group. Applying ``export_rank: 3`` to that made-up rank
-    would silently mute the actor -- taking every async rollout span with it.
+    Lens dropped both of its rank filters. A worker that would previously have
+    been muted by ``export_rank`` or a low sample rate now exports and labels
+    itself with ``nv.dl.rank`` instead, leaving the narrowing to the collector.
     """
     pytest.importorskip("nemo.lens")
     monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
     monkeypatch.setenv("NEMO_RL_OTEL_EXPORTER", "console")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORT_STRATEGY", "single_rank")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORT_RANK", "3")
 
-    handle = init_telemetry_worker(rank=0, world_size=1, always_export=True)
+    handle = init_telemetry_worker(rank=7, world_size=8)
     assert handle is not None
     assert handle.is_exporting
 
 
-def test_init_worker_always_export_overrides_sample_rate(monkeypatch):
-    # rank 0 hashes into the 0.785 bucket, so a low sample rate excludes it.
-    pytest.importorskip("nemo.lens")
-    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORTER", "console")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORT_STRATEGY", "sampled")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORT_SAMPLE_RATE", "0.1")
+def test_init_worker_records_a_ranked_worker_by_rank(monkeypatch):
+    """The rank label is the only thing that makes one worker's spans findable.
 
-    handle = init_telemetry_worker(rank=0, world_size=1, always_export=True)
-    assert handle is not None
-    assert handle.is_exporting
-
-
-def test_init_worker_always_export_disables_the_rank_sampler(monkeypatch):
-    """Exporting is not enough: the sampler drops spans before that decision.
-
-    ``sampler_enabled`` installs lens's ``RankAwareSampler`` on the tracer
-    provider, which filters on the same rank hash independently of
-    ``export_strategy``. Left on, it discards every span of a synthetic rank 0
-    while ``is_exporting`` still reports True -- telemetry that looks wired and
-    produces nothing.
+    With no rank filtering left, a fleet exports as one undifferentiated stream
+    unless every process says which rank it is -- so this attribute is what
+    replaced the export strategy, not a nice-to-have.
     """
     pytest.importorskip("nemo.lens")
     captured = {}
 
     def _fake_setup_telemetry(config, **kwargs):
-        captured["sampler_enabled"] = config.sampler_enabled
+        captured.update(kwargs)
         return SimpleNamespace(is_exporting=True)
 
     monkeypatch.setattr("nemo.lens.setup_telemetry", _fake_setup_telemetry)
     monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
-    monkeypatch.setenv("NEMO_RL_OTEL_SAMPLER_ENABLED", "1")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORT_SAMPLE_RATE", "0.1")
-
-    assert init_telemetry_worker(rank=0, world_size=1, always_export=True) is not None
-    assert captured["sampler_enabled"] is False
-
-
-def test_init_worker_leaves_the_rank_sampler_alone_for_ranked_workers(monkeypatch):
-    # The counterpart: a real group member is part of the population the user
-    # asked to sample, so the sampler must stay on.
-    pytest.importorskip("nemo.lens")
-    captured = {}
-
-    def _fake_setup_telemetry(config, **kwargs):
-        captured["sampler_enabled"] = config.sampler_enabled
-        return SimpleNamespace(is_exporting=True)
-
-    monkeypatch.setattr("nemo.lens.setup_telemetry", _fake_setup_telemetry)
-    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
-    monkeypatch.setenv("NEMO_RL_OTEL_SAMPLER_ENABLED", "1")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORT_SAMPLE_RATE", "0.1")
 
     assert init_telemetry_worker(rank=2, world_size=8) is not None
-    assert captured["sampler_enabled"] is True
+    assert captured["resource_attributes"]["nv.dl.rank"] == 2
+    assert captured["resource_attributes"]["nv.dl.world_size"] == 8
 
 
 def test_init_worker_survives_a_failing_setup(monkeypatch, caplog):
@@ -425,7 +360,7 @@ def test_init_worker_never_raises_on_setup_failure(monkeypatch):
     pytest.importorskip("nemo.lens")
 
     def _boom(config, **kwargs):
-        raise ValueError("unknown export_strategy 'typo'")
+        raise ValueError("unknown exporter 'typo'")
 
     monkeypatch.setattr("nemo.lens.setup_telemetry", _boom)
     monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
@@ -448,10 +383,17 @@ def test_init_driver_enabled_is_idempotent():
     assert handle2 is handle1
 
 
-def test_init_driver_exports_despite_nonzero_export_rank():
-    # export_rank selects among the Ray worker ranks; it must not switch off the
-    # driver, whose rank=0/world_size=1 are synthetic.
+def test_init_driver_ignores_a_stale_rank_filtering_key(monkeypatch):
+    """An old YAML must keep working, not fail on a key that no longer exists.
+
+    ``export_strategy`` and friends were real fields until lens removed the
+    machinery behind them, so configs in the wild still carry them.
+    ``extra="allow"`` is what lets those parse, and ``_config_to_env`` only
+    projects fields the map names -- so a leftover key reaches nothing rather
+    than being pushed at lens, which would now reject it.
+    """
     pytest.importorskip("nemo.lens")
+    monkeypatch.delenv("NEMO_RL_OTEL_EXPORT_STRATEGY", raising=False)
     cfg = TelemetryConfig(
         enabled=True,
         exporter="console",
@@ -461,17 +403,7 @@ def test_init_driver_exports_despite_nonzero_export_rank():
     handle = init_telemetry_driver(_FakeMasterConfig(cfg), "grpo")
     assert handle is not None
     assert handle.is_exporting
-
-
-def test_init_driver_exports_under_sampled_strategy(monkeypatch):
-    # rank 0 hashes into the 0.785 bucket, so a lower sample rate would exclude
-    # the driver without the export-strategy override.
-    pytest.importorskip("nemo.lens")
-    monkeypatch.setenv("NEMO_RL_OTEL_EXPORT_SAMPLE_RATE", "0.1")
-    cfg = TelemetryConfig(enabled=True, exporter="console", export_strategy="sampled")
-    handle = init_telemetry_driver(_FakeMasterConfig(cfg), "grpo")
-    assert handle is not None
-    assert handle.is_exporting
+    assert "NEMO_RL_OTEL_EXPORT_STRATEGY" not in os.environ
 
 
 def test_shutdown_is_a_noop_without_telemetry():

@@ -510,8 +510,11 @@ def test_every_rl_span_group_is_classified():
 # --------------------------------------------------------------------------- #
 def _setup(groups):
     exporter = InMemorySpanExporter()
-    cfg = NemoLensConfig(enabled=True, span_groups=groups, _span_group_cls=RLSpanGroup)
-    handle = setup_telemetry(cfg, rank=0, world_size=1, span_exporter=exporter)
+    # No span-group class to pass and no rank to declare: the spec resolves
+    # against the SpanRegistry that importing RLSpanGroup populated, and rank is
+    # a resource attribute rather than an argument.
+    cfg = NemoLensConfig(enabled=True, span_groups=groups)
+    handle = setup_telemetry(cfg, span_exporter=exporter)
     return handle, exporter
 
 

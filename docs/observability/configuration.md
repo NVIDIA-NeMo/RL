@@ -13,10 +13,6 @@ telemetry:
   enabled: false              # master switch; when false, every site is a ~0-cost no-op
   service_name: nemo-rl       # service.name reported to the backend
   span_groups: default        # preset (default | per_step | all) or a comma-separated group list
-  export_strategy: single_rank # single_rank | all_ranks | sampled | first_rank_per_node
-  export_rank: -1             # for single_rank: which rank exports (-1 = last rank)
-  export_sample_rate: 1.0     # for sampled: fraction of worker ranks that export
-  sampler_enabled: false      # drop spans at the SDK level using export_sample_rate
   traces_enabled: true        # emit trace spans
   metrics_enabled: true       # emit the rl.* metric instruments
   logs_enabled: false         # bridge Python logging to OTel logs (trace-correlated)
@@ -26,7 +22,7 @@ telemetry:
 
 The defaults above are the field defaults of `TelemetryConfig` (`nemo_rl/telemetry/config.py`). The endpoint, headers, and protocol are **not** in this block — they come from the standard `OTEL_EXPORTER_OTLP_*` env vars (see below).
 
-The driver always exports (it hosts the training loop and the metrics logger); `export_strategy` / `export_rank` govern the Ray **worker** ranks.
+Every process that enables telemetry exports — driver, workers, and singleton actors alike. There is no rank-filtering setting; see [Which ranks export](#which-ranks-export).
 
 `service_name` maps onto the standard `OTEL_SERVICE_NAME` (lens reads it unprefixed), so setting either works.
 
@@ -58,20 +54,16 @@ Endpoint, protocol, and headers are honoured by the OTel SDK directly:
 
 Pick the protocol to match your backend: a local collector or Jaeger typically speaks gRPC on `:4317`; a direct-to-SaaS OTLP endpoint typically speaks `http/protobuf` on `:443`. See [Observability Stack](observability-stack.md).
 
-## Export strategy
+## Which ranks export
 
-`export_strategy` controls which **worker** ranks actually send telemetry:
+**Every process that enables telemetry exports.** nemo-lens has no notion of rank: it does not select among ranks and does not sample by rank, so NeMo-RL has no `export_strategy`, `export_rank`, `export_sample_rate`, or `sampler_enabled` setting. Each process instead labels itself, and narrowing the fleet down is a decision you make with those labels:
 
-- `single_rank` (default) — only the rank named by `export_rank` (`-1` = last rank).
-- `all_ranks` — every worker exports.
-- `sampled` — a deterministic hash of the rank selects `export_sample_rate` of the ranks. The same rank and rate always give the same outcome, so the exporting set is stable across restarts.
-- `first_rank_per_node` — the first local rank on each node exports (reads `LOCAL_RANK`).
+- **Filter in the collector.** Every span and metric carries `nv.dl.rank` and `nv.dl.world_size` as resource attributes. Drop or keep whichever ranks you want in an OpenTelemetry Collector processor — the collector is also the only place that sees the whole fleet at once, which is where a policy about it belongs.
+- **Or keep a rank quiet at the source.** Leave `telemetry.enabled` false in the processes that should not emit. A process with telemetry disabled gets an empty span-group set, so `is_span_group_enabled()` is `False` everywhere and no span objects are created at all — the cheapest option, and the one to reach for if export volume is the concern rather than query noise.
 
-`export_sample_rate` applies to `sampled`; it has no effect under the other strategies. `sampler_enabled` is independent of `export_strategy` but asks the same kind of question: it installs lens's rank-aware sampler on the TracerProvider, which hashes the rank against `export_sample_rate` once at startup and then keeps or drops *every* span on that rank. A rank has to clear both filters to emit anything, so leaving the sampler on with a low rate can silence a rank the strategy selected.
+`RANK` is **group-local**: the policy group and the generation group each number their workers from zero, so `nv.dl.rank` is only unambiguous together with the `rl.worker_group` attribute that names which group it belongs to. Filter on the pair.
 
-The driver is independent of both — it always exports, and its rank sampler is disabled for the same reason (`_unrank` in `nemo_rl/telemetry/setup.py`): a synthetic rank 0 is not a member of the population the filters are selecting from. Singleton actors such as the async trajectory collector are exempt on the same grounds. Non-exporting ranks get an empty (`frozenset()`) span-group set, so `is_span_group_enabled()` is `False` everywhere and no span objects are created at all. See [lens: sampling](https://github.com/NVIDIA-NeMo/Lens) for the detailed semantics.
-
-`RANK` is **group-local**: the policy group and the generation group each number their workers from zero. So `export_rank: 3` selects rank 3 *of every worker group*, and each group's spans carry an `rl.worker_group` attribute to tell them apart.
+If you previously set `export_strategy` or one of its companions, the key still parses — `TelemetryConfig` allows extra keys — but it no longer does anything. It is not projected into the worker environment either, so nothing downstream reads it.
 
 ## Run identification
 
@@ -98,7 +90,7 @@ Filter by `run_id` in your backend to isolate a specific run.
 | `nemo.precision` | `policy.precision` |
 | `dl.tensor_parallel.size` | `policy.megatron_cfg` / `dtensor_cfg` TP size |
 | `dl.pipeline_parallel.size` | `policy.megatron_cfg` PP size |
-| `dl.rank`, `dl.world_size` | set automatically by lens |
+| `nv.dl.rank`, `nv.dl.world_size` | this process's rank and group size (`RANK` / `WORLD_SIZE`, or `0` / `1` for the driver and singleton actors) |
 | `rl.worker_group` | worker processes only: the worker group's `name_prefix` (`lm_policy`, `vllm_policy`, ...), from `NRL_WORKER_GROUP` |
 
 Attribute construction is best-effort: a missing config key simply omits that attribute; it never raises. Plus auto-detected host / GPU / SLURM / Kubernetes attributes from lens's resource detection.

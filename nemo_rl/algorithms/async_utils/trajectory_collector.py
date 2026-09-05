@@ -150,11 +150,9 @@ class AsyncTrajectoryCollector:
         # rollout phase at all. rank/world_size are passed explicitly: this
         # actor is a singleton rather than a member of a ranked group, and its
         # runtime_env is a copy of the driver's environment, so a stray RANK
-        # there must not decide whether it exports. always_export goes with
-        # that synthetic rank -- an export_strategy picking among a group's
-        # ranks would otherwise mute this actor entirely (export_rank: 3 never
-        # matches rank 0), taking every rollout span with it.
-        _telemetry = init_telemetry_worker(rank=0, world_size=1, always_export=True)
+        # there would otherwise label every rollout span with another group's
+        # rank.
+        _telemetry = init_telemetry_worker(rank=0, world_size=1)
         self._tracer = _telemetry.tracer if _telemetry is not None else None
         # The driver's rl.<algo>.job span, so this actor's spans land in the run's
         # trace rather than as loose roots. Reattached per thread below.

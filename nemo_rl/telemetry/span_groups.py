@@ -12,15 +12,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NeMo-RL specific span groups."""
+"""NeMo-RL span groups, declared into lens's ``SpanRegistry``.
+
+Lens ships no span-group names of its own: a consuming library registers what
+it emits under its own namespace and users select from that with
+``telemetry.span_groups``. So the groups that used to arrive from lens's base
+class -- ``job``, ``step``, ``checkpoint``, ``evaluate``, ``model_init``,
+``load_checkpoint``, ``forward_backward``, ``optimizer`` -- are declared here
+alongside the RL-specific ones. They keep their original names, because the
+names are the user-facing vocabulary and Megatron registers the same ones for
+the same phases; a group two libraries both register is shared, which is the
+intended behaviour for a job that drives both.
+
+``RLSpanGroup`` is a bag of ``str`` constants rather than an enum or a lens
+subclass, because ``managed_span`` and ``trace_fn`` take the group as a plain
+string. Call sites keep reading ``RLSpanGroup.GENERATION`` for discoverability
+and to keep the spelling in one place.
+
+Registration happens at import, which is what makes these groups selectable:
+lens resolves the ``span_groups`` spec against whatever is registered at the
+time, so this module must be imported before ``setup_telemetry``.
+``nemo_rl.telemetry.setup`` imports it directly for that reason.
+"""
 
 from typing import ClassVar, Final
 
-from nemo.lens.groups import SpanGroup
+from nemo.lens.groups import SpanRegistry
+
+#: Registry namespace NeMo-RL owns. Also the key for ``SpanRegistry.unregister``.
+NAMESPACE = "nemo_rl"
 
 
-class RLSpanGroup(SpanGroup):
-    """Span groups for NeMo-RL instrumentation."""
+class RLSpanGroup:
+    """Span group names for NeMo-RL instrumentation."""
+
+    # ------------------------------------------------------------------ #
+    # Groups lens used to ship
+    # ------------------------------------------------------------------ #
+    #
+    # Declared here now that lens names none itself. Same strings as before, so
+    # every existing ``span_groups`` value keeps working.
+
+    JOB = "job"
+    """The whole run: one span wrapping everything from setup to teardown."""
+
+    CHECKPOINT = "checkpoint"
+    """Checkpoint save spans."""
+
+    EVALUATE = "evaluate"
+    """Validation / evaluation spans."""
+
+    MODEL_INIT = "model_init"
+    """Model construction and sharding inside a worker."""
+
+    LOAD_CHECKPOINT = "load_checkpoint"
+    """Checkpoint restore spans."""
+
+    STEP = "step"
+    """One training step."""
+
+    FORWARD_BACKWARD = "forward_backward"
+    """Forward / backward passes within a step."""
+
+    OPTIMIZER = "optimizer"
+    """Optimizer step spans."""
 
     # ------------------------------------------------------------------ #
     # RL-specific groups
@@ -29,9 +84,9 @@ class RLSpanGroup(SpanGroup):
     SETUP = "setup"
     """Driver-side startup phases: Ray init, worker builds, collective init.
 
-    Distinct from the base ``MODEL_INIT`` group, which covers the model load
-    itself inside a worker. These are the driver's view of the same startup —
-    the phases between process start and the first training step.
+    Distinct from ``MODEL_INIT``, which covers the model load itself inside a
+    worker. These are the driver's view of the same startup — the phases
+    between process start and the first training step.
     """
 
     ROLLOUT = "rollout"
@@ -112,10 +167,10 @@ class RLSpanGroup(SpanGroup):
     # ``umbrella_trace_fn`` plus a drift test that rejects the unprefixed
     # spelling at a span call site.
 
-    U_JOB = SpanGroup.JOB
-    U_STEP = SpanGroup.STEP
-    U_MODEL_INIT = SpanGroup.MODEL_INIT
-    U_EVALUATE = SpanGroup.EVALUATE
+    U_JOB = JOB
+    U_STEP = STEP
+    U_MODEL_INIT = MODEL_INIT
+    U_EVALUATE = EVALUATE
     U_ROLLOUT = ROLLOUT
     U_SETUP = SETUP
     U_PER_PROMPT = PER_PROMPT
@@ -124,8 +179,16 @@ class RLSpanGroup(SpanGroup):
     # All groups and presets
     # ------------------------------------------------------------------ #
 
-    ALL_GROUPS: Final[frozenset] = SpanGroup.ALL_GROUPS | frozenset(
+    ALL_GROUPS: Final[frozenset] = frozenset(
         [
+            JOB,
+            CHECKPOINT,
+            EVALUATE,
+            MODEL_INIT,
+            LOAD_CHECKPOINT,
+            STEP,
+            FORWARD_BACKWARD,
+            OPTIMIZER,
             SETUP,
             ROLLOUT,
             GENERATION,
@@ -141,6 +204,9 @@ class RLSpanGroup(SpanGroup):
         ]
     )
 
+    #: Named subsets a user can select instead of listing groups. ``"all"`` is
+    #: not here: lens reserves it and resolves it as a wildcard over whatever is
+    #: registered, which is strictly better than a snapshot taken at import.
     _PRESETS: ClassVar[dict] = {
         # Startup is in here, and in per_step, for the reason MODEL_INIT was
         # added to per_step: "why was the first step so late" is one of the
@@ -151,10 +217,10 @@ class RLSpanGroup(SpanGroup):
         # the largest part, missing from inside it.
         "default": frozenset(
             [
-                SpanGroup.JOB,
-                SpanGroup.CHECKPOINT,
-                SpanGroup.EVALUATE,
-                SpanGroup.MODEL_INIT,
+                JOB,
+                CHECKPOINT,
+                EVALUATE,
+                MODEL_INIT,
                 SETUP,
             ]
         ),
@@ -164,15 +230,15 @@ class RLSpanGroup(SpanGroup):
         # (coarse: job + checkpoint + evaluate) and ``all``.
         "per_step": frozenset(
             [
-                SpanGroup.CHECKPOINT,
-                SpanGroup.EVALUATE,
+                CHECKPOINT,
+                EVALUATE,
                 # rl.vllm.load_model is the only span in this group, and it was
                 # otherwise reachable from "all" alone -- so the one phase that
                 # explains a slow start was invisible in both presets a user is
                 # likely to pick.
-                SpanGroup.MODEL_INIT,
+                MODEL_INIT,
                 SETUP,
-                SpanGroup.STEP,
+                STEP,
                 ROLLOUT,
                 GENERATION,
                 LOGPROB,
@@ -195,5 +261,45 @@ class RLSpanGroup(SpanGroup):
                 # explicitly with "per_step,per_prompt", or take "all".
             ]
         ),
-        "all": ALL_GROUPS,
     }
+
+    @classmethod
+    def resolve(cls, spec: str) -> frozenset:
+        """Resolve a ``span_groups`` spec to the group names it selects.
+
+        Thin wrapper over :meth:`SpanRegistry.resolve` that drops the ``pending``
+        half of the return. Unlike the fixed-membership scheme this replaces, an
+        unrecognised entry is not an error — the library that owns it may simply
+        not have been imported — so callers that want to report typos should use
+        :meth:`resolve_with_pending`.
+        """
+        return cls.resolve_with_pending(spec)[0]
+
+    @classmethod
+    def resolve_with_pending(cls, spec: str) -> tuple[frozenset, frozenset]:
+        """``(enabled, pending)`` for *spec*, straight from the registry.
+
+        ``pending`` holds spec entries that matched nothing registered. For
+        NeMo-RL that is very likely a typo rather than a not-yet-imported
+        library, which is why the driver reports it.
+        """
+        return SpanRegistry.resolve(spec)
+
+
+def register_span_groups(*, allow_override: bool = True) -> None:
+    """Declare NeMo-RL's groups and presets to lens.
+
+    Called at import. Idempotent by default so a re-import, or a test that
+    cleared the registry, can safely call it again -- re-registering replaces
+    the namespace wholesale, which is exactly the intent here since everything
+    is passed every time.
+    """
+    SpanRegistry.register(
+        NAMESPACE,
+        groups=RLSpanGroup.ALL_GROUPS,
+        presets=RLSpanGroup._PRESETS,
+        allow_override=allow_override,
+    )
+
+
+register_span_groups()

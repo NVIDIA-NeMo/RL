@@ -12,7 +12,7 @@ Telemetry is **optional**: it activates only when `enabled` is true *and* nemo-l
 nemo_rl/telemetry/
 ├── config.py       — TelemetryConfig: the telemetry: config block
 ├── setup.py        — init_telemetry_driver / init_telemetry_worker / get_telemetry_handle / shutdown_telemetry
-├── span_groups.py  — RLSpanGroup: RL-specific span groups + presets
+├── span_groups.py  — RLSpanGroup: span-group names + presets, registered into lens's SpanRegistry
 ├── instrumentation.py — managed_span/trace_fn (+ umbrella_* counterparts), bucket_scope/per_prompt_scope, phase/group → rl.bucket map (monitor derives goodput)
 ├── metrics.py      — tees Logger.log_metrics scalars into the rl.* instruments
 └── __init__.py
@@ -26,7 +26,7 @@ Each `examples/run_<algo>.py` calls `init_telemetry_driver(config, algorithm="<a
 
 OTel providers are process-global, so each Ray actor sets up its own: the policy, value and vLLM generation workers call `init_telemetry_worker()` from `__init__` and `shutdown_telemetry()` from `shutdown` (the latter matters — span/metric processors buffer in the background, and an actor that exits without flushing drops whatever it had not exported). Worker ranks come from the `RANK` / `WORLD_SIZE` env vars, and `RayWorkerGroup` also exports `NRL_WORKER_GROUP` so a worker's spans carry `rl.worker_group` — `RANK` is group-local, so it alone cannot distinguish `lm_policy` rank 3 from `vllm_policy` rank 3.
 
-The async trajectory collector is a singleton actor rather than a group member, so it passes `rank=0, world_size=1, always_export=True`: an `export_strategy` selecting among a group's ranks cannot meaningfully be applied to a synthetic rank, and would otherwise mute every rollout span in the run. It flushes on demand via `flush_telemetry()` because the driver reaps it with `ray.kill`, which runs no `atexit` handler.
+The async trajectory collector is a singleton actor rather than a group member, so it passes `rank=0, world_size=1`: its `runtime_env` is a copy of the driver's environment, and without an explicit rank every rollout span would be labelled with whatever `RANK` the driver happened to carry. It flushes on demand via `flush_telemetry()` because the driver reaps it with `ray.kill`, which runs no `atexit` handler.
 
 Trace context does not cross the Ray call boundary on its own, so a worker's spans are roots of their own traces, correlated to the driver by `run_id` rather than parented to it. The one exception is the async trajectory collector: the driver hands it a W3C carrier at construction and it reattaches that context per thread, so its rollout spans nest under `rl.grpo.job`. See [span groups — getting the collector into one waterfall](../../docs/observability/span-groups.md#getting-the-collector-into-one-waterfall).
 

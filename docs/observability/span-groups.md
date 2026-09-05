@@ -32,7 +32,11 @@ or take `all`. See [Per-prompt spans](#per-prompt-spans) for what you get.
 
 ## `RLSpanGroup`
 
-Defined in `nemo_rl/telemetry/span_groups.py`. Extends lens's base `SpanGroup` with RL-specific groups.
+Defined in `nemo_rl/telemetry/span_groups.py`, and declared to lens by `register_span_groups()` when that module is imported.
+
+nemo-lens ships **no** span-group names of its own: each consuming library registers what it emits into lens's `SpanRegistry` under its own namespace (NeMo-RL's is `nemo_rl`), and `telemetry.span_groups` resolves against whatever is registered in the process. So the groups marked "base" below — the ones lens used to define — are declared by NeMo-RL too. They keep their original names, which are also the names Megatron registers for the same phases; a group two libraries both register is shared, and enabling it turns on both.
+
+One consequence worth knowing: registration is an *import side effect*, so a group is only selectable once its module has been imported. `nemo_rl/telemetry/setup.py` imports this module before calling `setup_telemetry` for that reason.
 
 | Group | Origin | Controls |
 |---|---|---|
@@ -322,14 +326,11 @@ Async PPO records the same `init/total` timer but emits no span for it yet.
 
 In an async run, no rollout is generated on the driver. Every trajectory comes
 from inside `AsyncTrajectoryCollector`, a separate Ray actor, which calls
-`init_telemetry_worker(rank=0, world_size=1, always_export=True)` in its
-constructor. Explicit rank because it is a singleton, not a member of a ranked
-group, and its `runtime_env` is a copy of the driver's environment, so an
-inherited `RANK` must not decide whether it exports. `always_export` goes with
-that synthetic rank: an `export_strategy` that selects among a group's ranks has
-no meaning applied to a made-up one, and would silently mute the actor — with
-`export_rank: 3`, every rollout span in the run would disappear. The driver uses
-the same override for the same reason.
+`init_telemetry_worker(rank=0, world_size=1)` in its constructor. Explicit rank
+because it is a singleton, not a member of a ranked group, and its `runtime_env`
+is a copy of the driver's environment — so without this its spans would carry
+whatever `RANK` the driver happened to have. The driver reports itself the same
+way, for the same reason.
 
 It flushes through `flush_telemetry()`, which the driver calls before `ray.kill`,
 since a kill runs no `atexit` handler. That call stops the collection loop and
@@ -485,7 +486,7 @@ blanks today, so an empty trace is not read as a broken exporter:
 
 ## Resource attributes (process tags)
 
-Stable-for-the-run values, set once at init and attached to every span/metric: `rl.algorithm`, `rl.model`, `nemo.precision`, `dl.tensor_parallel.size`, `dl.pipeline_parallel.size`, plus `dl.rank` / `dl.world_size` (set automatically by lens). See [Configuration — Resource attributes](configuration.md#resource-attributes).
+Stable-for-the-run values, set once at init and attached to every span/metric: `rl.algorithm`, `rl.model`, `nemo.precision`, `dl.tensor_parallel.size`, `dl.pipeline_parallel.size`, plus `nv.dl.rank` / `nv.dl.world_size`. See [Configuration — Resource attributes](configuration.md#resource-attributes).
 
 ## Granularity guidance
 

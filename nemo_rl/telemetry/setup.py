@@ -46,7 +46,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
 
 if TYPE_CHECKING:
-    from nemo.lens import NemoLensConfig, TelemetryHandle
+    from nemo.lens import TelemetryHandle
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +71,6 @@ _WORKER_GROUP_ENV = "NRL_WORKER_GROUP"
 _ENV_FIELD_MAP = {
     "enabled": f"{_OTEL_PREFIX}_ENABLED",
     "span_groups": f"{_OTEL_PREFIX}_SPAN_GROUPS",
-    "export_strategy": f"{_OTEL_PREFIX}_EXPORT_STRATEGY",
-    "export_rank": f"{_OTEL_PREFIX}_EXPORT_RANK",
-    "export_sample_rate": f"{_OTEL_PREFIX}_EXPORT_SAMPLE_RATE",
-    "sampler_enabled": f"{_OTEL_PREFIX}_SAMPLER_ENABLED",
     "traces_enabled": f"{_OTEL_PREFIX}_TRACES_ENABLED",
     "metrics_enabled": f"{_OTEL_PREFIX}_METRICS_ENABLED",
     "logs_enabled": f"{_OTEL_PREFIX}_LOGS_ENABLED",
@@ -160,7 +156,7 @@ def _build_resource_attributes(
     Only stable-for-the-run values belong here (algorithm, model, precision,
     parallelism). Per-step values are span tags; time-series values are metrics.
     Best-effort: a missing key simply omits that attribute — never raises.
-    ``dl.rank`` / ``dl.world_size`` are set by lens from the setup call, not here.
+    Rank identity comes from :func:`_rank_attributes`, which the callers merge in.
     """
     attrs: dict[str, Any] = {"rl.algorithm": algorithm}
 
@@ -185,51 +181,22 @@ def _build_resource_attributes(
     return attrs
 
 
-def _always_export(
-    config: "NemoLensConfig",
-    rank: int,
-    world_size: int,
-) -> bool:
-    """Export-strategy override for singleton processes: always export."""
-    return True
+def _rank_attributes(rank: int, world_size: int) -> dict[str, Any]:
+    """Resource attributes identifying this process within its group.
 
+    Lens has no notion of rank: it neither filters nor samples on one, so every
+    process that sets up telemetry exports. Rank is recorded as a resource
+    attribute instead, which is what makes a single rank's spans selectable
+    afterwards -- filter on ``nv.dl.rank`` in the collector, or leave
+    ``telemetry.enabled`` false on the ranks that should stay quiet.
 
-def _unrank(config: "NemoLensConfig") -> Any:
-    """Disable rank-based span filtering for a process that has no real rank.
-
-    The driver and singleton actors such as ``AsyncTrajectoryCollector`` are not
-    members of a distributed group, so they pass a synthetic ``rank=0`` /
-    ``world_size=1``. Both of lens's rank filters then misfire on that made-up
-    rank, and the two are independent, so both have to be neutralised:
-
-    * ``export_strategy`` decides whether this process exports at all. A
-      strategy that selects among the ranks of a *group* has no meaning for a
-      singleton, and mutes it outright for any ``export_rank >= 1``.
-    * ``sampler_enabled`` installs a ``RankAwareSampler`` on the tracer
-      provider, which drops every span on ranks whose ``md5(rank)`` bucket
-      lands above ``export_sample_rate``. Rank 0's bucket is 0.785, so any
-      sample rate at or below that discards the process's spans *before* the
-      export decision is ever consulted.
-
-    The driver hosts the training loop and the metrics logger, and the
-    collector generates every async rollout, so either filter silently drops
-    the telemetry that matters most.
-
-    Mutating ``config`` here is process-local: it is rebuilt from the
-    environment in each process, and the propagated ``NEMO_RL_OTEL_*`` vars are
-    untouched, so ranked workers still honour what the user configured.
-
-    Returns the export-strategy override to hand to ``setup_telemetry``.
+    Passing rank at all is what keeps that filter available; lens warns when
+    ``nv.dl.rank`` is missing, because without it a process cannot be told
+    apart from its peers downstream.
     """
-    if config.sampler_enabled and config.export_sample_rate < 1.0:
-        logger.info(
-            "nemo-lens: disabling the rank sampler for this process "
-            "(sample_rate=%s applies to ranked workers, not to the driver or a "
-            "singleton actor)",
-            config.export_sample_rate,
-        )
-        config.sampler_enabled = False
-    return _always_export
+    from nemo.lens.semconv import NV_DL_RANK, NV_DL_WORLD_SIZE
+
+    return {NV_DL_RANK: rank, NV_DL_WORLD_SIZE: world_size}
 
 
 def init_telemetry_driver(
@@ -245,10 +212,6 @@ def init_telemetry_driver(
 
     Returns the :class:`TelemetryHandle`, or ``None`` if telemetry is disabled.
     Idempotent.
-
-    Raises:
-        ValueError: if ``telemetry.export_strategy`` names a strategy lens does
-            not have. Deliberately fatal on the driver, where the user sees it.
     """
     global _TELEMETRY_HANDLE, _TELEMETRY_INITIALISED
     if _TELEMETRY_INITIALISED:
@@ -260,14 +223,16 @@ def init_telemetry_driver(
     if tel is not None:
         _config_to_env(tel)
 
-    from nemo.lens import NemoLensConfig, registered_strategies, setup_telemetry
+    from nemo.lens import NemoLensConfig, setup_telemetry
 
+    # Imported for its import side effect as much as for the name: importing
+    # this module is what registers NeMo-RL's groups with lens's SpanRegistry,
+    # and the spec below can only resolve against groups already registered.
     from nemo_rl.telemetry.span_groups import RLSpanGroup
 
     config = NemoLensConfig.from_env(
         prefix=_OTEL_PREFIX,
         fallback_prefix=_OTEL_FALLBACK_PREFIX,
-        span_group_cls=RLSpanGroup,
     )
     if not config.enabled:
         _TELEMETRY_INITIALISED = True
@@ -288,34 +253,33 @@ def init_telemetry_driver(
         os.environ[_RUN_ID_ENV] = run_id
         config.run_id = run_id
 
-    # Passing _always_export below bypasses lens's registry lookup, which is
-    # what would otherwise reject a misspelled strategy. Validate it here so a
-    # typo fails on the driver, where the user sees it, instead of degrading to
-    # a warning inside every worker.
-    if config.export_strategy not in registered_strategies():
-        raise ValueError(
-            f"Unknown telemetry.export_strategy {config.export_strategy!r}. "
-            f"Registered strategies: {registered_strategies()}."
+    # Resolved eagerly so a typo is reported here rather than silently selecting
+    # less than the user asked for. Lens treats an unknown entry as pending, not
+    # an error, because in general the library that owns it may not have been
+    # imported yet -- but NeMo-RL registers everything it emits at import, so on
+    # the driver a pending entry really is a typo. A warning rather than a raise
+    # for the same reason the rest of this is best-effort: a misspelt group
+    # should not end a training run.
+    _, pending = RLSpanGroup.resolve_with_pending(config.span_groups)
+    if pending:
+        logger.warning(
+            "nemo-lens: telemetry.span_groups names %s, which match no registered "
+            "span group or preset and will select nothing. Registered groups: %s.",
+            sorted(pending),
+            sorted(RLSpanGroup.ALL_GROUPS),
         )
-
-    # Same reasoning, different field: lens resolves span_groups lazily, *after*
-    # it has installed the global tracer provider, so a typo there would take
-    # the process down with telemetry half-built and no handle to flush.
-    RLSpanGroup.resolve(config.span_groups)
 
     # Unguarded on purpose: _build_resource_attributes is total by construction
     # (missing keys omit an attribute), so a raise here is a real bug, and
     # swallowing it would drop rl.model / nemo.precision / dl.*_parallel.size
     # from every span and metric for the whole run.
     resource_attrs = _build_resource_attributes(master_config, algorithm)
+    # The driver is a singleton, not a member of a distributed group. Rank 0 of
+    # 1 is the honest description, and stating it silences lens's warning about
+    # a process that cannot be identified by rank downstream.
+    resource_attrs.update(_rank_attributes(rank=0, world_size=1))
 
-    handle = setup_telemetry(
-        config,
-        rank=0,
-        world_size=1,
-        resource_attributes=resource_attrs,
-        export_strategy=_unrank(config),
-    )
+    handle = setup_telemetry(config, resource_attributes=resource_attrs)
     # Only now, past everything that can raise: setting the guard earlier would
     # turn a retry after a failed setup into a silent None instead of the same
     # error. Lens leaves its own guard clear on that path, so a retry is safe.
@@ -356,7 +320,7 @@ def _worker_resource_attributes(
     """Build resource attributes identifying this worker process.
 
     ``RANK`` is group-local — the policy group and the generation group each
-    number their workers from zero — so ``dl.rank`` alone cannot tell their
+    number their workers from zero — so ``nv.dl.rank`` alone cannot tell their
     spans apart. ``rl.worker_group`` carries the group's ``name_prefix``
     (``lm_policy``, ``vllm_policy``, ...), which ``RayWorkerGroup`` exports as
     ``NRL_WORKER_GROUP``. Explicit ``extra`` attributes win.
@@ -374,31 +338,27 @@ def init_telemetry_worker(
     rank: Optional[int] = None,
     world_size: Optional[int] = None,
     resource_attributes: Optional[dict[str, Any]] = None,
-    always_export: bool = False,
 ) -> Optional["TelemetryHandle"]:
     """Initialise telemetry inside a Ray actor (call once per worker process).
 
     Reads the ``NEMO_RL_OTEL_*`` env propagated from the driver via the Ray
     ``runtime_env``. ``rank`` / ``world_size`` default to the ``RANK`` /
-    ``WORLD_SIZE`` env vars the worker was launched with, which — together with
-    the export strategy — decide whether this worker exports.
+    ``WORLD_SIZE`` env vars the worker was launched with, and are recorded as
+    ``nv.dl.rank`` / ``nv.dl.world_size`` resource attributes.
+
+    Every worker that gets here exports. Narrowing that down is a downstream
+    decision now: filter on ``nv.dl.rank`` in the collector, or leave
+    ``telemetry.enabled`` false for the ranks that should stay quiet.
 
     Args:
         rank: This process's rank. Defaults to the ``RANK`` env var.
         world_size: Size of this process's group. Defaults to ``WORLD_SIZE``.
         resource_attributes: Extra resource attributes for this process.
-        always_export: Bypass the configured rank filters for this process, the
-            way the driver does (see :func:`_unrank`). Set it for a *singleton*
-            actor passing a synthetic ``rank`` / ``world_size``: the filters
-            select among the ranks of a distributed group, so applying them to
-            a made-up rank has no meaning and silently mutes the actor — e.g.
-            ``export_rank: 3`` never matches a synthetic rank 0. Ranked members
-            of a real worker group must leave this false.
 
-    Never raises: unlike the driver, a worker must not fail a training run over
-    optional observability, and the driver has already validated the same
-    config before any worker starts — so a genuine misconfiguration surfaces
-    there, loudly, rather than here.
+    Never raises: a worker must not fail a training run over optional
+    observability. The driver resolves the same config before any worker
+    starts, so a misconfiguration is already reported once, from the one
+    process whose log the user is reading — rather than once per worker.
 
     Returns the :class:`TelemetryHandle`, or ``None`` if telemetry is disabled
     or setup failed. Idempotent per process.
@@ -416,7 +376,9 @@ def init_telemetry_worker(
     try:
         from nemo.lens import NemoLensConfig, setup_telemetry
 
-        from nemo_rl.telemetry.span_groups import RLSpanGroup
+        # Imported for the side effect: registers NeMo-RL's span groups, which
+        # the spec in the config below resolves against.
+        import nemo_rl.telemetry.span_groups  # noqa: F401
 
         if rank is None:
             rank = int(os.environ.get("RANK", "0"))
@@ -426,19 +388,14 @@ def init_telemetry_worker(
         config = NemoLensConfig.from_env(
             prefix=_OTEL_PREFIX,
             fallback_prefix=_OTEL_FALLBACK_PREFIX,
-            span_group_cls=RLSpanGroup,
         )
         if not config.enabled:
             return None
 
-        handle = setup_telemetry(
-            config,
-            rank=rank,
-            world_size=world_size,
-            resource_attributes=_worker_resource_attributes(resource_attributes),
-            # None leaves lens to resolve config.export_strategy as usual.
-            export_strategy=_unrank(config) if always_export else None,
-        )
+        attrs = _worker_resource_attributes(resource_attributes)
+        attrs.update(_rank_attributes(rank=rank, world_size=world_size))
+
+        handle = setup_telemetry(config, resource_attributes=attrs)
         logger.info(
             "nemo-lens worker telemetry initialised (group=%s, rank=%s/%s, exporting=%s)",
             os.environ.get(_WORKER_GROUP_ENV, "?"),
