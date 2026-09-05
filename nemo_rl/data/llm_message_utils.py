@@ -30,6 +30,10 @@ from nemo_rl.data.multimodal_utils import (
     get_multimodal_default_settings_from_processor,
     load_media_from_message,
 )
+from nemo_rl.data.routed_experts import (
+    RoutedExpertsBatch,
+    RoutedExpertsTensorRef,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = torch.Tensor
@@ -125,6 +129,18 @@ def message_log_to_flat_messages(
     # Concatenate tensors for each key
     concat: FlatMessagesType = {}
     for key in result:
+        routed_refs = [
+            value
+            for value in result[key]
+            if isinstance(value, RoutedExpertsTensorRef)
+        ]
+        if routed_refs:
+            if len(routed_refs) != len(result[key]):
+                raise TypeError(
+                    f"Routed-expert key {key!r} contains mixed lazy/non-lazy values"
+                )
+            concat[key] = RoutedExpertsBatch.from_message_segments(routed_refs)  # type: ignore[assignment]
+            continue
         if result[key] and isinstance(result[key][0], Tensor):
             try:
                 concat[key] = torch.cat(result[key])
@@ -383,6 +399,16 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
+        routed_batches = [
+            value for value in values if isinstance(value, RoutedExpertsBatch)
+        ]
+        if routed_batches:
+            if len(routed_batches) != len(values):
+                raise TypeError(
+                    f"Routed-expert key {key!r} is missing from one or more rows"
+                )
+            result[key] = RoutedExpertsBatch.concat(routed_batches)  # type: ignore[assignment]
+            continue
         packed_values = _validated_packed_values(key, values)
         # Preserve one logical row for conversations missing this media key.
         # Async replay may concatenate text-only and multimodal prompt groups in
