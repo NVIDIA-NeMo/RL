@@ -460,9 +460,8 @@ def vlm_hf_data_processor(
     from nemo_rl.data.datasets.response_datasets.refcoco import format_refcoco_dataset
     from nemo_rl.data.multimodal_utils import (
         PackedTensor,
-        get_dim_to_pack_along,
+        extract_multimodal_model_inputs,
         get_multimodal_default_settings_from_processor,
-        get_multimodal_keys_from_processor,
         resolve_to_image,
         uses_image_placeholder,
     )
@@ -608,50 +607,13 @@ def vlm_hf_data_processor(
 
     # add this for backward compatibility
     user_message["token_ids"] = message["input_ids"][0]
-    # add all keys and values to the user message, and the list of keys
-    multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    # Current Nemotron Omni processors emit imgs_sizes. Historical MMPR
-    # checkpoints instead emit a batch of fixed-size image tiles and only
-    # declare pixel_values. Treat each tile as one dynamic-resolution image so
-    # the Nemotron Omni path can patchify it and preserve the processor's exact
-    # placeholder count.
-    if (
-        uses_placeholder
-        and "pixel_values" in message
-        and "imgs_sizes" not in message
-        and message["pixel_values"].ndim == 4
-    ):
-        pixel_values = message["pixel_values"]
-        num_tiles, _, height, width = pixel_values.shape
-        message["imgs_sizes"] = torch.tensor(
-            [[height, width]] * num_tiles, dtype=torch.long
-        )
-
-    # imgs_sizes is not always declared in model_input_names by bundled image
-    # processors, so append it explicitly when present. RADIO uses temporal
-    # patching even for still images and requires one num_frames=1 entry per
-    # image/tile.
-    if "imgs_sizes" in message and "imgs_sizes" not in multimodal_keys:
-        multimodal_keys.append("imgs_sizes")
-    if "imgs_sizes" in message and "num_frames" not in message:
-        message["num_frames"] = torch.ones(len(message["imgs_sizes"]), dtype=torch.long)
-    if "num_frames" in message and "num_frames" not in multimodal_keys:
-        multimodal_keys.append("num_frames")
-    for key in multimodal_keys:
-        if key in message:
-            user_message[key] = PackedTensor(
-                message[key],
-                dim_to_pack=get_dim_to_pack_along(processor, key),
-                pad_to_max_shape=uses_placeholder and key == "pixel_values",
-            )
-
-    # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
-    if "token_type_ids" in message:
-        user_message["token_type_ids"] = message["token_type_ids"][0]
-
-    # for qwen2.5-vl (transformers>=5.3), mm_token_type_ids tells the model which tokens are text/image/video for 3D RoPE
-    if "mm_token_type_ids" in message:
-        user_message["mm_token_type_ids"] = message["mm_token_type_ids"][0]
+    # Single source of truth for media extraction: the MMPR imgs_sizes
+    # fallback, RADIO num_frames synthesis, PackedTensor wrapping (incl. the
+    # imgs_sizes int32 cast) and the gemma / qwen2.5-vl sequence-type maps all
+    # live in ``extract_multimodal_model_inputs``, which the NeMo-Gym path also
+    # uses. One implementation is what stops the two paths from handing the
+    # same model differently-typed inputs.
+    user_message.update(extract_multimodal_model_inputs(processor, message))
 
     ### append to user message
     message_log.append(user_message)

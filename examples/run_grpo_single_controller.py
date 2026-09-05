@@ -127,7 +127,7 @@ def main() -> None:
     init_ray()
 
     processor = None
-    if config.policy.get("is_vlm", False):
+    if config.policy.get("is_vlm"):
         processor = get_tokenizer(config.policy["tokenizer"], get_processor=True)
         tokenizer = processor.tokenizer
     else:
