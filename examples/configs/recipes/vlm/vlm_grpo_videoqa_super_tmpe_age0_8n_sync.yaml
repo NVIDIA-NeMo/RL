@@ -1,0 +1,48 @@
+# One-step synchronous diagnostic for generation/policy logprob parity.
+#
+# This deliberately removes async trajectory age and router replay from the
+# experiment. Point policy.model_name at the same exported HF checkpoint for
+# both engines; the resulting first and only batch is an age-zero residual-
+# precision A/B, not a production training recipe.
+defaults: ./vlm_grpo_videoqa_super_profile_band.yaml
+
+cluster:
+  num_nodes: 8
+  gpus_per_node: 4
+  segment_size: 2
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+  max_num_steps: 1
+  async_grpo:
+    enabled: false
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+checkpointing:
+  enabled: false
+
+policy:
+  train_global_batch_size: 16
+  router_replay:
+    enabled: false
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      load_format: auto
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 4
+        gpus_per_node: 4
+
+logger:
+  wandb:
+    name: sync_grpo_super35_tmpe_age0_bf16_residual_8n
