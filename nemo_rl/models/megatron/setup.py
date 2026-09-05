@@ -21,7 +21,7 @@ import time
 import warnings
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar, cast
 
 import torch
 from megatron.bridge import AutoBridge
@@ -1323,8 +1323,70 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         ):
             model_cfg.use_te_rng_tracker = True
 
-    # FP8 configuration
+    apply_te_precision_config(model_cfg, config)
+
+
+def apply_te_precision_config(model_cfg: Any, config: PolicyConfig) -> None:
+    """Apply mutually exclusive FP8 or FP4 Transformer Engine settings."""
+    from nemo_rl.models.generation.vllm.config import (
+        VllmConfig,
+        parse_nvfp4_pertoken_rollout,
+    )
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        resolve_boundary_ignore_patterns,
+    )
+    from nemo_rl.models.policy import Fp4Config
+
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+    raw_fp4_cfg = config["megatron_cfg"].get("fp4_cfg", None)
+    fp4_cfg = Fp4Config.model_validate(raw_fp4_cfg) if raw_fp4_cfg is not None else None
+    fp8_on = fp8_cfg is not None and fp8_cfg.get("enabled", False)
+    fp4_on = fp4_cfg is not None and fp4_cfg.enabled
+
+    generation_cfg = config.get("generation")
+    per_token_rollout = (
+        parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_cfg))
+        if generation_cfg is not None and generation_cfg.get("backend") == "vllm"
+        else None
+    )
+    if per_token_rollout is not None:
+        required_env = {
+            "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+            "NVTE_BACKWARD_OVERRIDE": "dequantized",
+        }
+        env_vars = config["megatron_cfg"].get("env_vars") or {}
+        invalid_env = {
+            key: env_vars.get(key)
+            for key, expected in required_env.items()
+            if str(env_vars.get(key)) != expected
+        }
+        if (
+            fp4_cfg is None
+            or not fp4_cfg.enabled
+            or fp4_cfg.fp4 != "e2m1"
+            or fp4_cfg.fp4_recipe != "nvfp4"
+            or fp4_cfg.fp4_param is not False
+            or config.get("precision") != "bfloat16"
+            or config.get("quant_cfg") is not None
+            or invalid_env
+            or not config["megatron_cfg"].get("te_precision_config_file")
+        ):
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout requires policy.precision="
+                "bfloat16, policy.quant_cfg=null (TE-only training), "
+                "megatron_cfg.fp4_cfg={enabled: true, fp4: e2m1, "
+                "fp4_recipe: nvfp4, fp4_param: false}, a routed-expert TE "
+                "precision recipe, and env_vars "
+                "NVTE_NVFP4_ROW_SCALED_ACTIVATION=1 plus "
+                "NVTE_BACKWARD_OVERRIDE=dequantized; invalid env values: "
+                f"{invalid_env}"
+            )
+    if fp8_on and fp4_on:
+        raise ValueError(
+            "policy.megatron_cfg.fp8_cfg and fp4_cfg cannot both have enabled: "
+            "true (Megatron does not allow fp8 and fp4 together)."
+        )
+
     if fp8_cfg is not None and fp8_cfg.get("enabled", False):
         try:
             model_cfg.fp8 = fp8_cfg["fp8"]
@@ -1333,7 +1395,104 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
+    if fp4_cfg is not None and fp4_cfg.enabled:
+        if fp4_cfg.fp4 is None:
+            raise KeyError("Missing key in fp4_cfg: 'fp4'")
+        model_cfg.fp4 = fp4_cfg.fp4
+        model_cfg.fp4_recipe = fp4_cfg.fp4_recipe
+        model_cfg.fp4_param = fp4_cfg.fp4_param
+        model_cfg.fp8 = None
+        print(
+            f"[fp4_cfg] Megatron FP4 training enabled: fp4={fp4_cfg.fp4} "
+            f"recipe={fp4_cfg.fp4_recipe} fp4_param={fp4_cfg.fp4_param}",
+            flush=True,
+        )
+
     megatron_cfg = config["megatron_cfg"]
+    if "first_last_layers_bf16" in megatron_cfg:
+        model_cfg.first_last_layers_bf16 = megatron_cfg["first_last_layers_bf16"]
+    if "num_layers_at_start_in_bf16" in megatron_cfg:
+        model_cfg.num_layers_at_start_in_bf16 = megatron_cfg[
+            "num_layers_at_start_in_bf16"
+        ]
+    if "num_layers_at_end_in_bf16" in megatron_cfg:
+        model_cfg.num_layers_at_end_in_bf16 = megatron_cfg["num_layers_at_end_in_bf16"]
+
+    te_precision_path = megatron_cfg.get("te_precision_config_file")
+    if te_precision_path:
+        from megatron.core.quantization.utils import load_quantization_recipe
+
+        model_cfg.quant_recipe = load_quantization_recipe(te_precision_path)
+        print(
+            f"[fp4_cfg] TE per-module precision recipe loaded from {te_precision_path}",
+            flush=True,
+        )
+
+    if per_token_rollout is not None:
+        from megatron.core.quantization.quant_config import MatchContext
+
+        quant_recipe = model_cfg.quant_recipe
+
+        def _match(module_path: str) -> str | None:
+            return quant_recipe.match_to_config_key(
+                MatchContext(module_path=module_path, layer_number=0)
+            )
+
+        expected_matches = {
+            "decoder.layers.0.self_attention.linear_qkv": "bf16",
+            "decoder.layers.0.self_attention.linear_proj": "bf16",
+            "decoder.layers.0.mlp.experts.linear_fc1": "nvfp4",
+            "decoder.layers.0.mlp.experts.linear_fc2": "nvfp4",
+        }
+        mismatches = {
+            path: (_match(path), expected)
+            for path, expected in expected_matches.items()
+            if _match(path) != expected
+        }
+        accidentally_quantized = {
+            path: _match(path)
+            for path in (
+                "decoder.layers.0.mlp.linear_fc1",
+                "decoder.layers.0.mlp.linear_fc2",
+                "decoder.layers.0.mlp.shared_experts.linear_fc1",
+                "decoder.layers.0.mlp.shared_experts.linear_fc2",
+            )
+            if _match(path) == "nvfp4"
+        }
+        if mismatches or accidentally_quantized:
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout requires a TE recipe with "
+                "BF16 attention and routed-expert-only NVFP4; mismatches="
+                f"{mismatches}, unexpected NVFP4={accidentally_quantized}"
+            )
+
+        num_hidden_layers = getattr(
+            model_cfg, "num_layers", getattr(model_cfg, "num_hidden_layers", None)
+        )
+        # Unconditional parity check against the instantiated MCore config.
+        # The driver owns the derivation; this side only verifies that what the
+        # rollout actually received is the boundary the trainer will use. An
+        # entry point that skipped normalization arrives here with an empty
+        # value and fails, instead of quantizing layers the trainer keeps BF16.
+        resolved_ignore = resolve_boundary_ignore_patterns(
+            num_hidden_layers=num_hidden_layers,
+            first_last_layers_bf16=bool(
+                getattr(model_cfg, "first_last_layers_bf16", False)
+            ),
+            num_layers_at_start_in_bf16=int(
+                getattr(model_cfg, "num_layers_at_start_in_bf16", 1) or 0
+            ),
+            num_layers_at_end_in_bf16=int(
+                getattr(model_cfg, "num_layers_at_end_in_bf16", 1) or 0
+            ),
+            expected_additional_ignore=per_token_rollout.additional_ignore,
+        )
+        print(
+            "[fp4_cfg] verified routed-expert NVFP4 coverage and BF16 boundary "
+            f"parity: {resolved_ignore}",
+            flush=True,
+        )
+
     fine_grained_activation_offloading = megatron_cfg.get(
         "fine_grained_activation_offloading"
     )

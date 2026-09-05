@@ -161,9 +161,21 @@ def make_processed_microbatch_iterator(
 
 
 def _get_fp8_token_alignment(megatron_cfg: dict[str, Any]) -> int:
-    """Return the token-dimension alignment required by the FP8 recipe."""
+    """Return the token-dimension alignment required by FP8 or FP4."""
     fp8_cfg = megatron_cfg.get("fp8_cfg") or {}
-    if not fp8_cfg.get("enabled", False):
+    fp4_cfg = megatron_cfg.get("fp4_cfg") or {}
+    use_fp8 = fp8_cfg.get("enabled", False)
+    use_fp4 = (
+        fp4_cfg.get("enabled", False) if isinstance(fp4_cfg, dict) else fp4_cfg.enabled
+    )
+    if use_fp8 and use_fp4:
+        raise ValueError(
+            "megatron_cfg.fp8_cfg and fp4_cfg cannot both have enabled: true "
+            "(Megatron does not allow fp8 and fp4 together)."
+        )
+    if use_fp4:
+        return 128
+    if not use_fp8:
         return 1
     if fp8_cfg["fp8_recipe"] == "blockwise":
         return 128

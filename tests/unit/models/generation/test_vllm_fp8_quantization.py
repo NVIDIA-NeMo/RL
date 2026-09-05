@@ -1089,14 +1089,20 @@ def _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model=F
     """
     import torch
 
-    class _RoutedExperts:
-        pass
+    class _RoutedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
 
-    class _MoERunner:
-        pass
+    class _MoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+    from nemo_rl.models.generation.vllm.quantization import utils as quant_utils
 
     monkeypatch.setattr(fp8, "RoutedExperts", _RoutedExperts)
-    monkeypatch.setattr(fp8, "MoERunner", _MoERunner)
+    monkeypatch.setattr(fp8, "MoERunner", _MoERunner, raising=False)
+    monkeypatch.setattr(quant_utils, "RoutedExperts", _RoutedExperts)
+    monkeypatch.setattr(quant_utils, "MoERunner", _MoERunner)
 
     experts = _RoutedExperts()
     experts.w13_weight = torch.zeros(2, 4, 4, dtype=experts_dtype)
@@ -1165,7 +1171,7 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     # Pass-through is also what a failed lookup produces, so pin that the
     # bf16 RoutedExperts was actually resolved.
     assert isinstance(
-        fp8._get_module_from_param_name(
+        fp8.get_module_from_param_name(
             model, f"{layers_prefix}.0.mlp.experts.gate_up_proj"
         ),
         fp8.RoutedExperts,

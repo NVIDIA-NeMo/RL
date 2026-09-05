@@ -13,12 +13,14 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import importlib.util
 import json
 import os
 import sys
 import threading
 import types
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -27,6 +29,7 @@ import pytest
 import ray
 import requests
 import torch
+from pydantic import ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
@@ -39,6 +42,11 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import (
+    NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS,
+    normalize_nvfp4_pertoken_policy_config,
+    normalize_vllm_refit_config,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
@@ -97,6 +105,95 @@ basic_vllm_test_config: VllmConfig = {
     },
     "vllm_kwargs": {},
 }
+
+
+def _make_nvfp4_pertoken_generation_config() -> VllmConfig:
+    config = deepcopy(basic_vllm_test_config)
+    config["nvfp4_pertoken_rollout"] = {"enabled": True}
+    return config
+
+
+def _deep_update(target: dict, update: dict) -> None:
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_update(target[key], value)
+        else:
+            target[key] = value
+
+
+def test_normalize_vllm_refit_config_validates_nvfp4_pertoken_schema_first():
+    """Direct refit normalization must not accept a typoed per-token config."""
+    with pytest.raises(ValidationError, match="unknown_key"):
+        normalize_vllm_refit_config(
+            {
+                "nvfp4_pertoken_rollout": {"enabled": True, "unknown_key": 1},
+                "refit_transport": None,
+            }
+        )
+
+
+def test_normalize_vllm_refit_config_rejects_nvfp4_with_explicit_transport():
+    """Direct normalization must enforce the per-token null-transport contract."""
+    with pytest.raises(ValueError, match="refit_transport=null"):
+        normalize_vllm_refit_config(
+            {
+                "nvfp4_pertoken_rollout": {"enabled": True},
+                "refit_transport": "nixl",
+            }
+        )
+
+
+def test_nvfp4_pertoken_normalization_is_silent_when_the_mode_is_off():
+    """A run that never asked for NVFP4 must not warn, whatever the entry point.
+
+    The early return also keeps the HF config load off the path of every
+    ordinary PPO/distillation run.
+    """
+    policy_config = {"generation": {"backend": "vllm"}, "megatron_cfg": {}}
+    for entry_point in ("grpo", "ppo", "distillation", "some_future_algorithm"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            normalize_nvfp4_pertoken_policy_config(
+                dict(policy_config), entry_point=entry_point
+            )
+
+
+def test_nvfp4_pertoken_warns_on_an_entry_point_without_end_to_end_coverage():
+    """PPO and distillation reuse GRPO's worker and refit path but are unvalidated.
+
+    The warning has to precede the HF config load so it is emitted even when
+    boundary resolution later fails, which is why the model name below never
+    has to resolve.
+    """
+    assert "grpo" in NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS
+    policy_config = {
+        "model_name": "nvfp4-pertoken-entry-point-probe",
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {
+            "first_last_layers_bf16": True,
+            "num_layers_at_start_in_bf16": 2,
+            "num_layers_at_end_in_bf16": 4,
+        },
+    }
+
+    for entry_point in ("ppo", "distillation"):
+        with pytest.warns(UserWarning, match="has end-to-end coverage"):
+            with contextlib.suppress(Exception):
+                normalize_nvfp4_pertoken_policy_config(
+                    dict(policy_config), entry_point=entry_point
+                )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with contextlib.suppress(Exception):
+            normalize_nvfp4_pertoken_policy_config(
+                dict(policy_config), entry_point="grpo"
+            )
+    assert not [w for w in caught if "has end-to-end coverage" in str(w.message)]
+
 
 basic_dtensor_test_config: PolicyConfig = {
     "model_name": basic_vllm_test_config["model_name"],
@@ -784,6 +881,317 @@ def test_configure_generation_config_keeps_dummy_startup_weights_for_nixl():
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"quant_cfg": "recipe.yaml"}, "quant_cfg"),
+        ({"real_quant": True}, "real_quant"),
+        ({"refit_transport": "nixl"}, "refit_transport"),
+        (
+            {
+                "vllm_kwargs": {
+                    "speculative_config": {
+                        "method": "mtp",
+                        "num_speculative_tokens": 1,
+                    }
+                }
+            },
+            "speculative decoding",
+        ),
+    ],
+)
+def test_nvfp4_pertoken_rejects_incompatible_generation_modes(mutation, message):
+    """Reject modes whose startup/refit contracts cannot carry per-token NVFP4."""
+    config = _make_nvfp4_pertoken_generation_config()
+    config.update(mutation)
+    with pytest.raises(ValueError, match=message):
+        configure_generation_config(
+            config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+        )
+
+
+def test_nvfp4_pertoken_rejects_standalone_eval():
+    """Per-token rollout requires a refit before generation and cannot evaluate alone."""
+    with pytest.raises(ValueError, match="standalone evaluation"):
+        configure_generation_config(
+            _make_nvfp4_pertoken_generation_config(),
+            MagicMock(pad_token_id=0, eos_token_id=1),
+            is_eval=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"colocated": {"enabled": False}},
+        {"vllm_cfg": {"pipeline_parallel_size": 2}},
+        {"vllm_cfg": {"expert_parallel_size": 2}},
+        {"vllm_cfg": {"kv_cache_dtype": "fp8"}},
+        {"vllm_cfg": {"precision": "fp8"}},
+    ],
+)
+def test_nvfp4_pertoken_rejects_unsupported_topology(mutation):
+    """The fused refit stream requires colocated rollout and vLLM EP=1."""
+    config = _make_nvfp4_pertoken_generation_config()
+    _deep_update(config, mutation)
+    with pytest.raises(ValueError, match="nvfp4_pertoken_rollout"):
+        configure_generation_config(
+            config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+        )
+
+
+@pytest.mark.parametrize(
+    "vllm_cfg",
+    [
+        {"tensor_parallel_size": 2},
+        {"pipeline_parallel_size": 2, "async_engine": True},
+        {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 2,
+            "async_engine": True,
+        },
+    ],
+)
+def test_nvfp4_pertoken_validation_accepts_vllm_model_parallelism(vllm_cfg):
+    """Setup accepts TP and async PP values for vLLM to validate further."""
+    config = _make_nvfp4_pertoken_generation_config()
+    config["vllm_cfg"].update(vllm_cfg)
+    configure_generation_config(
+        config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+    )
+
+
+@pytest.mark.parametrize("architecture", ["LlamaForCausalLM", "Qwen3_8ForCausalLM"])
+def test_nvfp4_pertoken_rejects_dense_models(architecture):
+    from nemo_rl.models.generation.vllm.config import (
+        validate_nvfp4_pertoken_model,
+    )
+
+    hf_config = types.SimpleNamespace(architectures=[architecture])
+    with pytest.raises(ValueError, match="requires a model with routed experts"):
+        validate_nvfp4_pertoken_model(hf_config)
+
+
+@pytest.mark.parametrize(
+    ("architecture", "expert_field"),
+    [
+        ("Qwen3MoeForCausalLM", {"num_experts": 128}),
+        ("Qwen3_5MoeForConditionalGeneration", {"num_experts": 256}),
+        ("DeepseekV2ForCausalLM", {"n_routed_experts": 64}),
+    ],
+)
+def test_nvfp4_pertoken_accepts_generic_moe_layouts(architecture, expert_field):
+    from nemo_rl.models.generation.vllm.config import (
+        validate_nvfp4_pertoken_model,
+    )
+
+    hf_config = types.SimpleNamespace(architectures=[architecture], **expert_field)
+    validate_nvfp4_pertoken_model(hf_config)
+
+
+def test_nvfp4_policy_boundary_normalization_uses_megatron_as_source(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import config as vllm_config
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=48),
+    )
+    policy_config = {
+        "model_name": "dummy-moe",
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {
+            "first_last_layers_bf16": True,
+            "num_layers_at_start_in_bf16": 2,
+            "num_layers_at_end_in_bf16": 4,
+        },
+    }
+
+    vllm_config.normalize_nvfp4_pertoken_policy_config(policy_config)
+
+    assert policy_config["generation"]["nvfp4_pertoken_rollout"][
+        "additional_ignore"
+    ] == [
+        "*.layers.0.mlp.experts*",
+        "*.layers.1.mlp.experts*",
+        "*.layers.44.mlp.experts*",
+        "*.layers.45.mlp.experts*",
+        "*.layers.46.mlp.experts*",
+        "*.layers.47.mlp.experts*",
+    ]
+
+
+def test_nvfp4_policy_boundary_normalization_uses_mcore_count_defaults(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import config as vllm_config
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=48),
+    )
+    policy_config = {
+        "model_name": "dummy-moe",
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {"first_last_layers_bf16": True},
+    }
+
+    vllm_config.normalize_nvfp4_pertoken_policy_config(policy_config)
+
+    assert policy_config["generation"]["nvfp4_pertoken_rollout"][
+        "additional_ignore"
+    ] == [
+        "*.layers.0.mlp.experts*",
+        "*.layers.47.mlp.experts*",
+    ]
+
+
+def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_worker
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        DEFAULT_NVFP4_IGNORE,
+    )
+
+    module_name = "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken"
+    fake_vllm_module = types.ModuleType(module_name)
+    captured = {}
+
+    def configure(llm_kwargs, ignore, explicit_engine_kwargs):
+        captured["kwargs"] = llm_kwargs
+        captured["ignore"] = ignore
+        captured["explicit_engine_kwargs"] = explicit_engine_kwargs
+        llm_kwargs["quantization"] = "nvfp4_pertoken"
+
+    fake_vllm_module.configure_nvfp4_pertoken_engine_kwargs = configure
+    monkeypatch.setitem(sys.modules, module_name, fake_vllm_module)
+
+    llm_kwargs = {"hf_overrides": {"max_position_embeddings": 4096}}
+    layer_ignore = "*.layers.0.mlp.experts*"
+    vllm_worker._configure_nvfp4_pertoken_engine_kwargs(
+        {
+            "nvfp4_pertoken_rollout": {
+                "enabled": True,
+                "additional_ignore": [layer_ignore],
+            },
+            "vllm_kwargs": {"hf_overrides": {"max_position_embeddings": 4096}},
+        },
+        llm_kwargs,
+    )
+
+    assert captured == {
+        "kwargs": llm_kwargs,
+        "ignore": [*DEFAULT_NVFP4_IGNORE, layer_ignore],
+        "explicit_engine_kwargs": {"hf_overrides": {"max_position_embeddings": 4096}},
+    }
+    assert llm_kwargs["quantization"] == "nvfp4_pertoken"
+
+
+@pytest.mark.vllm
+def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults():
+    """Framework defaults must not look like explicit user conflicts."""
+    pytest.importorskip("vllm")
+    from vllm.model_executor.layers.quantization import get_quantization_config
+
+    from nemo_rl.models.generation.vllm import vllm_worker
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
+        DEFAULT_NVFP4_IGNORE,
+        NVFP4_PER_TOKEN_METHOD,
+        NvFp4PerTokenConfig,
+        build_nvfp4_pertoken_hf_quant_config,
+    )
+
+    llm_kwargs = {
+        "quantization": "fp8",
+        "load_format": "dummy",
+        "hf_overrides": {"max_position_embeddings": 4096},
+    }
+    vllm_worker._configure_nvfp4_pertoken_engine_kwargs(
+        {"nvfp4_pertoken_rollout": {"enabled": True}, "vllm_kwargs": {}},
+        llm_kwargs,
+    )
+
+    assert llm_kwargs["quantization"] == NVFP4_PER_TOKEN_METHOD
+    assert get_quantization_config(NVFP4_PER_TOKEN_METHOD) is NvFp4PerTokenConfig
+    assert llm_kwargs["load_format"] == "dummy"
+    assert llm_kwargs["kernel_config"]["enable_flashinfer_autotune"] is False
+    assert llm_kwargs["worker_extension_cls"].endswith(".NvFp4PerTokenWorkerExtension")
+    assert llm_kwargs["hf_overrides"]["quantization_config"] == (
+        build_nvfp4_pertoken_hf_quant_config(DEFAULT_NVFP4_IGNORE)
+    )
+    assert llm_kwargs["hf_overrides"]["max_position_embeddings"] == 4096
+
+
+@pytest.mark.vllm
+def test_main_worker_rejects_explicit_quantization_for_nvfp4_pertoken():
+    pytest.importorskip("vllm")
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    with pytest.raises(ValueError, match="quantization"):
+        vllm_worker._configure_nvfp4_pertoken_engine_kwargs(
+            {
+                "nvfp4_pertoken_rollout": {"enabled": True},
+                "vllm_kwargs": {"quantization": "fp8"},
+            },
+            {"quantization": "fp8", "load_format": "dummy"},
+        )
+
+
+@pytest.mark.parametrize(
+    "llm_kwargs",
+    [
+        {"worker_extension_cls": "pkg.CustomExtension"},
+        {"quantization": "fp8"},
+        {"load_format": "auto"},
+        {"hf_overrides": {"quantization_config": {}}},
+        {"kernel_config": {"enable_flashinfer_autotune": True}},
+    ],
+)
+@pytest.mark.vllm
+def test_nvfp4_pertoken_rejects_conflicting_engine_kwargs(llm_kwargs):
+    pytest.importorskip("vllm")
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
+        DEFAULT_NVFP4_IGNORE,
+        configure_nvfp4_pertoken_engine_kwargs,
+    )
+
+    with pytest.raises(ValueError, match="nvfp4_pertoken"):
+        configure_nvfp4_pertoken_engine_kwargs(llm_kwargs, ignore=DEFAULT_NVFP4_IGNORE)
+
+
+def test_main_worker_without_nvfp4_pertoken_keeps_engine_kwargs():
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    llm_kwargs = {
+        "quantization": "fp8",
+        "load_format": "auto",
+        "worker_extension_cls": (
+            "nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension"
+        ),
+    }
+    expected = dict(llm_kwargs)
+
+    vllm_worker._configure_nvfp4_pertoken_engine_kwargs({}, llm_kwargs)
+
+    assert llm_kwargs == expected
+
+
+def test_main_worker_rejects_custom_worker_extension():
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    with pytest.raises(ValueError, match="worker_extension_cls is not supported"):
+        vllm_worker._validate_worker_extension_cls(
+            {"worker_extension_cls": "pkg.CustomExtension"},
+            "pkg.NemoInternalExtension",
+        )
 
 
 def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refit():
@@ -2083,6 +2491,7 @@ def test_vllm_http_server(cluster, tokenizer):
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
 
         # Remove version-dependent fields that vLLM may or may not include
+        d.pop("ec_transfer_params", None)
         message = d["choices"][0]["message"]
         for key in ("reasoning", "reasoning_content"):
             message.pop(key, None)
