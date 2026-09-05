@@ -193,7 +193,7 @@ def pack_payload(
 
     Returns:
         sample_ids of the form {group_id}_g{i}, a jagged-packed TensorDict, and per-row
-        tags carrying weight_version plus any per-row violation counts.
+        tags carrying group identity, weight_version, and per-row violation counts.
     """
     lengths = train_batch["input_lengths"]
     n = int(lengths.shape[0])
@@ -212,6 +212,7 @@ def pack_payload(
         {
             "weight_version": weight_version,
             "prompt_idx": prompt_idx,
+            "group_id": group_id,
             **violations[i],
         }
         for i in range(n)

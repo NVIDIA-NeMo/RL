@@ -103,6 +103,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.algorithms.utils import grouping_ids_from_identifiers
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -171,6 +172,25 @@ def _train_fields_for_step(
         if (policy_logprobs_required or field != "prev_logprobs")
         and (reference_logprobs_required or field != "reference_policy_logprobs")
     )
+
+
+def _prompt_ids_from_group_tags(
+    meta: KVBatchMeta, fallback: torch.Tensor
+) -> torch.Tensor:
+    """Use explicit prompt-group metadata when the producer provides it."""
+    if not meta.tags:
+        return fallback
+
+    group_ids = [tag.get("group_id") for tag in meta.tags]
+    if not any(group_id is not None for group_id in group_ids):
+        return fallback
+    if len(group_ids) != len(meta.sample_ids) or not all(
+        isinstance(group_id, str) and group_id for group_id in group_ids
+    ):
+        raise ValueError(
+            "Prompt group metadata must provide one non-empty group_id for every sample"
+        )
+    return grouping_ids_from_identifiers(cast(list[str], group_ids), 1)
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -3246,6 +3266,8 @@ class SingleControllerActor:
         )
 
         prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        if not self._is_ppo:
+            prompt_ids = _prompt_ids_from_group_tags(meta, prompt_ids)
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
