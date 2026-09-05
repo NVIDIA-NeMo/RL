@@ -1379,9 +1379,7 @@ def setup_single_controller(
     if processor is not None:
         partition_fields.extend(
             field
-            for field in sorted(
-                PACKED_MULTIMODAL_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
-            )
+            for field in sorted(PACKED_MULTIMODAL_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS)
             if field not in partition_fields
         )
     dp_client.register_partition(

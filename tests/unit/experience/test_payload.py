@@ -267,7 +267,7 @@ def test_multimodal_packed_tensor_round_trips_through_tq_payload() -> None:
     )
     assert "pixel_values" in fields
     assert tags[0]["pixel_values__row_shapes"]["shapes"] == [[2, 4]]
-    assert "pixel_values__row_shapes" not in tags[1]
+    assert tags[1]["pixel_values__row_shapes"]["shapes"] == []
 
     restored = materialize(fields, tags=tags)
     restored_media = restored["pixel_values"]

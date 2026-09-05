@@ -1094,7 +1094,9 @@ def encode_multimodal_for_wire(
 
 
 # Model inputs some remote-code processors omit from ``model_input_names`` even
-# though their forward requires them. Keep extraction and TQ schema warmup aligned.
+# though their forward requires them. Consumed by
+# ``extract_multimodal_model_inputs``; membership here does NOT imply the field
+# is wire-registered (see ``PACKED_/PER_TOKEN_MULTIMODAL_FIELDS``).
 UNDECLARED_MULTIMODAL_MODEL_INPUTS = (
     "imgs_sizes",
     "num_frames",

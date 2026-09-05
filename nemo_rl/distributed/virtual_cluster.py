@@ -27,6 +27,8 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -318,8 +320,6 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     # Put Hugging Face's generated ``transformers_modules`` package on the
     # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
     # that boundary. This covers both V1 worker groups and direct V2/SC actors.
-    from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
-
     env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
 

@@ -208,9 +208,7 @@ def pack_payload(
         if isinstance(v, torch.Tensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
-    multimodal = BatchedDataDict[Any](train_batch).get_multimodal_dict(
-        as_tensors=False
-    )
+    multimodal = BatchedDataDict[Any](train_batch).get_multimodal_dict(as_tensors=False)
     for key, value in multimodal.items():
         wire_value = encode_multimodal_for_wire(key, value)
         if wire_value is not None:

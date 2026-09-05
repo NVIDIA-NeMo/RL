@@ -96,14 +96,17 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
         async def generate_async(self, data):
             captured["data"] = data
             input_len = int(data["input_lengths"][0])
-            yield 0, BatchedDataDict(
-                {
-                    "output_ids": torch.cat(
-                        (data["input_ids"], torch.tensor([[42]])), dim=1
-                    ),
-                    "unpadded_sequence_lengths": torch.tensor([input_len + 1]),
-                    "logprobs": torch.zeros(1, input_len + 1),
-                }
+            yield (
+                0,
+                BatchedDataDict(
+                    {
+                        "output_ids": torch.cat(
+                            (data["input_ids"], torch.tensor([[42]])), dim=1
+                        ),
+                        "unpadded_sequence_lengths": torch.tensor([input_len + 1]),
+                        "logprobs": torch.zeros(1, input_len + 1),
+                    }
+                ),
             )
 
     manager = object.__new__(AsyncRolloutImpl)

@@ -50,14 +50,9 @@ policy:
     bad_words: []
     mcore_generation_config:
       buffer_size_gb: 8
-      transformer_impl: inference_optimized
-      cuda_graph_impl: local
-      inference_cuda_graph_scope: block
-      num_cuda_graphs: -1
       use_cuda_graphs_for_non_decode_steps: false
       moe_pad_experts_for_cuda_graph_inference: false
       moe_router_dtype: fp32
-      expose_http_server: true
       vision_embedding_cache_max_bytes: 536870912
       video_num_frames: ${data.default.num_frames}
       video_temporal_patch_size: ${data.default.video_temporal_patch_size}

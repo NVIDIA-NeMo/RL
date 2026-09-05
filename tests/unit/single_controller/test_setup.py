@@ -1028,9 +1028,7 @@ class TestSetup:
         assert call_kwargs["env_configs"] == {"math": math_env_cfg}
         assert actor_args.env_handles is patched_factories["env_handles"]
 
-    def test_vlm_processor_used_for_data_and_environment_setup(
-        self, patched_factories
-    ):
+    def test_vlm_processor_used_for_data_and_environment_setup(self, patched_factories):
         mc = _make_master_config(env={"clevr-cogent": {"some": "value"}})
         tokenizer = MagicMock(pad_token_id=0)
         processor = MagicMock(tokenizer=tokenizer)
@@ -1040,11 +1038,11 @@ class TestSetup:
 
         call_args, call_kwargs = patched_factories["setup_response_data"].call_args
         assert call_args[0] is processor
-        assert call_kwargs["env_configs"] == {
-            "clevr-cogent": {"some": "value"}
-        }
+        assert call_kwargs["env_configs"] == {"clevr-cogent": {"some": "value"}}
         assert call_kwargs["is_vlm"] is True
-        warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs["fields"]
+        warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
+            "fields"
+        ]
         for field in (
             "pixel_values",
             "image_grid_thw",
