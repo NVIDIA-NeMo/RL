@@ -33,11 +33,16 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # Calibrated from W&B runs spg9333n and g412b200.
     uv run tests/check_metrics.py $JSON_METRICS \
+        'all_finite(data["train/loss"])' \
+        'all_finite(data["train/grad_norm"])' \
+        'all_finite(data["train/token_mult_prob_error"])' \
         'median(data["train/token_mult_prob_error"]) < 1.05' \
-        'mean(data["train/gen_kl_error"]) < 0.002' \
-        'data["train/reward"]["20"] > -0.45' \
-        'data["train/filtered_reward"]["20"] > -0.45'
+        'mean(data["train/gen_kl_error"]) < 0.001' \
+        'mean(data["train/reward"]) > 0.1' \
+        'mean(data["train/filtered_reward"]) > -0.15' \
+        'max(data["train/num_masked_seqs_by_logprob_error"]) == 0'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
