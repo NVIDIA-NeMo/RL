@@ -3,7 +3,7 @@ cases:
     config_path: resources_servers/math_with_judge/configs/math_with_judge.yaml
     data_path: resources_servers/math_with_judge/data/example.jsonl
     example_index: 0
-    example_sha256: 5e8d77674814a6b1fdcd0f2dbef0c8597cc109814763056070ff2eeb0c9d70ef
+    example_sha256: 5e8d77674814a6b1fdcd0f2dbef0c8597cc109814763056070ff2eeb0c9d70ef  # pragma: allowlist secret
     agent_ref:
       type: responses_api_agents
       name: math_with_judge_simple_agent
@@ -18,7 +18,7 @@ cases:
     config_path: resources_servers/code_gen/configs/code_gen.yaml
     data_path: resources_servers/code_gen/data/example.jsonl
     example_index: 4
-    example_sha256: ceea8ed47c6615783bc9df8140110b2aa86729438448ee04e74c5d4850ebff24
+    example_sha256: ceea8ed47c6615783bc9df8140110b2aa86729438448ee04e74c5d4850ebff24  # pragma: allowlist secret
     agent_ref:
       type: responses_api_agents
       name: code_gen_simple_agent
@@ -55,7 +55,7 @@ cases:
     config_path: resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
     data_path: resources_servers/single_step_tool_use_with_argument_comparison/data/example.jsonl
     example_index: 4
-    example_sha256: 2e24731dfeda02e16351dd5abd5c1e3fd8307554f4824cf4fb3630672c63f5ca
+    example_sha256: 2e24731dfeda02e16351dd5abd5c1e3fd8307554f4824cf4fb3630672c63f5ca  # pragma: allowlist secret
     agent_ref:
       type: responses_api_agents
       name: single_step_tool_use_with_argument_comparison_agent
