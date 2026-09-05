@@ -4,6 +4,7 @@ set -euo pipefail
 
 ACTION=${ACTION:-render}
 PARTITION=${PARTITION:-batch}
+SLURM_QOS=${SLURM_QOS:-}
 WALLTIME=${WALLTIME:-01:00:00}
 
 case "${ACTION}" in
@@ -75,9 +76,14 @@ SBATCH_ACTION=()
 if [[ "${ACTION}" == test-only ]]; then
   SBATCH_ACTION=(--test-only)
 fi
+SBATCH_QOS=()
+if [[ -n "${SLURM_QOS}" ]]; then
+  SBATCH_QOS=(--qos="${SLURM_QOS}")
+fi
 
 exec sbatch \
   "${SBATCH_ACTION[@]}" \
+  "${SBATCH_QOS[@]}" \
   --nodes=1 \
   --gres=gpu:4 \
   --exclusive \

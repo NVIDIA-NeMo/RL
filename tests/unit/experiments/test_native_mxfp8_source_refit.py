@@ -114,6 +114,7 @@ def test_ntrace_image_builder_pins_native_runtime_in_immutable_image() -> None:
     assert "SRUN_CANDIDATE=$(command -v srun" in builder
     assert 'SRUN=${SRUN:-$(readlink -f "${SRUN_CANDIDATE}"' in builder
     assert '--wrap="${SRUN} ' in builder
+    assert 'SBATCH_QOS=(--qos="${SLURM_QOS}")' in builder
     assert "BUILD_COMMAND_B64=" in builder
     assert "base64 -d | bash" in builder
 
