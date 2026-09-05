@@ -184,6 +184,8 @@ def test_launcher_can_omit_gres_on_exclusive_clusters() -> None:
     assert 'if [[ "${SLURM_GRES}" != none ]]' in launcher
     assert 'SBATCH_GRES_ARGS=(--gres="${SLURM_GRES}")' in launcher
     assert '"${SBATCH_GRES_ARGS[@]}"' in launcher
+    assert 'SLURM_JOB_NAME=${SLURM_JOB_NAME:-${SLURM_ACCOUNT}.${RUN_NAME}}' in launcher
+    assert '--job-name="${SLURM_JOB_NAME}"' in launcher
 
 
 def test_ray_tmpdir_is_resolved_before_ray_head_and_workers_start() -> None:

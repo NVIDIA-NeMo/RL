@@ -286,6 +286,7 @@ require_prefix "${DATASET_ROOT}" /lustre DATASET_ROOT
 
 CACHE_ARM="${PRECISION_MODE}-fp8param-${FP8_PARAM}"
 RUN_NAME="native-mxfp8-${MODEL}-${CACHE_ARM}-${RUN_GROUP}"
+SLURM_JOB_NAME=${SLURM_JOB_NAME:-${SLURM_ACCOUNT}.${RUN_NAME}}
 RUN_ROOT="${RESULT_ROOT}/${RUN_NAME}"
 if [[ "${ACTION}" == submit ]]; then
   mkdir -p "${RUN_ROOT}/logs"
@@ -431,7 +432,7 @@ SBATCH_ARGS=(
   --partition="${PARTITION}"
   --time="${WALLTIME}"
   --segment="${SEGMENT_SIZE}"
-  --job-name="${SLURM_ACCOUNT}.${RUN_NAME}"
+  --job-name="${SLURM_JOB_NAME}"
   --output="${RUN_ROOT}/slurm-%j.out"
   --export="ALL,SLURM_HELPER_PATH=${SLURM_HELPER_PATH}"
   --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","reason":"model_loading","description":"native MXFP8 source refit"}}'
