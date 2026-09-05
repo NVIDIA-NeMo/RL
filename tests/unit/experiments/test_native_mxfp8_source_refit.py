@@ -96,6 +96,16 @@ def test_launcher_can_trace_nano_fp8_param_true_and_bf16_control() -> None:
     assert "NTRACE_GRAPH_CAPTURE=iteration" in launcher
 
 
+def test_ntrace_image_builder_pins_native_runtime_in_immutable_image() -> None:
+    builder = (EXPERIMENT_DIR / "build_ntrace_image_oci_hsg.sh").read_text()
+
+    assert "NTRACE_BUILD_CUPTI_CPP=ON" in builder
+    assert "NTRACE_REQUIRE_CUXXFILT=1" in builder
+    assert "--target /opt/ntrace-runtime" in builder
+    assert "selected_backend_name()" in builder
+    assert "--container-save=${OUTPUT_IMAGE}" in builder
+
+
 def test_launcher_selects_qwen235_native_mxfp8_arm() -> None:
     launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
 
