@@ -1214,6 +1214,19 @@ def setup(
     # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
     if generation_config["backend"] == "megatron":
         async_grpo_config = grpo_config.async_grpo
+        if (
+            async_grpo_config is not None
+            and "recompute_kv_cache_after_weight_updates"
+            not in async_grpo_config.model_fields_set
+        ):
+            # The flag's default (true) is chosen for vLLM, where it also governs
+            # prefix-cache invalidation. Megatron generation expresses the same
+            # choice engine-side via kv_cache_management_mode, so when the user
+            # left the flag unset, follow the engine mode instead of erroring.
+            async_grpo_config.recompute_kv_cache_after_weight_updates = (
+                generation_config["mcore_generation_config"]["kv_cache_management_mode"]
+                == "recompute"
+            )
         recompute_kv_cache = bool(
             async_grpo_config is not None
             and async_grpo_config.recompute_kv_cache_after_weight_updates
