@@ -17,7 +17,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -51,6 +51,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
     _startup_pipeline_ready,
+    _training_sampling_params_from_generation_config,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -91,7 +92,10 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
-from nemo_rl.models.generation.interfaces import should_use_async_rollouts
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    should_use_async_rollouts,
+)
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
@@ -111,6 +115,19 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.weight_synchronizer.is_stale = True
     policy_generation.weight_synchronizer.sync_weights.return_value = {}
     return policy_generation
+
+
+def test_training_sampling_params_from_generation_config_normalizes_greedy() -> None:
+    generation_config = cast(
+        GenerationConfig,
+        {"top_k": 5, "top_p": 0.8, "temperature": 0.0},
+    )
+
+    params = _training_sampling_params_from_generation_config(generation_config)
+
+    assert params.temperature == 1.0
+    assert params.top_k is None
+    assert params.top_p == 1.0
 
 
 def test_save_async_replay_buffer_checkpoint(tmp_path):
@@ -205,7 +222,7 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     policy_generation.weight_synchronizer = None
     kv_scales = {"layer.0": 0.5}
 
-    refit_policy_generation(
+    metrics = refit_policy_generation(
         policy,
         policy_generation,
         colocated_inference=True,
@@ -217,6 +234,32 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
     )
+    assert metrics == {"generation_workers_updated": 1.0}
+
+
+@pytest.mark.parametrize("colocated_inference", [True, False])
+@pytest.mark.parametrize(
+    "acknowledgements",
+    [[], [False], [True, False], [True, None]],
+)
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_refit_policy_generation_requires_a_worker_acknowledgement(
+    mock_ray: MagicMock,
+    acknowledgements: list[bool | None],
+    colocated_inference: bool,
+) -> None:
+    mock_ray.get.side_effect = [None, acknowledgements]
+    policy = MagicMock()
+    policy_generation = MagicMock()
+    policy_generation.weight_synchronizer = None
+
+    with pytest.raises(RuntimeError, match="Updating weights.*failed"):
+        refit_policy_generation(
+            policy,
+            policy_generation,
+            colocated_inference=colocated_inference,
+            _refit_buffer_size_gb=1.0,
+        )
 
 
 class TestMaskSampleFilter:

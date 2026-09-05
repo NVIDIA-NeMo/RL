@@ -60,7 +60,7 @@ uv run tests/check_metrics.py "${JSON_METRICS}" \
     'data["train/total_reward/mean"]["1"] == 0.5' \
     'all_finite(data["train/token_mult_prob_error"])' \
     'max(data["train/token_mult_prob_error"]) < 1.05' \
-    'data["refit/post_update_success"]["1"] == 1' \
+    'data["refit/generation_workers_updated"]["1"] > 0' \
     'data["timing/train/generation"]["1"] > 0' \
     'data["validation/accuracy"]["1"] == 0.5' \
     'data["timing/validation/total_validation_time"]["1"] > 0'

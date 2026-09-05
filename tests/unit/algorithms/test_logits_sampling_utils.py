@@ -15,7 +15,24 @@
 import pytest
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
+)
+
+
+def test_greedy_sampling_uses_unscaled_unfiltered_training_logprobs() -> None:
+    params = TrainingSamplingParams(top_k=5, top_p=0.8, temperature=0.0)
+
+    assert params.temperature == 1.0
+    assert params.top_k is None
+    assert params.top_p == 1.0
+
+
+@pytest.mark.parametrize("temperature", [-1.0, float("nan"), float("inf")])
+def test_invalid_temperature_is_rejected(temperature: float) -> None:
+    with pytest.raises(ValueError, match="temperature must"):
+        TrainingSamplingParams(temperature=temperature)
 
 
 @pytest.mark.parametrize(

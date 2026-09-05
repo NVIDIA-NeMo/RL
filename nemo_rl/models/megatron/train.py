@@ -34,6 +34,7 @@ from megatron.core.utils import StragglerDetector, get_model_config
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
+    apply_temperature_scaling,
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
@@ -199,23 +200,6 @@ def model_forward(
         output_tensor = output_tensor[0]
 
     return output_tensor
-
-
-def apply_temperature_scaling(
-    logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
-) -> torch.Tensor:
-    """Apply temperature scaling to logits.
-
-    Args:
-        logits: Logits tensor to scale
-        sampling_params: Sampling parameters
-
-    Returns:
-        torch.Tensor: Temperature-scaled logits
-    """
-    if sampling_params is not None and sampling_params.temperature != 1.0:
-        logits.div_(sampling_params.temperature)
-    return logits
 
 
 def forward_with_post_processing_fn(

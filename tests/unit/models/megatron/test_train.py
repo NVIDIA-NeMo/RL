@@ -193,6 +193,19 @@ class TestApplyTemperatureScaling:
 
         assert torch.allclose(result, original)
 
+    def test_greedy_temperature_keeps_logits_finite_and_unscaled(self):
+        """Greedy generation logprobs come from the unscaled distribution."""
+        from nemo_rl.models.megatron.train import apply_temperature_scaling
+
+        logits = torch.randn(2, 10, 100)
+        original = logits.clone()
+        sampling_params = TrainingSamplingParams(temperature=0.0)
+
+        result = apply_temperature_scaling(logits, sampling_params)
+
+        assert torch.equal(result, original)
+        assert torch.isfinite(result).all()
+
     def test_temperature_scaling_with_temperature_two(self):
         """Test that logits are divided by the configured temperature=2.0."""
         from nemo_rl.models.megatron.train import apply_temperature_scaling

@@ -521,6 +521,17 @@ def shutdown_environments(
                     print(f"Error stopping environment {task_name}: {kill_error}")
 
 
+def _training_sampling_params_from_generation_config(
+    generation_config: GenerationConfig,
+) -> TrainingSamplingParams:
+    """Build the effective policy-logprob sampling configuration."""
+    return TrainingSamplingParams(
+        top_k=generation_config["top_k"],
+        top_p=generation_config["top_p"],
+        temperature=generation_config["temperature"],
+    )
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -770,10 +781,7 @@ def setup(
         # applied. This also keeps prev/reference logprobs (computed via the fused
         # get_logprobs path) consistent with the actor logprobs.
         assert not need_top_k_or_top_p_filtering(
-            TrainingSamplingParams(
-                top_k=generation_config["top_k"],
-                top_p=generation_config["top_p"],
-            )
+            _training_sampling_params_from_generation_config(generation_config)
         ), (
             "Linear CE fusion loss is not supported with top-k/top-p training-time "
             "filtering for GRPO. The fused path computes logprobs from unfiltered "
@@ -2532,7 +2540,8 @@ def refit_policy_generation(
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
 
     Returns:
-        Scalar metrics reported by the selected weight synchronizer.
+        Scalar metrics reported by the selected weight synchronizer, or the
+        number of generation worker groups that acknowledged a direct refit.
     """
     # Every SGLang deployment reaches its refit through this hook: `setup`
     # attaches an SGLang synchronizer that owns the whole lifecycle (phase
@@ -2562,7 +2571,7 @@ def refit_policy_generation(
     )
     with timer_context:
         # update weights
-        update_success = False
+        acknowledged_updates: list[bool] = []
         if colocated_inference:
             # get model param keys, which is grouped by size
             if _refit_buffer_size_gb is not None:
@@ -2587,7 +2596,7 @@ def refit_policy_generation(
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+            acknowledged_updates = [result is True for result in results]
         else:
             # update weights through nccl (vLLM)
             futures_train = policy.broadcast_weights_for_collective(
@@ -2597,10 +2606,10 @@ def refit_policy_generation(
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+            acknowledged_updates = [result is True for result in results]
 
         # check if update is successful
-        if not update_success:
+        if not acknowledged_updates or not all(acknowledged_updates):
             error_tag = "cuda-ipc" if colocated_inference else "nccl"
             error_message = (
                 "❌ Error: Updating weights for the generation policy failed during refit.\n"
@@ -2613,7 +2622,7 @@ def refit_policy_generation(
         policy.offload_after_refit()
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
-    return {}
+    return {"generation_workers_updated": float(len(acknowledged_updates))}
 
 
 def _initial_policy_generation_stale(
@@ -3638,7 +3647,6 @@ def grpo_train(
                             _refit_buffer_size_gb=refit_buffer_size_gb,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
-                        refit_metrics["post_update_success"] = 1.0
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
