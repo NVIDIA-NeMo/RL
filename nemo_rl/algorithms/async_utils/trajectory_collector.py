@@ -50,6 +50,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import (
+    GENERATION_WEIGHT_VERSION_KEY,
     NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -1475,6 +1476,11 @@ class AsyncTrajectoryCollector:
         """Push one prompt group to the replay buffer with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
         if isinstance(self.master_config, GRPOMasterConfig):
+            final_batch_cpu[GENERATION_WEIGHT_VERSION_KEY] = torch.full(
+                (final_batch_cpu.size,),
+                int(generation_weight_version),
+                dtype=torch.long,
+            )
             final_batch_cpu[TARGET_WEIGHT_VERSION_KEY] = torch.full(
                 (final_batch_cpu.size,),
                 int(target_weight_version),

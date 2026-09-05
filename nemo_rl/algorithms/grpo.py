@@ -90,6 +90,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
+    GENERATION_WEIGHT_VERSION_KEY,
     NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -2086,11 +2087,22 @@ def _async_sample_identity_fields(
         (NEMO_GYM_TASK_INDEX_KEY, "task_index"),
         (NEMO_GYM_ROLLOUT_INDEX_KEY, "rollout_index"),
         (NEMO_GYM_ATTEMPT_INDEX_KEY, "attempt_index"),
+        (GENERATION_WEIGHT_VERSION_KEY, "generation_weight_version"),
         (TARGET_WEIGHT_VERSION_KEY, "target_weight_version"),
     ):
         value = _batch_row_value(batch, source_key, row_index)
         if value is not None:
             identity_fields[output_key] = value
+
+    generation_version = identity_fields.get("generation_weight_version")
+    target_version = identity_fields.get("target_weight_version")
+    if (
+        isinstance(generation_version, (int, float))
+        and not isinstance(generation_version, bool)
+        and isinstance(target_version, (int, float))
+        and not isinstance(target_version, bool)
+    ):
+        identity_fields["trajectory_age"] = target_version - generation_version
 
     agent_ref = _batch_row_value(batch, "agent_ref", row_index)
     if isinstance(agent_ref, Mapping):
@@ -2779,6 +2791,61 @@ def compute_and_apply_seq_logprob_error_masking(
                 for row_index in (
                     torch.nonzero(diff_mask_bool, as_tuple=False).flatten().tolist()
                 ):
+                    row_loss_mask = mask[row_index].bool()
+                    row_lp_error = lp_error[row_index]
+                    worst_sliced_position = int(
+                        torch.where(
+                            row_loss_mask,
+                            row_lp_error,
+                            torch.full_like(row_lp_error, float("-inf")),
+                        )
+                        .argmax()
+                        .detach()
+                        .cpu()
+                        .item()
+                    )
+                    # Logprobs are sliced with [:, 1:] above. Restore the
+                    # position in the unsliced input_ids/logprob tensors.
+                    worst_token_position = worst_sliced_position + 1
+                    worst_token_fields: dict[str, Any] = {
+                        "loss_token_count": int(
+                            row_loss_mask.sum().detach().cpu().item()
+                        ),
+                        "max_abs_logprob_delta": float(
+                            row_lp_error[worst_sliced_position]
+                            .detach()
+                            .cpu()
+                            .item()
+                        ),
+                        "max_error_token_position": worst_token_position,
+                        "generation_logprob_at_max_error": float(
+                            generation_logprobs[
+                                row_index, worst_sliced_position
+                            ]
+                            .detach()
+                            .cpu()
+                            .item()
+                        ),
+                        "prev_logprob_at_max_error": float(
+                            prev_logprobs[row_index, worst_sliced_position]
+                            .detach()
+                            .cpu()
+                            .item()
+                        ),
+                    }
+                    input_ids = train_data.get("input_ids")
+                    if (
+                        isinstance(input_ids, torch.Tensor)
+                        and input_ids.ndim == 2
+                        and row_index < input_ids.shape[0]
+                        and worst_token_position < input_ids.shape[1]
+                    ):
+                        worst_token_fields["max_error_token_id"] = int(
+                            input_ids[row_index, worst_token_position]
+                            .detach()
+                            .cpu()
+                            .item()
+                        )
                     _emit_async_sample_event(
                         "sample_masked",
                         sample_metadata,
@@ -2794,6 +2861,7 @@ def compute_and_apply_seq_logprob_error_masking(
                         ),
                         threshold=seq_logprob_error_threshold,
                         reward=float(rewards.view(-1)[row_index].detach().cpu().item()),
+                        **worst_token_fields,
                     )
 
         # Compute after-mask metrics (only for sequences that passed the threshold)
