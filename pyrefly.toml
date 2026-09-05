@@ -266,6 +266,7 @@ project-includes = [
   "nemo_rl/utils/nvml.py",
   "nemo_rl/utils/packed_tensor.py",
   "nemo_rl/utils/prefetch_venvs.py",
+  "nemo_rl/utils/quantization_logging.py",
   "nemo_rl/utils/r3_trace.py",
   "nemo_rl/utils/routed_experts_codec.py",
   "nemo_rl/utils/timer.py",

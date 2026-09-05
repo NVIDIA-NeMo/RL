@@ -21,11 +21,15 @@ silently reverted (#2188), and re-fixed (#2904). These tests pin the merge
 behavior so it cannot regress a third time.
 """
 
+import json
+
 import pytest
 
 from nemo_rl.models.generation.vllm.vllm_worker import (
     _log_effective_quantization_ignore_patterns,
+    _log_fp8_quantization_ignore_report,
     _merge_fp8_kwargs,
+    _should_log_fp8_quantization_ignore,
 )
 
 
@@ -52,6 +56,73 @@ def test_does_not_log_ignore_patterns_when_unconfigured(capsys) -> None:
     _log_effective_quantization_ignore_patterns({}, {})
 
     assert capsys.readouterr().out == ""
+
+
+def test_should_log_fp8_quantization_ignore_requires_rank_zero(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_DUMP_FP8_QUANTIZATION_IGNORE", "true")
+    monkeypatch.setenv("RANK", "1")
+
+    assert _should_log_fp8_quantization_ignore() is False
+
+    monkeypatch.setenv("RANK", "0")
+
+    assert _should_log_fp8_quantization_ignore() is True
+
+
+def test_log_fp8_quantization_ignore_report_writes_file(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    dump_path = tmp_path / "nested" / "report.json"
+    monkeypatch.setenv("NRL_DUMP_FP8_QUANTIZATION_IGNORE_PATH", str(dump_path))
+    ignore_report = {"generated": {"ignore": ["lm_head"]}, "sources": {}}
+    vllm_kwargs = {
+        "hf_overrides": {
+            "quantization_config": {
+                "ignore": ["lm_head", "model.layers.*.mlp.gate"],
+                "ignored_layers": ["lm_head"],
+            }
+        }
+    }
+
+    _log_fp8_quantization_ignore_report(ignore_report, vllm_kwargs)
+
+    assert capsys.readouterr().out == (
+        f"NRL_FP8_QUANTIZATION_IGNORE_DUMP_FILE={dump_path}\n"
+    )
+    assert json.loads(dump_path.read_text(encoding="utf-8")) == {
+        "generated": {"ignore": ["lm_head"]},
+        "sources": {},
+        "passed_to_vllm": {
+            "ignore": ["lm_head", "model.layers.*.mlp.gate"],
+            "ignored_layers": ["lm_head"],
+        },
+    }
+
+
+def test_log_fp8_quantization_ignore_report_prints_json(monkeypatch, capsys) -> None:
+    monkeypatch.delenv("NRL_DUMP_FP8_QUANTIZATION_IGNORE_PATH", raising=False)
+    ignore_report = {"generated": {"ignored_layers": ["lm_head"]}, "sources": {}}
+    vllm_kwargs = {
+        "hf_overrides": {
+            "quantization_config": {
+                "ignore": ["lm_head"],
+                "ignored_layers": ["lm_head"],
+            }
+        }
+    }
+
+    _log_fp8_quantization_ignore_report(ignore_report, vllm_kwargs)
+
+    output = capsys.readouterr().out
+    assert output.startswith("NRL_FP8_QUANTIZATION_IGNORE_DUMP=")
+    assert json.loads(output.removeprefix("NRL_FP8_QUANTIZATION_IGNORE_DUMP=")) == {
+        "generated": {"ignored_layers": ["lm_head"]},
+        "sources": {},
+        "passed_to_vllm": {
+            "ignore": ["lm_head"],
+            "ignored_layers": ["lm_head"],
+        },
+    }
 
 
 def test_fp8_and_user_hf_overrides_coexist():

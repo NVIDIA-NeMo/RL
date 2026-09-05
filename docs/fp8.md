@@ -85,6 +85,20 @@ MXFP8 configurations should use `quantization_ignore_patterns` instead.
 (`precision: "fp8"` without `is_mx`) has no pattern-based replacement yet and
 must continue to use `quantization_ignored_layer_kws`.
 
+### FP8 quantization diagnostics
+
+Set `NRL_LOG_LAYER_QUANTIZATION` to `1`, `true`, `yes`, or `on`
+(case-insensitive) to log each Megatron/vLLM layer quantization decision from
+rank 0. Entries use the `[LayerQuantization]` prefix and report whether the
+matched layer ran quantized or stayed in BF16, plus the reason when available.
+
+Set `NRL_DUMP_FP8_QUANTIZATION_IGNORE` to one of the same truthy values to dump
+the FP8 ignore inputs and the merged values passed to vLLM. By default, rank 0
+prints one JSON line with the `NRL_FP8_QUANTIZATION_IGNORE_DUMP=` marker. Set
+`NRL_DUMP_FP8_QUANTIZATION_IGNORE_PATH=/path/to/report.json` to write that JSON
+payload to a file instead; stdout then prints
+`NRL_FP8_QUANTIZATION_IGNORE_DUMP_FILE=/path/to/report.json`.
+
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```

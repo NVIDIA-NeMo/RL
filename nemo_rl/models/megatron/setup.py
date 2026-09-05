@@ -15,12 +15,14 @@
 import copy
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
 import warnings
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
+from functools import wraps
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -72,6 +74,12 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.utils.quantization_logging import (
+    LAYER_QUANTIZATION_LOG_ENV,
+    is_truthy_env_var,
+)
+
+logger = logging.getLogger(__name__)
 
 _HF_CONFIG_PATCHED = False
 
@@ -127,6 +135,94 @@ def _patch_hf_config_double_instantiation():
 
     Qwen3OmniMoeTalkerConfig.__post_init__ = _safe_post_init
     _HF_CONFIG_PATCHED = True
+
+
+_MEGATRON_FP8_CONTEXT_LAYER_QUANTIZATION_PATCH_ATTR = (
+    "_nrl_layer_quantization_logging_patched"
+)
+
+
+def _patch_megatron_fp8_context_layer_quantization_logging() -> None:
+    """Log Megatron FP8/BF16 layer-context decisions without patching Megatron files."""
+    if not is_truthy_env_var(LAYER_QUANTIZATION_LOG_ENV):
+        return
+
+    try:
+        import megatron.core.fp8_utils as fp8_utils
+    except (AttributeError, ImportError) as error:
+        logger.warning(
+            "Could not patch Megatron FP8 layer-quantization logging: %s",
+            error,
+        )
+        return
+
+    if getattr(fp8_utils, _MEGATRON_FP8_CONTEXT_LAYER_QUANTIZATION_PATCH_ATTR, False):
+        return
+
+    try:
+        original_get_fp8_context = fp8_utils.get_fp8_context
+    except AttributeError:
+        logger.warning(
+            "Could not patch Megatron FP8 layer-quantization logging: "
+            "megatron.core.fp8_utils.get_fp8_context is missing."
+        )
+        return
+
+    logged_layers: set[int] = set()
+
+    @wraps(original_get_fp8_context)
+    def wrapped_get_fp8_context(config, layer_no: int = -1, is_init: bool = False):
+        need_fp8_context = (
+            getattr(config, "fp8_param", False)
+            if is_init
+            else getattr(config, "fp8", False)
+        )
+        is_first_last_bf16_layer = getattr(fp8_utils, "is_first_last_bf16_layer", None)
+        first_or_last_layer = bool(
+            is_first_last_bf16_layer is not None
+            and is_first_last_bf16_layer(config, layer_no)
+        )
+        keep_in_bf16 = not need_fp8_context or first_or_last_layer
+
+        if not is_init and layer_no >= 0 and layer_no not in logged_layers:
+            logged_layers.add(layer_no)
+            try:
+                log_from_rank = (
+                    not torch.distributed.is_available()
+                    or not torch.distributed.is_initialized()
+                    or torch.distributed.get_rank() == 0
+                )
+            except RuntimeError:
+                log_from_rank = True
+
+            if log_from_rank:
+                if keep_in_bf16:
+                    reason = (
+                        "fp8_disabled"
+                        if not need_fp8_context
+                        else "first_or_last_layer"
+                    )
+                    logger.info(
+                        "[LayerQuantization][Megatron] layer=%d "
+                        "scope=layer_context decision=BF16 reason=%s",
+                        layer_no,
+                        reason,
+                    )
+                else:
+                    recipe = getattr(config, "fp8_recipe", None)
+                    recipe = getattr(recipe, "value", recipe)
+                    logger.info(
+                        "[LayerQuantization][Megatron] layer=%d "
+                        "scope=layer_context decision=QUANTIZED recipe=%s",
+                        layer_no,
+                        str(recipe).upper(),
+                    )
+
+        return original_get_fp8_context(config, layer_no=layer_no, is_init=is_init)
+
+    fp8_utils.get_fp8_context = wrapped_get_fp8_context
+    setattr(fp8_utils, _MEGATRON_FP8_CONTEXT_LAYER_QUANTIZATION_PATCH_ATTR, True)
+    logger.info("Patched Megatron FP8 layer-quantization logging.")
 
 
 try:
@@ -1814,6 +1910,7 @@ def setup_model_and_optimizer(
 ):
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
+    _patch_megatron_fp8_context_layer_quantization_logging()
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 

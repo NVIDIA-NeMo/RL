@@ -33,6 +33,8 @@ The two port patches ship their own suites. These cover the remaining patches:
 import ast
 import logging
 import os
+import sys
+import types
 
 import pytest
 
@@ -275,3 +277,177 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
 
     assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
     assert ray_executor.read_text() == once
+
+
+def test_modelopt_layer_quantization_logging_patch(monkeypatch, caplog):
+    """The logging monkeypatch reports ModelOpt's effective layer decision."""
+    package_names = [
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.layers",
+        "vllm.model_executor.layers.fused_moe",
+        "vllm.model_executor.layers.quantization",
+    ]
+    for name in package_names:
+        module = types.ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+    routed_experts_module = types.ModuleType(
+        "vllm.model_executor.layers.fused_moe.routed_experts"
+    )
+    linear_module = types.ModuleType("vllm.model_executor.layers.linear")
+    embedding_module = types.ModuleType(
+        "vllm.model_executor.layers.vocab_parallel_embedding"
+    )
+    modelopt_module = types.ModuleType(
+        "vllm.model_executor.layers.quantization.modelopt"
+    )
+
+    class LinearBase:
+        pass
+
+    class ParallelLMHead:
+        pass
+
+    class RoutedExperts:
+        pass
+
+    class QuantizedMethod:
+        pass
+
+    class UnquantizedLinearMethod:
+        pass
+
+    class ModelOptQuantConfigBase:
+        def __init__(self, excluded_prefixes=()):
+            self.excluded_prefixes = set(excluded_prefixes)
+
+        def is_layer_excluded(self, prefix):
+            return prefix in self.excluded_prefixes
+
+        def get_quant_method(self, layer, prefix):
+            if self.is_layer_excluded(prefix):
+                return UnquantizedLinearMethod()
+            return QuantizedMethod()
+
+    routed_experts_module.RoutedExperts = RoutedExperts
+    linear_module.LinearBase = LinearBase
+    embedding_module.ParallelLMHead = ParallelLMHead
+    modelopt_module.ModelOptQuantConfigBase = ModelOptQuantConfigBase
+
+    monkeypatch.setitem(
+        sys.modules, routed_experts_module.__name__, routed_experts_module
+    )
+    monkeypatch.setitem(sys.modules, linear_module.__name__, linear_module)
+    monkeypatch.setitem(sys.modules, embedding_module.__name__, embedding_module)
+    monkeypatch.setitem(sys.modules, modelopt_module.__name__, modelopt_module)
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.layers.quantization"],
+        "modelopt",
+        modelopt_module,
+        raising=False,
+    )
+    monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "1")
+
+    logger = logging.getLogger("test_modelopt_layer_quantization_logging_patch")
+    patches._patch_vllm_modelopt_layer_quantization_logging(logger)
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        ModelOptQuantConfigBase().get_quant_method(LinearBase(), "layers.0.mlp")
+        ModelOptQuantConfigBase({"lm_head"}).get_quant_method(
+            ParallelLMHead(), "lm_head"
+        )
+
+    assert (
+        "[LayerQuantization][vLLM] prefix=layers.0.mlp module=LinearBase "
+        "decision=QUANTIZED method=QuantizedMethod"
+    ) in caplog.text
+    assert (
+        "[LayerQuantization][vLLM] prefix=lm_head module=ParallelLMHead "
+        "decision=BF16 reason=excluded"
+    ) in caplog.text
+
+
+def test_modelopt_layer_quantization_logging_patches_mixed_precision_override(
+    monkeypatch, caplog
+):
+    """Mixed-precision subclasses with their own method must be patched too."""
+    package_names = [
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.layers",
+        "vllm.model_executor.layers.fused_moe",
+        "vllm.model_executor.layers.quantization",
+    ]
+    for name in package_names:
+        module = types.ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+    routed_experts_module = types.ModuleType(
+        "vllm.model_executor.layers.fused_moe.routed_experts"
+    )
+    linear_module = types.ModuleType("vllm.model_executor.layers.linear")
+    embedding_module = types.ModuleType(
+        "vllm.model_executor.layers.vocab_parallel_embedding"
+    )
+    modelopt_module = types.ModuleType(
+        "vllm.model_executor.layers.quantization.modelopt"
+    )
+
+    class LinearBase:
+        pass
+
+    class ParallelLMHead:
+        pass
+
+    class RoutedExperts:
+        pass
+
+    class BaseQuantizedMethod:
+        pass
+
+    class MixedPrecisionMethod:
+        pass
+
+    class ModelOptQuantConfigBase:
+        def get_quant_method(self, layer, prefix):
+            return BaseQuantizedMethod()
+
+    class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
+        def get_quant_method(self, layer, prefix):
+            return MixedPrecisionMethod()
+
+    routed_experts_module.RoutedExperts = RoutedExperts
+    linear_module.LinearBase = LinearBase
+    embedding_module.ParallelLMHead = ParallelLMHead
+    modelopt_module.ModelOptQuantConfigBase = ModelOptQuantConfigBase
+    modelopt_module.ModelOptMixedPrecisionConfig = ModelOptMixedPrecisionConfig
+
+    monkeypatch.setitem(
+        sys.modules, routed_experts_module.__name__, routed_experts_module
+    )
+    monkeypatch.setitem(sys.modules, linear_module.__name__, linear_module)
+    monkeypatch.setitem(sys.modules, embedding_module.__name__, embedding_module)
+    monkeypatch.setitem(sys.modules, modelopt_module.__name__, modelopt_module)
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.layers.quantization"],
+        "modelopt",
+        modelopt_module,
+        raising=False,
+    )
+    monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "on")
+
+    logger = logging.getLogger(
+        "test_modelopt_layer_quantization_logging_patches_mixed_precision_override"
+    )
+    patches._patch_vllm_modelopt_layer_quantization_logging(logger)
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        ModelOptMixedPrecisionConfig().get_quant_method(LinearBase(), "layers.0.mlp")
+
+    assert (
+        "[LayerQuantization][vLLM] prefix=layers.0.mlp module=LinearBase "
+        "decision=QUANTIZED method=MixedPrecisionMethod"
+    ) in caplog.text

@@ -25,10 +25,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 @pytest.fixture()
-def fp8_module():
+def fp8_module(monkeypatch):
     pytest.importorskip("vllm")
 
     from nemo_rl.models.generation.vllm.quantization import fp8
+
+    monkeypatch.delenv("NRL_DUMP_FP8_QUANTIZATION_IGNORE", raising=False)
+    monkeypatch.delenv("RANK", raising=False)
 
     old_config = fp8.global_fp8_config
     old_state = fp8.fp8_state
@@ -62,7 +65,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
 
-    vllm_kwargs = fp8.init_fp8(
+    vllm_kwargs, ignore_report = fp8.init_fp8(
         {
             "precision": "fp8",
             "kv_cache_dtype": "auto",
@@ -74,6 +77,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
         model_parallel_size=1,
     )
 
+    assert ignore_report is None
     assert vllm_kwargs == {
         "quantization": "fp8",
         "kv_cache_dtype": "auto",
@@ -112,7 +116,7 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
     )
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
-    vllm_kwargs = fp8.init_fp8(
+    vllm_kwargs, ignore_report = fp8.init_fp8(
         {
             "precision": "fp8",
             "kv_cache_dtype": "auto",
@@ -128,6 +132,7 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
         model_parallel_size=1,
     )
 
+    assert ignore_report is None
     quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
     assert quant_config["ignore"] == [
         "model.layers.*.self_attn.*",
@@ -151,6 +156,62 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
     }
     assert mxfp8_families == {"model.layers.0.mlp.experts"}
     assert not modelopt_config.is_layer_excluded("model.layers.0.mlp.gate_up_proj")
+
+
+def test_init_fp8_returns_ignore_report_for_modelopt_patterns(fp8_module, monkeypatch):
+    fp8 = fp8_module
+
+    class FakeModel:
+        def named_parameters(self):
+            return [
+                ("lm_head.weight", object()),
+                ("layers.0.mlp.gate.weight", object()),
+                ("layers.0.mlp.experts.0.gate_proj.weight", object()),
+            ]
+
+    monkeypatch.setenv("NRL_DUMP_FP8_QUANTIZATION_IGNORE", "yes")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8.AutoModel, "from_config", lambda *_args: FakeModel())
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs, ignore_report = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "quantization_ignore_patterns": [
+                "lm_head",
+                "model.layers.*.mlp.gate",
+            ],
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    assert ignore_report is not None
+    assert ignore_report["sources"]["quantization_ignore_patterns"] == {
+        "patterns": ["lm_head", "model.layers.*.mlp.gate"],
+        "matches": {
+            "lm_head": ["model.lm_head"],
+            "model.layers.*.mlp.gate": ["model.layers.0.mlp.gate"],
+        },
+        "match_error": None,
+    }
+    assert ignore_report["generated"]["ignored_layers"] == ["lm_head"]
+    assert ignore_report["generated"]["ignore"] == [
+        "lm_head",
+        "model.layers.*.mlp.gate",
+    ]
+    assert (
+        vllm_kwargs["hf_overrides"]["quantization_config"]["ignore"]
+        == ignore_report["generated"]["ignore"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -190,7 +251,7 @@ def test_init_fp8_does_not_add_draft_model_patterns_to_target_config(
     )
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
-    vllm_kwargs = fp8.init_fp8(
+    vllm_kwargs, _ = fp8.init_fp8(
         {
             "precision": "fp8",
             "kv_cache_dtype": "auto",
@@ -243,7 +304,7 @@ def test_init_fp8_deduplicates_explicit_ignore_pattern(fp8_module, monkeypatch):
     )
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
-    vllm_kwargs = fp8.init_fp8(
+    vllm_kwargs, _ = fp8.init_fp8(
         {
             "precision": "fp8",
             "kv_cache_dtype": "auto",
@@ -338,7 +399,7 @@ def test_init_fp8_excludes_lm_head_from_regular_fp8(fp8_module, monkeypatch):
     )
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
-    vllm_kwargs = fp8.init_fp8(
+    vllm_kwargs, _ = fp8.init_fp8(
         {
             "precision": "fp8",
             "kv_cache_dtype": "auto",
@@ -433,7 +494,7 @@ def test_init_fp8_combines_legacy_and_modelopt_ignore_patterns(fp8_module, monke
         DeprecationWarning,
         match="quantization_ignored_layer_kws.*quantization_ignore_patterns",
     ):
-        vllm_kwargs = fp8.init_fp8(
+        vllm_kwargs, _ = fp8.init_fp8(
             {
                 "precision": "fp8",
                 "kv_cache_dtype": "auto",
