@@ -1042,6 +1042,33 @@ def test_pad_and_align_uses_resolved_dtype():
     )
 
 
+def test_pad_and_align_accepts_vllm_uint16_routed_experts(monkeypatch):
+    monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
+
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.tensor(
+        [[[0, 1]], [[126, 127]]], dtype=torch.uint16
+    )
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=3,
+        padded_length=3,
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.int16,
+    )
+
+    assert routed_experts.dtype == torch.int16
+    assert torch.equal(
+        routed_experts[:2], completion_output.routed_experts.to(torch.int16)
+    )
+
+
 def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
     monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
 

@@ -27,6 +27,7 @@ import torch
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data.routed_experts import offload_routed_experts_inplace
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -49,10 +50,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self,
         max_size: int,
         drop_incomplete_targets_on_restore: bool,
+        require_routed_experts: bool = False,
     ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
+        self._require_routed_experts = require_routed_experts
         # True discards partial restored rows. The dataloader is not rewound,
         # so replacement rollouts come from subsequent prompts.
         self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
@@ -101,6 +104,24 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 return "full"
 
             print("🔍 ReplayBuffer.add: Adding trajectory")
+            # R3 route ids dominate the async replay payload (hundreds of GiB
+            # at production GBS).  Keep their bytes in Ray's object store so
+            # sampling transfers only references to the driver.  Policy
+            # workers resolve those references after DP sharding and
+            # microbatch slicing.
+            offloaded_bytes = offload_routed_experts_inplace(trajectory)
+            if self._require_routed_experts and offloaded_bytes == 0:
+                raise RuntimeError(
+                    "policy.router_replay.enabled=true requires routed_experts in "
+                    "every async replay group, but no route tensor was found at "
+                    "the replay boundary"
+                )
+            if offloaded_bytes:
+                print(
+                    "   R3: offloaded "
+                    f"{offloaded_bytes / 1024**3:.2f} GiB of routed experts "
+                    "from the replay actor heap"
+                )
             self.trajectories.append(trajectory)
             self.trajectory_versions.append(weight_version)
             self.target_weight_versions.append(target_weight_version)

@@ -160,7 +160,10 @@ def _as_routed_experts_tensor(
     global G_ROUTED_EXPERTS_RANGE_CHECKED
     tensor = torch.as_tensor(value, device=device)
     if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
-        max_id = int(tensor.max())
+        # vLLM's routed-experts capturer currently returns uint16. PyTorch does
+        # not implement the max reduction for uint16, so promote only for this
+        # one-time overflow guard before narrowing to the signed carry dtype.
+        max_id = int(tensor.to(dtype=torch.int64).max())
         limit = torch.iinfo(dtype).max
         if max_id > limit:
             raise ValueError(
