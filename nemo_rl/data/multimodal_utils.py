@@ -43,6 +43,10 @@ MULTIMODAL_CONTENT_TYPES = frozenset(
 )
 NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
 
+# Explicit provenance for media tensors rebuilt to match the rollout token
+# stream. The driver-side static reattach must preserve these tensors.
+ROLLOUT_MATCHED_MEDIA_KEY = "_rollout_matched_media"
+
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
 MEDIA_TAGS = {
@@ -101,6 +105,32 @@ def uses_image_placeholder(processor: Any) -> bool:
         rather than tokenized ``apply_chat_template``.
     """
     return type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
+
+
+_FIXED_TILE_IMAGE_PROCESSOR_NAMES = frozenset({"NemotronNanoVLV2Processor"})
+
+
+def uses_fixed_tile_image_processor(processor: Any) -> bool:
+    """Return whether image tiles use the legacy fixed-tile metadata contract."""
+    return type(processor).__name__ in _FIXED_TILE_IMAGE_PROCESSOR_NAMES
+
+
+def image_size_from_source(source: "str | Image.Image") -> tuple[int, int]:
+    """Return an image source's ``(width, height)`` without retaining pixels."""
+    if isinstance(source, Image.Image):
+        return source.width, source.height
+    if isinstance(source, str) and source.startswith("data:"):
+        _, encoded = source.split(",", 1)
+        with Image.open(BytesIO(base64.b64decode(encoded))) as image:
+            return image.width, image.height
+    if isinstance(source, str) and source.startswith("file://"):
+        with Image.open(source.removeprefix("file://")) as image:
+            return image.width, image.height
+    if isinstance(source, str) and not source.startswith(("http://", "https://")):
+        with Image.open(source) as image:
+            return image.width, image.height
+    image = resolve_to_image(source)
+    return image.width, image.height
 
 
 class PackedTensor:
@@ -1009,173 +1039,16 @@ def _restore_tensors(processed: dict[str, Any]) -> None:
                 continue
 
 
-_MEDIA_PLACEHOLDER_TOKEN_ID_KEY = "_media_placeholder_token_id"
-_MEDIA_PLACEHOLDER_RUN_LENGTHS_KEY = "_media_placeholder_run_lengths"
-_MEDIA_PLACEHOLDER_REQUIRE_EXACT_MATCH_KEY = (
-    "_media_placeholder_require_exact_match"
-)
-
-
-def _media_placeholder_run_lengths(
-    token_ids: torch.Tensor, media_token_id: int
-) -> list[int]:
-    """Return contiguous media-token run lengths in encounter order."""
-    if token_ids.ndim == 2:
-        if token_ids.shape[0] != 1:
-            raise ValueError(
-                "Media placeholder metadata expects one token row, got "
-                f"{tuple(token_ids.shape)}."
-            )
-        token_ids = token_ids[0]
-    if token_ids.ndim != 1:
+def _image_num_tokens_from_processed(processed: dict[str, Any]) -> list[int]:
+    value = processed.get("num_tokens")
+    if value is None:
         raise ValueError(
-            "Media placeholder metadata expects one-dimensional token ids, got "
-            f"{tuple(token_ids.shape)}."
+            "Processor output has no per-image 'num_tokens'; cannot verify "
+            "image parity with the rollout tokens."
         )
-
-    is_media = token_ids == media_token_id
-    run_lengths: list[int] = []
-    cursor = 0
-    while cursor < len(token_ids):
-        if not bool(is_media[cursor]):
-            cursor += 1
-            continue
-        run_end = cursor + 1
-        while run_end < len(token_ids) and bool(is_media[run_end]):
-            run_end += 1
-        run_lengths.append(run_end - cursor)
-        cursor = run_end
-    return run_lengths
-
-
-def _processor_media_token_counts(processed: dict[str, Any]) -> list[int]:
-    """Read authoritative per-image placeholder counts from processor output."""
-    counts = processed.get("num_tokens")
-    if isinstance(counts, torch.Tensor):
-        counts = counts.detach().cpu().reshape(-1).tolist()
-    if not isinstance(counts, (list, tuple)):
-        return []
-
-    result: list[int] = []
-    for count in counts:
-        if isinstance(count, torch.Tensor):
-            if count.numel() != 1:
-                return []
-            count = count.item()
-        try:
-            value = int(count)
-        except (TypeError, ValueError):
-            return []
-        if value <= 0:
-            return []
-        result.append(value)
-    return result
-
-
-def attach_media_placeholder_metadata(
-    message: dict[str, Any], processor: Any, processed: dict[str, Any]
-) -> None:
-    """Record processor-owned media run lengths for post-Gym reconciliation."""
-    image_token = getattr(processor, "image_token", "<image>")
-    media_token_id = getattr(processor, "image_token_id", None)
-    if media_token_id is None:
-        tokenizer = getattr(processor, "tokenizer", None)
-        convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
-        if callable(convert_tokens_to_ids):
-            media_token_id = convert_tokens_to_ids(image_token)
-    if not isinstance(media_token_id, int):
-        return
-
-    reference_lengths = _processor_media_token_counts(processed)
-    reference_input_ids = processed.get("input_ids")
-    if not reference_lengths and isinstance(reference_input_ids, torch.Tensor):
-        reference_lengths = _media_placeholder_run_lengths(
-            reference_input_ids, media_token_id
-        )
-    if reference_lengths:
-        message[_MEDIA_PLACEHOLDER_TOKEN_ID_KEY] = media_token_id
-        message[_MEDIA_PLACEHOLDER_RUN_LENGTHS_KEY] = reference_lengths
-
-
-def require_exact_media_placeholder_match(message: dict[str, Any]) -> None:
-    """Reject rollout media runs that differ from processor-owned lengths.
-
-    This is appropriate when the media tensor itself is produced by another
-    engine. Resizing the other engine's placeholder run after generation would
-    make the tensor shape valid while leaving generation and training logprobs
-    conditioned on different visual features.
-    """
-    message[_MEDIA_PLACEHOLDER_REQUIRE_EXACT_MATCH_KEY] = True
-
-
-def reconcile_message_media_placeholder_runs(message: dict[str, Any]) -> None:
-    """Match vLLM media runs to the checkpoint processor's feature counts."""
-    media_token_id = message.get(_MEDIA_PLACEHOLDER_TOKEN_ID_KEY)
-    reference_lengths = message.get(_MEDIA_PLACEHOLDER_RUN_LENGTHS_KEY)
-    token_ids = message.get("token_ids")
-    if (
-        not isinstance(media_token_id, int)
-        or not isinstance(reference_lengths, (list, tuple))
-        or not isinstance(token_ids, torch.Tensor)
-    ):
-        return
-
-    target_lengths = _media_placeholder_run_lengths(token_ids, media_token_id)
-    if not target_lengths:
-        return
-    expected_lengths = [int(length) for length in reference_lengths]
-    if len(target_lengths) != len(expected_lengths):
-        raise ValueError(
-            "Gym/checkpoint media-region mismatch: Gym returned "
-            f"{len(target_lengths)} placeholder runs, but the checkpoint processor "
-            f"created {len(expected_lengths)} media regions."
-        )
-    if target_lengths == expected_lengths:
-        return
-
-    if message.get(_MEDIA_PLACEHOLDER_REQUIRE_EXACT_MATCH_KEY) is True:
-        raise ValueError(
-            "Rollout/checkpoint media placeholder mismatch: rollout returned "
-            f"run lengths {target_lengths}, but the checkpoint processor created "
-            f"{expected_lengths}. Fix the rollout engine's media preprocessing "
-            "configuration; post-generation resizing would invalidate logprobs."
-        )
-
-    for key in ("routed_experts", "token_type_ids", "mm_token_type_ids"):
-        value = message.get(key)
-        if isinstance(value, torch.Tensor) and value.shape[0] == token_ids.shape[0]:
-            raise ValueError(
-                "Cannot resize media placeholder runs while sequence-aligned "
-                f"{key!r} is attached."
-            )
-
-    is_media = token_ids == media_token_id
-    pieces: list[torch.Tensor] = []
-    cursor = 0
-    run_index = 0
-    while cursor < len(token_ids):
-        if not bool(is_media[cursor]):
-            next_media = cursor + 1
-            while next_media < len(token_ids) and not bool(is_media[next_media]):
-                next_media += 1
-            pieces.append(token_ids[cursor:next_media])
-            cursor = next_media
-            continue
-        run_end = cursor + 1
-        while run_end < len(token_ids) and bool(is_media[run_end]):
-            run_end += 1
-        pieces.append(
-            torch.full(
-                (expected_lengths[run_index],),
-                media_token_id,
-                dtype=token_ids.dtype,
-                device=token_ids.device,
-            )
-        )
-        run_index += 1
-        cursor = run_end
-
-    message["token_ids"] = torch.cat(pieces) if pieces else token_ids.new_empty(0)
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.tolist()]
+    return [int(item) for item in value]
 
 
 def attach_image_model_inputs_to_message(
@@ -1184,11 +1057,27 @@ def attach_image_model_inputs_to_message(
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
-    max_num_tiles: int | None = None,
+    expected_num_tokens_per_image: "Sequence[int] | None" = None,
 ) -> None:
-    """Attach processor-owned image tensors without replacing rollout tokens."""
+    """Attach processor-owned image tensors without replacing rollout tokens.
+
+    When ``expected_num_tokens_per_image`` is given (per-image placeholder run
+    lengths read off the rollout's token ids), the processor output is verified
+    against it and mismatching turns are re-processed at the rollout's exact
+    per-image budgets, so the training-side projected feature count always
+    matches the rollout placeholders. Raises ValueError when parity cannot be
+    established, rather than attaching misaligned media.
+    """
     if not images or processor is None:
         return
+    if expected_num_tokens_per_image is not None and len(
+        expected_num_tokens_per_image
+    ) != len(images):
+        raise ValueError(
+            f"Got {len(images)} images but {len(expected_num_tokens_per_image)} "
+            "rollout placeholder runs for this turn. Refusing to train on "
+            "misaligned media."
+        )
 
     image_token = getattr(processor, "image_token", "<image>")
     # Processors that emit dynamic per-image resolutions return a ragged CHW list
@@ -1196,53 +1085,32 @@ def attach_image_model_inputs_to_message(
     # would make it stack those and fail before the exact imgs_sizes are read off
     # them. Off by default, so every other caller keeps the stacked path.
     allow_ragged_output = pad_dynamic_image_shapes and len(images) > 1
-    image_processor = getattr(processor, "image_processor", None)
-    restore_attr: str | None = None
-    original_budget: int | None = None
-    if max_num_tiles is not None:
-        if max_num_tiles < 1:
-            raise ValueError("max_num_tiles must be at least 1.")
-        if image_processor is not None and hasattr(image_processor, "max_num_tiles"):
-            restore_attr = "max_num_tiles"
-            original_budget = image_processor.max_num_tiles
-            image_processor.max_num_tiles = max_num_tiles
-        elif image_processor is not None and all(
-            hasattr(image_processor, name)
-            for name in ("min_num_patches", "max_num_patches")
-        ):
-            min_num_patches = image_processor.min_num_patches
-            if (
-                not isinstance(min_num_patches, int)
-                or isinstance(min_num_patches, bool)
-                or min_num_patches < 1
-            ):
-                raise ValueError(
-                    "The configured dynamic image processor has an invalid "
-                    "min_num_patches value."
-                )
-            restore_attr = "max_num_patches"
-            original_budget = image_processor.max_num_patches
-            image_processor.max_num_patches = min_num_patches * max_num_tiles
-        else:
-            raise ValueError(
-                "The configured image processor supports neither max_num_tiles "
-                "nor a dynamic min_num_patches/max_num_patches budget."
-            )
-    try:
-        processed = processor(
-            text=image_token * len(images),
-            images=images,
-            return_tensors=None if allow_ragged_output else "pt",
-        )
-    finally:
-        if restore_attr is not None:
-            setattr(image_processor, restore_attr, original_budget)
+    processed = processor(
+        text=image_token * len(images),
+        images=images,
+        return_tensors=None if allow_ragged_output else "pt",
+    )
     processed = dict(processed)
+    if expected_num_tokens_per_image is not None:
+        expected = [int(count) for count in expected_num_tokens_per_image]
+        if _image_num_tokens_from_processed(processed) != expected:
+            # Local import: the exact-count repair is Nemotron-processor
+            # specific and lives with the other Nemotron helpers.
+            from nemo_rl.environments.nemotron_utils import (
+                reprocess_images_at_rollout_budgets,
+            )
+
+            processed = reprocess_images_at_rollout_budgets(processor, images, expected)
+            # Corrected tiles may be ragged even when the originals were not.
+            allow_ragged_output = len(images) > 1
+            # Explicit provenance for the driver-side static reattach: only a
+            # REPAIRED turn carries media that differs from the statically
+            # budgeted prompt copy and must not be overwritten. Unrepaired
+            # turns keep no marker, so the reattach still restores the shared
+            # tensor set across a prompt group's repeated rows.
+            message[ROLLOUT_MATCHED_MEDIA_KEY] = True
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
-
-    attach_media_placeholder_metadata(message, processor, processed)
-
     model_inputs = extract_multimodal_model_inputs(processor, processed)
     message.update(
         {
@@ -1251,7 +1119,6 @@ def attach_image_model_inputs_to_message(
             if isinstance(value, PackedTensor)
         }
     )
-    reconcile_message_media_placeholder_runs(message)
 
 
 def nemo_gym_image_max_num_tiles(example: Any) -> int | None:

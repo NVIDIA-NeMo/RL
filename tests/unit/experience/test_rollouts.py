@@ -32,11 +32,9 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
+    ROLLOUT_MATCHED_MEDIA_KEY,
     attach_image_model_inputs_to_message,
-    attach_media_placeholder_metadata,
     image_to_data_url,
-    reconcile_message_media_placeholder_runs,
-    require_exact_media_placeholder_match,
 )
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -211,118 +209,63 @@ def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
     assert "input_ids" not in message
 
 
-def test_attach_image_model_inputs_caps_tiles_and_reconciles_placeholders():
+def test_attach_image_model_inputs_repairs_media_not_rollout_tokens(monkeypatch):
+    """A tiling mismatch must rebuild media and leave the trajectory intact."""
+
     class _ImageProcessor:
-        model_input_names = ["pixel_values"]
-        min_num_patches = 1024
-        max_num_patches = 13312
+        model_input_names = ["pixel_values", "imgs_sizes"]
 
     class _Tokenizer:
         model_input_names = ["input_ids"]
 
-        @staticmethod
-        def convert_tokens_to_ids(token):
-            assert token == "<image>"
-            return 99
-
     class _Processor:
         image_token = "<image>"
-        image_token_id = 99
         image_processor = _ImageProcessor()
         tokenizer = _Tokenizer()
-        model_input_names = ["input_ids", "pixel_values"]
+        model_input_names = ["input_ids", "pixel_values", "imgs_sizes"]
 
         def __call__(self, *, text, images, return_tensors):
-            assert self.image_processor.max_num_patches == 1024
             return {
-                "input_ids": torch.tensor([[10, 99, 99, 11]]),
-                "num_tokens": [2],
+                "input_ids": torch.tensor([[1, 2]]),
+                "num_tokens": [3],
                 "pixel_values": torch.ones(1, 3, 2, 2),
+                "imgs_sizes": torch.tensor([[2, 2]]),
             }
 
-    message = {"token_ids": torch.tensor([1, 99, 2])}
+    repaired = {
+        "input_ids": torch.tensor([[1, 2]]),
+        "num_tokens": [2],
+        "num_patches": [1],
+        "pixel_values": torch.full((1, 3, 2, 2), 9.0),
+        "imgs_sizes": torch.tensor([[2, 2]]),
+    }
+    repair_calls = []
+
+    def fake_reprocess(processor, images, expected):
+        repair_calls.append((processor, images, expected))
+        return repaired
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemotron_utils.reprocess_images_at_rollout_budgets",
+        fake_reprocess,
+    )
+    rollout_tokens = torch.tensor([7, 8, 9])
+    message = {"role": "user", "content": "", "token_ids": rollout_tokens}
     processor = _Processor()
+
     attach_image_model_inputs_to_message(
         message,
         images=[Image.new("RGB", (2, 2))],
         processor=processor,
-        max_num_tiles=1,
+        expected_num_tokens_per_image=[2],
     )
 
-    torch.testing.assert_close(message["token_ids"], torch.tensor([1, 99, 99, 2]))
-    assert processor.image_processor.max_num_patches == 13312
-
-
-def test_video_placeholder_metadata_reconciles_vllm_run_to_policy_features():
-    class _Processor:
-        image_token = "<image>"
-        image_token_id = 99
-
-    message = {"token_ids": torch.tensor([1, 99, 99, 99, 99, 2])}
-    policy_processed = {
-        "input_ids": torch.tensor([[10, 99, 99, 99, 11]]),
-        "num_tokens": [3],
-    }
-
-    attach_media_placeholder_metadata(message, _Processor(), policy_processed)
-    reconcile_message_media_placeholder_runs(message)
-
-    torch.testing.assert_close(message["token_ids"], torch.tensor([1, 99, 99, 99, 2]))
-
-
-def test_video_placeholder_metadata_can_require_exact_rollout_match():
-    class _Processor:
-        image_token = "<image>"
-        image_token_id = 99
-
-    message = {"token_ids": torch.tensor([1, 99, 99, 99, 99, 2])}
-    policy_processed = {
-        "input_ids": torch.tensor([[10, 99, 99, 99, 11]]),
-        "num_tokens": [3],
-    }
-
-    attach_media_placeholder_metadata(message, _Processor(), policy_processed)
-    require_exact_media_placeholder_match(message)
-
-    with pytest.raises(
-        ValueError, match="post-generation resizing would invalidate logprobs"
-    ):
-        reconcile_message_media_placeholder_runs(message)
-
-
-def test_video_exact_match_requirement_survives_gym_payload_reattachment():
-    class _Processor:
-        image_token = "<image>"
-        image_token_id = 99
-
-    source_message = {
-        "role": "user",
-        "content": "",
-        "token_ids": torch.tensor([10, 99, 99, 99, 11]),
-    }
-    attach_media_placeholder_metadata(
-        source_message,
-        _Processor(),
-        {"num_tokens": [3]},
+    assert repair_calls and repair_calls[0][2] == [2]
+    assert message["token_ids"] is rollout_tokens
+    assert message[ROLLOUT_MATCHED_MEDIA_KEY] is True
+    torch.testing.assert_close(
+        message["pixel_values"].as_tensor(), repaired["pixel_values"]
     )
-    require_exact_media_placeholder_match(source_message)
-    results = [
-        {
-            "_initial_multimodal_data_omitted": True,
-            "message_log": [
-                {
-                    "role": "user",
-                    "content": "",
-                    "token_ids": torch.tensor([10, 99, 99, 99, 99, 11]),
-                }
-            ],
-        }
-    ]
-
-    with pytest.raises(
-        ValueError, match="post-generation resizing would invalidate logprobs"
-    ):
-        _reattach_original_multimodal_payloads(results, [[source_message]])
 
 
 def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
@@ -334,6 +277,36 @@ def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
     )
 
     assert set(message) == {"role", "content", "token_ids"}
+
+
+def test_reattach_preserves_rollout_matched_media_marker():
+    """Actor media rebuilt from rollout tokens must not be overwritten."""
+    static_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    rollout_matched = PackedTensor(torch.tensor([[9.0]]), dim_to_pack=0)
+    original_logs = [
+        [{"role": "user", "content": "first", "pixel_values": static_image}]
+    ]
+    results = [
+        {
+            "_initial_multimodal_data_omitted": True,
+            "input_message_log": [{"role": "user", "content": "first"}],
+            "message_log": [
+                {
+                    "role": "user",
+                    "content": "first",
+                    "pixel_values": rollout_matched,
+                    ROLLOUT_MATCHED_MEDIA_KEY: True,
+                }
+            ],
+        }
+    ]
+
+    _reattach_original_multimodal_payloads(results, original_logs)
+
+    marked_user = results[0]["message_log"][0]
+    assert marked_user["pixel_values"] is rollout_matched
+    assert ROLLOUT_MATCHED_MEDIA_KEY not in marked_user
+    assert results[0]["input_message_log"][0]["pixel_values"] is static_image
 
 
 def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
