@@ -18,6 +18,7 @@ import json
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import pytest
 import ray
@@ -45,6 +46,11 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
@@ -1946,10 +1952,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     monkeypatch.setattr(
         rollouts_mod,
         "collect_multimodal_payload_metrics",
-        lambda payload, boundary, enabled: payload_calls.append(
-            (payload, boundary, enabled)
-        )
-        or {},
+        lambda payload, boundary, enabled: (
+            payload_calls.append((payload, boundary, enabled)) or {}
+        ),
     )
     monkeypatch.setattr(
         rollouts_mod, "print_multimodal_payload_metrics", lambda metrics: None
@@ -2299,6 +2304,24 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
                 timer_prefix="timing/test",
             )
         )
+
+
+def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
+    rows = [{"responses_create_params": {}} for _ in range(4)]
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=2,
+    )
+
+    assert rows[0][NEMO_GYM_GROUP_ID_KEY] == rows[1][NEMO_GYM_GROUP_ID_KEY]
+    assert rows[2][NEMO_GYM_GROUP_ID_KEY] == rows[3][NEMO_GYM_GROUP_ID_KEY]
+    assert rows[0][NEMO_GYM_GROUP_ID_KEY] != rows[2][NEMO_GYM_GROUP_ID_KEY]
+    assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0, 0]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
+    assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
 
 
 @pytest.mark.nemo_gym

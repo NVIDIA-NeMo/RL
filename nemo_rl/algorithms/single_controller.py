@@ -46,6 +46,7 @@ import io
 import logging
 import math
 import os
+import statistics
 import threading
 import time
 import uuid
@@ -54,7 +55,7 @@ from collections import deque
 from collections.abc import Iterator
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union, cast
 
 import ray
 import torch
@@ -111,6 +112,7 @@ from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
     ROLLOUT_METRICS,
+    ROUTE_PLAN_TAG,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -126,6 +128,7 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
+from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -135,6 +138,10 @@ from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+
+if TYPE_CHECKING:
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+    from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 
@@ -275,6 +282,14 @@ class SingleControllerActor:
         # therefore degrades to the documented off state rather than to a broken one.
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
         self._generation_router = getattr(actor_args, "generation_router", None)
+        self._finalizer_actors = list(actor_args.finalizer_actors)
+        self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
+        for actor in self._finalizer_actors:
+            self._available_finalizers.put_nowait(actor)
+        self._active_finalizers = 0
+        self._finalizer_waiters = 0
+        self._finalizer_unknown_outcomes = 0
+        self._finalizer_metrics_by_group: dict[str, dict[str, float]] = {}
         teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
         if teacher_worker_groups:
             self._teacher_coordinator: Optional[
@@ -294,7 +309,11 @@ class SingleControllerActor:
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
-        self._logger.log_hyperparams(master_config.model_dump())
+        hparams = master_config.model_dump()
+        if hparams.get("token_capture"):
+            # The control-plane bearer token must never reach W&B/TB telemetry.
+            hparams["token_capture"]["control_auth_token"] = "<redacted>"
+        self._logger.log_hyperparams(hparams)
         self._logger.log_metrics(
             setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
         )
@@ -376,9 +395,12 @@ class SingleControllerActor:
         # makes the native snapshot match the controller's metadata-only replay
         # index exactly. Generation may continue, but completed rollouts wait at
         # commit; _buffer_capacity bounds reservations and eventually stalls
-        # dispatch instead of allowing unbounded TQ growth.
-        # A future staging/finalizer path must join the same barrier before
-        # native restore can be authoritative.
+        # dispatch instead of allowing unbounded TQ growth. The finalizer commit,
+        # pre-publication cleanup, and post-train cleanup paths take the mutation
+        # side too. Authoritative (replay-index) snapshots are still rejected in
+        # token-capture mode by validate_single_controller_config: the capture
+        # dispatch path does not thread lineage group ids into the recovery
+        # ledger, so a resume could not reap it. Shadow snapshots still run.
         self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         self._buffer.set_data_plane_checkpoint_barrier(
             self._data_plane_checkpoint_barrier
@@ -441,6 +463,7 @@ class SingleControllerActor:
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
+            "sample_masks": [],
             "masked_advantages": [],
             "num_mask_sample_filtered": [],
             "sequence_lengths": [],
@@ -516,6 +539,11 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            for actor in self._finalizer_actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception as error:
+                    print(f"finalizer actor termination failed: {error}", flush=True)
             try:
                 self._weight_synchronizer.shutdown()
             except Exception as e:  # teardown must not mask the original failure
@@ -538,6 +566,10 @@ class SingleControllerActor:
             "inflight_rollouts": self._inflight_rollouts,
             "rollout_permitted": self._rollout_permitted.is_set(),
             "epoch": self._current_epoch,
+            "active_finalizers": self._active_finalizers,
+            "finalizer_waiters": self._finalizer_waiters,
+            "finalizer_queue_depth": self._available_finalizers.qsize(),
+            "finalizer_unknown_outcomes": self._finalizer_unknown_outcomes,
         }
 
     # ── internal helpers ───────────────────────────────────────────────────
@@ -1044,17 +1076,6 @@ class SingleControllerActor:
             return await result
         return result
 
-    async def _clear_data_plane_samples(self, sample_ids: list[str]) -> None:
-        """Clear consumed rows without overlapping a data-plane checkpoint."""
-        async with self._data_plane_checkpoint_barrier.mutation():
-            await call_data_plane(
-                self._dp_client,
-                "clear_samples",
-                offload_sync=True,
-                sample_ids=sample_ids,
-                partition_id=self._partition_id,
-            )
-
     async def _save_data_plane_checkpoint(
         self,
         checkpoint_path: PathLike,
@@ -1133,6 +1154,225 @@ class SingleControllerActor:
             flush=True,
         )
 
+    @staticmethod
+    def _request_staging_keys(request: "ReassemblyRequest") -> list[str]:
+        """Return the full receipt-manifest staging ownership for a request."""
+        keys: list[str] = []
+        for receipt in request.receipts:
+            if receipt is None:
+                continue
+            manifest = receipt.get("manifest")
+            if not isinstance(manifest, list):
+                continue
+            for record in manifest:
+                if isinstance(record, dict) and isinstance(
+                    record.get("staging_key"), str
+                ):
+                    keys.append(record["staging_key"])
+        return list(dict.fromkeys(keys))
+
+    async def _cleanup_known_finalization_request(
+        self, request: "ReassemblyRequest"
+    ) -> None:
+        """Clear known request ownership after a pre-publication/known outcome."""
+        errors: list[BaseException] = []
+        # One shared mutation slot for both clears: they run outside the train
+        # pump task, so a live data-plane checkpoint must not interleave them.
+        # Offloaded so the rollout pump's event loop keeps serving other
+        # dispatches and finalizer handoffs while the clears are in flight.
+        async with self._data_plane_checkpoint_barrier.mutation():
+            try:
+                await call_data_plane(
+                    self._dp_client,
+                    "clear_samples",
+                    offload_sync=True,
+                    sample_ids=list(request.rollout_ids),
+                    partition_id=self._partition_id,
+                )
+            except Exception as error:
+                errors.append(
+                    RuntimeError(
+                        "pre-publication canonical cleanup failed for "
+                        f"group={request.group_id!r}, ids={request.rollout_ids!r}"
+                    )
+                )
+                errors[-1].__cause__ = error
+            staging_keys = self._request_staging_keys(request)
+            if staging_keys:
+                try:
+                    await call_data_plane(
+                        self._dp_client,
+                        "clear_samples",
+                        offload_sync=True,
+                        sample_ids=staging_keys,
+                        partition_id=self._master_config.token_capture.staging_partition,
+                    )
+                except Exception as error:
+                    errors.append(
+                        RuntimeError(
+                            "pre-publication staging cleanup failed for "
+                            f"group={request.group_id!r}, keys={staging_keys!r}"
+                        )
+                    )
+                    errors[-1].__cause__ = error
+        if errors:
+            raise BaseExceptionGroup(
+                f"known-outcome cleanup failed for group {request.group_id}",
+                errors,
+            )
+        self._buffer.abort(request.group_id)
+
+    async def _finalize_with_actor(
+        self, request: "ReassemblyRequest"
+    ) -> Optional["FinalizedGroup"]:
+        """Submit one metadata request to the bounded fixed actor pool.
+
+        Returns the committed FinalizedGroup once the group is committed to
+        the replay buffer (callers may read valid_row_count/total_row_count
+        off it to decide whether the group is worth keeping), or None when
+        the finalizer itself dropped it as a structural outcome (ownership
+        already cleaned up; the caller credits the step short). A low
+        valid-row fraction is no longer a finalizer-side drop -- the caller
+        decides that, since only the caller can source a replacement.
+        """
+        self._finalizer_waiters += 1
+        queue_depth = max(
+            0,
+            self._finalizer_waiters - self._available_finalizers.qsize(),
+        )
+        queue_start = time.perf_counter()
+        try:
+            actor = await self._available_finalizers.get()
+        except asyncio.CancelledError:
+            await self._cleanup_known_finalization_request(request)
+            raise
+        finally:
+            self._finalizer_waiters -= 1
+        queue_wait_ms = (time.perf_counter() - queue_start) * 1000.0
+        self._active_finalizers += 1
+        active_actor_count = self._active_finalizers
+        finalize_start = time.perf_counter()
+        try:
+            finalized = await actor.finalize.remote(request)
+        except BaseException:
+            self._finalizer_unknown_outcomes += 1
+            print(
+                "FATAL: finalizer actor RPC failed after submission; canonical "
+                f"publication outcome is unknown for group {request.group_id}. "
+                "Stopping validation without actor replacement or retry.",
+                flush=True,
+            )
+            raise
+        else:
+            self._available_finalizers.put_nowait(actor)
+        finally:
+            self._active_finalizers -= 1
+        finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
+
+        if finalized.dropped:
+            try:
+                await self._cleanup_known_finalization_request(request)
+            except BaseException as cleanup_error:
+                raise RuntimeError(
+                    "finalizer dropped the group and known-key cleanup failed "
+                    f"for group {request.group_id}"
+                ) from cleanup_error
+            print(
+                f"  finalize: group {request.group_id} dropped "
+                f"({finalized.drop_reason or 'unspecified reason'})",
+                flush=True,
+            )
+            return None
+        if finalized.meta is None:
+            try:
+                await self._cleanup_known_finalization_request(request)
+            except BaseException as cleanup_error:
+                raise RuntimeError(
+                    "finalizer returned no metadata and known-key cleanup failed "
+                    f"for group {request.group_id}"
+                ) from cleanup_error
+            raise RuntimeError(
+                f"finalizer returned no metadata for non-dropped group {request.group_id}"
+            )
+        try:
+            await self._buffer.commit_finalized(
+                request.group_id,
+                finalized.meta,
+                finalized.group_min_wv,
+                finalized.group_max_wv,
+                staging_keys=finalized.staging_keys,
+            )
+        except BaseException as commit_error:
+            try:
+                await self._cleanup_known_finalization_request(request)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    f"finalizer commit and known-key cleanup failed for "
+                    f"group {request.group_id}",
+                    [commit_error, cleanup_error],
+                )
+            raise
+        finalized.metrics.update(
+            {
+                "finalize/queue_wait_ms": queue_wait_ms,
+                "finalize/total_ms": finalize_total_ms,
+                "finalize/queue_depth": float(queue_depth),
+                "finalize/active_actor_count": float(active_actor_count),
+            }
+        )
+        self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
+        return finalized
+
+    async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
+        """Clear canonical rows and full-manifest staging keys after train success.
+
+        Runs after ``finish_train_step`` because policy workers read the staged
+        capture deltas during training. One mutation cut spans both partitions
+        so a data-plane checkpoint sees either all of a step's rows or none, and
+        the clears are offloaded so the event loop keeps serving the rollout
+        pump and finalizer handoffs meanwhile.
+        """
+        canonical_by_partition: dict[str, list[str]] = {}
+        staging_by_partition: dict[str, list[str]] = {}
+        for meta in metas:
+            canonical_by_partition.setdefault(meta.partition_id, []).extend(
+                meta.sample_ids
+            )
+            for tag in meta.tags or []:
+                encoded_plan = tag.get(ROUTE_PLAN_TAG)
+                if encoded_plan is None:
+                    continue
+                plan = decode_route_plan(encoded_plan)
+                staging_by_partition.setdefault(plan.staging_partition, []).extend(
+                    plan.cleanup_staging_keys
+                )
+
+        errors: list[BaseException] = []
+        async with self._data_plane_checkpoint_barrier.mutation():
+            for label, by_partition in (
+                ("canonical", canonical_by_partition),
+                ("staging", staging_by_partition),
+            ):
+                for partition_id, ids in by_partition.items():
+                    unique_ids = list(dict.fromkeys(ids))
+                    try:
+                        await call_data_plane(
+                            self._dp_client,
+                            "clear_samples",
+                            offload_sync=True,
+                            sample_ids=unique_ids,
+                            partition_id=partition_id,
+                        )
+                    except Exception as error:
+                        cleanup_error = RuntimeError(
+                            f"post-train {label} cleanup failed: "
+                            f"partition={partition_id!r}, ids={unique_ids!r}"
+                        )
+                        cleanup_error.__cause__ = error
+                        errors.append(cleanup_error)
+        if errors:
+            raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
+
     # ── the three pumps + the inline advantage stage ───────────────────────
 
     async def _rollout_pump(self) -> None:
@@ -1150,7 +1390,10 @@ class SingleControllerActor:
           3. Wait for _rollout_permitted (paused during weight sync)
           4. Call rollout_manager.generate_and_push(prompt) — local async
              RolloutManager reserves a slot, runs the rollout, then commits the
-             group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
+             group via TQReplayBuffer (→ dp_client.put_samples + mark ready).
+             In token-capture mode (finalizer actors present) the rollout is run
+             via generate_for_finalization instead and its metadata-only request
+             is submitted to the finalizer actor pool.
           5. If the prompt was dropped, substitute a spare and repeat step 4 -- for this
              step, or for whichever step lends this one a finished group in its place
              (see _take_replacement, _promote_into_step) -- or credit the step short so
@@ -1179,92 +1422,203 @@ class SingleControllerActor:
             # substitutions because the slot stays occupied either way -- they are
             # released once something commits, or once a step is credited short.
             replacements = 0
+            generation_permit_released = False
+            inflight_count_released = False
             try:
-                while True:
+                if self._finalizer_actors:
+                    # Token-capture path: run capture generation, release the
+                    # generation permits as soon as the tokens are staged, then
+                    # hand the metadata-only request to the finalizer actor pool.
+                    ownership_transferred = False
                     try:
-                        if lineage_group_id is None:
-                            outcome = await self._rollout_manager.generate_and_push(
-                                prompt,
-                                target_step=target_step,
-                                inflight_registry=self._inflight_by_group_id,
+                        while True:
+                            request = (
+                                await self._rollout_manager.generate_for_finalization(
+                                    prompt,
+                                    target_step=target_step,
+                                    inflight_registry=self._inflight_by_group_id,
+                                )
                             )
-                        else:
-                            outcome = await self._rollout_manager.generate_and_push(
-                                prompt,
-                                target_step=target_step,
-                                inflight_registry=self._inflight_by_group_id,
-                                lineage_group_id=lineage_group_id,
+                            if not inflight_count_released:
+                                self._inflight_rollouts -= 1
+                                inflight_count_released = True
+                            if not generation_permit_released:
+                                sem.release()
+                                generation_permit_released = True
+                            if request is None:
+                                # Dropped within the infra budget: nothing was
+                                # committed, so the train pump will never release
+                                # this permit, and the step it was stamped for
+                                # must be allowed to close short.
+                                self._buffer_capacity.release()
+                                self._credit_shortfall(target_step)
+                                return
+                            finalized = await self._finalize_with_actor(request)
+                            if finalized is None:
+                                # Finalizer dropped the group as a structural
+                                # outcome (e.g. router replay with no routed
+                                # data yet); ownership was already cleaned up,
+                                # so like the dropped-prompt path above the
+                                # train pump will never release this permit
+                                # and the step must be allowed to close short.
+                                self._buffer_capacity.release()
+                                self._credit_shortfall(target_step)
+                                return
+                            min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
+                            below_threshold = (
+                                min_valid_fraction is not None
+                                and finalized.total_row_count > 0
+                                and finalized.valid_row_count
+                                / finalized.total_row_count
+                                < min_valid_fraction
                             )
-                    except BaseException:
-                        # On success ownership transfers to the train pump, which
-                        # releases this permit after consuming the committed group.
-                        self._buffer_capacity.release()
-                        raise
-
-                    if outcome is not RolloutOutcome.SKIPPED:
-                        break
-
-                    if self._rollout_recovery_enabled:
-                        assert lineage_group_id is not None
-                        async with (
-                            self._data_plane_checkpoint_barrier.mutation()
-                        ) as cut:
+                            if not below_threshold:
+                                ownership_transferred = True
+                                break
+                            # Enough rows verified to publish, but too few to
+                            # be worth training on. Unlike the finalizer's own
+                            # structural drops above, this is a policy call
+                            # only the controller can act on: it is the one
+                            # component that can source a replacement.
+                            try:
+                                await self._cleanup_known_finalization_request(request)
+                            except BaseException as cleanup_error:
+                                raise RuntimeError(
+                                    "finalizer group fell below "
+                                    "min_valid_fraction_per_group and "
+                                    "known-key cleanup failed for group "
+                                    f"{request.group_id}"
+                                ) from cleanup_error
+                            print(
+                                f"  finalize: group {request.group_id} below "
+                                "min_valid_fraction_per_group "
+                                f"({finalized.valid_row_count}/"
+                                f"{finalized.total_row_count} < "
+                                f"{min_valid_fraction}); seeking a replacement",
+                                flush=True,
+                            )
                             replacement = self._take_replacement(
                                 target_step, replacements
                             )
-                            # A skipped tracked prompt remains ledger-owned until this
-                            # controller transition. Dropping the old owner, reserving
-                            # a replacement, or crediting the target step short must be
-                            # one checkpoint-atomic decision.
-                            self._rollout_manager.discard_prompt_group(
-                                cut, lineage_group_id
-                            )
-                            if replacement is not None:
-                                lender_step = self._promote_into_step(target_step)
-                                if lender_step is not None:
-                                    target_step = lender_step
-                                lineage_group_id = (
-                                    self._rollout_manager.reserve_prompt_group(
-                                        cut,
-                                        replacement,
-                                        target_step=target_step,
-                                    )
+                            if replacement is None:
+                                self._rollout_manager.record_finalizer_dropped_prompt()
+                                self._buffer_capacity.release()
+                                self._credit_shortfall(target_step)
+                                return
+                            replacements += 1
+                            prompt = replacement
+                            # A substitution is a fresh rollout, not a
+                            # continuation of the one that fell short, so it
+                            # observes the same pause a first dispatch does
+                            # instead of pushing new generation into a
+                            # weight-sync window.
+                            await self._rollout_permitted.wait()
+                            # The next generate_for_finalization call is a
+                            # brand-new generation and must be re-counted
+                            # against the same concurrency limiter a first
+                            # dispatch would hold; both permits were released
+                            # early above, right after the attempt that fell
+                            # short finished generating.
+                            await sem.acquire()
+                            self._inflight_rollouts += 1
+                            inflight_count_released = False
+                            generation_permit_released = False
+                    except BaseException:
+                        # On success ownership transfers to the train pump, which
+                        # releases this permit after consuming the committed group.
+                        if not ownership_transferred:
+                            self._buffer_capacity.release()
+                        raise
+                else:
+                    while True:
+                        try:
+                            if lineage_group_id is None:
+                                outcome = await self._rollout_manager.generate_and_push(
+                                    prompt,
+                                    target_step=target_step,
+                                    inflight_registry=self._inflight_by_group_id,
                                 )
                             else:
-                                self._credit_shortfall(target_step)
-                    else:
-                        replacement = self._take_replacement(target_step, replacements)
-                    if replacement is None:
-                        # Nothing was committed, so the train pump will never see this
-                        # group and never release its permit on our behalf.
-                        self._buffer_capacity.release()
-                        if not self._rollout_recovery_enabled:
-                            self._credit_shortfall(target_step)
-                        return
+                                outcome = await self._rollout_manager.generate_and_push(
+                                    prompt,
+                                    target_step=target_step,
+                                    inflight_registry=self._inflight_by_group_id,
+                                    lineage_group_id=lineage_group_id,
+                                )
+                        except BaseException:
+                            # On success ownership transfers to the train pump, which
+                            # releases this permit after consuming the committed group.
+                            self._buffer_capacity.release()
+                            raise
 
-                    replacements += 1
-                    prompt = replacement
-                    print(
-                        f"  target_step={target_step}: substituting a spare prompt for "
-                        f"the dropped group (replacement {replacements}/"
-                        f"{self._async_cfg.rollout_failure.max_replacement_attempts}, "
-                        f"{len(self._replacement_reserve)} spare(s) left)",
-                        flush=True,
-                    )
-                    # Attempted only now that a spare is in hand, because the borrow is a
-                    # debt and the spare is what repays it. Borrowing without one would
-                    # leave the lender short instead: the same hole, one step later.
-                    if not self._rollout_recovery_enabled:
-                        lender_step = self._promote_into_step(target_step)
-                        if lender_step is not None:
-                            target_step = lender_step
-                    # A substitution is a fresh rollout, not a continuation of the one
-                    # that failed, so it observes the same pause a first dispatch does
-                    # instead of pushing new generation into a weight-sync window.
-                    await self._rollout_permitted.wait()
+                        if outcome is not RolloutOutcome.SKIPPED:
+                            break
+
+                        if self._rollout_recovery_enabled:
+                            assert lineage_group_id is not None
+                            async with (
+                                self._data_plane_checkpoint_barrier.mutation()
+                            ) as cut:
+                                replacement = self._take_replacement(
+                                    target_step, replacements
+                                )
+                                # A skipped tracked prompt remains ledger-owned until this
+                                # controller transition. Dropping the old owner, reserving
+                                # a replacement, or crediting the target step short must be
+                                # one checkpoint-atomic decision.
+                                self._rollout_manager.discard_prompt_group(
+                                    cut, lineage_group_id
+                                )
+                                if replacement is not None:
+                                    lender_step = self._promote_into_step(target_step)
+                                    if lender_step is not None:
+                                        target_step = lender_step
+                                    lineage_group_id = (
+                                        self._rollout_manager.reserve_prompt_group(
+                                            cut,
+                                            replacement,
+                                            target_step=target_step,
+                                        )
+                                    )
+                                else:
+                                    self._credit_shortfall(target_step)
+                        else:
+                            replacement = self._take_replacement(
+                                target_step, replacements
+                            )
+                        if replacement is None:
+                            # Nothing was committed, so the train pump will never see this
+                            # group and never release its permit on our behalf.
+                            self._buffer_capacity.release()
+                            if not self._rollout_recovery_enabled:
+                                self._credit_shortfall(target_step)
+                            return
+
+                        replacements += 1
+                        prompt = replacement
+                        print(
+                            f"  target_step={target_step}: substituting a spare prompt for "
+                            f"the dropped group (replacement {replacements}/"
+                            f"{self._async_cfg.rollout_failure.max_replacement_attempts}, "
+                            f"{len(self._replacement_reserve)} spare(s) left)",
+                            flush=True,
+                        )
+                        # Attempted only now that a spare is in hand, because the borrow is a
+                        # debt and the spare is what repays it. Borrowing without one would
+                        # leave the lender short instead: the same hole, one step later.
+                        if not self._rollout_recovery_enabled:
+                            lender_step = self._promote_into_step(target_step)
+                            if lender_step is not None:
+                                target_step = lender_step
+                        # A substitution is a fresh rollout, not a continuation of the one
+                        # that failed, so it observes the same pause a first dispatch does
+                        # instead of pushing new generation into a weight-sync window.
+                        await self._rollout_permitted.wait()
             finally:
-                self._inflight_rollouts -= 1
-                sem.release()
+                if not inflight_count_released:
+                    self._inflight_rollouts -= 1
+                if not generation_permit_released:
+                    sem.release()
 
             if replacements and target_step is not None:
                 # Counted per slot, not per attempt: a step got its group back, which is
@@ -1708,9 +2062,13 @@ class SingleControllerActor:
                     respectively. Each policy optimizer step closes here rather
                     than in 5 -- a PPO step is one chunk, so there is nothing to
                     accumulate across chunks.
-            4. Clear the batch. dp_client.clear_samples on the consumed sample_ids.
+            4. Close the chunk. Refresh min_sample_version and the dispatch tally. The
+                consumed rows stay in TQ: staged capture deltas are read by the policy
+                workers during 3, so nothing is cleared until the step closes.
             5. Train the policy model (GRPO) -- finish_train_step all_reduces the
-                accumulated gradients, rescales, and runs optimizer.step.
+                accumulated gradients, rescales, and runs optimizer.step. Then
+                _cleanup_consumed_metas clears every consumed canonical row and its
+                staged capture deltas.
             6. Refit the model. Sync the new policy weights to generation.
 
         PPO critic warmup (ppo.policy_training_start_step > 0) changes which of those
@@ -1738,6 +2096,8 @@ class SingleControllerActor:
             value_result: Optional[dict[str, Any]] = None
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
+            consumed_metas: list[KVBatchMeta] = []
+            step_finalizer_metrics: dict[str, list[float]] = {}
 
             with self._timer.time("total_step_time"):
                 # Re-read on every iteration rather than once: a prompt stamped for this
@@ -1811,9 +2171,24 @@ class SingleControllerActor:
                             await asyncio.sleep(0.005)
                             continue
 
-                        # Release buffer capacity
+                        consumed_metas.append(train_meta)
+
+                        # Release buffer capacity. The rows stay in TQ until the
+                        # post-step clear, but every reservation uses a fresh
+                        # uuid group id, so nothing can collide with them.
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
+                        selected_group_ids = {
+                            sample_id.rsplit("_g", 1)[0]
+                            for sample_id in train_meta.sample_ids
+                        }
+                        for group_id in selected_group_ids:
+                            for name, value in self._finalizer_metrics_by_group.pop(
+                                group_id, {}
+                            ).items():
+                                step_finalizer_metrics.setdefault(name, []).append(
+                                    float(value)
+                                )
 
                         selected_rollout_metrics.extend(
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
@@ -1977,9 +2352,6 @@ class SingleControllerActor:
                     else:
                         min_sample_version = curr_min_sample_version
 
-                    # Remove consumed sample_ids from the buffer
-                    await self._clear_data_plane_samples(list(train_meta.sample_ids))
-
                     groups_dispatched += num_groups
                     chunks_dispatched += 1
                     # How many chunks a step is split into decides how many times
@@ -2026,12 +2398,23 @@ class SingleControllerActor:
                             self._trainer.finish_train_step
                         )
 
+                # Clear consumed canonical rows (and their staged capture deltas)
+                # now that the step's training dispatches are complete.
+                await self._cleanup_consumed_metas(consumed_metas)
+
                 # Aggregate step metrics
                 step_metrics = {}
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                step_metrics.update(
+                    {
+                        name: statistics.fmean(values)
+                        for name, values in step_finalizer_metrics.items()
+                        if values
+                    }
+                )
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
@@ -3175,6 +3558,12 @@ class SingleControllerActor:
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
+        if self._master_config.token_capture.enabled:
+            # Rotate the version vLLM workers stamp on captured model calls
+            # (per-call tagging; group staleness = min over the group's calls).
+            await asyncio.to_thread(
+                self._gen.set_rollout_weight_version, self._trainer_version
+            )
         self._rollout_permitted.set()
         return aborted_stale_inflight_groups
 
@@ -3350,6 +3739,10 @@ class SingleControllerActor:
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
+                # Real validity (token-capture placeholders carry sample_mask 0,
+                # and mask_sample/overlong/seq-logprob-error rows are folded in
+                # via final_sample_mask) instead of the hardwired all-ones.
+                valid_mask=final_sample_mask,
                 **kwargs,
             )
             if self._is_ppo:
@@ -3384,6 +3777,7 @@ class SingleControllerActor:
 
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
+        self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
         if self._teacher_logprobs_required:
             valid = response_advantages.detach().double()
             self._opd_stat_sum += float(valid.sum())
