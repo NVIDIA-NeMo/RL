@@ -357,7 +357,7 @@ def setup(
         "A generation config in the PolicyConfig is required for PPO"
     )
     if generation_config["backend"] == "vllm":
-        normalize_nvfp4_pertoken_policy_config(policy_config)
+        normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="ppo")
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
         refit_transport = vllm_config.get("refit_transport")

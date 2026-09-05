@@ -32,6 +32,12 @@ policy:
       NVTE_NVFP4_DISABLE_2D_QUANTIZATION: '1'
       NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: '1'
       NVTE_BACKWARD_OVERRIDE: dequantized
+cluster:
+  # The performance recipe this inherits from pins segment_size=4 so all four
+  # nodes land in one NVLink domain. A 20-step smoke does not need that
+  # locality, and requiring it fails outright on clusters whose allocation
+  # spans domains (ResourceInsufficientError before any training runs).
+  segment_size: null
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
   wandb:
