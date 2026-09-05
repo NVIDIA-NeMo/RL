@@ -13,6 +13,8 @@
 # limitations under the License.
 import asyncio
 import json
+import multiprocessing
+import os
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -41,6 +43,8 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    _build_token_capture_source,
+    _token_capture_metrics,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -940,6 +944,41 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
     ]
     extra_body = json.loads(outbound["metadata"]["extra_body"])
     assert extra_body == {"chat_template_kwargs": {"enable_thinking": True}}
+
+
+class _ConfiguredTokenSource:
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    async def freeze(self, rollout_id: str) -> object:
+        raise NotImplementedError
+
+    async def drop(self, rollout_id: str, *, snapshot_id: str, version: int) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
+class _ConfiguredTokenSourceFactory:
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    def __call__(self) -> _ConfiguredTokenSource:
+        return _ConfiguredTokenSource(self.endpoint)
+
+
+def _build_source_in_consumer_process(factory, queue) -> None:
+    source, directories = _build_token_capture_source(
+        {
+            "token_id_capture": {
+                "enabled": True,
+                "rebuild_response": False,
+            }
+        },
+        factory,
+    )
+    queue.put((os.getpid(), source.endpoint, directories))
 
 
 def test_extract_reward_components():
@@ -1923,3 +1962,233 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
             f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
             f"got {null_resp.status_code}: {null_resp.text}"
         )
+
+
+class TestTokenCaptureMetrics:
+    """The numbers that make silent training loss visible.
+
+    The failure they exist to catch is a rollout that looks healthy -- green
+    run, moving reward -- while most of its calls were quarantined because the
+    chat template dropped earlier reasoning and the prompts stopped chaining.
+    """
+
+    def test_summarizes_a_healthy_batch(self):
+        per_rollout = [
+            {
+                "delivered_fraction": 1.0,
+                "quarantined_fraction": 0.0,
+                "n_calls": 4,
+                "chains": 1,
+            },
+            {
+                "delivered_fraction": 1.0,
+                "quarantined_fraction": 0.0,
+                "n_calls": 6,
+                "chains": 1,
+            },
+        ]
+        got = _token_capture_metrics(per_rollout, rebuilt=2, unbuilt=0)
+        assert got["token_capture/rebuilt_fraction"] == 1.0
+        assert got["token_capture/delivered_fraction_mean"] == 1.0
+        assert got["token_capture/calls_per_rollout_mean"] == 5.0
+        assert got["token_capture/masked_rollouts"] == 0.0
+
+    def test_surfaces_partial_delivery(self):
+        """A reasoning model whose history is stripped: the chain breaks, most of
+        the rollout is quarantined, and the run would otherwise look fine."""
+        per_rollout = [
+            {
+                "delivered_fraction": 0.2,
+                "quarantined_fraction": 0.75,
+                "n_calls": 8,
+                "chains": 4,
+            },
+            {
+                "delivered_fraction": 0.25,
+                "quarantined_fraction": 0.7,
+                "n_calls": 8,
+                "chains": 3,
+            },
+        ]
+        got = _token_capture_metrics(per_rollout, rebuilt=2, unbuilt=0)
+        assert got["token_capture/delivered_fraction_mean"] < 0.3
+        assert got["token_capture/quarantined_fraction_mean"] > 0.7
+        assert got["token_capture/chains_per_rollout_mean"] == 3.5
+
+    def test_counts_masked_incomplete_and_unbuilt(self):
+        per_rollout = [
+            {
+                "capture_incomplete": True,
+                "empty_generation_calls": 1,
+                "parent_link_failures": {"parent_digest_mismatch": 2},
+            },
+            {"empty_generation_calls": 2, "parent_link_failures": {}},
+        ]
+        # The mask verdict is counted from the build, not read out of the metrics dict, because
+        # Gym now puts it at the top of the rollout record and leaves only reasons in the dict.
+        got = _token_capture_metrics(per_rollout, rebuilt=1, unbuilt=1, masked=1)
+        assert got["token_capture/masked_rollouts"] == 1.0
+        assert got["token_capture/incomplete_rollouts"] == 1.0
+        assert got["token_capture/empty_generation_calls"] == 3.0
+        # Fallback reasons are counted per reason, then summed across the batch.
+        assert got["token_capture/parent_link_failures"] == 2.0
+        assert got["token_capture/rollouts_unbuilt"] == 1.0
+        assert got["token_capture/rebuilt_fraction"] == 0.5
+
+    def test_emits_nothing_when_capture_is_off(self):
+        assert _token_capture_metrics([], rebuilt=0, unbuilt=0) == {}
+
+
+def test_build_token_capture_source_uses_the_default_file_store(tmp_path):
+    source, directories = _build_token_capture_source(
+        {
+            "token_id_capture": {
+                "enabled": True,
+                "dir": str(tmp_path),
+                "rebuild_response": False,
+            }
+        }
+    )
+
+    assert source.root == tmp_path
+    assert directories == [tmp_path]
+
+
+def test_build_token_capture_source_uses_a_framework_owned_factory():
+    source, directories = _build_token_capture_source(
+        {
+            "token_id_capture": {
+                "enabled": True,
+                "rebuild_response": False,
+            }
+        },
+        _ConfiguredTokenSourceFactory(endpoint="transfer-queue://tokens"),
+    )
+
+    assert isinstance(source, _ConfiguredTokenSource)
+    assert source.endpoint == "transfer-queue://tokens"
+    assert directories == []
+
+
+def test_framework_source_factory_runs_in_the_consumer_process():
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    process = context.Process(
+        target=_build_source_in_consumer_process,
+        args=(_ConfiguredTokenSourceFactory("transfer-queue://tokens"), queue),
+    )
+
+    process.start()
+    process.join(timeout=60)
+
+    assert process.exitcode == 0
+    child_pid, endpoint, directories = queue.get(timeout=10)
+    assert child_pid != os.getpid()
+    assert endpoint == "transfer-queue://tokens"
+    assert directories == []
+
+
+@pytest.mark.asyncio
+async def test_run_rollouts_retires_capture_after_yield_is_accepted(monkeypatch):
+    """Keep frozen evidence until the rollout consumer requests another item."""
+    from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
+    from nemo_gym.token_id_capture import config as capture_config
+    from nemo_gym.token_id_capture import delivery
+
+    events = []
+    original_output = [
+        {"type": "function_call_output", "output": "data:image/png;base64,image"}
+    ]
+    rebuilt_output = [{"generation_token_ids": [1]}]
+
+    async def finalize(result, source):
+        rollout_id = result[ROLLOUT_ID_KEY_NAME]
+        assert rollout_id.startswith("s")
+        assert len(rollout_id.split("-", maxsplit=1)[0]) == 33
+        result["response"]["output"] = rebuilt_output
+        events.append("finalize")
+        return {
+            "rebuilt_response": {"output": rebuilt_output},
+            "metrics": {"n_calls": 2},
+            "_capture_snapshot": {"snapshot_id": "snapshot", "version": 1},
+        }
+
+    async def retire(rollout_id, source, built):
+        assert rollout_id.startswith("s")
+        assert built["_capture_snapshot"]["snapshot_id"] == "snapshot"
+        events.append("retire")
+        return True
+
+    monkeypatch.setattr(delivery, "finalize_rollout_token_capture", finalize)
+    monkeypatch.setattr(delivery, "retire_rollout_token_capture", retire)
+    monkeypatch.setattr(
+        capture_config,
+        "token_id_capture_enabled_for_agent",
+        lambda config, agent_name: agent_name == "captured",
+    )
+
+    row = {
+        "_rowidx": 0,
+        "agent_ref": {"name": "captured"},
+        "responses_create_params": {"input": []},
+    }
+    result = {
+        "response": {"output": original_output},
+        "responses_create_params": {"input": []},
+    }
+
+    class RolloutHelper:
+        def run_examples(self, *, examples, head_server_config):
+            async def completed():
+                return examples[0], result
+
+            return [asyncio.create_task(completed())]
+
+    actor_class = NemoGym.__ray_metadata__.modified_class
+    actor = actor_class(
+        NemoGymConfig(model_name="model", base_urls=[], initial_global_config_dict={})
+    )
+    actor.rh = object()
+    actor.rch = RolloutHelper()
+    actor.head_server_config = object()
+    actor._resolved_gym_config = {}
+    actor._token_capture_source = object()
+
+    def postprocess(row, finalized_result, tokenizer, **kwargs):
+        assert finalized_result["response"]["output"] is rebuilt_output
+        assert kwargs["media_output_items"] is original_output
+        return {"message_log": []}
+
+    actor._postprocess_nemo_gym_to_nemo_rl_result = postprocess
+
+    rollouts = actor.run_rollouts([row], object(), "test")
+    await anext(rollouts)
+    assert events == ["finalize"]
+
+    with pytest.raises(StopAsyncIteration):
+        await anext(rollouts)
+    assert events == ["finalize", "retire"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_the_token_source_before_gym_servers():
+    events = []
+
+    class Source:
+        async def close(self):
+            events.append("source")
+
+    class RunHelper:
+        def shutdown(self):
+            events.append("servers")
+
+    actor_class = NemoGym.__ray_metadata__.modified_class
+    actor = actor_class(
+        NemoGymConfig(model_name="model", base_urls=[], initial_global_config_dict={})
+    )
+    actor._token_capture_source = Source()
+    actor.rh = RunHelper()
+
+    await actor.shutdown()
+
+    assert events == ["source", "servers"]
