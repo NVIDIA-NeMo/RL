@@ -77,10 +77,10 @@ policy:
     vllm_kwargs:
       revision: ${policy.hf_config_overrides.revision}
     colocated:
-      enabled: false
+      enabled: true
       resources:
-        gpus_per_node: 1
-        num_nodes: 1
+        gpus_per_node: null
+        num_nodes: null
 
 data:
   max_input_seq_length: null
@@ -127,8 +127,8 @@ logger:
   tensorboard_enabled: true
   monitor_gpus: true
 
-# The H100 functional runner exposes two GPUs: one stays with non-colocated
-# vLLM above and the other runs the FSDP2 policy/optimizer.
+# The H100 functional runner exposes two GPUs. Colocation lets FSDP2 shard the
+# full-parameter policy and optimizer across both while vLLM shares that cluster.
 cluster:
   gpus_per_node: 2
   num_nodes: 1
