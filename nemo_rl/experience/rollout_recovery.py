@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 5
 _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
@@ -65,7 +65,14 @@ _GROUP_STATE_FIELDS = frozenset(
 _PROMPT_REF_STATE_FIELDS = frozenset({"sample_id", "task_name"})
 _SIBLING_STATE_FIELDS = frozenset({"generation_index", "attempts"})
 _ATTEMPT_STATE_FIELDS = frozenset(
-    {"attempt_uuid", "status", "receipt", "reward", "staging_keys"}
+    {
+        "attempt_uuid",
+        "status",
+        "receipt",
+        "reward",
+        "mask_sample",
+        "staging_keys",
+    }
 )
 
 
@@ -168,6 +175,7 @@ class RolloutAttemptRecord:
     status: RolloutAttemptStatus
     receipt: Optional[dict[str, Any]] = None
     reward: Optional[float] = None
+    mask_sample: Optional[bool] = None
     staging_keys: list[str] = field(default_factory=list)
 
     @property
@@ -272,6 +280,7 @@ class SiblingSealResult:
     # into a masked placeholder, matching the base token-capture contract.
     receipt: Optional[dict[str, Any]]
     reward: float
+    mask_sample: bool = False
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -567,6 +576,7 @@ class RolloutRecoveryLedger:
         gate_rollout_id: str,
         receipt: Optional[dict[str, Any]],
         reward: float,
+        mask_sample: bool = False,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -577,6 +587,8 @@ class RolloutRecoveryLedger:
         attempt = sibling.current_attempt
         expected_gate_rollout_id = record.gate_rollout_id(generation_index)
         staging_keys = _receipt_staging_keys(receipt)
+        if not isinstance(mask_sample, bool):
+            raise TypeError("mask_sample must be a bool")
         if gate_rollout_id != expected_gate_rollout_id:
             raise ValueError(
                 "streamed rollout identity mismatch: "
@@ -591,6 +603,7 @@ class RolloutRecoveryLedger:
             if (
                 attempt.receipt == receipt
                 and attempt.reward == float(reward)
+                and attempt.mask_sample is mask_sample
                 and attempt.staging_keys == staging_keys
             ):
                 return
@@ -607,6 +620,7 @@ class RolloutRecoveryLedger:
 
         attempt.receipt = copy.deepcopy(receipt)
         attempt.reward = float(reward)
+        attempt.mask_sample = mask_sample
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
@@ -666,6 +680,8 @@ class RolloutRecoveryLedger:
                     f"receipt={result.receipt.get('rollout_id')!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
+            if not isinstance(result.mask_sample, bool):
+                raise TypeError("mask_sample must be a bool")
             validated.append((attempt, result, _receipt_staging_keys(result.receipt)))
 
         # Validate the complete cohort before changing any sibling. A checkpoint
@@ -673,6 +689,7 @@ class RolloutRecoveryLedger:
         for attempt, result, staging_keys in validated:
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.reward = float(result.reward)
+            attempt.mask_sample = result.mask_sample
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
@@ -710,8 +727,14 @@ class RolloutRecoveryLedger:
 
     def finalization_inputs(
         self, group_id: str
-    ) -> tuple[list[str], list[str], list[Optional[dict[str, Any]]], list[float]]:
-        """Return physical IDs, canonical IDs, receipts and rewards in sibling order."""
+    ) -> tuple[
+        list[str],
+        list[str],
+        list[Optional[dict[str, Any]]],
+        list[float],
+        list[bool],
+    ]:
+        """Return sealed finalization inputs in stable sibling order."""
         record = self._require_group(group_id)
         if record.status != PromptGroupStatus.READY_TO_FINALIZE:
             raise ValueError(
@@ -719,9 +742,14 @@ class RolloutRecoveryLedger:
             )
         receipts: list[Optional[dict[str, Any]]] = []
         rewards: list[float] = []
+        mask_sample: list[bool] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
-            if attempt.status != RolloutAttemptStatus.SEALED or attempt.reward is None:
+            if (
+                attempt.status != RolloutAttemptStatus.SEALED
+                or attempt.reward is None
+                or attempt.mask_sample is None
+            ):
                 raise ValueError(
                     "logical rollout "
                     f"{record.logical_rollout_id(sibling.generation_index)!r} "
@@ -729,11 +757,13 @@ class RolloutRecoveryLedger:
                 )
             receipts.append(copy.deepcopy(attempt.receipt))
             rewards.append(attempt.reward)
+            mask_sample.append(attempt.mask_sample)
         return (
             record.gate_rollout_ids,
             record.logical_rollout_ids,
             receipts,
             rewards,
+            mask_sample,
         )
 
     def mark_finalization_started(
@@ -834,6 +864,7 @@ class RolloutRecoveryLedger:
                                     "status": attempt.status.value,
                                     "receipt": copy.deepcopy(attempt.receipt),
                                     "reward": attempt.reward,
+                                    "mask_sample": attempt.mask_sample,
                                     "staging_keys": list(attempt.staging_keys),
                                 }
                                 for attempt in sibling.attempts
@@ -1020,6 +1051,7 @@ class RolloutRecoveryLedger:
                     ) from error
                 receipt = attempt_state.get("receipt")
                 reward = attempt_state.get("reward")
+                mask_sample = attempt_state.get("mask_sample")
                 staging_keys = attempt_state.get("staging_keys")
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
@@ -1028,6 +1060,8 @@ class RolloutRecoveryLedger:
                 if attempt_status == RolloutAttemptStatus.SEALED:
                     if not isinstance(reward, (int, float)):
                         raise ValueError("sealed attempts require a reward")
+                    if not isinstance(mask_sample, bool):
+                        raise ValueError("sealed attempts require a boolean mask_sample")
                     if receipt is None:
                         if staging_keys:
                             raise ValueError(
@@ -1042,7 +1076,12 @@ class RolloutRecoveryLedger:
                         raise ValueError(
                             "sealed attempt receipt must be a mapping or None"
                         )
-                elif receipt is not None or reward is not None or staging_keys:
+                elif (
+                    receipt is not None
+                    or reward is not None
+                    or mask_sample is not None
+                    or staging_keys
+                ):
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
                     RolloutAttemptRecord(
@@ -1050,6 +1089,7 @@ class RolloutRecoveryLedger:
                         status=attempt_status,
                         receipt=copy.deepcopy(receipt),
                         reward=float(reward) if reward is not None else None,
+                        mask_sample=mask_sample,
                         staging_keys=list(staging_keys),
                     )
                 )

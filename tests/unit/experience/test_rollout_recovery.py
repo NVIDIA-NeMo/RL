@@ -556,6 +556,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
+            mask_sample=True,
         )
     )
 
@@ -621,6 +622,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
                         gate_rollout_id=gate_ids[generation_index],
                         receipt=receipt,
                         reward=float(generation_index),
+                        mask_sample=generation_index == 0,
                     )
                 )
             )
@@ -634,6 +636,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
                         gate_rollout_id=gate_ids[generation_index],
                         receipt=receipt,
                         reward=float(generation_index),
+                        mask_sample=generation_index == 0,
                     )
                     for generation_index, receipt in enumerate(receipts)
                 },
@@ -642,12 +645,15 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
 
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger.from_state_dict(state)
-    physical_ids, _, restored_receipts, rewards = restored.finalization_inputs("g7")
+    physical_ids, _, restored_receipts, rewards, mask_sample = (
+        restored.finalization_inputs("g7")
+    )
 
     assert physical_ids == gate_ids
     assert restored_receipts[0] is None
     assert restored_receipts[1] == receipts[1]
     assert rewards == [0.0, 1.0]
+    assert mask_sample == [True, False]
 
     state["schema_version"] = 3
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):

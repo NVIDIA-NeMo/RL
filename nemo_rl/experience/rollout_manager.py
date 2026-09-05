@@ -2065,12 +2065,18 @@ class RolloutManager:
                     f"receipt={receipt.get('rollout_id')!r}, "
                     f"expected={gate_rollout_id!r}"
                 )
+            mask_sample = bool(
+                (((completion.env_extras or {}).get("instance_config") or {}).get(
+                    MASK_SAMPLE, False
+                ))
+            )
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
                     gate_rollout_id=gate_rollout_id,
                     receipt=receipt,
                     reward=completion.reward,
+                    mask_sample=mask_sample,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2099,19 +2105,8 @@ class RolloutManager:
                     gate_rollout_id=gate_rollout_id,
                     receipt=receipt,
                     reward=completion.reward,
+                    mask_sample=mask_sample,
                 )
-
-        mask_sample_by_index: dict[int, bool] = {}
-
-        async def _record_completion(
-            generation_index: int, completion: Completion
-        ) -> None:
-            mask_sample_by_index[generation_index] = bool(
-                (((completion.env_extras or {}).get("instance_config") or {}).get(
-                    MASK_SAMPLE, False
-                ))
-            )
-            await _record_streamed_completion(generation_index, completion)
 
         try:
             if inflight_registry is not None:
@@ -2130,7 +2125,7 @@ class RolloutManager:
                         attempt_input_sample,
                         rollout_ids=list(rollout_ids),
                         generation_indices=pending_indices,
-                        on_completion=_record_completion,
+                        on_completion=_record_streamed_completion,
                         recovery_granularity=recovery_group.recovery_granularity,
                     )
             finally:
@@ -2141,6 +2136,7 @@ class RolloutManager:
                 canonical_sample_ids,
                 receipts,
                 rewards,
+                mask_sample,
             ) = self._recovery_ledger.finalization_inputs(group_id)
             request = ReassemblyRequest(
                 group_id=group_id,
@@ -2150,10 +2146,7 @@ class RolloutManager:
                 rewards=tuple(rewards),
                 fallback_weight_version=start_version,
                 prompt_idx=int(recovery_group.prompt_id),
-                mask_sample=tuple(
-                    mask_sample_by_index.get(index, False)
-                    for index in range(len(receipts))
-                ),
+                mask_sample=tuple(mask_sample),
             )
             from nemo_rl.experience.rollout_reassembler_actor import (
                 assert_metadata_only,
