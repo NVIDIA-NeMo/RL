@@ -29,6 +29,7 @@ policy:
   max_total_sequence_length: 30720
   refit_buffer_size_gb: 4
   quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
+  quant_fold_frozen_weight_snap: false
   dtensor_cfg:
     enabled: false
   optimizer: null
