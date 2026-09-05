@@ -963,7 +963,10 @@ class DTensorPolicyWorkerImpl(
                             loss.backward()
 
                     if num_valid_samples > 0:
-                        mb_losses.append(loss.item())
+                        # Metrics were materialized together by the loss;
+                        # undo this worker's per-global-batch scaling without
+                        # synchronizing the loss tensor again.
+                        mb_losses.append(loss_metrics["loss"] * num_global_batches)
                         all_mb_metrics.append(loss_metrics)
 
                 grad_norm: Optional[float | torch.Tensor] = None
