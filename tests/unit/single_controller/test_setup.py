@@ -513,6 +513,21 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_token_capture_rejects_message_level_advantage_penalties(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.grpo.invalid_tool_call_advantage = -5.0
+
+        with pytest.raises(
+            NotImplementedError, match="token-capture finalizer does not emit"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
     def test_resolves_and_passes_reward_penalties(self, patched_factories):
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=0)
@@ -781,6 +796,11 @@ class TestSetup:
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
             ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
+            (
+                "deferred_routes_without_capture",
+                ValueError,
+                "defer_routed_experts_to_policy requires",
+            ),
         ],
     )
     def test_invalid_config_fails_before_setup_factories(
@@ -800,6 +820,9 @@ class TestSetup:
         elif invalid_case == "buffer_capacity":
             mc = _make_master_config()
             mc.async_rl.max_buffered_rollouts = 7
+        elif invalid_case == "deferred_routes_without_capture":
+            mc = _make_master_config()
+            mc.token_capture.defer_routed_experts_to_policy = True
         elif invalid_case == "megatron_dtensor_trainer":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
@@ -904,6 +927,7 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
+        assert actor_args.finalizer_actors == []
         actor_args.dp_client.register_partition.assert_called_once()
         warmup = actor_args.dp_client.register_partition.call_args.kwargs
         assert warmup["partition_id"] == "rollout_data"
@@ -1154,8 +1178,55 @@ class TestSetup:
             tokenizer=tokenizer,
             enable_router_replay=False,
             use_fastokens=False,
+            token_capture=None,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+
+    def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        # Extend, don't replace: setup_single_controller also indexes the
+        # wandb keys that _make_master_config populates.
+        mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
+        mc.token_capture.enabled = True
+        mc.token_capture.num_reassembler_workers = 3
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+        fake_actors = [MagicMock(name=f"finalizer_{index}") for index in range(3)]
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=fake_actors,
+            ) as mock_create_finalizer_actors,
+        ):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        (actor_dp_config, actor_config), actor_kwargs = (
+            mock_create_finalizer_actors.call_args
+        )
+        assert actor_dp_config == mc.data_plane
+        assert actor_config.partition_id == "rollout_data"
+        assert actor_config.staging_partition == mc.token_capture.staging_partition
+        assert actor_config.pad_token_id == 9
+        assert actor_kwargs == {"num_workers": 3}
+        assert actor_args.finalizer_actors == fake_actors
+        assert not hasattr(actor_args.rollout_manager, "_finalizer")
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""
