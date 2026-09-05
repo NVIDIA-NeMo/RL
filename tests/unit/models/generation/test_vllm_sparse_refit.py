@@ -558,6 +558,8 @@ async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     worker._sparse_refit_receiver = MagicMock()
     worker.cfg = {"vllm_cfg": {"expose_http_server": False}}
     worker._mtp_load_from_disk = False
+    worker._mtp_speculative_enabled = True
+    worker._mtp_weights_from_refit = False
     worker.report_device_id_async = AsyncMock(return_value=["0"])
     worker.llm = MagicMock()
     worker.llm.collective_rpc = AsyncMock(return_value=["node-0", "node-0"])
@@ -573,6 +575,7 @@ async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     )
     assert worker.llm.collective_rpc.await_args_list == [
         call("bind_numa", args=()),
+        call("configure_mtp_drafter_weight_source", args=(False,)),
         call("report_node_hostname", args=()),
     ]
 
@@ -581,6 +584,8 @@ def test_sync_post_init_binds_numa() -> None:
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     worker._sparse_refit_receiver = None
     worker._mtp_load_from_disk = False
+    worker._mtp_speculative_enabled = True
+    worker._mtp_weights_from_refit = False
     worker.report_device_id = MagicMock(return_value=["0"])
     worker.llm = MagicMock()
 
@@ -589,6 +594,7 @@ def test_sync_post_init_binds_numa() -> None:
     assert worker.vllm_device_ids == ["0"]
     assert worker.llm.collective_rpc.call_args_list == [
         call("bind_numa", args=()),
+        call("configure_mtp_drafter_weight_source", args=(False,)),
     ]
 
 

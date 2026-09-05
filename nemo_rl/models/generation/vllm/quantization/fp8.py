@@ -14,7 +14,7 @@
 
 import os
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from unittest.mock import patch
 
@@ -303,8 +303,15 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [name for name, _ in model.named_parameters()]
+        get_text_config = getattr(config, "get_text_config", None)
+        text_config = (
+            get_text_config()
+            if callable(get_text_config)
+            else getattr(config, "text_config", config)
+        )
+        num_hidden_layers = text_config.num_hidden_layers
 
         bf16_params = []
         if num_first_layers_in_bf16 > 0:
@@ -315,8 +322,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             layers = [
                 l
                 for l in range(
-                    config.num_hidden_layers - num_last_layers_in_bf16,
-                    config.num_hidden_layers,
+                    num_hidden_layers - num_last_layers_in_bf16,
+                    num_hidden_layers,
                 )
             ]
             bf16_params.extend(_get_params_in_layers(param_names, layers))
@@ -332,7 +339,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         )
     if quantization_ignored_layer_kws:
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [
             f"model.{name}".removesuffix(".weight").replace(
                 "model.backbone.", "backbone."
@@ -538,7 +545,12 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
-def load_weights(weights, model_runner):
+def load_weights(
+    weights,
+    model_runner,
+    *,
+    model_load_weights: Callable[..., object] | None = None,
+):
     global global_fp8_config
     weights_quantized = []
     model = model_runner.model
@@ -591,8 +603,11 @@ def load_weights(weights, model_runner):
         else:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_inv", param_scale])
-    # Finally load the weights into vllm
-    model.load_weights(weights_quantized)
+    # Finally load the weights into vllm. Native layerwise reload callers pass
+    # a wrapper that keeps deferred weight-loader tensors off reusable buffers.
+    if model_load_weights is None:
+        model_load_weights = model.load_weights
+    model_load_weights(weights_quantized)
 
 
 def cast_tensor_to_fp8_blockwise(
