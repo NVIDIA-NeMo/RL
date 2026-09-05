@@ -52,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _startup_pipeline_ready,
     _training_sampling_params_from_generation_config,
+    _validate_fused_linear_logprobs_sampling,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -128,6 +129,20 @@ def test_training_sampling_params_from_generation_config_normalizes_greedy() -> 
     assert params.temperature == 1.0
     assert params.top_k is None
     assert params.top_p == 1.0
+    _validate_fused_linear_logprobs_sampling(generation_config)
+
+
+@pytest.mark.parametrize("temperature", [0.5, 1e-2])
+def test_fused_linear_logprobs_reject_non_unit_temperature(
+    temperature: float,
+) -> None:
+    generation_config = cast(
+        GenerationConfig,
+        {"top_k": None, "top_p": 1.0, "temperature": temperature},
+    )
+
+    with pytest.raises(AssertionError, match="non-unit training-time temperature"):
+        _validate_fused_linear_logprobs_sampling(generation_config)
 
 
 def test_save_async_replay_buffer_checkpoint(tmp_path):

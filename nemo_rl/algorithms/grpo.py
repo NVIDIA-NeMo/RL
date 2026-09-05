@@ -532,6 +532,28 @@ def _training_sampling_params_from_generation_config(
     )
 
 
+def _validate_fused_linear_logprobs_sampling(
+    generation_config: GenerationConfig,
+) -> None:
+    """Reject sampling transforms unsupported by fused Megatron logprobs."""
+    sampling_params = _training_sampling_params_from_generation_config(
+        generation_config
+    )
+    assert sampling_params.temperature == 1.0, (
+        "Linear CE fusion loss is not supported with non-unit training-time "
+        "temperature for GRPO. The fused path computes logprobs before "
+        "temperature scaling. Set policy.megatron_cfg.use_fused_linear_logprobs=false, "
+        "or set policy.generation.temperature to 1.0 (or 0.0 for greedy generation)."
+    )
+    assert not need_top_k_or_top_p_filtering(sampling_params), (
+        "Linear CE fusion loss is not supported with top-k/top-p training-time "
+        "filtering for GRPO. The fused path computes logprobs from unfiltered "
+        "logits. Set policy.megatron_cfg.use_fused_linear_logprobs=false, or "
+        "disable filtering (policy.generation.top_k=null, "
+        "policy.generation.top_p=1.0)."
+    )
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -780,15 +802,7 @@ def setup(
         # (unfiltered) logits, so top-k/top-p training-time filtering cannot be
         # applied. This also keeps prev/reference logprobs (computed via the fused
         # get_logprobs path) consistent with the actor logprobs.
-        assert not need_top_k_or_top_p_filtering(
-            _training_sampling_params_from_generation_config(generation_config)
-        ), (
-            "Linear CE fusion loss is not supported with top-k/top-p training-time "
-            "filtering for GRPO. The fused path computes logprobs from unfiltered "
-            "logits. Set policy.megatron_cfg.use_fused_linear_logprobs=false, or "
-            "disable filtering (policy.generation.top_k=null, "
-            "policy.generation.top_p=1.0)."
-        )
+        _validate_fused_linear_logprobs_sampling(generation_config)
 
     loss_fn = ClippedPGLossFn(
         loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
