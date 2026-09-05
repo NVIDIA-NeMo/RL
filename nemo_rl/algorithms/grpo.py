@@ -722,6 +722,8 @@ def setup(
             flush=True,
         )
 
+    _validate_training_bounds(grpo_config, train_sample_count)
+
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
@@ -2662,6 +2664,34 @@ def _placeholder_seq_logprob_error_metrics() -> dict[str, float]:
     }
 
 
+def _validate_training_bounds(grpo_config: GRPOConfig, train_sample_count: int) -> None:
+    """Reject bounds that would train zero steps, before anything is allocated.
+
+    Both trainers gate on ``current_epoch < max_num_epochs`` and the async one
+    additionally clamps ``max_num_steps`` to ``max_num_epochs * len(dataloader)``,
+    so either operand at zero ends the run having trained nothing -- silently, in
+    every path but one.
+    """
+    # Not the -1 convention v1 async PPO uses: GRPO has never had a sentinel for
+    # an unbounded epoch count, and `None` is the shape upstream reaches for
+    # elsewhere when it wants one.
+    if grpo_config.max_num_epochs <= 0:
+        raise ValueError(
+            f"grpo.max_num_epochs={grpo_config.max_num_epochs} trains zero steps: "
+            "the training loop gates on current_epoch < max_num_epochs, and GRPO "
+            "has no -1 convention. Set a positive grpo.max_num_epochs and bound "
+            "the run with grpo.max_num_steps."
+        )
+    if train_sample_count == 0:
+        raise ValueError(
+            "The training dataloader yields 0 batches, so the run is bounded at 0 "
+            "steps. The dataloader drops the last partial batch, so a dataset "
+            "smaller than grpo.num_prompts_per_step="
+            f"{grpo_config.num_prompts_per_step} yields none at all. Lower "
+            "grpo.num_prompts_per_step or use a larger dataset."
+        )
+
+
 def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
     """Reject ``use_kl_in_reward`` when the KL term would read zero placeholder logprobs.
 
@@ -4523,13 +4553,13 @@ def async_grpo_train(
 
     # Training state
     step = grpo_save_state.current_step
-    max_num_epochs = master_config.grpo.max_num_epochs
-    if max_num_epochs is not None and max_num_epochs > 0:
-        master_config.grpo.max_num_steps = min(
-            master_config.grpo.max_num_steps,
-            max_num_epochs * len(dataloader),
-        )
-    max_num_steps = master_config.grpo.max_num_steps
+    # Bound the loop locally: master_config is written into every checkpoint, so
+    # a value derived here does not belong in it. setup() has already rejected
+    # the bounds that would make this zero.
+    max_num_steps = min(
+        master_config.grpo.max_num_steps,
+        master_config.grpo.max_num_epochs * len(dataloader),
+    )
     if step >= max_num_steps:
         print(
             "Async GRPO training is already complete: "
@@ -4883,7 +4913,7 @@ def async_grpo_train(
             step=step,
             num_prompts_per_step=num_prompts_per_step,
             max_trajectory_age_steps=max_trajectory_age_steps,
-            max_num_steps=master_config.grpo.max_num_steps,
+            max_num_steps=max_num_steps,
         )
         if current_step_ready and not pipeline_ready:
             print(
