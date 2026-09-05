@@ -261,8 +261,12 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
-    # Recomputes the KV cache after weight updates.
-    recompute_kv_cache_after_weight_updates: bool = False
+    # In-flight refits: preempt in-flight requests and recompute their KV with the
+    # new weights (also clears the prefix cache). False keeps their pre-update KV
+    # (Magistral-style) AND leaves the prefix cache stale across weight updates,
+    # which grows train-vs-rollout mismatch when prompts share prefixes; the
+    # collector warns in that case. Drained refits always invalidate caches.
+    recompute_kv_cache_after_weight_updates: bool = True
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
