@@ -219,6 +219,31 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     )
 
 
+@patch("nemo_rl.algorithms.grpo.time.monotonic", side_effect=[100.0, 101.0, 120.0])
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_refit_policy_generation_shares_one_deadline_across_legacy_ipc_waits(
+    mock_ray: MagicMock,
+    _mock_monotonic: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    policy_generation = MagicMock()
+    policy_generation.weight_synchronizer = None
+    policy_generation.cfg = {"refit_timeout_s": 300.0}
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=True,
+        _refit_buffer_size_gb=1.0,
+    )
+
+    assert [call.kwargs["timeout"] for call in mock_ray.get.call_args_list] == [
+        299.0,
+        280.0,
+    ]
+
+
 class TestMaskSampleFilter:
     def test_masks_env_flagged_samples(self):
         repeated_batch = BatchedDataDict(

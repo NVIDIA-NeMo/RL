@@ -948,3 +948,39 @@ class TestFactory:
                 colocated=True,
                 refit_buffer_size_gb=0,
             )
+
+    def test_generation_config_refit_timeout_reaches_nccl_reshard(self):
+        gen = _mock_generation()
+        gen.cfg = {
+            "refit_transport": "nccl_reshard",
+            "refit_timeout_s": 300.0,
+        }
+
+        sync = create_weight_synchronizer(
+            policy=_mock_policy(),
+            generation=gen,
+            generation_backend=VLLM_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert isinstance(sync, NcclReshardWeightSynchronizer)
+        assert sync._refit_timeout_s == 300.0
+
+    @pytest.mark.parametrize("timeout", [0, -1.0])
+    def test_generation_config_rejects_nonpositive_refit_timeout(
+        self, timeout: float
+    ) -> None:
+        gen = _mock_generation()
+        gen.cfg = {"refit_timeout_s": timeout}
+
+        with pytest.raises(ValueError, match="refit_timeout_s must be > 0"):
+            create_weight_synchronizer(
+                policy=_mock_policy(),
+                generation=gen,
+                generation_backend=VLLM_BACKEND,
+                colocated=False,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
+            )
