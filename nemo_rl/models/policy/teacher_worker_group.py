@@ -80,7 +80,9 @@ def create_teacher_configs_from_opd_config(
             continue
         seen_models.add(model_name)
 
-        # defaults <- per-alias override, then validated/typed by the schema.
+        # defaults <- per-alias override, then schema-validated. Partial blocks
+        # are honored as written; set gpus_per_node in default_teacher_cfg to
+        # match the cluster (the schema default is 8).
         merged = {**default_cfg, **dict(overrides.get(alias, {}))}
         res = TeacherResourceConfig(**merged)
 
@@ -149,6 +151,19 @@ class TeacherWorkerGroup:
         # Apply any additional megatron config overrides from teacher config.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
+
+        # A teacher's MODEL comes from its own checkpoint: only keys the user
+        # explicitly wrote for this teacher may be applied onto its model
+        # provider. The clone of the student's config above is kept only for
+        # data-pipeline fields (packing, chunking, precision, ...), which must
+        # match the student's batches; its model-architecture keys (towers,
+        # mtp, ...) must not leak onto a possibly different architecture.
+        # setup.py / community_import.py consult this allowlist when building
+        # teacher providers; student configs carry no allowlist and behave as
+        # before.
+        cfg["megatron_cfg"]["_provider_override_allowlist"] = sorted(
+            teacher_cfg.megatron_cfg_overrides.keys()
+        )
 
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.
