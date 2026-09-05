@@ -18,8 +18,8 @@ from typing import Any, Callable, Optional, TypeVar
 import torch
 import torch.distributed
 
-from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
