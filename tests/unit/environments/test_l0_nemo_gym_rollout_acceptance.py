@@ -471,7 +471,9 @@ def l0_nemo_gym(scripted_openai_base_url):
         yield env
     finally:
         try:
-            ray.get(env.shutdown.remote(), timeout=10)
+            # The shared actor owns many Gym subprocesses, which are reaped
+            # sequentially during graceful shutdown.
+            ray.get(env.shutdown.remote(), timeout=60)
         finally:
             ray.kill(env)
 
