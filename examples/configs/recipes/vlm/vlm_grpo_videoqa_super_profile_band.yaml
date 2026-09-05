@@ -3,6 +3,7 @@ defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-asyn
 cluster:
   num_nodes: 32
   gpus_per_node: 4
+  segment_size: 8
 
 grpo:
   num_prompts_per_step: 128
@@ -35,6 +36,7 @@ grpo:
       profile_band_reasoning: true
       profile_band_answer: false
     profile_band:
+      enabled: true
       defaults:
         reasoning:
           a: 1024
@@ -55,8 +57,8 @@ checkpointing:
   # nonexistent validation metric.
   metric_name: null
   higher_is_better: true
-  save_period: 1
-  keep_top_k: 5
+  save_period: 5
+  keep_top_k: 2
   save_optimizer: true
   save_replay_buffer: false
 
@@ -71,10 +73,10 @@ policy:
   # Bridge learned to infer an omitted separate_video_embedder flag.
   hf_config_overrides:
     video_temporal_patch_size: 2
-    # Match the preprocessing contract stored in the stage-2 checkpoint.
-    # The vLLM compatibility patch reads these top-level overrides.
+    # vLLM resolves CAPRL frames onto a square 16x16 grid. Match that grid on
+    # the Megatron side; rollout tokens remain the authoritative trajectory.
     video_target_num_patches: 1024
-    video_maintain_aspect_ratio: true
+    video_maintain_aspect_ratio: false
   tokenizer:
     name: ${policy.model_name}
     # Use the tokenizer and template bundled with the stage-2 iter3159 checkpoint.
@@ -91,6 +93,7 @@ policy:
   megatron_cfg:
     empty_unused_memory_level: 2
     activation_checkpointing: true
+    recompute_granularity: full
     checkpoint:
       # Avoid CUDA IPC OOMs in the asynchronous checkpoint subprocess.
       async_save: false
@@ -106,7 +109,10 @@ policy:
     # same fp32/TF32 path. BF16 logit rounding is the dominant source of
     # generation-vs-training multiplicative probability error.
     fp32_lm_head: tf32
-    fp32_residual_connection: true
+    # The stage-2 checkpoint has llm_config.residual_in_fp32=false. Keep the
+    # policy residual path matched to vLLM; a one-sided fp32 override produces
+    # age-zero logprob divergence on sharp SA-V coordinate tokens.
+    fp32_residual_connection: false
     radio_force_cpe_eval_mode: true
     freeze_vision_model: true
     freeze_vision_projection: true
@@ -127,17 +133,17 @@ policy:
     # mtp_loss_scaling_factor: 0.1
     # mtp_detach_heads: true
   generation:
-    # vLLM's Nemotron video processor reads these fields exclusively from
-    # the nested vision_config. The checkpoint carries them only in
-    # preprocessor_config.json, while the policy processor already honors
-    # that file. Apply a rollout-only nested override so both engines use
-    # the same aspect-preserving 252-feature tubelets instead of repairing
-    # vLLM's square 256-feature placeholder runs after generation.
+    # Keep the generation-side processor on the same square video grid.
     hf_subconfig_overrides:
+      llm_config:
+        # Match policy.megatron_cfg.fp32_residual_connection above. The source
+        # checkpoint is also false; spelling this out makes the two-engine
+        # precision contract explicit and independently validated.
+        residual_in_fp32: false
       vision_config:
         video_temporal_patch_size: 2
         video_target_num_patches: 1024
-        video_maintain_aspect_ratio: true
+        video_maintain_aspect_ratio: false
     max_new_tokens: 16384
     temperature: 1.0
     top_p: 1.0
@@ -169,7 +175,6 @@ policy:
         sampling_style: nemotron_vl
         num_frames: 64
         temporal_patch_size: 2
-      reset_mm_cache_after_refit: false
       http_server_serving_chat_kwargs:
         # null delegates prompt rendering to the checkpoint tokenizer/template.
         chat_template: null
@@ -216,18 +221,16 @@ data:
     num_frames: 64
     video_temporal_patch_size: 2
     video_target_num_patches: 1024
-    video_maintain_aspect_ratio: true
+    video_maintain_aspect_ratio: false
     # Keep still-image tiling at the checkpoint processor's default. This
     # preserves SA-V spatial detail; CAPRL rows use the native-video path above.
 
 env:
   should_log_nemo_gym_responses: false
-  reject_generated_media_tokens: true
   nemo_gym:
     policy_max_input_tokens: ${policy.max_total_sequence_length}
     skip_venv_if_present: true
     pad_dynamic_image_shapes: true
-    debug_gen_timing: true
     config_paths:
       - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
       - resources_servers/mcqa/configs/mcqa.yaml
