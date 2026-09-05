@@ -116,6 +116,7 @@ _WORKPLACE_ARGUMENTS = {
 }
 _BYTE_TOKEN_OFFSET = 3
 _CONTINUATION_MARKER = "\x02nemo-rl-continuation\x00"
+_REJECTED_ROLLOUT_MARKER = "[NEMO_RL_L0_REJECTED_ROLLOUT]"
 
 
 def _tool_call_message(
@@ -231,10 +232,31 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
     def _message_for(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
         serialized_body = json.dumps(body)
         if "GOLD:" in serialized_body and "CANDIDATE:" in serialized_body:
+            if r"\\boxed{Ada Lovelace}" in serialized_body:
+                content = "The candidate does not match the reference.\n\n[[A!=B]]"
+                return {"role": "assistant", "content": content}, content
             return {
                 "role": "assistant",
                 "content": _EQUIVALENCE_JUDGE_COMPLETION,
             }, _EQUIVALENCE_JUDGE_COMPLETION
+        if _REJECTED_ROLLOUT_MARKER in serialized_body:
+            if "1000 digit numbers" in serialized_body:
+                content = r"\boxed{999999}"
+            elif "python programming language only" in serialized_body:
+                content = "```python\nprint(0)\n```"
+            elif "SHOW24" in serialized_body and "Medical Zone" in serialized_body:
+                content = "I cannot call the requested tool."
+            elif "cystic fibrosis" in serialized_body:
+                content = r"\boxed{A}"
+            elif "theory of evolution by natural selection" in serialized_body:
+                content = r"\boxed{Ada Lovelace}"
+            elif "Dizer Kola" in serialized_body:
+                content = "I cannot extract that."
+            elif "Task Update on Develop prototype" in serialized_body:
+                content = "Done"
+            else:
+                raise AssertionError("L0 rejected policy received an unrecognized prompt")
+            return {"role": "assistant", "content": content}, content
         if "1000 digit numbers" in serialized_body:
             content = r"\boxed{32}"
             return {"role": "assistant", "content": content}, content
@@ -345,6 +367,7 @@ def _load_acceptance_cases() -> list[dict[str, Any]]:
         "example_sha256",
         "agent_ref",
         "expected_generations",
+        "rejected_generations",
         "expected_prompt_fragment",
         "expected_result",
         "expected_reward",
@@ -371,8 +394,11 @@ def _load_acceptance_cases() -> list[dict[str, Any]]:
         )
         assert case["agent_ref"].keys() >= {"type", "name"}
         assert case["expected_generations"]
+        assert case["rejected_generations"]
         assert all(
-            isinstance(generation, str) for generation in case["expected_generations"]
+            isinstance(generation, str)
+            for key in ("expected_generations", "rejected_generations")
+            for generation in case[key]
         )
         assert math.isfinite(case["expected_reward"])
 
@@ -427,12 +453,18 @@ def test_l0_scripted_multiturn_tokens_are_contiguous():
     )
 
 
-def _load_case_datum(case: dict[str, Any]) -> DatumSpec:
+def _load_case_datum(case: dict[str, Any], *, accepted: bool) -> DatumSpec:
     dataset = NemoGymDataset(str(_GYM_ROOT / case["data_path"]))
     datum = nemo_gym_data_processor(
         dataset.dataset[case["example_index"]], None, None, None, 0
     )
     datum["extra_env_info"]["agent_ref"] = deepcopy(case["agent_ref"])
+    if not accepted:
+        input_items = datum["extra_env_info"]["responses_create_params"]["input"]
+        final_user_item = next(
+            item for item in reversed(input_items) if item.get("role") == "user"
+        )
+        final_user_item["content"] += f"\n\n{_REJECTED_ROLLOUT_MARKER}"
     return datum
 
 
@@ -481,12 +513,17 @@ def l0_nemo_gym(scripted_openai_base_url):
 @pytest.mark.nemo_gym
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("case", _L0_CASES, ids=[case["name"] for case in _L0_CASES])
-def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "rejected"])
+def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepted):
     """A pinned Gym example must preserve its contract across the NeMo RL boundary."""
     tokenizer = ByT5Tokenizer()
+    expected_generations = case[
+        "expected_generations" if accepted else "rejected_generations"
+    ]
+    expected_reward = case["expected_reward"] if accepted else 0.0
     result = run_nemo_gym_rollout_sync(
         policy_generation=_ScriptedPolicyGeneration(),
-        input_batch=rl_collate_fn([_load_case_datum(case)]),
+        input_batch=rl_collate_fn([_load_case_datum(case, accepted=accepted)]),
         tokenizer=tokenizer,
         task_to_env={"nemo_gym": l0_nemo_gym},
         max_seq_len=_GENERATION_CONFIG["max_total_sequence_length"],
@@ -500,7 +537,7 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
 
     reward = final_batch["total_reward"].item()
     assert math.isfinite(reward)
-    assert reward == pytest.approx(case["expected_reward"])
+    assert reward == pytest.approx(expected_reward)
     assert final_batch["length"].item() > 0
 
     assistant_messages = [
@@ -509,9 +546,9 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
         if message["role"] == "assistant"
     ]
     assert assistant_messages
-    assert len(assistant_messages) == len(case["expected_generations"])
+    assert len(assistant_messages) == len(expected_generations)
     for message, generation in zip(
-        assistant_messages, case["expected_generations"], strict=True
+        assistant_messages, expected_generations, strict=True
     ):
         assert isinstance(message["token_ids"], torch.Tensor)
         assert isinstance(message["generation_logprobs"], torch.Tensor)
@@ -532,36 +569,40 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
     full_result_table = result.rollout_metrics[full_result_key]
     assert len(full_result_table.data) == 1
     full_result = json.loads(full_result_table.data[0][0])
-    for field, expected_value in case["expected_result"].items():
-        assert full_result[field] == expected_value
+    if accepted:
+        for field, expected_value in case["expected_result"].items():
+            assert full_result[field] == expected_value
     assert full_result["response"]["output"]
-    if "expected_tool_outputs" in case:
+    if accepted and "expected_tool_outputs" in case:
         tool_outputs = [
             item["output"]
             for item in full_result["response"]["output"]
             if item["type"] == "function_call_output"
         ]
         assert tool_outputs == case["expected_tool_outputs"]
-    if "expected_judge_verdicts" in case:
+    expected_judge_verdicts = case.get(
+        "expected_judge_verdicts" if accepted else "rejected_judge_verdicts"
+    )
+    if expected_judge_verdicts is not None:
         verdicts = [
             evaluation["verdict_label"]
             for evaluation in full_result["judge_evaluations"]
         ]
-        assert verdicts == case["expected_judge_verdicts"]
+        assert verdicts == expected_judge_verdicts
     generation_strings = [
         item["generation_str"]
         for item in full_result["response"]["output"]
         if "generation_str" in item
     ]
-    assert generation_strings == case["expected_generations"]
+    assert generation_strings == expected_generations
     prompt_strings = [
         item["prompt_str"]
         for item in full_result["response"]["output"]
         if "prompt_str" in item
     ]
-    assert len(prompt_strings) == len(case["expected_generations"])
+    assert len(prompt_strings) == len(expected_generations)
     assert all(case["expected_prompt_fragment"] in prompt for prompt in prompt_strings)
-    if case["name"] == "workplace_assistant":
+    if accepted and case["name"] == "workplace_assistant":
         assert _CONTINUATION_MARKER in prompt_strings[1]
         continuation_json = prompt_strings[1].rpartition(_CONTINUATION_MARKER)[2]
         continuation_messages = json.loads(continuation_json)["messages"]
