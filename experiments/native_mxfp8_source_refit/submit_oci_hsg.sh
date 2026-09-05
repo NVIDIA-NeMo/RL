@@ -8,6 +8,11 @@ PRECISION_MODE=${PRECISION_MODE:-mxfp8}
 FP8_PARAM=${FP8_PARAM:-true}
 MAX_STEPS=${MAX_STEPS:-2}
 NATIVE_REFIT_AUDIT="${NATIVE_REFIT_AUDIT:-0}"
+PROFILE_MODE=${PROFILE_MODE:-none}
+NTRACE_INSTALL_TARGET=${NTRACE_INSTALL_TARGET:-/opt/ntrace-runtime}
+NTRACE_RANKS=${NTRACE_RANKS:-0}
+NTRACE_CAPTURE_ITER=${NTRACE_CAPTURE_ITER:-2}
+NTRACE_NUM_ITERS=${NTRACE_NUM_ITERS:-3}
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
 PARTITION=${PARTITION:-batch}
@@ -55,6 +60,14 @@ case "${NATIVE_REFIT_AUDIT}" in
     ;;
 esac
 
+case "${PROFILE_MODE}" in
+  none|ntrace) ;;
+  *)
+    echo "PROFILE_MODE must be none or ntrace" >&2
+    exit 2
+    ;;
+esac
+
 if [[ "${NATIVE_REFIT_AUDIT}" == 1 ]] \
   && [[ "${MODEL}:${PRECISION_MODE}:${FP8_PARAM}" != qwen30:mxfp8:true ]]; then
   echo "runtime audit requires MODEL=qwen30 PRECISION_MODE=mxfp8 FP8_PARAM=true" >&2
@@ -64,6 +77,24 @@ fi
 if ! [[ "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_STEPS must be a positive integer" >&2
   exit 2
+fi
+
+for value_name in NTRACE_CAPTURE_ITER NTRACE_NUM_ITERS; do
+  value=${!value_name}
+  if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${value_name} must be a non-negative integer" >&2
+    exit 2
+  fi
+done
+if [[ "${PROFILE_MODE}" == ntrace ]]; then
+  if (( NTRACE_NUM_ITERS < 1 )); then
+    echo "NTRACE_NUM_ITERS must be positive" >&2
+    exit 2
+  fi
+  if (( MAX_STEPS < NTRACE_CAPTURE_ITER + NTRACE_NUM_ITERS )); then
+    echo "MAX_STEPS must complete every requested ntrace iteration" >&2
+    exit 2
+  fi
 fi
 
 case "${MODEL}:${PRECISION_MODE}:${FP8_PARAM}" in
@@ -103,6 +134,12 @@ case "${MODEL}:${PRECISION_MODE}:${FP8_PARAM}" in
     SEGMENT_SIZE=4
     MODEL_CACHE_PATHS='hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16'
     ;;
+  nano:bf16:false)
+    CONFIG=experiments/native_mxfp8_source_refit/nano-bf16-train-mxfp8-rollout.yaml
+    NUM_NODES=8
+    SEGMENT_SIZE=4
+    MODEL_CACHE_PATHS='hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16'
+    ;;
   *)
     echo "Unsupported MODEL/PRECISION_MODE/FP8_PARAM combination: ${MODEL}/${PRECISION_MODE}/${FP8_PARAM}" >&2
     exit 2
@@ -115,8 +152,8 @@ if [[ -n "${REPO:-}" ]] && git -C "${REPO}" rev-parse --is-inside-work-tree >/de
 fi
 
 if [[ "${ACTION}" == render ]]; then
-  printf 'model=%s\nprecision_mode=%s\nfp8_param=%s\nnative_refit_audit=%s\nconfig=%s\nnodes=%s\nsegment_size=%s\nsteps=%s\nsource_sha=%s\n' \
-    "${MODEL}" "${PRECISION_MODE}" "${FP8_PARAM}" "${NATIVE_REFIT_AUDIT}" "${CONFIG}" "${NUM_NODES}" "${SEGMENT_SIZE}" "${MAX_STEPS}" "${SOURCE_SHA}"
+  printf 'model=%s\nprecision_mode=%s\nfp8_param=%s\nnative_refit_audit=%s\nprofile_mode=%s\nntrace_ranks=%s\nntrace_capture_iter=%s\nntrace_num_iters=%s\nconfig=%s\nnodes=%s\nsegment_size=%s\nsteps=%s\nsource_sha=%s\n' \
+    "${MODEL}" "${PRECISION_MODE}" "${FP8_PARAM}" "${NATIVE_REFIT_AUDIT}" "${PROFILE_MODE}" "${NTRACE_RANKS}" "${NTRACE_CAPTURE_ITER}" "${NTRACE_NUM_ITERS}" "${CONFIG}" "${NUM_NODES}" "${SEGMENT_SIZE}" "${MAX_STEPS}" "${SOURCE_SHA}"
   exit 0
 fi
 
@@ -249,6 +286,30 @@ if [[ "${ACTION}" == submit ]]; then
   mkdir -p "${DATASET_ROOT}"
 fi
 
+NTRACE_COMMAND="unset NRL_POLICY_PROFILER_CLASS"
+if [[ "${PROFILE_MODE}" == ntrace ]]; then
+  NTRACE_OUTPUT_DIR="${RUN_ROOT}/ntrace/policy"
+  NTRACE_COMMAND=$(cat <<EOF
+export PYTHONPATH=${NTRACE_INSTALL_TARGET}:${REPO}
+export NRL_POLICY_PROFILER_CLASS=ntrace.NemoRLTraceController
+export NTRACE_RANKS=${NTRACE_RANKS}
+export NTRACE_OUTPUT_DIR=${NTRACE_OUTPUT_DIR}
+export NTRACE_CAPTURE_ITER=${NTRACE_CAPTURE_ITER}
+export NTRACE_NUM_ITERS=${NTRACE_NUM_ITERS}
+export NTRACE_MAX_STACK_DEPTH=0
+export NTRACE_INCLUDE_STACK_TRACES=1
+export NTRACE_STACK_CAPTURE_SCOPE=all
+export NTRACE_STACK_TIMING_SAMPLE_INTERVAL=32
+export NTRACE_INCLUDE_NVTX_RANGES=1
+export NTRACE_ENABLE_MEGATRON_NVTX=1
+export NTRACE_GRAPH_CAPTURE=iteration
+export NTRACE_RECORD_WATERMARK_MB=0
+mkdir -p ${NTRACE_OUTPUT_DIR}
+/opt/nemo_rl_venv/bin/python -c 'import ntrace, pyarrow; from ntrace.backends import get_backend, selected_backend_name; assert selected_backend_name() == "cpp"; get_backend()'
+EOF
+)
+fi
+
 NATIVE_OVERRIDES=()
 if [[ "${PRECISION_MODE}" == mxfp8 && "${FP8_PARAM}" == true ]]; then
   NATIVE_OVERRIDES=(
@@ -274,6 +335,7 @@ COMMAND=$(cat <<EOF
 set -euo pipefail
 cd ${REPO}
 ${NATIVE_AUDIT_COMMAND}
+${NTRACE_COMMAND}
 export HOME=/root
 export HF_HOME_SOURCE=${HF_HOME}
 export HF_HOME=${LOCAL_SCRATCH}/hf-cache/${MODEL}

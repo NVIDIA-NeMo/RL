@@ -62,6 +62,17 @@ def test_qwen30_bf16_baseline_disables_training_and_rollout_quantization() -> No
     assert "refit_transport: nccl_reshard" in config
 
 
+def test_nano_bf16_training_control_keeps_mxfp8_rollout() -> None:
+    config = (
+        EXPERIMENT_DIR / "nano-bf16-train-mxfp8-rollout.yaml"
+    ).read_text()
+
+    assert "defaults: ./nano-fp8param-false.yaml" in config
+    assert "te_precision_config_file: null" in config
+    assert "fp8_cfg:\n      enabled: false" in config
+    assert "fp8_param: false" in config
+
+
 def test_launcher_selects_a_distinct_bf16_qwen30_arm() -> None:
     launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
 
@@ -69,6 +80,20 @@ def test_launcher_selects_a_distinct_bf16_qwen30_arm() -> None:
     assert "qwen30:bf16" in launcher
     assert "CONFIG=experiments/native_mxfp8_source_refit/qwen30-bf16.yaml" in launcher
     assert 'CACHE_ARM="${PRECISION_MODE}-fp8param-${FP8_PARAM}"' in launcher
+
+
+def test_launcher_can_trace_nano_fp8_param_true_and_bf16_control() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+
+    assert "nano:bf16:false" in launcher
+    assert (
+        "CONFIG=experiments/native_mxfp8_source_refit/"
+        "nano-bf16-train-mxfp8-rollout.yaml" in launcher
+    )
+    assert "PROFILE_MODE=${PROFILE_MODE:-none}" in launcher
+    assert "NRL_POLICY_PROFILER_CLASS=ntrace.NemoRLTraceController" in launcher
+    assert "NTRACE_MAX_STACK_DEPTH=0" in launcher
+    assert "NTRACE_GRAPH_CAPTURE=iteration" in launcher
 
 
 def test_launcher_selects_qwen235_native_mxfp8_arm() -> None:
