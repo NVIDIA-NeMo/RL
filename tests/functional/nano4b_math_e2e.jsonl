@@ -1,0 +1,2 @@
+{"responses_create_params":{"input":[{"role":"user","content":"Return exactly \\boxed{2}."}],"max_output_tokens":64},"question":"Return exactly \\boxed{2}.","expected_answer":"2","agent_ref":{"type":"responses_api_agents","name":"math_with_judge_simple_agent"}}
+{"responses_create_params":{"input":[{"role":"user","content":"Return exactly \\boxed{12}."}],"max_output_tokens":64},"question":"Return exactly \\boxed{12}.","expected_answer":"999999","agent_ref":{"type":"responses_api_agents","name":"math_with_judge_simple_agent"}}
