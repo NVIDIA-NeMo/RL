@@ -33,6 +33,7 @@ from nemo_rl.data_plane.factory import (
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
@@ -113,7 +114,7 @@ def main() -> None:
             assert config.policy["generation"] is not None, (
                 "A generation config is required for GRPO"
             )
-            has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
+            has_refit_draft_weights = draft_refit_enabled(config.policy.get("draft"))
             megatron_cfg = config.policy.get("megatron_cfg") or {}
             trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
             config.policy["generation"] = configure_generation_config(
