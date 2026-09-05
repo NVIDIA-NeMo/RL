@@ -524,10 +524,10 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
-    def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+    def _report_dp_openai_server_base_urls(self) -> list[str]:
         """Report the data parallel OpenAI server base URLs of vLLM workers, only populated if it is async vLLM engine and the HTTP server is active."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            return [None]  # Not applicable since this is sync
+            return []  # Not applicable since this is sync
 
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
@@ -536,22 +536,34 @@ class VllmGeneration(GenerationInterface):
         )
         # Wait for all futures to complete
         results = ray.get(futures)
+        # A worker leaves base_url unset unless expose_http_server started a server, so
+        # an async engine without one answers with all Nones -- report that as no URLs,
+        # for the same reason the sync branch returns empty. Collapse the whole list
+        # rather than filtering entry by entry: expose_http_server is one config value
+        # for every worker, so the answer is all-or-nothing, and GenerationFleetHealth
+        # indexes this list by shard and length-checks it against shard_count.
+        if not any(results):
+            return []
         return results
 
-    def _collect_reserved_urls(self) -> list[Optional[str]]:
+    def _collect_reserved_urls(self) -> list[str]:
         """Collect reserved URLs from DP leaders before model loading.
 
         Only called when defer_model_load=True. Workers have bound ports
         during __init__ and can report their reserved URLs immediately.
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            return [None]
+            return []
 
         futures = self.worker_group.run_all_workers_single_data(
             "get_reserved_url",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         results = ray.get(futures)
+        # Only expose_http_server reserves a socket, so without one every worker
+        # reports None here too. Collapsed as a whole, per the note above.
+        if not any(results):
+            return []
         return results
 
     def load_and_start(self) -> None:
