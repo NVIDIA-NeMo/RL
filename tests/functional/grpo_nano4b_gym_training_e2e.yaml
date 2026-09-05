@@ -69,7 +69,7 @@ policy:
     top_p: 1.0
     vllm_cfg:
       async_engine: true
-      tensor_parallel_size: 2
+      tensor_parallel_size: 1
       max_model_len: ${policy.max_total_sequence_length}
       gpu_memory_utilization: 0.7
       enforce_eager: true
@@ -79,7 +79,7 @@ policy:
     colocated:
       enabled: false
       resources:
-        gpus_per_node: 2
+        gpus_per_node: 1
         num_nodes: 1
 
 data:
@@ -87,7 +87,9 @@ data:
   shuffle: false
   num_workers: 0
   train:
+    dataset_name: NemoGymDataset
     data_path: tests/functional/nano4b_math_e2e.jsonl
+    split_validation_size: 0
   validation:
     data_path: tests/functional/nano4b_math_e2e.jsonl
   default:
@@ -125,6 +127,8 @@ logger:
   tensorboard_enabled: true
   monitor_gpus: true
 
+# The H100 functional runner exposes two GPUs: one stays with non-colocated
+# vLLM above and the other runs the FSDP2 policy/optimizer.
 cluster:
-  gpus_per_node: 4
+  gpus_per_node: 2
   num_nodes: 1
