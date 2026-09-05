@@ -43,7 +43,7 @@ checkpointing:
 policy:
   model_name: nvidia/Llama-3.1-Nemotron-Nano-4B-v1.1
   hf_config_overrides:
-    revision: d552708a9d575fa8d4a690b988fd870d65279f98
+    revision: d552708a9d575fa8d4a690b988fd870d65279f98  # pragma: allowlist secret
   tokenizer:
     name: ${policy.model_name}
     tokenizer_kwargs:
