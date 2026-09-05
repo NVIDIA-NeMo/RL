@@ -98,6 +98,8 @@ def load_dataset_from_path(
     data_path: str,
     data_subset: Optional[str] = None,
     data_split: Optional[str] = "train",
+    *,
+    preserve_jsonl_rows: bool = False,
 ):
     """Load a dataset from a local file, huggingface dataset, or Arrow dataset (saved with save_to_disk).
 
@@ -105,6 +107,10 @@ def load_dataset_from_path(
         data_path: The path to the dataset.
         data_subset: The subset to load from the dataset. Only supported for huggingface datasets.
         data_split: The split to load from the dataset.
+        preserve_jsonl_rows: Load each JSONL row as an unparsed string in a
+            ``text`` column. Hugging Face materializes the text builder's
+            Arrow cache under ``HF_DATASETS_CACHE``, so subsequent jobs can
+            memory-map and reuse it instead of rebuilding Python strings.
     """
     FILEEXT2TYPE = {
         ".arrow": "arrow",
@@ -114,12 +120,14 @@ def load_dataset_from_path(
         ".parquet": "parquet",
         ".txt": "text",
     }
-    suffix = os.path.splitext(data_path)[-1]
+    suffix = os.path.splitext(data_path)[-1].lower()
     # load from local file (not save_to_disk format)
     if dataset_type := FILEEXT2TYPE.get(suffix):
         assert data_subset is None, (
             "data_subset is only supported for huggingface datasets"
         )
+        if suffix == ".jsonl" and preserve_jsonl_rows:
+            dataset_type = "text"
         raw_dataset = load_dataset(dataset_type, data_files=data_path)
     else:
         try:

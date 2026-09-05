@@ -194,12 +194,27 @@ def main() -> None:
     # We assert here since this is right after the final config has been materialized.
     assert should_use_nemo_gym(config)
 
+    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
+    # before setup() so it is not forwarded into NeMo-Gym's global config. It
+    # also determines whether the validation dataset is the collection input.
+    is_trajectory_collection = bool(
+        config.env["nemo_gym"].pop("is_trajectory_collection", False)
+    )
+    should_load_validation = is_trajectory_collection or (
+        config.grpo.val_period > 0 or config.grpo.val_at_start or config.grpo.val_at_end
+    )
+
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
     with rl_init_timer.time("data"):
         print("\n▶ Setting up data...")
         data_tokenizer = processor if processor is not None else tokenizer
+        if not should_load_validation and config.data.get("validation") is not None:
+            print("  - Skipping validation dataset because validation is disabled.")
         train_dataset, val_dataset = setup_response_data(
-            data_tokenizer, config.data, env_configs=None
+            data_tokenizer,
+            config.data,
+            env_configs=None,
+            load_validation=should_load_validation,
         )
 
     # Validation dataset config setup.
@@ -225,13 +240,6 @@ The validation set you pass in will directly be used for validation with no addi
 
     with rl_init_timer.time("ray_connect"):
         init_ray()
-
-    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
-    # before setup() so it is not forwarded into NeMo-Gym's global config (the
-    # gym actor is now created inside setup()).
-    is_trajectory_collection = (
-        config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
-    )
 
     with rl_init_timer.time("setup"):
         (
