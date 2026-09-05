@@ -1082,6 +1082,7 @@ base_vllm_test_config: VllmConfig = {
     "vllm_cfg": {
         "async_engine": False,
         "precision": "bfloat16",
+        "refit_cache_loader_routes": False,
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,
@@ -1946,10 +1947,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     monkeypatch.setattr(
         rollouts_mod,
         "collect_multimodal_payload_metrics",
-        lambda payload, boundary, enabled: payload_calls.append(
-            (payload, boundary, enabled)
-        )
-        or {},
+        lambda payload, boundary, enabled: (
+            payload_calls.append((payload, boundary, enabled)) or {}
+        ),
     )
     monkeypatch.setattr(
         rollouts_mod, "print_multimodal_payload_metrics", lambda metrics: None
