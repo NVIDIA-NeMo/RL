@@ -203,6 +203,7 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     # weight_synchronizer and refit_policy_generation would delegate to it instead
     # of taking the colocated IPC path under test.
     policy_generation.weight_synchronizer = None
+    policy_generation.cfg = {}
     kv_scales = {"layer.0": 0.5}
 
     refit_policy_generation(
