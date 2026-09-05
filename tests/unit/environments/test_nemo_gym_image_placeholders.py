@@ -16,6 +16,7 @@ import pytest
 import torch
 from PIL import Image
 
+from nemo_rl.data.multimodal_utils import uses_image_placeholder
 from nemo_rl.environments.nemo_gym import _attach_multimodal_data_to_user_message
 
 # --------------------------------------------------------------------------
@@ -55,6 +56,14 @@ class NemotronNanoVLV2Processor:
         if self._imgs_sizes is not None:
             processed["imgs_sizes"] = self._imgs_sizes
         return processed
+
+
+class NemotronH_Omni_Reasoning_V3Processor(NemotronNanoVLV2Processor):
+    """Super checkpoint processor; dispatch is deliberately class-name based."""
+
+
+def test_super_processor_uses_placeholder_multimodal_path():
+    assert uses_image_placeholder(NemotronH_Omni_Reasoning_V3Processor(None))
 
 
 def _ragged(*shapes: tuple[int, ...]) -> NemotronNanoVLV2Processor:

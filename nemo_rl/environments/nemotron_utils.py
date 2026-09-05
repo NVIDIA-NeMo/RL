@@ -27,6 +27,7 @@ NEMOTRON_VIDEO_PROCESSOR_NAMES = frozenset(
     {
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        "NemotronH_Omni_Reasoning_V3Processor",
     }
 )
 
