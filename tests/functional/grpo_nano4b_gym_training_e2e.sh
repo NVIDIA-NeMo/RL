@@ -51,8 +51,15 @@ uv run tests/check_metrics.py "${JSON_METRICS}" \
     'all_finite(data["train/loss"])' \
     'all_finite(data["train/grad_norm"])' \
     'min(data["train/grad_norm"]) > 0' \
+    'all_finite(data["train/advantages/min"])' \
+    'all_finite(data["train/advantages/max"])' \
+    'min(data["train/advantages/min"]) < 0' \
+    'max(data["train/advantages/max"]) > 0' \
     'data["train/total_reward/min"]["1"] == 0' \
     'data["train/total_reward/max"]["1"] == 1' \
     'data["train/total_reward/mean"]["1"] == 0.5' \
     'all_finite(data["train/token_mult_prob_error"])' \
-    'data["timing/train/generation"]["1"] > 0'
+    'max(data["train/token_mult_prob_error"]) < 1.05' \
+    'data["timing/train/generation"]["1"] > 0' \
+    'data["validation/accuracy"]["1"] == 0.5' \
+    'data["timing/validation/total_validation_time"]["1"] > 0'

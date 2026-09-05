@@ -20,9 +20,10 @@ grpo:
   max_num_steps: 1
   normalize_rewards: false
   use_leave_one_out_baseline: false
+  max_val_samples: null
   val_period: -1
   val_at_start: false
-  val_at_end: false
+  val_at_end: true
   overlong_filtering: false
   skip_reference_policy_logprobs_calculation: true
   adv_estimator:
@@ -41,8 +42,12 @@ checkpointing:
 
 policy:
   model_name: nvidia/Llama-3.1-Nemotron-Nano-4B-v1.1
+  hf_config_overrides:
+    revision: d552708a9d575fa8d4a690b988fd870d65279f98
   tokenizer:
     name: ${policy.model_name}
+    tokenizer_kwargs:
+      revision: ${policy.hf_config_overrides.revision}
   train_global_batch_size: 2
   train_micro_batch_size: 1
   logprob_batch_size: 1
@@ -69,6 +74,8 @@ policy:
       gpu_memory_utilization: 0.7
       enforce_eager: true
       expose_http_server: true
+    vllm_kwargs:
+      revision: ${policy.hf_config_overrides.revision}
     colocated:
       enabled: false
       resources:
@@ -81,7 +88,8 @@ data:
   num_workers: 0
   train:
     data_path: tests/functional/nano4b_math_e2e.jsonl
-  validation: null
+  validation:
+    data_path: tests/functional/nano4b_math_e2e.jsonl
   default:
     dataset_name: NemoGymDataset
     env_name: nemo_gym
