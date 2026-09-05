@@ -2217,6 +2217,63 @@ class TestCreateMegatronConfigGlooProcessGroups:
 
 
 @pytest.mark.mcore
+class TestCreateMegatronConfigBatchPlaceholder:
+    """Bridge validation must not constrain NeMo-RL's real GRPO batch size."""
+
+    def test_uses_policy_data_parallel_width_not_rollout_batch(self):
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        model_cfg = SimpleNamespace(
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+        )
+        config = {
+            "train_global_batch_size": 2048,
+            "train_micro_batch_size": 1,
+            "megatron_cfg": {
+                "optimizer": {"use_distributed_optimizer": False},
+                "scheduler": {},
+                "distributed_data_parallel_config": {
+                    "overlap_param_gather": False,
+                    "grad_reduce_in_fp32": False,
+                    "overlap_grad_reduce": False,
+                    "data_parallel_sharding_strategy": "no_shard",
+                },
+                "train_iters": 10,
+            },
+        }
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup.torch.distributed.is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "nemo_rl.models.megatron.setup.torch.distributed.get_world_size",
+                return_value=48,
+            ),
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig") as mock_training,
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=model_cfg,
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        assert mock_training.call_args.kwargs["global_batch_size"] == 24
+        assert config["train_global_batch_size"] == 2048
+
+
+@pytest.mark.mcore
 class TestCreateMegatronConfigOptimizerOffload:
     """Tests for optimizer CPU-offload plumbing into Megatron Core."""
 
