@@ -53,12 +53,10 @@ fi
 BUILD_COMMAND=$(cat <<EOF
 set -euo pipefail
 rm -rf /opt/ntrace-runtime
-NTRACE_BUILD_CUPTI_CPP=ON NTRACE_REQUIRE_CUXXFILT=1 \
-  uv pip install \
-    --python /opt/nemo_rl_venv/bin/python \
-    --no-deps \
-    --target /opt/ntrace-runtime \
-    ${NTRACE_REPO}
+NTRACE_INSTALL_SOURCE=${NTRACE_REPO} \
+NTRACE_INSTALL_TARGET=/opt/ntrace-runtime \
+NTRACE_INSTALL_PYTHON=/opt/nemo_rl_venv/bin/python \
+  bash ${NTRACE_REPO}/scripts/ntrace_nemo_rl_install_target.sh
 printf '%s\n' '${NTRACE_SHA}' > /opt/ntrace-runtime/.source-revision
 PYTHONPATH=/opt/ntrace-runtime /opt/nemo_rl_venv/bin/python -c \
   'import ntrace, pyarrow; from ntrace.backends import get_backend, selected_backend_name; assert selected_backend_name() == "cpp"; get_backend()'
@@ -90,4 +88,5 @@ exec sbatch \
     --container-workdir=/tmp \
     --container-writable \
     --container-save=${OUTPUT_IMAGE} \
-    bash -lc 'printf %s ${BUILD_COMMAND_B64} | base64 -d | bash'"
+    bash -lc 'printf %s ${BUILD_COMMAND_B64} | base64 -d | bash' \
+  && sha256sum ${OUTPUT_IMAGE} > ${OUTPUT_IMAGE}.sha256"

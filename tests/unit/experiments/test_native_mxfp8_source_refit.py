@@ -92,18 +92,25 @@ def test_launcher_can_trace_nano_fp8_param_true_and_bf16_control() -> None:
     )
     assert "PROFILE_MODE=${PROFILE_MODE:-none}" in launcher
     assert "NRL_POLICY_PROFILER_CLASS=ntrace.NemoRLTraceController" in launcher
-    assert "NTRACE_MAX_STACK_DEPTH=0" in launcher
+    assert "PYTHONPATH_VALUE=${NTRACE_INSTALL_TARGET}:${REPO}" in launcher
+    assert "export PYTHONPATH=${PYTHONPATH_VALUE}" in launcher
+    assert "export PYTHONPATH=${REPO}" not in launcher
+    assert "unset NTRACE_MAX_STACK_DEPTH" in launcher
+    assert "NTRACE_CUPTI_BACKEND=cpp" in launcher
     assert "NTRACE_GRAPH_CAPTURE=iteration" in launcher
+
+    ray_sub = (REPO_ROOT / "ray.sub").read_text()
+    assert 'COMMON_SRUN_ARGS+=" --container-remap-root"' in ray_sub
 
 
 def test_ntrace_image_builder_pins_native_runtime_in_immutable_image() -> None:
     builder = (EXPERIMENT_DIR / "build_ntrace_image_oci_hsg.sh").read_text()
 
-    assert "NTRACE_BUILD_CUPTI_CPP=ON" in builder
-    assert "NTRACE_REQUIRE_CUXXFILT=1" in builder
-    assert "--target /opt/ntrace-runtime" in builder
+    assert "ntrace_nemo_rl_install_target.sh" in builder
+    assert "NTRACE_INSTALL_TARGET=/opt/ntrace-runtime" in builder
     assert "selected_backend_name()" in builder
     assert "--container-save=${OUTPUT_IMAGE}" in builder
+    assert "sha256sum ${OUTPUT_IMAGE}" in builder
     assert "BUILD_COMMAND_B64=" in builder
     assert "base64 -d | bash" in builder
 

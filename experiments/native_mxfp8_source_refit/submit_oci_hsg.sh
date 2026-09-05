@@ -287,23 +287,29 @@ if [[ "${ACTION}" == submit ]]; then
 fi
 
 NTRACE_COMMAND="unset NRL_POLICY_PROFILER_CLASS"
+PYTHONPATH_VALUE=${REPO}
 if [[ "${PROFILE_MODE}" == ntrace ]]; then
   NTRACE_OUTPUT_DIR="${RUN_ROOT}/ntrace/policy"
+  PYTHONPATH_VALUE=${NTRACE_INSTALL_TARGET}:${REPO}
   NTRACE_COMMAND=$(cat <<EOF
-export PYTHONPATH=${NTRACE_INSTALL_TARGET}:${REPO}
 export NRL_POLICY_PROFILER_CLASS=ntrace.NemoRLTraceController
+export NTRACE_CUPTI_BACKEND=cpp
 export NTRACE_RANKS=${NTRACE_RANKS}
 export NTRACE_OUTPUT_DIR=${NTRACE_OUTPUT_DIR}
 export NTRACE_CAPTURE_ITER=${NTRACE_CAPTURE_ITER}
 export NTRACE_NUM_ITERS=${NTRACE_NUM_ITERS}
-export NTRACE_MAX_STACK_DEPTH=0
+unset NTRACE_MAX_STACK_DEPTH
 export NTRACE_INCLUDE_STACK_TRACES=1
 export NTRACE_STACK_CAPTURE_SCOPE=all
 export NTRACE_STACK_TIMING_SAMPLE_INTERVAL=32
 export NTRACE_INCLUDE_NVTX_RANGES=1
 export NTRACE_ENABLE_MEGATRON_NVTX=1
+export NTRACE_INCLUDE_MEMOPS=0
+export NTRACE_SAVE_CPU_NVTX=0
 export NTRACE_GRAPH_CAPTURE=iteration
 export NTRACE_RECORD_WATERMARK_MB=0
+export NTRACE_CUPTI_FINALIZE_ON_PAUSE=1
+export NTRACE_MEMORY_DIAGNOSTICS=0
 mkdir -p ${NTRACE_OUTPUT_DIR}
 /opt/nemo_rl_venv/bin/python -c 'import ntrace, pyarrow; from ntrace.backends import get_backend, selected_backend_name; assert selected_backend_name() == "cpp"; get_backend()'
 EOF
@@ -349,7 +355,7 @@ export TRITON_CACHE_DIR=${LOCAL_SCRATCH}/triton-cache/${SOURCE_SHA}/${CACHE_ARM}
 export UV_CACHE_DIR=${LOCAL_SCRATCH}/uv-cache
 export UV_PYTHON_INSTALL_DIR=${LOCAL_SCRATCH}/uv-python
 export UV_LOCK_TIMEOUT=7200
-export PYTHONPATH=${REPO}
+export PYTHONPATH=${PYTHONPATH_VALUE}
 unset UV_PROJECT_ENVIRONMENT WANDB_API_KEY
 mkdir -p "\${HF_HOME}"
 /opt/nemo_rl_venv/bin/python examples/run_grpo.py \\

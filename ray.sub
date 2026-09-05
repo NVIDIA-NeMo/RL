@@ -265,6 +265,9 @@ fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"
 COMMON_SRUN_ARGS+=" --no-container-mount-home"
+if [[ "${CONTAINER_REMAP_ROOT:-0}" == 1 ]]; then
+  COMMON_SRUN_ARGS+=" --container-remap-root"
+fi
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
