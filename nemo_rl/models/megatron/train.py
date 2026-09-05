@@ -65,6 +65,7 @@ from nemo_rl.models.megatron.router_replay import (
     set_router_replay_forward,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
 # Union type for any post-processing function (defined after classes below)
 PostProcessingFunction = Union[
@@ -544,12 +545,21 @@ class LossPostProcessor:
             if fuse_loss:
                 # The fused path prepares loss via prepare_packed_loss_input and
                 # cannot honor a custom prepare_fn (e.g. the value model's); guard
-                # rather than silently bypass it.
+                # before reading packed metadata so misconfiguration fails clearly.
                 assert self.prepare_fn is None, (
                     "sequence_packing.fuse_loss=true does not support a custom "
                     "prepare_fn (e.g. the value model's value-specific prep). "
                     "Disable fuse_loss for the value model."
                 )
+
+            cu_seqlens_q = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
+            padded_boundaries = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            )
+            cu_seqlens_q_padded = to_cpu_int_tuple(padded_boundaries)
+            if fuse_loss:
                 wrapper_cls = SequencePackingFusionLossWrapper
                 prepare_fn = partial(
                     prepare_packed_loss_input,
@@ -563,8 +573,8 @@ class LossPostProcessor:
             loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_fn,
-                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_q_padded=cu_seqlens_q_padded,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
@@ -656,7 +666,7 @@ class LogprobsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
-        cu_seqlens_padded: torch.Tensor,
+        cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
@@ -674,19 +684,24 @@ class LogprobsPostProcessor:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
+        cu_seqlens_padded_cpu = None
+        if self.cfg["sequence_packing"]["enabled"]:
+            assert cu_seqlens_padded is not None
+            cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
             elif self.cfg["sequence_packing"]["enabled"]:
+                assert cu_seqlens_padded_cpu is not None
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()
                 logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
                 token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                     output_tensor,
                     target=input_ids,
-                    cu_seqlens_padded=cu_seqlens_padded,
+                    cu_seqlens_padded=cu_seqlens_padded_cpu,
                     unpacked_seqlen=original_seq_length,
                     vocab_start_index=tp_rank * output_tensor.shape[-1],
                     vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],

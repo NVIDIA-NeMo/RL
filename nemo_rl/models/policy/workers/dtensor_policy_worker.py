@@ -104,6 +104,7 @@ from nemo_rl.utils.native_checkpoint import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 from nemo_rl.utils.timer import Timer
 
 
@@ -912,11 +913,14 @@ class DTensorPolicyWorkerImpl(
                         )
                         # Wrap loss function for sequence packing if needed
                         if self.enable_seq_packing:
+                            cu_seqlens_q = to_cpu_int_tuple(
+                                flash_attn_kwargs.cu_seqlens_q
+                            )
                             loss_fn_ = SequencePackingLossWrapper(
                                 loss_fn=loss_fn,
                                 prepare_fn=prepare_loss_input_wrapped,
-                                cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
-                                cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
+                                cu_seqlens_q=cu_seqlens_q,
+                                cu_seqlens_q_padded=cu_seqlens_q,
                             )
                             loss, loss_metrics = loss_fn_(
                                 logits,
