@@ -590,6 +590,36 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
+    def setup_token_capture(
+        self, dp_cfg: dict[str, Any], staging_partition: str
+    ) -> None:
+        """Install ledger-authoritative token capture in every DP-leader worker.
+
+        Called once at setup when ``token_capture.enabled``; each async worker
+        builds its in-worker data-plane client + TQTokenSink and makes the
+        single Gym ``install_capture`` call.
+        """
+        assert self.cfg["vllm_cfg"]["async_engine"], (
+            "token capture requires the async vLLM engine (the capture host "
+            "is the worker's in-process HTTP server)"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            "setup_token_capture",
+            dp_cfg=dp_cfg,
+            staging_partition=staging_partition,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the weight version workers stamp on captured model calls."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "set_rollout_weight_version",
+            version=version,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
     def _get_raw_spec_counters(self) -> dict[str | tuple[str, int], float]:
         """Collect raw spec decode counters from workers."""
         futures = self.worker_group.run_all_workers_single_data(

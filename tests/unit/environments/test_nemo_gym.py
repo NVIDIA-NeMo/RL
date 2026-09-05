@@ -1566,6 +1566,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             cfg = {}
             rch = _RolloutCollectionHelper()
             head_server_config = object()
+            _token_capture_enabled = False
 
             def _require_spinup(self):
                 pass
@@ -1682,6 +1683,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             head_server_config = SimpleNamespace(backend="megatron")
             _tokenizer = _Tokenizer()
             _processor = None
+            _token_capture_enabled = False
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
