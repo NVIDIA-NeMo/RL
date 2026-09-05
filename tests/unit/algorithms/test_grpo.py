@@ -46,7 +46,9 @@ from nemo_rl.algorithms.grpo import (
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
+    _prompt_grouping_ids,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
+    _replay_prompt_batches,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
@@ -261,6 +263,68 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+def test_nemo_gym_prompt_grouping_uses_source_group_positions() -> None:
+    grouping_ids = _prompt_grouping_ids(
+        torch.empty((4, 0)),
+        num_prompts=2,
+        num_generations_per_prompt=2,
+        use_nemo_gym=True,
+    )
+
+    assert torch.equal(grouping_ids, torch.tensor([[0], [0], [1], [1]]))
+
+
+def test_nemo_gym_prompt_grouping_offsets_dynamic_sampling_batches() -> None:
+    grouping_ids = _prompt_grouping_ids(
+        torch.empty((4, 0)),
+        num_prompts=2,
+        num_generations_per_prompt=2,
+        use_nemo_gym=True,
+        group_offset=2,
+    )
+
+    assert torch.equal(grouping_ids, torch.tensor([[2], [2], [3], [3]]))
+
+
+def test_native_prompt_grouping_preserves_token_identity() -> None:
+    prompt_token_ids = torch.tensor([[1, 2], [1, 2], [3, 4], [3, 4]])
+
+    grouping_ids = _prompt_grouping_ids(
+        prompt_token_ids,
+        num_prompts=2,
+        num_generations_per_prompt=2,
+        use_nemo_gym=False,
+    )
+
+    assert grouping_ids is prompt_token_ids
+
+
+def test_replay_prompt_batches_restore_grouping_without_task_indices() -> None:
+    def make_batch(prompt: str) -> BatchedDataDict:
+        return create_mock_batch(
+            2,
+            ["math", "math"],
+            [
+                [
+                    {"role": "user", "content": f"{prompt}_{index}"},
+                    {"role": "assistant", "content": "response"},
+                ]
+                for index in range(2)
+            ],
+        )
+
+    batches = _replay_prompt_batches(
+        [
+            {"batch": make_batch("first")},
+            {"batch": make_batch("second")},
+        ],
+        use_explicit_grouping=True,
+    )
+
+    assert torch.equal(batches[0]["prompt_grouping_ids"], torch.tensor([[0], [0]]))
+    assert torch.equal(batches[1]["prompt_grouping_ids"], torch.tensor([[1], [1]]))
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -2537,6 +2601,58 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     assert batch_cache is not None
 
 
+def test_dapo_dynamic_sampling_carries_prompt_grouping_ids(mock_grpo_components):
+    def make_batch(grouping_id: int) -> BatchedDataDict:
+        batch = create_mock_batch(
+            3,
+            ["math"] * 3,
+            [
+                [
+                    {"role": "user", "content": f"prompt_{grouping_id}"},
+                    {"role": "assistant", "content": f"response_{i}"},
+                ]
+                for i in range(3)
+            ],
+        )
+        batch["total_reward"] = torch.tensor([1.0, 0.0, 0.5])
+        batch["prompt_grouping_ids"] = torch.full((3, 1), grouping_id)
+        return batch
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 2
+    master_config.grpo.num_generations_per_prompt = 3
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
+    std = torch.tensor([0.4, 0.4, 0.4])
+    baseline = torch.tensor([0.5, 0.5, 0.5])
+
+    _, complete, cache, _ = dynamic_sampling(
+        make_batch(10),
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=Timer(),
+    )
+    assert not complete
+
+    result, complete, _, _ = dynamic_sampling(
+        make_batch(11),
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=2,
+        master_config=master_config,
+        timer=Timer(),
+        batch_cache=cache,
+    )
+
+    assert complete
+    assert torch.equal(
+        result["prompt_grouping_ids"],
+        torch.tensor([[10], [10], [10], [11], [11], [11]]),
+    )
+
+
 def test_dapo_cache_aligns_deduplicated_media_with_text_only_batch(
     mock_grpo_components,
 ):
@@ -4057,6 +4173,31 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
                 _initial_grpo_save_state(),
                 master_config,
             )
+
+
+def test_grpo_train_passes_source_prompt_grouping_ids_to_estimator(
+    mock_grpo_components, monkeypatch
+):
+    source_prompt_grouping_ids = torch.tensor([[1234]])
+    mock_adv_estimator = MagicMock()
+    mock_adv_estimator.compute_advantage.side_effect = (
+        lambda **kwargs: torch.zeros_like(kwargs["mask"])
+    )
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._prompt_grouping_ids",
+        lambda *args, **kwargs: source_prompt_grouping_ids,
+    )
+
+    _run_single_grpo_train_step(mock_grpo_components, grpo_train, monkeypatch)
+
+    assert torch.equal(
+        mock_adv_estimator.compute_advantage.call_args.kwargs["prompt_ids"],
+        source_prompt_grouping_ids,
+    )
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])

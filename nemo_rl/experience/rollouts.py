@@ -292,7 +292,10 @@ def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
         [
-            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
+            bool(
+                (extra or {}).get(MASK_SAMPLE)
+                or ((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False)
+            )
             for extra in extras
         ],
         dtype=torch.bool,
