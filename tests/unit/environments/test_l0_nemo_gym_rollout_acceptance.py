@@ -38,6 +38,8 @@ from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 _REPO_ROOT = Path(__file__).parents[3]
 _GYM_ROOT = _REPO_ROOT / "3rdparty/Gym-workspace/Gym"
 _CASES_PATH = Path(__file__).parent / "nemo_gym_test_data/l0_rollout_acceptance.yaml"
+# "L0" names the RL CI tier chosen for this test. The exercised boundary is
+# the conceptual L2 contract: a real Gym environment rolls out through NeMo RL.
 _POLICY_MODEL_CONFIG = (
     "responses_api_models/vllm_model/configs/vllm_model_for_training.yaml"
 )
@@ -371,6 +373,7 @@ def _load_acceptance_cases() -> list[dict[str, Any]]:
         "expected_generations",
         "rejected_generations",
         "expected_prompt_fragment",
+        "metadata_fields",
         "expected_result",
         "expected_reward",
     }
@@ -395,6 +398,8 @@ def _load_acceptance_cases() -> list[dict[str, Any]]:
             f"{case['name']}: pinned example changed; review the row and update its golden values"
         )
         assert case["agent_ref"].keys() >= {"type", "name"}
+        assert case["metadata_fields"]
+        assert all(isinstance(field, str) for field in case["metadata_fields"])
         assert case["expected_generations"]
         assert case["rejected_generations"]
         assert all(
@@ -523,9 +528,17 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepte
         "expected_generations" if accepted else "rejected_generations"
     ]
     expected_reward = case["expected_reward"] if accepted else 0.0
+    datum = _load_case_datum(case, accepted=accepted)
+    extra_env_info = datum["extra_env_info"]
+    expected_metadata = {
+        field: deepcopy(extra_env_info[field]) for field in case["metadata_fields"]
+    }
+    assert case["expected_prompt_fragment"] in json.dumps(
+        extra_env_info["responses_create_params"]
+    )
     result = run_nemo_gym_rollout_sync(
         policy_generation=_ScriptedPolicyGeneration(),
-        input_batch=rl_collate_fn([_load_case_datum(case, accepted=accepted)]),
+        input_batch=rl_collate_fn([datum]),
         tokenizer=tokenizer,
         task_to_env={"nemo_gym": l0_nemo_gym},
         max_seq_len=_GENERATION_CONFIG["max_total_sequence_length"],
@@ -571,6 +584,10 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepte
     full_result_table = result.rollout_metrics[full_result_key]
     assert len(full_result_table.data) == 1
     full_result = json.loads(full_result_table.data[0][0])
+    for field, expected_value in extra_env_info["responses_create_params"].items():
+        assert full_result["responses_create_params"][field] == expected_value
+    for field, expected_value in expected_metadata.items():
+        assert full_result[field] == expected_value
     if accepted:
         for field, expected_value in case["expected_result"].items():
             assert full_result[field] == expected_value

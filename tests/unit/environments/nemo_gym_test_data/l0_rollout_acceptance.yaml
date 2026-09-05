@@ -10,6 +10,9 @@ cases:
     expected_generations:
       - '\boxed{32}'
     expected_prompt_fragment: 1000 digit numbers
+    metadata_fields:
+      - question
+      - expected_answer
     rejected_generations:
       - '\boxed{999999}'
     expected_reward: 1.0
@@ -48,6 +51,8 @@ cases:
         sys.stdout.write("\n".join(answers))
         ```
     expected_prompt_fragment: beautiful number
+    metadata_fields:
+      - verifier_metadata
     rejected_generations:
       - |-
         ```python
@@ -71,6 +76,8 @@ cases:
     expected_generations:
       - '{"name":"check_seat_availability","arguments":{"event_id":"SHOW24","section":"Medical Zone"}}'
     expected_prompt_fragment: SHOW24
+    metadata_fields:
+      - expected_action
     rejected_generations:
       - I cannot call the requested tool.
     expected_reward: 1.0
@@ -92,6 +99,11 @@ cases:
     expected_generations:
       - '\boxed{B}'
     expected_prompt_fragment: cystic fibrosis
+    metadata_fields:
+      - uuid
+      - options
+      - expected_answer
+      - grading_mode
     rejected_generations:
       - '\boxed{A}'
     expected_reward: 1.0
@@ -110,6 +122,8 @@ cases:
     expected_generations:
       - '\boxed{Charles Darwin}'
     expected_prompt_fragment: theory of evolution by natural selection
+    metadata_fields:
+      - expected_answer
     rejected_generations:
       - '\boxed{Ada Lovelace}'
     rejected_judge_verdicts:
@@ -131,6 +145,15 @@ cases:
     expected_generations:
       - '{"name":"response_tool_8","arguments":{"extraction":{"name":"Dizer Kola","native_name":"ديزركلا","romanized_name":"Dizer Kola","settlement_type":"village","country":"Iran","province":"Mazandaran","county":"Nowshahr","bakhsh":"Central","rural_district":"Baladeh Kojur","coordinates":{"latitude":36.55694,"longitude":51.79389},"population_total":250,"population_year":2006,"number_of_families":64,"timezone_standard":"UTC+3:30 (IRST)","timezone_dst":"UTC+4:30 (IRDT)"}}}'
     expected_prompt_fragment: Dizer Kola
+    metadata_fields:
+      - schema_str
+      - schema_type
+      - response_mode
+      - problem_type
+      - schema_repr
+      - tool_name
+      - tool_schema_mode
+      - tool_payload_key
     rejected_generations:
       - I cannot extract that.
     expected_reward: 1.0
@@ -150,6 +173,11 @@ cases:
       - '{"name":"email_reply_email","arguments":{"email_id":"00000057","body":"Thanks for the update - I will get back to you tomorrow."}}'
       - Done
     expected_prompt_fragment: Task Update on Develop prototype
+    metadata_fields:
+      - id
+      - ground_truth
+      - category
+      - environment_name
     rejected_generations:
       - Done
     expected_reward: 1.0
