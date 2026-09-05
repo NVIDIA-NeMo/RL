@@ -468,6 +468,25 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        # Staging-buffer cache for refit weight streaming; only populated when
+        # cfg["refit_persistent_ipc_buffers"] is enabled.
+        self._refit_ipc_buffer_cache: dict[str, Any] = {}
+        # HF param names to MXFP8-quantize on the trainer during refit; set via
+        # enable_refit_prequantize() when vllm_cfg.refit_prequantize is on.
+        self._refit_prequant_names: set[str] = set()
+        # HF param metadata cached by prepare_refit_info so that
+        # enable_refit_prequantize can derive updated metadata without
+        # re-running the export + quantize pass.
+        self._refit_param_info_hf: Optional[
+            dict[str, tuple[torch.Size, torch.dtype]]
+        ] = None
+        # Pinned host staging for the reference-policy swap; only populated when
+        # megatron_cfg["pinned_reference_swap"] is enabled. Buffer contents are
+        # only live within a single use_reference_model call (every copy
+        # synchronizes before control leaves it) and each call re-reads
+        # model.state_dict(), so offload_before/after_refit moving or replacing
+        # param storages between calls cannot collide with these buffers.
+        self._pinned_swap_save_buffers: dict[str, torch.Tensor] = {}
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
@@ -2071,6 +2090,7 @@ class MegatronPolicyWorkerImpl(
         source_state_dict: dict,
         *,
         raise_if_key_missing: bool = False,
+        non_blocking: bool = False,
     ) -> None:
         """Apply a state dict to self.model in-place.
 
@@ -2082,6 +2102,8 @@ class MegatronPolicyWorkerImpl(
             source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
             raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
                 from source_state_dict; if False, skip such keys.
+            non_blocking: Passed to the in-place copies; callers staging from
+                pinned CPU memory must synchronize afterwards.
         """
         for state_dict_key, param_or_buf in self.model.state_dict().items():
             if (
@@ -2102,7 +2124,7 @@ class MegatronPolicyWorkerImpl(
                 isinstance(source_value, torch.Tensor)
                 and param_or_buf.shape == source_value.shape
             ):
-                param_or_buf.copy_(source_value)
+                param_or_buf.copy_(source_value, non_blocking=non_blocking)
                 continue
 
             # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
@@ -2133,12 +2155,39 @@ class MegatronPolicyWorkerImpl(
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
+            # NotRequired key: absent means disabled, default lives in the exemplar YAML.
+            use_pinned_swap = bool(
+                self.cfg["megatron_cfg"].get("pinned_reference_swap")
+            )
+
             # Save original references
             model_state_dict = {}
             for name, item in self.model.state_dict().items():
                 if isinstance(item, torch.Tensor):
-                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
+                    # extra_state tensors stay on fresh pageable copies:
+                    # set_extra_state() may retain the tensor it is given, and
+                    # a reused pinned buffer would mutate it on the next swap.
+                    if use_pinned_swap and "extra_state" not in name:
+                        buf = self._pinned_swap_save_buffers.get(name)
+                        if buf is None:
+                            buf = torch.empty(
+                                item.shape,
+                                dtype=item.dtype,
+                                device="cpu",
+                                pin_memory=True,
+                            )
+                            self._pinned_swap_save_buffers[name] = buf
+                        buf.copy_(item.detach(), non_blocking=True)
+                        item = buf
+                    else:
+                        item = item.detach().to(
+                            device="cpu", non_blocking=True, copy=True
+                        )
                 model_state_dict[name] = item
+            if use_pinned_swap:
+                # D2H saves must land before the reference apply overwrites
+                # the params they read from.
+                torch.cuda.synchronize()
 
             # Swap reference state into self.model. Use _apply_state_dict_to_model
             # (rather than load_state_dict) so FP8 _extra_state with mismatched shape
@@ -2146,7 +2195,10 @@ class MegatronPolicyWorkerImpl(
             self._apply_state_dict_to_model(
                 self.reference_state_dict,
                 raise_if_key_missing=True,
+                non_blocking=use_pinned_swap,
             )
+            if use_pinned_swap:
+                torch.cuda.synchronize()
 
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                 gc.collect()
@@ -2178,7 +2230,10 @@ class MegatronPolicyWorkerImpl(
             self._apply_state_dict_to_model(
                 model_state_dict,
                 raise_if_key_missing=True,
+                non_blocking=use_pinned_swap,
             )
+            if use_pinned_swap:
+                torch.cuda.synchronize()
 
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                 gc.collect()
@@ -2285,7 +2340,7 @@ class MegatronPolicyWorkerImpl(
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
-    def prepare_refit_info(self) -> None:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
@@ -2294,7 +2349,86 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in self._iter_params_with_optional_kv_scales():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
+        self._refit_param_info_hf = refit_param_info_hf
         return refit_param_info_hf
+
+    def enable_refit_prequantize(self, param_names: list[str]) -> dict[str, Any]:
+        """Quantize the listed HF params to MXFP8 on the trainer during refit.
+
+        Derives the updated metadata from the shapes cached by
+        prepare_refit_info instead of re-running the export + quantize pass:
+        MXFP8 keeps the value shape and adds one uint8 E8M0 scale per 32-wide
+        block along the last dim, so no tensor needs to be materialized here.
+
+        Args:
+            param_names: fp8-eligible parameter names reported by the vLLM
+                workers (see VllmInternalWorkerExtension.prepare_refit_info).
+
+        Returns:
+            Updated refit metadata: the listed params become float8_e4m3fn and
+            each gains a *_scale_from_checkpoint uint8 entry.
+        """
+        if self._is_fp8_export():
+            raise ValueError(
+                "vllm_cfg.refit_prequantize requires BF16 trainer-exported weights; "
+                "Megatron blockwise FP8 parameter storage uses a different scale layout."
+            )
+        if self._refit_param_info_hf is None:
+            raise RuntimeError(
+                "enable_refit_prequantize requires prepare_refit_info to have "
+                "run first so the HF parameter metadata is available."
+            )
+
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            MXFP8_BLOCK_SIZE,
+        )
+
+        self._refit_prequant_names = set(param_names)
+
+        refit_param_info_hf = {}
+        for name, (shape, dtype) in self._refit_param_info_hf.items():
+            if name not in self._refit_prequant_names:
+                refit_param_info_hf[name] = (shape, dtype)
+                continue
+            if dtype == torch.float8_e4m3fn:
+                raise ValueError(
+                    "vllm_cfg.refit_prequantize requires BF16 trainer-exported weights; "
+                    f"{name} is already stored as E4M3 with a non-MXFP8 scale layout."
+                )
+            if shape[-1] % MXFP8_BLOCK_SIZE != 0:
+                raise ValueError(
+                    f"MXFP8 requires the last dim to be divisible by "
+                    f"{MXFP8_BLOCK_SIZE}; {name} has shape {tuple(shape)}."
+                )
+            scale_shape = torch.Size((*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE))
+            refit_param_info_hf[name] = (shape, torch.float8_e4m3fn)
+            refit_param_info_hf[name + "_scale_from_checkpoint"] = (
+                scale_shape,
+                torch.uint8,
+            )
+        return refit_param_info_hf
+
+    def _maybe_prequantize_param(
+        self, name: str, tensor: torch.Tensor
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        if name not in self._refit_prequant_names:
+            yield name, tensor
+            return
+        if tensor.dtype == torch.float8_e4m3fn:
+            raise ValueError(
+                "vllm_cfg.refit_prequantize requires BF16 trainer-exported weights; "
+                f"{name} is already stored as E4M3 with a non-MXFP8 scale layout."
+            )
+
+        # Deferred: pulls in the heavy nemo_rl...generation.vllm package init,
+        # which trainer workers only need when prequantized refit is enabled.
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            mxfp8_e4m3_quantize_for_refit,
+        )
+
+        param_lp, param_scale = mxfp8_e4m3_quantize_for_refit(tensor)
+        yield name, param_lp
+        yield name + "_scale_from_checkpoint", param_scale
 
     def _collect_mtp_metrics(
         self,
@@ -2534,9 +2668,10 @@ class MegatronPolicyWorkerImpl(
             conversion_tasks=conversion_tasks,  # used for metadata caching
         )
 
-        # Yield the original parameters first.
+        # Yield the original parameters first, MXFP8-quantizing on the trainer
+        # when pre-quantized refit is enabled for the parameter.
         for name, tensor in base_iter:
-            yield name, tensor
+            yield from self._maybe_prequantize_param(name, tensor)
 
         if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
@@ -2834,6 +2969,11 @@ class MegatronPolicyWorkerImpl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            buffer_cache=(
+                self._refit_ipc_buffer_cache
+                if self.cfg.get("refit_persistent_ipc_buffers")
+                else None
+            ),
         )
 
     @torch.no_grad()
@@ -3256,7 +3396,8 @@ class MegatronPolicyWorkerImpl(
         ``kv_scales`` (FP8 KV cache): the per-layer k/v(/q) scales ride the misc
         packed-broadcast as plain scale tensors (the is_nccl_reshard_param whitelist
         excludes ``.k_scale``/``.v_scale``/``.q_scale`` -> misc); the gen side finalizes
-        them via ``_maybe_process_fp8_kv_cache``.  No out-of-band channel needed.
+        them via the ``process_weights_after_loading`` pass in the weight-update
+        finalizer.  No out-of-band channel needed.
         """
         from nemo_rl.distributed.refit_watchdog import (
             RefitAborted,
@@ -3537,56 +3678,7 @@ class MegatronPolicyWorkerImpl(
             self._clear_fp8_caches()
 
         if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
-            # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
-            # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
-            # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
-            # runs at different sequence lengths, the cache fills quickly and the tensors
-            # anchor large CUDA segments.
-            try:
-                from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-                    RotaryEmbedding,
-                )
-
-                RotaryEmbedding.forward.cache_clear()
-            except Exception:
-                pass
-
-            # Clear MoE token dispatcher persistent routing tensors.
-            #
-            # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
-            # self.model.modules() never yields it. We must access it via the token_dispatcher
-            # attribute on MoELayer nn.Module objects.
-            #
-            # When recompute_mlp=True and fp8=True,
-            # transformer_layer._forward_mlp wraps self.mlp (the MoE layer) with te_checkpoint.
-            # te_checkpoint._CheckpointFunction.backward recomputes the forward with
-            # torch.enable_grad(), which causes dispatch_preprocess to store
-            #   dispatcher.probs = routing_probs   (with grad_fn, under enable_grad)
-            # This creates a reference cycle:
-            #   _CheckpointFunctionBackward → ctx → ctx.run_function=mlp
-            #   → mlp.token_dispatcher.probs → probs.grad_fn → ... → _CheckpointFunctionBackward
-            #
-            # Breaking this cycle by nulling dispatcher.probs frees BOTH:
-            #   - the routing tensors
-            #   - the te_checkpoint ctx saved tensors
-            try:
-                for module in self.model.modules():
-                    if not hasattr(module, "token_dispatcher"):
-                        continue
-                    dispatcher = module.token_dispatcher
-                    if dispatcher is None:
-                        continue
-                    for attr in (
-                        "probs",  # AllToAll + AllGather
-                        "routing_map",  # AllToAll
-                        "reversed_local_input_permutation_mapping",  # AllToAll
-                        "local_probs",  # AllGather
-                        "local_map",  # AllGather
-                    ):
-                        if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
-                            setattr(dispatcher, attr, None)
-            except Exception:
-                pass
+            self._clear_rope_and_moe_dispatcher_caches()
 
         torch.randn(1).cuda()  # wake up torch allocator
         if (
@@ -3607,6 +3699,59 @@ class MegatronPolicyWorkerImpl(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
+
+    def _clear_rope_and_moe_dispatcher_caches(self) -> None:
+        """Clear rotary-embedding and MoE dispatcher caches repopulated by forwards."""
+        # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
+        # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
+        # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
+        # runs at different sequence lengths, the cache fills quickly and the tensors
+        # anchor large CUDA segments.
+        try:
+            from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+                RotaryEmbedding,
+            )
+
+            RotaryEmbedding.forward.cache_clear()
+        except Exception:
+            pass
+
+        # Clear MoE token dispatcher persistent routing tensors.
+        #
+        # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
+        # self.model.modules() never yields it. We must access it via the token_dispatcher
+        # attribute on MoELayer nn.Module objects.
+        #
+        # When recompute_mlp=True and fp8=True,
+        # transformer_layer._forward_mlp wraps self.mlp (the MoE layer) with te_checkpoint.
+        # te_checkpoint._CheckpointFunction.backward recomputes the forward with
+        # torch.enable_grad(), which causes dispatch_preprocess to store
+        #   dispatcher.probs = routing_probs   (with grad_fn, under enable_grad)
+        # This creates a reference cycle:
+        #   _CheckpointFunctionBackward → ctx → ctx.run_function=mlp
+        #   → mlp.token_dispatcher.probs → probs.grad_fn → ... → _CheckpointFunctionBackward
+        #
+        # Breaking this cycle by nulling dispatcher.probs frees BOTH:
+        #   - the routing tensors
+        #   - the te_checkpoint ctx saved tensors
+        try:
+            for module in self.model.modules():
+                if not hasattr(module, "token_dispatcher"):
+                    continue
+                dispatcher = module.token_dispatcher
+                if dispatcher is None:
+                    continue
+                for attr in (
+                    "probs",  # AllToAll + AllGather
+                    "routing_map",  # AllToAll
+                    "reversed_local_input_permutation_mapping",  # AllToAll
+                    "local_probs",  # AllGather
+                    "local_map",  # AllGather
+                ):
+                    if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
+                        setattr(dispatcher, attr, None)
+        except Exception:
+            pass
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
@@ -3635,7 +3780,28 @@ class MegatronPolicyWorkerImpl(
             self.model, "cpu", move_params=not keep_params_for_generation
         )
         torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
+        if self.cfg.get("megatron_cfg", {}).get("refit_slim_offload_after"):
+            # Grad buffers were already offloaded by offload_before_refit at
+            # the start of the refit, so skip the full rerun (grad-buffer moves
+            # and a second gc/empty_cache pair). Cache clears must still honor
+            # their knobs: callers may have run a forward pass since (e.g.
+            # teacher logits in distillation), repopulating TE fp8 workspaces,
+            # the rotary-embedding lru_cache, and MoE dispatcher tensors.
+            if self.fp8_cfg and self.fp8_cfg.get("force_clear_fp8_caches", False):
+                self._clear_fp8_caches()
+            if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
+                self._clear_rope_and_moe_dispatcher_caches()
+            if (
+                hasattr(self, "optimizer")
+                and self.optimizer is not None
+                and not self.optimizer_cpu_offload
+                and self.offload_optimizer_for_refit
+            ):
+                self.move_optimizer("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+        else:
+            self.offload_before_refit()  # rerun the old offload function
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB

@@ -1474,9 +1474,20 @@ class VllmAsyncGenerationWorkerImpl(
 
         return cast(list[str], list_of_worker_results)
 
-    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+    async def prepare_refit_info_async(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
         """Async version of prepare_refit_info."""
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        results = await self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, fp8.serialize_fp8_config()),
+        )
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     async def _reset_encoder_cache_after_weight_update(self) -> None:
         """Invalidate weight-dependent multimodal encoder outputs when enabled."""
