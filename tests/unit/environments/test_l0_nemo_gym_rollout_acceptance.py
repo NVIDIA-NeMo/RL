@@ -209,13 +209,40 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _assert_request_contract(body: dict[str, Any]) -> None:
+        serialized_body = json.dumps(body)
+        is_judge_request = (
+            "GOLD:" in serialized_body and "CANDIDATE:" in serialized_body
+        )
+
         assert body["model"] == "scripted-model"
-        assert body["temperature"] == _GENERATION_CONFIG["temperature"]
-        assert body["top_p"] == _GENERATION_CONFIG["top_p"]
-        assert body["max_tokens"] == _GENERATION_CONFIG["max_new_tokens"]
         assert body["logprobs"] is True
         assert body["top_logprobs"] == 0
         assert body["return_tokens_as_token_ids"] is True
+
+        if is_judge_request:
+            assert "temperature" not in body
+            assert "top_p" not in body
+            assert "max_tokens" not in body
+        else:
+            assert body["temperature"] == _GENERATION_CONFIG["temperature"]
+            assert body["top_p"] == _GENERATION_CONFIG["top_p"]
+            assert body["max_tokens"] == _GENERATION_CONFIG["max_new_tokens"]
+
+        expected_tool_name = None
+        if "SHOW24" in serialized_body and "Medical Zone" in serialized_body:
+            expected_tool_name = "check_seat_availability"
+        elif "Dizer Kola" in serialized_body:
+            expected_tool_name = "response_tool_8"
+        elif "Task Update on Develop prototype" in serialized_body:
+            expected_tool_name = "email_reply_email"
+
+        if expected_tool_name is not None:
+            tool_names = {
+                tool["function"]["name"]
+                for tool in body.get("tools", [])
+                if tool.get("type") == "function"
+            }
+            assert expected_tool_name in tool_names
 
     @staticmethod
     def _message_for(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
