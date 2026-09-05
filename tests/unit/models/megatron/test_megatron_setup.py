@@ -684,6 +684,43 @@ class TestApplyParallelismConfig:
 
 
 @pytest.mark.mcore
+class TestApplyMtpConfig:
+    """Tests for the complete MTP-disable override."""
+
+    def test_zero_removes_checkpoint_mtp_patterns(self):
+        """A zero depth must also remove Bridge's serialized MTP suffix."""
+        from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+        model_cfg = SimpleNamespace(
+            mtp_num_layers=1,
+            mtp_hybrid_override_pattern="*E",
+            hybrid_layer_pattern="MEMEMEM/*E",
+        )
+
+        _apply_mtp_config(model_cfg, {"megatron_cfg": {"mtp_num_layers": 0}})
+
+        assert model_cfg.mtp_num_layers == 0
+        assert model_cfg.mtp_hybrid_override_pattern is None
+        assert model_cfg.hybrid_layer_pattern == "MEMEMEM"
+
+    def test_positive_depth_preserves_checkpoint_mtp_patterns(self):
+        """Enabling MTP must retain the provider's checkpoint-native pattern."""
+        from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+        model_cfg = SimpleNamespace(
+            mtp_num_layers=1,
+            mtp_hybrid_override_pattern="*E",
+            hybrid_layer_pattern="MEMEMEM/*E",
+        )
+
+        _apply_mtp_config(model_cfg, {"megatron_cfg": {"mtp_num_layers": 1}})
+
+        assert model_cfg.mtp_num_layers == 1
+        assert model_cfg.mtp_hybrid_override_pattern == "*E"
+        assert model_cfg.hybrid_layer_pattern == "MEMEMEM/*E"
+
+
+@pytest.mark.mcore
 class TestApplyMoeConfig:
     """Tests for _apply_moe_config function."""
 
