@@ -103,6 +103,16 @@ def test_launcher_can_trace_nano_fp8_param_true_and_bf16_control() -> None:
     assert 'COMMON_SRUN_ARGS+=" --container-remap-root"' in ray_sub
 
 
+def test_launcher_exports_ntrace_pythonpath_before_import_preflight() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+    command = launcher.split(
+        "\nCOMMAND=$(cat <<EOF\nset -euo pipefail\n", maxsplit=1
+    )[1].split("\nEOF\n)", maxsplit=1)[0]
+
+    pythonpath_export = "export PYTHONPATH=${PYTHONPATH_VALUE}"
+    assert command.index(pythonpath_export) < command.index("${NTRACE_COMMAND}")
+
+
 def test_ntrace_image_builder_pins_native_runtime_in_immutable_image() -> None:
     builder = (EXPERIMENT_DIR / "build_ntrace_image_oci_hsg.sh").read_text()
 

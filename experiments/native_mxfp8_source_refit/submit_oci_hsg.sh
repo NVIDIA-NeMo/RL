@@ -340,6 +340,7 @@ fi
 COMMAND=$(cat <<EOF
 set -euo pipefail
 cd ${REPO}
+export PYTHONPATH=${PYTHONPATH_VALUE}
 ${NATIVE_AUDIT_COMMAND}
 ${NTRACE_COMMAND}
 export HOME=/root
@@ -355,7 +356,6 @@ export TRITON_CACHE_DIR=${LOCAL_SCRATCH}/triton-cache/${SOURCE_SHA}/${CACHE_ARM}
 export UV_CACHE_DIR=${LOCAL_SCRATCH}/uv-cache
 export UV_PYTHON_INSTALL_DIR=${LOCAL_SCRATCH}/uv-python
 export UV_LOCK_TIMEOUT=7200
-export PYTHONPATH=${PYTHONPATH_VALUE}
 unset UV_PROJECT_ENVIRONMENT WANDB_API_KEY
 mkdir -p "\${HF_HOME}"
 /opt/nemo_rl_venv/bin/python examples/run_grpo.py \\
