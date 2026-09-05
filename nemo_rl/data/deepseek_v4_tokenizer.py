@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+from collections.abc import Mapping
 from typing import Any
 
 from nemo_rl.data.deepseek_v4_encoding import encode_messages
@@ -20,7 +21,7 @@ from nemo_rl.data.deepseek_v4_encoding import encode_messages
 DEEPSEEK_V4_CHAT_TEMPLATE = "deepseek_v4"
 
 
-def should_use_deepseek_v4_chat_template(tokenizer_config: dict[str, Any]) -> bool:
+def should_use_deepseek_v4_chat_template(tokenizer_config: Mapping[str, Any]) -> bool:
     """Return whether the config explicitly requests the DeepSeek V4 renderer."""
     return tokenizer_config.get("chat_template") == DEEPSEEK_V4_CHAT_TEMPLATE
 

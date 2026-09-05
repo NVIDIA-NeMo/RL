@@ -1,25 +1,13 @@
 defaults: ../../grpo_math_1B.yaml
-
-# DeepSeek V4 Flash DAPO-GRPO reference configuration for AutoModel r0.6.0.
-# The non-Base Flash checkpoint stores FP4 expert weights. AutoModel dequantizes
-# them to BF16 for training, while vLLM uses the FP8 expert layout selected by
-# expert_dtype. The same layout also supports Flash-Base, whose experts are FP8
-# on disk. This recipe uses the validated 2K-response AdamW configuration and
-# does not enable training-side fake quantization.
 grpo:
-  num_prompts_per_step: 32
-  num_generations_per_prompt: 16
   batch_multiplier: 4
   max_num_epochs: 100
   max_num_steps: 1000
   normalize_rewards: false
   use_leave_one_out_baseline: false
   adv_estimator:
-    name: grpo
     normalize_rewards: false
     use_leave_one_out_baseline: false
-    minus_baseline: true
-  val_period: 10
   max_val_samples: 960
   val_batch_size: 960
   use_dynamic_sampling: true
@@ -30,7 +18,6 @@ grpo:
     enabled: true
     overlong_buffer_length: 1024
     max_response_length: 2048
-
 loss_fn:
   token_level_loss: false
   reference_policy_kl_penalty: 0.0
@@ -39,65 +26,48 @@ loss_fn:
   truncated_importance_sampling_ratio: 2
   ratio_clip_max: 0.28
   ratio_clip_c: 10
-
 checkpointing:
   checkpoint_dir: results/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128
   keep_top_k: 1
   save_period: 2
   checkpoint_must_save_by: 00:03:45:00
   model_save_format: null
-
 policy:
   model_name: deepseek-ai/DeepSeek-V4-Flash-0731
   tokenizer:
-    name: ${policy.model_name}
-    # The official checkpoint currently has no HF chat template. NeMo-RL and
-    # vLLM both use vLLM 0.25.1's native DeepSeek V4 renderer for this selector.
     chat_template: deepseek_v4
     chat_template_kwargs:
       enable_thinking: false
   dequantize_base_checkpoint: true
   hf_config_overrides:
     num_nextn_predict_layers: 0
-    # Flash is FP4 on disk, but rollout uses the FP8 expert layout populated by
-    # refit. Do not replace the checkpoint's quantization_config: AutoModel
-    # still needs it to dequantize the training checkpoint correctly.
     expert_dtype: fp8
-  train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  # 1024 prompt tokens + 2048 response tokens.
   max_total_sequence_length: 3072
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
   make_sequence_length_divisible_by: 64
   optimizer:
-    name: torch.optim.AdamW
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
-      betas: [0.9, 0.999]
-      eps: 1.0e-08
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
-      start_factor: 1.0e-02
+      start_factor: 0.01
       end_factor: 1.0
       total_iters: 5
   - name: torch.optim.lr_scheduler.ConstantLR
     kwargs:
       factor: 1.0
       total_iters: 10000000000
-  - milestones: [5]
+  - milestones:
+    - 5
   dtensor_cfg:
-    _v2: true
-    enabled: true
     env_vars:
-      NRL_OFFLOAD_OPTIMIZER_FOR_TRAIN: "0"
-      NRL_OPTIMIZER_OFFLOAD_DEBUG: "0"
-    cpu_offload: false
-    sequence_parallel: false
-    tensor_parallel_size: 1
+      NRL_OFFLOAD_OPTIMIZER_FOR_TRAIN: '0'
+      NRL_OPTIMIZER_OFFLOAD_DEBUG: '0'
     context_parallel_size: 8
     expert_parallel_size: 128
     activation_checkpointing: true
@@ -107,7 +77,6 @@ policy:
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.BackendConfig
-        # DeepSeek V4 CP is model-owned and requires TileLang attention.
         attn: tilelang
         linear: torch
         rms_norm: torch_fp32
@@ -117,35 +86,25 @@ policy:
         rope_fusion: false
         enable_hf_state_dict_adapter: true
         enable_fsdp_optimizations: true
-  megatron_cfg:
-    enabled: false
   sequence_packing:
     enabled: false
   dynamic_batching:
     enabled: true
   generation:
     max_new_tokens: 2048
-    temperature: 1.0
     vllm_cfg:
       precision: fp8
       kv_cache_dtype: fp8_ds_mla
-      # Work around https://github.com/NVIDIA-NeMo/RL/issues/3412: vLLM 0.25
-      # defaults to RayExecutorV2, while FP8 worker patching currently uses V1.
       env_vars:
-        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
-        # DeepSeek V4 block-wise FP8 uses UE8M0 scales.
-        VLLM_USE_DEEP_GEMM_E8M0: "1"
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: '0'
+        VLLM_USE_DEEP_GEMM_E8M0: '1'
       use_deep_gemm: true
       pow2_weight_scaling_factors: true
       tensor_parallel_size: 8
-      expert_parallel_size: 1
       enable_expert_parallel: true
-      gpu_memory_utilization: 0.6
       enforce_eager: true
-      max_model_len: ${policy.max_total_sequence_length}
     vllm_kwargs:
       tokenizer_mode: deepseek_v4
-
 data:
   max_input_seq_length: 1024
   filter_overlong_prompts: true
@@ -155,22 +114,18 @@ data:
     dataset_name: DAPOMathAIME2024
   default:
     prompt_file: null
-
 env:
   math:
     num_workers: 16
     math_verify_impl: dapo_math_verify
-
 logger:
   wandb_enabled: true
   tensorboard_enabled: true
-  monitor_gpus: true
   num_val_samples_to_print: 2
   num_train_samples_to_print: 2
   wandb:
     project: nemo-rl
     name: grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128
-
 cluster:
   gpus_per_node: 8
   num_nodes: 16
