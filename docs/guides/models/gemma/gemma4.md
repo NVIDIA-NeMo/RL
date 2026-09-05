@@ -85,6 +85,28 @@ in generation KL error is 1.6e-5 across 100 aligned training points.
 
 ![Gemma 4 E2B CP1 versus CP2 curves for train/loss, train/mean_gen_tokens_per_sample, train/reward, validation/accuracy, train/gen_kl_error, and train/approx_entropy](../../../assets/gemma4/gemma4-e2b-cp1-vs-cp2-100steps.png)
 
+### 26B-A4B Context Parallel Parity
+
+The 26B-A4B pair keeps the four-node, 32-GPU training world size fixed while
+changing the model-parallel layout from EP32 × CP1 to EP16 × CP2. Both runs
+complete 100 steps. The mean absolute difference in validation accuracy is
+0.0114 across 20 aligned validation points, while the mean absolute difference
+in generation KL error is 5.6e-5 across 100 aligned training points. The final
+validation accuracies are 0.741 for EP32 × CP1 and 0.751 for EP16 × CP2.
+
+![Gemma 4 26B-A4B EP32 CP1 versus EP16 CP2 curves for train/loss, train/mean_gen_tokens_per_sample, train/reward, validation/accuracy, train/gen_kl_error, and train/approx_entropy](../../../assets/gemma4/gemma4-26ba4b-cp1-vs-cp2-100steps.png)
+
+### 31B Context Parallel Parity
+
+The 31B CP1 and CP2 runs use the same four-node training configuration except
+for `policy.dtensor_cfg.context_parallel_size`. Both runs complete 100 steps.
+The mean absolute difference in validation accuracy is 0.0099 across 20 aligned
+validation points, while the mean absolute difference in generation KL error is
+2.2e-5 across 100 aligned training points. The final validation accuracies are
+0.823 for CP1 and 0.818 for CP2.
+
+![Gemma 4 31B CP1 versus CP2 curves for train/loss, train/mean_gen_tokens_per_sample, train/reward, validation/accuracy, train/gen_kl_error, and train/approx_entropy](../../../assets/gemma4/gemma4-31b-cp1-vs-cp2-100steps.png)
+
 ### 12B Long Run
 
 The 12B CP1 run completed 200 steps. Validation accuracy increases from 0.540
