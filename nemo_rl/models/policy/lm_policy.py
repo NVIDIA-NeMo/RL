@@ -173,6 +173,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "which the fused path never materializes. Disable one of the "
                 "two."
             )
+        if (
+            draft_enabled
+            and int(config["draft"].get("ttt_steps", 1) or 1) > 1
+            and bool(config.get("sequence_packing", {}).get("enabled", False))
+        ):
+            # Multi-pass TTT slices the unshifted teacher per pass to build its
+            # targets, which assumes the [B, S] layout; the packed draft loss
+            # pre-shifts and packs a single mask instead.
+            raise ValueError(
+                "policy.draft.ttt_steps > 1 does not support sequence packing "
+                "yet. Set policy.draft.ttt_steps=1 or disable "
+                "policy.sequence_packing."
+            )
         if megatron_enable:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",

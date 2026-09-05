@@ -23,6 +23,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     DPOLossDataDict,
     DPOLossFn,
     DraftCrossEntropyLossFn,
+    DraftTTTCrossEntropyLossFn,
     MseValueLossConfig,
     MseValueLossFn,
     NLLLossFn,

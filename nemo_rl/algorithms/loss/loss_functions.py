@@ -23,6 +23,7 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
+from nemo_rl.algorithms.loss.utils import draft_pass_token_mask
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
@@ -39,6 +40,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedCrossEntropy,
     DistributedCrossEntropy,
     cp_shift_next,
     group_all_reduce_sum,
@@ -59,6 +61,14 @@ class DraftCrossEntropyLossConfig(TypedDict):
 class DraftCrossEntropyLossDataDict(TypedDict):
     teacher_logits: Tensor
     student_logits: Tensor
+    token_mask: Tensor
+    sample_mask: Tensor
+    student_vocab_indices: NotRequired[Tensor]
+
+
+class DraftTTTCrossEntropyLossDataDict(TypedDict):
+    teacher_logits: Tensor
+    student_logits_by_pass: list[Tensor]
     token_mask: Tensor
     sample_mask: Tensor
     student_vocab_indices: NotRequired[Tensor]
@@ -107,6 +117,150 @@ class DraftCrossEntropyLossFn(LossFunction):
             mask,
             global_normalization_factor=global_valid_toks,
         )
+
+
+class DraftTTTCrossEntropyLossFn(LossFunction):
+    """Soft-target cross-entropy over several TTT draft passes.
+
+    The multi-pass sibling of :class:`DraftCrossEntropyLossFn`, selected when
+    ``policy.draft.ttt_steps > 1``. The single-pass class stays the loss for
+    ``ttt_steps == 1`` (including the packed layout), which is why the two live
+    side by side instead of behind a flag.
+
+    Pass ``d`` (1-indexed) student logits at position ``i`` predict token
+    ``x_{i+d+1}``; the matching soft target is the (detached, unshifted)
+    policy logits at position ``i + d``, so both sides are pure slices of
+    their full-length tensors. The per-pass mask is
+    ``token_mask[i + d + 1] * sample_mask`` (see ``draft_pass_token_mask``).
+
+    The scalar loss is ``sum_d alpha_d * masked_sum_d / denominator`` where
+    the denominator is ``sum_d alpha_d * global_draft_pass_counts[d-1]`` (the
+    DP-all-reduced per-pass counts from ``compute_draft_pass_valid_counts``)
+    when provided, else the policy's ``global_valid_toks`` (single-pass
+    fallback for callers that do not thread the draft counts).
+
+    Every returned metric is normalized by a GLOBAL denominator so the
+    driver's sum-over-microbatches aggregation reconstructs a global mean
+    (mirroring how the policy losses report): ``draft_loss_pass_d`` sums to
+    the global per-token soft-CE of pass d.
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.DRAFT_TTT
+
+    def __init__(
+        self,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        pass_weights: Optional[list[float]] = None,
+        seq_chunk_size: int = 4096,
+    ):
+        self.vocab_parallel_group = vocab_parallel_group
+        self.pass_weights = pass_weights
+        # Sequence-dim tile for the loss internals: the fp32 soft-CE buffers
+        # here and the d2t full-vocab TP gather in prepare_loss_input. Trades
+        # a few extra TP collectives for peak memory; never affects results.
+        # Set via policy.draft.loss_seq_chunk_size.
+        self.seq_chunk_size = seq_chunk_size
+
+    def _per_token_soft_ce(
+        self, student_logits: Tensor, teacher_logits: Tensor
+    ) -> Tensor:
+        # Soft cross entropy matches the forward-KL student gradient. The
+        # sequence-chunked variant keeps the fp32 softmax buffers chunk-sized
+        # and saves only the bf16 logits references for backward — essential
+        # when several TTT passes stack up before the shared backward.
+        return ChunkedDistributedCrossEntropy.apply(
+            student_logits,
+            teacher_logits,
+            self.seq_chunk_size,
+            self.vocab_parallel_group,
+            False,
+        )
+
+    def __call__(
+        self,
+        teacher_logits: Tensor,
+        student_logits_by_pass: list[Tensor],
+        data: BatchedDataDict[DraftTTTCrossEntropyLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Reduce the masked per-pass draft losses to a scalar and metrics."""
+        num_passes = len(student_logits_by_pass)
+        if self.pass_weights is not None and len(self.pass_weights) != num_passes:
+            raise ValueError(
+                f"pass_weights has {len(self.pass_weights)} entries but the "
+                f"draft produced {num_passes} passes."
+            )
+        if (
+            global_draft_pass_counts is not None
+            and global_draft_pass_counts.shape[0] != num_passes
+        ):
+            raise ValueError(
+                f"global_draft_pass_counts has {global_draft_pass_counts.shape[0]} "
+                f"entries but the draft produced {num_passes} passes."
+            )
+
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+        seq_len = teacher_logits.shape[1]
+
+        if global_draft_pass_counts is not None:
+            pass_counts = global_draft_pass_counts.float()
+            weights = (
+                torch.ones_like(pass_counts)
+                if self.pass_weights is None
+                else pass_counts.new_tensor(self.pass_weights)
+            )
+            denominator = (weights * pass_counts).sum()
+        else:
+            pass_counts = None
+            denominator = global_valid_toks
+
+        metrics: dict[str, Any] = {}
+        total = teacher_logits.new_zeros((), dtype=torch.float32)
+        for pass_index, student_logits in enumerate(student_logits_by_pass):
+            ttt_pass = pass_index + 1
+            weight = (
+                1.0
+                if self.pass_weights is None
+                else float(self.pass_weights[pass_index])
+            )
+            valid_len = seq_len - ttt_pass - 1
+            if valid_len <= 0:
+                metrics[f"draft_loss_pass_{ttt_pass}"] = 0.0
+                continue
+
+            # Views into the unshifted tensors — the chunked CE makes its own
+            # per-chunk contiguous fp32 copies, so no full-pass copy here.
+            student_slice = student_logits[:, :valid_len]
+            teacher_slice = teacher_logits[:, ttt_pass : ttt_pass + valid_len]
+            per_token_loss = self._per_token_soft_ce(student_slice, teacher_slice)
+
+            pass_mask = draft_pass_token_mask(
+                token_mask, ttt_pass
+            ) * sample_mask.unsqueeze(-1)
+            pass_sum = (per_token_loss.float() * pass_mask).sum()
+            total = total + weight * pass_sum
+
+            with torch.no_grad():
+                # GLOBAL per-pass denominator: the driver aggregates mb-metric
+                # lists with a plain sum, so a per-microbatch mean would be
+                # inflated by the number of microbatches (~512x at gbs 512).
+                metric_denominator = (
+                    pass_counts[pass_index]
+                    if pass_counts is not None
+                    else global_valid_toks.float()
+                )
+                metrics[f"draft_loss_pass_{ttt_pass}"] = float(
+                    (
+                        pass_sum.detach() / torch.clamp(metric_denominator, min=1.0)
+                    ).item()
+                )
+
+        loss = total / torch.clamp(denominator.float(), min=1.0)
+        return loss, metrics
 
 
 class ClippedPGLossConfig(BaseModel, extra="allow"):
