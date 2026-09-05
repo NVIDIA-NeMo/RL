@@ -86,7 +86,6 @@ policy:
       context_parallel_size: 1
       tensor_model_parallel_size: 2
       buffer_size_gb: 20
-      num_cuda_graphs: -1
       max_tokens: ${policy.max_total_sequence_length}
       expose_http_server: true
       enable_prefix_caching: true

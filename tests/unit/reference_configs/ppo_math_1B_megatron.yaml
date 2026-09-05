@@ -249,13 +249,20 @@ policy:
     mcore_generation_config:
       buffer_size_gb: 20
       buffer_guaranteed_fraction: 0.1
-      num_cuda_graphs: 16
+      # Generation CUDA graphs. MCore accepts only these pairings:
+      #   cuda_graph_impl "none"  -> omit inference_cuda_graph_scope
+      #   cuda_graph_impl "local" -> inference_cuda_graph_scope "layer" or "block"
+      cuda_graph_impl: "local"
+      cuda_graph_sizing_distribution: "linear"  # How captured CUDA-graph sizes are spaced. Options: "exponential" (log-spaced), "linear" (denser at the top end).
+      inference_cuda_graph_scope: "block"
+      num_cuda_graphs: -1  # Number of CUDA graphs to pre-compile for different batch sizes (-1 = auto).
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
       unified_memory_level: 0
       max_tokens: 16384
       logprobs_mode: processed_logprobs
+      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo", "nccl" ("nvshmem" is accepted but currently broken, see #3646).
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}

@@ -384,13 +384,14 @@ policy:
         shard_expert_weights: false
     mcore_generation_config:
       max_model_len: ${policy.max_total_sequence_length}
+      cuda_graph_sizing_distribution: "linear"  # How captured CUDA-graph sizes are spaced. Options: "exponential" (log-spaced), "linear" (denser at the top end).
       # Generation CUDA graphs. MCore accepts only these pairings:
       #   cuda_graph_impl "none"  -> omit inference_cuda_graph_scope
       #   cuda_graph_impl "local" -> inference_cuda_graph_scope "layer" or "block"
       cuda_graph_impl: "local"
       inference_cuda_graph_scope: "block"
       buffer_size_gb: 10
-      num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
+      num_cuda_graphs: -1  # Number of CUDA graphs to pre-compile for different batch sizes (-1 = auto).
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
@@ -400,7 +401,7 @@ policy:
       materialize_only_last_token_logits: true  # Materialize logits only for the last token of each sequence during decode.
       num_speculative_tokens: 0
       logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
-      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl"
+      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo", "nccl" ("nvshmem" is accepted but currently broken, see #3646).
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
     vllm_cfg:
