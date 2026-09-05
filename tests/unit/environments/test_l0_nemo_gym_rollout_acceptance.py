@@ -112,6 +112,7 @@ _WORKPLACE_ARGUMENTS = {
     "email_id": "00000057",
     "body": "Thanks for the update - I will get back to you tomorrow.",
 }
+_CONTINUATION_FRAME = b"\x02nemo-rl-continuation\x00"
 
 
 def _tool_call_message(
@@ -170,7 +171,7 @@ def _prompt_token_ids(body: dict[str, Any]) -> list[int]:
     return (
         list(b"\x00" + compress(initial_request))
         + list(b"\x01" + first_generation.encode())
-        + list(b"\x02" + compress(serialized_request))
+        + list(_CONTINUATION_FRAME + serialized_request)
     )
 
 
@@ -190,7 +191,10 @@ class _ScriptedTokenizer:
         for token_ids in batch:
             payload = bytes(int(token_id) for token_id in token_ids)
             if payload.startswith(b"\x00"):
-                decoded.append(decompress(payload[1:]).decode())
+                _, frame, continuation = payload.rpartition(_CONTINUATION_FRAME)
+                decoded.append(
+                    continuation.decode() if frame else decompress(payload[1:]).decode()
+                )
             elif payload.startswith(b"\x01"):
                 decoded.append(payload[1:].decode())
             else:
@@ -202,6 +206,16 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
     """Return deterministic policy outputs to real Gym model and agent services."""
 
     protocol_version = "HTTP/1.1"
+
+    @staticmethod
+    def _assert_request_contract(body: dict[str, Any]) -> None:
+        assert body["model"] == "scripted-model"
+        assert body["temperature"] == _GENERATION_CONFIG["temperature"]
+        assert body["top_p"] == _GENERATION_CONFIG["top_p"]
+        assert body["max_tokens"] == _GENERATION_CONFIG["max_new_tokens"]
+        assert body["logprobs"] is True
+        assert body["top_logprobs"] == 0
+        assert body["return_tokens_as_token_ids"] is True
 
     @staticmethod
     def _message_for(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -262,6 +276,7 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
 
         content_length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(content_length))
+        self._assert_request_contract(body)
         message, generation_text = self._message_for(body)
         prompt_token_ids = _prompt_token_ids(body)
         generation_token_ids = list(b"\x01" + generation_text.encode())
@@ -393,6 +408,9 @@ def test_l0_scripted_multiturn_tokens_are_contiguous():
     continuation_prompt = _prompt_token_ids(continuation_body)
 
     assert continuation_prompt[: len(seen_token_ids)] == seen_token_ids
+    assert json.loads(_ScriptedTokenizer().batch_decode([continuation_prompt])[0]) == (
+        continuation_body
+    )
 
 
 def _load_case_datum(case: dict[str, Any]) -> DatumSpec:
@@ -417,10 +435,10 @@ def scripted_openai_base_url():
         server_thread.join(timeout=5)
 
 
-@pytest.fixture
-def l0_nemo_gym(scripted_openai_base_url, case):
-    """Start the selected real Gym environment with case-local attribution."""
-    config_paths = [_POLICY_MODEL_CONFIG, case["config_path"]]
+@pytest.fixture(scope="module")
+def l0_nemo_gym(scripted_openai_base_url):
+    """Start all acceptance environments in one real Gym actor."""
+    config_paths = [_POLICY_MODEL_CONFIG] + [case["config_path"] for case in _L0_CASES]
     tokenizer = _ScriptedTokenizer()
     env = spinup_nemo_gym_actor(
         {
@@ -475,12 +493,18 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
         if message["role"] == "assistant"
     ]
     assert assistant_messages
-    for message in assistant_messages:
+    assert len(assistant_messages) == len(case["expected_generations"])
+    for message, generation in zip(
+        assistant_messages, case["expected_generations"], strict=True
+    ):
         assert isinstance(message["token_ids"], torch.Tensor)
         assert isinstance(message["generation_logprobs"], torch.Tensor)
-        assert len(message["token_ids"]) > 0
-        assert len(message["token_ids"]) == len(message["generation_logprobs"])
-        assert torch.isfinite(message["generation_logprobs"]).all()
+        expected_token_ids = torch.tensor(list(b"\x01" + generation.encode()))
+        torch.testing.assert_close(message["token_ids"], expected_token_ids)
+        torch.testing.assert_close(
+            message["generation_logprobs"],
+            torch.full((len(expected_token_ids),), -0.1),
+        )
 
     metric_prefix = f"{case['agent_ref']['name']}/reward/"
     assert any(key.startswith(metric_prefix) for key in result.rollout_metrics)
@@ -519,3 +543,11 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
     ]
     assert len(prompt_strings) == len(case["expected_generations"])
     assert all(case["expected_prompt_fragment"] in prompt for prompt in prompt_strings)
+    if case["name"] == "workplace_assistant":
+        continuation_messages = json.loads(prompt_strings[1])["messages"]
+        assert any(message.get("tool_calls") for message in continuation_messages)
+        assert any(
+            message.get("role") == "tool"
+            and "Email replied successfully" in message.get("content", "")
+            for message in continuation_messages
+        )
