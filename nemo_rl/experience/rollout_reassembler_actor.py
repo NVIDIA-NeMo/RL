@@ -22,7 +22,7 @@ import ray
 import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
-from nemo_rl.experience.rollout_reassembler import RolloutReassembler, FinalizedGroup
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 
 # Field names whose values are per-token and therefore large, but whose Python
 # type is indistinguishable from metadata -- a list[int] of token ids looks just
