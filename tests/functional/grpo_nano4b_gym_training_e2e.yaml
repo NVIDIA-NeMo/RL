@@ -65,7 +65,8 @@ policy:
   make_sequence_length_divisible_by: 1
   generation:
     max_new_tokens: 64
-    temperature: 0.0
+    temperature: 1.0
+    val_temperature: 0.0
     top_p: 1.0
     vllm_cfg:
       async_engine: true
@@ -120,6 +121,10 @@ env:
       responses_api_models:
         vllm_model:
           uses_reasoning_parser: false
+          # Keep temperature positive for policy logprobs while making sampled
+          # training rollouts reproducible enough for exact reward goldens.
+          extra_body:
+            seed: 42
 
 logger:
   log_dir: tests/functional/grpo_nano4b_gym_training_e2e/logs
