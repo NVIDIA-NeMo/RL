@@ -1400,4 +1400,5 @@ def test_rollout_pump_writes_expected_tq_data(
             "num_invalid_tool_calls",
             "num_malformed_thinking",
             "num_assistant_messages",
+            "num_routed_experts_backfilled",
         }
