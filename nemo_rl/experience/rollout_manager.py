@@ -1049,7 +1049,12 @@ class AsyncNemoGymRolloutImpl:
             )
             results[rowidx] = result
             if on_completion is not None:
-                await on_completion(rowidx, self._result_to_completion(result))
+                # Use the same conversion path as completed groups so streamed
+                # recovery records inherit the current mask and reward semantics.
+                # Completion callbacks are token-capture receipt-only, making this
+                # conversion lightweight and safe to repeat during group metrics.
+                row_completions, _ = self._results_to_completions([result])
+                await on_completion(rowidx, row_completions[0])
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
 

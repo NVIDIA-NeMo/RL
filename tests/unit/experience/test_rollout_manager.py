@@ -782,6 +782,51 @@ def test_receipt_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+def test_streamed_receipt_callback_uses_current_completion_conversion():
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix):
+            del pending, timer_prefix
+
+            async def result_ref():
+                return 0, _mask_gate_receipt_result(), None
+
+            async def stream():
+                yield result_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False)
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    results = [None]
+    shaping = [None]
+    streamed = []
+
+    async def on_completion(generation_index, completion):
+        streamed.append((generation_index, completion))
+
+    _run(
+        impl._stream_rows(
+            env,
+            [{"_rowidx": 0}],
+            results,
+            shaping,
+            1,
+            "timing/test",
+            on_completion=on_completion,
+        )
+    )
+
+    assert len(streamed) == 1
+    generation_index, completion = streamed[0]
+    assert generation_index == 0
+    assert completion.env_extras["ng_rollout_id"] == "r0"
+    assert "mask_sample" not in completion.env_extras["instance_config"]
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     impl = _nemo_gym_impl(True, log_full_result_tables=log_full_result_tables)
