@@ -51,7 +51,6 @@ def _request() -> ReassemblyRequest:
         ),
         rewards=(1.0,),
         mask_sample=(False,),
-        prompt_idx=0,
         fallback_weight_version=4,
     )
 
