@@ -44,12 +44,11 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.multimodal_utils import (
     NATIVE_MULTIMODAL_KEYS,
+    ROLLOUT_MATCHED_MEDIA_KEY,
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
     attach_image_model_inputs_to_message,
     extract_input_images_from_responses_messages,
-    nemo_gym_image_max_num_tiles,
-    reconcile_message_media_placeholder_runs,
 )
 from nemo_rl.data.routed_experts import RoutedExpertsTensorRef
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -61,6 +60,7 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
 )
+from nemo_rl.environments.nemotron_utils import verify_static_video_media_alignment
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
@@ -139,7 +139,6 @@ def attach_initial_nemo_gym_image_payloads(
             images=images,
             processor=processor,
             pad_dynamic_image_shapes=pad_dynamic_image_shapes,
-            max_num_tiles=nemo_gym_image_max_num_tiles(extra_env_info),
         )
 
 
@@ -215,20 +214,27 @@ def _reattach_original_multimodal_payloads(
 def _reattach_static_multimodal_payloads_to_result(
     result: dict[str, Any],
     source_message_log: list[dict[str, Any]],
+    tokenizer: Any = None,
 ) -> None:
     """Restore static media to each Gym-authored message-log representation."""
     for log_key in ("input_message_log", "message_log"):
         target_log = result.get(log_key)
         if not target_log:
             continue
-        attach_static_multimodal_payload(target_log, source_message_log)
+        attach_static_multimodal_payload(target_log, source_message_log, tokenizer)
 
 
 def attach_static_multimodal_payload(
     target_message_log: list[dict[str, Any]],
     source_message_log: list[dict[str, Any]],
+    tokenizer: Any = None,
 ) -> None:
-    """Copy policy-ready media from static source turns to Gym-authored turns."""
+    """Copy policy-ready media from static source turns to Gym-authored turns.
+
+    Rollout-matched image tensors are authoritative and are never overwritten.
+    Static video tensors are copied only after their placeholder expansion is
+    verified against the rollout token stream.
+    """
     source_users = [
         message for message in source_message_log if message.get("role") == "user"
     ]
@@ -241,19 +247,13 @@ def attach_static_multimodal_payload(
             "turns than the source prompt."
         )
     for source, target in zip(source_users, target_users):
+        if target.pop(ROLLOUT_MATCHED_MEDIA_KEY, False):
+            continue
+        if tokenizer is not None:
+            verify_static_video_media_alignment(source, target, tokenizer)
         for key, value in source.items():
-            if (
-                isinstance(value, PackedTensor)
-                or key in NATIVE_MULTIMODAL_KEYS
-                or key
-                in {
-                    "_media_placeholder_token_id",
-                    "_media_placeholder_run_lengths",
-                    "_media_placeholder_require_exact_match",
-                }
-            ):
+            if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
                 target[key] = value
-        reconcile_message_media_placeholder_runs(target)
 
 
 def _add_r3_fallback_metrics(
@@ -2503,7 +2503,7 @@ async def run_async_nemo_gym_rollout(
                 completed_group = accumulator.add(rowidx, result)
                 if original_message_logs is not None:
                     _reattach_static_multimodal_payloads_to_result(
-                        result, original_message_logs[rowidx]
+                        result, original_message_logs[rowidx], tokenizer
                     )
                     result.pop("_initial_multimodal_data_omitted", None)
                 if completed_group is not None:

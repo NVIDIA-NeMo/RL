@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -19,7 +21,36 @@ from PIL import Image
 
 from nemo_rl.environments.nemotron_utils import (
     _resize_and_normalize_nemotron_video_frame,
+    placeholder_runs_from_token_ids,
+    verify_static_video_media_alignment,
 )
+
+
+def test_placeholder_runs_preserve_per_region_counts() -> None:
+    assert placeholder_runs_from_token_ids(
+        [10, 98, 99, 99, 97, 11, 98, 99, 99, 99, 97],
+        (99, 98, 97),
+    ) == [2, 3]
+
+
+def test_static_video_alignment_rejects_different_rollout_grid() -> None:
+    class _Tokenizer:
+        unk_token_id = None
+
+        @staticmethod
+        def convert_tokens_to_ids(tokens):
+            mapping = {"<image>": 99, "<img>": 98, "</img>": 97}
+            return [mapping[token] for token in tokens]
+
+    source = {
+        "token_ids": torch.tensor([98, 99, 99, 99, 97]),
+        "num_frames": SimpleNamespace(tensors=[torch.tensor([2])]),
+        "imgs_sizes": SimpleNamespace(tensors=[torch.tensor([[2, 2]])]),
+    }
+    target = {"token_ids": torch.tensor([98, 99, 99, 99, 99, 97])}
+
+    with pytest.raises(ValueError, match="3 placeholder tokens total.*4"):
+        verify_static_video_media_alignment(source, target, _Tokenizer())
 
 
 @pytest.mark.vllm

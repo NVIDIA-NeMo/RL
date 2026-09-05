@@ -464,6 +464,7 @@ def vlm_hf_data_processor(
         get_multimodal_default_settings_from_processor,
         get_multimodal_keys_from_processor,
         resolve_to_image,
+        uses_fixed_tile_image_processor,
         uses_image_placeholder,
     )
 
@@ -615,6 +616,7 @@ def vlm_hf_data_processor(
     # placeholder count.
     if (
         uses_placeholder
+        and not uses_fixed_tile_image_processor(processor)
         and "pixel_values" in message
         and "imgs_sizes" not in message
         and message["pixel_values"].ndim == 4

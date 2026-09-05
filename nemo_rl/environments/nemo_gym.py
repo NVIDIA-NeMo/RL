@@ -36,7 +36,7 @@ from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
     encode_images_in_examples,
     extract_input_image_sources_from_responses_messages,
-    nemo_gym_image_max_num_tiles,
+    image_size_from_source,
     resolve_to_image,
     uses_image_placeholder,
 )
@@ -48,6 +48,11 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemotron_utils import (
+    count_image_placeholder_runs,
+    predicted_static_image_num_tokens,
+    supports_image_placeholder_run_parity,
+)
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -610,7 +615,7 @@ def _attach_multimodal_data_to_user_message(
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
-    max_num_tiles: int | None = None,
+    expected_num_tokens_per_image: "list[int] | None" = None,
 ) -> None:
     """Attach per-turn multimodal tensors to ``user_message``.
 
@@ -627,7 +632,7 @@ def _attach_multimodal_data_to_user_message(
         images=images,
         processor=processor,
         pad_dynamic_image_shapes=pad_dynamic_image_shapes,
-        max_num_tiles=max_num_tiles,
+        expected_num_tokens_per_image=expected_num_tokens_per_image,
     )
 
 
@@ -929,7 +934,6 @@ Depending on your data shape, you may want to change these values."""
         )
 
         processor = getattr(self, "_processor", None)
-        image_max_num_tiles = nemo_gym_image_max_num_tiles(nemo_gym_row)
         response = nemo_gym_result["response"]
         empty_response_output = (
             isinstance(response.get("output"), list) and not response["output"]
@@ -981,6 +985,46 @@ Depending on your data shape, you may want to change these values."""
             and initial_media_matches_raw_input
             and returned_media_matches_raw_input
         )
+        parity_processor = (
+            processor
+            if processor is not None
+            and supports_image_placeholder_run_parity(processor)
+            else None
+        )
+        # vLLM can shrink an image's tile budget for a long request. Static
+        # deduplication is safe only when its processor-owned token counts
+        # already equal the rollout expansion; otherwise the Gym actor must
+        # attach tensors rebuilt from the rollout's exact per-image budgets.
+        if (
+            initial_multimodal_data_omitted
+            and parity_processor is not None
+            and raw_initial_sources
+        ):
+            first_trainable_item = next(
+                (
+                    item
+                    for item in response["output"]
+                    if _is_trainable_output_item(item)
+                ),
+                None,
+            )
+            predicted = predicted_static_image_num_tokens(
+                parity_processor,
+                [image_size_from_source(source) for source in raw_initial_sources],
+            )
+            first_turn_runs = (
+                count_image_placeholder_runs(
+                    first_trainable_item["prompt_token_ids"], parity_processor
+                )
+                if first_trainable_item is not None
+                else []
+            )
+            if (
+                predicted is None
+                or len(first_turn_runs) < len(predicted)
+                or first_turn_runs[: len(predicted)] != predicted
+            ):
+                initial_multimodal_data_omitted = False
         if initial_multimodal_data_omitted:
             media_messages, _ = _without_initial_image_sources(
                 media_messages, raw_initial_sources
@@ -1079,6 +1123,26 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 images_this_turn = (
                     per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
                 )
+                expected_num_tokens: "list[int] | None" = None
+                if images_this_turn and parity_processor is not None:
+                    turn_runs = count_image_placeholder_runs(
+                        new_prompt_token_ids, parity_processor
+                    )
+                    omitted_leading_runs = (
+                        len(raw_initial_sources)
+                        if initial_multimodal_data_omitted and turn_idx == 0
+                        else 0
+                    )
+                    if len(turn_runs) != omitted_leading_runs + len(images_this_turn):
+                        raise ValueError(
+                            f"Rollout/image mismatch on NeMo Gym turn {turn_idx}: "
+                            f"the prompt delta contains {len(turn_runs)} image "
+                            f"placeholder runs but {len(images_this_turn)} images "
+                            f"were collected for this turn (plus "
+                            f"{omitted_leading_runs} deduplicated initial images). "
+                            "Refusing to train on misaligned media."
+                        )
+                    expected_num_tokens = turn_runs[omitted_leading_runs:]
                 _attach_multimodal_data_to_user_message(
                     user_message,
                     images=images_this_turn,
@@ -1090,7 +1154,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     pad_dynamic_image_shapes=getattr(
                         self, "_pad_dynamic_image_shapes", False
                     ),
-                    max_num_tiles=image_max_num_tiles,
+                    expected_num_tokens_per_image=expected_num_tokens,
                 )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
