@@ -16,6 +16,7 @@ NTRACE_NUM_ITERS=${NTRACE_NUM_ITERS:-3}
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
 PARTITION=${PARTITION:-batch}
+SLURM_GRES="${SLURM_GRES:-gpu:4}"
 LOCAL_SCRATCH=${LOCAL_SCRATCH:-/raid/scratch/${USER}}
 SLURM_HELPER_CANDIDATE_DIRS=${SLURM_HELPER_CANDIDATE_DIRS:-/usr/local/bin:/usr/bin:/bin}
 SLURM_HELPER_RESOLVER_CANDIDATES=${SLURM_HELPER_RESOLVER_CANDIDATES:-/usr/bin/readlink:/bin/readlink:/usr/bin/realpath:/bin/realpath}
@@ -417,9 +418,14 @@ if [[ "${ACTION}" == test-only ]]; then
   SBATCH_ACTION=(--test-only)
 fi
 
+SBATCH_GRES_ARGS=()
+if [[ "${SLURM_GRES}" != none ]]; then
+  SBATCH_GRES_ARGS=(--gres="${SLURM_GRES}")
+fi
+
 SBATCH_ARGS=(
   --nodes="${NUM_NODES}"
-  --gres=gpu:4
+  "${SBATCH_GRES_ARGS[@]}"
   --exclusive
   --account="${SLURM_ACCOUNT}"
   --partition="${PARTITION}"

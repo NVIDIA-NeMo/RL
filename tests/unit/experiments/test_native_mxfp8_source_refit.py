@@ -177,6 +177,15 @@ def test_launcher_can_enable_second_refit_runtime_audit() -> None:
     assert "runtime audit requires MODEL=qwen30" in launcher
 
 
+def test_launcher_can_omit_gres_on_exclusive_clusters() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+
+    assert 'SLURM_GRES="${SLURM_GRES:-gpu:4}"' in launcher
+    assert 'if [[ "${SLURM_GRES}" != none ]]' in launcher
+    assert 'SBATCH_GRES_ARGS=(--gres="${SLURM_GRES}")' in launcher
+    assert '"${SBATCH_GRES_ARGS[@]}"' in launcher
+
+
 def test_ray_tmpdir_is_resolved_before_ray_head_and_workers_start() -> None:
     launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
     ray_sub = (REPO_ROOT / "ray.sub").read_text()
