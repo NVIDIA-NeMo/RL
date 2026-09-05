@@ -798,7 +798,9 @@ def test_iter_params_batches_expert_prequantization(monkeypatch):
 
 
 @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
-def test_enable_refit_prequantize_rejects_fp8_param_storage(fp8_recipe):
+def test_enable_refit_prequantize_rejects_fp8_param_storage(
+    fp8_recipe: str,
+) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
