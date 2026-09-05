@@ -1081,6 +1081,8 @@ class DTensorPolicyWorkerV2Impl(
         self,
         buffer_size_bytes: int = 0,
         kv_scales: Optional[dict[str, float]] = None,
+        *,
+        verify_mode: str,
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         if kv_scales is not None:
@@ -1102,6 +1104,7 @@ class DTensorPolicyWorkerV2Impl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            verify_mode=verify_mode,
         )
 
     @torch.no_grad()

@@ -2523,8 +2523,11 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         print("Updating vLLM weights from HF policy...")
 
         buffer_size_bytes = int(lm_policy.get_free_memory_bytes() * 0.3)
-        lm_policy.stream_weights_via_ipc_zmq(buffer_size_bytes=buffer_size_bytes)
-        update_success = vllm_policy.update_weights_via_ipc_zmq()
+        lm_policy.stream_weights_via_ipc_zmq(
+            buffer_size_bytes=buffer_size_bytes,
+            verify_mode="off",
+        )
+        update_success = vllm_policy.update_weights_via_ipc_zmq(verify_digests=False)
         assert update_success, "Weight update should succeed"
         print("vLLM weights successfully updated.")
 

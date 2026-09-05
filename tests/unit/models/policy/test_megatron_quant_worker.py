@@ -521,7 +521,11 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
         fake_stream_weights_via_ipc_zmq_impl,
     )
 
-    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123, kv_scales={"scale": 1.0})
+    worker.stream_weights_via_ipc_zmq(
+        buffer_size_bytes=123,
+        kv_scales={"scale": 1.0},
+        verify_mode="off",
+    )
 
     assert calls[0] == "init_zmq"
     assert calls[1]["buffer_size_bytes"] == 123
@@ -562,7 +566,11 @@ def test_stream_weights_via_ipc_zmq_does_not_move_without_real_quant(monkeypatch
         fake_stream_weights_via_ipc_zmq_impl,
     )
 
-    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123, kv_scales={"scale": 1.0})
+    worker.stream_weights_via_ipc_zmq(
+        buffer_size_bytes=123,
+        kv_scales={"scale": 1.0},
+        verify_mode="off",
+    )
 
     assert calls[0] == "init_zmq"
     assert calls[1]["buffer_size_bytes"] == 123

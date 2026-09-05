@@ -393,6 +393,13 @@ policy:
     # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
     real_quant_export_cpu_offload: true
     refit_cfg:
+      # Byte-level digest verification of refit weight transfers (IPC/ZMQ
+      # transport). "off" (default) adds zero overhead; "log" hashes the sent
+      # and received bytes per parameter and warns on mismatch; "enforce"
+      # raises so a corrupted transfer fails the refit instead of silently
+      # skewing rollouts. Quote "off": bare off is YAML for boolean false.
+      verify:
+        mode: "off"
       nixl:
         update_weights_bucket_memory_ratio: 0.05
         device: cuda

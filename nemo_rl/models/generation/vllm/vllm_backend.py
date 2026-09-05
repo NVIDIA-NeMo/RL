@@ -34,6 +34,7 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.weight_sync.digest import digests_to_ints, tensor_digest
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _STR_TO_DTYPE,
     HFToLocalParamMap,
@@ -916,8 +917,15 @@ class VllmInternalWorkerExtension:
         torch.cuda.current_stream().synchronize()
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(self, verify_digests: bool) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
+
+        Args:
+            verify_digests: When True, hash every received parameter's bytes,
+                dtype, and shape and return the digests to the sender with the
+                final ACK (as a pyobj instead of the plain byte ACK). The sender
+                compares them against its own hashes of the sent tensors. Must
+                match the sender's refit verify configuration.
 
         Returns:
             bool: True if weights were successfully updated.
@@ -925,6 +933,7 @@ class VllmInternalWorkerExtension:
         buffer = None
         weight = None
         weights = None
+        received_digests: dict[str, torch.Tensor] = {}
 
         try:
             self.maybe_init_zmq()
@@ -941,7 +950,18 @@ class VllmInternalWorkerExtension:
                             manifest.require_complete()
                             finalize()
                         finally:
-                            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                            if verify_digests:
+                                # Every hashed batch was synchronized before its
+                                # ACK, so materializing the digests here cannot
+                                # observe unfinished kernels.
+                                self.zmq_socket.send_pyobj(
+                                    {
+                                        "ack": IPCProtocol.ACK.value,
+                                        "digests": digests_to_ints(received_digests),
+                                    }
+                                )
+                            else:
+                                self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                         break
 
                     batch_keys = None
@@ -976,6 +996,12 @@ class VllmInternalWorkerExtension:
                             "inaccurate info like keys or cached dtype in "
                             "state_dict_info"
                         )
+                        if verify_digests:
+                            # Hash the received views before loading mutates
+                            # anything downstream; the kernels are ordered on
+                            # the current stream ahead of this batch's fence.
+                            for key, received_weight in weights:
+                                received_digests[key] = tensor_digest(received_weight)
                         self._load_weights(weights)
                     except Exception as error:
                         batch_error = error

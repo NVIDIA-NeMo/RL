@@ -150,6 +150,14 @@ class VllmGeneration(GenerationInterface):
             defer_model_load: If True, defer model loading for overlapped init
         """
         # Store config
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        # Fail at construction (every algorithm and transport passes here)
+        # rather than let unsupported topologies silently skip verification.
+        enforce_refit_verify_supported(config)
+
         self.cfg = config
         self._defer_model_load = defer_model_load
         self.weight_synchronizer: WeightSynchronizer | None = None
@@ -1189,7 +1197,7 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         ray.get(futures)
 
-    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+    def update_weights_via_ipc_zmq(self, verify_digests: bool) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -1201,9 +1209,9 @@ class VllmGeneration(GenerationInterface):
             else "update_weights_via_ipc_zmq"
         )
 
-        # Use run_all_workers_single_data since no data needs to be passed
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
+            verify_digests=verify_digests,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 

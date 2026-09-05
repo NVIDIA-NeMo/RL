@@ -1118,13 +1118,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return free_memory_bytes
 
     def stream_weights_via_ipc_zmq(
-        self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None
+        self,
+        buffer_size_bytes: int,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        verify_mode: str,
     ) -> list[ray.ObjectRef]:
         """Send the weights for IPC handles via ZMQ socket."""
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_ipc_zmq",
             buffer_size_bytes=buffer_size_bytes,
             kv_scales=kv_scales,
+            verify_mode=verify_mode,
         )
         return futures
 

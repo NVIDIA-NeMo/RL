@@ -279,6 +279,11 @@ policy:
       unified_memory_level: 0
       max_tokens: 16384
       logprobs_mode: processed_logprobs
+    refit_cfg:
+      # Byte-level digest verification of IPC refit transfers.
+      # Quote "off": bare off is YAML for boolean false.
+      verify:
+        mode: "off"
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}

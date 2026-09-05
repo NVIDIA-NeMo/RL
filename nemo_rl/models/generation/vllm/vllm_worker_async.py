@@ -1489,6 +1489,7 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def update_weights_via_ipc_zmq_async(
         self,
+        verify_digests: bool,
     ) -> bool:
         """Async version of update_weights_via_ipc_zmq."""
         try:
@@ -1503,7 +1504,7 @@ class VllmAsyncGenerationWorkerImpl(
 
             # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_via_ipc_zmq", args=tuple()
+                "update_weights_via_ipc_zmq", args=(verify_digests,)
             )
 
             if asyncio.iscoroutine(result_or_coro):

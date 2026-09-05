@@ -57,6 +57,15 @@ FANOUT_METHODS = [
             "interfaces.py",
         ],
     ),
+    (
+        "stream_weights_via_ipc_zmq",
+        [
+            "workers/dtensor_policy_worker.py",
+            "workers/dtensor_policy_worker_v2.py",
+            "workers/megatron_policy_worker.py",
+            "interfaces.py",
+        ],
+    ),
 ]
 
 # The same contract on the generation side, and worse there: VllmGeneration picks the
@@ -85,7 +94,17 @@ GEN_FANOUT = [
     ),
     ("nccl_reshard_refit", "vllm_worker.py", "nccl_reshard_refit"),
     ("nccl_reshard_refit", "vllm_worker_async.py", "nccl_reshard_refit_async"),
+    ("update_weights_via_ipc_zmq", "vllm_worker.py", "update_weights_via_ipc_zmq"),
+    (
+        "update_weights_via_ipc_zmq",
+        "vllm_worker_async.py",
+        "update_weights_via_ipc_zmq_async",
+    ),
 ]
+
+# Worker-group control kwargs consumed by run_all_workers_*() itself, never
+# forwarded to the worker method.
+WORKER_GROUP_CONTROL_KWARGS = {"run_rank_0_only_axes"}
 
 # One level up again: CollectiveWeightSynchronizer holds a GenerationInterface and calls
 # update_weights_from_collective on it, so EVERY backend has to take what it sends --
@@ -106,6 +125,17 @@ GENERATION_BACKENDS = [
     "sglang/sglang_generation.py",
 ]
 
+# Backends that override the IPC hook. Megatron inherits the base method because it
+# never uses IPC refit; every concrete override still has to accept the synchronizer's
+# verification keyword.
+GENERATION_IPC_BACKENDS = [
+    "interfaces.py",
+    "vllm/vllm_generation.py",
+    "dynamo/dynamo_generation.py",
+    "trtllm/trtllm_generation.py",
+    "sglang/sglang_generation.py",
+]
+
 
 def _kwargs_of(path: Path, method: str) -> set[str]:
     """Keyword names accepted by the outermost definition of ``method`` in ``path``."""
@@ -118,6 +148,31 @@ def _kwargs_of(path: Path, method: str) -> set[str]:
             return {
                 arg.arg
                 for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs)
+                if arg.arg != "self"
+            }
+    raise AssertionError(f"{path.name} does not define {method}()")
+
+
+def _defaulted_kwargs_of(path: Path, method: str) -> set[str]:
+    """Keyword-capable arguments with defaults on ``method`` in ``path``."""
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            node.name == method
+        ):
+            args = node.args
+            positional = [*args.posonlyargs, *args.args]
+            positional_with_defaults = (
+                positional[-len(args.defaults) :] if args.defaults else []
+            )
+            keyword_only_with_defaults = [
+                arg
+                for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True)
+                if default is not None
+            ]
+            return {
+                arg.arg
+                for arg in (*positional_with_defaults, *keyword_only_with_defaults)
                 if arg.arg != "self"
             }
     raise AssertionError(f"{path.name} does not define {method}()")
@@ -172,13 +227,22 @@ def _forwarded_by_vllm_generation(method: str) -> set[str]:
         ):
             continue
         for call in ast.walk(node):
-            if (
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "remote"
+            if not (
+                isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
             ):
+                continue
+            if call.func.attr == "remote":
                 return {kw.arg for kw in call.keywords if kw.arg is not None}
-    raise AssertionError(f"VllmGeneration.{method}() has no .remote() fan-out")
+            # Same contract when the fan-out goes through the worker group:
+            # every kwarg except the group's own control kwargs reaches the
+            # worker method picked by config.
+            if call.func.attr.startswith("run_all_workers"):
+                return {
+                    kw.arg
+                    for kw in call.keywords
+                    if kw.arg is not None and kw.arg not in WORKER_GROUP_CONTROL_KWARGS
+                }
+    raise AssertionError(f"VllmGeneration.{method}() has no worker fan-out")
 
 
 @pytest.mark.parametrize(
@@ -217,6 +281,22 @@ def _forwarded_by_collective_synchronizer() -> set[str]:
     )
 
 
+def _forwarded_by_ipc_synchronizer() -> set[str]:
+    """Keywords sent to ``generation.update_weights_via_ipc_zmq``."""
+    path = REPO_ROOT / "nemo_rl" / "weight_sync" / "ipc_weight_synchronizer.py"
+    tree = ast.parse(path.read_text())
+    for call in ast.walk(tree):
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "update_weights_via_ipc_zmq"
+        ):
+            return {kw.arg for kw in call.keywords if kw.arg is not None}
+    raise AssertionError(
+        "IPCWeightSynchronizer no longer calls update_weights_via_ipc_zmq"
+    )
+
+
 @pytest.mark.parametrize("backend", GENERATION_BACKENDS)
 def test_every_generation_backend_accepts_what_the_synchronizer_sends(backend):
     forwarded = _forwarded_by_collective_synchronizer()
@@ -231,9 +311,67 @@ def test_every_generation_backend_accepts_what_the_synchronizer_sends(backend):
     )
 
 
+@pytest.mark.parametrize("backend", GENERATION_IPC_BACKENDS)
+def test_every_ipc_generation_override_accepts_verification_keyword(backend):
+    forwarded = _forwarded_by_ipc_synchronizer()
+    accepted = _kwargs_of(GENERATION / backend, "update_weights_via_ipc_zmq")
+    missing = forwarded - accepted
+    assert not missing, (
+        f"IPCWeightSynchronizer sends {sorted(missing)} to "
+        f"generation.update_weights_via_ipc_zmq(), but {backend} does not accept "
+        f"{'it' if len(missing) == 1 else 'them'}. A GenerationInterface call then "
+        "fails with TypeError before the backend can reject unsupported verification."
+    )
+
+
+def test_ipc_verification_is_required_through_both_fanouts():
+    """Only the config model owns the off default; consumers require its result."""
+    required_args = [
+        (
+            REPO_ROOT / "nemo_rl" / "weight_sync" / "ipc_weight_synchronizer.py",
+            "__init__",
+            "verify_mode",
+        ),
+        (POLICY / "interfaces.py", "stream_weights_via_ipc_zmq", "verify_mode"),
+        (POLICY / "lm_policy.py", "stream_weights_via_ipc_zmq", "verify_mode"),
+        (POLICY / "utils.py", "stream_weights_via_ipc_zmq_impl", "verify_mode"),
+        *[
+            (POLICY / worker, "stream_weights_via_ipc_zmq", "verify_mode")
+            for worker in (
+                "workers/dtensor_policy_worker.py",
+                "workers/dtensor_policy_worker_v2.py",
+                "workers/megatron_policy_worker.py",
+            )
+        ],
+        *[
+            (GENERATION / backend, "update_weights_via_ipc_zmq", "verify_digests")
+            for backend in GENERATION_IPC_BACKENDS
+        ],
+        (GEN / "vllm_worker.py", "update_weights_via_ipc_zmq", "verify_digests"),
+        (
+            GEN / "vllm_worker_async.py",
+            "update_weights_via_ipc_zmq_async",
+            "verify_digests",
+        ),
+        (GEN / "vllm_backend.py", "update_weights_via_ipc_zmq", "verify_digests"),
+    ]
+
+    for path, method, argument in required_args:
+        assert argument in _kwargs_of(path, method)
+        assert argument not in _defaulted_kwargs_of(path, method), (
+            f"{path.relative_to(REPO_ROOT)}::{method}() defaults {argument}; callers "
+            "can bypass VllmRefitVerifyConfig resolution by omitting it."
+        )
+
+
 def test_the_refit_deadline_is_one_of_those_kwargs():
     """Guards the guard: if the deadline stops being forwarded, the test above goes vacuous."""
     assert "refit_timeout_s" in _forwarded_by_policy("broadcast_weights_for_collective")
+
+
+def test_the_digest_flag_is_one_of_the_ipc_kwargs():
+    """Guards the guard: backend compatibility is vacuous if no flag is sent."""
+    assert "verify_digests" in _forwarded_by_ipc_synchronizer()
 
 
 # Refit entrypoints on the Ray-actor side of a vLLM collective_rpc. Everything these call

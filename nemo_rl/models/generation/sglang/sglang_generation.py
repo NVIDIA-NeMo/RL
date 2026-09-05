@@ -816,7 +816,11 @@ class SGLangGeneration(GenerationInterface):
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         pass
 
-    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+    def update_weights_via_ipc_zmq(self, verify_digests: bool) -> list[ray.ObjectRef]:
+        if verify_digests:
+            raise NotImplementedError(
+                "SGLang does not support IPC refit digest verification."
+            )
         return []
 
     def update_weights_from_collective(

@@ -480,8 +480,12 @@ class TrtllmGeneration(GenerationInterface):
             recompute_kv=recompute_kv,
         )
 
-    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+    def update_weights_via_ipc_zmq(self, verify_digests: bool) -> list[ray.ObjectRef]:
         """Receive weights via CUDA-IPC + ZMQ (colocated mode)."""
+        if verify_digests:
+            raise NotImplementedError(
+                "TensorRT-LLM does not support IPC refit digest verification."
+            )
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
         return self.worker_group.run_all_workers_single_data(

@@ -123,7 +123,7 @@ class TestIPCWeightSynchronizer:
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         assert sync.is_stale
         sync.sync_weights()
@@ -141,13 +141,44 @@ class TestIPCWeightSynchronizer:
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
         kv_scales = {"layer.0": 0.5}
 
         sync.sync_weights(kv_scales=kv_scales)
 
         call_kwargs = policy.stream_weights_via_ipc_zmq.call_args
         assert call_kwargs.kwargs["kv_scales"] == kv_scales
+
+    @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+    def test_sync_weights_threads_verify_mode_to_both_sides(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="enforce")
+
+        sync.sync_weights()
+
+        assert (
+            policy.stream_weights_via_ipc_zmq.call_args.kwargs["verify_mode"]
+            == "enforce"
+        )
+        assert gen.update_weights_via_ipc_zmq.call_args.kwargs["verify_digests"] is True
+
+    @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+    def test_sync_weights_resolved_off_disables_verification(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
+
+        sync.sync_weights()
+
+        assert (
+            policy.stream_weights_via_ipc_zmq.call_args.kwargs["verify_mode"] == "off"
+        )
+        assert (
+            gen.update_weights_via_ipc_zmq.call_args.kwargs["verify_digests"] is False
+        )
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_sync_weights_raises_on_failure(self, mock_ray):
@@ -157,7 +188,7 @@ class TestIPCWeightSynchronizer:
         ]
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         with pytest.raises(RuntimeError, match="Weight transfer failed"):
             sync.sync_weights()
@@ -167,7 +198,12 @@ class TestIPCWeightSynchronizer:
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen, refit_buffer_size_gb=2)
+        sync = IPCWeightSynchronizer(
+            policy,
+            gen,
+            refit_buffer_size_gb=2,
+            verify_mode="off",
+        )
 
         sync.sync_weights()
         call_kwargs = policy.stream_weights_via_ipc_zmq.call_args
@@ -180,7 +216,7 @@ class TestIPCWeightSynchronizer:
         policy = _mock_policy()
         policy.get_free_memory_bytes.return_value = 10 * (1024**3)
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         sync.sync_weights()
         call_kwargs = policy.stream_weights_via_ipc_zmq.call_args
@@ -190,7 +226,7 @@ class TestIPCWeightSynchronizer:
     def test_init_communicator(self):
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         sync.init_communicator()
         policy.prepare_refit_info.assert_called_once()
@@ -202,7 +238,7 @@ class TestIPCWeightSynchronizer:
         mock_ray.get.side_effect = RuntimeError("IPC transfer exploded")
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         with pytest.raises(RuntimeError, match="IPC transfer exploded"):
             sync.sync_weights()
@@ -214,7 +250,12 @@ class TestIPCWeightSynchronizer:
     def test_negative_buffer_size_raises(self):
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen, refit_buffer_size_gb=-1)
+        sync = IPCWeightSynchronizer(
+            policy,
+            gen,
+            refit_buffer_size_gb=-1,
+            verify_mode="off",
+        )
         with pytest.raises(ValueError, match="refit_buffer_size_gb must be > 0"):
             sync._compute_buffer_size()
 
@@ -223,7 +264,7 @@ class TestIPCWeightSynchronizer:
         monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "not_a_number")
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
         with pytest.raises(ValueError, match="must be a valid float"):
             sync._compute_buffer_size()
 
@@ -232,7 +273,7 @@ class TestIPCWeightSynchronizer:
         monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0")
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
         with pytest.raises(ValueError, match="must be > 0"):
             sync._compute_buffer_size()
 
@@ -869,6 +910,31 @@ class TestFactory:
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
 
+    @pytest.mark.parametrize("verify_mode", ["log", "enforce"])
+    @pytest.mark.parametrize("refit_transport", [None, "nccl_reshard"])
+    def test_non_colocated_vllm_rejects_refit_verification(
+        self, verify_mode: str, refit_transport: str | None
+    ) -> None:
+        gen = _mock_generation(
+            cfg={
+                "refit_transport": refit_transport,
+                "refit_cfg": {"verify": {"mode": verify_mode}},
+            }
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="supported only for colocated vLLM IPC weight synchronization",
+        ):
+            create_weight_synchronizer(
+                policy=_mock_policy(),
+                generation=gen,
+                generation_backend=VLLM_BACKEND,
+                colocated=False,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
+            )
+
     def test_non_colocated_dynamo_returns_collective(self):
         sync = create_weight_synchronizer(
             policy=_mock_policy(),
@@ -948,3 +1014,131 @@ class TestFactory:
                 colocated=True,
                 refit_buffer_size_gb=0,
             )
+
+
+# ---------------------------------------------------------------------------
+# Refit verify config: fail loud, not silently off
+# ---------------------------------------------------------------------------
+
+
+class TestRefitVerifyConfigValidation:
+    def test_misspelled_mode_key_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        with pytest.raises(Exception, match="mdoe"):
+            resolve_refit_verify_config({"refit_cfg": {"verify": {"mdoe": "enforce"}}})
+
+    def test_non_mapping_verify_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        with pytest.raises(Exception):
+            resolve_refit_verify_config({"refit_cfg": {"verify": False}})
+
+    def test_absent_verify_defaults_off(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        assert resolve_refit_verify_config({}).mode == "off"
+        assert resolve_refit_verify_config({"refit_cfg": None}).mode == "off"
+        assert resolve_refit_verify_config({"refit_cfg": {}}).mode == "off"
+
+    def test_enforce_rejected_on_non_colocated_topology(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        config = {
+            "refit_cfg": {"verify": {"mode": "enforce"}},
+            "colocated": {"enabled": False},
+        }
+        with pytest.raises(NotImplementedError, match="colocated"):
+            enforce_refit_verify_supported(config)
+
+    def test_enforce_rejected_on_non_default_transport(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        config = {
+            "refit_cfg": {"verify": {"mode": "enforce"}},
+            "colocated": {"enabled": True},
+            "refit_transport": "vllm_zmq_sparse",
+        }
+        with pytest.raises(NotImplementedError, match="colocated"):
+            enforce_refit_verify_supported(config)
+
+    def test_off_is_supported_everywhere(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        enforce_refit_verify_supported({"colocated": {"enabled": False}})
+
+    def test_explicit_null_verify_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        with pytest.raises(Exception):
+            resolve_refit_verify_config({"refit_cfg": {"verify": None}})
+
+    def test_misspelled_outer_verify_key_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        config = {
+            "refit_cfg": {"verfiy": {"mode": "enforce"}},
+            "colocated": {"enabled": True},
+        }
+        with pytest.raises(ValueError, match="verfiy"):
+            enforce_refit_verify_supported(config)
+
+    def test_plugin_selector_key_is_allowed(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+        )
+
+        config = {
+            "refit_cfg": {"my.mod:Engine": {}},
+            "refit_transport": "my.mod:Engine",
+            "colocated": {"enabled": True},
+        }
+        enforce_refit_verify_supported(config)
+
+    def test_non_mapping_refit_cfg_is_rejected(self):
+        from nemo_rl.models.generation.vllm.config import resolve_refit_verify_config
+
+        for bad in ([], "", False):
+            with pytest.raises(Exception):
+                resolve_refit_verify_config({"refit_cfg": bad})
+
+    def test_normalized_model_extra_typo_still_rejected(self):
+        """normalize -> VllmGeneration is the real GRPO order for non-default
+        transports; the typo lands in model_extra and must still be caught."""
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+            normalize_vllm_refit_config,
+        )
+
+        config = {
+            "refit_transport": "vllm_zmq_sparse",
+            "refit_cfg": {"verfiy": {"mode": "enforce"}},
+            "colocated": {"enabled": True},
+            "vllm_cfg": {},
+        }
+        normalize_vllm_refit_config(config)
+        with pytest.raises(ValueError, match="verfiy"):
+            enforce_refit_verify_supported(config)
+
+    def test_normalized_plugin_selector_still_allowed(self):
+        from nemo_rl.models.generation.vllm.config import (
+            enforce_refit_verify_supported,
+            normalize_vllm_refit_config,
+        )
+
+        config = {
+            "refit_transport": "my.mod:Engine",
+            "refit_cfg": {"my.mod:Engine": {}},
+            "colocated": {"enabled": True},
+            "vllm_cfg": {},
+        }
+        normalize_vllm_refit_config(config)
+        enforce_refit_verify_supported(config)

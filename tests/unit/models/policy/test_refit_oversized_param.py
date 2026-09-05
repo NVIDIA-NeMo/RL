@@ -25,9 +25,11 @@ These tests run on CPU tensors with a stub socket -- no GPU, no Ray -- because
 the packing/hand-off logic is plain Python around a byte buffer.
 """
 
+import pytest
 import torch
 
 from nemo_rl.models.policy import utils
+from nemo_rl.weight_sync.digest import digests_to_ints, tensor_digest
 
 # Small enough to keep the test instant; the arithmetic is scale-free.
 BUFFER_BYTES = 4096
@@ -82,6 +84,7 @@ def _stream(monkeypatch, params, buffer_size_bytes=BUFFER_BYTES):
         zmq_socket=socket,
         rank=0,
         worker_name="test-worker",
+        verify_mode="off",
     )
     return socket
 
@@ -167,3 +170,152 @@ def test_alignment_is_what_decides_oversized(monkeypatch):
 
     socket = _stream(monkeypatch, [_param("exact.weight", 2048)])
     assert socket.payloads == [(["exact.weight"], 2048)]
+
+
+# --- digest verification (refit_cfg.verify) -------------------------------
+#
+# The verifying socket mirrors the receiver's slicing exactly as
+# ``VllmInternalWorkerExtension.update_weights_via_ipc_zmq`` does it: walk the
+# staged buffer by aligned offsets, reinterpret each slice by the parameter's
+# dtype/shape, and hash it. Streaming end-to-end through a CPU byte buffer
+# proves the sender's digests describe the same bytes the receiver sees.
+
+
+class VerifyingFakeSocket(FakeSocket):
+    """FakeSocket that hashes received bytes and ACKs COMPLETE with digests."""
+
+    def __init__(self, state_dict_info, tamper=None):
+        super().__init__()
+        self.state_dict_info = state_dict_info
+        self.received_digests = {}
+        self.tamper = tamper or {}
+        self.plain_final_ack = False
+
+    def send_pyobj(self, payload):
+        if payload is utils.IPCProtocol.COMPLETE:
+            self.completed = True
+            self.pending_acks += 1
+            return
+        buffer, param_names, used_bytes = payload
+        offset = 0
+        for name in param_names:
+            shape, dtype = self.state_dict_info[name]
+            nbytes = dtype.itemsize * shape.numel()
+            weight = buffer[offset : offset + nbytes].view(dtype).view(shape)
+            self.received_digests[name] = tensor_digest(weight)
+            offset += utils.calculate_aligned_size(nbytes)
+        assert offset == used_bytes
+        self.payloads.append((list(param_names), used_bytes))
+        self.pending_acks += 1
+
+    def recv_pyobj(self):
+        assert self.completed, "final ACK requested before COMPLETE"
+        assert self.pending_acks > 0
+        self.pending_acks -= 1
+        if self.plain_final_ack:
+            return b""
+        digests = digests_to_ints(self.received_digests)
+        digests.update(self.tamper)
+        return {"ack": "ack", "digests": digests}
+
+
+def _stream_verified(monkeypatch, params, verify_mode, tamper=None, **socket_kwargs):
+    # The verifying receiver needs the staged bytes, not an opaque handle.
+    monkeypatch.setattr(
+        utils, "get_handle_from_tensor", lambda tensor: tensor.detach().clone()
+    )
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda *a, **k: _NullStream(), raising=False
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    state_dict_info = {name: (tensor.shape, tensor.dtype) for name, tensor in params}
+    socket = VerifyingFakeSocket(state_dict_info, tamper=tamper, **socket_kwargs)
+    utils.stream_weights_via_ipc_zmq_impl(
+        params_generator=iter(params),
+        buffer_size_bytes=BUFFER_BYTES,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test-worker",
+        verify_mode=verify_mode,
+    )
+    return socket
+
+
+def _random_param(name, nbytes, seed):
+    generator = torch.Generator().manual_seed(seed)
+    return name, torch.randint(
+        0, 256, (nbytes,), dtype=torch.uint8, generator=generator
+    )
+
+
+def test_verify_passes_on_clean_transfer(monkeypatch):
+    """Sender digests match receiver digests computed from the staged bytes."""
+    params = [
+        _random_param("layer.0.weight", 512, seed=0),
+        # Oversized parameters take the dedicated-buffer branch and must be
+        # hashed like any other.
+        _random_param("embed.weight", 3072, seed=1),
+        _random_param("layer.1.weight", 700, seed=2),
+    ]
+
+    socket = _stream_verified(monkeypatch, params, verify_mode="enforce")
+
+    assert socket.pending_acks == 0
+    assert set(socket.received_digests) == {name for name, _ in params}
+
+
+def test_verify_enforce_raises_on_mismatch(monkeypatch):
+    params = [_random_param("layer.0.weight", 512, seed=0)]
+
+    with pytest.raises(RuntimeError, match="layer.0.weight"):
+        _stream_verified(
+            monkeypatch, params, verify_mode="enforce", tamper={"layer.0.weight": 1}
+        )
+
+
+def test_verify_log_warns_but_does_not_raise(monkeypatch, capsys):
+    params = [_random_param("layer.0.weight", 512, seed=0)]
+
+    _stream_verified(
+        monkeypatch, params, verify_mode="log", tamper={"layer.0.weight": 1}
+    )
+
+    assert "refit digest mismatch" in capsys.readouterr().out
+
+
+def test_verify_rejects_protocol_desync(monkeypatch):
+    """A digest-less final ACK means the receiver ran without verification."""
+    params = [_random_param("layer.0.weight", 512, seed=0)]
+
+    with pytest.raises(RuntimeError, match="no digests"):
+        socket = VerifyingFakeSocket({name: (t.shape, t.dtype) for name, t in params})
+        socket.plain_final_ack = True
+        monkeypatch.setattr(
+            utils, "get_handle_from_tensor", lambda tensor: tensor.detach().clone()
+        )
+        monkeypatch.setattr(
+            torch.cuda, "current_stream", lambda *a, **k: _NullStream(), raising=False
+        )
+        monkeypatch.setattr(
+            torch.cuda, "empty_cache", lambda *a, **k: None, raising=False
+        )
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        utils.stream_weights_via_ipc_zmq_impl(
+            params_generator=iter(params),
+            buffer_size_bytes=BUFFER_BYTES,
+            zmq_socket=socket,
+            rank=0,
+            worker_name="test-worker",
+            verify_mode="enforce",
+        )
+
+
+def test_verify_off_keeps_plain_byte_protocol(monkeypatch):
+    """The resolved off mode must not switch the final ACK to a pyobj."""
+    socket = _stream(monkeypatch, [_param("layer.0.weight", 512)])
+    # _stream runs with verify_mode="off" and FakeSocket has no recv_pyobj;
+    # reaching COMPLETE with all ACKs consumed proves the old protocol held.
+    assert socket.completed
+    assert socket.pending_acks == 0

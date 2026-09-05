@@ -121,6 +121,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_vllm_refit_config,
+    resolve_refit_verify_config,
 )
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
@@ -2564,6 +2565,16 @@ def refit_policy_generation(
         # update weights
         update_success = False
         if colocated_inference:
+            generation_config = getattr(policy_generation, "cfg", None)
+            if generation_config is None:
+                raise RuntimeError(
+                    "Colocated IPC refit requires the generation config so the "
+                    "digest verification mode can be resolved."
+                )
+            verify_mode = resolve_refit_verify_config(
+                cast(VllmConfig, generation_config)
+            ).mode
+
             # get model param keys, which is grouped by size
             if _refit_buffer_size_gb is not None:
                 buffer_size_bytes = int(_refit_buffer_size_gb * (1024**3))
@@ -2582,8 +2593,11 @@ def refit_policy_generation(
             futures_train = policy.stream_weights_via_ipc_zmq(
                 buffer_size_bytes=buffer_size_bytes,
                 kv_scales=kv_scales,
+                verify_mode=verify_mode,
             )
-            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            futures_inference = policy_generation.update_weights_via_ipc_zmq(
+                verify_digests=verify_mode != "off"
+            )
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)

@@ -165,9 +165,24 @@ class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
     release_after_refit: bool = False
 
 
+class VllmRefitVerifyConfig(BaseModel, extra="forbid"):
+    """Tensor byte and metadata verification for refit weight transfers.
+
+    mode:
+        - "off": no verification (default; zero overhead).
+        - "log": hash sent and received bytes, dtype, and shape per parameter;
+          print a warning listing mismatched parameters.
+        - "enforce": like "log", but raise instead of warning so a corrupted
+          transfer fails the refit rather than silently skewing rollouts.
+    """
+
+    mode: Literal["off", "log", "enforce"] = "off"
+
+
 class VllmRefitConfig(BaseModel, extra="allow"):
     sparse: VllmSparseRefitConfig = Field(default_factory=VllmSparseRefitConfig)
     nixl: VllmNixlRefitConfig = Field(default_factory=VllmNixlRefitConfig)
+    verify: VllmRefitVerifyConfig = Field(default_factory=VllmRefitVerifyConfig)
 
 
 class VllmConfig(GenerationConfig):
@@ -259,6 +274,86 @@ def materialize_vllm_video_config(
     video_media_io_kwargs["num_frames"] = video_config.num_frames
 
 
+def resolve_refit_verify_config(config: VllmConfig) -> VllmRefitVerifyConfig:
+    """Resolve the refit verification scope regardless of transport.
+
+    ``normalize_vllm_refit_config`` returns early for the default transports
+    (null -> IPC/collective, "nccl_reshard") without validating ``refit_cfg``,
+    but verification is orthogonal to transport selection, so it is resolved
+    here independently.
+    """
+    refit_cfg = config.get("refit_cfg")
+    if refit_cfg is None:
+        return VllmRefitVerifyConfig()
+    if not isinstance(refit_cfg, VllmRefitConfig):
+        # Any explicit non-null value -- including non-mappings like ``[]``
+        # or ``""``, ``verify: null``, and invalid inner keys -- goes to
+        # Pydantic as-is and fails loudly rather than silently degrading to
+        # the "off" default. Only a truly absent refit_cfg (or absent
+        # verify field, which Pydantic defaults) turns verification off.
+        refit_cfg = VllmRefitConfig.model_validate(refit_cfg)
+    return refit_cfg.verify
+
+
+_REFIT_CFG_KNOWN_KEYS = frozenset({"sparse", "nixl", "verify"})
+
+
+def _validate_refit_cfg_keys(config: VllmConfig) -> None:
+    """Reject unknown top-level refit_cfg keys (scoped to the transport).
+
+    ``VllmRefitConfig`` is ``extra="allow"`` so custom checkpoint-engine
+    plugins can scope their options under their own ``module:ClassName``
+    selector key; every other unknown key is a typo (e.g. ``verfiy``) that
+    would otherwise silently disable what the user thought they enabled.
+    """
+    refit_cfg = config.get("refit_cfg")
+    if refit_cfg is None:
+        return
+    if isinstance(refit_cfg, VllmRefitConfig):
+        # normalize_vllm_refit_config validates and writes the model back for
+        # non-default transports before VllmGeneration is constructed; a typo
+        # like "verfiy" then lives in model_extra and must still be caught.
+        present = set((refit_cfg.model_extra or {}).keys())
+    elif isinstance(refit_cfg, dict):
+        present = set(refit_cfg) - _REFIT_CFG_KNOWN_KEYS
+    else:
+        # Non-mapping values fail loudly in resolve_refit_verify_config.
+        return
+    transport = config.get("refit_transport")
+    allowed = set()
+    if isinstance(transport, str) and ":" in transport:
+        allowed.add(transport)
+    unknown = present - allowed
+    if unknown:
+        raise ValueError(
+            f"Unknown policy.generation.refit_cfg keys: {sorted(unknown)}. "
+            f"Known keys: {sorted(_REFIT_CFG_KNOWN_KEYS | allowed)}."
+        )
+
+
+def enforce_refit_verify_supported(config: VllmConfig) -> None:
+    """Setup-boundary check shared by every vLLM deployment path.
+
+    Refit digest verification is implemented only for the colocated CUDA-IPC
+    transport. Synchronizers for other topologies/transports are sometimes
+    constructed directly (bypassing the weight-sync factory), so this is
+    validated where every algorithm must pass: VllmGeneration construction.
+    """
+    _validate_refit_cfg_keys(config)
+    if resolve_refit_verify_config(config).mode == "off":
+        return
+    colocated = config["colocated"]["enabled"]
+    transport = config.get("refit_transport")
+    if not colocated or transport is not None:
+        raise NotImplementedError(
+            "policy.generation.refit_cfg.verify is currently supported only "
+            "for colocated CUDA-IPC weight synchronization "
+            "(policy.generation.colocated.enabled=true and "
+            "refit_transport=null). Set verify.mode='off' or switch to the "
+            "supported topology."
+        )
+
+
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
     if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
@@ -293,7 +388,12 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
             "embeddings would silently survive weight updates. Supported "
             "transports: null (collective/IPC) and 'nccl_reshard'."
         )
-    refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
+    raw_refit_cfg = config.get("refit_cfg")
+    # Explicit falsy non-mappings ([] / "" / false) must fail in Pydantic,
+    # not be coerced into an empty (and therefore default) config.
+    refit_config = VllmRefitConfig.model_validate(
+        {} if raw_refit_cfg is None else raw_refit_cfg
+    )
     if ":" in transport:
         plugin_config = (refit_config.model_extra or {}).get(transport)
         if plugin_config is None:

@@ -103,6 +103,34 @@ policy:
         shard_expert_weights: false
 ```
 
+## Verify a Transfer
+
+The colocated CUDA-IPC transport can verify, per parameter, that the tensor
+loaded by the vLLM workers has the same bytes, dtype, and shape as the tensor
+the policy workers sent. Both sides hash their view of the transfer with a
+deterministic integer digest (no floating-point reduction, so the check itself
+cannot be skewed by the nondeterminism it is meant to catch), and the sender
+compares the two sets after the final acknowledgment.
+
+```yaml
+policy:
+  generation:
+    refit_cfg:
+      verify:
+        mode: "off"   # "off" | "log" | "enforce" -- quote it; bare off is YAML false
+```
+
+- `"off"` (default): no hashing, zero overhead.
+- `"log"`: print a warning listing mismatched parameters.
+- `"enforce"`: raise on mismatch so a corrupted transfer fails the refit
+  instead of silently skewing rollout logprobs.
+
+A mismatch means the received bytes, dtype, or shape differ from what was sent:
+a corrupted transfer, or `prepare_refit_info` metadata that no longer matches
+what the exporter streams. Verification covers transfer integrity only; it
+does not compare against the weights vLLM materializes after loading (fusion,
+TP sharding, and online quantization legitimately transform them).
+
 ## Learn More
 
 - [NCCL Reshard Refit](../design-docs/nccl-reshard-refit.md) describes its

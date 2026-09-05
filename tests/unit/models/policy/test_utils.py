@@ -188,6 +188,7 @@ def test_stream_weights_releases_buffers_before_complete_without_full_gc(
         zmq_socket=socket,
         rank=0,
         worker_name="test_worker",
+        verify_mode="off",
     )
 
     assert events == ["empty_cache"]
@@ -219,6 +220,7 @@ def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch
         zmq_socket=socket,
         rank=0,
         worker_name="test_worker",
+        verify_mode="off",
     )
 
     assert captured["buffer_device"].type == "cuda"
@@ -257,6 +259,7 @@ def test_stream_weights_via_ipc_zmq_aligns_cpu_tensor_groups(monkeypatch):
         zmq_socket=socket,
         rank=0,
         worker_name="test_worker",
+        verify_mode="off",
     )
 
     assert captured["buffer_device"].type == "cuda"
@@ -302,6 +305,7 @@ def test_stream_weights_via_ipc_zmq_preserves_cpu_and_gpu_source_bytes(
             zmq_socket=socket,
             rank=0,
             worker_name="test_worker",
+            verify_mode="off",
         )
         _, names, used_bytes = socket.sent[0]
         offset = 0
@@ -349,6 +353,7 @@ def server_process(
             socket,
             rank=0,
             worker_name="test_server",
+            verify_mode="off",
         )
     except Exception as e:
         import sys

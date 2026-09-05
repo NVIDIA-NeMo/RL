@@ -116,8 +116,8 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     generation.set_refit_membership = lambda membership: setattr(
         generation, "_refit_membership", membership
     )
-    generation.rebuild_collective = (
-        lambda membership, ip, port: vllm_generation.VllmGeneration.rebuild_collective(
+    generation.rebuild_collective = lambda membership, ip, port: (
+        vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
         )
     )
@@ -346,10 +346,9 @@ class TestControllerCallSite:
         _condemn(monitor, 1)
         calls = []
         synchronizer = SimpleNamespace(
-            reconcile_communicator=lambda absent, force=False: calls.append(
-                list(absent)
+            reconcile_communicator=lambda absent, force=False: (
+                calls.append(list(absent)) or False
             )
-            or False
         )
         ctrl = self._controller(monitor, synchronizer)
 

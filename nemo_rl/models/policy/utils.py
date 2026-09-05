@@ -359,8 +359,62 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
     return int(((size_bytes + alignment - 1) // alignment) * alignment)
 
 
+def _check_refit_digests(
+    local_digests: dict[str, "torch.Tensor"],
+    final_ack: object,
+    verify_mode: str,
+    rank: int,
+    worker_name: str,
+) -> None:
+    """Compare sender-side digests against the receiver's final-ACK digests.
+
+    Raises RuntimeError on mismatch in "enforce" mode; prints a warning in
+    "log" mode. A final ACK without digests means the two sides disagree on
+    the verification protocol, which is always an error.
+    """
+    from nemo_rl.weight_sync.digest import compare_digests, digests_to_ints
+
+    remote_digests = final_ack.get("digests") if isinstance(final_ack, dict) else None
+    if remote_digests is None:
+        raise RuntimeError(
+            f"{worker_name} (rank {rank}): refit verification is enabled on the "
+            "sender but the receiver's final ACK carried no digests. Both sides "
+            "must run with the same refit verify configuration."
+        )
+
+    mismatched = compare_digests(digests_to_ints(local_digests), remote_digests)
+    if not mismatched:
+        if rank == 0:
+            print(
+                f"{worker_name}: refit digest verification passed for "
+                f"{len(local_digests)} parameters",
+                flush=True,
+            )
+        return
+
+    shown = ", ".join(mismatched[:20])
+    if len(mismatched) > 20:
+        shown += f", ... ({len(mismatched) - 20} more)"
+    message = (
+        f"{worker_name} (rank {rank}): refit digest mismatch for "
+        f"{len(mismatched)}/{len(local_digests)} parameters: {shown}. "
+        "The tensor bytes, dtype, or shape received by the generation worker "
+        "differ from what the policy worker sent (corrupted transfer or "
+        "stale/desynced refit metadata)."
+    )
+    if verify_mode == "enforce":
+        raise RuntimeError(message)
+    print(f"WARNING: {message}", flush=True)
+
+
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
+    *,
+    verify_mode: str,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -373,7 +427,17 @@ def stream_weights_via_ipc_zmq_impl(
         zmq_socket: ZMQ socket for communication
         rank: Worker rank for logging
         worker_name: Name of the worker for logging
+        verify_mode: "off", "log", or "enforce" (see ``VllmRefitVerifyConfig``).
+            When not "off", every streamed tensor is hashed, the receiver
+            returns its own per-parameter hashes with the final ACK, and
+            mismatches are reported ("log") or raised ("enforce"). The
+            receiver must be invoked with ``verify_digests=True`` so both
+            sides agree on the final-ACK wire format.
     """
+    from nemo_rl.weight_sync.digest import tensor_digest
+
+    verify = verify_mode != "off"
+    local_digests: dict[str, torch.Tensor] = {}
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
 
@@ -434,6 +498,11 @@ def stream_weights_via_ipc_zmq_impl(
 
     try:
         for name, tensor in params_generator:
+            if verify:
+                # Hash before packing so the oversized-parameter branch is
+                # covered too. The digest kernel runs on the current stream,
+                # ordered with the pack copy below.
+                local_digests[name] = tensor_digest(tensor)
             # Initialize device and buffers on first tensor
             if buffer_a is None:
                 buffer_device = tensor.device
@@ -521,7 +590,16 @@ def stream_weights_via_ipc_zmq_impl(
         torch.cuda.current_stream().synchronize()
         release_staging_buffers()
         zmq_socket.send_pyobj(IPCProtocol.COMPLETE)
-        zmq_socket.recv()
+        if verify:
+            # With verification on, the receiver replies to COMPLETE with a
+            # pyobj ACK carrying its per-parameter digests of the received
+            # bytes (instead of the plain byte ACK).
+            final_ack = zmq_socket.recv_pyobj()
+            _check_refit_digests(
+                local_digests, final_ack, verify_mode, rank, worker_name
+            )
+        else:
+            zmq_socket.recv()
 
         if rank == 0:
             print(
