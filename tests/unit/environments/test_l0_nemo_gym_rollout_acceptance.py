@@ -37,14 +37,18 @@ from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 
 _REPO_ROOT = Path(__file__).parents[3]
 _GYM_ROOT = _REPO_ROOT / "3rdparty/Gym-workspace/Gym"
-_CASES_PATH = Path(__file__).parent / "nemo_gym_test_data/p0_rollout_acceptance.yaml"
+_CASES_PATH = Path(__file__).parent / "nemo_gym_test_data/l0_rollout_acceptance.yaml"
 _POLICY_MODEL_CONFIG = (
     "responses_api_models/vllm_model/configs/vllm_model_for_training.yaml"
 )
-_REQUIRED_P0_CASES = {
+_REQUIRED_L0_CASES = {
     "code_gen",
+    "equivalence_llm_judge",
     "math_with_judge",
+    "mcqa",
     "single_step_tool_use_with_argument_comparison",
+    "structured_outputs_v4",
+    "workplace_assistant",
 }
 _GENERATION_CONFIG = {
     "backend": "test",
@@ -81,6 +85,93 @@ _TOOL_CALL_GENERATION = (
     '{"name":"check_seat_availability","arguments":'
     '{"event_id":"SHOW24","section":"Medical Zone"}}'
 )
+_MCQA_COMPLETION = r"\boxed{B}"
+_EQUIVALENCE_COMPLETION = r"\boxed{Charles Darwin}"
+_EQUIVALENCE_JUDGE_COMPLETION = (
+    "The candidate identifies Darwin, so it matches the reference.\n\n"
+    "[[A=B]] they are equivalent"
+)
+_STRUCTURED_OUTPUTS_ARGUMENTS = {
+    "name": "Dizer Kola",
+    "native_name": "ديزركلا",
+    "romanized_name": "Dizer Kola",
+    "settlement_type": "village",
+    "country": "Iran",
+    "province": "Mazandaran",
+    "county": "Nowshahr",
+    "bakhsh": "Central",
+    "rural_district": "Baladeh Kojur",
+    "coordinates": {"latitude": 36.55694, "longitude": 51.79389},
+    "population_total": 250,
+    "population_year": 2006,
+    "number_of_families": 64,
+    "timezone_standard": "UTC+3:30 (IRST)",
+    "timezone_dst": "UTC+4:30 (IRDT)",
+}
+_WORKPLACE_ARGUMENTS = {
+    "email_id": "00000057",
+    "body": "Thanks for the update - I will get back to you tomorrow.",
+}
+
+
+def _tool_call_message(
+    name: str, arguments: dict[str, Any], call_id: str
+) -> tuple[dict[str, Any], str]:
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                },
+            }
+        ],
+    }
+    generation = json.dumps(
+        {"name": name, "arguments": arguments},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return message, generation
+
+
+def _prompt_token_ids(body: dict[str, Any]) -> list[int]:
+    serialized_request = json.dumps(
+        body, sort_keys=True, separators=(",", ":")
+    ).encode()
+    prompt_token_ids = list(b"\x00" + compress(serialized_request))
+
+    messages = body.get("messages", [])
+    if not any(message.get("role") == "tool" for message in messages):
+        return prompt_token_ids
+
+    # The RL postprocessor requires each later prompt to start with every token
+    # already observed. Reconstruct the first workplace request, then append the
+    # first generation and an opaque encoding of the continuation request.
+    first_assistant_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "assistant"
+    )
+    initial_body = deepcopy(body)
+    initial_body["messages"] = messages[:first_assistant_index]
+    initial_request = json.dumps(
+        initial_body, sort_keys=True, separators=(",", ":")
+    ).encode()
+    _, first_generation = _tool_call_message(
+        "email_reply_email",
+        _WORKPLACE_ARGUMENTS,
+        "call-l0-workplace",
+    )
+    return (
+        list(b"\x00" + compress(initial_request))
+        + list(b"\x01" + first_generation.encode())
+        + list(b"\x02" + compress(serialized_request))
+    )
 
 
 class _ScriptedPolicyGeneration:
@@ -115,6 +206,11 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _message_for(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
         serialized_body = json.dumps(body)
+        if "GOLD:" in serialized_body and "CANDIDATE:" in serialized_body:
+            return {
+                "role": "assistant",
+                "content": _EQUIVALENCE_JUDGE_COMPLETION,
+            }, _EQUIVALENCE_JUDGE_COMPLETION
         if "1000 digit numbers" in serialized_body:
             content = r"\boxed{32}"
             return {"role": "assistant", "content": content}, content
@@ -124,24 +220,40 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
                 "content": _CODE_GEN_COMPLETION,
             }, _CODE_GEN_COMPLETION
         if "SHOW24" in serialized_body and "Medical Zone" in serialized_body:
-            return (
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call-p0-acceptance",
-                            "type": "function",
-                            "function": {
-                                "name": "check_seat_availability",
-                                "arguments": _TOOL_CALL_ARGUMENTS,
-                            },
-                        }
-                    ],
-                },
-                _TOOL_CALL_GENERATION,
+            message, _ = _tool_call_message(
+                "check_seat_availability",
+                json.loads(_TOOL_CALL_ARGUMENTS),
+                "call-l0-tool-use",
             )
-        raise AssertionError("P0 scripted policy received an unrecognized prompt")
+            return message, _TOOL_CALL_GENERATION
+        if "cystic fibrosis" in serialized_body:
+            return {
+                "role": "assistant",
+                "content": _MCQA_COMPLETION,
+            }, _MCQA_COMPLETION
+        if "theory of evolution by natural selection" in serialized_body:
+            return {
+                "role": "assistant",
+                "content": _EQUIVALENCE_COMPLETION,
+            }, _EQUIVALENCE_COMPLETION
+        if "Dizer Kola" in serialized_body:
+            return _tool_call_message(
+                "response_tool_8",
+                {"extraction": _STRUCTURED_OUTPUTS_ARGUMENTS},
+                "call-l0-structured-output",
+            )
+        if "Task Update on Develop prototype" in serialized_body:
+            if any(
+                message.get("role") == "tool" for message in body.get("messages", [])
+            ):
+                content = "Done"
+                return {"role": "assistant", "content": content}, content
+            return _tool_call_message(
+                "email_reply_email",
+                _WORKPLACE_ARGUMENTS,
+                "call-l0-workplace",
+            )
+        raise AssertionError("L0 scripted policy received an unrecognized prompt")
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path != "/v1/chat/completions":
@@ -151,10 +263,7 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(content_length))
         message, generation_text = self._message_for(body)
-        serialized_request = json.dumps(
-            body, sort_keys=True, separators=(",", ":")
-        ).encode()
-        prompt_token_ids = list(b"\x00" + compress(serialized_request))
+        prompt_token_ids = _prompt_token_ids(body)
         generation_token_ids = list(b"\x01" + generation_text.encode())
         message.update(
             {
@@ -164,7 +273,7 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
             }
         )
         response = {
-            "id": "chatcmpl-p0-acceptance",
+            "id": "chatcmpl-l0-acceptance",
             "object": "chat.completion",
             "created": 0,
             "model": body.get("model", "scripted-model"),
@@ -198,7 +307,7 @@ def _load_acceptance_cases() -> list[dict[str, Any]]:
     with _CASES_PATH.open() as case_file:
         cases = safe_load(case_file)["cases"]
 
-    assert cases, "P0 Gym rollout acceptance matrix must not be empty"
+    assert cases, "L0 Gym rollout acceptance matrix must not be empty"
     required_fields = {
         "name",
         "config_path",
@@ -206,7 +315,7 @@ def _load_acceptance_cases() -> list[dict[str, Any]]:
         "example_index",
         "example_sha256",
         "agent_ref",
-        "expected_generation",
+        "expected_generations",
         "expected_prompt_fragment",
         "expected_result",
         "expected_reward",
@@ -232,18 +341,58 @@ def _load_acceptance_cases() -> list[dict[str, Any]]:
             f"{case['name']}: pinned example changed; review the row and update its golden values"
         )
         assert case["agent_ref"].keys() >= {"type", "name"}
-        assert case["expected_result"]
+        assert case["expected_generations"]
+        assert all(
+            isinstance(generation, str) for generation in case["expected_generations"]
+        )
         assert math.isfinite(case["expected_reward"])
 
     names = [case["name"] for case in cases]
     assert len(names) == len(set(names)), "acceptance case names must be unique"
-    assert set(names) == _REQUIRED_P0_CASES, (
-        f"P0 matrix must contain exactly {_REQUIRED_P0_CASES}, got {set(names)}"
+    assert set(names) == _REQUIRED_L0_CASES, (
+        f"L0 matrix must contain exactly {_REQUIRED_L0_CASES}, got {set(names)}"
     )
     return cases
 
 
-_P0_CASES = _load_acceptance_cases()
+_L0_CASES = _load_acceptance_cases()
+
+
+@pytest.mark.nemo_gym
+def test_l0_scripted_multiturn_tokens_are_contiguous():
+    initial_body = {
+        "model": "scripted-model",
+        "messages": [
+            {"role": "system", "content": "system"},
+            {
+                "role": "user",
+                "content": "Task Update on Develop prototype",
+            },
+        ],
+    }
+    continuation_body = deepcopy(initial_body)
+    continuation_body["messages"].extend(
+        [
+            {"role": "assistant", "content": None, "tool_calls": []},
+            {
+                "role": "tool",
+                "tool_call_id": "call-l0-workplace",
+                "content": '{"output":"Email replied successfully."}',
+            },
+        ]
+    )
+    _, first_generation = _tool_call_message(
+        "email_reply_email",
+        _WORKPLACE_ARGUMENTS,
+        "call-l0-workplace",
+    )
+    seen_token_ids = _prompt_token_ids(initial_body) + list(
+        b"\x01" + first_generation.encode()
+    )
+
+    continuation_prompt = _prompt_token_ids(continuation_body)
+
+    assert continuation_prompt[: len(seen_token_ids)] == seen_token_ids
 
 
 def _load_case_datum(case: dict[str, Any]) -> DatumSpec:
@@ -269,7 +418,7 @@ def scripted_openai_base_url():
 
 
 @pytest.fixture
-def p0_nemo_gym(scripted_openai_base_url, case):
+def l0_nemo_gym(scripted_openai_base_url, case):
     """Start the selected real Gym environment with case-local attribution."""
     config_paths = [_POLICY_MODEL_CONFIG, case["config_path"]]
     tokenizer = _ScriptedTokenizer()
@@ -297,15 +446,15 @@ def p0_nemo_gym(scripted_openai_base_url, case):
 
 @pytest.mark.nemo_gym
 @pytest.mark.timeout(900)
-@pytest.mark.parametrize("case", _P0_CASES, ids=[case["name"] for case in _P0_CASES])
-def test_p0_gym_environments_roll_out_through_nemo_rl(p0_nemo_gym, case):
+@pytest.mark.parametrize("case", _L0_CASES, ids=[case["name"] for case in _L0_CASES])
+def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
     """A pinned Gym example must preserve its contract across the NeMo RL boundary."""
     tokenizer = _ScriptedTokenizer()
     result = run_nemo_gym_rollout_sync(
         policy_generation=_ScriptedPolicyGeneration(),
         input_batch=rl_collate_fn([_load_case_datum(case)]),
         tokenizer=tokenizer,
-        task_to_env={"nemo_gym": p0_nemo_gym},
+        task_to_env={"nemo_gym": l0_nemo_gym},
         max_seq_len=_GENERATION_CONFIG["max_total_sequence_length"],
         generation_config=deepcopy(_GENERATION_CONFIG),
         log_full_result_tables=True,
@@ -344,16 +493,29 @@ def test_p0_gym_environments_roll_out_through_nemo_rl(p0_nemo_gym, case):
     for field, expected_value in case["expected_result"].items():
         assert full_result[field] == expected_value
     assert full_result["response"]["output"]
+    if "expected_tool_outputs" in case:
+        tool_outputs = [
+            item["output"]
+            for item in full_result["response"]["output"]
+            if item["type"] == "function_call_output"
+        ]
+        assert tool_outputs == case["expected_tool_outputs"]
+    if "expected_judge_verdicts" in case:
+        verdicts = [
+            evaluation["verdict_label"]
+            for evaluation in full_result["judge_evaluations"]
+        ]
+        assert verdicts == case["expected_judge_verdicts"]
     generation_strings = [
         item["generation_str"]
         for item in full_result["response"]["output"]
         if "generation_str" in item
     ]
-    assert generation_strings == [case["expected_generation"]]
+    assert generation_strings == case["expected_generations"]
     prompt_strings = [
         item["prompt_str"]
         for item in full_result["response"]["output"]
         if "prompt_str" in item
     ]
-    assert len(prompt_strings) == 1
-    assert case["expected_prompt_fragment"] in prompt_strings[0]
+    assert len(prompt_strings) == len(case["expected_generations"])
+    assert all(case["expected_prompt_fragment"] in prompt for prompt in prompt_strings)
