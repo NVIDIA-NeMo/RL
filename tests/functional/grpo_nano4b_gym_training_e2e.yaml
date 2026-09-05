@@ -1,0 +1,134 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+defaults: ../../examples/configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 1
+  max_num_steps: 1
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  max_val_samples: null
+  val_period: -1
+  val_at_start: false
+  val_at_end: true
+  overlong_filtering: false
+  skip_reference_policy_logprobs_calculation: true
+  adv_estimator:
+    name: reinforce_plus_plus
+    normalize_rewards: false
+    use_leave_one_out_baseline: false
+    minus_baseline: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: false
+  use_kl_in_reward: false
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: nvidia/Llama-3.1-Nemotron-Nano-4B-v1.1
+  hf_config_overrides:
+    revision: d552708a9d575fa8d4a690b988fd870d65279f98  # pragma: allowlist secret
+  tokenizer:
+    name: ${policy.model_name}
+    tokenizer_kwargs:
+      revision: ${policy.hf_config_overrides.revision}
+  train_global_batch_size: 2
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  dtensor_cfg:
+    enabled: true
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+  megatron_cfg:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    max_new_tokens: 64
+    temperature: 0.0
+    top_p: 1.0
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 1
+      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.7
+      enforce_eager: true
+      expose_http_server: true
+    vllm_kwargs:
+      revision: ${policy.hf_config_overrides.revision}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  train:
+    dataset_name: NemoGymDataset
+    data_path: tests/functional/nano4b_math_e2e.jsonl
+    split_validation_size: 0
+  validation:
+    data_path: tests/functional/nano4b_math_e2e.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: false
+  nemo_gym:
+    port_range_low: 5000
+    port_range_high: 5999
+    is_trajectory_collection: false
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          judge_model_server:
+            name: policy_model
+          should_use_judge: false
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+
+logger:
+  log_dir: tests/functional/grpo_nano4b_gym_training_e2e/logs
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: true
+
+# The H100 functional runner exposes two GPUs: one stays with non-colocated
+# vLLM above and the other runs the FSDP2 policy/optimizer.
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1

@@ -602,7 +602,11 @@ class BaseVllmGenerationWorker:
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
-        hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        hf_config = AutoConfig.from_pretrained(
+            self.model_name,
+            trust_remote_code=True,
+            revision=vllm_kwargs.get("revision"),
+        )
         self.routed_experts_dtype = resolve_routed_experts_dtype(
             get_num_routed_experts(hf_config)
         )

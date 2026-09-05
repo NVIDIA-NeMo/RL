@@ -3638,6 +3638,7 @@ def grpo_train(
                             _refit_buffer_size_gb=refit_buffer_size_gb,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
+                        refit_metrics["post_update_success"] = 1.0
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
