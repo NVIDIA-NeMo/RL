@@ -2562,6 +2562,13 @@ def _gpt_forward_with_linear_ce_fusion(
     )
     from megatron.core.utils import deprecate_inference_params, get_pg_size
 
+    # A VLM wrapper in front of this GPTModel cannot forward the kwarg (its own
+    # forward() does not declare it), so nemo_rl.models.megatron.train arms this
+    # instance for the duration of the call instead. See
+    # _armed_linear_ce_fusion().
+    if getattr(self, "_linear_ce_fusion_armed", False):
+        return_logprobs_for_linear_ce_fusion = True
+
     if not return_logprobs_for_linear_ce_fusion:
         passthrough_kwargs: dict[str, Any] = {}
         # is_spec_decode was added to GPTModel.forward in newer Megatron-LM. Only
