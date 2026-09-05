@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import warnings
+from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -54,8 +55,95 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
+from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
+
+
+from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
+
+
+class _AsyncLLMHTTPClient:
+    """Keep HTTP generation on the loop that owns AsyncLLM request state.
+
+    The engine-client surface is explicit. Do not add a ``__getattr__`` fallback.
+    Add each new member here and decide whether it must run on the engine loop.
+    """
+
+    def __init__(self, engine_client: Any, engine_loop: asyncio.AbstractEventLoop):
+        self._engine_client = engine_client
+        self._engine_loop = engine_loop
+        self.model_config = engine_client.model_config
+        self.renderer = engine_client.renderer
+        self.input_processor = engine_client.input_processor
+        self.vllm_config = engine_client.vllm_config
+
+    async def _run_on_engine_loop(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        if asyncio.get_running_loop() is self._engine_loop:
+            return await operation()
+
+        future = asyncio.run_coroutine_threadsafe(operation(), self._engine_loop)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
+    def generate(
+        self,
+        prompt: Any,
+        sampling_params: Any,
+        request_id: str,
+        **kwargs: Any,
+    ) -> AsyncGenerator[Any, None]:
+        return self._generate(prompt, sampling_params, request_id, kwargs)
+
+    async def _generate(
+        self,
+        prompt: Any,
+        sampling_params: Any,
+        request_id: str,
+        kwargs: dict[str, Any],
+    ) -> AsyncGenerator[Any, None]:
+        iterator = None
+        completed = False
+
+        async def next_output() -> Any:
+            nonlocal iterator
+            if iterator is None:
+                iterator = self._engine_client.generate(
+                    prompt, sampling_params, request_id, **kwargs
+                )
+            return await anext(iterator)
+
+        try:
+            while True:
+                try:
+                    yield await self._run_on_engine_loop(next_output)
+                except StopAsyncIteration:
+                    completed = True
+                    return
+        finally:
+            if not completed:
+                try:
+                    await self._run_on_engine_loop(
+                        lambda: self._engine_client.abort(request_id)
+                    )
+                except Exception:
+                    LOGGER.exception("Failed to abort vLLM request %s", request_id)
+
+    # These members only read engine status or immutable configuration. Running
+    # them on the engine loop added a cross-thread wait to each HTTP request.
+    @property
+    def errored(self) -> bool:
+        return self._engine_client.errored
+
+    @property
+    def dead_error(self) -> BaseException:
+        return self._engine_client.dead_error
+
+    async def is_tracing_enabled(self) -> bool:
+        return await self._engine_client.is_tracing_enabled()
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -94,11 +182,12 @@ class VllmAsyncGenerationWorkerImpl(
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
-        # Defaults for HTTP server state; overwritten by _create_engine()
-        # when the worker is a model owner and the model is actually loaded.
+        # Defaults for HTTP server state; populated after the actor loop starts.
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._engine_loop = None
+        self._http_engine_client = None
 
         super().__init__(
             config,
@@ -199,37 +288,11 @@ class VllmAsyncGenerationWorkerImpl(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        if self.cfg["vllm_cfg"].get("expose_http_server"):
-            # Must run after AsyncLLM.from_engine_args and before
-            # _setup_vllm_server spawns the uvicorn thread.
-            self._install_engine_input_socket_lock()
-            self.server_thread, self.base_url, self.http_server = (
-                self._setup_vllm_server()
-            )
-
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
-
-    def _install_engine_input_socket_lock(self) -> None:
-        """Serialise sends on AsyncMPClient.input_socket across OS threads
-        to prevent race conditions that block the vLLM engine (e.g. during
-        in flight weight updates in async grpo).
-        """
-        shadow_sock = self.llm.engine_core.input_socket._shadow_sock
-
-        lock = threading.Lock()
-        original_send_multipart = shadow_sock.send_multipart
-
-        def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
-            with lock:
-                return original_send_multipart(*args, **kwargs)
-
-        # Replace the bound method on this socket instance only; other zmq
-        # sockets in the process are unaffected.
-        shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
@@ -325,6 +388,9 @@ class VllmAsyncGenerationWorkerImpl(
             self.generation_tokens = []
 
     async def post_init_async(self):
+        self._engine_loop = asyncio.get_running_loop()
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
@@ -335,6 +401,11 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
+        if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._http_engine_client = _AsyncLLMHTTPClient(self.llm, self._engine_loop)
+            self.server_thread, self.base_url, self.http_server = (
+                self._setup_vllm_server()
+            )
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -391,7 +462,9 @@ class VllmAsyncGenerationWorkerImpl(
                 maybe_reasoning_parser_plugin
             )
 
-        engine_client = self.llm
+        engine_client = self._http_engine_client
+        if engine_client is None:
+            raise RuntimeError("The HTTP engine client is not initialized.")
         model_config = self.llm_async_engine_args.create_model_config()
         base_model_paths = [
             BaseModelPath(
@@ -963,9 +1036,7 @@ class VllmAsyncGenerationWorkerImpl(
         if reserved_sock is not None:
             # Hand the pre-bound listening socket directly to uvicorn's asyncio
             # server via server.serve(sockets=). No close-and-rebind needed.
-            import asyncio
-
-            def _run_with_socket():
+            def _run_with_socket() -> None:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(server.serve(sockets=[reserved_sock]))
@@ -1468,7 +1539,7 @@ class VllmAsyncGenerationWorkerImpl(
             return False
 
     async def update_weights_from_collective_async(
-        self, buffer_size_bytes: Optional[int] = None
+        self, refit_timeout_s: float | None = None
     ) -> bool:
         """Async version of update_weights_from_collective."""
         try:
@@ -1481,15 +1552,9 @@ class VllmAsyncGenerationWorkerImpl(
                     "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
                 )
 
-            if buffer_size_bytes is None:
-                result_or_coro = await self.llm.collective_rpc(
-                    "update_weights_from_collective", args=tuple()
-                )
-            else:
-                result_or_coro = await self.llm.collective_rpc(
-                    "update_weights_from_collective",
-                    kwargs={"buffer_size_bytes": buffer_size_bytes},
-                )
+            result_or_coro = await self.llm.collective_rpc(
+                "update_weights_from_collective", args=(refit_timeout_s,)
+            )
 
             if asyncio.iscoroutine(result_or_coro):
                 worker_results = await result_or_coro
@@ -1506,6 +1571,19 @@ class VllmAsyncGenerationWorkerImpl(
             await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
@@ -1540,7 +1618,9 @@ class VllmAsyncGenerationWorkerImpl(
             "prepare_nccl_reshard_refit_info", args=(refit_info,)
         )
 
-    async def nccl_reshard_refit_async(self) -> bool:
+    async def nccl_reshard_refit_async(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> bool:
         """Async version of nccl_reshard_refit."""
         try:
             assert self.llm is not None, (
@@ -1548,7 +1628,7 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
             result_or_coro = await self.llm.collective_rpc(
-                "nccl_reshard_refit", args=tuple()
+                "nccl_reshard_refit", args=(refit_timeout_s,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1566,6 +1646,19 @@ class VllmAsyncGenerationWorkerImpl(
             await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)
             import traceback
 
@@ -1586,6 +1679,34 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
+
+    async def pause_generation_async(self, *, clear_cache: bool) -> bool:
+        """Pause vLLM generation for an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to pause generation with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "pause_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
+        return True
+
+    async def resume_generation_async(self) -> bool:
+        """Resume vLLM generation after an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to resume generation with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "resume_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.resume_generation()
+        return True
 
     async def sleep_async(self):
         """Async version of sleep."""
@@ -1633,6 +1754,11 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self.server_thread is not None:
+                self.http_server.should_exit = True
+                await asyncio.to_thread(self.server_thread.join)
+                self.server_thread = None
+
             if self._sparse_refit_receiver is not None:
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
 
@@ -1654,21 +1780,17 @@ class VllmAsyncGenerationWorkerImpl(
             gc.collect()
             torch.cuda.empty_cache()
 
-            if self.server_thread is not None:
-                from threading import Thread
-
-                from uvicorn import Server
-
-                self.http_server: Server
-                self.server_thread: Thread
-
-                self.http_server.should_exit = True
-                self.server_thread.join()
-
             return True
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away. Off the
+            # event loop: the flush blocks on a network export with a 5s
+            # timeout, and this is an async actor whose other coroutines --
+            # including in-flight generate requests -- share this loop. Same
+            # reason the sparse-refit shutdown above is offloaded.
+            await asyncio.to_thread(shutdown_telemetry)
 
 
 @ray.remote(

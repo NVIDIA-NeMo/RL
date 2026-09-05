@@ -1,0 +1,14 @@
+defaults: ./grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym.yaml
+# GB200 sizing: the same 16-GPU layouts on 4-GPU nodes, so the training EP8
+# groups span two nodes (cross-node expert parallelism, the production
+# Blackwell shape) and placement runs through the NVLink-domain topology path;
+# inference TP4 occupies exactly one node.
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym
+logger:
+  wandb:
+    name: grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 2

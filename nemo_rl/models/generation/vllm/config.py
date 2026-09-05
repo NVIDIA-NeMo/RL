@@ -66,11 +66,6 @@ class VllmSpecificArgs(TypedDict):
     cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
-    # Deprecated in 0.8. Use quantization_ignore_patterns instead.
-    quantization_ignored_layer_kws: NotRequired[list[str]]
-    # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
-    # Supports exact names, substrings, and fnmatch wildcards.
-    quantization_ignore_patterns: NotRequired[list[str]]
     # With is_mx, quantize weights to MXFP8 on the trainer during refit and
     # stream E4M3 data plus scales (~47% smaller payload) instead of BF16;
     # the vLLM worker then skips its per-refit re-quantization. Requires the
@@ -78,6 +73,11 @@ class VllmSpecificArgs(TypedDict):
     refit_prequantize: NotRequired[bool]
     # Cache and replay stable vLLM weight-loader routes across refits.
     refit_cache_loader_routes: NotRequired[bool]
+    # Deprecated in 0.8. Use quantization_ignore_patterns instead.
+    quantization_ignored_layer_kws: NotRequired[list[str]]
+    # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
+    # Supports exact names, substrings, and fnmatch wildcards.
+    quantization_ignore_patterns: NotRequired[list[str]]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
@@ -325,7 +325,7 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         raise ValueError(
             "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
             f"with refit_transport={transport!r}: this transport's refit path "
-            "does not reset the multimodal encoder cache, so stale vision "
+            "does not reset the multimodal encoder cache, so stale multimodal "
             "embeddings would silently survive weight updates. Supported "
             "transports: null (collective/IPC) and 'nccl_reshard'."
         )

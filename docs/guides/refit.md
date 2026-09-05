@@ -44,7 +44,7 @@ colocated generation.
 |---|---|---|
 | `policy.generation.vllm_cfg.refit_prequantize` | Megatron training with MXFP8 vLLM rollout | Quantizes eligible weights on the trainer and transfers E4M3 values plus E8M0 scales. Requires `precision: fp8` and `is_mx: true`; sparse delta and NCCL Reshard do not support it. |
 | `policy.generation.vllm_cfg.refit_cache_loader_routes` | vLLM refit | Replays identity-validated weight-loader routes after the first refit. Disabled by default because loader behavior is model-dependent. |
-| `policy.refit_buffer_size_gb` | Colocated IPC/HTTP or non-colocated NCCL broadcast | Sets the packing threshold explicitly. For NCCL broadcast, the same byte value is sent to producer and consumer so their collective chunk boundaries match. |
+| `policy.refit_buffer_size_gb` | Colocated CUDA IPC or non-colocated NCCL broadcast | Sets the packing threshold explicitly. For NCCL broadcast, the same byte value is sent to producer and consumer so their collective chunk boundaries match. |
 | `policy.refit_persistent_ipc_buffers` | Colocated CUDA-IPC refit | Reuses the two trainer staging buffers across refits. A fixed `refit_buffer_size_gb` gives stable memory use. |
 | `policy.megatron_cfg.refit_slim_offload_after` | Colocated Megatron refit | Avoids repeating grad-buffer offload and a second allocator cleanup after weights are transferred. |
 | `policy.megatron_cfg.pinned_reference_swap` | Megatron reference-policy logprobs | Keeps the CPU reference copy in pinned memory for faster host-to-device swaps, at the cost of additional pinned host memory. |

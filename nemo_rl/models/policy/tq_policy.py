@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ from __future__ import annotations
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Optional
 
 import ray
@@ -64,6 +65,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
+    if "mtp_metrics" in results[0]:
+        out["mtp_metrics"] = results[0]["mtp_metrics"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
@@ -130,6 +133,10 @@ class TQPolicy(TQDriverMixin, Policy):
         )
 
     # ── lifecycle ──────────────────────────────────────────────────────
+
+    def load_data_plane_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Restore TQ through the clean bootstrap client during SC setup."""
+        return self.dp_client.load_checkpoint(checkpoint_dir)
 
     def shutdown(self) -> bool:  # type: ignore[override]
         """Close the TQ client before shutting down the worker group."""
@@ -211,14 +218,22 @@ class TQPolicy(TQDriverMixin, Policy):
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
-        Logprob workers need only LP_SEED_FIELDS — narrow the meta's
-        field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
-        multimodal). The same shape is used for both prev_lp and ref_lp.
-        Workers compute the per-token tensor and commit it to TQ via the
-        leader-rank ``_write_back_result_field``; the Ray return is
-        always None, so this dispatcher just waits for completion.
+        Logprob workers fetch ``LP_SEED_FIELDS`` plus the multimodal
+        columns ``_isolated_meta`` unions in, so prev/ref logprobs see the
+        same model inputs as the training forward, which is narrowed through
+        the same helper. Narrowing the
+        meta's field list still keeps rollout-only payload (message-log
+        bulk, ``content``) in TQ. The same shape is used for both prev_lp
+        and ref_lp. Workers compute the per-token tensor and commit it to
+        TQ via the leader-rank ``_write_back_result_field``; the Ray
+        return is always None, so this dispatcher just waits for
+        completion.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
+        # Narrow the fetch to LP_SEED_FIELDS + optional routed_experts under
+        # R3 replay. ``_isolated_meta`` unions in the multimodal columns the
+        # rollout wrote, for this dispatch and the training one alike, so the
+        # prev/ref logprobs and the training forward see identical model inputs.
         lp_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
@@ -326,10 +341,14 @@ class TQPolicy(TQDriverMixin, Policy):
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
+        # The multimodal columns are per-batch, not part of the static schema,
+        # so ``_isolated_meta`` unions them in — without them a VLM training
+        # forward would run image-blind while the logprob forwards saw images.
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+                train_fields,
+                enabled=self._router_replay_enabled,
             ),
             task_name="train",
         )
@@ -433,6 +452,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self,
         meta: KVBatchMeta,
         timer: Optional[Timer] = None,
+        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
     ) -> None:
         """Dispatch one meta slice (DP-sharded) into an open train step.
 
@@ -447,12 +467,18 @@ class TQPolicy(TQDriverMixin, Policy):
         ``.grad``. Returns nothing — per-microbatch metrics accumulate in
         the workers' open-step state and surface once via
         :meth:`finish_train_step`.
+
+        Args:
+            meta: Data-plane metadata for the samples in this chunk.
+            timer: Optional timer for nested policy-training measurements.
+            train_fields: Columns produced for this step and fetched by workers.
         """
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                train_fields,
+                enabled=self._router_replay_enabled,
             ),
             task_name="train",
         )

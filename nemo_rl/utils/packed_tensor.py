@@ -36,14 +36,6 @@ def get_num_buffers():
     return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
 
 
-def _resolve_target_packed_tensor_size(buffer_size_bytes: int | None) -> int:
-    if buffer_size_bytes is None:
-        return get_target_packed_tensor_size()
-    if buffer_size_bytes <= 0:
-        raise ValueError("buffer_size_bytes must be > 0")
-    return buffer_size_bytes
-
-
 def packed_broadcast_producer(
     iterator,
     group,
@@ -67,7 +59,13 @@ def packed_broadcast_producer(
         None
 
     """
-    target_packed_tensor_size = _resolve_target_packed_tensor_size(buffer_size_bytes)
+    if buffer_size_bytes is not None and buffer_size_bytes <= 0:
+        raise ValueError("buffer_size_bytes must be > 0")
+    target_packed_tensor_size = (
+        get_target_packed_tensor_size()
+        if buffer_size_bytes is None
+        else buffer_size_bytes
+    )
 
     num_buffers = get_num_buffers() if num_buffers is None else num_buffers
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
@@ -136,7 +134,6 @@ def packed_broadcast_consumer(
     src,
     post_unpack_func,
     *,
-    buffer_size_bytes: int | None = None,
     num_buffers: int | None = None,
 ):
     """Consume a packed tensor and unpack it into a list of tensors.
@@ -146,7 +143,6 @@ def packed_broadcast_consumer(
         group: process group (vllm PyNcclCommunicator)
         src: source rank (0 in current implementation)
         post_unpack_func: function to apply to each tensor after unpacking
-        buffer_size_bytes: Optional explicit packing threshold.
         num_buffers: number of alternating CUDA buffers/streams. Uses the
             NRL_REFIT_NUM_BUFFERS default when unset. Chunk boundaries only
             depend on the packed-buffer target size, so the producer and
@@ -199,7 +195,7 @@ def packed_broadcast_consumer(
 
         return unpacked_list
 
-    target_packed_tensor_size = _resolve_target_packed_tensor_size(buffer_size_bytes)
+    target_packed_tensor_size = get_target_packed_tensor_size()
 
     if num_buffers is None:
         num_buffers = get_num_buffers()

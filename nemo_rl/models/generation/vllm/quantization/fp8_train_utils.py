@@ -72,7 +72,7 @@ def mxfp8_e4m3_quantize_for_refit(
     """Quantize a weight to MXFP8 on the trainer for pre-quantized refit.
 
     Mirrors the receiver path in quantization/fp8.py load_weights
-    (mxfp8_e4m3_quantize + scale squeeze) so the streamed E4M3 data and
+    (mxfp8_e4m3_quantize + scale reshape) so the streamed E4M3 data and
     *_scale_from_checkpoint scales load bit-identically without receiver-side
     re-quantization. Uses the same flashinfer kernel as vLLM on Blackwell and
     the torch reference elsewhere.
@@ -94,11 +94,12 @@ def mxfp8_e4m3_quantize_for_refit(
                 x_scales = x_scales.view(x.size(0), -1)
     if x_q is None or x_scales is None:
         x_q, x_scales = _mxfp8_e4m3_quantize_torch(x)
-    x_scales = torch.squeeze(x_scales, dim=-1)
+    x_scales = x_scales.reshape(*x.shape[:-1], x.shape[-1] // MXFP8_BLOCK_SIZE)
     # Match the receiver path's zero-scale clamp: an E8M0 byte of 0 (2^-127)
     # destabilizes the TRTLLM kernels, and pre-quantized tensors skip the
     # receiver-side quantize branch where the clamp normally runs.
-    x_scales = torch.where(x_scales == 0, torch.ones_like(x_scales), x_scales)
+    # pyrefly: ignore  # no-matching-overload
+    x_scales = x_scales.masked_fill(x_scales == 0, 1)
     return x_q, x_scales
 
 
@@ -135,10 +136,8 @@ def iter_mxfp8_prequantized_params(
     if scratch_cache is None:
         scratch_cache = {}
 
-    pending: dict[
-        tuple[str, str],
-        list[tuple[int, str, torch.Tensor, torch.cuda.Stream | None]],
-    ] = {}
+    pending: list[tuple[int, str, str, torch.Tensor, torch.cuda.Stream | None]] = []
+    pending_expert_ids: set[int] = set()
     current_prefix: str | None = None
 
     def yield_on_current_stream(
@@ -153,11 +152,11 @@ def iter_mxfp8_prequantized_params(
                 output_tensor.record_stream(consumer_stream)
             yield output_name, output_tensor
 
-    def quantize_one(
+    def quantize_one_result(
         name: str,
         tensor: torch.Tensor,
         source_stream: torch.cuda.Stream | None = None,
-    ) -> Iterator[tuple[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Stream | None]:
         if tensor.dtype == torch.float8_e4m3fn:
             raise ValueError(
                 "MXFP8 prequantization requires BF16 trainer-exported weights; "
@@ -174,92 +173,109 @@ def iter_mxfp8_prequantized_params(
             producer_stream.wait_stream(source_stream)
             tensor.record_stream(producer_stream)
         value, scale = quantize_fn(tensor)
+        return value, scale, producer_stream
+
+    def quantize_one(
+        name: str,
+        tensor: torch.Tensor,
+        source_stream: torch.cuda.Stream | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        value, scale, producer_stream = quantize_one_result(name, tensor, source_stream)
         yield from yield_on_current_stream(
             ((name, value), (name + "_scale_from_checkpoint", scale)),
             producer_stream,
         )
 
-    def flush_group(
-        group_key: tuple[str, str],
-    ) -> Iterator[tuple[str, torch.Tensor]]:
-        group = pending.pop(group_key)
-        group.sort(key=lambda item: item[0])
-        while group:
-            chunk = group[:max_experts_per_batch]
-            del group[:max_experts_per_batch]
-            tensors = [tensor for _expert_id, _name, tensor, _stream in chunk]
-            batchable = len(chunk) > 1 and len({item[0] for item in chunk}) == len(
-                chunk
-            )
-            if batchable:
-                first = tensors[0]
-                batchable = all(
-                    tensor.shape == first.shape
-                    and tensor.dtype == first.dtype
-                    and tensor.device == first.device
-                    and tensor.layout is torch.strided
-                    for tensor in tensors
-                )
-            if not batchable:
-                for _expert_id, name, tensor, source_stream in chunk:
-                    yield from quantize_one(name, tensor, source_stream)
-                continue
-
-            first = tensors[0]
-            if first.dtype == torch.float8_e4m3fn:
-                raise ValueError(
-                    "MXFP8 prequantization requires BF16 trainer-exported weights."
-                )
-            required_numel = len(chunk) * first.numel()
-            stack_stream = (
-                torch.cuda.current_stream(first.device) if first.is_cuda else None
-            )
-            if stack_stream is not None:
-                for tensor, (_expert_id, _name, _tensor, source_stream) in zip(
-                    tensors, chunk
-                ):
-                    if source_stream is not None and source_stream != stack_stream:
-                        stack_stream.wait_stream(source_stream)
-                    tensor.record_stream(stack_stream)
-            stream_id = (
-                int(stack_stream.cuda_stream) if stack_stream is not None else None
-            )
-            cache_key = (first.device, first.dtype, stream_id)
-            scratch = scratch_cache.get(cache_key)
-            if scratch is None or scratch.numel() < required_numel:
-                scratch = torch.empty(
-                    required_numel,
-                    dtype=first.dtype,
-                    device=first.device,
-                )
-                scratch_cache[cache_key] = scratch
-            stacked = scratch[:required_numel].view(len(chunk), *first.shape)
-            with torch.no_grad():
-                torch.stack(tensors, dim=0, out=stacked)
-
-            producer_stream = stack_stream
-            value, scale = quantize_fn(stacked.view(-1, stacked.shape[-1]))
-            value = value.view_as(stacked)
-            scale_columns = first.shape[-1] // MXFP8_BLOCK_SIZE
-            scale_shape = (
-                first.shape[:-1]
-                if scale_columns == 1
-                else (*first.shape[:-1], scale_columns)
-            )
-            scale = scale.view(len(chunk), *scale_shape)
-            entries = (
-                entry
-                for index, (_expert_id, name, _tensor, _stream) in enumerate(chunk)
-                for entry in (
-                    (name, value[index]),
-                    (name + "_scale_from_checkpoint", scale[index]),
-                )
-            )
-            yield from yield_on_current_stream(entries, producer_stream)
-
     def flush_pending() -> Iterator[tuple[str, torch.Tensor]]:
-        while pending:
-            yield from flush_group(next(iter(pending)))
+        if not pending:
+            return
+
+        results: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.cuda.Stream | None]
+        ] = {}
+        projection_groups: dict[str, list[int]] = {}
+        for index, (_expert_id, projection, _name, _tensor, _stream) in enumerate(
+            pending
+        ):
+            projection_groups.setdefault(projection, []).append(index)
+
+        for indices in projection_groups.values():
+            for chunk_start in range(0, len(indices), max_experts_per_batch):
+                chunk_indices = indices[
+                    chunk_start : chunk_start + max_experts_per_batch
+                ]
+                chunk = [pending[index] for index in chunk_indices]
+                tensors = [tensor for _id, _proj, _name, tensor, _stream in chunk]
+                batchable = len(chunk) > 1 and len({item[0] for item in chunk}) == len(
+                    chunk
+                )
+                if batchable:
+                    first = tensors[0]
+                    batchable = all(
+                        tensor.shape == first.shape
+                        and tensor.dtype == first.dtype
+                        and tensor.device == first.device
+                        and tensor.layout is torch.strided
+                        for tensor in tensors
+                    )
+                if not batchable:
+                    for index, (_id, _proj, name, tensor, source_stream) in zip(
+                        chunk_indices, chunk
+                    ):
+                        results[index] = quantize_one_result(
+                            name, tensor, source_stream
+                        )
+                    continue
+
+                first = tensors[0]
+                if first.dtype == torch.float8_e4m3fn:
+                    raise ValueError(
+                        "MXFP8 prequantization requires BF16 trainer-exported weights."
+                    )
+                required_numel = len(chunk) * first.numel()
+                stack_stream = (
+                    torch.cuda.current_stream(first.device) if first.is_cuda else None
+                )
+                if stack_stream is not None:
+                    for tensor, (_id, _proj, _name, _tensor, source_stream) in zip(
+                        tensors, chunk
+                    ):
+                        if source_stream is not None and source_stream != stack_stream:
+                            stack_stream.wait_stream(source_stream)
+                        tensor.record_stream(stack_stream)
+                stream_id = (
+                    int(stack_stream.cuda_stream) if stack_stream is not None else None
+                )
+                cache_key = (first.device, first.dtype, stream_id)
+                scratch = scratch_cache.get(cache_key)
+                if scratch is None or scratch.numel() < required_numel:
+                    scratch = torch.empty(
+                        required_numel,
+                        dtype=first.dtype,
+                        device=first.device,
+                    )
+                    scratch_cache[cache_key] = scratch
+                stacked = scratch[:required_numel].view(len(chunk), *first.shape)
+                with torch.no_grad():
+                    torch.stack(tensors, dim=0, out=stacked)
+
+                value, scale = quantize_fn(stacked.view(-1, stacked.shape[-1]))
+                value = value.view_as(stacked)
+                scale_columns = first.shape[-1] // MXFP8_BLOCK_SIZE
+                scale_shape = (*first.shape[:-1], scale_columns)
+                scale = scale.view(len(chunk), *scale_shape)
+                for offset, index in enumerate(chunk_indices):
+                    results[index] = value[offset], scale[offset], stack_stream
+
+        for index, (_id, _proj, name, _tensor, _stream) in enumerate(pending):
+            value, scale, producer_stream = results[index]
+            yield from yield_on_current_stream(
+                ((name, value), (name + "_scale_from_checkpoint", scale)),
+                producer_stream,
+            )
+
+        pending.clear()
+        pending_expert_ids.clear()
 
     for name, tensor in params:
         match = _EXPERT_WEIGHT_PATTERN.match(name) if name in selected_names else None
@@ -278,14 +294,17 @@ def iter_mxfp8_prequantized_params(
         if current_prefix is not None and prefix != current_prefix:
             yield from flush_pending()
         current_prefix = prefix
-        group_key = (prefix, projection)
-        group = pending.setdefault(group_key, [])
+        expert_id = int(match.group("expert_id"))
+        if (
+            expert_id not in pending_expert_ids
+            and len(pending_expert_ids) == max_experts_per_batch
+        ):
+            yield from flush_pending()
         source_stream = (
             torch.cuda.current_stream(tensor.device) if tensor.is_cuda else None
         )
-        group.append((int(match.group("expert_id")), name, tensor, source_stream))
-        if len(group) == max_experts_per_batch:
-            yield from flush_group(group_key)
+        pending.append((expert_id, projection, name, tensor, source_stream))
+        pending_expert_ids.add(expert_id)
 
     if pending:
         yield from flush_pending()

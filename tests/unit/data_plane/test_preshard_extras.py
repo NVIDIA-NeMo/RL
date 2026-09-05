@@ -133,6 +133,34 @@ def test_shard_meta_for_dp_preserves_partition_id():
     assert all(m.partition_id == "train" for m in metas)
 
 
+def test_shard_meta_for_dp_permutes_tags_with_sample_ids():
+    """Tags must ride each sample, not each position.
+
+    ``tags`` carries the per-row multimodal shapes. Sharding sorts by sequence
+    length, so a tags list left un-permuted would pair one sample's pixel bytes
+    with another sample's shapes — and ``from_wire`` would reshape into it
+    silently instead of raising.
+    """
+    n, dp = 8, 4
+    meta = _meta(n)
+    # Tag each sample with its own id so a mispairing is directly visible.
+    meta.tags = [{"owner": sid} for sid in meta.sample_ids]
+
+    metas, _ = shard_meta_for_dp(meta, dp_world=dp, batch_size=n)
+
+    for shard in metas:
+        assert shard.tags is not None
+        assert len(shard.tags) == len(shard.sample_ids)
+        for sid, tag in zip(shard.sample_ids, shard.tags):
+            assert tag["owner"] == sid
+
+
+def test_shard_meta_for_dp_leaves_tags_none_when_absent():
+    """Text-only runs write no tags; sharding must not invent an empty list."""
+    metas, _ = shard_meta_for_dp(_meta(4), dp_world=2, batch_size=4)
+    assert all(m.tags is None for m in metas)
+
+
 def test_shard_meta_for_dp_unsorted_round_trip():
     """unsorted_indices must reconstruct the input order from DP-rank concat."""
     n, dp = 8, 4

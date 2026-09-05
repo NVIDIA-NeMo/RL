@@ -18,25 +18,21 @@ import pytest
 import torch
 
 from nemo_rl.utils.packed_tensor import (
-    _resolve_target_packed_tensor_size,
     packed_broadcast_consumer,
     packed_broadcast_producer,
 )
 
 
-def test_explicit_buffer_size_overrides_dynamic_default():
-    with patch(
-        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
-        return_value=4096,
-    ):
-        assert _resolve_target_packed_tensor_size(1024) == 1024
-        assert _resolve_target_packed_tensor_size(None) == 4096
-
-
 @pytest.mark.parametrize("buffer_size_bytes", [0, -1])
-def test_explicit_buffer_size_must_be_positive(buffer_size_bytes):
+def test_producer_rejects_nonpositive_buffer_size(buffer_size_bytes):
     with pytest.raises(ValueError, match="buffer_size_bytes must be > 0"):
-        _resolve_target_packed_tensor_size(buffer_size_bytes)
+        packed_broadcast_producer(
+            iterator=iter([]),
+            group=None,
+            src=0,
+            post_iter_func=lambda x: x,
+            buffer_size_bytes=buffer_size_bytes,
+        )
 
 
 class MockCommunicationGroup:

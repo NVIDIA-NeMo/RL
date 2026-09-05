@@ -15,7 +15,7 @@
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import Fp8Config, PolicyConfig
 
 
 class MCoreGenerationSpecificArgs(TypedDict):
@@ -48,6 +48,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
+    async_sched_mode: NotRequired[Literal["legacy", "async"]]
+    vision_embedding_cache_max_bytes: NotRequired[int]
+    allow_stale_multimodal_embeddings: NotRequired[bool]
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     num_speculative_tokens: int
@@ -55,20 +58,41 @@ class MCoreGenerationSpecificArgs(TypedDict):
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
 
+    # Raw media preprocessing corresponding with Megatron's
+    # ImageProcessingConfig / VideoProcessingConfig.
+    # `video_num_frames` is required for video.
+    vision_model_type: NotRequired[str]
+    image_dynamic_resolution: NotRequired[bool]
+    video_num_frames: NotRequired[int]  # Frames sampled per video.
+    video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.
+    video_target_num_patches: NotRequired[int]  # Overrides the image max-patch budget.
+    video_maintain_aspect_ratio: NotRequired[bool]
+
+    # Fully-qualified class path of the MCore inference wrapper, e.g.
+    # "megatron.core.inference.model_inference_wrappers.multimodal.
+    # nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper".
+    # Resolved by `_get_megatron_inference_wrapper_cls`; its `supports_*`
+    # attributes gate which modalities are preprocessed. Not media preprocessing
+    # itself, and used on the direct generate path as well as the HTTP endpoint.
+    megatron_inference_wrapper: NotRequired[str]
+
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)
     # - "offload": cache is moved off-GPU between iterations
-    #
-    # The third mcore value, "recompute" (drop + rebuild on resume), must be set via
-    # `grpo.async_grpo.recompute_kv_cache_after_weight_updates=true`.
-    # TODO: Unify `kv_cache_management_mode` and `recompute_kv_cache_after_weight_updates`.
-    kv_cache_management_mode: Literal["persist", "offload"]
+    # - "recompute": cache is dropped and rebuilt on resume
+    kv_cache_management_mode: Literal["persist", "offload", "recompute"]
 
     logging_step_interval: NotRequired[int]
     # Whether MCore returns selected-token log-probs before or after sampling
     # processors. Policy recomputation uses raw model logits, so numerical
     # parity checks should select raw_logprobs explicitly.
     logprobs_mode: Literal["processed_logprobs", "raw_logprobs"]
+
+    # FP8/MXFP8 for the dedicated (non-colocated) inference model;
+    # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
+    fp8_cfg: NotRequired[Fp8Config]
+    # Merged into megatron_cfg for gen workers; required for EP>1 + local CUDA graphs.
+    moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
 
 
 class MCoreGenerationConfig(GenerationConfig):
@@ -80,10 +104,18 @@ class MCoreGenerationConfig(GenerationConfig):
 def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]:
     """The `megatron_cfg` a dedicated inference model runs with."""
     generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
+    overrides = dict(generation_config.get("mcore_generation_config") or {})
+    explicit_cp = overrides.pop("context_parallel_size", None)
+    if explicit_cp is not None and explicit_cp != 1:
+        raise ValueError(
+            "Megatron generation does not support context parallelism: remove "
+            "policy.generation.mcore_generation_config.context_parallel_size or set it to 1."
+        )
     merged: dict[str, Any] = {
         **cast(dict[str, Any], policy_config["megatron_cfg"]),
-        **(generation_config.get("mcore_generation_config") or {}),
+        **overrides,
         "activation_checkpointing": False,
+        "context_parallel_size": 1,
     }
     # inference_optimized layers hard-require SP with TP>1. Raise with the
     # config key: the colocated build bypasses validate_and_set_config, so this
@@ -110,13 +142,12 @@ def dedicated_inference_megatron_cfg(
     Colocated Megatron generation shares the training model unless the resolved
     inference layout or `transformer_impl` differs from training; then the worker
     builds a second model and reshards into it on every wake. Inference never
-    uses CP, so CP is pinned to 1 (CP>1 training therefore always differs).
+    uses CP, and CP is already pinned to 1 (CP>1 training therefore always differs).
 
     Returns None when the resolved config matches training (reshardless:
     generate directly on the shared training model).
     """
     inference_mcfg = merged_inference_megatron_cfg(policy_config)
-    inference_mcfg["context_parallel_size"] = 1
 
     train_mcfg = cast(dict[str, Any], policy_config["megatron_cfg"])
     layout_keys = (

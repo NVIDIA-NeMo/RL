@@ -149,18 +149,29 @@ def test_model_cp_slicing_capability_is_detected():
     assert not _model_slices_context_parallel_inputs(object())
 
 
-def test_model_cp_slicing_rejects_transfer_queue_setup():
+def test_model_cp_slicing_accepts_transfer_queue_setup(monkeypatch):
+    """Media-before-CP models are served by the leader-broadcast fetch.
+
+    ``_fetch`` broadcasts one DP slice across the replica group (TP x CP x PP
+    siblings of a DP rank), so every CP sibling gets identical full THD rows and
+    the model applies its own post-embedding slice. Setup used to reject these
+    models outright; the contract is satisfied, so it must not.
+    """
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model_slices_context_parallel_inputs = True
+    worker._dp_client = None
 
-    with pytest.raises(
-        NotImplementedError, match="TransferQueue/SingleController does not yet support"
-    ):
-        worker.setup_data_plane(MagicMock())
+    client = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client", lambda cfg, bootstrap: client
+    )
+    worker.setup_data_plane(MagicMock())
+
+    assert worker._dp_client is client
 
 
 def test_refit_size_estimate_preserves_integral_buffer_dtype():
@@ -328,6 +339,7 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model = _FakeTrainableModel()
+    worker.model.eval = lambda: events.append("eval")
     worker.cfg = (
         {"generation": {"backend": generation_backend}} if generation_backend else {}
     )
@@ -360,7 +372,31 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
 
     assert events[0] == "finalize_async_save"
     assert events.index("finalize_async_save") < events.index("move_model")
+    assert events.index("eval") < events.index("move_model")
     assert move_kwargs[0]["move_params"] is expect_move_params
+
+
+def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
+    """Mamba decode caches must refresh before CUDA parameter storage is released."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    move_kwargs = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = _FakeTrainableModel()
+    worker.model.eval = lambda: events.append("eval")
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_model") or move_kwargs.append(kwargs) or model
+    )
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronPolicyWorkerImpl.finish_inference(worker)
+
+    assert events == ["eval", "move_model"]
+    assert move_kwargs == [{"move_params": True, "move_grads": False}]
 
 
 def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
@@ -508,17 +544,18 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
 
     class _PrequantCheckpointWorker(MegatronCheckpointEngineSendMixin):
         enable_refit_prequantize = MegatronPolicyWorkerImpl.enable_refit_prequantize
+        _is_fp8_export = MegatronPolicyWorkerImpl._is_fp8_export
         _iter_params_with_optional_kv_scales = (
             MegatronPolicyWorkerImpl._iter_params_with_optional_kv_scales
         )
         _maybe_prequantize_param = MegatronPolicyWorkerImpl._maybe_prequantize_param
-        _is_fp8_export = MegatronPolicyWorkerImpl._is_fp8_export
 
     name = "model.layers.0.mlp.down_proj.weight"
     weight = torch.randn(64, 64, dtype=torch.bfloat16)
     worker = _PrequantCheckpointWorker()
-    worker.fp8_cfg = None
     worker._refit_prequant_names = set()
+    worker._refit_param_info_hf = None
+    worker.fp8_cfg = None
     worker.model = object()
     worker.draft_model = None
     worker.refit_conversion_tasks = []
@@ -526,7 +563,12 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
     worker.megatron_bridge = SimpleNamespace(
         export_hf_weights=lambda *_args, **_kwargs: iter([(name, weight)])
     )
-    worker.prepare_refit_info = lambda: {name: (weight.shape, weight.dtype)}
+
+    def _prepare_refit_info() -> dict[str, Any]:
+        worker._refit_param_info_hf = {name: (weight.shape, weight.dtype)}
+        return worker._refit_param_info_hf
+
+    worker.prepare_refit_info = _prepare_refit_info
     worker.checkpoint_engine = SimpleNamespace(get_target_weight_layout=lambda: None)
 
     class _Generation:
@@ -755,23 +797,154 @@ def test_iter_params_batches_expert_prequantization(monkeypatch):
     assert calls[0][1] == {name}
 
 
-def test_enable_refit_prequantize_rejects_blockwise_fp8_storage():
+def test_iter_params_preserves_bridge_expert_wire_order(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    names = [
+        f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+        for expert_id in range(2)
+    ]
+    weights = [
+        torch.full((2, 32), expert_id + 1, dtype=torch.bfloat16)
+        for expert_id in range(2)
+    ]
+    stack_calls = []
+    original_stack = torch.stack
+
+    def record_stack(tensors, *args, **kwargs):
+        stack_calls.append([tensor.clone() for tensor in tensors])
+        return original_stack(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "stack", record_stack)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._refit_prequant_names = set(names)
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = []
+    worker.cfg = {"megatron_cfg": {"enabled": True}}
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=lambda *_args, **_kwargs: iter(zip(names, weights))
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales())
+
+    assert [name for name, _tensor in output] == [
+        entry_name
+        for name in names
+        for entry_name in (name, name + "_scale_from_checkpoint")
+    ]
+    assert len(stack_calls) == 1
+    assert len(stack_calls[0]) == 2
+
+
+@pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
+def test_enable_refit_prequantize_rejects_fp8_param_storage(
+    fp8_recipe: str,
+) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.fp8_cfg = {
+        "enabled": True,
         "fp8_param": True,
-        "fp8_recipe": "blockwise",
+        "fp8_recipe": fp8_recipe,
     }
 
     with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
         worker.enable_refit_prequantize(["model.weight"])
 
 
-@pytest.mark.parametrize("slim", [False, True])
-def test_offload_after_refit_routes_cleanup_by_mode(monkeypatch, slim):
+def test_enable_refit_prequantize_allows_disabled_fp8_param_storage() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {
+        "enabled": False,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+    }
+    worker._refit_param_info_hf = {
+        "model.weight": (torch.Size([4, 64]), torch.bfloat16),
+    }
+
+    info = worker.enable_refit_prequantize(["model.weight"])
+
+    assert info["model.weight"] == (torch.Size([4, 64]), torch.float8_e4m3fn)
+    assert info["model.weight_scale_from_checkpoint"] == (
+        torch.Size([4, 2]),
+        torch.uint8,
+    )
+
+
+def test_enable_refit_prequantize_requires_prepare_refit_info():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = None
+
+    with pytest.raises(RuntimeError, match="prepare_refit_info"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_enable_refit_prequantize_derives_metadata_without_export():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = {
+        "model.a.weight": (torch.Size([4, 64]), torch.bfloat16),
+        "model.b.weight": (torch.Size([4, 64]), torch.bfloat16),
+    }
+
+    def _fail_iter(*_args, **_kwargs):
+        raise AssertionError("metadata derivation must not re-export weights")
+
+    worker._iter_params_with_optional_kv_scales = _fail_iter
+
+    info = worker.enable_refit_prequantize(["model.a.weight"])
+
+    assert info["model.a.weight"] == (torch.Size([4, 64]), torch.float8_e4m3fn)
+    assert info["model.a.weight_scale_from_checkpoint"] == (
+        torch.Size([4, 2]),
+        torch.uint8,
+    )
+    assert info["model.b.weight"] == (torch.Size([4, 64]), torch.bfloat16)
+    assert worker._refit_prequant_names == {"model.a.weight"}
+
+
+def test_enable_refit_prequantize_rejects_indivisible_last_dim():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = {
+        "model.weight": (torch.Size([4, 48]), torch.bfloat16),
+    }
+
+    with pytest.raises(ValueError, match="divisible"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+@pytest.mark.parametrize(
+    "slim,offload_optimizer",
+    [(False, True), (True, True), (True, False)],
+)
+def test_offload_after_refit_routes_cleanup_by_mode(
+    monkeypatch, slim, offload_optimizer
+):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -779,10 +952,6 @@ def test_offload_after_refit_routes_cleanup_by_mode(monkeypatch, slim):
     worker = object.__new__(MegatronPolicyWorkerImpl)
     model = SimpleNamespace(eval=MagicMock())
     worker.model = model
-    worker.finalize_async_save = MagicMock()
-    worker.is_generation_colocated = False
-    worker.inference_model = None
-    worker._colocated_reshard_plan = None
     worker.move_model = MagicMock(return_value=model)
     worker.cfg = {
         "megatron_cfg": {
@@ -795,8 +964,10 @@ def test_offload_after_refit_routes_cleanup_by_mode(monkeypatch, slim):
     worker._clear_rope_and_moe_dispatcher_caches = MagicMock()
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = offload_optimizer
     worker.move_optimizer = MagicMock()
     worker.offload_before_refit = MagicMock()
+    worker.finalize_async_save = MagicMock()
     collect = MagicMock()
     empty_cache = MagicMock()
     monkeypatch.setattr(
@@ -816,12 +987,16 @@ def test_offload_after_refit_routes_cleanup_by_mode(monkeypatch, slim):
 
     worker.offload_after_refit()
 
-    worker.move_model.assert_called_once_with(model, "cpu", move_params=True)
+    worker.finalize_async_save.assert_called_once_with()
+    worker.move_model.assert_called_once_with(model, "cpu")
     model.eval.assert_called_once_with()
     if slim:
         worker._clear_fp8_caches.assert_called_once_with()
         worker._clear_rope_and_moe_dispatcher_caches.assert_called_once_with()
-        worker.move_optimizer.assert_called_once_with("cpu")
+        if offload_optimizer:
+            worker.move_optimizer.assert_called_once_with("cpu")
+        else:
+            worker.move_optimizer.assert_not_called()
         collect.assert_called_once_with()
         empty_cache.assert_called_once_with()
         worker.offload_before_refit.assert_not_called()

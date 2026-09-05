@@ -26,6 +26,7 @@ Two flavors of coverage:
    test session. It is skipped when the fastokens wheel is unavailable.
 """
 
+import os
 import subprocess
 import sys
 import types
@@ -40,6 +41,7 @@ def _reset_fastokens_state(monkeypatch):
     """Reset module-level patch flag and env var before each test."""
     monkeypatch.setattr(fastokens_util, "_patched", False)
     monkeypatch.delenv("NRL_USE_FASTOKENS", raising=False)
+    monkeypatch.delenv("VLLM_USE_FASTOKENS", raising=False)
 
 
 def _install_fake_fastokens(monkeypatch, patch_fn):
@@ -70,26 +72,89 @@ def test_patches_once_when_config_enabled(monkeypatch):
     assert fastokens_util._patched is True
 
 
-def test_env_override_forces_on_over_disabled_config(monkeypatch):
+def test_vllm_env_only_does_not_force_nemo_rl_patch(monkeypatch):
     calls = []
     _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
-    monkeypatch.setenv("NRL_USE_FASTOKENS", "1")
+    monkeypatch.setenv("VLLM_USE_FASTOKENS", "1")
 
-    fastokens_util.maybe_patch_fastokens(False)  # config off, env forces on
+    fastokens_util.maybe_patch_fastokens(False)
+
+    assert calls == []
+    assert fastokens_util._patched is False
+
+
+def test_vllm_env_only_does_not_disable_config_patch(monkeypatch):
+    calls = []
+    _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
+    monkeypatch.setenv("VLLM_USE_FASTOKENS", "0")
+
+    fastokens_util.maybe_patch_fastokens(True)
 
     assert calls == [1]
     assert fastokens_util._patched is True
 
 
-def test_env_override_forces_off_over_enabled_config(monkeypatch):
+def test_nrl_env_sets_vllm_env_and_forces_on(monkeypatch, capsys):
+    calls = []
+    _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
+    monkeypatch.setenv("NRL_USE_FASTOKENS", "1")
+
+    fastokens_util.maybe_patch_fastokens(False)
+
+    assert calls == [1]
+    assert fastokens_util._patched is True
+    assert os.environ["VLLM_USE_FASTOKENS"] == "1"
+    assert capsys.readouterr().err == ""
+
+
+def test_nrl_env_forces_off_and_sets_vllm_env(monkeypatch, capsys):
     calls = []
     _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
     monkeypatch.setenv("NRL_USE_FASTOKENS", "0")
 
-    fastokens_util.maybe_patch_fastokens(True)  # config on, env forces off
+    fastokens_util.maybe_patch_fastokens(True)
 
     assert calls == []
     assert fastokens_util._patched is False
+    assert os.environ["VLLM_USE_FASTOKENS"] == "0"
+    assert capsys.readouterr().err == ""
+
+
+def test_nrl_env_invalid_value_forces_off_and_mirrors_zero(monkeypatch):
+    calls = []
+    _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
+    monkeypatch.setenv("NRL_USE_FASTOKENS", "true")
+
+    fastokens_util.maybe_patch_fastokens(True)
+
+    assert calls == []
+    assert fastokens_util._patched is False
+    assert os.environ["VLLM_USE_FASTOKENS"] == "0"
+
+
+def test_nrl_env_empty_value_forces_off_and_mirrors_zero(monkeypatch):
+    calls = []
+    _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
+    monkeypatch.setenv("NRL_USE_FASTOKENS", "")
+
+    fastokens_util.maybe_patch_fastokens(True)
+
+    assert calls == []
+    assert fastokens_util._patched is False
+    assert os.environ["VLLM_USE_FASTOKENS"] == "0"
+
+
+def test_nrl_env_overrides_explicit_vllm_env(monkeypatch):
+    calls = []
+    _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
+    monkeypatch.setenv("NRL_USE_FASTOKENS", "1")
+    monkeypatch.setenv("VLLM_USE_FASTOKENS", "0")
+
+    fastokens_util.maybe_patch_fastokens(False)
+
+    assert calls == [1]
+    assert fastokens_util._patched is True
+    assert os.environ["VLLM_USE_FASTOKENS"] == "1"
 
 
 def test_missing_package_is_non_fatal(monkeypatch):

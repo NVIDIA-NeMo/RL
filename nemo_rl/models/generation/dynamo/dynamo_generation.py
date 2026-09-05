@@ -36,6 +36,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
 
@@ -625,6 +626,8 @@ class DynamoGeneration(GenerationInterface):
         self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:
         """Serialize checkpoint-format tensor metadata for native vLLM refit."""
+        if state_dict_info is None:
+            return None
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
@@ -637,9 +640,10 @@ class DynamoGeneration(GenerationInterface):
         )
 
     def update_weights_from_collective(
-        self, buffer_size_bytes: Optional[int] = None
+        self, refit_timeout_s: Optional[float] = None
     ) -> list[ray.ObjectRef]:
         """Receive packed checkpoint-format weights on every Dynamo worker."""
+        reject_unenforceable_refit_deadline("Dynamo", refit_timeout_s)
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")

@@ -77,6 +77,12 @@ def _mock_generation(**overrides):
     gen.update_weights_via_ipc_zmq.return_value = [MagicMock()]
     gen.update_weights_from_collective.return_value = [MagicMock()]
     gen.init_collective.return_value = [MagicMock()]
+    # A real worker group, because the reshard transport now derives its refit
+    # membership from dp_size and the worker count. Left as bare MagicMocks these
+    # reach the rank arithmetic and fail there, on a comparison, several frames from
+    # the cause.
+    gen.worker_group.dp_size = 1
+    gen.worker_group.workers = [MagicMock()]
     gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
     gen.get_inference_world_size.return_value = None
     for k, v in overrides.items():
@@ -617,6 +623,7 @@ class TestCollectiveWeightSynchronizer:
 
         policy.broadcast_weights_for_collective.assert_called_once_with(
             kv_scales=None,
+            refit_timeout_s=None,
             buffer_size_bytes=None,
             num_buffers=None,
         )
@@ -655,7 +662,6 @@ class TestCollectiveWeightSynchronizer:
         policy.broadcast_weights_for_collective.assert_called_once_with(
             kv_scales=None,
             buffer_size_bytes=expected_bytes,
-            num_buffers=None,
         )
         gen.update_weights_from_collective.assert_called_once_with(
             buffer_size_bytes=expected_bytes
@@ -699,39 +705,6 @@ class TestCollectiveWeightSynchronizer:
         )
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
-    def test_backend_sender_contract_controls_geometry_and_world_size(self, mock_ray):
-        mock_ray.get.return_value = [True]
-        policy = _mock_policy()
-        gen = _mock_generation()
-        gen.get_collective_sender_spec.return_value = CollectiveSenderSpec(
-            nccl_peer="vllm",
-            buffer_size_bytes=1024**3,
-            num_buffers=2,
-        )
-        gen.get_inference_world_size.return_value = 8
-        sync = CollectiveWeightSynchronizer(
-            policy,
-            gen,
-            _mock_cluster(world_size=4, ip="10.0.0.1", port=29500),
-            _mock_cluster(world_size=2),
-        )
-
-        sync.init_communicator()
-        sync.sync_weights()
-
-        policy.init_collective.assert_called_once_with(
-            "10.0.0.1", 29500, 12, train_world_size=4, nccl_peer="vllm"
-        )
-        gen.init_collective.assert_called_once_with(
-            "10.0.0.1", 29500, 12, train_world_size=4
-        )
-        policy.broadcast_weights_for_collective.assert_called_once_with(
-            kv_scales=None,
-            buffer_size_bytes=1024**3,
-            num_buffers=2,
-        )
-
-    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_init_communicator_prequantizes_before_collective_setup(self, mock_ray):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
@@ -761,6 +734,40 @@ class TestCollectiveWeightSynchronizer:
             call(updated_info),
         ]
         policy.init_collective.assert_called_once()
+
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_backend_sender_contract_controls_geometry_and_world_size(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.get_collective_sender_spec.return_value = CollectiveSenderSpec(
+            nccl_peer="vllm",
+            buffer_size_bytes=1024**3,
+            num_buffers=2,
+        )
+        gen.get_inference_world_size.return_value = 8
+        sync = CollectiveWeightSynchronizer(
+            policy,
+            gen,
+            _mock_cluster(world_size=4, ip="10.0.0.1", port=29500),
+            _mock_cluster(world_size=2),
+        )
+
+        sync.init_communicator()
+        sync.sync_weights()
+
+        policy.init_collective.assert_called_once_with(
+            "10.0.0.1", 29500, 12, train_world_size=4, nccl_peer="vllm"
+        )
+        gen.init_collective.assert_called_once_with(
+            "10.0.0.1", 29500, 12, train_world_size=4
+        )
+        policy.broadcast_weights_for_collective.assert_called_once_with(
+            kv_scales=None,
+            refit_timeout_s=None,
+            buffer_size_bytes=1024**3,
+            num_buffers=2,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +808,9 @@ class TestNcclReshardWeightSynchronizer:
         policy.prepare_nccl_reshard_refit_info.return_value = refit_info
         gen = _mock_generation()
         gen.init_nccl_reshard_comm_group.return_value = [MagicMock()]
+        # tp_size=4 over a 4-GPU generation world -> one DP shard.
+        gen.worker_group.dp_size = 1
+        gen.worker_group.workers = [MagicMock() for _ in range(4)]
         train_cluster = _mock_cluster(world_size=2)
         train_cluster.num_gpus_per_node = 8
         train_cluster.get_available_address_and_port.return_value = (

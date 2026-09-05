@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -33,6 +33,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -821,9 +822,9 @@ class SGLangGeneration(GenerationInterface):
         return []
 
     def update_weights_from_collective(
-        self, buffer_size_bytes: int | None = None
+        self, refit_timeout_s: Optional[float] = None
     ) -> list[ray.ObjectRef]:
-        del buffer_size_bytes
+        reject_unenforceable_refit_deadline("SGLang", refit_timeout_s)
         return []
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:

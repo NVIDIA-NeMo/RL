@@ -65,6 +65,7 @@ TRAIN_CMD=(
     checkpointing.checkpoint_dir="${CKPT_DIR}"
     checkpointing.metric_name=null
     checkpointing.save_period=1
+    +checkpointing.save_data_plane=true
 )
 
 cd "${PROJECT_ROOT}"
@@ -80,8 +81,12 @@ grep -q "weight_sync=CollectiveWeightSynchronizer" "${EXP_DIR}/run1.log"
 # policy_training_start_step=1, so step 0 trains the critic alone and step 1 is
 # where the policy joins. The banner fires exactly on that transition.
 test "$(grep -c "Critic warmup complete" "${EXP_DIR}/run1.log")" -eq 1
-test -f "${CKPT_DIR}/step_1/replay_buffer.pt"
-test -f "${CKPT_DIR}/step_2/replay_buffer.pt"
+test -f "${CKPT_DIR}/step_1/replay_buffer_metadata.pt"
+test -d "${CKPT_DIR}/step_1/data_plane"
+test ! -f "${CKPT_DIR}/step_1/replay_buffer.pt"
+test -f "${CKPT_DIR}/step_2/replay_buffer_metadata.pt"
+test -d "${CKPT_DIR}/step_2/data_plane"
+test ! -f "${CKPT_DIR}/step_2/replay_buffer.pt"
 test -d "${CKPT_DIR}/step_1/value/weights"
 
 "${TRAIN_CMD[@]}" \
@@ -90,7 +95,7 @@ test -d "${CKPT_DIR}/step_1/value/weights"
     "$@" \
     2>&1 | tee "${EXP_DIR}/run2.log"
 
-grep -q "Restoring replay buffer from checkpoint" "${EXP_DIR}/run2.log"
+grep -q "Restoring replay buffer metadata" "${EXP_DIR}/run2.log"
 grep -qF "replay group(s) from checkpoint" "${EXP_DIR}/run2.log"
 # Warmup is behind us on the resumed run, so the policy trains every step and the
 # transition never happens again.

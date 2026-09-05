@@ -75,6 +75,14 @@ def test_last_dim_not_divisible_raises():
         _mxfp8_e4m3_quantize_torch(x)
 
 
+def test_refit_quantize_preserves_single_scale_block_dimension():
+    x = torch.randn(8, MXFP8_BLOCK_SIZE, dtype=torch.bfloat16)
+
+    _, scales = mxfp8_e4m3_quantize_for_refit(x)
+
+    assert scales.shape == (8, 1)
+
+
 def test_blackwell_refit_prequantization_requires_flashinfer(monkeypatch):
     class FakeBlackwellTensor:
         is_cuda = True
@@ -171,11 +179,7 @@ def test_batched_expert_prequantization_preserves_wire_entries_and_reuses_scratc
         torch.testing.assert_close(output[name], tensor)
         scale_name = name + "_scale_from_checkpoint"
         scale_columns = tensor.shape[-1] // MXFP8_BLOCK_SIZE
-        expected_scale_shape = (
-            tensor.shape[:-1]
-            if scale_columns == 1
-            else (*tensor.shape[:-1], scale_columns)
-        )
+        expected_scale_shape = (*tensor.shape[:-1], scale_columns)
         assert output[scale_name].shape == expected_scale_shape
         assert torch.all(output[scale_name] == 1)
 
@@ -194,7 +198,7 @@ def test_batched_expert_prequantization_preserves_wire_entries_and_reuses_scratc
     assert next(iter(scratch_cache.values())).data_ptr() == first_scratch_ptr
 
 
-def test_batched_expert_prequantization_bounds_batch_and_has_stable_order():
+def test_batched_expert_prequantization_bounds_batch_and_preserves_source_order():
     from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
 
     calls = []
@@ -225,21 +229,11 @@ def test_batched_expert_prequantization_bounds_batch_and_has_stable_order():
         )
     )
 
-    expected_names = []
-    for expert_ids, projection in (
-        ((0, 1), "gate"),
-        ((0, 1), "up"),
-        ((0, 1), "down"),
-        ((2, 3), "gate"),
-        ((2, 3), "up"),
-        ((2, 3), "down"),
-        ((4,), "gate"),
-        ((4,), "up"),
-        ((4,), "down"),
-    ):
-        for expert_id in expert_ids:
-            name = expert_name(expert_id, projection)
-            expected_names.extend((name, name + "_scale_from_checkpoint"))
+    expected_names = [
+        output_name
+        for name, _tensor in params
+        for output_name in (name, name + "_scale_from_checkpoint")
+    ]
 
     assert [name for name, _tensor in output] == expected_names
     assert calls == [
@@ -318,6 +312,31 @@ def test_batched_expert_prequantization_uses_stream_local_scratch():
 
     assert len(first_batch) == len(second_batch) == 4
     assert len(scratch_cache) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_refit_quantize_matches_receiver_quantize_mxfp8_weight():
+    """Sender prequantization and the receiver helper must agree bit-for-bit.
+
+    The trainer streams E4M3 data + *_scale_from_checkpoint produced by
+    mxfp8_e4m3_quantize_for_refit; weights the receiver quantizes itself go
+    through quantize_mxfp8_weight. Refit correctness relies on the two
+    implementations producing identical bits for the same input.
+    """
+    from nemo_rl.models.generation.vllm.quantization.fp8 import quantize_mxfp8_weight
+
+    torch.manual_seed(0)
+    x = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    x[0].zero_()
+
+    recv_lp, recv_scale = quantize_mxfp8_weight(x)
+    sent_lp, sent_scale = mxfp8_e4m3_quantize_for_refit(x)
+
+    assert sent_lp.dtype == recv_lp.dtype
+    assert torch.equal(sent_lp.view(torch.uint8), recv_lp.view(torch.uint8))
+    assert sent_scale.dtype == recv_scale.dtype
+    assert sent_scale.shape == recv_scale.shape
+    assert torch.equal(sent_scale, recv_scale)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -436,13 +455,13 @@ def test_batched_expert_prequantization_waits_for_pending_input_stream(
     consumer_stream = torch.cuda.Stream()
 
     with torch.cuda.stream(producer_stream):
-        gate_entries = [next(output) for _ in range(4)]
+        gate_entries = [next(output) for _ in range(2)]
     with torch.cuda.stream(consumer_stream):
         up_name, up_tensor = next(output)
         observed = up_tensor.clone()
     consumer_stream.synchronize()
 
-    assert len(gate_entries) == 4
+    assert len(gate_entries) == 2
     assert up_name == expert_name(0, "up")
     torch.testing.assert_close(observed, torch.full_like(observed, 7))
 

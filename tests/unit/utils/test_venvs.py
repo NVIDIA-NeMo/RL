@@ -16,7 +16,11 @@ import subprocess
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from nemo_rl.utils.venvs import create_local_venv
+from nemo_rl.utils.venvs import (
+    add_hf_modules_cache_to_pythonpath,
+    create_local_venv,
+    make_actor_runtime_env,
+)
 from tests.unit.conftest import TEST_ASSETS_DIR
 
 
@@ -48,3 +52,51 @@ def test_create_local_venv():
             # Verify the command executed successfully (return code 0)
             assert result.returncode == 0, f"Failed to import sphinx: {result.stderr}"
             assert "Sphinx package is installed" in result.stdout
+
+
+def test_add_hf_modules_cache_to_pythonpath():
+    result = add_hf_modules_cache_to_pythonpath(
+        {
+            "HF_MODULES_CACHE": "/hf/modules",
+            "PYTHONPATH": f"/project{os.pathsep}/other",
+        }
+    )
+
+    assert result["PYTHONPATH"].split(os.pathsep) == [
+        "/hf/modules",
+        "/project",
+        "/other",
+    ]
+
+
+def test_add_hf_modules_cache_does_not_duplicate_pythonpath_entry():
+    pythonpath = f"/project{os.pathsep}/hf/modules"
+
+    result = add_hf_modules_cache_to_pythonpath(
+        {"HF_MODULES_CACHE": "/hf/modules", "PYTHONPATH": pythonpath}
+    )
+
+    assert result["PYTHONPATH"] == pythonpath
+
+
+def test_make_actor_runtime_env_builds_local_venv_for_uv_python_executable():
+    """Mirrors the inline venv-creation logic that used to live in grpo.py."""
+    with (
+        patch(
+            "nemo_rl.distributed.ray_actor_environment_registry.get_actor_python_env",
+            return_value="uv run --group vllm",
+        ) as mock_get_env,
+        patch(
+            "nemo_rl.utils.venvs.create_local_venv_on_each_node",
+            return_value="/fake/venv/bin/python",
+        ) as mock_create_venv,
+    ):
+        runtime_env = make_actor_runtime_env("some.module.SomeActor")
+
+    mock_get_env.assert_called_once_with("some.module.SomeActor")
+    mock_create_venv.assert_called_once_with(
+        "uv run --group vllm", "some.module.SomeActor"
+    )
+    assert runtime_env["py_executable"] == "/fake/venv/bin/python"
+    assert runtime_env["env_vars"]["VIRTUAL_ENV"] == "/fake/venv"
+    assert runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] == "/fake/venv"

@@ -65,7 +65,10 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
-from nemo_rl.models.automodel.data import filter_multimodal_kwargs_for_model
+from nemo_rl.models.automodel.data import (
+    check_sequence_dim,
+    filter_multimodal_kwargs_for_model,
+)
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -93,6 +96,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
+from nemo_rl.telemetry.setup import init_telemetry_worker
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -228,6 +232,10 @@ class DTensorPolicyWorkerImpl(
         # benefit. ray.get_gpu_ids()[0] is the physical GPU index that keys the
         # affinity file, and reading it does not initialize CUDA.
         bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
 
         self.tokenizer = tokenizer
         self.processor = processor
@@ -634,13 +642,9 @@ class DTensorPolicyWorkerImpl(
             "cross-tokenizer distillation requires dtensor_cfg._v2=True."
         )
         # dim 1 is always assumed to be the sequence dim, sanity check this here.
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Shared with the v2 worker so the multimodal skip (packed wire
+        # fields are not sequence-aligned) lives in exactly one place.
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -1047,13 +1051,9 @@ class DTensorPolicyWorkerImpl(
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Shared with the v2 worker so the multimodal skip (packed wire
+        # fields are not sequence-aligned) lives in exactly one place.
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         all_log_probs = []
         self.model.eval()
@@ -1350,13 +1350,9 @@ class DTensorPolicyWorkerImpl(
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Shared with the v2 worker so the multimodal skip (packed wire
+        # fields are not sequence-aligned) lives in exactly one place.
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
         self.model.eval()
 
         with unshard_fsdp2_model(self.model), torch.no_grad():
@@ -1910,11 +1906,43 @@ class DTensorPolicyWorkerImpl(
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
     ) -> None:
-        """Broadcast the weights for collective communication."""
+        """Broadcast the weights for collective communication.
+
+        Guarded exactly as the Megatron worker is, and for the same reason: a generation
+        rank that dies mid-broadcast leaves this call blocked in NCCL with no timeout and
+        no error. Disarmed unless refit_timeout_s is set, so the default path is
+        unchanged.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            self._broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                buffer_size_bytes=buffer_size_bytes,
+                num_buffers=num_buffers,
+            )
+        if guard.fired:
+            # The aborted collective returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit broadcast exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+    ) -> None:
         if kv_scales is not None:
             raise NotImplementedError(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."

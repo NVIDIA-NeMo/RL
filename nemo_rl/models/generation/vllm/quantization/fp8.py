@@ -23,6 +23,7 @@ import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
@@ -77,6 +78,11 @@ class FP8State:
     seen_params: set = field(default_factory=lambda: set())
     fp8_param_names: set = field(default_factory=lambda: set())
     vllm_patches: list = field(default_factory=lambda: [])
+    # Full refit manifest names from prepare_refit_info. load_weights receives
+    # transfer batches split by buffer size, so a weight and its
+    # *_scale_from_checkpoint entry may arrive in different batches; presence
+    # must be validated against the full manifest, not the current batch.
+    refit_manifest_names: set | None = None
 
 
 # Global FP8 config that can be accessed by patched vLLM functions
@@ -116,46 +122,33 @@ def install_fp8_config(config: dict[str, Any] | None) -> None:
     global_fp8_config = FP8Config(**config)
 
 
-def _patch_ray_executor_v2_worker(ray_executor_v2: Any, fp8_config: FP8Config) -> None:
-    """Install FP8 patches inside RayExecutorV2 workers before model loading."""
-    original_ray_worker_proc = ray_executor_v2.RayWorkerProc
-    if getattr(original_ray_worker_proc, "_nrl_fp8_patched", False):
-        original_ray_worker_proc._nrl_fp8_config = fp8_config
-        return
-
-    class NRLFP8RayWorkerProc(original_ray_worker_proc):
-        _nrl_fp8_patched = True
-        _nrl_fp8_config = fp8_config
-
-        def initialize_worker(
-            self,
-            local_rank: int,
-            env_vars: dict[str, str],
-            driver_env_vars: dict[str, str] | None = None,
-            assigned_physical_gpu_ids: list[int] | None = None,
-        ) -> Any:
-            global fp8_patches_applied
-            if not fp8_patches_applied:
-                apply_fp8_patches(None, type(self)._nrl_fp8_config)
-            return super().initialize_worker(
-                local_rank,
-                env_vars,
-                driver_env_vars,
-                assigned_physical_gpu_ids,
-            )
-
-    ray_executor_v2.RayWorkerProc = NRLFP8RayWorkerProc
+def set_refit_manifest_names(names: set[str] | None) -> None:
+    fp8_state.refit_manifest_names = names
 
 
 def monkey_patch_vllm_ray_executor(fp8_config):
-    try:
-        from vllm.v1.executor import ray_executor_v2
-    except ImportError:
-        pass
-    else:
-        _patch_ray_executor_v2_worker(ray_executor_v2, fp8_config)
-
     if fp8_config.model_parallel_size > 1:
+        if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
+            from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+            original_initialize_worker = RayWorkerProc.initialize_worker
+
+            def patched_initialize_worker(self, *args, **kwargs):
+                # Resolve state in the worker's module because cloudpickle snapshots
+                # globals referenced by nested functions.
+                from nemo_rl.models.generation.vllm.quantization import fp8
+
+                if not fp8.fp8_patches_applied:
+                    fp8.apply_fp8_patches(None, fp8_config)
+
+                return original_initialize_worker(self, *args, **kwargs)
+
+            # RayExecutorV2 creates ray.remote(RayWorkerProc) after this hook. Ray
+            # copies inherited methods onto its generated actor subclass and
+            # serializes it by value, so actors receive this driver-side replacement.
+            RayWorkerProc.initialize_worker = patched_initialize_worker
+            return
+
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
         from vllm.v1.executor.ray_executor import RayDistributedExecutor
@@ -542,11 +535,29 @@ def _get_module_from_param_name(model, name: str):
     return current_module
 
 
+_GROUPED_EXPERT_WEIGHT_SUFFIXES = (
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+)
+_SCALE_FROM_CHECKPOINT_SUFFIX = "_scale_from_checkpoint"
+
+
+def _is_grouped_expert_weight(name: str) -> bool:
+    return name.endswith(_GROUPED_EXPERT_WEIGHT_SUFFIXES)
+
+
+def _grouped_expert_weight_name_from_scale(name: str) -> str | None:
+    if not name.endswith(_SCALE_FROM_CHECKPOINT_SUFFIX):
+        return None
+    weight_name = name.removesuffix(_SCALE_FROM_CHECKPOINT_SUFFIX)
+    return weight_name if _is_grouped_expert_weight(weight_name) else None
+
+
 def _is_fp8_weight(name, model):
     if name not in fp8_state.seen_params:
         fp8_state.seen_params.add(name)
         # Filter out bias params
-        if name.endswith("weight"):
+        if name.endswith("weight") or _is_grouped_expert_weight(name):
             module = _get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
@@ -585,16 +596,28 @@ def load_weights(weights, model_runner):
     global global_fp8_config
     weights_quantized = []
     model = model_runner.model
+    weights = list(weights)
+    weight_names = {name for name, _tensor in weights}
 
     for k, v in weights:
-        # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
-        # (so `_is_fp8_weight` would skip them) and vLLM's grouped loader cannot
-        # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
-        # layout, then reshape to 2D [num_experts, out_features, in_features] -> [num_experts*out_features, in_features]
-        # so the block scales can be quantized and routed correctly.
-        if k.endswith("mlp.experts.gate_up_proj") or k.endswith(
-            "mlp.experts.down_proj"
-        ):
+        grouped_weight_name = _grouped_expert_weight_name_from_scale(k)
+        if grouped_weight_name is not None:
+            is_prequantized_mx = (
+                global_fp8_config is not None
+                and global_fp8_config.is_mx
+                and global_fp8_config.refit_prequantize
+            )
+            if is_prequantized_mx and _is_fp8_weight(grouped_weight_name, model):
+                weights_quantized.extend(_reroute_grouped_moe_expert_scale(k, v))
+            else:
+                weights_quantized.append((k, v))
+            continue
+        # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix,
+        # and vLLM's grouped loader cannot load receiver-quantized per-block
+        # scales. Expand them into the per-expert FP8 layout so the block scales
+        # can be quantized and routed correctly. Prequantized MXFP8 weights stay
+        # fused; their scale sidecars are rerouted by the branch above.
+        if _is_grouped_expert_weight(k):
             # Quantize only if vLLM built this layer's experts as FP8. Experts
             # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
             # quantization_ignored_layer_kws) are built unquantized, with bf16
@@ -608,9 +631,15 @@ def load_weights(weights, model_runner):
                 and experts_module.w13_weight.dtype == torch.float8_e4m3fn
                 and experts_module.w2_weight.dtype == torch.float8_e4m3fn
             ):
+                if v.dtype == torch.float8_e4m3fn:
+                    # Trainer-side prequantized slab: already E4M3 with its
+                    # scale streamed separately; pass through untouched.
+                    weights_quantized.append((k, v))
+                    continue
                 if global_fp8_config.is_mx:
                     raise NotImplementedError(
-                        "MXFP8 refit does not support grouped MoE expert weights."
+                        "MXFP8 refit does not support quantizing grouped MoE "
+                        "expert weights on the fly; enable refit_prequantize."
                     )
                 weights_quantized.extend(_expand_grouped_moe_expert_to_fp8(k, v))
             else:
@@ -624,6 +653,19 @@ def load_weights(weights, model_runner):
                 raise ValueError(
                     "MXFP8 E4M3 refit weights require refit_prequantize=true; "
                     "other FP8 trainer scale layouts are not compatible."
+                )
+            # Transfer batches split by buffer size, so the matching scale may
+            # arrive in an earlier or later batch; validate against the full
+            # refit manifest when available, not just the current batch.
+            scale_name = k + "_scale_from_checkpoint"
+            manifest = fp8_state.refit_manifest_names
+            if (
+                global_fp8_config.is_mx
+                and scale_name not in weight_names
+                and (manifest is None or scale_name not in manifest)
+            ):
+                raise ValueError(
+                    f"Prequantized MXFP8 weight {k!r} is missing {scale_name!r}."
                 )
             # Prequantized MXFP8 sends the matching *_scale_from_checkpoint
             # entry separately, and IPC buffer boundaries may place that scale
@@ -641,12 +683,6 @@ def load_weights(weights, model_runner):
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
             )
         if global_fp8_config.is_mx:
-            # vLLM 0.25 returns row-major [M, K / 32] E8M0 scales.
-            # All-zero blocks quantize to E8M0 byte 0, which destabilizes the
-            # TRTLLM MXFP8 kernel; clamp to byte 1 (weights are 0 anyway).
-            param_scale = torch.where(
-                param_scale == 0, torch.ones_like(param_scale), param_scale
-            )
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
         else:
@@ -844,6 +880,48 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
             entries.append((name, weight_fp8[expert_id]))
             entries.append((name + "_scale_inv", scale_inv[expert_id]))
     return entries
+
+
+def _reroute_grouped_moe_expert_scale(
+    key: str, scale: torch.Tensor
+) -> list[tuple[str, torch.Tensor]]:
+    """Route suffixless grouped MXFP8 scales through vLLM's expert mapping.
+
+    vLLM 0.25.1 treats every 3D expert tensor as a fused weight and applies
+    weight-orientation heuristics that transpose the K-compressed W13 scale.
+    Match the ModelOpt refit backend: emit W13 as per-expert 2D gate/up scales
+    and keep W2 batched behind the expert-zero checkpoint route.
+    """
+    if scale.ndim != 3:
+        raise ValueError(f"Grouped MXFP8 scale {key!r} must be 3D, got {scale.ndim}D.")
+
+    weight_name = key.removesuffix(_SCALE_FROM_CHECKPOINT_SUFFIX)
+    base, projection = weight_name.rsplit(".", 1)
+    if projection == "down_proj":
+        return [
+            (
+                f"{base}.0.down_proj.weight_scale_from_checkpoint",
+                scale,
+            )
+        ]
+
+    if scale.shape[1] % 2 != 0:
+        raise ValueError(
+            f"Grouped gate/up MXFP8 scale {key!r} must have an even projection "
+            f"dimension, got {tuple(scale.shape)}."
+        )
+    gate_scale, up_scale = scale.chunk(2, dim=1)
+    return [
+        (
+            f"{base}.{expert_id}.{shard_name}.weight_scale_from_checkpoint",
+            expert_scale,
+        )
+        for shard_name, grouped_scale in (
+            ("gate_proj", gate_scale),
+            ("up_proj", up_scale),
+        )
+        for expert_id, expert_scale in enumerate(grouped_scale.unbind(0))
+    ]
 
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
