@@ -160,7 +160,10 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    resolve_refit_timeout_s,
+)
 
 # ===============================================================================
 # Configuration
@@ -2542,6 +2545,17 @@ def refit_policy_generation(
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
+    refit_timeout_s = resolve_refit_timeout_s(policy_generation)
+    refit_deadline = (
+        None if refit_timeout_s is None else time.monotonic() + refit_timeout_s
+    )
+
+    def wait_for_refit(futures: Any) -> Any:
+        if refit_deadline is None:
+            return ray.get(futures)
+        remaining_s = max(0.0, refit_deadline - time.monotonic())
+        return ray.get(futures, timeout=remaining_s)
+
     if isinstance(policy_generation, SGLangGeneration):
         # Fail loudly rather than falling through to the vLLM branches, which
         # would call methods the SGLang path does not implement.
@@ -2585,18 +2599,21 @@ def refit_policy_generation(
             )
             futures_inference = policy_generation.update_weights_via_ipc_zmq()
             # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
+            wait_for_refit(futures_train)
+            results = wait_for_refit(futures_inference)
             update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl (vLLM)
             futures_train = policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
+                refit_timeout_s=refit_timeout_s,
             )
-            futures_inference = policy_generation.update_weights_from_collective()
+            futures_inference = policy_generation.update_weights_from_collective(
+                refit_timeout_s=refit_timeout_s
+            )
             # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
+            wait_for_refit(futures_train)
+            results = wait_for_refit(futures_inference)
             update_success = all(result for result in results if result is not None)
 
         # check if update is successful
