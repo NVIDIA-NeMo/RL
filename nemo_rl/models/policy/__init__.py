@@ -382,8 +382,10 @@ class MegatronConfig(TypedDict):
     # No effect when use_fused_linear_logprobs is set, which bypasses the
     # output layer's standalone forward.
     fp32_lm_head: NotRequired[bool | Literal["tf32"]]
-    # Keep the transformer residual stream in fp32. Small additional reduction in
-    # gen/train logprob mismatch on top of fp32_lm_head.
+    # Keep the transformer residual stream in fp32. For vLLM generation this
+    # must match the rollout implementation's effective residual precision;
+    # an HF ``residual_in_fp32`` field is not sufficient when that model
+    # implementation does not consume it (for example vLLM Nemotron-H).
     fp32_residual_connection: NotRequired[bool]
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: bool
