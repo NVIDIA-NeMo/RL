@@ -1631,6 +1631,36 @@ def _create_megatron_config(
     fp8_param_enabled: bool = False,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    # NeMo-RL owns microbatch scheduling for policy train/logprob calls; the
+    # TrainingConfig batch sizes below are only placeholders required while
+    # Megatron-Bridge builds and validates its ConfigContainer. Newer Bridge
+    # versions validate that placeholder as an eval batch and require it to be
+    # divisible by the policy data-parallel width. Feeding the real rollout
+    # batch here therefore rejects otherwise-valid layouts such as 48 policy
+    # ranks, TP=2, CP=1 (DP=24), and a 2,048-sequence GRPO batch.
+    #
+    # Use one placeholder microbatch per DP replica. The actual GRPO batch
+    # remains in ``config`` and is consumed directly by MegatronPolicyWorker.
+    world_size = (
+        torch.distributed.get_world_size()
+        if torch.distributed.is_initialized()
+        else 1
+    )
+    model_parallel_size = (
+        model_cfg.tensor_model_parallel_size
+        * model_cfg.pipeline_model_parallel_size
+        * model_cfg.context_parallel_size
+    )
+    if world_size % model_parallel_size != 0:
+        raise ValueError(
+            f"Policy world size ({world_size}) must be divisible by model-parallel "
+            f"size ({model_parallel_size})"
+        )
+    bridge_placeholder_global_batch_size = (
+        config.get("train_micro_batch_size", 1)
+        * (world_size // model_parallel_size)
+    )
+
     # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
     # only valid when fp8 is enabled, fp8_param=True, and recipe is mxfp8. Mcore's
     # DDP __post_init__ asserts they remain in sync, so we centralize the derivation
@@ -1677,7 +1707,7 @@ def _create_megatron_config(
         dist=dist_cfg,
         train=TrainingConfig(
             micro_batch_size=1,  # ignored
-            global_batch_size=config["train_global_batch_size"],  # ignored
+            global_batch_size=bridge_placeholder_global_batch_size,  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
         optimizer=OptimizerConfig(**optimizer_kwargs),
