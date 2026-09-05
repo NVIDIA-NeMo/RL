@@ -146,6 +146,25 @@ def test_launcher_selects_qwen235_native_mxfp8_arm() -> None:
     assert "fp8_param: true" in config
 
 
+def test_qwen235_twenty_step_arms_match_except_training_and_rollout_precision() -> (
+    None
+):
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+    candidate = (EXPERIMENT_DIR / "qwen235-fp8param-true.yaml").read_text()
+    baseline = (EXPERIMENT_DIR / "qwen235-bf16.yaml").read_text()
+
+    assert "te_nano_routed_fp8param.yaml" in candidate
+    assert "qwen235:bf16:false" in launcher
+    assert "CONFIG=experiments/native_mxfp8_source_refit/qwen235-bf16.yaml" in launcher
+    assert "grpo-qwen3-235b-32n4g-async-1off.yaml" in baseline
+    assert "te_precision_config_file: null" in baseline
+    assert "fp8_cfg:\n      enabled: false" in baseline
+    assert "refit_transport: nccl_reshard" in baseline
+    assert "precision: bfloat16" in baseline
+    assert "is_mx: false" in baseline
+    assert "moe_backend: flashinfer_trtllm" in baseline
+
+
 def test_launcher_can_enable_second_refit_runtime_audit() -> None:
     launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
 

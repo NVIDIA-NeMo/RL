@@ -116,6 +116,12 @@ case "${MODEL}:${PRECISION_MODE}:${FP8_PARAM}" in
     SEGMENT_SIZE=2
     MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-30B-A3B'
     ;;
+  qwen235:bf16:false)
+    CONFIG=experiments/native_mxfp8_source_refit/qwen235-bf16.yaml
+    NUM_NODES=32
+    SEGMENT_SIZE=16
+    MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-235B-A22B'
+    ;;
   qwen235:mxfp8:true)
     CONFIG=experiments/native_mxfp8_source_refit/qwen235-fp8param-true.yaml
     NUM_NODES=32

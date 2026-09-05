@@ -5,7 +5,7 @@ checkpointing:
 policy:
   megatron_cfg:
     native_mxfp8_storage_assertion: qwen235
-    te_precision_config_file: experiments/native_mxfp8_source_refit/te_nano_routed.yaml
+    te_precision_config_file: experiments/native_mxfp8_source_refit/te_nano_routed_fp8param.yaml
     fp8_cfg:
       enabled: true
       fp8: e4m3
