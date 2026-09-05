@@ -16,6 +16,7 @@ import os
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from unittest.mock import patch
 
 import ray
@@ -31,6 +32,9 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.vllm.patches import (
+    _patch_vllm_modelopt_layer_quantization_logging,
+)
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
@@ -159,6 +163,8 @@ def apply_fp8_patches(self, fp8_config):
 
     # Apply weight-related patches only when using FP8 weights (precision=fp8)
     if global_fp8_config.use_fp8_weights:
+        _patch_vllm_modelopt_layer_quantization_logging(logger)
+
         # This patch is used to support torch.compile with vllm parameter subclasses, such as
         # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
         # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
@@ -212,7 +218,7 @@ def apply_fp8_patches(self, fp8_config):
     fp8_patches_applied = True
 
 
-def init_fp8(vllm_cfg, model_name, model_parallel_size):
+def init_fp8(vllm_cfg, model_name, model_parallel_size, *, return_ignore_report=False):
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
@@ -301,12 +307,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+    bf16_params = []
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
             model = AutoModel.from_config(config)
         param_names = [name for name, _ in model.named_parameters()]
 
-        bf16_params = []
         if num_first_layers_in_bf16 > 0:
             layers = [l for l in range(num_first_layers_in_bf16)]
             bf16_params.extend(_get_params_in_layers(param_names, layers))
@@ -323,6 +329,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
     quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws")
+    keyword_ignored_layers = []
+    vllm_param_names_for_report = []
     if "quantization_ignored_layer_kws" in vllm_cfg:
         warnings.warn(
             "quantization_ignored_layer_kws is deprecated in NeMo RL 0.8; "
@@ -339,11 +347,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             )
             for name, _ in model.named_parameters()
         ]
+        vllm_param_names_for_report = param_names
         ignored_layers = [
             n
             for n in param_names
             if any(p in n for p in quantization_ignored_layer_kws)
         ]
+        keyword_ignored_layers = ignored_layers
         if "ignored_layers" not in fp8_block_quant_kwargs:
             fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
         else:
@@ -373,6 +383,59 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
+
+    if return_ignore_report:
+        pattern_matches = {}
+        pattern_match_error = None
+        if quantization_ignore_patterns:
+            try:
+                if vllm_param_names_for_report:
+                    pattern_param_names = vllm_param_names_for_report
+                else:
+                    with init_empty_weights():
+                        model = AutoModel.from_config(config)
+                    pattern_param_names = [
+                        f"model.{name}".removesuffix(".weight").replace(
+                            "model.backbone.", "backbone."
+                        )
+                        for name, _ in model.named_parameters()
+                    ]
+                for pattern in quantization_ignore_patterns:
+                    has_glob = any(char in pattern for char in "*?[")
+                    pattern_matches[pattern] = [
+                        name
+                        for name in pattern_param_names
+                        if fnmatchcase(name, pattern)
+                        or (
+                            name.startswith("model.")
+                            and fnmatchcase(name.removeprefix("model."), pattern)
+                        )
+                        or (not has_glob and pattern in name)
+                    ]
+            except Exception as error:
+                pattern_match_error = f"{type(error).__name__}: {error}"
+
+        ignore_report = {
+            "sources": {
+                "num_layers_in_bf16": list(dict.fromkeys(bf16_params)),
+                "quantization_ignored_layer_kws": list(
+                    dict.fromkeys(keyword_ignored_layers)
+                ),
+                "quantization_ignore_patterns": {
+                    "patterns": list(quantization_ignore_patterns or []),
+                    "matches": pattern_matches,
+                    "match_error": pattern_match_error,
+                },
+                "default_ignored_layers": list(DEFAULT_QUANTIZATION_IGNORED_LAYERS),
+            },
+            "generated": {
+                "ignored_layers": list(
+                    fp8_block_quant_kwargs.get("ignored_layers", [])
+                ),
+                "ignore": list(fp8_block_quant_kwargs.get("ignore", [])),
+            },
+        }
+        return vllm_kwargs, ignore_report
 
     return vllm_kwargs
 

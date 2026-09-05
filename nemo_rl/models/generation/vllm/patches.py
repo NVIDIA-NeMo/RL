@@ -14,7 +14,14 @@
 
 import os
 from contextlib import contextmanager
+from functools import wraps
 from importlib.util import find_spec
+from typing import Any
+
+G_LAYER_QUANTIZATION_LOG_ENV = "NRL_LOG_LAYER_QUANTIZATION"
+G_MODELOPT_LAYER_QUANTIZATION_PATCH_ATTR = (
+    "_nrl_modelopt_layer_quantization_logging_patched"
+)
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -131,6 +138,106 @@ def _patch_vllm_init_workers_ray(
     os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(sorted(merged))
 
     return applied
+
+
+def _patch_vllm_modelopt_layer_quantization_logging(
+    logger: Any | None = None,
+) -> None:
+    """Log vLLM ModelOpt FP8/BF16 layer decisions without patching vLLM files."""
+    if os.environ.get(G_LAYER_QUANTIZATION_LOG_ENV, "0") != "1":
+        return
+
+    if logger is None:
+        from vllm.logger import init_logger
+
+        logger = init_logger("vllm_patch")
+
+    try:
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.quantization import modelopt
+        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    except (AttributeError, ImportError) as error:
+        logger.warning(
+            "Could not patch vLLM ModelOpt layer-quantization logging: %s",
+            error,
+        )
+        return
+
+    if hasattr(modelopt, "LOG_LAYER_QUANTIZATION") and hasattr(
+        modelopt, "LAYER_QUANTIZATION_LOG_ENV"
+    ):
+        modelopt.LOG_LAYER_QUANTIZATION = True
+        logger.info(
+            "vLLM ModelOpt layer-quantization source logging is already present."
+        )
+        return
+
+    logged_layer_types = (LinearBase, ParallelLMHead, RoutedExperts)
+
+    def bf16_reason(quant_config: Any, prefix: str, quant_method: Any) -> str:
+        try:
+            if quant_config.is_layer_excluded(prefix):
+                return "excluded"
+        except (AttributeError, TypeError):
+            pass
+        if (
+            "vision_tower" in prefix
+            or "vision_model" in prefix
+            or "vit_large_projector" in prefix
+        ):
+            return "vision_module"
+        if quant_method is None:
+            return "not_quantized"
+        return "unquantized_method"
+
+    def wrap_get_quant_method(cls: Any) -> bool:
+        if cls is None or getattr(cls, G_MODELOPT_LAYER_QUANTIZATION_PATCH_ATTR, False):
+            return False
+
+        original_get_quant_method = getattr(cls, "get_quant_method", None)
+        if original_get_quant_method is None:
+            return False
+
+        @wraps(original_get_quant_method)
+        def wrapped_get_quant_method(self: Any, layer: Any, prefix: str) -> Any:
+            quant_method = original_get_quant_method(self, layer, prefix)
+            if isinstance(layer, logged_layer_types):
+                if (
+                    quant_method is None
+                    or type(quant_method).__name__ == "UnquantizedLinearMethod"
+                ):
+                    logger.info(
+                        "[LayerQuantization][vLLM] prefix=%s module=%s "
+                        "decision=BF16 reason=%s",
+                        prefix,
+                        type(layer).__name__,
+                        bf16_reason(self, prefix, quant_method),
+                    )
+                else:
+                    logger.info(
+                        "[LayerQuantization][vLLM] prefix=%s module=%s "
+                        "decision=QUANTIZED method=%s",
+                        prefix,
+                        type(layer).__name__,
+                        type(quant_method).__name__,
+                    )
+            return quant_method
+
+        setattr(cls, "_nrl_original_get_quant_method", original_get_quant_method)
+        cls.get_quant_method = wrapped_get_quant_method
+        setattr(cls, G_MODELOPT_LAYER_QUANTIZATION_PATCH_ATTR, True)
+        return True
+
+    patched = wrap_get_quant_method(getattr(modelopt, "ModelOptQuantConfigBase", None))
+    mixed_precision_cls = getattr(modelopt, "ModelOptMixedPrecisionConfig", None)
+    if mixed_precision_cls is not None and "get_quant_method" in getattr(
+        mixed_precision_cls, "__dict__", {}
+    ):
+        patched = wrap_get_quant_method(mixed_precision_cls) or patched
+
+    if patched:
+        logger.info("Patched vLLM ModelOpt layer-quantization logging.")
 
 
 def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
