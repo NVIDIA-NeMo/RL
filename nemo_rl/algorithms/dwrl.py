@@ -2384,7 +2384,7 @@ def validate(
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
             reward_accuracy = rewards_t.mean().item()
         else:
-            accuracy = 0.0
+            reward_accuracy = 0.0
         num_samples_env = len(total_rewards_env)
         if num_samples_env > 0:
             rewards_t_env = torch.tensor(total_rewards_env, dtype=torch.float32)

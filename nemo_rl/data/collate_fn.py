@@ -129,6 +129,7 @@ def preference_collate_fn(
     tokenizer: TokenizerType,
     make_sequence_length_divisible_by: int,
     add_loss_mask: bool,
+    return_batch_only: bool = False,
 ) -> BatchedDataDict[Any]:
     """Collate function for preference data training.
 
@@ -149,6 +150,7 @@ def preference_collate_fn(
     loss_multiplier = []
     idx = []
     task_names = []
+    extra_env_infos = []
     for datum_spec in data_batch:
         ## interleave chosen and rejected examples
         message_log.append(datum_spec["message_log_chosen"])
@@ -158,6 +160,7 @@ def preference_collate_fn(
         loss_multiplier.extend([datum_spec["loss_multiplier"]] * 2)
         idx.extend([datum_spec["idx"]] * 2)
         task_names.extend([datum_spec.get("task_name", None)] * 2)
+        extra_env_infos.extend([datum_spec["extra_env_info"], datum_spec["extra_env_info"]])
     length_batch: torch.Tensor = torch.tensor(length)
     loss_multiplier_batch: torch.Tensor = torch.tensor(loss_multiplier)
 
@@ -169,8 +172,11 @@ def preference_collate_fn(
         loss_multiplier=loss_multiplier_batch,
         task_name=task_names,
         idx=idx,
+        extra_env_info=extra_env_infos,
         batch_max_length=batch_max_length,
     )
+    if return_batch_only:
+        return batch
 
     if add_loss_mask:
         add_loss_mask_to_message_log(
