@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
@@ -273,6 +274,12 @@ def materialize_vllm_video_config(
     video_media_io_kwargs["num_frames"] = video_config.num_frames
 
 
+# Entry points with end-to-end coverage for the per-token NVFP4 rollout.
+# Every other entry point shares the same Megatron training worker and vLLM
+# refit path, so the mode is expected to work there, but is unvalidated.
+NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS = frozenset({"grpo"})
+
+
 def parse_nvfp4_pertoken_rollout(
     config: VllmConfig,
 ) -> NvFp4PerTokenRolloutConfig | None:
@@ -286,11 +293,17 @@ def parse_nvfp4_pertoken_rollout(
 
 def normalize_nvfp4_pertoken_policy_config(
     policy_config: Mapping[str, Any],
+    *,
+    entry_point: str = "grpo",
 ) -> None:
     """Derive rollout BF16 exclusions from the policy's Megatron boundary.
 
     This runs on the driver before generation workers are created so trainer
     and rollout actors receive one normalized precision contract.
+
+    ``entry_point`` names the calling algorithm so an unvalidated one warns
+    instead of appearing supported; see
+    ``NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS``.
     """
     generation_config = policy_config.get("generation") or {}
     if generation_config.get("backend") != "vllm":
@@ -298,6 +311,15 @@ def normalize_nvfp4_pertoken_policy_config(
     rollout = parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_config))
     if rollout is None:
         return
+    if entry_point not in NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS:
+        warnings.warn(
+            "generation.nvfp4_pertoken_rollout has end-to-end coverage on "
+            f"{sorted(NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS)} only. {entry_point} "
+            "reuses the same Megatron training worker and vLLM refit path, so the "
+            "mode is expected to work, but it has not been validated there.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     from transformers import AutoConfig
 

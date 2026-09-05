@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib.util
 import json
 import os
 import sys
 import types
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -38,7 +40,11 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.generation.vllm.config import normalize_vllm_refit_config
+from nemo_rl.models.generation.vllm.config import (
+    NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS,
+    normalize_nvfp4_pertoken_policy_config,
+    normalize_vllm_refit_config,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
@@ -132,6 +138,58 @@ def test_normalize_vllm_refit_config_rejects_nvfp4_with_explicit_transport():
                 "refit_transport": "nixl",
             }
         )
+
+
+def test_nvfp4_pertoken_normalization_is_silent_when_the_mode_is_off():
+    """A run that never asked for NVFP4 must not warn, whatever the entry point.
+
+    The early return also keeps the HF config load off the path of every
+    ordinary PPO/distillation run.
+    """
+    policy_config = {"generation": {"backend": "vllm"}, "megatron_cfg": {}}
+    for entry_point in ("grpo", "ppo", "distillation", "some_future_algorithm"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            normalize_nvfp4_pertoken_policy_config(
+                dict(policy_config), entry_point=entry_point
+            )
+
+
+def test_nvfp4_pertoken_warns_on_an_entry_point_without_end_to_end_coverage():
+    """PPO and distillation reuse GRPO's worker and refit path but are unvalidated.
+
+    The warning has to precede the HF config load so it is emitted even when
+    boundary resolution later fails, which is why the model name below never
+    has to resolve.
+    """
+    assert "grpo" in NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS
+    policy_config = {
+        "model_name": "nvfp4-pertoken-entry-point-probe",
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {
+            "first_last_layers_bf16": True,
+            "num_layers_at_start_in_bf16": 2,
+            "num_layers_at_end_in_bf16": 4,
+        },
+    }
+
+    for entry_point in ("ppo", "distillation"):
+        with pytest.warns(UserWarning, match="has end-to-end coverage"):
+            with contextlib.suppress(Exception):
+                normalize_nvfp4_pertoken_policy_config(
+                    dict(policy_config), entry_point=entry_point
+                )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with contextlib.suppress(Exception):
+            normalize_nvfp4_pertoken_policy_config(
+                dict(policy_config), entry_point="grpo"
+            )
+    assert not [w for w in caught if "has end-to-end coverage" in str(w.message)]
 
 
 basic_dtensor_test_config: PolicyConfig = {
