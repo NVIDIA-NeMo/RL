@@ -609,6 +609,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._message_level_advantage_penalties_enabled = True
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
@@ -701,6 +702,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     )
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -764,6 +766,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -832,6 +835,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -894,6 +898,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -954,6 +959,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -1037,6 +1043,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1390,6 +1397,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._finalizer_metrics_by_group = {}
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
@@ -2252,6 +2260,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],

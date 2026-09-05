@@ -1478,9 +1478,10 @@ class TestGenerateForFinalizationFlow:
         request = _run(mgr.generate_for_finalization({"prompt": "p"}))
 
         # The gym mask flag is read from env_extras exactly like the token
-        # path's _mask_sample_flags; receipt completions are never truncated.
+        # path's _mask_sample_flags. truncated is not part of this request --
+        # the dispatcher has no real tokens to measure it from; the finalizer
+        # computes it from each row's rebuilt length instead.
         assert request.mask_sample == (True, False)
-        assert request.truncated == (False, False)
 
     def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()
@@ -1499,7 +1500,6 @@ class TestGenerateForFinalizationFlow:
         assert [r["rollout_id"] for r in request.receipts] == expected_ids
         assert request.rewards == (0.5, 0.5)
         assert request.mask_sample == (False, False)
-        assert request.truncated == (False, False)
         assert request.fallback_weight_version == 7
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.

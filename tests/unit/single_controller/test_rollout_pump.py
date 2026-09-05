@@ -1176,7 +1176,8 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             rollout_failure=_failure_cfg(),
         )
         ctrl._master_config = SimpleNamespace(
-            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = manager
