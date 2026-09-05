@@ -1,20 +1,13 @@
-# NeMo-RL v2 SingleController overlay for eight-node, non-colocated Omni CLEVR.
 defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron_generation.v1.yaml
-
 grpo:
   async_grpo: null
   val_period: 0
   val_at_start: false
   val_at_end: false
-
 data_plane:
   enabled: true
-  impl: transfer_queue
-  backend: simple
-  claim_meta_poll_interval_s: 0.5
   simple:
     num_storage_units: 16
-
 async_rl:
   sampler:
     name: in_order
@@ -23,28 +16,3 @@ async_rl:
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, 2}
   max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
-
-policy:
-  generation:
-    backend: megatron
-    colocated:
-      enabled: false
-      resources:
-        num_nodes: 6
-        gpus_per_node: 4
-    mcore_generation_config:
-      transformer_impl: inference_optimized
-      moe_router_dtype: fp32
-      moe_pad_experts_for_cuda_graph_inference: false
-      cuda_graph_impl: local
-      inference_cuda_graph_scope: block
-      num_cuda_graphs: -1
-      use_cuda_graphs_for_non_decode_steps: false
-      enable_chunked_prefill: true
-      async_sched_mode: async
-      kv_cache_management_mode: persist
-      refit_backend: nccl
-
-cluster:
-  num_nodes: 8
-  gpus_per_node: 4
