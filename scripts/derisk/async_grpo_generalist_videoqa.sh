@@ -32,10 +32,13 @@ data_path="${DATA_PATH:-/lustre/fsw/portfolios/nemotron/users/arushig/nemo_gym_r
 tokenizer_chat_template="${TOKENIZER_CHAT_TEMPLATE:-default}"
 vllm_chat_template="${VLLM_CHAT_TEMPLATE:-null}"
 persistent_cache="${PERSISTENT_CACHE:-/scratch/fsw/portfolios/nemotron/projects/nemotron_omni_vision/users/ehosseiniasl/nemo_rl_cache}"
-gym_venv_dir="${GYM_VENV_DIR:-${persistent_cache}/gym_venvs_derisk}"
 slurm_time_limit="${SLURM_TIME_LIMIT:-14:00:00}"
 
 run_id="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}"
+# Gym environments are created lazily and are not safe for independent cold
+# starts to populate concurrently. Keep one cache across this run's array
+# windows while isolating it from other experiments.
+gym_venv_dir="${GYM_VENV_DIR:-${persistent_cache}/gym_venvs_derisk/${run_id}}"
 base_name="${BASE_NAME:-async_grpo_super35_latest_combined_sav_caprl_${run_id}}"
 candidate_name="${base_name}_${SLURM_ACCOUNT}_${SLURM_PARTITION//,/_}"
 results_dir="${RESULTS_DIR:-${code_dir}/results/${base_name}}"
@@ -64,6 +67,21 @@ fi
 num_train_nodes=$((num_nodes - num_gen_nodes))
 if (( num_train_nodes % segment_size != 0 || num_gen_nodes % segment_size != 0 )); then
   echo "ERROR: SEGMENT_SIZE must divide both policy and generation node counts" >&2
+  exit 1
+fi
+# This recipe fixes TP=2, PP=1, and CP=1, so policy DP is the number of
+# training GPUs divided by two.  Reject an incompatible node split before
+# sbatch; otherwise async GRPO discovers it only after generating all 2048
+# first-step sequences.
+policy_model_parallel_size=2
+policy_world_size=$((num_train_nodes * gpus_per_node))
+if (( policy_world_size % policy_model_parallel_size != 0 )); then
+  echo "ERROR: policy GPU count ${policy_world_size} is not divisible by recipe model-parallel size ${policy_model_parallel_size}" >&2
+  exit 1
+fi
+policy_dp_size=$((policy_world_size / policy_model_parallel_size))
+if (( train_global_batch_size % policy_dp_size != 0 )); then
+  echo "ERROR: rollout batch ${train_global_batch_size} is not divisible by policy DP ${policy_dp_size} (${num_train_nodes} training nodes). Choose a compatible NUM_GEN_NODES; for NUM_NODES=20 use NUM_GEN_NODES=12, and for NUM_NODES=32 use NUM_GEN_NODES=16." >&2
   exit 1
 fi
 
@@ -215,7 +233,7 @@ submit_args=(
 )
 
 echo "candidate=${candidate_name}"
-echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} length_penalty=${length_penalty_enabled} profile_band=${profile_band_enabled} router_replay=${router_replay_enabled} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template}"
+echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} training_nodes=${num_train_nodes} generation_nodes=${num_gen_nodes} policy_dp=${policy_dp_size} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} length_penalty=${length_penalty_enabled} profile_band=${profile_band_enabled} router_replay=${router_replay_enabled} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template}"
 echo "container=${container}"
 echo "results=${results_dir}"
 
