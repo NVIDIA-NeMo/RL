@@ -1162,10 +1162,11 @@ def dynamic_sampling(
 def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
-    PPO's training loop consumes a `(advantages, returns)` pair from a
-    value-model-based estimator, so only `gae` and `raw_reward` are supported
-    here. Group-relative estimators like GRPO / Reinforce++ are not compatible
-    with PPO's loop and live in `grpo.py`.
+    Both supported estimators return an ``AdvantageResult``. `gae` populates
+    ``returns`` with its value target; `raw_reward` leaves it None, and the
+    loop only writes ``train_data["returns"]`` when it is present. Only these
+    two are offered here -- group-relative estimators like GRPO / Reinforce++
+    are not compatible with PPO's loop and live in `grpo.py`.
 
     Args:
         master_config: The master configuration dictionary.
@@ -1677,16 +1678,12 @@ def ppo_train(
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
-                    result = adv_estimator.compute_advantage(**adv_kwargs)
-                    if isinstance(result, tuple):
-                        advantages, returns = result
-                    else:
-                        advantages, returns = result, None
+                    adv_result = adv_estimator.compute_advantage(**adv_kwargs)
                     del prompt_ids_for_adv
 
-                    train_data["advantages"] = advantages
-                    if returns is not None:
-                        train_data["returns"] = returns
+                    train_data["advantages"] = adv_result.advantages
+                    if adv_result.returns is not None:
+                        train_data["returns"] = adv_result.returns
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
@@ -2693,15 +2690,11 @@ def async_ppo_train(
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
-                    result = adv_estimator.compute_advantage(**adv_kwargs)
-                    if isinstance(result, tuple):
-                        advantages, returns = result
-                    else:
-                        advantages, returns = result, None
+                    adv_result = adv_estimator.compute_advantage(**adv_kwargs)
                     del prompt_ids_for_adv
-                    train_data["advantages"] = advantages
-                    if returns is not None:
-                        train_data["returns"] = returns
+                    train_data["advantages"] = adv_result.advantages
+                    if adv_result.returns is not None:
+                        train_data["returns"] = adv_result.returns
 
                 # ---- 7. Grouped critic epochs, then grouped actor epochs ----
                 # Actor and critic share the training GPUs. Keep each model

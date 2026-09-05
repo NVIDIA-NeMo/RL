@@ -3341,21 +3341,21 @@ class SingleControllerActor:
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
         has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
-        # Value-model estimators (GAE) hand back the regression target alongside
-        # the advantages; the group-relative ones return a bare tensor.
+        # ``returns`` stays None unless the estimator produced a value target.
         returns: Optional[torch.Tensor] = None
         if has_valid_training_tokens:
-            result = self._advantage_estimator.compute_advantage(
+            adv_result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
                 **kwargs,
             )
-            if self._is_ppo:
-                advantages, returns = result
-            else:
-                advantages = result
+            # No is_ppo branch: an AdvantageResult always carries both, and
+            # ``returns`` is None for every estimator with no value target.
+            advantages = adv_result.advantages
+            if adv_result.returns is not None:
+                returns = adv_result.returns
         else:
             advantages = torch.zeros_like(mask)
             if self._is_ppo:

@@ -26,6 +26,7 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.advantage_estimator import AdvantageResult
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
@@ -173,8 +174,10 @@ class _FakeAdvEstimator:
         mask: torch.Tensor,
         repeated_batch: dict,
         **kwargs,
-    ) -> torch.Tensor:
-        return rewards.detach().unsqueeze(-1).expand_as(mask).clone()
+    ) -> AdvantageResult:
+        return AdvantageResult(
+            advantages=rewards.detach().unsqueeze(-1).expand_as(mask).clone()
+        )
 
 
 @ray.remote(num_cpus=0)  # pragma: no cover
