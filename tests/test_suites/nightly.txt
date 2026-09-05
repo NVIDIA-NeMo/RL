@@ -198,6 +198,7 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-n
 
 # Gemma 4 functional runs
 tests/test_suites/llm/dapo-gemma4-e2b-it-1n8g-fsdp2-automodel.sh
+tests/test_suites/llm/dapo-gemma4-12b-it-2n8g-fsdp2-automodel.sh
 
 # Functional Gemma 4 E4B VLM GRPO run
 tests/test_suites/vlm/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.sh
