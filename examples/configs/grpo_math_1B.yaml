@@ -244,6 +244,9 @@ policy:
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
+    # For HybridEP sequence packing with PP=1 and MTP disabled, set true to align
+    # uneven rank-local inputs before forward and avoid collective-order hangs.
+    moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.

@@ -7,11 +7,12 @@ This document describes the sequence packing and dynamic batching features imple
 1. [Problem](#problem)
 2. [Sequence Packing and Dynamic Batching](#sequence-packing-and-dynamic-batching)
 3. [Sequence Packing](#sequence-packing)
-4. [Dynamic Batching](#dynamic-batching)
-5. [Configuration](#configuration)
-6. [Integration with Training Pipeline](#integration-with-training-pipeline)
-7. [Metrics and Monitoring](#metrics-and-monitoring)
-8. [Usage](#usage)
+4. [HybridEP with Packed Sequences](#hybridep-with-packed-sequences)
+5. [Dynamic Batching](#dynamic-batching)
+6. [Configuration](#configuration)
+7. [Integration with Training Pipeline](#integration-with-training-pipeline)
+8. [Metrics and Monitoring](#metrics-and-monitoring)
+9. [Usage](#usage)
 
 ## Problem
 
@@ -225,6 +226,36 @@ Internally, DTensor and Megatron-Core are made aware of sequence packing with ei
 - With using Sequence Packing with Megatron + Pipeline Parallelism (PP), note that all packed sequences will be padded up to the maximum packed sequence length because PP requires maintaining a fixed-size batch x seqlen buffer for PP communications. In practice, however, we find that packing is _so efficient_ that this hardly makes a difference.
 
 All together, we see **speedups in the ~2-3x range** when enabling sequence packing.
+
+### HybridEP with Packed Sequences
+
+Packed sequence lengths can differ across expert-parallel ranks. HybridEP
+collectives require every participating rank to use an aligned input length;
+otherwise a run can hang when communication overlaps. For the supported
+pipeline-parallel-size-one, MTP-disabled path, enable NeMo-RL's one-time input
+pre-padding:
+
+```yaml
+policy:
+  megatron_cfg:
+    moe_token_dispatcher_type: "flex"
+    moe_flex_dispatcher_backend: "hybridep"
+    moe_hybridep_prepad_packed_inputs: true
+    pipeline_model_parallel_size: 1
+    mtp_num_layers: 0
+  sequence_packing:
+    enabled: true
+```
+
+`moe_hybridep_prepad_packed_inputs: true` aligns the packed input length across
+the HybridEP group once before the forward pass. This avoids issuing an
+additional scalar alignment collective inside every MoE layer, where it can
+interleave with expert-parameter collectives and hang.
+
+The option is not enabled by default because this NeMo-RL-owned pre-padding
+path does not currently support pipeline parallelism or MTP. NeMo-RL rejects
+unsupported combinations during setup. When the option is omitted or `false`,
+uneven-input padding is delegated to Megatron-Core instead.
 
 ## Dynamic Batching
 

@@ -808,6 +808,134 @@ class TestApplyMoeConfig:
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
 
+    def test_hybridep_without_sequence_packing_enables_dispatch_padding(
+        self, monkeypatch
+    ):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=False,
+        )
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is True
+
+    def test_hybridep_sequence_packing_without_opt_in_keeps_dispatch_padding(
+        self, monkeypatch
+    ):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=True,
+        )
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+        )
+        config["sequence_packing"] = {"enabled": True}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is True
+
+    def test_hybridep_sequence_packing_explicitly_uses_input_prepadding(
+        self, monkeypatch
+    ):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=True,
+        )
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_prepad_packed_inputs=True,
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=0,
+        )
+        config["sequence_packing"] = {"enabled": True}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is False
+
+    def test_hybridep_input_prepadding_requires_flex_dispatcher(self, monkeypatch):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=True,
+        )
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_token_dispatcher_type="alltoall",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_prepad_packed_inputs=True,
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=0,
+        )
+        config["sequence_packing"] = {"enabled": True}
+
+        with pytest.raises(ValueError, match="flex token dispatcher"):
+            _apply_moe_config(model_cfg, config)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"pipeline_model_parallel_size": 8}, "pipeline parallel size 1"),
+            ({"mtp_num_layers": 1}, "MTP disabled"),
+        ],
+    )
+    def test_hybridep_input_prepadding_rejects_unsupported_layouts(
+        self, monkeypatch, overrides, message
+    ):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=True,
+        )
+        megatron_overrides = {
+            "expert_model_parallel_size": 8,
+            "moe_flex_dispatcher_backend": "hybridep",
+            "moe_hybridep_prepad_packed_inputs": True,
+            "pipeline_model_parallel_size": 1,
+            "mtp_num_layers": 0,
+            **overrides,
+        }
+        config = self._base_moe_cfg(**megatron_overrides)
+        config["sequence_packing"] = {"enabled": True}
+
+        with pytest.raises(ValueError, match=message):
+            _apply_moe_config(model_cfg, config)
+
+    def test_non_hybridep_preserves_uneven_dispatch_padding_default(self):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=False,
+        )
+        config = self._base_moe_cfg(
+            moe_flex_dispatcher_backend="deepep",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is False
+
     def test_hybridep_env_vars_auto_set_with_warning(self, monkeypatch):
         """HybridEP backend with no env config: auto-set env vars and emit warnings."""
         from nemo_rl.models.megatron.setup import _apply_moe_config
