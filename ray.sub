@@ -171,6 +171,9 @@ fi
 #   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
 #     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
 #     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
+#     [4100, 4200) Dynamo NIXL side channels (node-local engine index)
+#     [4200, 4300) Dynamo prefill KV event streams (node-local engine index)
+#     [4300, 4999) Other generation HTTP servers + SGLang engine NCCL/dist_init
 #   5000-5999    NeMo Gym HTTP servers (Gym global config port_range_low/high)
 #   6000         Sandbox Nginx (NEMO_SKILLS_SANDBOX_PORT)
 #   6001-6999    Sandbox uWSGI workers (SANDBOX_BASE_PORT)

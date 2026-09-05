@@ -32,6 +32,8 @@ It does not replace NeMo RL's normal Ray or vLLM dependencies: the standard
 NeMo RL vLLM environment currently uses vLLM 0.25.1, while this isolated
 Dynamo environment uses Dynamo's vLLM 0.23.0 pin. Both environments pin
 `nvidia-nccl-cu13==2.30.7` so their NCCL communicators use the same release.
+The Dynamo dependency set also contains `nixl-cu13==1.1.0` for prefill/decode
+KV transfer.
 For a local source checkout, the same environment can be installed under
 `venvs/dynamo`:
 
@@ -40,9 +42,9 @@ bash docker/dynamo/install.sh
 ```
 
 Set `NEMO_RL_DYNAMO_VENV_DIR` to choose another location. The installer checks
-that Dynamo resolved vLLM 0.23.0 and NCCL 2.30.7, applies the vLLM PR #44814
-backport only after `git apply --check`, and writes the upstream marker to
-`VLLM_BACKPORTS`.
+that Dynamo resolved vLLM 0.23.0, NCCL 2.30.7, and the NIXL 1.1.0 CU13 package.
+It applies the vLLM PR #44814 backport only after `git apply --check` and writes
+the upstream marker to `VLLM_BACKPORTS`.
 
 Treat the isolated dependency pin and backport as one update. A Dynamo upgrade
 must update and reverify these coupled locations:
@@ -83,6 +85,7 @@ policy:
     backend: dynamo
     dynamo_cfg:
       engine: vllm
+      disaggregation: null
       frontend_args:
         router_mode: kv
     vllm_cfg:
@@ -100,6 +103,42 @@ NeMo RL derives each engine's world size from TP times PP. EP must be one or
 equal to TP. Parser settings belong under `dynamo_cfg.worker_args`; inherited
 vLLM HTTP-parser settings are rejected with the corresponding Dynamo field.
 Service ports and the namespace are runtime-owned rather than public config.
+
+### Prefill/decode disaggregation
+
+Use
+[`examples/configs/grpo_math_1B_dynamo_disagg.yaml`](../../examples/configs/grpo_math_1B_dynamo_disagg.yaml)
+for a small prefill/decode example. The opt-in fields are:
+
+```yaml
+policy:
+  generation:
+    dynamo_cfg:
+      disaggregation:
+        prefill_workers: 1
+        decode_workers: 1
+```
+
+Both roles use the same `vllm_cfg` and `vllm_kwargs`. The required inference
+GPU count is:
+
+```text
+(prefill_workers + decode_workers) * tensor_parallel_size * pipeline_parallel_size
+```
+
+Each TP times PP engine must fit on one node. Prefill and decode engines may be
+on different nodes. NeMo RL starts decode engines first and then prefill
+engines. This gives every engine a stable NCCL refit rank.
+
+NeMo RL manages `--disaggregation-mode`, the NIXL connector, NIXL side-channel
+ports, and prefill KV-event ports. Do not set these values in
+`worker_args.extra_cli_args`, `vllm_kwargs`, or `vllm_cfg.env_vars`.
+When vLLM prefix caching is disabled, Dynamo does not publish KV events because
+there are no cached prefixes to reuse.
+
+NIXL moves KV-cache data from prefill to decode. NCCL moves model weights from
+training to every prefill and decode engine. Both roles receive each refit and
+both roles have their KV caches cleared after the refit.
 
 `vllm_cfg` settings are handled in five explicit classes:
 
@@ -140,6 +179,8 @@ The fixed port layout is:
 - `1313-1399`: driver-local etcd and NATS control plane
 - `3000-3999`: frontend and token-wrapper HTTP endpoints
 - `4000-4099`: node-local `DYN_SYSTEM_PORT`
+- `4100-4199`: node-local NIXL side-channel ports
+- `4200-4299`: node-local prefill KV-event ports
 - `7000 + slot * 100`: node-local vLLM rendezvous ports
 
 ## Run the two-GPU smoke
@@ -170,6 +211,31 @@ The recipe assigns one GPU to training and one to a TP1 Dynamo worker. Its two
 steps exercise generation, refit, post-refit cache invalidation, telemetry,
 and cleanup. For a matched control, run the same seed/model/batch settings with
 the standard non-colocated vLLM backend and compare post-refit output validity.
+
+## Run the three-GPU disaggregated smoke
+
+Use the same command with three GPUs and the P/D config:
+
+```bash
+export GPUS_PER_NODE=3
+printf -v COMMAND '%q ' \
+  /opt/nemo_rl_venv/bin/python -u "$PWD/examples/run_grpo.py" \
+  --config "$PWD/examples/configs/grpo_math_1B_dynamo_disagg.yaml"
+export COMMAND
+
+sbatch \
+  --nodes=1 \
+  --gres=gpu:3 \
+  --exclusive \
+  --account=<account> \
+  --partition=<partition> \
+  ray.sub
+```
+
+This assigns one GPU to training, one to a TP1 decode engine, and one to a TP1
+prefill engine. The existing Dynamo L1 job runs both the aggregated and P/D
+smokes. These tests verify function only. They do not measure or claim
+performance.
 
 ## Run SWE1 with W&B
 
