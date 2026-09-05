@@ -36,6 +36,12 @@ test -s "${BASE_IMAGE}"
 test -d "${NTRACE_REPO}/src/ntrace"
 test -f "${NTRACE_REPO}/pyproject.toml"
 
+SRUN=${SRUN:-$(command -v srun 2>/dev/null || true)}
+if [[ -z "${SRUN}" || "${SRUN}" != /* || ! -x "${SRUN}" ]]; then
+  echo "Set SRUN to the absolute path of the Slurm srun executable" >&2
+  exit 2
+fi
+
 NTRACE_SHA=$(git -C "${NTRACE_REPO}" rev-parse HEAD)
 OUTPUT_LOG=${OUTPUT_IMAGE%.sqsh}.build-%j.out
 
@@ -80,7 +86,7 @@ exec sbatch \
   --job-name="${SLURM_ACCOUNT}.build-ntrace-${NTRACE_SHA:0:8}" \
   --output="${OUTPUT_LOG}" \
   --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"container_build","description":"build ntrace runtime image"}}' \
-  --wrap="srun --ntasks=1 --ntasks-per-node=1 \
+  --wrap="${SRUN} --ntasks=1 --ntasks-per-node=1 \
     --no-container-mount-home \
     --container-remap-root \
     --container-image=${BASE_IMAGE} \
