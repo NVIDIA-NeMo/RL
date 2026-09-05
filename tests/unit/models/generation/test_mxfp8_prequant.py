@@ -455,13 +455,13 @@ def test_batched_expert_prequantization_waits_for_pending_input_stream(
     consumer_stream = torch.cuda.Stream()
 
     with torch.cuda.stream(producer_stream):
-        gate_entries = [next(output) for _ in range(4)]
+        gate_entries = [next(output) for _ in range(2)]
     with torch.cuda.stream(consumer_stream):
         up_name, up_tensor = next(output)
         observed = up_tensor.clone()
     consumer_stream.synchronize()
 
-    assert len(gate_entries) == 4
+    assert len(gate_entries) == 2
     assert up_name == expert_name(0, "up")
     torch.testing.assert_close(observed, torch.full_like(observed, 7))
 
