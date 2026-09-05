@@ -2368,7 +2368,11 @@ class MegatronPolicyWorkerImpl(
             Updated refit metadata: the listed params become float8_e4m3fn and
             each gains a *_scale_from_checkpoint uint8 entry.
         """
-        if self.fp8_cfg is not None and self.fp8_cfg.get("fp8_param", False):
+        if (
+            self.fp8_cfg is not None
+            and self.fp8_cfg.get("enabled", False)
+            and self.fp8_cfg.get("fp8_param", False)
+        ):
             raise ValueError(
                 "vllm_cfg.refit_prequantize requires BF16 trainer-exported weights; "
                 "Megatron FP8 parameter storage uses a different scale layout."

@@ -849,12 +849,37 @@ def test_enable_refit_prequantize_rejects_fp8_param_storage(
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.fp8_cfg = {
+        "enabled": True,
         "fp8_param": True,
         "fp8_recipe": fp8_recipe,
     }
 
     with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
         worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_enable_refit_prequantize_allows_disabled_fp8_param_storage() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {
+        "enabled": False,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+    }
+    worker._refit_param_info_hf = {
+        "model.weight": (torch.Size([4, 64]), torch.bfloat16),
+    }
+
+    info = worker.enable_refit_prequantize(["model.weight"])
+
+    assert info["model.weight"] == (torch.Size([4, 64]), torch.float8_e4m3fn)
+    assert info["model.weight_scale_from_checkpoint"] == (
+        torch.Size([4, 2]),
+        torch.uint8,
+    )
 
 
 def test_enable_refit_prequantize_requires_prepare_refit_info():
