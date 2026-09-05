@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import warnings
+from functools import wraps
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -57,6 +58,88 @@ from nemo_rl.models.generation.openai_server_utils import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _cap_nemotron_dynamic_image_processor(
+    processor: Any, max_num_tiles: int | None
+) -> None:
+    """Map vLLM's logical image tile cap to its dynamic patch budget."""
+    if max_num_tiles is None:
+        return
+    if (
+        not isinstance(max_num_tiles, int)
+        or isinstance(max_num_tiles, bool)
+        or max_num_tiles < 1
+    ):
+        raise ValueError("max_num_tiles must be a positive integer")
+
+    dynamic_tiler = getattr(processor, "dynamic_tiler", None)
+    if dynamic_tiler is None:
+        return
+    min_attr = next(
+        (
+            name
+            for name in ("_min_num_patches", "min_num_patches")
+            if hasattr(dynamic_tiler, name)
+        ),
+        None,
+    )
+    max_attr = next(
+        (
+            name
+            for name in ("_max_num_patches", "max_num_patches")
+            if hasattr(dynamic_tiler, name)
+        ),
+        None,
+    )
+    if min_attr is None or max_attr is None:
+        raise AttributeError(
+            "vLLM's dynamic image tiler does not expose a min/max patch budget"
+        )
+    min_num_patches = getattr(dynamic_tiler, min_attr)
+    if (
+        not isinstance(min_num_patches, int)
+        or isinstance(min_num_patches, bool)
+        or min_num_patches < 1
+    ):
+        raise ValueError("vLLM's dynamic image tiler has an invalid patch minimum")
+    max_num_patches = min_num_patches * max_num_tiles
+    setattr(dynamic_tiler, max_attr, max_num_patches)
+    LOGGER.info(
+        "Applied dynamic image cap: max_num_tiles=%d max_num_patches=%d",
+        max_num_tiles,
+        max_num_patches,
+    )
+
+
+def _install_nemotron_dynamic_image_tile_cap_adapter() -> None:
+    """Make vLLM honor per-request tile caps for dynamic Nemotron images."""
+    from vllm.transformers_utils.processors.nano_nemotron_vl import (
+        NanoNemotronVLProcessor,
+    )
+
+    installed_attr = "_nemo_rl_dynamic_image_tile_cap_adapter_installed"
+    if getattr(NanoNemotronVLProcessor, installed_attr, False):
+        return
+    original_init = NanoNemotronVLProcessor.__init__
+
+    @wraps(original_init)
+    def adapted_init(
+        self: Any,
+        *args: Any,
+        max_num_tiles: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        original_init(
+            self,
+            *args,
+            max_num_tiles=max_num_tiles,
+            **kwargs,
+        )
+        _cap_nemotron_dynamic_image_processor(self, max_num_tiles)
+
+    NanoNemotronVLProcessor.__init__ = adapted_init
+    setattr(NanoNemotronVLProcessor, installed_attr, True)
 
 # NeMo Gym's vllm_model proxy recovers from a prompt that overflows the context
 # window by turning the failure into an empty completion with
@@ -196,6 +279,8 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+        _install_nemotron_dynamic_image_tile_cap_adapter()
 
         # Workaround: convert compilation_config dict to CompilationConfig object
         # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
@@ -1620,6 +1705,32 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
+
+    async def pause_generation_async(self, *, clear_cache: bool) -> bool:
+        """Pause vLLM generation for an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to pause generation with either an uninitialized vLLM or non-model-owner"
+        )
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "pause_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
+        return True
+
+    async def resume_generation_async(self) -> bool:
+        """Resume vLLM generation paused for an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to resume generation with either an uninitialized vLLM or non-model-owner"
+        )
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "resume_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.resume_generation()
+        return True
 
     async def sleep_async(self):
         """Async version of sleep."""
