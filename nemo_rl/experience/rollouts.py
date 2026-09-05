@@ -43,6 +43,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import (
+    ROLLOUT_MATCHED_MEDIA_KEY,
     NATIVE_MULTIMODAL_KEYS,
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
@@ -50,6 +51,9 @@ from nemo_rl.data.multimodal_utils import (
     extract_input_images_from_responses_messages,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.nemotron_utils import (
+    verify_static_video_media_alignment,
+)
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -211,20 +215,28 @@ def _reattach_original_multimodal_payloads(
 def _reattach_static_multimodal_payloads_to_result(
     result: dict[str, Any],
     source_message_log: list[dict[str, Any]],
+    tokenizer: Any = None,
 ) -> None:
     """Restore static media to each Gym-authored message-log representation."""
     for log_key in ("input_message_log", "message_log"):
         target_log = result.get(log_key)
         if not target_log:
             continue
-        attach_static_multimodal_payload(target_log, source_message_log)
+        attach_static_multimodal_payload(target_log, source_message_log, tokenizer)
 
 
 def attach_static_multimodal_payload(
     target_message_log: list[dict[str, Any]],
     source_message_log: list[dict[str, Any]],
+    tokenizer: Any = None,
 ) -> None:
-    """Copy policy-ready media from static source turns to Gym-authored turns."""
+    """Copy policy-ready media from static source turns to Gym-authored turns.
+
+    When ``tokenizer`` is provided, video turns are verified before the copy:
+    the rollout's placeholder expansion must match the static tensors, or the
+    attach raises a diagnostic naming the mismatch instead of letting training
+    crash on unattributable media misalignment.
+    """
     source_users = [
         message for message in source_message_log if message.get("role") == "user"
     ]
@@ -237,6 +249,15 @@ def attach_static_multimodal_payload(
             "turns than the source prompt."
         )
     for source, target in zip(source_users, target_users):
+        if target.pop(ROLLOUT_MATCHED_MEDIA_KEY, False):
+            # The Gym actor attached rollout-matched media for this turn (e.g.
+            # after vetoing dedup omission on a budget-bound row); never
+            # overwrite it with the statically-budgeted prompt copy. Key
+            # presence alone is not provenance: targets may carry placeholder
+            # or stale payloads that this copy is expected to replace.
+            continue
+        if tokenizer is not None:
+            verify_static_video_media_alignment(source, target, tokenizer)
         for key, value in source.items():
             if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
                 target[key] = value
@@ -2472,7 +2493,7 @@ async def run_async_nemo_gym_rollout(
                 completed_group = accumulator.add(rowidx, result)
                 if original_message_logs is not None:
                     _reattach_static_multimodal_payloads_to_result(
-                        result, original_message_logs[rowidx]
+                        result, original_message_logs[rowidx], tokenizer
                     )
                     result.pop("_initial_multimodal_data_omitted", None)
                 if completed_group is not None:
