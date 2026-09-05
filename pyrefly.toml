@@ -244,6 +244,7 @@ project-includes = [
   "nemo_rl/telemetry/metrics.py",
   "nemo_rl/telemetry/setup.py",
   "nemo_rl/telemetry/span_groups.py",
+  "nemo_rl/transformers_compat.py",
   "nemo_rl/utils/__init__.py",
   "nemo_rl/utils/checkpoint.py",
   "nemo_rl/utils/checkpoint_engines/__init__.py",

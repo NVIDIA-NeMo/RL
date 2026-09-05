@@ -104,6 +104,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
@@ -1945,11 +1946,16 @@ class SingleControllerActor:
                         )
 
                     if getattr(self._gen, "requires_kv_scale_sync", False):
+                        # Mirrors grpo_sync's calibration filter. The static
+                        # list cannot name the VLM extras -- which of
+                        # pixel_values / image_grid_thw / ... exist is
+                        # per-processor -- so without the union this path
+                        # calibrates image-blind on a VLM run.
                         calibration_fields = [
                             field
                             for field in (train_meta.fields or [])
                             if field in DP_CALIB_INPUT_FIELDS
-                        ]
+                        ] + present_multimodal_fields(train_meta)
                         calibration_batches.append(
                             await asyncio.to_thread(
                                 self._trainer.read_from_dataplane,
