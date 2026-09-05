@@ -596,6 +596,8 @@ def load_weights(weights, model_runner):
     global global_fp8_config
     weights_quantized = []
     model = model_runner.model
+    weights = list(weights)
+    weight_names = {name for name, _tensor in weights}
 
     for k, v in weights:
         grouped_weight_name = _grouped_expert_weight_name_from_scale(k)

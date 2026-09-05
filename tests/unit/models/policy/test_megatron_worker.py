@@ -797,6 +797,48 @@ def test_iter_params_batches_expert_prequantization(monkeypatch):
     assert calls[0][1] == {name}
 
 
+def test_iter_params_preserves_bridge_expert_wire_order(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    names = [
+        f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+        for expert_id in range(2)
+    ]
+    weights = [
+        torch.full((2, 32), expert_id + 1, dtype=torch.bfloat16)
+        for expert_id in range(2)
+    ]
+    stack_calls = []
+    original_stack = torch.stack
+
+    def record_stack(tensors, *args, **kwargs):
+        stack_calls.append([tensor.clone() for tensor in tensors])
+        return original_stack(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "stack", record_stack)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._refit_prequant_names = set(names)
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = []
+    worker.cfg = {"megatron_cfg": {"enabled": True}}
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=lambda *_args, **_kwargs: iter(zip(names, weights))
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales())
+
+    assert [name for name, _tensor in output] == [
+        entry_name
+        for name in names
+        for entry_name in (name, name + "_scale_from_checkpoint")
+    ]
+    assert len(stack_calls) == 1
+    assert len(stack_calls[0]) == 2
+
+
 @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
 def test_enable_refit_prequantize_rejects_fp8_param_storage(
     fp8_recipe: str,
