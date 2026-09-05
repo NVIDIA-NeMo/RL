@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import types
 from functools import partial
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +22,18 @@ import torch
 
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+DRAFT_STEP_PAYLOAD_KEY = "_draft_step_payload"
+
+
+def _mock_step_state_without_megatron() -> tuple[types.ModuleType, types.ModuleType]:
+    module = types.ModuleType("nemo_rl.models.megatron.draft.step_state")
+    module.DRAFT_STEP_PAYLOAD_KEY = DRAFT_STEP_PAYLOAD_KEY
+    module.DRAFT_LOSS_METRIC_KEY = "draft_loss"
+    module.DraftStepState = MagicMock()
+    package = types.ModuleType("nemo_rl.models.megatron.draft")
+    package.step_state = module
+    return package, module
 
 
 @patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
@@ -94,18 +108,19 @@ def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
     assert metrics["draft_loss"] == draft_loss.item()
 
 
-@patch("nemo_rl.algorithms.loss.loss_functions.DistributedCrossEntropy.apply")
-def test_draft_cross_entropy_loss_uses_distributed_path_for_tp(
-    mock_distributed_ce,
+@patch("nemo_rl.algorithms.loss.loss_functions.streaming_vocab_parallel_soft_ce")
+def test_draft_cross_entropy_loss_uses_streaming_path(
+    mock_streaming_ce,
 ):
-    """DraftCrossEntropyLossFn should delegate to DistributedCrossEntropy under TP."""
+    """DraftCrossEntropyLossFn should consume one-bin streaming statistics."""
     teacher_logits = torch.randn(2, 3, 5)
     student_logits = torch.randn(2, 3, 5)
     token_mask = torch.ones(2, 3)
     sample_mask = torch.ones(2)
     global_valid = torch.tensor(6.0)
-    per_token_loss = torch.full((2, 3), 2.0)
-    mock_distributed_ce.return_value = per_token_loss
+    stats = MagicMock()
+    stats.normalized.return_value = torch.tensor(2.0)
+    mock_streaming_ce.return_value = stats
 
     loss_fn = DraftCrossEntropyLossFn(vocab_parallel_group=MagicMock())
     loss = loss_fn(
@@ -117,8 +132,69 @@ def test_draft_cross_entropy_loss_uses_distributed_path_for_tp(
         global_valid_toks=global_valid,
     )
 
-    mock_distributed_ce.assert_called_once()
+    mock_streaming_ce.assert_called_once()
+    call_kwargs = mock_streaming_ce.call_args.kwargs
+    assert call_kwargs["student_logits"] is student_logits
+    assert call_kwargs["teacher_logits"] is teacher_logits
+    assert call_kwargs["token_chunk_size"] == 4096
+    assert call_kwargs["tp_group"] is loss_fn.vocab_parallel_group
+    torch.testing.assert_close(
+        call_kwargs["mask"],
+        token_mask * sample_mask.unsqueeze(-1),
+    )
+    stats.normalized.assert_called_once()
     assert loss.item() == 2.0
+
+
+@patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
+def test_draft_loss_wrapper_defers_raw_stats_for_split_step(
+    mock_draft_loss_cls,
+) -> None:
+    """Split loss keeps differentiable raw sums and emits detached counts."""
+    from nemo_rl.algorithms.loss.draft import DraftLossStats
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    policy_loss = torch.tensor(5.0)
+    numerator = torch.tensor([12.0], requires_grad=True)
+    stats = DraftLossStats(
+        numerators=numerator,
+        counts=torch.tensor([3.0]),
+        weights=torch.ones(1),
+    )
+    draft_loss_fn = MagicMock()
+    draft_loss_fn.loss_stats.return_value = stats
+    mock_draft_loss_cls.return_value = draft_loss_fn
+    data = BatchedDataDict({})
+    wrapper = DraftLossWrapper(
+        loss_fn=MagicMock(return_value=(policy_loss, {})),
+        prepare_fn=MagicMock(return_value=({}, data)),
+        data_dict=data,
+        loss_weight=0.5,
+        defer_normalization=True,
+    )
+
+    payload = object()
+    draft_package, step_state_module = _mock_step_state_without_megatron()
+    step_state_module.DraftStepState.metric_payload.return_value = payload
+    with patch.dict(
+        sys.modules,
+        {
+            "nemo_rl.models.megatron.draft": draft_package,
+            "nemo_rl.models.megatron.draft.step_state": step_state_module,
+        },
+    ):
+        combined_loss, metrics = wrapper(
+            next_token_logits=torch.randn(1, 2, 3),
+            data=data,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
+
+    assert combined_loss.item() == pytest.approx(11.0)
+    assert metrics["draft_loss"] == pytest.approx(12.0)
+    assert metrics[DRAFT_STEP_PAYLOAD_KEY] is payload
+    step_state_module.DraftStepState.metric_payload.assert_called_once_with(stats)
+    draft_loss_fn.assert_not_called()
 
 
 def test_roll_packed_seq_dim_respects_segment_boundaries():
@@ -260,3 +336,26 @@ def test_packed_draft_loss_matches_unpacked(draft_vocab_size, d2t):
         reference_metrics["draft_loss"], rel=1e-5
     )
     assert packed_metrics["draft_loss"] > 0.0
+
+
+def test_packed_mode_rejects_deferred_normalization():
+    """The packed path emits no step payload, so deferral cannot be honored.
+
+    Accepting the flag would leave the draft grads on the policy denominator
+    with no runtime symptom, so the combination fails at construction.
+    """
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    batch = _build_draft_batch(11, None)
+
+    with pytest.raises(ValueError, match="deferred draft normalization"):
+        DraftLossWrapper(
+            loss_fn=_zero_policy_loss,
+            prepare_fn=None,
+            data_dict=batch["data"],
+            cu_seqlens_q=batch["cu_seqlens"],
+            cu_seqlens_q_padded=batch["cu_seqlens_padded"],
+            d2t=None,
+            student_logits=batch["packed_student"],
+            defer_normalization=True,
+        )

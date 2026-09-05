@@ -254,6 +254,7 @@ class DraftLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        defer_normalization: bool = False,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_q_padded: Optional[torch.Tensor] = None,
         d2t: Optional[torch.Tensor] = None,
@@ -266,6 +267,7 @@ class DraftLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        self.defer_normalization = defer_normalization
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_q_padded = (
             cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
@@ -274,6 +276,13 @@ class DraftLossWrapper:
         self.student_logits = student_logits
         if cu_seqlens_q is not None and student_logits is None:
             raise ValueError("student_logits must be passed explicitly in packed mode.")
+        if cu_seqlens_q is not None and defer_normalization:
+            # The packed path normalizes inside _packed_draft_loss and emits no
+            # step payload, so a deferred caller would silently keep the policy
+            # denominator on the draft gradients. Fail loudly instead.
+            raise ValueError(
+                "deferred draft normalization is not supported in packed mode."
+            )
         if cu_seqlens_q is None and prepare_fn is None:
             raise ValueError("prepare_fn is required in unpacked mode.")
         self.draft_loss_fn = DraftCrossEntropyLossFn(
@@ -339,6 +348,14 @@ class DraftLossWrapper:
             **kwargs,
         )
 
+        # Function-local import: step_state lives under models.megatron.draft,
+        # whose package import pulls the modelopt chain non-megatron users avoid.
+        from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_LOSS_METRIC_KEY,
+            DRAFT_STEP_PAYLOAD_KEY,
+            DraftStepState,
+        )
+
         if self.cu_seqlens_q is not None:
             draft_loss = self._packed_draft_loss(
                 next_token_logits, data, global_valid_seqs, global_valid_toks
@@ -352,14 +369,22 @@ class DraftLossWrapper:
                 vocab_parallel_group=self.vocab_parallel_group,
                 context_parallel_group=self.context_parallel_group,
             )
-            draft_loss = self.draft_loss_fn(
-                data=data,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                **loss_input,
-            )
+            if self.defer_normalization:
+                stats = self.draft_loss_fn.loss_stats(data=data, **loss_input)
+                draft_loss = stats.normalized(
+                    normalization_counts=torch.ones_like(stats.counts),
+                )
+                # Deferred payloads are only consumed by the Megatron split API.
+                metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
+            else:
+                draft_loss = self.draft_loss_fn(
+                    data=data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    **loss_input,
+                )
         combined_loss = policy_loss + self.loss_weight * draft_loss
-        metrics["draft_loss"] = float(draft_loss.detach().item())
+        metrics[DRAFT_LOSS_METRIC_KEY] = float(draft_loss.detach().item())
         return combined_loss, metrics
 
 

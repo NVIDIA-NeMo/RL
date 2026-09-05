@@ -63,6 +63,11 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         metrics["grad_norm"] = grad_norm.detach().mean().item()
     elif grad_norm is not None:
         metrics["grad_norm"] = float(grad_norm)
+    draft_grad_norm = train_result.get("draft_grad_norm")
+    if isinstance(draft_grad_norm, torch.Tensor):
+        metrics["draft_grad_norm"] = draft_grad_norm.detach().mean().item()
+    elif draft_grad_norm is not None:
+        metrics["draft_grad_norm"] = float(draft_grad_norm)
     if "total_flops" in train_result:
         metrics["total_flops"] = float(train_result["total_flops"])
     if "num_ranks" in train_result:
