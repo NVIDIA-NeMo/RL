@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.codec import materialize
 from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
@@ -240,6 +242,39 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
         prompt_idx=17,
     )
     assert "routed_experts" not in fields
+
+
+def test_multimodal_packed_tensor_round_trips_through_tq_payload() -> None:
+    completions = [
+        _completion(route_start=10, reward=1.0, with_routes=False),
+        _completion(route_start=30, reward=2.0, with_routes=False),
+    ]
+    media = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    completions[0].message_log[0]["pixel_values"] = PackedTensor(media, dim_to_pack=0)
+
+    train_batch = record_to_train_batch(
+        _record(completions),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+    assert isinstance(train_batch["pixel_values"], PackedTensor)
+
+    _, fields, tags = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+    assert "pixel_values" in fields
+    assert tags[0]["pixel_values__row_shapes"]["shapes"] == [[2, 4]]
+    assert tags[1]["pixel_values__row_shapes"]["shapes"] == []
+
+    restored = materialize(fields, tags=tags)
+    restored_media = restored["pixel_values"]
+    assert isinstance(restored_media, PackedTensor)
+    assert len(restored_media) == 2
+    assert restored_media.logical_segment_counts_by_row() == [1, 0]
+    assert torch.equal(restored_media.as_tensor(), media)
 
 
 def test_record_to_train_batch_carries_raw_masks_without_applying_them() -> None:

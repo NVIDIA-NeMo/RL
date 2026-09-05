@@ -1093,6 +1093,18 @@ def encode_multimodal_for_wire(
         )
 
 
+# Model inputs some remote-code processors omit from ``model_input_names`` even
+# though their forward requires them. Consumed by
+# ``extract_multimodal_model_inputs``; membership here does NOT imply the field
+# is wire-registered (see ``PACKED_/PER_TOKEN_MULTIMODAL_FIELDS``).
+UNDECLARED_MULTIMODAL_MODEL_INPUTS = (
+    "imgs_sizes",
+    "num_frames",
+    "pixel_values_flat",
+    "image_num_patches",
+)
+
+
 def get_multimodal_keys_from_processor(processor) -> list[str]:
     """Get keys of the multimodal data that can be used as model inputs.
 
@@ -1216,12 +1228,7 @@ def extract_multimodal_model_inputs(
     # TODO(rohitrango): Let ProcessorInterface declare model-specific media inputs.
     # Some remote-code processors omit these inputs from model_input_names even
     # though their model forward requires them.
-    for key in (
-        "imgs_sizes",
-        "num_frames",
-        "pixel_values_flat",
-        "image_num_patches",
-    ):
+    for key in UNDECLARED_MULTIMODAL_MODEL_INPUTS:
         if key in processed and key not in multimodal_keys:
             multimodal_keys.append(key)
     for key in multimodal_keys:

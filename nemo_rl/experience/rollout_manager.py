@@ -30,6 +30,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.failures import (
@@ -616,15 +617,23 @@ class AsyncRolloutImpl:
         Returns:
             Tuple of (assistant_message, input_lengths, gen_metrics)
         """
-        # Prepare generation input
-        input_ids = torch.cat([m["token_ids"] for m in message_log]).unsqueeze(0)
-        input_lengths = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
+        # Flatten both tokens and model-ready multimodal inputs. Building this
+        # from token_ids alone leaves expanded media placeholders in the prompt
+        # without the pixel tensors Megatron needs to project.
+        flat_messages, input_lengths = batched_message_log_to_flat_message(
+            [message_log],
+            pad_value_dict={"token_ids": self._tokenizer.pad_token_id},
+        )
+        input_ids = flat_messages["token_ids"]
         generation_input_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": input_ids,
                 "input_lengths": input_lengths,
                 "stop_strings": [stop_strings],
             }
+        )
+        generation_input_data.update(
+            flat_messages.get_multimodal_dict(as_tensors=False)
         )
 
         # Generate response

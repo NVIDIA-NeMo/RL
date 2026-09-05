@@ -29,6 +29,7 @@ import json
 import tempfile
 import uuid
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -40,11 +41,13 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
+    AsyncRolloutImpl,
     RolloutManager,
     RolloutOutcome,
     RolloutRetryPolicy,
@@ -84,6 +87,58 @@ def _with_cut(buffer, callback):
             return callback(cut)
 
     return _run(apply())
+
+
+def test_generate_response_forwards_message_log_media_to_generation() -> None:
+    captured: dict[str, BatchedDataDict] = {}
+
+    class _Generation:
+        async def generate_async(self, data):
+            captured["data"] = data
+            input_len = int(data["input_lengths"][0])
+            yield (
+                0,
+                BatchedDataDict(
+                    {
+                        "output_ids": torch.cat(
+                            (data["input_ids"], torch.tensor([[42]])), dim=1
+                        ),
+                        "unpadded_sequence_lengths": torch.tensor([input_len + 1]),
+                        "logprobs": torch.zeros(1, input_len + 1),
+                    }
+                ),
+            )
+
+    manager = object.__new__(AsyncRolloutImpl)
+    manager._policy_generation = _Generation()
+    manager._tokenizer = SimpleNamespace(
+        pad_token_id=0,
+        decode=lambda *_args, **_kwargs: "answer",
+    )
+    manager._timeouts = SimpleNamespace(generation_s=10.0)
+    pixel_values = PackedTensor(torch.ones(2, 3, 4, 4), dim_to_pack=0)
+    imgs_sizes = PackedTensor(torch.tensor([[4, 4], [4, 4]]), dim_to_pack=0)
+    message_log = [
+        {
+            "role": "user",
+            "content": "image",
+            "token_ids": torch.tensor([1, 2, 3]),
+            "pixel_values": pixel_values,
+            "imgs_sizes": imgs_sizes,
+        }
+    ]
+
+    _run(manager._generate_response(message_log, None))
+
+    generation_data = captured["data"]
+    assert isinstance(generation_data["pixel_values"], PackedTensor)
+    assert isinstance(generation_data["imgs_sizes"], PackedTensor)
+    assert torch.equal(
+        generation_data["pixel_values"].as_tensor(), pixel_values.as_tensor()
+    )
+    assert torch.equal(
+        generation_data["imgs_sizes"].as_tensor(), imgs_sizes.as_tensor()
+    )
 
 
 class _FakeBuffer:

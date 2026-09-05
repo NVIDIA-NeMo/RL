@@ -168,11 +168,9 @@ def _make_worker(loss_type):
     # pre-hook back after the first optimizer step.
     w._first_train_step_forward_pre_hook_disabled = False
     w._first_train_step_param_sync_func = None
-    # Also set in __init__, from the loaded model. train_microbatch reads both
-    # to reject a multimodal model, so they must exist before the first call.
-    # These values are the text-only case, which is what this mock fabric is.
+    # Also set in __init__ from the loaded model. The split microbatch path
+    # forwards these capabilities to the same iterator used by regular train.
     w.media_placeholder_token_id = None
-    w.model_slices_context_parallel_inputs = False
     # Pure telemetry, and it resets the CUDA peak counters — keep it out of the
     # way so these tests stay hermetic on GPU shards.
     w._log_gpu_mem = MagicMock()
@@ -412,6 +410,27 @@ class TestAssertStepOpen:
 
 
 class TestTrainMicrobatch:
+    def test_forwards_multimodal_iterator_capabilities(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.media_placeholder_token_id = 42
+        w.delegate_pack_to_model = True
+        w.delegate_mtp_loss_mask_to_model = True
+        batch = _fake_batch()
+
+        with patch(
+            f"{WORKER_MOD}.attach_media_token_validity_mask"
+        ) as attach_validity_mask:
+            w.begin_train_step(loss_fn=w._test_loss_fn)
+            w.train_microbatch(batch)
+
+        attach_validity_mask.assert_called_once_with(batch, 42)
+        iterator_kwargs = mock_module_symbols["gmi"].call_args.kwargs
+        assert iterator_kwargs["delegate_pack_to_model"] is True
+        assert iterator_kwargs["delegate_mtp_loss_mask_to_model"] is True
+        assert iterator_kwargs["model_slices_context_parallel_inputs"] is False
+
     def test_wraps_forward_backward_in_no_sync(self, mock_module_symbols):
         """The single most important assertion in this file. Without the
         no_sync wrap, mcore DDP dispatches a per-call cross-DP reduce on
