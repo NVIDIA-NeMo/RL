@@ -35,7 +35,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
     SamplerConfig,
     required_buffer_capacity_for_config,
-    sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
@@ -1150,22 +1149,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.num_reassembler_workers exceeds "
             "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
             stacklevel=2,
-        )
-    if (
-        token_capture_config.enabled
-        and master_config.checkpointing["enabled"]
-        and master_config.checkpointing.get("save_data_plane")
-        and sampler_supports_buffer_checkpoint(async_config.sampler)
-    ):
-        raise NotImplementedError(
-            "token_capture.enabled does not support rollout-recovery "
-            "checkpointing (checkpointing.save_data_plane=true with a "
-            "replay-checkpoint-capable sampler): the capture dispatch path "
-            "does not thread lineage group ids, so the recovery ledger would "
-            "never be reaped and a resume would re-dispatch every restored "
-            "prompt on top of the recovered replay groups. Set "
-            "checkpointing.enabled=false, or use a sampler without buffer "
-            "checkpointing."
         )
     if token_capture_config.enabled and reward_penalties_enabled:
         warnings.warn(
