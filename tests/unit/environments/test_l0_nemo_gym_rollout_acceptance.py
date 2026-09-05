@@ -20,11 +20,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import Any
-from zlib import compress, decompress
 
 import pytest
 import ray
 import torch
+from transformers import ByT5Tokenizer
 from yaml import safe_load
 
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -53,7 +53,7 @@ _REQUIRED_L0_CASES = {
 _GENERATION_CONFIG = {
     "backend": "test",
     "max_new_tokens": 1024,
-    "max_total_sequence_length": 16384,
+    "max_total_sequence_length": 65536,
     "temperature": 0.0,
     "top_p": 1.0,
     "top_k": None,
@@ -112,7 +112,8 @@ _WORKPLACE_ARGUMENTS = {
     "email_id": "00000057",
     "body": "Thanks for the update - I will get back to you tomorrow.",
 }
-_CONTINUATION_FRAME = b"\x02nemo-rl-continuation\x00"
+_BYTE_TOKEN_OFFSET = 3
+_CONTINUATION_MARKER = "\x02nemo-rl-continuation\x00"
 
 
 def _tool_call_message(
@@ -140,11 +141,14 @@ def _tool_call_message(
     return message, generation
 
 
+def _text_token_ids(text: str) -> list[int]:
+    """Match ByT5's byte vocabulary without deriving goldens from the tokenizer."""
+    return [byte + _BYTE_TOKEN_OFFSET for byte in text.encode()]
+
+
 def _prompt_token_ids(body: dict[str, Any]) -> list[int]:
-    serialized_request = json.dumps(
-        body, sort_keys=True, separators=(",", ":")
-    ).encode()
-    prompt_token_ids = list(b"\x00" + compress(serialized_request))
+    serialized_request = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    prompt_token_ids = _text_token_ids(serialized_request)
 
     messages = body.get("messages", [])
     if not any(message.get("role") == "tool" for message in messages):
@@ -152,7 +156,7 @@ def _prompt_token_ids(body: dict[str, Any]) -> list[int]:
 
     # The RL postprocessor requires each later prompt to start with every token
     # already observed. Reconstruct the first workplace request, then append the
-    # first generation and an opaque encoding of the continuation request.
+    # first generation and a marked encoding of the continuation request.
     first_assistant_index = next(
         index
         for index, message in enumerate(messages)
@@ -160,18 +164,16 @@ def _prompt_token_ids(body: dict[str, Any]) -> list[int]:
     )
     initial_body = deepcopy(body)
     initial_body["messages"] = messages[:first_assistant_index]
-    initial_request = json.dumps(
-        initial_body, sort_keys=True, separators=(",", ":")
-    ).encode()
+    initial_request = json.dumps(initial_body, sort_keys=True, separators=(",", ":"))
     _, first_generation = _tool_call_message(
         "email_reply_email",
         _WORKPLACE_ARGUMENTS,
         "call-l0-workplace",
     )
     return (
-        list(b"\x00" + compress(initial_request))
-        + list(b"\x01" + first_generation.encode())
-        + list(_CONTINUATION_FRAME + serialized_request)
+        _text_token_ids(initial_request)
+        + _text_token_ids(first_generation)
+        + _text_token_ids(_CONTINUATION_MARKER + serialized_request)
     )
 
 
@@ -179,27 +181,6 @@ class _ScriptedPolicyGeneration:
     """Minimum policy-generation surface consumed by the Gym rollout path."""
 
     cfg = _GENERATION_CONFIG
-
-
-class _ScriptedTokenizer:
-    """Reversibly decode request and generation metadata without model weights."""
-
-    pad_token_id = 256
-
-    def batch_decode(self, batch: list[list[int]]) -> list[str]:
-        decoded = []
-        for token_ids in batch:
-            payload = bytes(int(token_id) for token_id in token_ids)
-            if payload.startswith(b"\x00"):
-                _, frame, continuation = payload.rpartition(_CONTINUATION_FRAME)
-                decoded.append(
-                    continuation.decode() if frame else decompress(payload[1:]).decode()
-                )
-            elif payload.startswith(b"\x01"):
-                decoded.append(payload[1:].decode())
-            else:
-                raise ValueError("Unrecognized scripted token sequence")
-        return decoded
 
 
 class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
@@ -306,7 +287,11 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
         self._assert_request_contract(body)
         message, generation_text = self._message_for(body)
         prompt_token_ids = _prompt_token_ids(body)
-        generation_token_ids = list(b"\x01" + generation_text.encode())
+        generation_token_ids = _text_token_ids(generation_text)
+        assert (
+            len(prompt_token_ids) + len(generation_token_ids)
+            <= _GENERATION_CONFIG["max_total_sequence_length"]
+        )
         message.update(
             {
                 "prompt_token_ids": prompt_token_ids,
@@ -428,14 +413,14 @@ def test_l0_scripted_multiturn_tokens_are_contiguous():
         _WORKPLACE_ARGUMENTS,
         "call-l0-workplace",
     )
-    seen_token_ids = _prompt_token_ids(initial_body) + list(
-        b"\x01" + first_generation.encode()
-    )
+    seen_token_ids = _prompt_token_ids(initial_body) + _text_token_ids(first_generation)
 
     continuation_prompt = _prompt_token_ids(continuation_body)
 
     assert continuation_prompt[: len(seen_token_ids)] == seen_token_ids
-    assert json.loads(_ScriptedTokenizer().batch_decode([continuation_prompt])[0]) == (
+    decoded_continuation = ByT5Tokenizer().batch_decode([continuation_prompt])[0]
+    assert _CONTINUATION_MARKER in decoded_continuation
+    assert json.loads(decoded_continuation.rpartition(_CONTINUATION_MARKER)[2]) == (
         continuation_body
     )
 
@@ -466,7 +451,7 @@ def scripted_openai_base_url():
 def l0_nemo_gym(scripted_openai_base_url):
     """Start all acceptance environments in one real Gym actor."""
     config_paths = [_POLICY_MODEL_CONFIG] + [case["config_path"] for case in _L0_CASES]
-    tokenizer = _ScriptedTokenizer()
+    tokenizer = ByT5Tokenizer()
     env = spinup_nemo_gym_actor(
         {
             "nemo_gym": {
@@ -494,7 +479,7 @@ def l0_nemo_gym(scripted_openai_base_url):
 @pytest.mark.parametrize("case", _L0_CASES, ids=[case["name"] for case in _L0_CASES])
 def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
     """A pinned Gym example must preserve its contract across the NeMo RL boundary."""
-    tokenizer = _ScriptedTokenizer()
+    tokenizer = ByT5Tokenizer()
     result = run_nemo_gym_rollout_sync(
         policy_generation=_ScriptedPolicyGeneration(),
         input_batch=rl_collate_fn([_load_case_datum(case)]),
@@ -526,7 +511,9 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
     ):
         assert isinstance(message["token_ids"], torch.Tensor)
         assert isinstance(message["generation_logprobs"], torch.Tensor)
-        expected_token_ids = torch.tensor(list(b"\x01" + generation.encode()))
+        expected_token_ids = torch.tensor(
+            [byte + _BYTE_TOKEN_OFFSET for byte in generation.encode()]
+        )
         torch.testing.assert_close(message["token_ids"], expected_token_ids)
         torch.testing.assert_close(
             message["generation_logprobs"],
@@ -571,7 +558,9 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case):
     assert len(prompt_strings) == len(case["expected_generations"])
     assert all(case["expected_prompt_fragment"] in prompt for prompt in prompt_strings)
     if case["name"] == "workplace_assistant":
-        continuation_messages = json.loads(prompt_strings[1])["messages"]
+        assert _CONTINUATION_MARKER in prompt_strings[1]
+        continuation_json = prompt_strings[1].rpartition(_CONTINUATION_MARKER)[2]
+        continuation_messages = json.loads(continuation_json)["messages"]
         assert any(message.get("tool_calls") for message in continuation_messages)
         assert any(
             message.get("role") == "tool"
