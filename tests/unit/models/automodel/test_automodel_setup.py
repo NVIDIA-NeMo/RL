@@ -1631,6 +1631,48 @@ class TestSetupModelAndOptimizer:
                 checkpoint_manager=mock_checkpoint_manager,
             )
 
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_setup_model_with_cp_raises_for_gemma4_unified(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_config,
+        mock_runtime_config,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """Test that Gemma 4 unified checkpoints reject context parallel."""
+        mock_get_rank.return_value = 0
+        mock_fsdp2_config = MagicMock()
+        mock_fsdp2_config.sequence_parallel = False
+        distributed_context = DistributedContext(
+            device_mesh=MagicMock(),
+            moe_mesh=MagicMock(),
+            fsdp2_config=mock_fsdp2_config,
+            moe_config=MagicMock(),
+            dp_size=1,
+            tp_size=1,
+            cp_size=2,
+        )
+
+        mock_runtime_config.model_config.model_type = "gemma4_unified"
+        mock_runtime_config.model_config.architectures = [
+            "Gemma4UnifiedForConditionalGeneration"
+        ]
+
+        with pytest.raises(
+            AssertionError,
+            match="Context parallel is not supported for the Gemma 4 unified checkpoint",
+        ):
+            setup_model_and_optimizer(
+                config=mock_config,
+                tokenizer=mock_tokenizer,
+                runtime_config=mock_runtime_config,
+                distributed_context=distributed_context,
+                checkpoint_manager=mock_checkpoint_manager,
+            )
+
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")

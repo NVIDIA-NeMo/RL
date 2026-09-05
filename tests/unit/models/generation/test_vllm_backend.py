@@ -1190,6 +1190,56 @@ def test_load_weights_routes_only_policy_weights_to_mtp_drafter(monkeypatch):
 
 @pytest.mark.vllm
 @pytest.mark.parametrize(
+    ("language_model_only", "expected_keys"),
+    [
+        (True, ["model.language_model.layers.0.self_attn.q_proj.weight"]),
+        (
+            False,
+            [
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.embed_vision.pos_embedding",
+                "model.embed_audio.embedding_projection.weight",
+            ],
+        ),
+    ],
+)
+def test_gemma4_unified_refit_drops_multimodal_weights_only_for_text_generation(
+    monkeypatch, language_model_only, expected_keys
+):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    loaded = []
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(load_weights=lambda *, weights: loaded.extend(weights)),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["Gemma4UnifiedForConditionalGeneration"],
+                multimodal_config=SimpleNamespace(
+                    language_model_only=language_model_only
+                ),
+            )
+        ),
+    )
+    ext._load_draft_weights = MagicMock()
+    ext._maybe_refit_mtp_drafter = MagicMock()
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    weights = [
+        ("model.language_model.layers.0.self_attn.q_proj.weight", "language"),
+        ("model.embed_vision.pos_embedding", "vision"),
+        ("model.embed_audio.embedding_projection.weight", "audio"),
+    ]
+
+    ext._load_weights(weights)
+
+    assert [key for key, _ in loaded] == expected_keys
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
     "method, from_disk, has_drafter, expected",
     [
         ("mtp", False, True, True),  # co-trained MTP drafter refit from policy stream
