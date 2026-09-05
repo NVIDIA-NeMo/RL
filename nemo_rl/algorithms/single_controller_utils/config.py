@@ -683,6 +683,32 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         return RecoveryGranularityResolution(agent_name, self.default_granularity)
 
 
+class RolloutCheckpointConfig(BaseModel, extra="forbid"):
+    """Frequent rollout-state snapshots anchored to durable trainer state.
+
+    ``interval_s=None`` disables saving and restoring periodic snapshots. A
+    snapshot taken before the first trainer checkpoint is anchored to the
+    initial model and a rollout-semantic configuration fingerprint. Later
+    snapshots require the durable trainer checkpoint for the controller's
+    current completed step; interval attempts are skipped until that exact
+    anchor exists.
+
+    ``restore_mode="latest"`` selects the newest compatible periodic snapshot.
+    ``trainer_checkpoint`` ignores newer periodic snapshots and restores the
+    rollout state bundled with the durable trainer checkpoint.
+
+    SingleController has no validation loop, so checkpoint selection must use
+    ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
+    ``val:<name>`` settings are rejected during setup. Unknown keys are
+    forbidden because a misspelled interval, retention, or restore option can
+    silently disable the durability behavior the operator intended.
+    """
+
+    interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    keep_latest_k: Annotated[int, Field(ge=1)] = 2
+    restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -702,6 +728,9 @@ class MasterConfig(BaseModel, extra="allow"):
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
     rollout_recovery: RolloutRecoveryConfig = Field(
         default_factory=RolloutRecoveryConfig
+    )
+    rollout_checkpointing: RolloutCheckpointConfig = Field(
+        default_factory=RolloutCheckpointConfig
     )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 

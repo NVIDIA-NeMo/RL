@@ -132,6 +132,15 @@ checkpointing:
   # aborts checkpoint finalization.
   save_data_plane: true
 
+# Frequent rollout-only snapshots are disabled unless interval_s is set. When
+# disabled, existing periodic snapshots are ignored. Enabling them requires a
+# durable trainer checkpoint for the current completed step and native TQ
+# checkpoint support. save_period=1 provides an anchor after every train step.
+rollout_checkpointing:
+  interval_s: null
+  keep_latest_k: 2
+  restore_mode: latest
+
 policy:
   dtensor_cfg:
     enabled: false
