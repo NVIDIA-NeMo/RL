@@ -866,7 +866,7 @@ class TestApplyMoeConfig:
 
         model_cfg = MagicMock()
         config = self._base_moe_cfg(
-            expert_model_parallel_size=128,
+            expert_model_parallel_size=144,
             moe_flex_dispatcher_backend="hybridep",
             moe_hybridep_num_sms=24,
             hybridep_num_ranks_per_nvlink_domain=72,
@@ -884,6 +884,118 @@ class TestApplyMoeConfig:
         # Bool False path also tested in dedicated test below; here ensure no auto warning fired.
         hybridep_warns = [w for w in caught if "HybridEP" in str(w.message)]
         assert hybridep_warns == []
+
+    def test_hybridep_logs_effective_environment_on_rank_zero(
+        self, monkeypatch, capsys
+    ):
+        """The rank-zero diagnostic reports validated environment topology."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
+        monkeypatch.setenv("NVLINK_DOMAIN_SIZE", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+
+        _apply_moe_config(
+            MagicMock(),
+            self._base_moe_cfg(
+                expert_model_parallel_size=32,
+                moe_flex_dispatcher_backend="hybridep",
+            ),
+        )
+
+        output = capsys.readouterr().out
+        assert "[HybridEP topology]" in output
+        assert "ep_size=32" in output
+        assert "ranks_per_domain=8 source=environment" in output
+        assert "nvlink_domain_size=8 source=environment" in output
+        assert "use_mnnvl=0 source=environment" in output
+        assert "combine_chunk_tokens=128 source=environment" in output
+
+    def test_hybridep_typed_config_precedence_is_logged(self, monkeypatch, capsys):
+        """Typed config overrides conflicting rank and MNNVL environment values."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "16")
+        monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
+        monkeypatch.setenv("NVLINK_DOMAIN_SIZE", "8")
+        monkeypatch.setenv("USE_MNNVL", "1")
+
+        _apply_moe_config(
+            MagicMock(),
+            self._base_moe_cfg(
+                expert_model_parallel_size=32,
+                moe_flex_dispatcher_backend="hybridep",
+                hybridep_num_ranks_per_nvlink_domain=8,
+                hybridep_use_mnnvl=False,
+            ),
+        )
+
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "8"
+        assert os.environ["USE_MNNVL"] == "0"
+        output = capsys.readouterr().out
+        assert "ranks_per_domain=8 source=megatron_cfg" in output
+        assert "use_mnnvl=0 source=megatron_cfg" in output
+
+    def test_hybridep_logs_only_on_rank_zero(self, monkeypatch, capsys):
+        """Nonzero ranks do not emit the process-wide topology diagnostic."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
+        monkeypatch.setenv("NVLINK_DOMAIN_SIZE", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+
+        _apply_moe_config(
+            MagicMock(),
+            self._base_moe_cfg(
+                expert_model_parallel_size=32,
+                moe_flex_dispatcher_backend="hybridep",
+            ),
+        )
+
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize(
+        ("name", "value", "message"),
+        [
+            (
+                "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN",
+                "0",
+                "must be positive",
+            ),
+            (
+                "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN",
+                "3",
+                "must divide",
+            ),
+            ("NVLINK_DOMAIN_SIZE", "0", "must be positive"),
+            ("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "0", "must be positive"),
+            ("USE_MNNVL", "2", "must be one of"),
+        ],
+    )
+    def test_hybridep_rejects_invalid_topology_environment(
+        self, monkeypatch, name, value, message
+    ):
+        """Invalid HybridEP topology environment values fail before model setup."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
+        monkeypatch.setenv("NVLINK_DOMAIN_SIZE", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+        monkeypatch.setenv(name, value)
+
+        with pytest.raises(ValueError, match=message):
+            _apply_moe_config(
+                MagicMock(),
+                self._base_moe_cfg(
+                    expert_model_parallel_size=8,
+                    moe_flex_dispatcher_backend="hybridep",
+                ),
+            )
 
     def test_hybridep_use_mnnvl_explicit_false(self, monkeypatch):
         """hybridep_use_mnnvl=False → USE_MNNVL='0'."""
