@@ -10,6 +10,8 @@ For the full list of supported models, see
 
 ## Families
 
+- **[DeepSeek](deepseek/index.md)** — DeepSeek V4 Flash GRPO with AutoModel
+  training and block-FP8 vLLM generation.
 - **[GLM](glm/index.md)** — GLM-5.1 and GLM-5.2 GRPO recipes on the Megatron
   backend, colocated and non-colocated with vLLM.
 - **[Nemotron](nemotron/index.md)** — post-training recipes for Nemotron 3
@@ -20,12 +22,12 @@ For the full list of supported models, see
   generation-length guidance.
 
 Other model-specific guides currently live directly under
-[Guides](../../index.md) (for example, [DeepSeek](../deepseek.md)) and are
-migrated into this hub as their guidance grows.
+[Guides](../../index.md) and are migrated into this hub as their guidance grows.
 
 ```{toctree}
 :hidden:
 
+deepseek/index.md
 glm/index.md
 nemotron/index.md
 qwen/index.md
