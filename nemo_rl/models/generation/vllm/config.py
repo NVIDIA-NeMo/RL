@@ -168,6 +168,10 @@ class VllmRefitConfig(BaseModel, extra="allow"):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Recursive HF overrides applied only to vLLM's loaded config. Use this for
+    # nested rollout-backend settings that must not replace the corresponding
+    # complete policy sub-config during AutoConfig.from_pretrained.
+    hf_subconfig_overrides: NotRequired[dict[str, Any]]
     # Null uses the topology default (IPC colocated, NCCL non-colocated).
     # Built-ins select sparse delta over S3/ZeroMQ or NIXL.
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
