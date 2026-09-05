@@ -53,8 +53,14 @@ cd -
 # smoke test, we trim all but the first tool
 TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
 VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > $TRAIN_PATH
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
+jq -c '
+    .agent_ref //= {"name": "workplace_assistant_simple_agent"}
+    | .responses_create_params.tools |= (.[0:1])
+' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > $TRAIN_PATH
+jq -c '
+    .agent_ref //= {"name": "workplace_assistant_simple_agent"}
+    | .responses_create_params.tools |= (.[0:1])
+' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $SC_ENTRYPOINT \

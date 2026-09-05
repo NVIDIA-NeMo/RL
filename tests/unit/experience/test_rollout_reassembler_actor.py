@@ -96,6 +96,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     assert {f.name for f in fields(ReassemblyRequest)} == {
         "group_id",
         "rollout_ids",
+        "canonical_sample_ids",
         "receipts",
         "rewards",
         "fallback_weight_version",

@@ -935,8 +935,10 @@ class TestSetup:
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=False, backend="sglang")
         elif invalid_case == "prompt_group_recovery_without_capture":
+            mc = _make_master_config()
             mc.rollout_recovery.default_granularity = RecoveryGranularity.PROMPT_GROUP
         elif invalid_case == "recovery_override_without_capture":
+            mc = _make_master_config()
             mc.rollout_recovery.task_granularity_overrides = {
                 "genrm": RecoveryGranularity.PROMPT_GROUP
             }

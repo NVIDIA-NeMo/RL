@@ -683,6 +683,7 @@ def test_rollout_manager_forwards_log_full_result_tables():
         "task_to_env": {},
         "num_generations_per_prompt": 1,
         "max_seq_len": 1,
+        "rollout_recovery_config": RolloutRecoveryConfig(),
         "generation_config": {
             "stop_strings": None,
             "stop_token_ids": None,
@@ -1610,7 +1611,7 @@ class TestGenerateForFinalizationFlow:
             buf, instance_configs=[{"mask_sample": True}, {"other": 1}]
         )
 
-        request = _run(mgr.generate_for_finalization({"prompt": "p"}))
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
 
         # The gym mask flag is read from env_extras exactly like the token
         # path's _mask_sample_flags. truncated is not part of this request --

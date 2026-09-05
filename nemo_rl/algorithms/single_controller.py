@@ -1125,14 +1125,12 @@ class SingleControllerActor:
 
     async def _call_dp(self, method_name: str, **kwargs) -> Any:
         """Call a DataPlaneClient method or a Ray actor exposing that method."""
-        method = getattr(self._dp_client, method_name)
-        remote = getattr(method, "remote", None)
-        if remote is not None:
-            return await self._ray_get(remote(**kwargs))
-        result = method(**kwargs)
-        if asyncio.iscoroutine(result):
-            return await result
-        return result
+        return await call_data_plane(
+            self._dp_client,
+            method_name,
+            offload_sync=True,
+            **kwargs,
+        )
 
     async def _save_data_plane_checkpoint(
         self,
