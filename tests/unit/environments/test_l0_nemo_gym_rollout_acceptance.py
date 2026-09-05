@@ -53,7 +53,9 @@ _REQUIRED_L0_CASES = {
 _GENERATION_CONFIG = {
     "backend": "test",
     "max_new_tokens": 1024,
-    "max_total_sequence_length": 65536,
+    # Tool-heavy environments such as workplace_assistant serialize more than
+    # 64K byte-level tokens before a continuation generation.
+    "max_total_sequence_length": 131072,
     "temperature": 0.0,
     "top_p": 1.0,
     "top_k": None,
