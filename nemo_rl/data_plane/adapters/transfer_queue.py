@@ -677,6 +677,7 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
+                    "checkpoint": mooncake_cfg.checkpoint.model_dump(),
                     **_mooncake_transport_config(),
                 },
             },
@@ -776,6 +777,10 @@ class TQDataPlaneClient(DataPlaneClient):
                 cluster — ``cfg`` is then only consulted for client-side
                 knobs (poll interval).
         """
+        # Ray serializes this driver-built client into the SingleController
+        # actor; retain the config so process-local hooks can be reinstalled.
+        self._cfg = cfg
+
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
         # env vars and they can't be changed. Two per-process knobs are
@@ -811,6 +816,12 @@ class TQDataPlaneClient(DataPlaneClient):
             mooncake_cfg = backend_config(cfg)
             if mooncake_cfg.reuse_registered_buffers:
                 _patch_mooncake_staging_buffers(mooncake_cfg.staging_buffer_size)
+            if mooncake_cfg.checkpoint.enabled:
+                from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
+                    install_tq_mooncake_checkpoint_plugin,
+                )
+
+                install_tq_mooncake_checkpoint_plugin()
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
@@ -836,6 +847,35 @@ class TQDataPlaneClient(DataPlaneClient):
         # The controller's field map is append-only, so each field only needs
         # warming once for the lifetime of this client.
         self._warmed_fields: dict[str, set[str]] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize the config needed to rebuild a process-local TQ client."""
+        return {"cfg": self._cfg}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Rebuild process-local TQ state after Ray deserialization."""
+        cfg = state.get("cfg")
+        if cfg is None:
+            raise RuntimeError(
+                "Cannot deserialize TQDataPlaneClient without its data-plane config"
+            )
+        self.__init__(cast(DataPlaneConfig, cfg), bootstrap=False)
+
+    @staticmethod
+    def _read_complete_checkpoint_metadata(
+        checkpoint_dir: str | Path,
+    ) -> dict[str, Any]:
+        """Read TQ metadata and require a complete storage payload."""
+        metadata_path = Path(checkpoint_dir) / "metadata.json"
+        with metadata_path.open() as metadata_file:
+            checkpoint_metadata = json.load(metadata_file)
+        if not isinstance(checkpoint_metadata, dict):
+            raise ValueError("TQ checkpoint metadata must be a dictionary")
+        if checkpoint_metadata.get("storage_saved") is not True:
+            raise RuntimeError(
+                "TQ checkpoint is incomplete: metadata.json storage_saved must be true"
+            )
+        return checkpoint_metadata
 
     def _require_checkpointing_support(self) -> None:
         """Reject backends that cannot round-trip all data-plane state."""
@@ -1114,6 +1154,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._require_checkpointing_support()
         _connect_existing()
         tq.save_checkpoint(checkpoint_dir, metadata=metadata)
+        self._read_complete_checkpoint_metadata(checkpoint_dir)
 
     def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
         """Restore TQ state after initialization and before data operations.
@@ -1126,9 +1167,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._require_clean_for_load()
         # Validate the adapter-owned metadata before starting TQ's
         # non-transactional storage/controller restore.
-        metadata_path = Path(checkpoint_dir) / "metadata.json"
-        with metadata_path.open() as metadata_file:
-            checkpoint_metadata = json.load(metadata_file)
+        checkpoint_metadata = self._read_complete_checkpoint_metadata(checkpoint_dir)
         user_metadata = checkpoint_metadata.get("user_metadata", {})
         if not isinstance(user_metadata, dict):
             raise ValueError("TQ checkpoint user_metadata must be a dictionary")

@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tensordict import TensorDict
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
@@ -59,6 +59,16 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
 
     storage_capacity: int = 1000000  # max samples retained per partition
     num_storage_units: int
+
+
+class MooncakeCheckpointConfig(BaseModel, extra="allow"):
+    """Opt in to explicit TQ storage checkpoints for Mooncake.
+
+    Normal PUTs remain memory-only. Payload transfer to durable storage starts
+    only when the caller invokes ``tq.save_checkpoint``.
+    """
+
+    enabled: bool = False
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
@@ -91,6 +101,9 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
+    checkpoint: MooncakeCheckpointConfig = Field(
+        default_factory=MooncakeCheckpointConfig
+    )
 
 
 class DataPlaneConfig(TypedDict):
@@ -137,11 +150,17 @@ _CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple"})
 def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
     """Return whether the configured backend supports complete save/load.
 
-    This is a static allow-list so an unrecognized future backend defaults to
+    Simple always supports native TQ checkpoints. Mooncake supports them only
+    when its explicit checkpoint plugin is enabled; normal Mooncake operation
+    remains memory-only. An unrecognized future backend defaults to
     unsupported until its storage payload and controller metadata are both
     known to round-trip through a checkpoint.
     """
-    return cfg["backend"] in _CHECKPOINTABLE_BACKENDS
+    if cfg["backend"] in _CHECKPOINTABLE_BACKENDS:
+        return True
+    if cfg["backend"] == "mooncake_cpu":
+        return bool(backend_config(cfg).checkpoint.enabled)
+    return False
 
 
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {

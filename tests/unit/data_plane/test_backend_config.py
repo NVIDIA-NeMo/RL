@@ -58,6 +58,14 @@ def test_checkpointing_capability_defaults_to_unsupported(
     assert data_plane_supports_checkpointing(_cfg(backend)) is expected
 
 
+def test_mooncake_checkpointing_capability_requires_explicit_opt_in() -> None:
+    cfg = _cfg(
+        "mooncake_cpu",
+        mooncake_cpu={"checkpoint": {"enabled": True}},
+    )
+    assert data_plane_supports_checkpointing(cfg) is True
+
+
 def test_nested_block_is_used() -> None:
     cfg = _cfg(
         "mooncake_cpu",
@@ -94,6 +102,18 @@ def test_partial_nested_block_keeps_other_defaults() -> None:
     resolved = backend_config(cfg)
     assert resolved.local_buffer_size == 7
     assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
+
+
+def test_mooncake_checkpoint_is_an_explicit_opt_in() -> None:
+    assert backend_config(_cfg("mooncake_cpu")).checkpoint.enabled is False
+
+    resolved = backend_config(
+        _cfg(
+            "mooncake_cpu",
+            mooncake_cpu={"checkpoint": {"enabled": True}},
+        )
+    )
+    assert resolved.checkpoint.enabled is True
 
 
 def test_simple_backend_nested_block_is_used() -> None:

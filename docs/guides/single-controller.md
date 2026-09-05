@@ -71,7 +71,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing currently supports only the `simple` storage backend. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
+5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing supports the `simple` storage backend and `mooncake_cpu` when `data_plane.mooncake_cpu.checkpoint.enabled: true`. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
 
     ```yaml
     checkpointing:
@@ -109,7 +109,7 @@ Completed groups are restored directly from the TQ snapshot. Prompt groups whose
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
 
-Native TQ save/load currently requires `data_plane.backend: "simple"`. Mooncake-backed storage is not recoverable through this mechanism. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
+Native TQ save/load works with `data_plane.backend: "simple"`, or with `data_plane.backend: "mooncake_cpu"` when the explicit Mooncake checkpoint plugin is enabled through `data_plane.mooncake_cpu.checkpoint.enabled: true`. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
 
 ## Async-RL Knobs and Sampler Modes
 
