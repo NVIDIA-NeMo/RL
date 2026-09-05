@@ -3796,3 +3796,112 @@ def test_validate_fp32_lm_head_config_ignores_non_vllm_generation():
     # SFT/DPO-style configs have no vLLM engine to disagree with.
     validate_fp32_lm_head_config({"megatron_cfg": {"fp32_lm_head": "tf32"}})
     validate_fp32_lm_head_config(_fp32_policy_cfg("tf32", {}, backend="megatron"))
+
+
+def _residual_policy_cfg(trainer, rollout_overrides=None, backend="vllm"):
+    generation = {"backend": backend}
+    if rollout_overrides is not None:
+        generation["hf_subconfig_overrides"] = rollout_overrides
+    return {
+        "megatron_cfg": {"fp32_residual_connection": trainer},
+        "generation": generation,
+    }
+
+
+@pytest.mark.parametrize(
+    "trainer, checkpoint, rollout_overrides",
+    [
+        (False, False, None),
+        (True, True, None),
+        (True, False, {"llm_config": {"residual_in_fp32": True}}),
+        (False, True, {"text_config": {"residual_in_fp32": False}}),
+    ],
+)
+def test_validate_vllm_residual_precision_config_accepts_matched_engines(
+    trainer, checkpoint, rollout_overrides
+):
+    from nemo_rl.models.megatron.setup import (
+        validate_vllm_residual_precision_config,
+    )
+
+    validate_vllm_residual_precision_config(
+        _residual_policy_cfg(trainer, rollout_overrides), checkpoint
+    )
+
+
+@pytest.mark.parametrize(
+    "trainer, checkpoint, rollout_overrides",
+    [
+        (True, False, None),
+        (False, True, None),
+        (True, True, {"language_config": {"residual_in_fp32": False}}),
+        (False, False, {"residual_in_fp32": True}),
+    ],
+)
+def test_validate_vllm_residual_precision_config_rejects_one_sided(
+    trainer, checkpoint, rollout_overrides
+):
+    from nemo_rl.models.megatron.setup import (
+        validate_vllm_residual_precision_config,
+    )
+
+    with pytest.raises(ValueError, match="Residual precision must match"):
+        validate_vllm_residual_precision_config(
+            _residual_policy_cfg(trainer, rollout_overrides), checkpoint
+        )
+
+
+def test_validate_vllm_residual_precision_config_inherits_checkpoint_default():
+    from nemo_rl.models.megatron.setup import (
+        validate_vllm_residual_precision_config,
+    )
+
+    config = {"megatron_cfg": {}, "generation": {"backend": "vllm"}}
+    validate_vllm_residual_precision_config(config, False)
+    validate_vllm_residual_precision_config(config, True)
+
+
+def test_validate_vllm_residual_precision_config_rejects_unsupported_fp32():
+    from nemo_rl.models.megatron.setup import (
+        validate_vllm_residual_precision_config,
+    )
+
+    with pytest.raises(ValueError, match="does not support an fp32 residual"):
+        validate_vllm_residual_precision_config(
+            _residual_policy_cfg(
+                False, {"llm_config": {"residual_in_fp32": True}}
+            ),
+            False,
+            vllm_supports_residual_in_fp32=False,
+        )
+
+    with pytest.raises(ValueError, match="Residual precision must match"):
+        validate_vllm_residual_precision_config(
+            _residual_policy_cfg(True),
+            True,
+            vllm_supports_residual_in_fp32=False,
+        )
+
+
+def test_validate_vllm_residual_precision_config_accepts_unsupported_bf16():
+    from nemo_rl.models.megatron.setup import (
+        validate_vllm_residual_precision_config,
+    )
+
+    validate_vllm_residual_precision_config(
+        _residual_policy_cfg(
+            False, {"llm_config": {"residual_in_fp32": False}}
+        ),
+        False,
+        vllm_supports_residual_in_fp32=False,
+    )
+
+
+def test_validate_vllm_residual_precision_config_ignores_non_vllm_generation():
+    from nemo_rl.models.megatron.setup import (
+        validate_vllm_residual_precision_config,
+    )
+
+    validate_vllm_residual_precision_config(
+        _residual_policy_cfg(True, backend="megatron"), False
+    )

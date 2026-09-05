@@ -514,6 +514,97 @@ def validate_fp32_lm_head_config(config: PolicyConfig) -> None:
         )
 
 
+def _residual_in_fp32_override(overrides: Any) -> Optional[bool]:
+    """Read a rollout HF residual-precision override from common LM subconfigs."""
+    if not isinstance(overrides, Mapping):
+        return None
+
+    direct_value = overrides.get("residual_in_fp32")
+    if isinstance(direct_value, bool):
+        return direct_value
+
+    # Multimodal checkpoints commonly nest the causal LM config under one of
+    # these keys.  Keep this deliberately narrow: recursively accepting every
+    # mapping could mistake an unrelated tower's residual setting for the LM.
+    for key in ("llm_config", "text_config", "language_config"):
+        nested = overrides.get(key)
+        if isinstance(nested, Mapping):
+            nested_value = nested.get("residual_in_fp32")
+            if isinstance(nested_value, bool):
+                return nested_value
+    return None
+
+
+def validate_vllm_residual_precision_config(
+    config: PolicyConfig,
+    checkpoint_residual_in_fp32: bool,
+    *,
+    vllm_supports_residual_in_fp32: bool = True,
+) -> None:
+    """Reject different residual precision in Megatron and vLLM.
+
+    Megatron exposes ``fp32_residual_connection`` as a runtime-only override,
+    whereas support on the vLLM side is architecture-specific. Enabling only
+    the Megatron side makes the two engines execute different residual math at
+    identical weights. Sharp structured-output tokens can then have very
+    different probabilities even for an age-zero trajectory.
+
+    In particular, the vLLM Nemotron-H implementation used by Super 3.5 does
+    not consume ``residual_in_fp32``: its decoder layers keep the fused RMSNorm
+    residual in the model dtype. Treating an HF override as effective for that
+    implementation would silently accept the same mismatch this guard is meant
+    to prevent.
+    """
+    generation = config.get("generation") or {}
+    if generation.get("backend") != "vllm":
+        return
+
+    megatron_cfg = config.get("megatron_cfg") or {}
+    trainer_residual_in_fp32 = bool(
+        megatron_cfg.get("fp32_residual_connection", checkpoint_residual_in_fp32)
+    )
+    rollout_override = _residual_in_fp32_override(
+        generation.get("hf_subconfig_overrides")
+    )
+    if not vllm_supports_residual_in_fp32:
+        if rollout_override is True:
+            raise ValueError(
+                "generation.hf_subconfig_overrides requests "
+                "residual_in_fp32=true, but this vLLM model implementation "
+                "does not support an fp32 residual stream. The override would "
+                "be ignored; use false and set "
+                "megatron_cfg.fp32_residual_connection=false."
+            )
+        rollout_residual_in_fp32 = False
+    else:
+        rollout_residual_in_fp32 = (
+            checkpoint_residual_in_fp32
+            if rollout_override is None
+            else rollout_override
+        )
+
+    if trainer_residual_in_fp32 != rollout_residual_in_fp32:
+        raise ValueError(
+            "Residual precision must match between Megatron policy scoring and "
+            "vLLM generation: "
+            "megatron_cfg.fp32_residual_connection="
+            f"{megatron_cfg.get('fp32_residual_connection')!r} resolves to "
+            f"{trainer_residual_in_fp32}, while the checkpoint/rollout "
+            f"residual_in_fp32 resolves to {rollout_residual_in_fp32}. "
+            "Use a residual precision supported by both engines."
+        )
+
+
+def _vllm_supports_residual_in_fp32(model_cfg: Any) -> bool:
+    """Return whether vLLM implements an fp32 residual path for this provider."""
+    # Super 3.5's NemotronOmni provider wraps the vLLM Nemotron-H language
+    # model. That implementation does not read the HF residual_in_fp32 field.
+    return not (
+        type(model_cfg).__name__ == "NemotronOmniModelProvider"
+        or getattr(model_cfg, "language_model_type", None) == "nemotron6-moe"
+    )
+
+
 def _resolve_output_layer_owner(chunk: Any) -> Any:
     """Return the module that owns ``output_layer`` for a Megatron model chunk.
 
@@ -804,6 +895,15 @@ def setup_model_config(
             )
         model_cfg = _merge_model_overrides(model_cfg, model_overrides)
 
+    checkpoint_residual_in_fp32 = bool(
+        getattr(model_cfg, "fp32_residual_connection", False)
+    )
+    validate_vllm_residual_precision_config(
+        config,
+        checkpoint_residual_in_fp32,
+        vllm_supports_residual_in_fp32=_vllm_supports_residual_in_fp32(model_cfg),
+    )
+
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
 
@@ -826,9 +926,9 @@ def setup_model_config(
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
-    # Optional fp32 residual stream. Reduces generation/training logprob
-    # mismatch (train/token_mult_prob_error) by accumulating the residual in
-    # fp32; supported by both transformer and mamba layers.
+    # Optional fp32 residual stream. This must match vLLM's effective residual
+    # precision; the validation above rejects a one-sided or unsupported
+    # override before model construction.
     if "fp32_residual_connection" in config["megatron_cfg"]:
         model_cfg.fp32_residual_connection = config["megatron_cfg"][
             "fp32_residual_connection"
