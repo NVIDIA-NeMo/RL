@@ -164,3 +164,111 @@ def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
         flat["generation_logprobs"],
         torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2]]),
     )
+
+
+def test_sync_rollout_actor_uses_explicit_nemo_gym_prompt_groups() -> None:
+    """Harness prompt rewrites must not change synchronous TQ grouping."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import torch
+
+    from nemo_rl.data_plane.interfaces import KVBatchMeta
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
+
+    message_logs = [
+        [
+            {
+                "role": "user",
+                "content": f"workspace-{index}",
+                "token_ids": torch.tensor([100 + index]),
+            },
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([200 + index]),
+                "generation_logprobs": torch.tensor([-0.1]),
+            },
+        ]
+        for index in range(4)
+    ]
+    final_batch = BatchedDataDict(
+        {
+            "message_log": message_logs,
+            "length": torch.ones(4, dtype=torch.long),
+            "total_reward": torch.tensor([1.0, 0.0, 0.5, 0.25]),
+            "loss_multiplier": torch.ones(4),
+            "truncated": torch.zeros(4, dtype=torch.bool),
+        }
+    )
+    rollout_result = SimpleNamespace(
+        final_batch=final_batch,
+        rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+    )
+
+    controller_cls = SyncRolloutActor.__ray_metadata__.modified_class
+    actor = object.__new__(controller_cls)
+    actor.policy_generation = None
+    actor.tokenizer = SimpleNamespace(pad_token_id=0)
+    actor.task_to_env = {}
+    actor._dp_client = object()
+    actor.master_config = SimpleNamespace(
+        policy={
+            "generation": {},
+            "make_sequence_length_divisible_by": 1,
+            "precision": "float32",
+        },
+        logger={"wandb_enabled": False, "wandb": {}},
+        env={"nemo_gym": {}},
+        grpo=SimpleNamespace(
+            deduplicate_multimodal_data=False,
+            debug_payload_metrics=False,
+        ),
+        reward_penalties=SimpleNamespace(),
+    )
+
+    def fake_write(batch, *, sample_ids, partition_id, tags, **kwargs):
+        del batch, kwargs
+        return KVBatchMeta(
+            partition_id=partition_id,
+            task_name=partition_id,
+            sample_ids=sample_ids,
+            tags=tags,
+        )
+
+    with (
+        patch(
+            "nemo_rl.experience.sync_rollout_actor.run_nemo_gym_rollout_sync",
+            return_value=rollout_result,
+        ),
+        patch(
+            "nemo_rl.experience.sync_rollout_actor.get_nemo_gym_thinking_tags",
+            return_value=None,
+        ),
+        patch(
+            "nemo_rl.environments.nemo_gym.should_use_nemo_gym",
+            return_value=True,
+        ),
+        patch(
+            "nemo_rl.experience.sync_rollout_actor.kv_first_write",
+            side_effect=fake_write,
+        ),
+    ):
+        meta, carry, _, _ = actor.rollout_to_tq(
+            BatchedDataDict({"row": torch.arange(4)}),
+            partition_id="train",
+            group_size=2,
+        )
+
+    grouping_ids = carry["prompt_ids_for_adv"]
+    assert torch.equal(grouping_ids[0], grouping_ids[1])
+    assert torch.equal(grouping_ids[2], grouping_ids[3])
+    assert not torch.equal(grouping_ids[0], grouping_ids[2])
+    assert meta.tags is not None
+    assert [tag["group_id"] for tag in meta.tags] == [
+        meta.sample_ids[0].rsplit("_g", 1)[0],
+        meta.sample_ids[1].rsplit("_g", 1)[0],
+        meta.sample_ids[2].rsplit("_g", 1)[0],
+        meta.sample_ids[3].rsplit("_g", 1)[0],
+    ]

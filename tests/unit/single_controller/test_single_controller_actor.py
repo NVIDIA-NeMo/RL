@@ -34,6 +34,7 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     _pooled_opd_metrics,
+    _prompt_ids_from_group_tags,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -44,6 +45,37 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+
+
+def test_prompt_group_tags_are_explicit_and_complete() -> None:
+    fallback = torch.tensor([[10], [20]])
+    grouped_meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=["opaque-a", "opaque-b"],
+        tags=[{"group_id": "same"}, {"group_id": "same"}],
+    )
+
+    grouped = _prompt_ids_from_group_tags(grouped_meta, fallback)
+
+    assert torch.equal(grouped[0], grouped[1])
+    custom_meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=["custom_g0", "custom_g1"],
+        tags=[{}, {}],
+    )
+    assert _prompt_ids_from_group_tags(custom_meta, fallback) is fallback
+    with pytest.raises(ValueError, match="one non-empty group_id"):
+        _prompt_ids_from_group_tags(
+            KVBatchMeta(
+                partition_id="train",
+                task_name="train",
+                sample_ids=["opaque-a", "opaque-b"],
+                tags=[{"group_id": "same"}, {}],
+            ),
+            fallback,
+        )
 
 
 class FakeWeightSynchronizer:
@@ -614,6 +646,12 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
         task_name="train",
         sample_ids=["first_g0", "first_g1", "second_g0", "second_g1"],
         fields=list(data.keys()),
+        tags=[
+            {"group_id": "first"},
+            {"group_id": "first"},
+            {"group_id": "second"},
+            {"group_id": "second"},
+        ],
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -2208,11 +2246,10 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     """The critic's regression target has to reach TQ, or the value train step
     fetches a column nobody wrote."""
     batch_size, sequence_length = 2, 4
+    prompt_ids_for_adv = torch.tensor([[1, 2, 0, 0], [3, 4, 0, 0]], dtype=torch.long)
     data = TensorDict(
         {
-            "prompt_ids_for_adv": torch.zeros(
-                batch_size, sequence_length, dtype=torch.long
-            ),
+            "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": torch.tensor([1.0, 0.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
@@ -2258,8 +2295,9 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        sample_ids=["same_g0", "same_g1"],
         fields=list(data.keys()),
+        tags=[{"group_id": "same"}, {"group_id": "same"}],
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -2267,6 +2305,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     assert has_valid_training_tokens
     assert "values" in (data_plane.selected_fields or [])
     assert estimator.kwargs is not None
+    assert torch.equal(estimator.kwargs["prompt_ids"], prompt_ids_for_adv)
     assert torch.equal(estimator.kwargs["values"], torch.zeros(2, 4))
     assert data_plane.written_fields is not None
     assert torch.equal(

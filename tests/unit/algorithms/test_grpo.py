@@ -48,6 +48,7 @@ from nemo_rl.algorithms.grpo import (
     _needs_hf_refit_handshake,
     _prompt_grouping_ids,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
+    _replay_prompt_batches,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
@@ -298,6 +299,32 @@ def test_native_prompt_grouping_preserves_token_identity() -> None:
     )
 
     assert grouping_ids is prompt_token_ids
+
+
+def test_replay_prompt_batches_restore_grouping_without_task_indices() -> None:
+    def make_batch(prompt: str) -> BatchedDataDict:
+        return create_mock_batch(
+            2,
+            ["math", "math"],
+            [
+                [
+                    {"role": "user", "content": f"{prompt}_{index}"},
+                    {"role": "assistant", "content": "response"},
+                ]
+                for index in range(2)
+            ],
+        )
+
+    batches = _replay_prompt_batches(
+        [
+            {"batch": make_batch("first")},
+            {"batch": make_batch("second")},
+        ],
+        use_explicit_grouping=True,
+    )
+
+    assert torch.equal(batches[0]["prompt_grouping_ids"], torch.tensor([[0], [0]]))
+    assert torch.equal(batches[1]["prompt_grouping_ids"], torch.tensor([[1], [1]]))
 
 
 def test_initial_policy_generation_stale() -> None:

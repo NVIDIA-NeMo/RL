@@ -57,19 +57,6 @@ def grouping_ids_from_identifiers(
     )
 
 
-def grouping_ids_from_sample_ids(sample_ids: Sequence[str]) -> torch.Tensor:
-    """Derive prompt-group identities from ``{group_id}_g{index}`` sample IDs."""
-    group_ids = []
-    for sample_id in sample_ids:
-        group_id, separator, generation_index = sample_id.rpartition("_g")
-        if not separator or not generation_index.isdigit():
-            raise ValueError(
-                f"Invalid grouped sample ID {sample_id!r}; expected '{{group_id}}_g{{index}}'"
-            )
-        group_ids.append(group_id)
-    return grouping_ids_from_identifiers(group_ids, 1)
-
-
 def get_gdpo_reward_component_keys(batch) -> list[str]:
     """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
     return sorted(

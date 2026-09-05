@@ -2389,6 +2389,23 @@ def _prompt_grouping_ids(
     )
 
 
+def _replay_prompt_batches(
+    trajectories: list[dict[str, Any]],
+    *,
+    use_explicit_grouping: bool,
+) -> list[BatchedDataDict]:
+    """Prepare replay batches with stable identities for each prompt group."""
+    prompt_batches = []
+    for group_index, trajectory in enumerate(trajectories):
+        prompt_batch = trajectory["batch"]
+        if use_explicit_grouping:
+            prompt_batch["prompt_grouping_ids"] = torch.full(
+                (prompt_batch.size, 1), group_index, dtype=torch.int64
+            )
+        prompt_batches.append(prompt_batch)
+    return prompt_batches
+
+
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
@@ -5089,14 +5106,10 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch.
                     # Reconstruct grouping from the replay buffer's prompt groups.
                     # This also repairs groups loaded from older checkpoints.
-                    per_prompt_batches = []
-                    for group_index, trajectory in enumerate(trajectories):
-                        prompt_batch = trajectory["batch"]
-                        if NEMO_GYM_TASK_INDEX_KEY in trajectory:
-                            prompt_batch["prompt_grouping_ids"] = torch.full(
-                                (prompt_batch.size, 1), group_index, dtype=torch.int64
-                            )
-                        per_prompt_batches.append(prompt_batch)
+                    per_prompt_batches = _replay_prompt_batches(
+                        trajectories,
+                        use_explicit_grouping=should_use_nemo_gym(master_config),
+                    )
                     repeated_batch = BatchedDataDict.from_batches(
                         per_prompt_batches,
                         allow_missing_packed_tensors=(

@@ -420,7 +420,16 @@ class SyncRolloutActor:
                 )
             driver_carry = {k: driver_carry[k] for k in carry_keys}
 
-        sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
+        tags = multimodal_row_tags(multimodal, n_samples) or [
+            {} for _ in range(n_samples)
+        ]
+        sample_ids = []
+        row_index = 0
+        for group_id in uids:
+            for generation_index in range(n_per_prompt):
+                sample_ids.append(f"{group_id}_g{generation_index}")
+                tags[row_index]["group_id"] = group_id
+                row_index += 1
         trace_rollout_payload(keys=sample_ids, data=bulk_batch)
         meta = kv_first_write(
             bulk_batch,
@@ -431,7 +440,7 @@ class SyncRolloutActor:
             # Per-row shapes the flattening removes from the payload. ``tags``
             # is the transport's per-sample channel and is projected with the
             # rows, so no consumer re-keys them.
-            tags=multimodal_row_tags(multimodal, len(sample_ids)),
+            tags=tags,
             task_name=partition_id,
             pad_to_multiple=int(
                 cfg.policy.get("make_sequence_length_divisible_by") or 1
