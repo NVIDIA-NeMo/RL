@@ -30,8 +30,9 @@ no key minting). Workers fetch their slice from TQ via
 from __future__ import annotations
 
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,6 +45,8 @@ from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     LP_SEED_FIELDS,
+    ROUTE_PASSTHROUGH_FLAG,
+    ROUTE_PLAN_TAG,
     fields_with_optional_routed_experts,
 )
 from nemo_rl.models.policy.lm_policy import Policy
@@ -72,6 +75,15 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         for k, v in r["all_mb_metrics"].items():
             all_mb_metrics[k].extend(v)
     out["all_mb_metrics"] = dict(all_mb_metrics)
+    # Only the replica leader ever populates this (see
+    # TQWorkerMixin._maybe_assemble_routed_experts), so non-leader entries
+    # are always empty and summing every result is safe without an
+    # is_replica_leader filter; each DP replica leader covers disjoint data.
+    route_fallback_counts: Counter[str] = Counter()
+    for r in results:
+        route_fallback_counts.update(r.get("route_fallback_counts") or {})
+    if route_fallback_counts:
+        out["route_fallback_counts"] = dict(route_fallback_counts)
     return out
 
 
@@ -205,6 +217,41 @@ class TQPolicy(TQDriverMixin, Policy):
 
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 
+    def _with_route_fields(
+        self,
+        meta: KVBatchMeta,
+        base_fields: tuple[str, ...],
+        *,
+        task_name: str,
+        want_routes: bool,
+    ) -> KVBatchMeta:
+        """Resolve direct versus deferred route storage for one worker request.
+
+        Delegates to :meth:`TQDriverMixin._isolated_meta` so the narrowed
+        meta also gets its per-dispatch forward-pad target minted.
+        """
+        want = self._router_replay_enabled and want_routes
+        plan_presence = [ROUTE_PLAN_TAG in tag for tag in (meta.tags or [])]
+        if want and any(plan_presence) and not all(plan_presence):
+            raise RuntimeError(
+                "router replay does not support mixed direct/deferred route "
+                "storage in one worker fetch"
+            )
+        passthrough = bool(want and plan_presence and all(plan_presence))
+        extra_info = dict(meta.extra_info or {})
+        if passthrough:
+            extra_info[ROUTE_PASSTHROUGH_FLAG] = True
+        else:
+            extra_info.pop(ROUTE_PASSTHROUGH_FLAG, None)
+        return self._isolated_meta(
+            replace(meta, extra_info=extra_info),
+            fields=fields_with_optional_routed_experts(
+                base_fields,
+                enabled=want and not passthrough,
+            ),
+            task_name=task_name,
+        )
+
     def _logprob_dispatch(
         self,
         meta: KVBatchMeta,
@@ -234,13 +281,11 @@ class TQPolicy(TQDriverMixin, Policy):
         # R3 replay. ``_isolated_meta`` unions in the multimodal columns the
         # rollout wrote, for this dispatch and the training one alike, so the
         # prev/ref logprobs and the training forward see identical model inputs.
-        lp_meta = self._isolated_meta(
+        lp_meta = self._with_route_fields(
             meta,
-            fields=fields_with_optional_routed_experts(
-                LP_SEED_FIELDS,
-                enabled=self._router_replay_enabled and include_router_replay,
-            ),
+            LP_SEED_FIELDS,
             task_name=task_name,
+            want_routes=include_router_replay,
         )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
@@ -344,13 +389,11 @@ class TQPolicy(TQDriverMixin, Policy):
         # The multimodal columns are per-batch, not part of the static schema,
         # so ``_isolated_meta`` unions them in — without them a VLM training
         # forward would run image-blind while the logprob forwards saw images.
-        train_meta = self._isolated_meta(
+        train_meta = self._with_route_fields(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields,
-                enabled=self._router_replay_enabled,
-            ),
+            train_fields,
             task_name="train",
+            want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
@@ -474,13 +517,14 @@ class TQPolicy(TQDriverMixin, Policy):
             train_fields: Columns produced for this step and fetched by workers.
         """
         spa, dba = self._packing_args("train_mb_tokens")
-        train_meta = self._isolated_meta(
+        train_meta = self._with_route_fields(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields,
-                enabled=self._router_replay_enabled,
-            ),
+            # Raw fields, not pre-wrapped in fields_with_optional_routed_experts:
+            # _with_route_fields applies that wrapper itself, gated on both
+            # router replay and route-plan passthrough.
+            train_fields,
             task_name="train",
+            want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
