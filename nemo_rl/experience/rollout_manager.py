@@ -777,6 +777,7 @@ class AsyncNemoGymRolloutImpl:
         stats: Optional[RolloutStats] = None,
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
+        log_full_result_tables: bool = False,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -786,6 +787,7 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._max_gym_row_attempts = (
@@ -1156,10 +1158,11 @@ class AsyncNemoGymRolloutImpl:
                 rollout_metrics.update(
                     calculate_single_metric(values, n, f"{agent_name}/{key}")
                 )
-        rollout_metrics[f"{agent_name}/full_result"] = Table(
-            data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
-            columns=["Full result"],
-        )
+        if self._log_full_result_tables:
+            rollout_metrics[f"{agent_name}/full_result"] = Table(
+                data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
+                columns=["Full result"],
+            )
 
         # Necessary for downstream nemo rl logging/printing.
         rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
@@ -1187,6 +1190,7 @@ class RolloutManager:
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
+        log_full_result_tables: bool = False,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1220,8 +1224,9 @@ class RolloutManager:
             max_rollout_turns=max_rollout_turns,
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
-            # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
+            # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores these.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            log_full_result_tables=log_full_result_tables,
             reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.

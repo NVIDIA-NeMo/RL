@@ -1561,6 +1561,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             val_at_start=False,
             val_at_end=False,
         ),
+        logger={"wandb_enabled": False, "wandb": {}},
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,

@@ -578,7 +578,31 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
     assert manager._impl._reward_penalty_config is reward_penalty_config
 
 
-def _nemo_gym_impl(mask_env_flagged_samples, reward_penalty_config=None):
+def test_rollout_manager_forwards_log_full_result_tables():
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+        "generation_config": {
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        "use_nemo_gym": True,
+    }
+
+    assert RolloutManager(**common)._impl._log_full_result_tables is False
+    manager = RolloutManager(**common, log_full_result_tables=True)
+    assert manager._impl._log_full_result_tables is True
+
+
+def _nemo_gym_impl(
+    mask_env_flagged_samples,
+    reward_penalty_config=None,
+    *,
+    log_full_result_tables=False,
+):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
         task_to_env={},
@@ -591,6 +615,7 @@ def _nemo_gym_impl(mask_env_flagged_samples, reward_penalty_config=None):
             "top_k": None,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
+        log_full_result_tables=log_full_result_tables,
         reward_penalty_config=reward_penalty_config,
     )
 
@@ -624,6 +649,24 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     ][0]
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
+    impl = _nemo_gym_impl(True, log_full_result_tables=log_full_result_tables)
+    completion = Completion(
+        message_log=[
+            {"role": "user", "token_ids": [1]},
+            {"role": "assistant", "token_ids": [2, 3]},
+        ],
+        env_extras={"reward": 1.0, "payload": "large"},
+        truncated=False,
+        reward=1.0,
+    )
+
+    metrics = impl._compute_rollout_metrics([completion], "agent")
+
+    assert ("agent/full_result" in metrics) is log_full_result_tables
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):

@@ -29,70 +29,26 @@ from nemo_rl.data_plane.codec import pack_per_token_field, to_nested_by_length
 
 from ._rollout_shapes import make_rollout_batch
 
-# ── P1: promote_1d — writer unsqueezes, reader squeezes ──────────────────────
-
-
-def test_promote_1d_leaves_unsqueezes_1d() -> None:
-    """`_promote_1d_leaves` turns 1D ``(N,)`` leaves into ``(N, 1)``.
-
-    Guards the mooncake_cpu path where TQ's extract_field_schema silently
-    unsqueezes 1D fields in metadata; the wire layer pre-unsqueezes so the
-    per-row data shape matches the metadata-recorded shape.
-    """
-    from tensordict import TensorDict
-
-    from nemo_rl.data_plane.adapters.transfer_queue import _promote_1d_leaves
-
-    n = 8
-    t = torch.arange(n, dtype=torch.float32)
-    td = TensorDict({"input_lengths": t}, batch_size=[n])
-
-    out = _promote_1d_leaves(td)
-    assert out["input_lengths"].shape == (n, 1), (
-        "Expected input_lengths to use the Mooncake wire shape "
-        f"({n}, 1), got {tuple(out['input_lengths'].shape)}."
-    )
-
-
-def test_promote_1d_roundtrip_via_from_wire() -> None:
-    """`_promote_1d_leaves` then `_from_wire` restores the original ``(N,)`` shape and values."""
-    from tensordict import TensorDict
-
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _from_wire,
-        _promote_1d_leaves,
-    )
-
-    n = 6
-    original = torch.arange(n, dtype=torch.float32)
-    td = TensorDict({"input_lengths": original}, batch_size=[n])
-
-    wire = _promote_1d_leaves(td)
-    assert wire["input_lengths"].shape == (n, 1)
-
-    back = _from_wire(wire)
-    assert back["input_lengths"].shape == (n,)
-    assert torch.equal(back["input_lengths"], original)
-
 
 @pytest.mark.parametrize("field_name", ["mask_sample", "truncated"])
 def test_raw_sample_filter_fields_roundtrip_as_dense_1d(field_name: str) -> None:
-    """Raw loss-filter fields use the Mooncake scalar wire workaround."""
+    """Raw loss-filter fields survive the Mooncake scalar wire as dense ``(N,)``.
+
+    Ported from the ``_promote_1d_leaves`` pair this file used to carry. That
+    writer/reader pair was replaced by ``_patch_scalar_field_schema``, which
+    fixes the same TQ bug at the schema layer and covers *every* dense 1-D
+    field instead of a hand-kept allowlist — so there is no promote step to
+    assert on any more, and the property to pin is just the round trip.
+    """
     from tensordict import TensorDict
 
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _from_wire,
-        _promote_1d_leaves,
-    )
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
 
     n = 4
     original = torch.tensor([False, True, False, True])
     td = TensorDict({field_name: original}, batch_size=[n])
 
-    wire = _promote_1d_leaves(td)
-    assert wire[field_name].shape == (n, 1)
-
-    back = _from_wire(wire)
+    back = _from_wire(td)
     assert back[field_name].shape == (n,)
     assert torch.equal(back[field_name], original)
 
@@ -116,8 +72,15 @@ def test_from_wire_densifies_uniform_nested_rows() -> None:
     assert torch.equal(back["input_ids"], torch.stack(rows))
 
 
-def test_from_wire_preserves_genuine_length_one_token_column() -> None:
-    """Only fields promoted from ``(N,)`` are squeezed after a TQ read."""
+def test_from_wire_squeezes_nothing_even_for_scalar_field_names() -> None:
+    """``_from_wire`` densifies; it never reinterprets a row's rank.
+
+    A ``(1,)`` row is genuine data now. Per-sample scalar columns are
+    stored as 0-d rows (``_patch_scalar_field_schema``) and TQ stacks them
+    into a dense ``(N,)`` before this function runs, so a nested ``(1,)``
+    row arriving here means the producer really wrote length-1 rows —
+    squeezing it would corrupt them. Field name must not change that.
+    """
     from tensordict import TensorDict
 
     from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
@@ -137,49 +100,40 @@ def test_from_wire_preserves_genuine_length_one_token_column() -> None:
 
     back = _from_wire(wire)
 
-    assert back["total_reward"].shape == (n,)
+    # ``total_reward`` is a per-sample scalar by name, but these rows are
+    # length-1 vectors — both columns densify identically.
+    assert back["total_reward"].shape == (n, 1)
     assert back["input_ids"].shape == (n, 1)
     assert torch.equal(back["input_ids"], torch.arange(n).unsqueeze(-1))
 
 
-def test_from_wire_rejects_invalid_declared_field_shape() -> None:
-    """A corrupted scalar wire shape fails at the data-plane boundary."""
+def test_from_wire_passes_dense_fields_through_untouched() -> None:
+    """Dense inputs are returned as-is — no rank policing by field name.
+
+    Replaces a guard that rejected a declared scalar arriving as ``(3, 2)``.
+    That check belonged to the writer-unsqueeze/reader-squeeze pair, which
+    no longer exists: the schema now reports the shape the rows actually
+    have, so there is no promoted encoding for a malformed value to
+    violate.
+    """
     from tensordict import TensorDict
 
     from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
 
     wire = TensorDict({"input_lengths": torch.ones(3, 2)}, batch_size=[3])
 
-    with pytest.raises(ValueError, match=r"input_lengths.*\(N, 1\)"):
-        _from_wire(wire)
+    back = _from_wire(wire)
+    assert back["input_lengths"].shape == (3, 2)
 
 
-def test_promote_1d_leaves_rejects_undeclared_1d_field() -> None:
-    """New scalar fields must be added to the authoritative schema."""
-    from tensordict import TensorDict
+def test_put_samples_passes_fields_and_tags_through_unchanged(monkeypatch) -> None:
+    """``put_samples`` reshapes nothing and does not touch user tags.
 
-    from nemo_rl.data_plane.adapters.transfer_queue import _promote_1d_leaves
-
-    fields = TensorDict({"new_scalar": torch.arange(3)}, batch_size=[3])
-
-    with pytest.raises(ValueError, match="not declared.*PROMOTE_1D_FIELDS"):
-        _promote_1d_leaves(fields)
-
-
-def test_promote_1d_leaves_rejects_invalid_declared_field_shape() -> None:
-    """A schema-declared scalar cannot silently change its user-level rank."""
-    from tensordict import TensorDict
-
-    from nemo_rl.data_plane.adapters.transfer_queue import _promote_1d_leaves
-
-    fields = TensorDict({"input_lengths": torch.ones(3, 2)}, batch_size=[3])
-
-    with pytest.raises(ValueError, match=r"input_lengths.*shape \(N,\)"):
-        _promote_1d_leaves(fields)
-
-
-def test_put_samples_uses_schema_without_private_shape_tags(monkeypatch) -> None:
-    """Mooncake promotion changes tensors but not user-provided TQ tags."""
+    The writer-unsqueeze half of the old 1-D workaround is gone — the
+    schema now reports the ``()`` rows TQ actually stores — so a ``(N,)``
+    column reaches the wire as ``(N,)``. Tag passthrough was the other
+    half of this test's intent and is unchanged.
+    """
     from tensordict import TensorDict
 
     import nemo_rl.data_plane.adapters.transfer_queue as tq_adapter
@@ -203,13 +157,12 @@ def test_put_samples_uses_schema_without_private_shape_tags(monkeypatch) -> None
     ) -> None:
         assert keys == ["a", "b", "c"]
         assert partition_id == "train"
-        assert fields["input_lengths"].shape == (n, 1)
+        assert fields["input_lengths"].shape == (n,)  # not promoted any more
         assert fields["input_ids"].shape == (n, 1)
         assert tags == user_tags
 
     monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", fake_kv_batch_put)
     client = object.__new__(tq_adapter.TQDataPlaneClient)
-    client._promote_1d = True
 
     meta = client.put_samples(
         ["a", "b", "c"], "train", fields=original_fields, tags=user_tags
@@ -218,8 +171,14 @@ def test_put_samples_uses_schema_without_private_shape_tags(monkeypatch) -> None
     assert meta.tags == user_tags
 
 
-def test_get_samples_uses_static_shape_schema(monkeypatch) -> None:
-    """The Mooncake adapter restores scalar ranks without row metadata."""
+def test_get_samples_returns_scalar_columns_dense(monkeypatch) -> None:
+    """A per-sample scalar column arrives dense and is passed through.
+
+    TQ stores these as 0-d rows and ``_merge_tensors_to_tensordict`` stacks
+    them into ``(N,)`` before the adapter sees them, so ``get_samples`` has
+    no rank to restore — it just must not disturb the column. Previously
+    this arrived nested with ``(1,)`` rows and was squeezed back.
+    """
     from tensordict import TensorDict
 
     import nemo_rl.data_plane.adapters.transfer_queue as tq_adapter
@@ -234,10 +193,8 @@ def test_get_samples_uses_static_shape_schema(monkeypatch) -> None:
     )
     wire_data = TensorDict(
         {
-            "total_reward": torch.nested.as_nested_tensor(
-                [row for row in original["total_reward"].unsqueeze(-1)],
-                layout=torch.jagged,
-            ),
+            # Dense: what TQ hands back for a 0-d-row scalar column.
+            "total_reward": original["total_reward"],
             "input_ids": torch.nested.as_nested_tensor(
                 [row for row in original["input_ids"]], layout=torch.jagged
             ),
@@ -255,7 +212,6 @@ def test_get_samples_uses_static_shape_schema(monkeypatch) -> None:
 
     monkeypatch.setattr(tq_adapter.tq, "kv_batch_get", fake_kv_batch_get)
     client = object.__new__(tq_adapter.TQDataPlaneClient)
-    client._promote_1d = True
     client._data_operations_started = False
 
     restored = client.get_samples(
@@ -290,7 +246,6 @@ def test_get_samples_densifies_uniform_rows_without_1d_promotion(monkeypatch) ->
 
     monkeypatch.setattr(tq_adapter.tq, "kv_batch_get", fake_kv_batch_get, raising=False)
     client = object.__new__(tq_adapter.TQDataPlaneClient)
-    client._promote_1d = False
     client._data_operations_started = False
 
     restored = client.get_samples(["a", "b"], "train", ["input_ids"])

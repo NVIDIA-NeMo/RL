@@ -146,6 +146,54 @@ class TestGetAndValidateSeqlen:
         sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
         assert seq_dim_size == 10
 
+    def test_get_and_validate_seqlen_skips_packed_multimodal_fields(self):
+        """mcore twin of the automodel ``check_sequence_dim`` skip.
+
+        A packed multimodal field has patch/image count on dim 1, not seqlen.
+        Without the skip every VLM step through the data plane trips the assert.
+        """
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = MagicMock()
+        data.__getitem__ = MagicMock(
+            side_effect=lambda k: torch.zeros(2, 10) if k == "input_ids" else None
+        )
+        data.items = MagicMock(
+            return_value=[
+                ("input_ids", torch.zeros(2, 10)),
+                # [B, max_patches, C, H, W] — dim 1 is 7 patches, not 10 tokens.
+                ("pixel_values", torch.zeros(2, 7, 3, 2, 2)),
+                ("image_grid_thw", torch.zeros(2, 4, 3)),
+            ]
+        )
+
+        sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
+
+        assert sequence_dim == 1
+        assert seq_dim_size == 10
+
+    def test_get_and_validate_seqlen_still_checks_per_token_multimodal(self):
+        """Only the *packed* registry is exempt. Per-token maps like
+        ``mm_token_type_ids`` are ``[B, S]``, so a seqlen mismatch there is a
+        real bug that must keep failing."""
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = MagicMock()
+        data.__getitem__ = MagicMock(
+            side_effect=lambda k: torch.zeros(2, 10) if k == "input_ids" else None
+        )
+        data.items = MagicMock(
+            return_value=[
+                ("input_ids", torch.zeros(2, 10)),
+                ("mm_token_type_ids", torch.zeros(2, 15)),  # Mismatched!
+            ]
+        )
+
+        with pytest.raises(AssertionError) as exc_info:
+            get_and_validate_seqlen(data)
+
+        assert "Dim 1 must be the sequence dim" in str(exc_info.value)
+
 
 @pytest.mark.mcore
 class TestProcessMicrobatch:
