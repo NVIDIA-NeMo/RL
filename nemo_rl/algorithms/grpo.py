@@ -4476,6 +4476,27 @@ def async_grpo_train(
     samples_per_prompt_group = master_config.grpo.num_generations_per_prompt
     train_gbs = master_config.policy["train_global_batch_size"]
 
+    # Validate the policy sharding contract before starting continuous
+    # generation.  Performing this check only after a complete rollout wastes
+    # the entire first generation window for an invalid topology (for example,
+    # 2048 samples on DP=24).  The same invariant is required by
+    # BatchedDataDict.shard_by_batch_size and Megatron's global-batch schedule.
+    expected_train_gbs = num_prompts_per_step * samples_per_prompt_group
+    if train_gbs != expected_train_gbs:
+        raise ValueError(
+            "Async GRPO requires policy.train_global_batch_size to equal "
+            "grpo.num_prompts_per_step * grpo.num_generations_per_prompt, "
+            f"but got {train_gbs} != {expected_train_gbs}."
+        )
+    policy_dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+    if train_gbs % policy_dp_size != 0:
+        raise AssertionError(
+            "Async GRPO training batch is incompatible with the policy topology: "
+            f"train_global_batch_size={train_gbs} is not divisible by "
+            f"data_parallel size {policy_dp_size}. Adjust the policy/generation "
+            "node split (or model-parallel topology) before launching rollouts."
+        )
+
     # Ensure the buffer has at least one step worth of prompt-groups before training
     min_trajectories_needed = num_prompts_per_step
 
@@ -5047,13 +5068,6 @@ def async_grpo_train(
                     )
                     time.sleep(0.5)
                     continue
-
-                # Optional sanity: ensure DP divisibility to avoid sharding issues
-                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
-                if expected_batch_size % dp_size != 0:
-                    raise AssertionError(
-                        f"Configuration error: (num_prompts_per_step * num_generations_per_prompt) = {expected_batch_size} must be divisible by data_parallel size {dp_size}."
-                    )
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
 
