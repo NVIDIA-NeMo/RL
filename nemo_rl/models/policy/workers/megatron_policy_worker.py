@@ -1453,16 +1453,12 @@ class MegatronPolicyWorkerImpl(
                 any of the packing/CP capability flags, so a multimodal model
                 would silently be handed CP-sliced rows it believes are full.
         """
-        if self.media_placeholder_token_id is not None or (
-            self.model_slices_context_parallel_inputs
-        ):
+        if self.media_placeholder_token_id is not None:
             raise NotImplementedError(
                 "train_microbatch does not support multimodal models: its "
                 "microbatch iterator is built without "
-                "attach_media_token_validity_mask, delegate_pack_to_model, "
-                "delegate_mtp_loss_mask_to_model or "
-                "model_slices_context_parallel_inputs, all of which the train / "
-                "get_logprobs / get_topk_logits paths pass. Threading them here "
+                "attach_media_token_validity_mask, which the train / "
+                "get_logprobs / get_topk_logits paths pass. Threading it here "
                 "needs a SingleController VLM recipe to verify against; until "
                 "then use train_presharded, which delegates to train."
             )
