@@ -1,0 +1,7 @@
+defaults: ./qwen35-sync-ep32-alltoall.yaml
+
+policy:
+  megatron_cfg:
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32

@@ -1,0 +1,39 @@
+defaults: ../../examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml
+
+loss_fn:
+  use_importance_sampling_correction: true
+
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 32
+    expert_tensor_parallel_size: 1
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+  generation:
+    refit_transport: null
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: null
+        gpus_per_node: null
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 1
+      precision: bfloat16
+      refit_prequantize: false
+      refit_cache_loader_routes: true
+      quantization_ignore_patterns:
+        - "*layers.*.self_attn.*"
+        - "*layers.*.mlp.gate"
+        - "*layers.*.mlp.shared_experts.*"
+        - "*mtp.*"
+        - lm_head
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
+      expert_placement_strategy: linear
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+  segment_size: 8
