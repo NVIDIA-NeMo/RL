@@ -9,6 +9,7 @@ STEPS_PER_RUN=20
 MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
 NUM_MINUTES=240
+JOB_REAPER_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","reason":"disproportionate_resource_requirement","description":"6-node GRPO with vLLM has long GPU-idle phases during Ray init and model loading"}}'
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
