@@ -41,7 +41,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    validate_vllm_quantization_config,
+)
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
@@ -149,6 +152,8 @@ class VllmGeneration(GenerationInterface):
             workers_per_node: Workers per node override
             defer_model_load: If True, defer model loading for overlapped init
         """
+        validate_vllm_quantization_config(config)
+
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load
@@ -1200,8 +1205,19 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy shutdown: {e}")
             return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns:
+            When MXFP8 trainer-side pre-quantization is enabled
+            (vllm_cfg.refit_prequantize), the parameter names the engine wants
+            quantized on the trainer before streaming. None otherwise.
+        """
+        if state_dict_info is None:
+            return None
+
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "prepare_refit_info_async"
@@ -1216,8 +1232,13 @@ class VllmGeneration(GenerationInterface):
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 
-        # Wait for all futures to complete
-        ray.get(futures)
+        # Union the fp8-eligible parameter names across workers: replicas are
+        # equivalent, but with pipeline parallelism each worker only reports
+        # the parameters of its local shard.
+        names = sorted(
+            {name for result in ray.get(futures) if result for name in result}
+        )
+        return names or None
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""

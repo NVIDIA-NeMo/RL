@@ -59,6 +59,8 @@ def packed_broadcast_producer(
         None
 
     """
+    if buffer_size_bytes is not None and buffer_size_bytes <= 0:
+        raise ValueError("buffer_size_bytes must be > 0")
     target_packed_tensor_size = (
         get_target_packed_tensor_size()
         if buffer_size_bytes is None
@@ -127,7 +129,12 @@ def packed_broadcast_producer(
 
 
 def packed_broadcast_consumer(
-    iterator, group, src, post_unpack_func, *, num_buffers: int | None = None
+    iterator,
+    group,
+    src,
+    post_unpack_func,
+    *,
+    num_buffers: int | None = None,
 ):
     """Consume a packed tensor and unpack it into a list of tensors.
 

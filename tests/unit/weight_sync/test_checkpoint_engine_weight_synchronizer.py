@@ -14,7 +14,7 @@
 
 """Tests for checkpoint-engine weight synchronization and factory routing."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -33,6 +33,7 @@ from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 def _mock_policy(**overrides):
     policy = MagicMock()
+    policy.cfg = {"megatron_cfg": {"enabled": True}}
     policy.offload_before_refit.return_value = None
     policy.offload_after_refit.return_value = None
     policy.prepare_refit_info.return_value = {"layer_0": {"shape": [4096, 4096]}}
@@ -151,6 +152,54 @@ def _checkpoint_sync(
 
 
 class TestCheckpointEngineWeightSynchronizer:
+    def test_init_communicator_completes_prequant_handshake(self):
+        sync = _checkpoint_sync(MagicMock())
+        sync._ensure_checkpoint_engine_ready = MagicMock()
+        state_dict_info = {"layer_0": {"shape": [4096, 4096]}}
+        prequant_names = ["layer_0"]
+        updated_info = {"layer_0": {"shape": [4096, 4096], "dtype": "float8_e4m3fn"}}
+        sync._policy.prepare_refit_info.return_value = state_dict_info
+        sync._generation.prepare_refit_info.side_effect = [prequant_names, None]
+        sync._policy.enable_refit_prequantize.return_value = updated_info
+
+        sync.init_communicator()
+
+        sync._policy.enable_refit_prequantize.assert_called_once_with(prequant_names)
+        assert sync._generation.prepare_refit_info.call_args_list == [
+            call(state_dict_info),
+            call(updated_info),
+        ]
+        sync._ensure_checkpoint_engine_ready.assert_called_once_with()
+
+    def test_init_communicator_rejects_missing_prequant_metadata(self):
+        sync = _checkpoint_sync(MagicMock())
+        sync._ensure_checkpoint_engine_ready = MagicMock()
+        sync._policy.prepare_refit_info.return_value = {
+            "layer_0": {"shape": [4096, 4096]}
+        }
+        sync._generation.prepare_refit_info.return_value = ["layer_0"]
+        sync._policy.enable_refit_prequantize.return_value = None
+
+        with pytest.raises(
+            RuntimeError,
+            match="did not return updated metadata",
+        ):
+            sync.init_communicator()
+
+        sync._ensure_checkpoint_engine_ready.assert_not_called()
+
+    def test_init_communicator_rejects_prequantization_without_megatron(self):
+        sync = _checkpoint_sync(MagicMock())
+        sync._ensure_checkpoint_engine_ready = MagicMock()
+        sync._policy.cfg = {"megatron_cfg": {"enabled": False}}
+        sync._generation.prepare_refit_info.return_value = ["layer_0"]
+
+        with pytest.raises(ValueError, match="requires the Megatron policy backend"):
+            sync.init_communicator()
+
+        sync._policy.enable_refit_prequantize.assert_not_called()
+        sync._ensure_checkpoint_engine_ready.assert_not_called()
+
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_bucket_uses_minimum_total_memory_and_is_cached(self, mock_ray, capsys):
         config = _checkpoint_engine_cfg(bucket_memory_ratio=0.125)
