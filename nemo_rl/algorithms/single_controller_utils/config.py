@@ -623,7 +623,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
 
 
 @dataclass(frozen=True)
-class RecoveryGranularityResolution:
+class AgentRecoveryGranularity:
     """Recovery granularity selected for a prompt-group reservation.
 
     ``agent_name`` is copied from the prompt when present. ``granularity`` is
@@ -660,9 +660,7 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         default_factory=dict
     )
 
-    def resolve_for_prompt(
-        self, prompt: Mapping[str, Any]
-    ) -> RecoveryGranularityResolution:
+    def resolve_for_prompt(self, prompt: Mapping[str, Any]) -> AgentRecoveryGranularity:
         """Resolve one new group using agent, then task, then the global default."""
         extra_env_info = prompt.get("extra_env_info")
         agent_name: Optional[str] = None
@@ -678,7 +676,7 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         if agent_name is not None:
             override = self.agent_granularity_overrides.get(agent_name)
             if override is not None:
-                return RecoveryGranularityResolution(agent_name, override)
+                return AgentRecoveryGranularity(agent_name, override)
 
         task_name = prompt.get("task_name")
         if task_name is not None and not isinstance(task_name, str):
@@ -686,8 +684,8 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         if task_name is not None:
             override = self.task_granularity_overrides.get(task_name)
             if override is not None:
-                return RecoveryGranularityResolution(agent_name, override)
-        return RecoveryGranularityResolution(agent_name, self.default_granularity)
+                return AgentRecoveryGranularity(agent_name, override)
+        return AgentRecoveryGranularity(agent_name, self.default_granularity)
 
 
 class MasterConfig(BaseModel, extra="allow"):
