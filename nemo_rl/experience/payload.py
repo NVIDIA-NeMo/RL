@@ -38,6 +38,7 @@ VIOLATION_TAG_KEYS = (
     "num_invalid_tool_calls",
     "num_malformed_thinking",
     "num_assistant_messages",
+    "num_routed_experts_backfilled",
 )
 # Per-row violation counts ride ``tags`` rather than the tensor fields, so this
 # key is carried on the train batch and consumed by pack_payload.
@@ -135,7 +136,9 @@ def record_to_train_batch(
     # Must precede the prompt extraction: it reuses the same message dicts, so
     # backfilling here also covers the prompt flatten below. Doing it only inside
     # add_grpo_token_loss_masks_and_generation_logprobs would be too late.
-    backfill_missing_routed_experts(message_logs)
+    routed_experts_backfilled = backfill_missing_routed_experts(message_logs)
+    for counts, backfilled in zip(violation_counts, routed_experts_backfilled):
+        counts["num_routed_experts_backfilled"] = backfilled
 
     prompt_message_logs = extract_initial_prompt_messages(message_logs, prompt_lengths)
     prompt_flat, _ = batched_message_log_to_flat_message(

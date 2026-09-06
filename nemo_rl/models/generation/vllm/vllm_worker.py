@@ -455,6 +455,9 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
+    def _refit_with_reload_api_enabled(self) -> bool:
+        return bool(self.cfg["vllm_cfg"].get("refit_with_reload_api"))
+
     @trace_fn(RLSpanGroup.MODEL_INIT, "rl.vllm.load_model")
     def _load_model(self, bundle_indices, seed):
         """Perform the heavy model loading and engine creation.
@@ -1322,7 +1325,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=(refit_timeout_s,)
+                "update_weights_from_collective",
+                args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
             )
             worker_results = cast(list[bool], result_or_coro)
 

@@ -791,6 +791,7 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
         )
 
     assert configured["vllm_cfg"]["load_format"] == "auto"
+    assert configured["_draft_weights_from_refit"] is False
 
 
 @pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
@@ -836,6 +837,7 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+    assert configured["_draft_weights_from_refit"] is True
 
 
 def test_configure_generation_config_keeps_real_quant_export_on_cpu() -> None:
@@ -1196,6 +1198,61 @@ def test_vllm_missing_required_config_key(cluster):
         "Error should mention the missing 'model_name' key"
     )
     print(f"Successfully caught missing config key with error: {error_message}")
+
+
+@pytest.mark.parametrize(
+    ("config_updates", "error_match"),
+    [
+        ({"colocated.enabled": True}, "not supported yet.*colocated"),
+        ({"refit_transport": "nccl_reshard"}, "explicitly unsupported.*nccl_reshard"),
+        (
+            {"refit_transport": "nixl"},
+            "not supported yet.*update_weights_from_checkpoint_engine",
+        ),
+        (
+            {"refit_transport": "custom.module:Engine"},
+            "not supported yet.*update_weights_from_checkpoint_engine",
+        ),
+        ({"refit_transport": "vllm_s3_sparse"}, "refit_transport"),
+        ({"refit_transport": "vllm_zmq_sparse"}, "refit_transport"),
+        ({"quant_cfg": "NVFP4_DEFAULT_CFG"}, "explicitly unsupported.*quant_cfg"),
+        ({"_draft_weights_from_refit": True}, "policy.draft.enabled=true"),
+        (
+            {
+                "vllm_kwargs": {
+                    "speculative_config": {
+                        "method": "mtp",
+                        "num_speculative_tokens": 1,
+                    }
+                },
+                "_mtp_weights_from_refit": True,
+            },
+            "not supported yet.*MTP draft weights",
+        ),
+    ],
+)
+def test_vllm_generation_rejects_unsupported_reload_refit_config(
+    config_updates, error_match
+):
+    class DummyCluster:
+        num_gpus_per_node = 1
+
+        def world_size(self):
+            return 1
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config["refit_transport"] = None
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    for path, value in config_updates.items():
+        target = vllm_config
+        parts = path.split(".")
+        for part in parts[:-1]:
+            target = target[part]
+        target[parts[-1]] = value
+
+    with pytest.raises(AssertionError, match=error_match):
+        VllmGeneration(DummyCluster(), vllm_config)
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):

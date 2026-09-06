@@ -28,6 +28,9 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 
 from __future__ import annotations
 
+import logging
+import time
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
@@ -42,9 +45,15 @@ from nemo_rl.data_plane.schema import (
     GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
+    ROUTE_PASSTHROUGH_FLAG,
+    ROUTE_PLAN_TAG,
+    ROUTED_EXPERTS_ENCODING_FIELD,
+    ROUTED_EXPERTS_FIELD,
+    ROUTED_EXTRAS_METADATA_FIELD,
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
+from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
@@ -162,7 +171,15 @@ def _broadcast_batched_data_dict(
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
                 out[key] = tensor
-            torch.distributed.broadcast(tensor, src=src, group=group)
+            # NCCL has no int16 ("Short") type; ship as int32 and narrow back
+            # (routed_experts rides TQ as int16).
+            if tensor.dtype == torch.int16:
+                wire = tensor.to(torch.int32)
+                torch.distributed.broadcast(wire, src=src, group=group)
+                tensor = wire.to(torch.int16)
+                out[key] = tensor
+            else:
+                torch.distributed.broadcast(tensor, src=src, group=group)
             # Restore non-leader tensors to the leader's source device
             # so downstream code sees the same layout pre-broadcast.
             if (
@@ -216,6 +233,7 @@ class TQWorkerMixin:
     """
 
     _dp_client: Optional[DataPlaneClient] = None
+    _route_fallback_counts: Counter[str] = Counter()
 
     def setup_data_plane(self, cfg: DataPlaneConfig) -> None:
         """Connect this worker process's client to the existing TQ controller.
@@ -239,6 +257,7 @@ class TQWorkerMixin:
         # multimodal model rather than training on rows it mis-describes.
         if self._dp_client is not None:
             return
+        self._route_fallback_counts = Counter()
         from nemo_rl.data_plane import build_data_plane_client
 
         # bootstrap=False — the driver already created the named
@@ -264,6 +283,12 @@ class TQWorkerMixin:
         it use leader-fetch + NCCL broadcast.
         """
         return None
+
+    def _routed_experts_dimensions(self) -> tuple[int, int]:
+        """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
+        raise NotImplementedError(
+            "the router-replay policy worker must provide route dimensions"
+        )
 
     def _pad_value_dict(self) -> dict[str, Any]:
         """Per-field pad value used by :func:`materialize` to detile the jagged wire format.
@@ -345,6 +370,7 @@ class TQWorkerMixin:
                     pad_to_seqlen=pad_to_seqlen,
                     tags=meta.tags,
                 )
+                data = self._maybe_assemble_routed_experts(meta, data)
             else:
                 data = None
             data = _broadcast_batched_data_dict(
@@ -377,6 +403,7 @@ class TQWorkerMixin:
             pad_to_seqlen=pad_to_seqlen,
             tags=meta.tags,
         )
+        data = self._maybe_assemble_routed_experts(meta, data)
         attach_message_log_view(data)
         trace_tq_fetch_payload(
             stage=meta.task_name or "unknown",
@@ -385,6 +412,176 @@ class TQWorkerMixin:
         )
         if preprocess is not None:
             data = preprocess(self, data)
+        return data
+
+    def _fetch_route_fragments(
+        self,
+        *,
+        keys: list[str],
+        partition_id: str,
+    ) -> dict[str, RouteFragment]:
+        """Fetch a unique key set in one request and preserve request identity."""
+        if not keys:
+            return {}
+        rows = self._require_dp_client().get_samples(
+            sample_ids=keys,
+            partition_id=partition_id,
+            select_fields=[
+                ROUTED_EXPERTS_FIELD,
+                ROUTED_EXPERTS_ENCODING_FIELD,
+                ROUTED_EXTRAS_METADATA_FIELD,
+            ],
+        )
+        n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
+        if n_rows != len(keys):
+            raise KeyError(f"requested {len(keys)} route rows, got {n_rows}")
+        route_column = rows.get(ROUTED_EXPERTS_FIELD)
+        encoding_column = rows.get(ROUTED_EXPERTS_ENCODING_FIELD)
+        metadata_column = rows.get(ROUTED_EXTRAS_METADATA_FIELD)
+        if route_column is None or encoding_column is None or metadata_column is None:
+            raise KeyError("deferred route row is missing integrity metadata")
+        return {
+            key: RouteFragment(
+                routes=route_column[index],
+                encoding=int(encoding_column[index].reshape(-1)[0].item()),
+                extras_metadata_json=bytes(
+                    int(value) for value in metadata_column[index].reshape(-1).tolist()
+                ),
+            )
+            for index, key in enumerate(keys)
+        }
+
+    def _route_fragments_by_row(
+        self,
+        plans: list[Any],
+    ) -> tuple[list[dict[str, RouteFragment]], int, float]:
+        """Use one normal-path batch read; isolate error retries per rollout."""
+        from nemo_rl.experience.route_plan import decode_route_plan
+
+        decoded = [decode_route_plan(plan) for plan in plans]
+        partitions = {plan.staging_partition for plan in decoded}
+        if len(partitions) != 1:
+            raise RuntimeError(
+                f"deferred route plans use mixed staging partitions: {partitions}"
+            )
+        partition_id = next(iter(partitions))
+        keys = list(
+            dict.fromkeys(
+                span.staging_key
+                for plan in decoded
+                for span in plan.spans
+                if span.staged_route_len > 0
+            )
+        )
+        fetch_start = time.perf_counter()
+        try:
+            fragments = self._fetch_route_fragments(
+                keys=keys,
+                partition_id=partition_id,
+            )
+        except Exception as batch_error:  # noqa: BLE001 - isolate fallback by rollout
+            logging.getLogger(__name__).warning(
+                "deferred route batch fetch failed; isolating by rollout: %s",
+                batch_error,
+            )
+            per_row: list[dict[str, RouteFragment]] = []
+            for plan in decoded:
+                row_keys = list(
+                    dict.fromkeys(
+                        span.staging_key
+                        for span in plan.spans
+                        if span.staged_route_len > 0
+                    )
+                )
+                try:
+                    per_row.append(
+                        self._fetch_route_fragments(
+                            keys=row_keys,
+                            partition_id=partition_id,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - this rollout becomes sentinel
+                    per_row.append({})
+            return (
+                per_row,
+                len(keys),
+                (time.perf_counter() - fetch_start) * 1000.0,
+            )
+        return (
+            [fragments for _ in decoded],
+            len(keys),
+            (time.perf_counter() - fetch_start) * 1000.0,
+        )
+
+    def _maybe_assemble_routed_experts(
+        self,
+        meta: "KVBatchMeta",
+        data: BatchedDataDict[Any],
+    ) -> BatchedDataDict[Any]:
+        """Materialize deferred routes at the policy worker consumption boundary."""
+        if not (meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG):
+            return data
+
+        from nemo_rl.experience.route_plan import decode_route_plan
+        from nemo_rl.models.generation.interfaces import (
+            ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+        )
+
+        tags = meta.tags or []
+        if len(tags) != len(meta.sample_ids):
+            raise RuntimeError(
+                "deferred route tags must align with sample_ids: "
+                f"{len(tags)} tags for {len(meta.sample_ids)} rows"
+            )
+        encoded_plans = []
+        for index, tag in enumerate(tags):
+            if ROUTE_PLAN_TAG not in tag:
+                raise RuntimeError(
+                    f"deferred route plan missing for row {meta.sample_ids[index]!r}"
+                )
+            encoded_plans.append(tag[ROUTE_PLAN_TAG])
+        plans = [decode_route_plan(plan) for plan in encoded_plans]
+        fragments_by_row, _, _ = self._route_fragments_by_row(encoded_plans)
+
+        # The worker supplies real model dims — the authoritative shape check.
+        num_moe_layers, top_k = self._routed_experts_dimensions()
+        input_ids = data["input_ids"]
+        input_lengths = data["input_lengths"].reshape(-1)
+        routed = torch.full(
+            (
+                len(meta.sample_ids),
+                int(input_ids.shape[1]),
+                num_moe_layers,
+                top_k,
+            ),
+            ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+            dtype=torch.int16,
+        )
+        request_fallbacks: Counter[str] = Counter()
+        for row_index, (plan, fragments) in enumerate(zip(plans, fragments_by_row)):
+            canonical_len = int(input_lengths[row_index].item())
+            tensor, reason = execute_route_plan(
+                plan,
+                fragments,
+                dims=(num_moe_layers, top_k),
+                canonical_len=canonical_len,
+            )
+            if tensor is None:
+                # The row stays all-sentinel: the model falls back to its own
+                # router for exactly these positions (counted, not fatal).
+                request_fallbacks[reason or "unknown"] += 1
+            else:
+                routed[row_index, :canonical_len] = tensor
+
+        self._route_fallback_counts.update(request_fallbacks)
+        if request_fallbacks:
+            logging.getLogger(__name__).warning(
+                "deferred route fallback for %d/%d rollouts: %s",
+                sum(request_fallbacks.values()),
+                len(plans),
+                dict(request_fallbacks),
+            )
+        data[ROUTED_EXPERTS_FIELD] = routed
         return data
 
     def _apply_packing_prep(self, data: BatchedDataDict[Any]) -> BatchedDataDict[Any]:
@@ -750,9 +947,16 @@ class TQWorkerMixin:
         GPU and the metric list ends up TP×CP×PP times too long, which
         inflates every per-token aggregate (gen_kl_error, probs_ratio,
         etc.) by that same factor.
+
+        Also pops this step's deferred-route fallback counts (only the
+        replica leader ever populates them, same as the metrics above) so
+        they report a per-step rate instead of accumulating silently for
+        the worker's lifetime.
         """
         result = self.finish_train_step()  # type: ignore[attr-defined]
         result["is_replica_leader"] = bool(self._is_replica_leader())
+        result["route_fallback_counts"] = dict(self._route_fallback_counts)
+        self._route_fallback_counts = Counter()
         return result
 
     @wrap_with_nvtx_name("policy_worker/abort_train_step_presharded")
