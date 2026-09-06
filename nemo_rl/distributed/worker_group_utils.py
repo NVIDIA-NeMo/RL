@@ -14,6 +14,8 @@
 
 import fnmatch
 import logging
+import os
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
@@ -22,6 +24,19 @@ from nemo_rl.utils.nsys import (
     NRL_NSYS_PROFILE_STEP_RANGE,
     NRL_NSYS_WORKER_PATTERNS,
 )
+
+
+def merge_env_vars_with_process_env(env_vars: Mapping[str, str]) -> dict[str, str]:
+    """Combine caller-declared env vars with the launching process environment.
+
+    Declared values win. Returns a new dict: callers pass a live reference into the
+    run config, and merging in place would persist the whole launcher environment
+    (including any secrets it holds) into every checkpoint's ``config.yaml``.
+    """
+    merged = dict(env_vars)
+    for k, v in os.environ.items():
+        merged.setdefault(k, v)
+    return merged
 
 
 def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
