@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Optional
 
 import pytest
 
+from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
+from nemo_rl.experience.interfaces import Completion
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
@@ -299,6 +302,8 @@ def _run_gym_rollouts(
     effort_config: Optional[EffortLevelsConfig],
     prompt: str,
     results: list[dict],
+    *,
+    on_completion: Optional[Callable[[int, Completion], Awaitable[None]]] = None,
 ):
     """Drive the real _run_rollouts against a fake NeMo-Gym stream."""
     impl = AsyncNemoGymRolloutImpl(
@@ -316,7 +321,14 @@ def _run_gym_rollouts(
         )()
     }
     inputs = [_gym_input(i, prompt) for i in range(len(results))]
-    return asyncio.run(impl._run_rollouts(inputs, Timer(), "timing/test"))
+    return asyncio.run(
+        impl._run_rollouts(
+            inputs,
+            Timer(),
+            "timing/test",
+            on_completion=on_completion,
+        )
+    )
 
 
 def test_rollout_manager_forwards_effort_config():
@@ -326,6 +338,7 @@ def test_rollout_manager_forwards_effort_config():
         "task_to_env": {},
         "num_generations_per_prompt": 1,
         "max_seq_len": 1,
+        "rollout_recovery_config": RolloutRecoveryConfig(),
         "generation_config": _GENERATION_CONFIG,
         "use_nemo_gym": True,
     }
@@ -353,6 +366,34 @@ def test_run_rollouts_shapes_completion_reward_and_emits_low_metrics():
     assert metrics["median_length_low"] == pytest.approx(100.0)
     assert "mean_length_high" not in metrics
     assert "median_length_high" not in metrics
+
+
+def test_streamed_completion_is_shaped_before_recovery_callback() -> None:
+    """Recovery ownership must never seal the environment's raw reward."""
+    observed_rewards: list[float] = []
+
+    async def record_completion(_rowidx: int, completion: Completion) -> None:
+        observed_rewards.append(completion.reward)
+
+    result = {
+        "input_message_log": [{"role": "user", "token_ids": [1, 2]}],
+        "message_log": [],
+        "full_result": {
+            "reward": 1.0,
+            "response": {"usage": {"output_tokens": 100}},
+        },
+        "receipt": {"rollout_id": "rollout-0", "manifest": []},
+        "rollout_id": "rollout-0",
+    }
+
+    _run_gym_rollouts(
+        _LOW_EFFORT_CONFIG,
+        "<budget> be concise",
+        [result],
+        on_completion=record_completion,
+    )
+
+    assert observed_rewards == pytest.approx([1.9])
 
 
 def test_run_rollouts_leaves_high_effort_prompt_reward_untouched():

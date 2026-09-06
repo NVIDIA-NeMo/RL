@@ -180,6 +180,23 @@ token_capture:
   enabled: false
   staging_partition: rollout_staging
 
+# Retry and restore policy for unfinished token-capture groups. "sibling" reuses
+# already sealed generations; "prompt_group" regenerates every sibling when any
+# sibling fails in-process or was unfinished at a checkpoint. Agent overrides win
+# over task overrides.
+rollout_recovery:
+  default_granularity: sibling
+  # Per-Gym-agent override, keyed on extra_env_info.agent_ref.name. Wins over
+  # the task map below.
+  #   agent_granularity_overrides: {genrm_agent: prompt_group}
+  agent_granularity_overrides: {}
+  # Per-dataset-task override, keyed on the prompt's task_name.
+  #   task_granularity_overrides: {math: prompt_group}
+  task_granularity_overrides: {}
+
+# Leaving either map above non-empty requires the top-level token_capture section
+# above to set enabled: true.
+
 cluster:
   # Master ports inherit the shared 1400-1999 band from grpo_math_1B.yaml.
   gpus_per_node: 2

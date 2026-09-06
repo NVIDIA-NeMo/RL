@@ -214,11 +214,12 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         [1.0, 0.0],
         mask_sample=[True, False],
         fallback_weight_version=9,
-        prompt_idx=0,
+        prompt_idx=17,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
     assert finalized.meta.sample_ids == rollout_ids
+    assert [tag["prompt_idx"] for tag in finalized.meta.tags] == [17, 17]
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
@@ -254,11 +255,37 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
+def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
+    tq_client, partitions
+):
+    group_id = "stable"
+    physical_id = f"{group_id}_g0_aattempt"
+    canonical_id = f"{group_id}_g0"
+    receipt, _ = _stage_fixture(
+        tq_client,
+        "worked_example",
+        rollout_id=physical_id,
+    )
+    receipt["rollout_id"] = physical_id
+
+    finalized = _finalizer(tq_client).finalize_group(
+        group_id,
+        [physical_id],
+        [receipt],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=4,
+        prompt_idx=17,
+        canonical_sample_ids=[canonical_id],
+    )
+
+    assert finalized.meta is not None
+    assert finalized.meta.sample_ids == [canonical_id]
+    assert _fetch_rows(tq_client, [canonical_id])["input_ids"] is not None
+
+
 def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions):
-    """The finalizer no longer drops a low-valid-fraction group itself --
-    only the controller can source a replacement, so it reports the counts
-    and always finalizes (see min_valid_fraction_per_group's removal from
-    RolloutReassembler; the threshold now lives in single_controller.py)."""
+    """The finalizer reports validity; the controller owns replacement policy."""
     group_id = "grp2"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
     finalizer = _finalizer(tq_client)
@@ -269,7 +296,7 @@ def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions
         [0.0, 0.0],
         mask_sample=[False] * 2,
         fallback_weight_version=3,
-        prompt_idx=0,
+        prompt_idx=17,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
@@ -415,7 +442,7 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         [1.0, 0.0],
         mask_sample=[False] * 2,
         fallback_weight_version=9,
-        prompt_idx=0,
+        prompt_idx=17,
     )
     assert not finalized.dropped
     assert "routed_experts" in finalized.meta.fields
@@ -471,7 +498,7 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
             [1.0],
             mask_sample=[False],
             fallback_weight_version=9,
-            prompt_idx=0,
+            prompt_idx=17,
         )
 
 
@@ -565,7 +592,7 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         [1.0, 0.0],
         mask_sample=[False] * 2,
         fallback_weight_version=9,
-        prompt_idx=0,
+        prompt_idx=17,
     )
 
     assert finalized.meta is not None
