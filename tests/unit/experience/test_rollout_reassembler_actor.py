@@ -32,7 +32,9 @@ from nemo_rl.experience.rollout_reassembler_actor import (
 def _request() -> ReassemblyRequest:
     return ReassemblyRequest(
         group_id="group",
+        prompt_idx=17,
         rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
         receipts=(
             {
                 "rollout_id": "group_g0",
@@ -47,7 +49,6 @@ def _request() -> ReassemblyRequest:
         ),
         rewards=(1.0,),
         mask_sample=(False,),
-        prompt_idx=0,
         fallback_weight_version=4,
     )
 
@@ -95,6 +96,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     assert {f.name for f in fields(ReassemblyRequest)} == {
         "group_id",
         "rollout_ids",
+        "canonical_sample_ids",
         "receipts",
         "rewards",
         "fallback_weight_version",

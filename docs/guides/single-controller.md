@@ -104,7 +104,32 @@ On resume, Single-Controller validates the TQ snapshot against the trainer check
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
 :::{note}
-Completed groups are restored directly from the TQ snapshot. Prompt groups whose generations were still in flight at the checkpoint boundary are recovered by ownership: `rollout_recovery.pt` records them, and on resume they are redispatched and regenerated from the same dataset rows. Only rows already committed to TQ preserve their exact generated tokens; redispatched groups produce new samples from the same prompts.
+Completed groups are restored directly from the TQ snapshot. For unfinished
+token-capture groups, `rollout_recovery.default_granularity` controls both live
+failure and restart behavior:
+
+- `sibling` preserves each sealed sibling and redispatches only unfinished ones.
+- `prompt_group` retries every sibling in the group when any sibling is unfinished.
+
+`sibling` is the default and avoids regenerating completed work. Use
+`prompt_group` when every generation in a recovered group must come from the
+policy weights live at redispatch.
+
+`task_source_granularity_overrides` can select the policy using the Gym
+`task_source` embedded in the raw rollout row. Unlike `agent_ref`, this identity
+is available before Gym resolves the concrete agent and SC reserves the recovery
+group. When a row already carries an `agent_ref`, a matching
+`agent_granularity_overrides` entry wins over a matching task-source entry,
+mirroring Gym's concrete-route precedence. Otherwise the task-source override,
+then the global default, applies. The agent map also keeps datasets collated
+before Gym recorded `task_source` working, although re-collating them is
+recommended. Non-default policies require `token_capture.enabled: true`. The
+task source and resolved policy are persisted in `rollout_recovery.pt`, so
+recovery does not reinterpret an existing group using changed configuration. A
+generation that already finished keeps its tokens in the token-capture staging
+area, so `sibling` reuses them unchanged; a redispatched sibling produces a new
+sample from the same prompt. Neither becomes a training row until every
+generation in the group has finished.
 :::
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.

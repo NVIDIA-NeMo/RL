@@ -53,6 +53,7 @@ class ReassemblyRequest:
 
     group_id: str
     rollout_ids: tuple[str, ...]
+    canonical_sample_ids: tuple[str, ...]
     receipts: tuple[Optional[dict[str, Any]], ...]
     rewards: tuple[float, ...]
     fallback_weight_version: int
@@ -136,13 +137,14 @@ class RolloutReassemblerActor:  # pragma: no cover
         assert_metadata_only(request)
         if not (
             len(request.rollout_ids)
+            == len(request.canonical_sample_ids)
             == len(request.receipts)
             == len(request.rewards)
             == len(request.mask_sample)
         ):
             raise ValueError(
-                "finalizer request rollout_ids, receipts, rewards, and "
-                "mask_sample must be parallel"
+                "finalizer request rollout_ids, canonical_sample_ids, receipts, "
+                "rewards, and mask_sample must be parallel"
             )
         result = self._finalizer.finalize_group(
             request.group_id,
@@ -152,6 +154,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             mask_sample=list(request.mask_sample),
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
+            canonical_sample_ids=list(request.canonical_sample_ids),
         )
         assert_metadata_only(result)
         return result

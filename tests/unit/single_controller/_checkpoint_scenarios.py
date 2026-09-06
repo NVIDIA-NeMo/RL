@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import torch
+from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils import replay_buffer as _rb
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -56,9 +57,13 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
-from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.experience.rollout_recovery import (
+    RolloutAttemptStatus,
+    RolloutRecoveryLedger,
+)
 
 PARTITION = "rollout_data"
+STAGING_PARTITION = "rollout_staging"
 ROLLOUTS_PER_GROUP = 2  # rollouts_per_prompt_group
 GROUPS_PER_STEP = 3  # prompt_groups per training step
 CAPACITY = 64  # max_buffered_rollouts
@@ -91,7 +96,8 @@ class Group:
         gid: Prompt-group number, matching the order the dataloader served it.
         done: How many of its ``ROLLOUTS_PER_GROUP`` rollouts have finished.
             ``ROLLOUTS_PER_GROUP`` means the group committed; anything less
-            means it is still in flight.
+            means it is still in flight. Finished siblings of an incomplete
+            group are sealed in the recovery ledger and backed by staging rows.
         weight: Weight version the group was dispatched at.
         target: ``target_step`` stamp, used by the gated samplers.
         evicted: The sampler deliberately dropped it (too stale). An evicted
@@ -164,6 +170,10 @@ def _gid(n: int) -> str:
     return f"g{n:02d}"
 
 
+def _staging_key(group_id: str, generation_index: int) -> str:
+    return f"{group_id}/sibling-{generation_index}/call-0"
+
+
 @dataclass(frozen=True)
 class Case:
     """One row of the test matrix: a scenario run under one sampler.
@@ -227,6 +237,12 @@ def _fresh_client(register: bool) -> NoOpDataPlaneClient:
             num_samples=CAPACITY * ROLLOUTS_PER_GROUP,
             consumer_tasks=["train"],
         )
+        dp.register_partition(
+            partition_id=STAGING_PARTITION,
+            fields=["token_ids"],
+            num_samples=CAPACITY * ROLLOUTS_PER_GROUP,
+            consumer_tasks=[],
+        )
     return dp
 
 
@@ -279,7 +295,10 @@ class RoundTrip:
     nothing asserts on them. ``stamps`` records each restored group's
     ``target_step`` and start weight. ``selected`` and ``selected_count`` report
     the optional restore-then-select result used to verify each sampler's
-    recovery key at multiple gate lags.
+    recovery key at multiple gate lags. The sealed-sibling and redispatch maps
+    verify that an unfinished group keeps completed work and retries only its
+    missing generation indices. The staging-row sets verify that the matching
+    token-capture payload survived the data-plane checkpoint.
     """
 
     recovered: set[str]
@@ -291,6 +310,11 @@ class RoundTrip:
     stamps: dict[str, tuple[int | None, int]]
     selected: set[str]
     selected_count: int
+    sealed_before: dict[str, tuple[int, ...]]
+    sealed_after: dict[str, tuple[int, ...]]
+    redispatched: dict[str, tuple[int, ...]]
+    staging_rows_before: set[str]
+    staging_rows_after_restore: set[str]
 
 
 async def _round_trip(
@@ -321,7 +345,7 @@ async def _round_trip(
                 or group.done == ROLLOUTS_PER_GROUP
             ):
                 continue
-            recovery_ledger_a.reserve_group(
+            recovery_group = recovery_ledger_a.reserve_group(
                 cut,
                 group_id=_gid(group.gid),
                 admission_id=f"batch-{group.target}",
@@ -332,8 +356,37 @@ async def _round_trip(
                 start_weight_version=group.weight,
                 admitted=True,
             )
+            recovery_ledger_a.mark_group_dispatched(cut, recovery_group.group_id)
+            for generation_index in range(group.done):
+                gate_rollout_id = recovery_group.gate_rollout_id(generation_index)
+                staging_key = _staging_key(recovery_group.group_id, generation_index)
+                dp_a.put_samples(
+                    sample_ids=[staging_key],
+                    partition_id=STAGING_PARTITION,
+                    fields=TensorDict(
+                        {"token_ids": torch.tensor([[generation_index]])},
+                        batch_size=[1],
+                    ),
+                )
+                recovery_ledger_a.mark_sibling_sealed(
+                    cut,
+                    recovery_group.group_id,
+                    generation_index=generation_index,
+                    gate_rollout_id=gate_rollout_id,
+                    receipt={
+                        "rollout_id": gate_rollout_id,
+                        "manifest": [{"staging_key": staging_key}],
+                    },
+                    reward=float(generation_index),
+                    mask_sample=False,
+                )
+    sealed_before = {
+        group.group_id: tuple(group.sealed_generation_indices)
+        for group in recovery_ledger_a.groups()
+    }
     recovery_sidecar = recovery_ledger_a.state_dict()
     rows_before = set(dp_a.list_sample_ids(PARTITION))
+    staging_rows_before = set(dp_a.list_sample_ids(STAGING_PARTITION))
     dp_a.save_checkpoint(tmp_path / "data_plane")
 
     # ---- restart: brand new process, nothing carried over in memory ----
@@ -354,8 +407,30 @@ async def _round_trip(
         recovery_ledger_b = RolloutRecoveryLedger()
         async with buf_b.data_plane_checkpoint_barrier.mutation() as cut:
             recovery_ledger_b.load_state_dict(cut, recovery_sidecar)
+            recovery_ledger_b.prepare_for_restart(cut)
             recovery_ledger_b.discard_canonical_groups(cut, set(buf_b._group_ids))
+        staging_rows_after_restore = set(dp_b.list_sample_ids(STAGING_PARTITION))
+        sealed_after = {
+            group.group_id: tuple(group.sealed_generation_indices)
+            for group in recovery_ledger_b.groups()
+        }
+        redispatched: dict[str, tuple[int, ...]] = {}
         for group in recovery_ledger_b.groups():
+            async with buf_b.data_plane_checkpoint_barrier.mutation() as cut:
+                retry_group = recovery_ledger_b.prepare_incomplete_retry(
+                    cut, group.group_id
+                )
+                generation_indices = tuple(
+                    sibling.generation_index
+                    for sibling in retry_group.siblings
+                    if sibling.current_attempt.status is RolloutAttemptStatus.RESERVED
+                )
+                recovery_ledger_b.mark_group_dispatched(
+                    cut,
+                    group.group_id,
+                    generation_indices=list(generation_indices),
+                )
+            redispatched[group.group_id] = generation_indices
             group_id = buf_b.reserve(
                 weight_version=group.start_weight_version,
                 target_step=group.target_step,
@@ -369,6 +444,10 @@ async def _round_trip(
             )
             async with buf_b.data_plane_checkpoint_barrier.mutation() as cut:
                 recovery_ledger_b.discard_group(cut, group_id)
+    else:
+        sealed_after = {}
+        redispatched = {}
+        staging_rows_after_restore = set(dp_b.list_sample_ids(STAGING_PARTITION))
 
     ready = {
         gid for gid, is_ready in zip(buf_b._group_ids, buf_b.ready_list) if is_ready
@@ -405,6 +484,11 @@ async def _round_trip(
         stamps=stamps,
         selected=selected,
         selected_count=selected_count,
+        sealed_before=sealed_before,
+        sealed_after=sealed_after,
+        redispatched=redispatched,
+        staging_rows_before=staging_rows_before,
+        staging_rows_after_restore=staging_rows_after_restore,
     )
 
 
@@ -506,6 +590,21 @@ S_PARTIAL = Scenario(
     lag=1,
 )
 
+S_ZERO_LAG_PARTIAL = Scenario(
+    name="lag0-current-step-partly-generated",
+    groups=(
+        Group(9, 2, weight=4, target=4),
+        Group(10, 2, weight=4, target=4),
+        Group(11, 2, weight=4, target=4),
+        Group(12, 1, weight=5, target=5),
+        Group(13, 2, weight=5, target=5),
+        Group(14, 0, weight=5, target=5),
+    ),
+    cursor=15,
+    trained=frozenset({9, 10, 11}),
+    lag=0,
+)
+
 S_LAG2 = Scenario(
     name="lag2-two-batches-in-flight",
     groups=(
@@ -568,5 +667,12 @@ S_STALE_ONLY = Scenario(
 # Everything fully generated -- the case this PR set out to recover.
 FULLY_GENERATED = (S_ZERO_LAG_ALL_COMPLETE, S_ALL_COMPLETE, S_STALE_ONLY)
 # At least one group still generating when the snapshot was taken.
-WITH_IN_FLIGHT = (S_PARTIAL, S_LAG2, S_EVICTED, S_TRAINED_OUT_OF_ORDER)
+WITH_IN_FLIGHT = (
+    S_ZERO_LAG_PARTIAL,
+    S_PARTIAL,
+    S_LAG2,
+    S_EVICTED,
+    S_TRAINED_OUT_OF_ORDER,
+)
+WITH_SEALED_SIBLINGS = (S_ZERO_LAG_PARTIAL, S_PARTIAL, S_LAG2)
 ALL_SCENARIOS = FULLY_GENERATED + WITH_IN_FLIGHT

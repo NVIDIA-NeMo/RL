@@ -78,6 +78,20 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
+def _rollout_progress_identity(row: Mapping[str, Any]) -> str:
+    """Return the concrete agent route, falling back to task provenance."""
+    agent_ref = row.get("agent_ref")
+    if isinstance(agent_ref, Mapping):
+        agent_name = agent_ref.get("name")
+        if isinstance(agent_name, str) and agent_name:
+            return f"agent:{agent_name}"
+
+    task_source = row.get("task_source")
+    if isinstance(task_source, str) and task_source:
+        return f"task-source:{task_source}"
+    return "<unknown>"
+
+
 class NemoGymCompatibleConfig(Protocol):
     """Configuration fields required to select the NeMo Gym rollout path."""
 
@@ -602,17 +616,20 @@ Depending on your data shape, you may want to change these values."""
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
-        timer = Timer()
-        counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
-
         # Normalize local media before shipping requests to vLLM. Helper is a no-op
         # for text-only rows and already-qualified URLs.
         # Megatron's HTTP backend consumes the same normalized Responses payload.
         normalize_media_in_examples(nemo_gym_examples)
 
+        timer = Timer()
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
+        )
+        # Gym resolves task_source to agent_ref synchronously in run_examples().
+        # Build the counter afterward so completion rows use the same identity.
+        routing_counts_left = Counter(
+            _rollout_progress_identity(row) for row in nemo_gym_examples
         )
 
         num_results = 0
@@ -665,18 +682,18 @@ Depending on your data shape, you may want to change these values."""
                     / total_time
                 )
 
-            agent_name = nemo_gym_row["agent_ref"]["name"]
-            counts_left[agent_name] -= 1
-            if counts_left[agent_name] <= 0:
-                counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
-                top_left = counts_left.most_common(5)
+            routing_identity = _rollout_progress_identity(nemo_gym_row)
+            routing_counts_left[routing_identity] -= 1
+            if routing_counts_left[routing_identity] <= 0:
+                routing_counts_left.pop(routing_identity)
+            if num_results % 10 == 0 and routing_counts_left:
+                top_left = routing_counts_left.most_common(5)
                 top_left_str = "\n".join(
                     f"{index + 1}. {name}: {count}"
                     for index, (name, count) in enumerate(top_left)
                 )
                 print(
-                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                    "Top 5 NeMo Gym routing identities left in this rollout batch: "
                     f"{top_left_str}",
                     file=sys.stderr,
                 )
