@@ -28,8 +28,8 @@ from pathlib import Path
 from nemo_rl.models.generation.vllm import patches
 
 
-def patch_snippets(patch_fn_name: str) -> tuple[str, str]:
-    """Return ``(old_snippet, new_snippet)`` for a patch function in patches.py.
+def patch_replacements(patch_fn_name: str) -> tuple[tuple[str, str], ...]:
+    """Return all ``(old_snippet, new_snippet)`` pairs for a source patch.
 
     Read out of the source with ``ast`` rather than duplicated here, so the
     snippets cannot drift from the patch they are meant to reverse.
@@ -47,6 +47,7 @@ def patch_snippets(patch_fn_name: str) -> tuple[str, str]:
         ) from None
 
     snippets = {}
+    replacements = None
     for node in ast.walk(func):
         if (
             isinstance(node, ast.Assign)
@@ -56,13 +57,35 @@ def patch_snippets(patch_fn_name: str) -> tuple[str, str]:
         ):
             snippets[node.targets[0].id] = ast.literal_eval(node.value)
 
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "replacements"
+        ):
+            replacements = ast.literal_eval(node.value)
+
+    if replacements is not None:
+        return tuple(replacements)
+
     missing = {"old_snippet", "new_snippet"} - snippets.keys()
     if missing:
         raise AssertionError(
             f"{patch_fn_name} no longer defines {sorted(missing)}; the test "
             "helper can no longer reverse its patch"
         )
-    return snippets["old_snippet"], snippets["new_snippet"]
+    return ((snippets["old_snippet"], snippets["new_snippet"]),)
+
+
+def patch_snippets(patch_fn_name: str) -> tuple[str, str]:
+    """Return the single replacement pair used by a one-anchor patch."""
+    replacements = patch_replacements(patch_fn_name)
+    if len(replacements) != 1:
+        raise AssertionError(
+            f"{patch_fn_name} has {len(replacements)} replacement pairs; use "
+            "patch_replacements()"
+        )
+    return replacements[0]
 
 
 def write_unpatched_copy(
@@ -80,19 +103,20 @@ def write_unpatched_copy(
     Returns:
         ``destination``.
     """
-    old_snippet, new_snippet = patch_snippets(patch_fn_name)
+    replacements = patch_replacements(patch_fn_name)
     content = Path(patches._get_vllm_file(relative_source)).read_text()
 
-    if new_snippet in content:
-        content = content.replace(new_snippet, old_snippet, 1)
-    assert new_snippet not in content, (
-        f"reversing {patch_fn_name} left its replacement behind in "
-        f"{relative_source}; the patch may have been applied more than once"
-    )
-    assert old_snippet in content, (
-        f"{relative_source} contains neither the patched nor the original form "
-        f"of the {patch_fn_name} anchor; vLLM has probably changed upstream"
-    )
+    for old_snippet, new_snippet in reversed(replacements):
+        if new_snippet in content:
+            content = content.replace(new_snippet, old_snippet, 1)
+        assert new_snippet not in content, (
+            f"reversing {patch_fn_name} left its replacement behind in "
+            f"{relative_source}; the patch may have been applied more than once"
+        )
+        assert old_snippet in content, (
+            f"{relative_source} contains neither the patched nor the original "
+            f"form of a {patch_fn_name} anchor; vLLM has probably changed upstream"
+        )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(content)

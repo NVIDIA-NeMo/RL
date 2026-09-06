@@ -602,6 +602,190 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     )
 
 
+def _patch_vllm_radio_final_layernorm(logger) -> None:
+    """Match HF/Megatron's final RADIO encoder LayerNorm in vLLM.
+
+    Nemotron Super-Omni checkpoints with MTP apply a learned final LayerNorm to
+    RADIO features before pixel shuffle and projection. vLLM 0.25.1 omits the
+    module, operation, and checkpoint mapping. Patch all image/video feature
+    paths and load the learned affine parameters. The norm is selected from the
+    model configuration; it does not require a runtime experiment flag.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate nano_nemotron_vl.py for the RADIO final "
+            "LayerNorm patch."
+        )
+        return
+
+    marker = "self.vision_final_layernorm = nn.LayerNorm("
+    replacements = (
+        (
+            """            self.mlp1 = mlp1.to(llm_dtype)
+            self.sound_encoder: ProjectedParakeet | None = None
+""",
+            """            self.mlp1 = mlp1.to(llm_dtype)
+            self.vision_final_layernorm: nn.LayerNorm | None = None
+            if (
+                getattr(config.text_config, "num_nextn_predict_layers", 0) or 0
+            ) > 0:
+                # Keep the tiny affine in fp32 so normalization matches the
+                # Megatron scoring path; checkpoint BF16 values load into it.
+                self.vision_final_layernorm = nn.LayerNorm(
+                    vit_hidden_size,
+                    eps=getattr(vision_config, "layer_norm_eps", 1.0e-6),
+                ).float()
+                logger.info_once(
+                    "Enabled checkpoint-backed RADIO final LayerNorm",
+                    scope="global",
+                )
+            self.sound_encoder: ProjectedParakeet | None = None
+""",
+        ),
+        (
+            """        return x
+
+    def extract_feature_dynamic(
+""",
+            """        return x
+
+    def _apply_vision_final_layernorm(
+        self, vit_embeds: torch.Tensor
+    ) -> torch.Tensor:
+        if self.vision_final_layernorm is None:
+            return vit_embeds
+        output_dtype = vit_embeds.dtype
+        return self.vision_final_layernorm(vit_embeds.float()).to(output_dtype)
+
+    def extract_feature_dynamic(
+""",
+        ),
+        (
+            """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
+        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+            """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
+        vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+        ),
+        (
+            """            else:
+                _, vit_embeds = self.vision_model(chunk)
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+            """            else:
+                _, vit_embeds = self.vision_model(chunk)
+            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+        ),
+        (
+            """            connector=["mlp1", "sound_encoder.projection"],
+""",
+            """            connector=[
+                "mlp1",
+                "vision_final_layernorm",
+                "sound_encoder.projection",
+            ],
+""",
+        ),
+        (
+            """        adapter_dict = dict(self.mlp1.named_parameters())
+""",
+            """        adapter_dict = dict(self.mlp1.named_parameters())
+        final_layernorm_dict = (
+            dict(self.vision_final_layernorm.named_parameters())
+            if self.vision_final_layernorm is not None
+            else {}
+        )
+""",
+        ),
+        (
+            """            return None
+
+        def is_vision_weights(name: str) -> bool:
+""",
+            """            return None
+
+        def get_final_layernorm_name(name: str) -> str | None:
+            for prefix in (
+                "vision_final_layernorm.",
+                "vision_projector.vision_final_layernorm.",
+            ):
+                if name.startswith(prefix):
+                    return name.removeprefix(prefix)
+            return None
+
+        def is_vision_weights(name: str) -> bool:
+""",
+        ),
+        (
+            """        adapter_weights: list[tuple[str, torch.Tensor]] = []
+        vision_weights: list[tuple[str, torch.Tensor]] = []
+""",
+            """        adapter_weights: list[tuple[str, torch.Tensor]] = []
+        final_layernorm_weights: list[tuple[str, torch.Tensor]] = []
+        vision_weights: list[tuple[str, torch.Tensor]] = []
+""",
+        ),
+        (
+            """                elif is_vision_weights(name):
+""",
+            """                elif (
+                    final_layernorm_name := get_final_layernorm_name(name)
+                ) is not None:
+                    if (
+                        not load_multimodal_weights
+                        or self.vision_final_layernorm is None
+                    ):
+                        continue
+                    final_layernorm_weights.append(
+                        (final_layernorm_name, w.detach().clone())
+                    )
+                elif is_vision_weights(name):
+""",
+        ),
+        (
+            """            self.vision_model.load_weights(vision_weights)
+            if self.sound_encoder is not None and len(sound_weights) > 0:
+""",
+            """            for trimmed_name, w in final_layernorm_weights:
+                param = final_layernorm_dict[trimmed_name]
+                with torch.no_grad():
+                    default_weight_loader(param, w)
+            if final_layernorm_weights:
+                logger.info_once(
+                    "Loaded RADIO final LayerNorm affine parameters",
+                    scope="global",
+                )
+            self.vision_model.load_weights(vision_weights)
+            if self.sound_encoder is not None and len(sound_weights) > 0:
+""",
+        ),
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM RADIO final LayerNorm patch already applied.")
+            return
+        for old_snippet, _new_snippet in replacements:
+            if content.count(old_snippet) != 1:
+                logger.warning(
+                    "Could not apply vLLM RADIO final LayerNorm patch: expected "
+                    "vLLM 0.25.1 source shape was not found in %s.",
+                    file_to_patch,
+                )
+                return
+        for old_snippet, new_snippet in replacements:
+            content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info("Applied checkpoint-backed vLLM RADIO final LayerNorm patch.")
+
+
 def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:
     """Compute NemotronH logits with an fp32 LM head (MiniMax-M1-style).
 
@@ -677,6 +861,8 @@ def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:
         write_back(content.replace(old_snippet, new_snippet, 1))
 
     logger.info("Applied NemotronH fp32 LM head source patch.")
+
+
 def _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch(
     logger: Any | None = None,
 ) -> None:
@@ -1224,5 +1410,6 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_nemotron_h_fp32_lm_head(patch_logger)
     _patch_vllm_flashinfer_trtllm_refit_buffers(patch_logger)
