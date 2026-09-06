@@ -21,6 +21,11 @@ policy:
     moe_hybridep_num_sms: 32
     moe_hybridep_prepad_packed_inputs: true
     moe_router_dtype: fp32
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "32"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "72"
+      USE_MNNVL: "1"
   generation:
     refit_transport: null
     colocated:
