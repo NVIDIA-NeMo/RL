@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -30,10 +31,18 @@ from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryCon
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    _ATTEMPT_STATE_FIELDS,
+    _GROUP_STATE_FIELDS,
+    _PROMPT_REF_STATE_FIELDS,
+    _SIBLING_STATE_FIELDS,
     PromptGroupPhase,
+    PromptGroupRecoveryRecord,
+    PromptRef,
     RecoveryGranularity,
+    RolloutAttemptRecord,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
+    RolloutSiblingRecord,
     SiblingSealResult,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -127,6 +136,22 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
     assert restored.get_group("g7").phase is PromptGroupPhase.ADMITTED
 
 
+def test_serialized_state_fields_match_recovery_dataclasses() -> None:
+    """Require every durable dataclass field to be classified explicitly."""
+    assert _PROMPT_REF_STATE_FIELDS == {
+        field.name for field in dataclasses.fields(PromptRef)
+    }
+    assert _SIBLING_STATE_FIELDS == {
+        field.name for field in dataclasses.fields(RolloutSiblingRecord)
+    }
+    assert _ATTEMPT_STATE_FIELDS == {
+        field.name for field in dataclasses.fields(RolloutAttemptRecord)
+    }
+    assert _GROUP_STATE_FIELDS == {
+        field.name for field in dataclasses.fields(PromptGroupRecoveryRecord)
+    } - {"runtime_prompt_payload"}
+
+
 @pytest.mark.parametrize(
     ("path", "context"),
     [
@@ -160,6 +185,126 @@ def test_ledger_restore_rejects_unknown_fields(
     target["unexpected"] = True
 
     with pytest.raises(ValueError, match=rf"{context} contains unknown fields"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def _sealed_attempt_state() -> dict[str, Any]:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    gate_id = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=gate_id,
+            receipt={
+                "rollout_id": gate_id,
+                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
+            },
+            reward=1.0,
+            mask_sample=True,
+        )
+    )
+    return ledger.state_dict()
+
+
+@pytest.mark.parametrize(
+    ("case", "error_fragment"),
+    [
+        ("attempt_uuid", "attempt_uuid must contain exactly 16 bytes"),
+        ("status_type", "invalid rollout attempt status"),
+        ("status_value", "invalid rollout attempt status"),
+        ("staging_keys", "staging_keys must be a list of strings"),
+        ("reward", "sealed attempts require a reward"),
+        ("mask_sample", "sealed attempts require a boolean mask_sample"),
+        (
+            "missing_receipt_staging",
+            "sealed missing-receipt attempt cannot own staging keys",
+        ),
+        ("receipt_type", "sealed attempt receipt must be a mapping or None"),
+        ("receipt_manifest_type", "receipt must contain a manifest list"),
+        ("receipt_identity", "sealed receipt identity mismatch"),
+        ("receipt_manifest", "sealed receipt staging manifest mismatch"),
+        ("unsealed_payload", "only sealed attempts may retain receipt data"),
+    ],
+)
+def test_restore_rejects_malformed_attempt_fields(
+    case: str, error_fragment: str
+) -> None:
+    state = _sealed_attempt_state()
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+
+    if case == "attempt_uuid":
+        attempt["attempt_uuid"] = b"short"
+    elif case == "status_type":
+        attempt["status"] = None
+    elif case == "status_value":
+        attempt["status"] = "unknown"
+    elif case == "staging_keys":
+        attempt["staging_keys"] = ["valid", 7]
+    elif case == "reward":
+        attempt["reward"] = None
+    elif case == "mask_sample":
+        attempt["mask_sample"] = "yes"
+    elif case == "missing_receipt_staging":
+        attempt["receipt"] = None
+    elif case == "receipt_type":
+        attempt["receipt"] = []
+    elif case == "receipt_manifest_type":
+        attempt["receipt"]["manifest"] = None
+    elif case == "receipt_identity":
+        attempt["receipt"]["rollout_id"] = "wrong"
+    elif case == "receipt_manifest":
+        attempt["receipt"]["manifest"] = [{"staging_key": "wrong"}]
+    elif case == "unsealed_payload":
+        attempt["status"] = RolloutAttemptStatus.DISPATCHED.value
+    else:  # pragma: no cover - the parameter table above owns the cases.
+        raise AssertionError(f"unknown malformed-attempt case={case!r}")
+
+    with pytest.raises(ValueError, match=error_fragment):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def test_restore_rejects_non_mapping_attempt() -> None:
+    state = _sealed_attempt_state()
+    state["groups"][0]["siblings"][0]["attempts"][0] = None
+
+    with pytest.raises(ValueError, match="rollout-recovery attempt must be a mapping"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def test_restore_rejects_duplicate_attempt_identity() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+    siblings = state["groups"][0]["siblings"]
+    siblings[1]["attempts"][0]["attempt_uuid"] = siblings[0]["attempts"][0][
+        "attempt_uuid"
+    ]
+
+    with pytest.raises(ValueError, match="duplicate rollout attempt identity"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 

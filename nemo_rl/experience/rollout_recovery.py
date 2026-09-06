@@ -23,6 +23,7 @@ reads back on restore.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -1163,20 +1164,9 @@ class RolloutRecoveryLedger:
     @staticmethod
     def _copy_group(record: PromptGroupRecoveryRecord) -> PromptGroupRecoveryRecord:
         """Copy mutable lineage metadata without duplicating the prompt payload."""
-        return PromptGroupRecoveryRecord(
-            group_id=record.group_id,
-            admission_id=record.admission_id,
-            prompt_id=record.prompt_id,
-            prompt_ref=record.prompt_ref,
-            agent_name=record.agent_name,
-            recovery_granularity=record.recovery_granularity,
-            runtime_prompt_payload=record.runtime_prompt_payload,
-            expected_generations=record.expected_generations,
-            target_step=record.target_step,
-            start_weight_version=record.start_weight_version,
+        return dataclasses.replace(
+            record,
             siblings=copy.deepcopy(record.siblings),
-            phase=record.phase,
-            status=record.status,
         )
 
     @staticmethod
