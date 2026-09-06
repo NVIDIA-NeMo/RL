@@ -42,7 +42,9 @@ single `ValueError` listing every violation. The current requirements are:
 * BF16 FlashInfer TRTLLM MoE is supported through vLLM's native
   layerwise-reload path. Its grouped expert weights must use expert-parallel
   destination sharding with linear expert placement; tensor-sharded expert
-  destinations and round-robin placement are rejected.
+  destinations and round-robin placement are rejected. This path does not
+  support an FP8 KV cache or a co-trained MTP drafter; setup rejects both
+  combinations.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`. 
 * Generation-side, PP > 1 is not supported. 
@@ -71,18 +73,22 @@ nccl-reshard-refit implementation:
   Two FFN-named groups are explicitly excluded and ride the misc path instead:
   shared-expert weights (`*.shared_expert.*`, which fuse differently on the vLLM
   side) and co-trained MTP drafter weights (which vLLM keeps in a separate
-  drafter module updated through `load_weights`). MTP weights are recognized two
-  ways: bare-`mtp.`-prefix HF names (NemotronH, Qwen3.5) via
+  drafter module updated through `load_weights`). Co-trained MTP is not supported
+  with BF16 FlashInfer TRTLLM; this routing applies to other supported backend
+  combinations. MTP weights are recognized two ways: bare-`mtp.`-prefix HF names
+  (NemotronH, Qwen3.5) via
   `is_nccl_reshard_param()`, and DeepSeek-style MTP exported as trailing
   `model.layers.N` indices via provenance — the Megatron-side name carries an
   `mtp.` module segment (bare for LM bridges, `language_model.mtp.*` for the VL
   and EXAONE bridges), so the worker excludes those HF layers when building the
   metadata (`_collect_mtp_hf_layer_names()`).
 * **Misc path** — everything else (embeddings, attention projections, layernorms, the
-  MoE router, `lm_head`, FP8 `_scale_inv` siblings, FP8 KV-cache scales, …). These ride
-  a packed broadcast (conventional `packed_tensor.py` implementation) over the shared
-  `model_update_group` and are loaded on the generation side through the backend's
-  regular `load_weights` machinery.
+  MoE router, `lm_head`, FP8 `_scale_inv` siblings, FP8 KV-cache scales, …). FP8
+  KV-cache scales are supported only by backend combinations that allow an FP8 KV
+  cache; BF16 FlashInfer TRTLLM rejects that configuration at setup. These tensors
+  ride a packed broadcast (conventional `packed_tensor.py` implementation) over the
+  shared `model_update_group` and are loaded on the generation side through the
+  backend's regular `load_weights` machinery.
 
 The feature is integrated into the `nemo_rl/weight_sync/` framework:
 `create_weight_synchronizer(..., nccl_reshard_refit=True)` returns a
@@ -96,8 +102,8 @@ training starts:
 
 1. **`init_collective()`** — creates the `model_update_group`, a NCCL group spanning all
    training and generation ranks. The bulk path does not use it; it carries the misc
-   packed-broadcast (and FP8 KV-cache scales), identical to the conventional collective
-   transport.
+   packed-broadcast, including FP8 KV-cache scales for backend combinations that support
+   them, identical to the conventional collective transport.
 2. **`init_nccl_reshard_comm_group()`** — creates the bulk-path communicator(s): **one
    NCCL group per training PP stage**, each spanning that stage's training ranks plus
    *all* generation ranks (non-PP is simply `pp_size == 1`, a single group over
