@@ -152,8 +152,8 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
         "num_routed_experts_backfilled": 0,
     }
     assert tags == [
-        {"weight_version": 3, "prompt_idx": 17, **no_violations},
-        {"weight_version": 3, "prompt_idx": 17, **no_violations},
+        {"weight_version": 3, "prompt_idx": 17, "group_id": "group", **no_violations},
+        {"weight_version": 3, "prompt_idx": 17, "group_id": "group", **no_violations},
     ]
 
 
@@ -360,6 +360,7 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
         {
             "weight_version": 7,
             "prompt_idx": 17,
+            "group_id": "g",
             "num_invalid_tool_calls": 1,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 1,
@@ -368,6 +369,7 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
         {
             "weight_version": 7,
             "prompt_idx": 17,
+            "group_id": "g",
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 1,
             "num_assistant_messages": 1,
@@ -376,6 +378,7 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
         {
             "weight_version": 7,
             "prompt_idx": 17,
+            "group_id": "g",
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 0,
