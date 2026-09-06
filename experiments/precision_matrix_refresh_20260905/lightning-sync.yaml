@@ -19,6 +19,7 @@ policy:
     moe_token_dispatcher_type: flex
     moe_flex_dispatcher_backend: hybridep
     moe_hybridep_num_sms: 32
+    moe_hybridep_prepad_packed_inputs: true
     moe_router_dtype: fp32
   generation:
     refit_transport: null
