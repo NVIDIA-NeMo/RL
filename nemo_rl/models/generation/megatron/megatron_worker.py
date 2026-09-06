@@ -557,10 +557,10 @@ class MegatronGenerationMixin:
         ip = _get_node_ip_local()
         reserved_port = self._reserved_http_server_port
         if reserved_port is not None:
-            # Defer fd handoff until immediately before server startup. Holding
-            # this listener across model initialization can leak it into a
-            # long-lived child process, which then receives SO_REUSEPORT traffic
-            # despite never accepting HTTP requests.
+            # Defer socket handoff until immediately before server startup.
+            # Holding this listener across model initialization can fork
+            # into a persistent child process, which then receives Gym
+            # traffic despite never accepting HTTP requests.
             reserved_socket = receive_held_socket(reserved_port)
             server_port = reserved_socket.getsockname()[1]
         else:

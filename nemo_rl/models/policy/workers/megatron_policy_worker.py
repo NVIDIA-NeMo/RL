@@ -479,11 +479,9 @@ class MegatronPolicyWorkerImpl(
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
-        # Keep only the port number during model initialization. Adopting the
-        # listening socket here lets long-lived initialization subprocesses
-        # inherit a duplicate fd; with SO_REUSEPORT, requests can then be routed
-        # to a subprocess that never accepts them. Rank 0 adopts the socket
-        # immediately before starting the HTTP frontends instead.
+        # Store the reserved HTTP server port for inference server initialization.
+        # Megatron-LLM's inference server lives on Rank 0 only.
+        # TODO: Multiple inference servers for each MP coordinator.
         self._reserved_http_server_port = (
             reserved_http_server_port if self.rank == 0 else None
         )
