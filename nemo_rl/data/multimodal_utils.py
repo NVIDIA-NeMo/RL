@@ -1240,7 +1240,7 @@ def extract_multimodal_model_inputs(
                 f"Processor model input {key!r} must be a torch.Tensor, got "
                 f"{type(value).__name__}."
             )
-        if key == "imgs_sizes":
+        if key in ("imgs_sizes", "num_frames"):
             value = value.to(dtype=torch.int32)
         extracted[key] = PackedTensor(
             value,

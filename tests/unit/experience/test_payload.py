@@ -84,7 +84,9 @@ def _completion(
     )
 
 
-def _record(completions: list[Completion]) -> PromptGroupRecord:
+def _record(
+    completions: list[Completion], *, loss_multiplier: float = 1.0
+) -> PromptGroupRecord:
     return PromptGroupRecord(
         prompt_idx=0,
         prompt=[
@@ -98,6 +100,7 @@ def _record(completions: list[Completion]) -> PromptGroupRecord:
         metadata={"task_name": "test"},
         completions=completions,
         rollout_metrics={},
+        loss_multiplier=loss_multiplier,
     )
 
 
@@ -320,6 +323,24 @@ def test_record_to_train_batch_carries_raw_masks_without_applying_them() -> None
     )
     assert torch.equal(fields["mask_sample"], train_batch["mask_sample"])
     assert torch.equal(fields["truncated"], train_batch["truncated"])
+
+
+def test_record_to_train_batch_broadcasts_prompt_loss_multiplier() -> None:
+    record = _record(
+        [
+            _completion(route_start=10, reward=1.0),
+            _completion(route_start=30, reward=2.0),
+        ],
+        loss_multiplier=0.0,
+    )
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+
+    assert torch.equal(train_batch["sample_mask"], torch.zeros(2))
 
 
 def _failed_completion() -> Completion:

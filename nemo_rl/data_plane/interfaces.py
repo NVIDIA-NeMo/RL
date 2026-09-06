@@ -296,7 +296,22 @@ class KVBatchMeta:
         )
 
     def concat(self, *others: "KVBatchMeta") -> "KVBatchMeta":
-        """Append ``others`` and union their fields in first-seen order."""
+        """Append metadata from the same partition.
+
+        Sample IDs are concatenated in argument order, while fields are
+        unioned in first-seen order. Sequence lengths and tags are retained
+        only when every input provides them.
+
+        Args:
+            *others: Metadata batches whose ``partition_id`` matches this
+                batch.
+
+        Returns:
+            A new metadata batch containing all input rows.
+
+        Raises:
+            ValueError: If any input has a different ``partition_id``.
+        """
         if any(o.partition_id != self.partition_id for o in others):
             raise ValueError("KVBatchMeta.concat: partition_ids must match")
         all_m = (self, *others)

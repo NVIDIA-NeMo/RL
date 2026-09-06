@@ -234,6 +234,8 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
 
+- VLM-GRPO with Megatron training is supported with either vLLM or Megatron
+  generation.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).

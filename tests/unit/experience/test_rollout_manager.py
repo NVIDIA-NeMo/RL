@@ -1020,7 +1020,10 @@ def test_async_rollout_manager(
     - completions hold independent (not aliased) message_log objects
     """
     vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
-    input_sample = single_multi_step_calculator_input_sample
+    input_sample = {
+        **single_multi_step_calculator_input_sample,
+        "loss_multiplier": 0.25,
+    }
     num_generations = 2
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
@@ -1044,6 +1047,7 @@ def test_async_rollout_manager(
         f"Expected {num_generations} completions, got {len(record.completions)}"
     )
     assert record.prompt_idx == input_sample["idx"]
+    assert record.loss_multiplier == input_sample["loss_multiplier"]
 
     for i, completion in enumerate(record.completions):
         assert isinstance(completion, Completion)
@@ -1298,6 +1302,7 @@ def test_async_nemo_gym_rollout_manager(
         f"Expected {num_generations} completions, got {len(record.completions)}"
     )
     assert record.prompt_idx == 0
+    assert record.loss_multiplier == single_prompt["loss_multiplier"]
 
     for i, completion in enumerate(record.completions):
         assert isinstance(completion, Completion)

@@ -455,6 +455,7 @@ class AsyncRolloutImpl:
             metadata={"task_name": input_sample["task_name"]},
             completions=completions,
             rollout_metrics=rollout_metrics,
+            loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
         )
 
     async def _run_single_rollout(
@@ -874,6 +875,7 @@ class AsyncNemoGymRolloutImpl:
             metadata={"task_name": "nemo_gym"},
             completions=completions,
             rollout_metrics=rollout_metrics,
+            loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
         )
 
     def _validate_init_params(self) -> None:

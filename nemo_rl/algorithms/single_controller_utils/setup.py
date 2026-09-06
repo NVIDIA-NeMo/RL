@@ -70,10 +70,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.multimodal_utils import (
-    PACKED_MULTIMODAL_FIELDS,
-    PER_TOKEN_MULTIMODAL_FIELDS,
-)
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -1447,9 +1444,7 @@ def setup_single_controller(
         if processor is not None:
             partition_fields.extend(
                 field
-                for field in sorted(
-                    PACKED_MULTIMODAL_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
-                )
+                for field in sorted(WIRE_MULTIMODAL_FIELDS)
                 if field not in partition_fields
             )
         dp_client.register_partition(
@@ -1479,13 +1474,20 @@ def setup_single_controller(
             )
         group_size = algo_cfg.num_generations_per_prompt
         num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
+        partition_fields = fields_with_optional_routed_experts(
+            DP_TRAIN_FIELDS,
+            enabled=r3_enabled
+            and not token_capture_cfg.defer_routed_experts_to_policy,
+        )
+        if processor is not None:
+            partition_fields.extend(
+                field
+                for field in sorted(WIRE_MULTIMODAL_FIELDS)
+                if field not in partition_fields
+            )
         dp_client.register_partition(
             partition_id=partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS,
-                enabled=r3_enabled
-                and not token_capture_cfg.defer_routed_experts_to_policy,
-            ),
+            fields=partition_fields,
             num_samples=num_rollout_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
             grpo_group_size=group_size,

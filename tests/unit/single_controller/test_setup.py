@@ -59,6 +59,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollouts import EffortLevelsConfig
@@ -1067,14 +1068,7 @@ class TestSetup:
         warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
             "fields"
         ]
-        for field in (
-            "pixel_values",
-            "image_grid_thw",
-            "imgs_sizes",
-            "num_frames",
-            "mm_token_type_ids",
-        ):
-            assert field in warmup_fields
+        assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
     def test_weight_sync_factory_args(self, patched_factories):
         """create_weight_synchronizer receives policy / generation / topology."""
@@ -1227,6 +1221,8 @@ class TestSetup:
             None,
         )
         fake_actors = [MagicMock(name=f"finalizer_{index}") for index in range(3)]
+        tokenizer = MagicMock(pad_token_id=9)
+        processor = MagicMock(tokenizer=tokenizer)
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
@@ -1239,7 +1235,9 @@ class TestSetup:
                 return_value=fake_actors,
             ) as mock_create_finalizer_actors,
         ):
-            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
+            actor_args, _ = setup_single_controller(
+                mc, tokenizer, processor=processor
+            )
 
         (actor_dp_config, actor_config), actor_kwargs = (
             mock_create_finalizer_actors.call_args
@@ -1251,6 +1249,11 @@ class TestSetup:
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
+        partition_calls = actor_args.dp_client.register_partition.call_args_list
+        assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
+        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(
+            partition_calls[1].kwargs["fields"]
+        )
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""

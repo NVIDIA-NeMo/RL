@@ -20,6 +20,20 @@ PROJECT_ROOT=$(realpath "${SCRIPT_DIR}/../..")
 
 cd "${PROJECT_ROOT}"
 
+# run_test [fast] <command...>
+# - "run_test fast <cmd>" = always runs (both fast and full modes)
+# - "run_test <cmd>"      = only runs in full mode; skipped when FAST=1
+run_test() {
+    if [[ "$1" == "fast" ]]; then
+        shift
+        time "$@"
+    elif [[ "${FAST:-0}" == "1" ]]; then
+        echo "FAST: Skipping: $*"
+    else
+        time "$@"
+    fi
+}
+
 GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
 if (( GPU_COUNT < 2 )); then
     echo "SKIP: Nemotron Omni SingleController functional tests require at least two GB200 GPUs"
@@ -30,8 +44,8 @@ fi
 # and one GPU hosts Megatron generation.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
-time uv run --no-sync bash ./tests/functional/nemotron_omni_clevr_megatron_single_controller_1n2g.sh
-time uv run --no-sync bash ./tests/functional/nemotron_omni_gym_video_megatron_single_controller_1n2g.sh
+run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_clevr_megatron_single_controller_1n2g.sh
+run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_gym_video_megatron_single_controller_1n2g.sh
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then
