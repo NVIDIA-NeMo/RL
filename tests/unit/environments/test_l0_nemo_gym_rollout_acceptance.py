@@ -475,6 +475,40 @@ def _load_case_datum(case: dict[str, Any], *, accepted: bool) -> DatumSpec:
     return datum
 
 
+def _assert_contract_preserved(
+    actual: Any, expected: Any, *, path: str = "responses_create_params"
+) -> None:
+    """Require every source value while allowing Gym to add schema defaults."""
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict), (
+            f"{path}: expected a mapping, got {type(actual).__name__}"
+        )
+        missing_keys = expected.keys() - actual.keys()
+        assert not missing_keys, f"{path}: missing keys {sorted(missing_keys)}"
+        for key, expected_value in expected.items():
+            _assert_contract_preserved(
+                actual[key], expected_value, path=f"{path}.{key}"
+            )
+        return
+
+    if isinstance(expected, list):
+        assert isinstance(actual, list), (
+            f"{path}: expected a list, got {type(actual).__name__}"
+        )
+        assert len(actual) == len(expected), (
+            f"{path}: expected {len(expected)} items, got {len(actual)}"
+        )
+        for index, (actual_value, expected_value) in enumerate(
+            zip(actual, expected, strict=True)
+        ):
+            _assert_contract_preserved(
+                actual_value, expected_value, path=f"{path}[{index}]"
+            )
+        return
+
+    assert actual == expected, f"{path}: expected {expected!r}, got {actual!r}"
+
+
 @pytest.fixture(scope="module")
 def scripted_openai_base_url():
     server = ThreadingHTTPServer(("0.0.0.0", 0), _ScriptedOpenAIHandler)
@@ -584,8 +618,10 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepte
     full_result_table = result.rollout_metrics[full_result_key]
     assert len(full_result_table.data) == 1
     full_result = json.loads(full_result_table.data[0][0])
-    for field, expected_value in extra_env_info["responses_create_params"].items():
-        assert full_result["responses_create_params"][field] == expected_value
+    _assert_contract_preserved(
+        full_result["responses_create_params"],
+        extra_env_info["responses_create_params"],
+    )
     for field, expected_value in expected_metadata.items():
         assert full_result[field] == expected_value
     if accepted:
