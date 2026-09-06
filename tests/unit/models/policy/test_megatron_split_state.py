@@ -435,44 +435,39 @@ class TestTrainMicrobatch:
         w.train_microbatch(_fake_batch())
         assert mock_module_symbols["mfb"].call_count == 1
 
-    @pytest.mark.parametrize(
-        (
-            "delegate_pack_to_model",
-            "delegate_mtp_loss_mask_to_model",
-            "model_slices_context_parallel_inputs",
-        ),
-        [
-            pytest.param(True, True, False, id="model-owned-packing"),
-            pytest.param(False, False, True, id="model-owned-cp-slicing"),
-        ],
-    )
     def test_forwards_model_owned_packing_flags(
         self,
         mock_module_symbols: dict[str, MagicMock],
-        delegate_pack_to_model: bool,
-        delegate_mtp_loss_mask_to_model: bool,
-        model_slices_context_parallel_inputs: bool,
     ) -> None:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 1
-        w.delegate_pack_to_model = delegate_pack_to_model
-        w.delegate_mtp_loss_mask_to_model = delegate_mtp_loss_mask_to_model
-        w.model_slices_context_parallel_inputs = model_slices_context_parallel_inputs
+        w.delegate_pack_to_model = True
+        w.delegate_mtp_loss_mask_to_model = True
 
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
 
         kwargs = mock_module_symbols["gmi"].call_args.kwargs
-        assert kwargs["delegate_pack_to_model"] is delegate_pack_to_model
-        assert (
-            kwargs["delegate_mtp_loss_mask_to_model"] is delegate_mtp_loss_mask_to_model
-        )
-        assert (
-            kwargs["model_slices_context_parallel_inputs"]
-            is model_slices_context_parallel_inputs
-        )
+        assert kwargs["delegate_pack_to_model"] is True
+        assert kwargs["delegate_mtp_loss_mask_to_model"] is True
+        assert kwargs["model_slices_context_parallel_inputs"] is False
+
+    def test_rejects_model_owned_cp_slicing(self, mock_module_symbols) -> None:
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model_slices_context_parallel_inputs = True
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+
+        with pytest.raises(
+            NotImplementedError,
+            match="train_microbatch does not support multimodal models",
+        ):
+            w.train_microbatch(_fake_batch())
+
+        mock_module_symbols["gmi"].assert_not_called()
 
     def test_passes_placeholder_n_one_to_loss(self, mock_module_symbols):
         """The N=1 trick: loss must be called with global_valid_*=1 so it
