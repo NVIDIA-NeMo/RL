@@ -146,6 +146,27 @@ checkpointing:
   enabled: false
   checkpoint_dir: results/ppo-single-controller
   metric_name: null
+  # Periodic rollout snapshots need an immutable trainer anchor for every
+  # completed step. Keep this at 1 when
+  # rollout_checkpointing.snapshot_attempt_interval_s is set.
+  save_period: 1
+  # Include native TQ state and the metadata-only replay index. A save failure
+  # aborts checkpoint finalization.
+  save_data_plane: true
+
+# Frequent rollout-only snapshots are disabled unless
+# snapshot_attempt_interval_s is set. When
+# disabled, existing periodic snapshots are ignored. Enabling them requires a
+# durable trainer checkpoint for the current completed step and native TQ
+# checkpoint support. save_period=1 provides an anchor after every train step.
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+  keep_latest_k: 2
+  restore_mode: latest
+  # Advanced escape hatch for runtime-only fields from external integrations.
+  # Every config path not excluded here or by NeMo-RL's built-in denylist must
+  # match before a bootstrap rollout snapshot can be restored.
+  extra_fingerprint_excluded_paths: []
 
 policy:
   tokenizer:

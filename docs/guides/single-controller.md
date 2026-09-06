@@ -103,6 +103,97 @@ On resume, Single-Controller validates the TQ snapshot against the trainer check
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
+### Periodic rollout snapshots
+
+Normal trainer checkpoints are written at step boundaries. Periodic rollout
+snapshots preserve newer rollout progress between those trainer checkpoints,
+including while the train pump is accumulating a streamed step:
+
+```yaml
+checkpointing:
+  enabled: true
+  checkpoint_dir: /shared/checkpoints/my-run
+  save_data_plane: true
+  save_period: 1
+
+rollout_checkpointing:
+  snapshot_attempt_interval_s: 120
+  keep_latest_k: 2
+  restore_mode: latest
+  extra_fingerprint_excluded_paths: []
+
+token_capture:
+  enabled: true
+```
+
+`snapshot_attempt_interval_s` is the cadence at which Single-Controller attempts
+a rollout snapshot. It is not a guarantee that a snapshot is written at every
+interval. An attempt after step N succeeds only when the immutable trainer
+checkpoint `step_N` is already durable. Consequently, `save_period: 1` is
+recommended for continuous post-step coverage; with a larger value, attempts
+are skipped until the matching trainer checkpoint exists. Before the first
+training step, snapshots are anchored to the initial model and a fingerprint of
+the rollout-semantic configuration.
+
+The bootstrap fingerprint is fail-closed: every configuration value affects
+compatibility unless NeMo-RL's built-in denylist identifies it as operational,
+such as logging, cluster placement, checkpoint location, runtime ports, or
+credentials. This means configuration added by an external algorithm is safe
+by default—a change prevents bootstrap recovery instead of silently mixing
+incompatible rollout state.
+The bootstrap manifest also stores this credential-redacted compatibility
+identity so a rejected restart can report the exact changed dotpaths instead of
+showing only two opaque digests.
+
+An integration may use `extra_fingerprint_excluded_paths` for additional
+runtime-only values that are not part of NeMo-RL's built-in configuration:
+
+```yaml
+rollout_checkpointing:
+  extra_fingerprint_excluded_paths:
+    - custom_algo.observability
+    - env.private_agent.runtime_endpoint
+    - env.private_agent.workers.*.log_dir
+```
+
+Each dotpath removes that value and its children from the compatibility
+identity. `*` matches one mapping or list level and `**` matches any number of
+levels.
+Only exclude values that cannot affect prompts, generation, rewards, lineage,
+or the interpretation of persisted rollout data. These exclusions must be set
+on the original run as well as its restart.
+
+Periodic snapshots currently require all of the following:
+
+- `checkpointing.enabled: true` and `checkpointing.save_data_plane: true`.
+- `data_plane.backend: simple`, because native TQ save/load is required.
+- `token_capture.enabled: true`.
+- A replay-recoverable sampler with training-claim ownership. All built-in
+  samplers qualify. A custom sampler must explicitly declare both
+  `supports_buffer_checkpoint = True` and `supports_training_claims = True`.
+
+Each trainer or bootstrap anchor has a `rollout_snapshots/` directory. A
+published `snapshot_NNNNNN/` contains the native TQ snapshot and matching
+replay, dataloader, controller, replacement-reserve, and unfinished-rollout
+metadata. `keep_latest_k` retains recent committed snapshots as fallbacks;
+temporary or interrupted directories are never selected for recovery.
+
+With `restore_mode: latest`, startup selects the newest compatible committed
+snapshot under the latest trainer anchor. With `trainer_checkpoint`, it ignores
+newer periodic rollout progress and resumes from the trainer checkpoint bundle.
+Checkpoint selection is read-only: neither mode removes snapshots. If no trainer
+checkpoint exists, `trainer_checkpoint` cannot safely reuse an existing bootstrap
+namespace, so startup fails without modifying it. Recover that state with `latest`
+or choose a new `checkpoint_dir` to start a fresh bootstrap lineage. Obsolete
+bootstrap snapshots are removed only by retention after a durable trainer
+checkpoint exists.
+
+> **Bootstrap-only `trainer_checkpoint` behavior:** A bootstrap rollout snapshot
+> has no corresponding model or optimizer checkpoint. Therefore
+> `restore_mode: trainer_checkpoint` deliberately fails when bootstrap state exists
+> but no trainer checkpoint does. It does not ignore or delete that state. Use
+> `latest` to recover it, or select a new `checkpoint_dir` to start from scratch.
+
 :::{note}
 Completed groups are restored directly from the TQ snapshot. For unfinished
 token-capture groups, `rollout_recovery.default_granularity` controls both live

@@ -260,7 +260,11 @@ def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() 
     )
     ctrl = _controller(SimpleNamespace())
 
-    asyncio.run(ctrl._cleanup_consumed_metas([meta]))
+    async def _cleanup() -> None:
+        async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+            await ctrl._cleanup_consumed_metas_unlocked(cut, [meta])
+
+    asyncio.run(_cleanup())
 
     assert ctrl._dp_client.clear_calls == [
         {

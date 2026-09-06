@@ -690,6 +690,59 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         return RecoveryGranularityResolution(agent_name, self.default_granularity)
 
 
+class RolloutCheckpointConfig(BaseModel, extra="forbid"):
+    """Frequent rollout-state snapshots anchored to durable trainer state.
+
+    ``snapshot_attempt_interval_s=None`` disables saving and restoring periodic
+    snapshots. A snapshot taken before the first trainer checkpoint is anchored
+    to the initial model and a rollout-semantic configuration fingerprint. Later
+    snapshots require the durable trainer checkpoint for the controller's
+    current completed step; attempts are skipped until that exact anchor exists.
+
+    ``restore_mode="latest"`` selects the newest compatible periodic snapshot.
+    ``trainer_checkpoint`` ignores newer periodic snapshots and restores the
+    rollout state bundled with the durable trainer checkpoint. Restore
+    selection never deletes checkpoint state. If no trainer checkpoint exists,
+    ``trainer_checkpoint`` rejects an occupied bootstrap namespace; use
+    ``latest`` or a new checkpoint directory instead.
+
+    Bootstrap compatibility is fail-closed: every configuration value affects
+    the fingerprint unless it is on the built-in operational denylist.
+    ``extra_fingerprint_excluded_paths`` lets integrations exclude additional
+    runtime-only dotpaths. ``*`` matches one mapping or list level and ``**``
+    matches any number of levels.
+
+    SingleController has no validation loop, so checkpoint selection must use
+    ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
+    ``val:<name>`` settings are rejected during setup. Unknown keys are
+    forbidden because a misspelled interval, retention, or restore option can
+    silently disable the durability behavior the operator intended.
+    """
+
+    snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    keep_latest_k: Annotated[int, Field(ge=1)] = 2
+    restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
+    extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":
+        """Reject ambiguous paths that could silently fail to exclude a value."""
+        invalid = [
+            path
+            for path in self.extra_fingerprint_excluded_paths
+            if not path
+            or path != path.strip()
+            or any(not segment for segment in path.split("."))
+            or path in {"*", "**"}
+        ]
+        if invalid:
+            raise ValueError(
+                "extra_fingerprint_excluded_paths must contain non-empty dotpaths "
+                f"and cannot exclude the whole config, got {invalid!r}"
+            )
+        return self
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -709,6 +762,9 @@ class MasterConfig(BaseModel, extra="allow"):
     async_rl: AsyncRLConfig
     rollout_recovery: RolloutRecoveryConfig = Field(
         default_factory=RolloutRecoveryConfig
+    )
+    rollout_checkpointing: RolloutCheckpointConfig = Field(
+        default_factory=RolloutCheckpointConfig
     )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
