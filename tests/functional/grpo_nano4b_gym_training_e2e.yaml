@@ -128,7 +128,7 @@ logger:
   tensorboard_enabled: true
   monitor_gpus: true
 
-# The H100 functional runner exposes two GPUs. Colocation lets FSDP2 shard the
+# The functional test reserves two GPUs. Colocation lets FSDP2 shard the
 # full-parameter policy and optimizer across both while vLLM shares that cluster.
 cluster:
   gpus_per_node: 2

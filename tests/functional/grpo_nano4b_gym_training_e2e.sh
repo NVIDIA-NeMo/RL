@@ -45,12 +45,15 @@ uv run tests/json_dump_tb_logs.py "${LOG_DIR}" --output_path "${JSON_METRICS}"
 
 # The fixture intentionally contains one accepted and one rejected rollout. In
 # addition to testing both verifier outcomes, this gives Reinforce++ a non-zero
-# advantage so grad_norm proves that an optimizer step was actually exercised.
+# advantage so a finite nonzero grad norm and positive learning rate prove that
+# a trainable update signal reached the optimizer path.
 uv run tests/check_metrics.py "${JSON_METRICS}" \
     'len(data["train/loss"]) == 1' \
     'all_finite(data["train/loss"])' \
     'all_finite(data["train/grad_norm"])' \
     'min(data["train/grad_norm"]) > 0' \
+    'all_finite(data["train/lr"])' \
+    'min(data["train/lr"]) > 0' \
     'all_finite(data["train/advantages/min"])' \
     'all_finite(data["train/advantages/max"])' \
     'min(data["train/advantages/min"]) < 0' \
