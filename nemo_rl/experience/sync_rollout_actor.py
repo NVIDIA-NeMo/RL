@@ -260,6 +260,7 @@ class SyncRolloutActor:
                 and cfg.env["nemo_gym"].get("effort_levels") is not None
                 else None,
                 reward_penalty_config=cfg.reward_penalties,
+                time_efficiency_config=cfg.grpo.time_efficiency,
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,

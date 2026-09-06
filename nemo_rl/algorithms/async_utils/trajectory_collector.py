@@ -1300,6 +1300,11 @@ class AsyncTrajectoryCollector:
                 ),
                 reward_penalty_config=self.master_config.reward_penalties,
                 length_penalty_config=self.master_config.grpo.model_dump(),
+                time_efficiency_config=(
+                    self.master_config.grpo.time_efficiency
+                    if isinstance(self.master_config, GRPOMasterConfig)
+                    else None
+                ),
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env

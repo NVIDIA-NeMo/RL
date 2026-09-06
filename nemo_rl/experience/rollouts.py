@@ -78,6 +78,10 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
+from nemo_rl.utils.time_efficiency import (
+    TimeEfficiencyConfig,
+    apply_time_efficiency_reward,
+)
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -2284,6 +2288,7 @@ async def run_async_nemo_gym_rollout(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     length_penalty_config: dict[str, Any] | BaseModel | None = None,
+    time_efficiency_config: Optional[TimeEfficiencyConfig] = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
@@ -2316,6 +2321,8 @@ async def run_async_nemo_gym_rollout(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         length_penalty_config: Optional GRPO config block for length adjustments.
+        time_efficiency_config: Optional ``grpo.time_efficiency`` block; deducts
+            a price for each rollout's agent wall time from its reward.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
             flags in the rollout batch for loss masking.
@@ -2492,6 +2499,7 @@ async def run_async_nemo_gym_rollout(
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
                         length_penalty_config=length_penalty_config,
+                        time_efficiency_config=time_efficiency_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
                     )
@@ -2530,6 +2538,7 @@ def run_nemo_gym_rollout_sync(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     length_penalty_config: dict[str, Any] | BaseModel | None = None,
+    time_efficiency_config: Optional[TimeEfficiencyConfig] = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     sampling_params: Optional[GenerationSamplingParams] = None,
     mask_env_flagged_samples: bool = True,
@@ -2557,6 +2566,8 @@ def run_nemo_gym_rollout_sync(
         greedy: Must be ``False`` because this path does not support greedy mode.
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
+        time_efficiency_config: Optional ``grpo.time_efficiency`` block; deducts
+            a price for each rollout's agent wall time from its reward.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         sampling_params: Sampling profile stamped onto every NeMo-Gym row.
             ``None`` uses the train profile from ``generation_config``;
@@ -2595,6 +2606,7 @@ def run_nemo_gym_rollout_sync(
             effort_config=effort_config,
             reward_penalty_config=reward_penalty_config,
             length_penalty_config=length_penalty_config,
+            time_efficiency_config=time_efficiency_config,
             thinking_tags=thinking_tags,
             mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
@@ -2622,10 +2634,17 @@ def _postprocess_single_nemo_gym_group(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     length_penalty_config: dict[str, Any] | BaseModel | None = None,
+    time_efficiency_config: Optional[TimeEfficiencyConfig] = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
+    # Wall-clock time-efficiency reward. Runs first so the reward-zeroing
+    # penalties below can still zero a rollout after the deduction.
+    time_efficiency_stats = apply_time_efficiency_reward(
+        results, time_efficiency_config
+    )
+
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
     length_rewards_low = shaping.length_rewards_low
@@ -2796,6 +2815,10 @@ def _postprocess_single_nemo_gym_group(
                 )
 
         rollout_metrics.update(per_agent_metrics)
+
+    # Surface the time-efficiency term as W&B curves next to reward so the
+    # deduction can be watched against accuracy.
+    rollout_metrics.update(time_efficiency_stats)
 
     # Necessary for downstream nemo rl logging/printing.
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
