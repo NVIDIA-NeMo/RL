@@ -1925,3 +1925,7 @@ class TestGenerateForFinalizationFlow:
         assert request is not None
         assert request.prompt_idx == 9
         assert restored._impl.seen_generation_indices == [0, 1]
+        assert (
+            restored._impl.seen_recovery_granularity
+            is RecoveryGranularity.PROMPT_GROUP
+        )

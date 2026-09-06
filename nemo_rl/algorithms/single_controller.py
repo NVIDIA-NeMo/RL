@@ -1233,6 +1233,7 @@ class SingleControllerActor:
         request: "ReassemblyRequest",
     ) -> None:
         """Clear known request ownership while holding a barrier mutation slot."""
+        cut.require_live()
         errors: list[BaseException] = []
         try:
             await self._call_dp(

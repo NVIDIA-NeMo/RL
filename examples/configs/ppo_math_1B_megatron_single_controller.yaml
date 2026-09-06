@@ -232,10 +232,8 @@ rollout_recovery:
   #   task_granularity_overrides: {math: prompt_group}
   task_granularity_overrides: {}
 
-# Leaving either map above non-empty requires token capture, which is a separate
-# top-level section (not in this file, and off by default):
-# token_capture:
-#   enabled: true
+# Leaving either map above non-empty requires the top-level token_capture section
+# above to set enabled: true.
 
 cluster:
   # Master ports inherit the shared 1400-1999 band from ppo_math_1B.yaml.
