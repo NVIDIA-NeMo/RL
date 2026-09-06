@@ -827,13 +827,12 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     # An enabled one here describes shaping this run does not do. An entry leaves
-    # this list once the SC path implements it; overlong_filtering is applied in
-    # the advantage stage from the raw completion flags in the TransferQueue.
+    # this list once the SC path implements it; overlong_filtering and
+    # reward_scaling are applied in the advantage stage.
     unsupported = [
         name
         for name, enabled in (
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
         )
         if enabled
