@@ -55,7 +55,7 @@ COMMON_OVERRIDES=(
     +checkpointing.save_data_plane=true
     ++token_capture.enabled=true
     ++rollout_recovery.default_granularity=sibling
-    ++rollout_checkpointing.interval_s="$SNAPSHOT_INTERVAL_S"
+    ++rollout_checkpointing.snapshot_attempt_interval_s="$SNAPSHOT_INTERVAL_S"
     ++rollout_checkpointing.keep_latest_k=8
     ++rollout_checkpointing.restore_mode=latest
     async_rl.sampler.name=in_order
@@ -102,7 +102,7 @@ deadline = time.monotonic() + float(sys.argv[6])
 while time.monotonic() < deadline:
     for snapshot in sorted(root.glob("snapshot_*"), reverse=True):
         manifest_path = snapshot / "manifest.json"
-        if not (snapshot / "COMMITTED").is_file() or not manifest_path.is_file():
+        if not manifest_path.is_file():
             continue
         manifest = json.loads(manifest_path.read_text())
         if (

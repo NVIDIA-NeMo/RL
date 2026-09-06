@@ -1207,6 +1207,9 @@ class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
 
+    def training_owned_group_ids(self) -> set[str]:
+        return set()
+
 
 class _NoOpTrainer:
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
