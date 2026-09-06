@@ -71,11 +71,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_DIRNAME,
-    ROLLOUT_SNAPSHOTS_DIRNAME,
-    bootstrap_fingerprint,
-    ensure_bootstrap_anchor,
-    reset_bootstrap_anchor,
+    BootstrapCompatibilityIdentity,
+    bootstrap_compatibility_identity,
     resolve_latest_snapshot,
+    validate_bootstrap_anchor,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -163,7 +162,7 @@ class SingleControllerActorArgs:
     finalizer_actors: list[Any]
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
-    bootstrap_fingerprint: Optional[str] = None
+    bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -953,7 +952,7 @@ def setup_single_controller(
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     if (
         master_config.checkpointing.get("save_data_plane")
-        or rollout_checkpoint_cfg.interval_s is not None
+        or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
     ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
@@ -1012,7 +1011,7 @@ def setup_single_controller(
     # capture-enabled vLLM workers a venv that carries nemo_gym (the
     # worker hosts Gym's capture core + adapter in-process).
     token_capture_cfg = master_config.token_capture
-    if rollout_checkpoint_cfg.interval_s is not None:
+    if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.enabled=true"
@@ -1121,10 +1120,15 @@ def setup_single_controller(
     bootstrap_anchor = checkpointer.checkpoint_dir / BOOTSTRAP_DIRNAME
     needs_bootstrap_identity = (
         trainer_checkpoint_path is None
-        and rollout_checkpoint_cfg.interval_s is not None
+        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+    )
+    bootstrap_identity = (
+        bootstrap_compatibility_identity(master_config)
+        if needs_bootstrap_identity
+        else None
     )
     bootstrap_digest = (
-        bootstrap_fingerprint(master_config) if needs_bootstrap_identity else None
+        bootstrap_identity.fingerprint() if bootstrap_identity is not None else None
     )
     resolved_snapshot = None
     restored_trainer_version = (
@@ -1134,7 +1138,7 @@ def setup_single_controller(
     )
     if (
         trainer_checkpoint_path is not None
-        and rollout_checkpoint_cfg.interval_s is not None
+        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
         and restore_mode == "latest"
     ):
         resolved_snapshot = resolve_latest_snapshot(
@@ -1144,30 +1148,24 @@ def setup_single_controller(
             expected_bootstrap_fingerprint=None,
         )
     elif trainer_checkpoint_path is None:
-        if rollout_checkpoint_cfg.interval_s is not None:
+        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
             assert bootstrap_digest is not None
-            if restore_mode == "latest":
-                bootstrap_anchor = ensure_bootstrap_anchor(
-                    checkpointer.checkpoint_dir,
-                    fingerprint=bootstrap_digest,
+            assert bootstrap_identity is not None
+            if bootstrap_anchor.is_dir():
+                validate_bootstrap_anchor(
+                    bootstrap_anchor,
+                    identity=bootstrap_identity,
                 )
-            else:
-                had_bootstrap_snapshots = (
-                    bootstrap_anchor / ROLLOUT_SNAPSHOTS_DIRNAME
-                ).is_dir()
-                bootstrap_anchor = reset_bootstrap_anchor(
-                    checkpointer.checkpoint_dir,
-                    fingerprint=bootstrap_digest,
-                )
-                if had_bootstrap_snapshots:
-                    print(
-                        "📦 Ignored existing bootstrap rollout snapshots and "
-                        "started a new bootstrap lineage because "
-                        f"rollout_checkpointing.restore_mode={restore_mode!r}.",
-                        flush=True,
+                if restore_mode == "trainer_checkpoint":
+                    raise ValueError(
+                        "rollout_checkpointing.restore_mode='trainer_checkpoint' "
+                        "cannot start a fresh bootstrap lineage because checkpoint "
+                        f"state already exists at {bootstrap_anchor}. Use "
+                        "restore_mode='latest' to recover it or choose a new "
+                        "checkpoint_dir. Existing checkpoint state was not modified."
                     )
         if (
-            rollout_checkpoint_cfg.interval_s is not None
+            rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
             and restore_mode == "latest"
             and bootstrap_anchor.is_dir()
         ):
@@ -1733,7 +1731,7 @@ def setup_single_controller(
         save_state=save_state,
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
-        bootstrap_fingerprint=bootstrap_digest,
+        bootstrap_identity=bootstrap_identity,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

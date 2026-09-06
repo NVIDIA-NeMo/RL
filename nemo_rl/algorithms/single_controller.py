@@ -101,6 +101,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+    BootstrapCompatibilityIdentity,
     RolloutSnapshotManifest,
     commit_snapshot,
     ensure_bootstrap_anchor,
@@ -438,7 +439,9 @@ class SingleControllerActor:
         self._checkpoint_save_lock = asyncio.Lock()
         self._last_rollout_snapshot_mutation_version: Optional[int] = None
         self._last_missing_rollout_snapshot_anchor: Optional[tuple[int, int]] = None
-        self._bootstrap_fingerprint = getattr(actor_args, "bootstrap_fingerprint", None)
+        self._bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = (
+            actor_args.bootstrap_identity
+        )
         self._rollout_checkpoint_stop_requested = asyncio.Event()
         # Narrow unsafe window after an optimizer mutates model state and before
         # SC publishes the matching TQ cleanup and trainer counters. Gradient
@@ -550,7 +553,8 @@ class SingleControllerActor:
         tasks = [rollout_task, train_task, watchdog_task]
         rollout_checkpoint_task = (
             asyncio.create_task(self._rollout_checkpoint_pump())
-            if self._master_config.rollout_checkpointing.interval_s is not None
+            if self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
+            is not None
             else None
         )
         if rollout_checkpoint_task is not None:
@@ -1521,11 +1525,6 @@ class SingleControllerActor:
                     errors.append(cleanup_error)
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
-
-    async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
-        """Clear consumed rows without racing a native TQ checkpoint."""
-        async with self._data_plane_checkpoint_barrier.mutation() as cut:
-            await self._cleanup_consumed_metas_unlocked(cut, metas)
 
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
@@ -3512,16 +3511,16 @@ class SingleControllerActor:
                     raise RuntimeError(
                         "bootstrap rollout snapshot requires trainer version zero"
                     )
-                if self._bootstrap_fingerprint is None:
+                if self._bootstrap_identity is None:
                     raise RuntimeError(
-                        "rollout snapshotting requires a bootstrap fingerprint"
+                        "rollout snapshotting requires a bootstrap identity"
                     )
                 anchor = await asyncio.to_thread(
                     ensure_bootstrap_anchor,
                     self._checkpointer.checkpoint_dir,
-                    fingerprint=self._bootstrap_fingerprint,
+                    identity=self._bootstrap_identity,
                 )
-                snapshot_fingerprint = self._bootstrap_fingerprint
+                snapshot_fingerprint = self._bootstrap_identity.fingerprint()
             else:
                 if self._trainer_version != self._train_steps:
                     raise RuntimeError(
@@ -3616,16 +3615,18 @@ class SingleControllerActor:
 
     async def _rollout_checkpoint_pump(self) -> None:
         """Persist rollout state periodically, including during streamed train."""
-        interval_s = self._master_config.rollout_checkpointing.interval_s
-        if interval_s is None:
+        snapshot_attempt_interval_s = (
+            self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
+        )
+        if snapshot_attempt_interval_s is None:
             raise RuntimeError("rollout checkpoint pump started while disabled")
         consecutive_failures = 0
         while True:
-            await asyncio.sleep(interval_s)
+            await asyncio.sleep(snapshot_attempt_interval_s)
             deadline_due = self._train_steps == 0 and self._timeout.would_save()
             try:
                 saved = await self._save_rollout_checkpoint(force=deadline_due)
-            except Exception as error:
+            except (OSError, TimeoutError) as error:
                 if deadline_due:
                     raise RuntimeError(
                         "failed to save the required pre-step rollout checkpoint"

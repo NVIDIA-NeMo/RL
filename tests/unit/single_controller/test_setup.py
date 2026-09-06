@@ -61,6 +61,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
     validate_single_controller_config,
 )
+from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    bootstrap_compatibility_identity,
+    ensure_bootstrap_anchor,
+)
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
@@ -695,7 +699,9 @@ class TestSetup:
         mc = _make_master_config()
         mc.checkpointing["enabled"] = False
         mc.checkpointing["save_data_plane"] = True
-        mc.rollout_checkpointing = RolloutCheckpointConfig(interval_s=1.0)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
 
         with pytest.raises(ValueError, match="requires checkpointing.enabled=true"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -708,7 +714,9 @@ class TestSetup:
         )
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = False
-        mc.rollout_checkpointing = RolloutCheckpointConfig(interval_s=1.0)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
 
         with (
             pytest.warns(UserWarning, match="cannot recover completed buffered"),
@@ -722,7 +730,9 @@ class TestSetup:
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
-        mc.rollout_checkpointing = RolloutCheckpointConfig(interval_s=1.0)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
 
         with pytest.raises(ValueError, match="requires token_capture.enabled=true"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -736,7 +746,9 @@ class TestSetup:
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
-        mc.rollout_checkpointing = RolloutCheckpointConfig(interval_s=1.0)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
 
         with (
             pytest.warns(UserWarning, match="cannot recover completed buffered"),
@@ -753,7 +765,9 @@ class TestSetup:
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
-        mc.rollout_checkpointing = RolloutCheckpointConfig(interval_s=1.0)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
 
         with pytest.raises(ValueError, match="supports training-claim ownership"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -781,9 +795,11 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger = {"log_dir": str(tmp_path / "logs")}
+        mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
-        mc.rollout_checkpointing = RolloutCheckpointConfig(interval_s=1.0)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
         fake_finalizers = [MagicMock(name="finalizer")]
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
@@ -798,7 +814,8 @@ class TestSetup:
             ),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch(
-                "nemo_rl.experience.finalizer_actor.create_finalizer_actors",
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
                 return_value=fake_finalizers,
             ),
         ):
@@ -818,7 +835,7 @@ class TestSetup:
         checkpoint_dir = tmp_path / "checkpoints"
         mc.checkpointing["checkpoint_dir"] = str(checkpoint_dir)
         mc.rollout_checkpointing = RolloutCheckpointConfig(
-            interval_s=None,
+            snapshot_attempt_interval_s=None,
             restore_mode="latest",
         )
         (checkpoint_dir / "bootstrap" / "rollout_snapshots").mkdir(parents=True)
@@ -831,6 +848,66 @@ class TestSetup:
 
         resolve.assert_not_called()
         assert actor_args.last_checkpoint_path is None
+
+    def test_trainer_checkpoint_restore_preserves_bootstrap_state(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config(colocated=False, backend="vllm")
+        checkpoint_dir = tmp_path / "checkpoints"
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(checkpoint_dir),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 1,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.logger = {"log_dir": str(tmp_path / "logs")}
+        mc.token_capture.enabled = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            restore_mode="trainer_checkpoint",
+        )
+        anchor = ensure_bootstrap_anchor(
+            checkpoint_dir,
+            identity=bootstrap_compatibility_identity(mc),
+        )
+        payload = anchor / "rollout_snapshots" / "snapshot_000001" / "payload"
+        payload.parent.mkdir(parents=True)
+        payload.write_text("preserve me")
+        before = {
+            path.relative_to(anchor): path.read_bytes()
+            for path in anchor.rglob("*")
+            if path.is_file()
+        }
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            pytest.raises(
+                ValueError,
+                match="Existing checkpoint state was not modified",
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        after = {
+            path.relative_to(anchor): path.read_bytes()
+            for path in anchor.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
+        patched_factories["setup_response_data"].assert_not_called()
 
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()

@@ -71,6 +71,11 @@ class PromptGroupSampler(Protocol):
 
     Implement this (or subclass ``BaseSampler``) to add a custom sampling
     algorithm; point ``async_rl.sampler`` at ``module:ClassName`` to load it.
+    A custom sampler that supports replay recovery must explicitly declare
+    ``supports_buffer_checkpoint = True``. It must additionally declare
+    ``supports_training_claims = True`` before periodic rollout snapshots may
+    be enabled; omitting that optional capability preserves the legacy
+    remove-on-selection behavior.
     """
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
@@ -121,6 +126,9 @@ class PromptGroupSampler(Protocol):
 
     supports_buffer_checkpoint: ClassVar[bool]
     """Whether completed buffered groups can be restored safely."""
+
+    supports_training_claims: ClassVar[bool]
+    """Whether selected groups remain owned until the train step commits."""
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
@@ -661,7 +669,8 @@ class CustomSamplerConfig(BaseModel, extra="allow"):
     # Extra keys are forwarded to the constructor (after ``buffer``). The
     # target class must declare a boolean ``supports_buffer_checkpoint`` class
     # attribute so setup can validate recovery requirements before allocating
-    # cluster resources.
+    # cluster resources. Periodic rollout snapshots additionally require an
+    # explicit boolean ``supports_training_claims = True`` declaration.
     target: str
 
 
@@ -817,7 +826,8 @@ def create_sampler(
                 f"interface (needs admit/select/evict/should_abort_inflight, "
                 f"dispatch_index, set_dispatch_index, restore_dispatch_index, "
                 f"is_on_policy, supports_buffer_checkpoint, "
-                f"required_buffer_capacity)"
+                f"required_buffer_capacity; periodic rollout snapshots also "
+                f"require supports_training_claims=True)"
             )
     else:
         raise ValueError(f"unknown sampler config {type(cfg).__name__}")

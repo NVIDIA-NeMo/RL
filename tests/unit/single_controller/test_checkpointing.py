@@ -82,10 +82,11 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_DIRNAME,
-    ROLLOUT_SNAPSHOT_COMMITTED_FILENAME,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+    BootstrapCompatibilityIdentity,
     RolloutSnapshotManifest,
+    bootstrap_compatibility_identity,
     commit_snapshot,
     prepare_snapshot_paths,
 )
@@ -564,7 +565,7 @@ def _actor_master_config(
     max_num_epochs: int = 1,
     buffer_checkpoint: bool = False,
     data_plane_checkpoint: bool = True,
-    rollout_checkpoint_interval_s: Optional[float] = None,
+    rollout_checkpoint_attempt_interval_s: Optional[float] = None,
     token_capture_enabled: bool = False,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
@@ -626,7 +627,7 @@ def _actor_master_config(
             max_buffered_rollouts=4,
         ),
         rollout_checkpointing=RolloutCheckpointConfig(
-            interval_s=rollout_checkpoint_interval_s
+            snapshot_attempt_interval_s=rollout_checkpoint_attempt_interval_s
         ),
         token_capture=TokenCaptureConfig(enabled=token_capture_enabled),
     )
@@ -641,7 +642,7 @@ def _make_actor_args(
     dp_client: Optional[_FakeDPClient] = None,
     last_checkpoint_path: Optional[str] = None,
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
-    bootstrap_fingerprint: Optional[str] = None,
+    bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=_FakeGeneration(),
@@ -663,7 +664,7 @@ def _make_actor_args(
         last_checkpoint_path=last_checkpoint_path,
         finalizer_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
-        bootstrap_fingerprint=bootstrap_fingerprint,
+        bootstrap_identity=bootstrap_identity,
     )
 
 
@@ -1102,7 +1103,8 @@ class TestPeriodicRolloutCheckpoint:
     @pytest.mark.parametrize(
         "config",
         [
-            {"interval_s": 0},
+            {"snapshot_attempt_interval_s": 0},
+            {"interval_s": 1},
             {"keep_latest_k": 0},
             {"unknown_option": True},
         ],
@@ -1115,12 +1117,14 @@ class TestPeriodicRolloutCheckpoint:
         config = _actor_master_config(
             tmp_path,
             buffer_checkpoint=True,
-            rollout_checkpoint_interval_s=120.0,
+            rollout_checkpoint_attempt_interval_s=120.0,
             token_capture_enabled=True,
         )
         return _ACTOR_CLS(
             config,
-            _make_actor_args(bootstrap_fingerprint="bootstrap-digest"),
+            _make_actor_args(
+                bootstrap_identity=bootstrap_compatibility_identity(config)
+            ),
             SetupTimingMetrics(),
         )
 
@@ -1139,7 +1143,6 @@ class TestPeriodicRolloutCheckpoint:
             / "rollout_snapshots"
             / "snapshot_000001"
         )
-        assert (snapshot / ROLLOUT_SNAPSHOT_COMMITTED_FILENAME).is_file()
         assert (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).is_file()
         manifest = json.loads(
             (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
@@ -1212,7 +1215,7 @@ class TestPeriodicRolloutCheckpoint:
         capsys: pytest.CaptureFixture[str],
     ):
         actor = self._actor(tmp_path)
-        actor._master_config.rollout_checkpointing.interval_s = 0.001
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._train_steps = 1
 
         async def _main() -> None:
@@ -1249,7 +1252,7 @@ class TestPeriodicRolloutCheckpoint:
         capsys: pytest.CaptureFixture[str],
     ):
         actor = self._actor(tmp_path)
-        actor._master_config.rollout_checkpointing.interval_s = 0.001
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._train_steps = 1
 
         async def _main() -> None:
@@ -1274,6 +1277,32 @@ class TestPeriodicRolloutCheckpoint:
 
         output = capsys.readouterr().out
         assert output.count("Periodic rollout checkpoint failed") == 3
+
+    def test_periodic_pump_does_not_retry_invariant_failure(self, tmp_path: Path):
+        actor = self._actor(tmp_path)
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
+        calls = 0
+
+        async def _main() -> None:
+            async def _failing_save(*, force: bool = False) -> bool:
+                nonlocal calls
+                del force
+                calls += 1
+                raise RuntimeError("broken checkpoint invariant")
+
+            actor._save_rollout_checkpoint = _failing_save
+            with pytest.raises(RuntimeError, match="broken checkpoint invariant"):
+                await asyncio.wait_for(
+                    actor._rollout_checkpoint_pump(),
+                    timeout=1.0,
+                )
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert calls == 1
 
 
 class TestDataPlaneCheckpoint:
@@ -1579,9 +1608,13 @@ class TestDataPlaneCheckpoint:
             started = await asyncio.to_thread(dp_client.save_started.wait, 30.0)
             assert started
 
-            clear_task = asyncio.create_task(
-                actor._cleanup_consumed_metas([_consumed_meta("sample-0")])
-            )
+            async def _clear() -> None:
+                async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                    await actor._cleanup_consumed_metas_unlocked(
+                        cut, [_consumed_meta("sample-0")]
+                    )
+
+            clear_task = asyncio.create_task(_clear())
             await asyncio.sleep(0)
             assert dp_client.clear_calls == []
 
@@ -1602,7 +1635,10 @@ class TestDataPlaneCheckpoint:
                 mc, _make_actor_args(dp_client=dp_client), SetupTimingMetrics()
             )
             event_loop_thread_id = threading.get_ident()
-            await actor._cleanup_consumed_metas([_consumed_meta("sample-0")])
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                await actor._cleanup_consumed_metas_unlocked(
+                    cut, [_consumed_meta("sample-0")]
+                )
             actor._checkpointer.shutdown()
             return event_loop_thread_id
 
@@ -2067,7 +2103,9 @@ class TestSetupResumeWiring:
         final_snapshot = _write_periodic_snapshot(step_3)
         mc = _setup_master_config(str(ckpt_dir))
         mc.checkpointing["save_period"] = 1
-        mc.rollout_checkpointing = RolloutCheckpointConfig(interval_s=120.0)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=120.0
+        )
         mc.token_capture = TokenCaptureConfig(enabled=True)
         mc.policy["generation"].update(
             {
@@ -2078,7 +2116,7 @@ class TestSetupResumeWiring:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger = {"log_dir": str(tmp_path / "logs")}
+        mc.logger["log_dir"] = str(tmp_path / "logs")
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -2098,7 +2136,8 @@ class TestSetupResumeWiring:
                 return_value=False,
             ),
             patch(
-                "nemo_rl.experience.finalizer_actor.create_finalizer_actors",
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
                 return_value=[MagicMock(name="finalizer")],
             ),
         ):
@@ -2123,7 +2162,7 @@ class TestSetupResumeWiring:
         _write_periodic_snapshot(step_3)
         mc = _setup_master_config(str(ckpt_dir))
         mc.rollout_checkpointing = RolloutCheckpointConfig(
-            interval_s=None,
+            snapshot_attempt_interval_s=None,
             restore_mode="latest",
         )
 

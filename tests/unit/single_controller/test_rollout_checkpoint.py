@@ -19,12 +19,19 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller_utils import rollout_checkpoint
-from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    MasterConfig,
+    RolloutCheckpointConfig,
+    TokenCaptureConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION,
+    BOOTSTRAP_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+    BootstrapCompatibilityIdentity,
     RolloutSnapshotManifest,
     bootstrap_compatibility_identity,
     bootstrap_fingerprint,
@@ -32,12 +39,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
-    reset_bootstrap_anchor,
     resolve_latest_snapshot,
+    validate_bootstrap_anchor,
 )
 from nemo_rl.data import DataConfig
-from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.generation.vllm.config import VllmSpecificArgs
+from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
 from nemo_rl.models.policy import PolicyConfig
 
 
@@ -50,179 +56,23 @@ class _DumpedConfig:
         return self._dumped
 
 
-_BOOTSTRAP_PROJECTION_CASES = (
-    (
-        rollout_checkpoint._BOOTSTRAP_POLICY_FIELDS,
-        frozenset(
-            {
-                "disable_modelopt_layer_spec",
-                "draft",
-                "dtensor_cfg",
-                "dynamic_batching",
-                "generation",
-                "generation_batch_size",
-                "is_vlm",
-                "logprob_batch_size",
-                "logprob_chunk_size",
-                "make_sequence_length_divisible_by",
-                "max_grad_norm",
-                "megatron_cfg",
-                "optimizer",
-                "precision",
-                "quant_batch_size",
-                "quant_calib_data",
-                "quant_calib_size",
-                "quant_cfg",
-                "quant_sequence_length",
-                "refit_buffer_size_gb",
-                "reward_model_cfg",
-                "router_replay",
-                "scheduler",
-                "sequence_packing",
-                "train_global_batch_size",
-                "train_micro_batch_size",
-            }
-        ),
-        PolicyConfig,
-    ),
-    (
-        rollout_checkpoint._BOOTSTRAP_GENERATION_FIELDS,
-        frozenset(
-            {
-                "_debug_payload_metrics",
-                "_mtp_weights_from_refit",
-                "_pad_token_id",
-                "bad_words",
-                "colocated",
-                "model_name",
-                "port_range_high",
-                "port_range_low",
-                "use_async_rollouts",
-                "val_temperature",
-                "val_top_k",
-                "val_top_p",
-            }
-        ),
-        GenerationConfig,
-    ),
-    (
-        rollout_checkpoint._BOOTSTRAP_VLLM_FIELDS,
-        frozenset(
-            {
-                "async_engine",
-                "cap_max_tokens_to_context",
-                "enable_return_routed_experts",
-                "enforce_eager",
-                "env_vars",
-                "expert_parallel_size",
-                "expose_http_server",
-                "gpu_memory_utilization",
-                "http_refit_api_key_env_var",
-                "http_refit_server_port",
-                "is_mx",
-                "kv_cache_dtype",
-                "load_format",
-                "logprobs_mode",
-                "pipeline_parallel_size",
-                "precision",
-                "quantization_ignore_patterns",
-                "quantization_ignored_layer_kws",
-                "reset_encoder_cache_after_weight_update",
-                "skip_tokenizer_init",
-                "tensor_parallel_size",
-                "tool_parser_plugin",
-                "use_tqdm",
-                "video",
-                "zmq_refit_server_port",
-            }
-        ),
-        VllmSpecificArgs,
-    ),
-    (
-        rollout_checkpoint._BOOTSTRAP_GRPO_FIELDS,
-        frozenset(
-            {
-                "adv_estimator",
-                "advantage_clip_high",
-                "advantage_clip_low",
-                "async_grpo",
-                "batch_multiplier",
-                "calculate_advantages_on_gpu",
-                "debug_payload_metrics",
-                "deduplicate_multimodal_data",
-                "dynamic_sampling_max_gen_batches",
-                "invalid_tool_call_advantage",
-                "malformed_thinking_advantage",
-                "max_num_epochs",
-                "max_num_steps",
-                "max_val_samples",
-                "normalize_rewards",
-                "overlong_filtering",
-                "reward_scaling",
-                "reward_shaping",
-                "seq_logprob_error_threshold",
-                "skip_reference_policy_logprobs_calculation",
-                "stop_at_validation_metric",
-                "stop_at_validation_threshold",
-                "use_dynamic_sampling",
-                "use_leave_one_out_baseline",
-                "val_at_end",
-                "val_at_start",
-                "val_batch_size",
-                "val_num_generations_per_prompt",
-                "val_period",
-                "val_start_at",
-            }
-        ),
-        GRPOConfig,
-    ),
-    (
-        rollout_checkpoint._BOOTSTRAP_DATA_FIELDS,
-        frozenset(
-            {
-                "add_bos",
-                "add_eos",
-                "add_generation_prompt",
-                "add_system_prompt",
-                "custom_dataloader",
-                "num_prompts_per_dataloader",
-                "num_workers",
-                "use_multiple_dataloader",
-                "validation",
-            }
-        ),
-        DataConfig,
-    ),
-    (
-        rollout_checkpoint._BOOTSTRAP_TOKEN_CAPTURE_FIELDS,
-        frozenset(
-            {
-                "capture_dir",
-                "control_auth_token",
-                "control_timeout_s",
-                "num_finalizer_workers",
-            }
-        ),
-        TokenCaptureConfig,
-    ),
-)
-
-
-@pytest.mark.parametrize(
-    ("declared", "ignored", "schema"),
-    [
-        pytest.param(declared, ignored, schema, id=schema.__name__)
-        for declared, ignored, schema in _BOOTSTRAP_PROJECTION_CASES
-    ],
-)
-def test_bootstrap_projection_covers_config_schema(declared, ignored, schema):
-    fields = (
-        set(schema.model_fields)
-        if hasattr(schema, "model_fields")
-        else set(schema.__annotations__)
+def _test_bootstrap_identity(label: str = "v1") -> BootstrapCompatibilityIdentity:
+    return BootstrapCompatibilityIdentity(
+        schema_version=BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION,
+        excluded_paths=(),
+        config={"test_identity": label},
     )
-    assert declared.isdisjoint(ignored)
-    assert declared | ignored == fields
+
+
+def _test_bootstrap_fingerprint(label: str = "v1") -> str:
+    return _test_bootstrap_identity(label).fingerprint()
+
+
+def _ensure_test_bootstrap_anchor(tmp_path: Path, label: str = "v1") -> Path:
+    return ensure_bootstrap_anchor(
+        tmp_path,
+        identity=_test_bootstrap_identity(label),
+    )
 
 
 def _commit_snapshot(
@@ -230,8 +80,10 @@ def _commit_snapshot(
     *,
     mutation_version: int,
     trainer_version: int = 0,
-    fingerprint: str | None = "fingerprint-v1",
+    fingerprint: str | None = None,
 ):
+    if fingerprint is None:
+        fingerprint = _test_bootstrap_fingerprint()
     tmp_path, final_path, _ = prepare_snapshot_paths(anchor)
     manifest = RolloutSnapshotManifest(
         schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
@@ -251,14 +103,80 @@ def _commit_snapshot(
 
 
 def test_bootstrap_anchor_rejects_different_initial_state(tmp_path):
-    anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
-    assert ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1") == anchor
+    anchor = _ensure_test_bootstrap_anchor(tmp_path)
+    assert _ensure_test_bootstrap_anchor(tmp_path) == anchor
+    manifest = json.loads((anchor / BOOTSTRAP_MANIFEST_FILENAME).read_text())
+    assert manifest["bootstrap_identity"] == _test_bootstrap_identity().to_dict()
 
-    with pytest.raises(ValueError, match="does not match"):
-        ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v2")
+    with pytest.raises(
+        ValueError,
+        match="Existing checkpoint state was not modified",
+    ) as error:
+        _ensure_test_bootstrap_anchor(tmp_path, "v2")
+
+    assert "test_identity: 'v1' -> 'v2'" in str(error.value)
+    assert "bootstrap_fingerprint" not in str(error.value)
 
 
-def test_bootstrap_fingerprint_ignores_non_recovery_configuration() -> None:
+def test_validate_bootstrap_anchor_is_read_only(tmp_path: Path) -> None:
+    identity = _test_bootstrap_identity()
+    anchor = ensure_bootstrap_anchor(tmp_path, identity=identity)
+    snapshot = anchor / "rollout_snapshots" / "snapshot_000001"
+    snapshot.mkdir(parents=True)
+    payload = snapshot / "payload"
+    payload.write_text("preserve me")
+
+    before = {
+        path.relative_to(anchor): path.read_bytes()
+        for path in anchor.rglob("*")
+        if path.is_file()
+    }
+    validate_bootstrap_anchor(anchor, identity=identity)
+    after = {
+        path.relative_to(anchor): path.read_bytes()
+        for path in anchor.rglob("*")
+        if path.is_file()
+    }
+
+    assert after == before
+
+
+def test_bootstrap_anchor_mismatch_names_redacted_config_paths(tmp_path: Path) -> None:
+    original = _DumpedConfig(
+        {
+            "policy": {"generation": {"temperature": 1.0}},
+            "env": {"service": {"api_key": "secret-one"}},
+            "custom_algo": {"service_token": "custom-secret-one"},
+        }
+    )
+    changed = _DumpedConfig(
+        {
+            "policy": {"generation": {"temperature": 0.7}},
+            "env": {"service": {"api_key": "secret-two"}},
+            "custom_algo": {"service_token": "custom-secret-two"},
+        }
+    )
+    anchor = ensure_bootstrap_anchor(
+        tmp_path,
+        identity=bootstrap_compatibility_identity(cast(Any, original)),
+    )
+
+    with pytest.raises(ValueError) as error:
+        validate_bootstrap_anchor(
+            anchor,
+            identity=bootstrap_compatibility_identity(cast(Any, changed)),
+        )
+
+    message = str(error.value)
+    assert "policy.generation.temperature: 1.0 -> 0.7" in message
+    assert "secret-one" not in message
+    assert "secret-two" not in message
+    manifest = (anchor / BOOTSTRAP_MANIFEST_FILENAME).read_text()
+    assert "secret-one" not in manifest
+    assert "custom-secret-one" not in manifest
+
+
+def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
     base = {
         "policy": {
             "model_name": "model-a",
@@ -267,41 +185,34 @@ def test_bootstrap_fingerprint_ignores_non_recovery_configuration() -> None:
                 "backend": "vllm",
                 "temperature": 1.0,
                 "colocated": {"enabled": True, "resources": {"gpus": 8}},
-                "vllm_cfg": {
-                    "kv_cache_dtype": "auto",
-                    "precision": "bfloat16",
-                    "skip_tokenizer_init": False,
-                },
+                "port_range_low": 3000,
+                "port_range_high": 4000,
             },
         },
         "data": {
             "train": [{"data_path": "/datasets/train.jsonl"}],
             "num_workers": 4,
         },
-        "grpo": {
-            "num_generations_per_prompt": 4,
-            "max_num_steps": 10,
-            "batch_multiplier": 1,
-            "use_dynamic_sampling": False,
-            "reward_shaping": {"enabled": False},
-            "reward_scaling": {"enabled": False},
-        },
-        "loss_fn": {
-            "reference_policy_kl_penalty": 0.01,
-            "use_kl_in_reward": False,
-        },
-        "reward_penalties": {"penalize_unwanted_tokens": False},
+        "grpo": {"num_generations_per_prompt": 4},
         "token_capture": {
+            "capture_dir": "/run/one/capture",
+            "control_auth_token": "secret-one",
             "control_timeout_s": 60.0,
             "enabled": True,
-            "num_finalizer_workers": 2,
+            "num_reassembler_workers": 2,
             "on_capture_failure": "continue",
             "staging_partition": "rollout_staging",
         },
+        "async_rl": {
+            "sampler": {"name": "windowed", "max_staleness_versions": 1},
+            "stall_watchdog": {"interval_s": 30},
+        },
+        "checkpointing": {"checkpoint_dir": "/run/one/checkpoints"},
+        "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
         "cluster": {"num_nodes": 2},
         "logger": {"log_dir": "/run/one"},
     }
-    compatible_changed = {
+    operationally_changed = {
         **base,
         "policy": {
             **base["policy"],
@@ -309,40 +220,148 @@ def test_bootstrap_fingerprint_ignores_non_recovery_configuration() -> None:
             "generation": {
                 **base["policy"]["generation"],
                 "colocated": {"enabled": False, "resources": {"gpus": 16}},
-                "vllm_cfg": {
-                    "kv_cache_dtype": "fp8",
-                    "precision": "float16",
-                    "skip_tokenizer_init": True,
-                },
+                "port_range_low": 5000,
+                "port_range_high": 6000,
             },
         },
         "data": {**base["data"], "num_workers": 16},
-        "grpo": {
-            **base["grpo"],
-            "max_num_steps": 100,
-            "batch_multiplier": 2,
-            "use_dynamic_sampling": True,
-            "reward_shaping": {"enabled": True},
-            "reward_scaling": {"enabled": True},
-        },
-        "loss_fn": {
-            "reference_policy_kl_penalty": 0.1,
-            "use_kl_in_reward": True,
-        },
-        "reward_penalties": {"penalize_unwanted_tokens": True},
         "token_capture": {
             **base["token_capture"],
+            "capture_dir": "/run/two/capture",
+            "control_auth_token": "secret-two",
             "control_timeout_s": 15.0,
-            "num_finalizer_workers": 8,
+            "num_reassembler_workers": 8,
         },
+        "async_rl": {
+            **base["async_rl"],
+            "stall_watchdog": {"interval_s": 5},
+        },
+        "checkpointing": {"checkpoint_dir": "/run/two/checkpoints"},
+        "rollout_checkpointing": {"snapshot_attempt_interval_s": 300},
         "cluster": {"num_nodes": 8},
         "logger": {"log_dir": "/run/two"},
     }
 
     fingerprint = bootstrap_fingerprint(cast(Any, _DumpedConfig(base)))
     assert fingerprint == bootstrap_fingerprint(
-        cast(Any, _DumpedConfig(compatible_changed))
+        cast(Any, _DumpedConfig(operationally_changed))
     )
+
+
+def test_bootstrap_fingerprint_includes_unknown_config_by_default() -> None:
+    base = {"custom_algo": {"semantic_setting": "one"}}
+    changed = {"custom_algo": {"semantic_setting": "two"}}
+
+    assert bootstrap_fingerprint(cast(Any, _DumpedConfig(base))) != (
+        bootstrap_fingerprint(cast(Any, _DumpedConfig(changed)))
+    )
+
+
+def test_bootstrap_fingerprint_honors_extra_excluded_dotpaths() -> None:
+    base = {
+        "custom_algo": {
+            "semantic_setting": "same",
+            "runtime": {"endpoint": "host-one", "port": 1234},
+        },
+        "rollout_checkpointing": {
+            "extra_fingerprint_excluded_paths": ["custom_algo.runtime"]
+        },
+    }
+    runtime_changed = {
+        **base,
+        "custom_algo": {
+            **base["custom_algo"],
+            "runtime": {"endpoint": "host-two", "port": 5678},
+        },
+    }
+    semantic_changed = {
+        **base,
+        "custom_algo": {
+            **base["custom_algo"],
+            "semantic_setting": "different",
+        },
+    }
+
+    fingerprint = bootstrap_fingerprint(cast(Any, _DumpedConfig(base)))
+    assert fingerprint == bootstrap_fingerprint(
+        cast(Any, _DumpedConfig(runtime_changed))
+    )
+    assert fingerprint != bootstrap_fingerprint(
+        cast(Any, _DumpedConfig(semantic_changed))
+    )
+    identity = bootstrap_compatibility_identity(cast(Any, _DumpedConfig(base)))
+    assert identity.config["custom_algo"] == {"semantic_setting": "same"}
+    assert "custom_algo.runtime" in identity.excluded_paths
+
+
+def test_bootstrap_fingerprint_extra_excluded_dotpaths_support_lists() -> None:
+    base = {
+        "custom_algo": {
+            "workers": [
+                {"name": "one", "log_dir": "/run/one"},
+                {"name": "two", "log_dir": "/run/two"},
+            ]
+        },
+        "rollout_checkpointing": {
+            "extra_fingerprint_excluded_paths": ["custom_algo.workers.*.log_dir"]
+        },
+    }
+    changed = {
+        **base,
+        "custom_algo": {
+            "workers": [
+                {"name": "one", "log_dir": "/other/one"},
+                {"name": "two", "log_dir": "/other/two"},
+            ]
+        },
+    }
+
+    assert bootstrap_fingerprint(cast(Any, _DumpedConfig(base))) == (
+        bootstrap_fingerprint(cast(Any, _DumpedConfig(changed)))
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["", " custom.path", "custom.path ", ".x", "x.", "x..y", "*", "**"],
+)
+def test_rollout_checkpoint_config_rejects_invalid_extra_excluded_path(
+    path: str,
+) -> None:
+    with pytest.raises(ValueError, match="extra_fingerprint_excluded_paths"):
+        RolloutCheckpointConfig(extra_fingerprint_excluded_paths=[path])
+
+
+def test_builtin_fingerprint_exclusions_reference_declared_config_fields() -> None:
+    """Keep typed portions of the built-in denylist from silently going stale."""
+
+    def _fields(schema: Any) -> set[str]:
+        model_fields = getattr(schema, "model_fields", None)
+        if model_fields is not None:
+            return set(model_fields)
+        return set(schema.__annotations__)
+
+    schemas_by_prefix = {
+        (): _fields(MasterConfig),
+        ("async_rl",): _fields(AsyncRLConfig),
+        ("data",): _fields(DataConfig),
+        ("policy",): _fields(PolicyConfig),
+        ("policy", "generation"): _fields(VllmConfig),
+        ("policy", "generation", "vllm_cfg"): _fields(VllmSpecificArgs),
+        ("rollout_checkpointing",): _fields(RolloutCheckpointConfig),
+        ("token_capture",): _fields(TokenCaptureConfig),
+    }
+    for excluded_path in rollout_checkpoint._BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS:
+        segments = tuple(excluded_path.split("."))
+        for prefix, fields in schemas_by_prefix.items():
+            if segments[: len(prefix)] != prefix or len(segments) == len(prefix):
+                continue
+            next_segment = segments[len(prefix)]
+            if not any(character in next_segment for character in "*?["):
+                assert next_segment in fields, (
+                    f"bootstrap fingerprint exclusion {excluded_path!r} refers to "
+                    f"unknown config field {'.'.join((*prefix, next_segment))!r}"
+                )
 
 
 @pytest.mark.parametrize(
@@ -358,6 +377,7 @@ def test_bootstrap_fingerprint_ignores_non_recovery_configuration() -> None:
             "async_rl",
             {"sampler": {"name": "windowed", "max_staleness_versions": 2}},
         ),
+        ("rollout_recovery", {"default_granularity": "prompt_group"}),
     ],
 )
 def test_bootstrap_fingerprint_rejects_rollout_semantic_changes(
@@ -377,6 +397,7 @@ def test_bootstrap_fingerprint_rejects_rollout_semantic_changes(
             "mixed_weight_version_policy": "allow",
         },
         "async_rl": {"sampler": {"name": "windowed", "max_staleness_versions": 1}},
+        "rollout_recovery": {"default_granularity": "sibling"},
     }
     modified = {**base, section: {**base[section], **changed}}
 
@@ -408,6 +429,20 @@ def test_bootstrap_fingerprint_rejects_generation_semantic_changes() -> None:
     }
     assert bootstrap_fingerprint(cast(Any, _DumpedConfig(base))) != (
         bootstrap_fingerprint(cast(Any, _DumpedConfig(sampling_changed)))
+    )
+
+    blocked_tokens_changed = {
+        **base,
+        "policy": {
+            **base["policy"],
+            "generation": {
+                **base["policy"]["generation"],
+                "bad_words": ["forbidden"],
+            },
+        },
+    }
+    assert bootstrap_fingerprint(cast(Any, _DumpedConfig(base))) != (
+        bootstrap_fingerprint(cast(Any, _DumpedConfig(blocked_tokens_changed)))
     )
 
     context_changed = {
@@ -540,13 +575,13 @@ def test_bootstrap_fingerprint_ignores_nemo_gym_service_routing() -> None:
     identity = bootstrap_compatibility_identity(cast(Any, _DumpedConfig(base)))
     assert (
         "base_url"
-        not in identity.environment["nemo_gym"]["genrm_model"]["responses_api_models"][
-            "genrm_model"
-        ]
+        not in identity.config["env"]["nemo_gym"]["genrm_model"][
+            "responses_api_models"
+        ]["genrm_model"]
     )
     assert (
         "base_url"
-        not in identity.environment["nemo_gym"]["nl2bash_judge_model"][
+        not in identity.config["env"]["nemo_gym"]["nl2bash_judge_model"][
             "responses_api_models"
         ]["local_vllm_model"]
     )
@@ -554,9 +589,9 @@ def test_bootstrap_fingerprint_ignores_nemo_gym_service_routing() -> None:
 
 @pytest.mark.parametrize(
     "field",
-    sorted(rollout_checkpoint._BOOTSTRAP_ENV_RUNTIME_FIELDS),
+    ["concurrency", "nemo_gym_log_dir", "num_processes", "verbose"],
 )
-def test_bootstrap_fingerprint_ignores_declared_environment_runtime_fields(
+def test_bootstrap_fingerprint_ignores_environment_runtime_fields(
     field: str,
 ) -> None:
     base = {
@@ -614,7 +649,7 @@ def test_bootstrap_fingerprint_ignores_nested_environment_credentials(
     }
 
     identity = bootstrap_compatibility_identity(cast(Any, _DumpedConfig(base)))
-    assert field not in identity.environment["nemo_gym"]["service"]
+    assert field not in identity.config["env"]["nemo_gym"]["service"]
     assert bootstrap_fingerprint(cast(Any, _DumpedConfig(base))) == (
         bootstrap_fingerprint(cast(Any, _DumpedConfig(credential_changed)))
     )
@@ -644,7 +679,7 @@ def test_bootstrap_fingerprint_keeps_environment_token_semantics() -> None:
     }
 
     identity = bootstrap_compatibility_identity(cast(Any, _DumpedConfig(base)))
-    assert identity.environment["nemo_gym"]["service"] == {
+    assert identity.config["env"]["nemo_gym"]["service"] == {
         "max_tokens": 1024,
         "model": "model-a",
         "tokenizer": "tokenizer-a",
@@ -675,22 +710,8 @@ def test_prune_bootstrap_snapshots_requires_durable_trainer_checkpoint(tmp_path)
     assert not snapshot_root.exists()
 
 
-def test_reset_bootstrap_anchor_discards_skipped_snapshot_lineage(
-    tmp_path: Path,
-) -> None:
-    anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="old-fingerprint")
-    snapshot_root = anchor / "rollout_snapshots"
-    (snapshot_root / "snapshot_000001").mkdir(parents=True)
-
-    reset = reset_bootstrap_anchor(tmp_path, fingerprint="new-fingerprint")
-
-    assert reset == anchor
-    assert not snapshot_root.exists()
-    assert ensure_bootstrap_anchor(tmp_path, fingerprint="new-fingerprint") == anchor
-
-
 def test_resolver_selects_latest_compatible_committed_snapshot(tmp_path):
-    anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
+    anchor = _ensure_test_bootstrap_anchor(tmp_path)
     first = _commit_snapshot(anchor, mutation_version=1)
     second = _commit_snapshot(anchor, mutation_version=2)
 
@@ -698,7 +719,7 @@ def test_resolver_selects_latest_compatible_committed_snapshot(tmp_path):
         anchor,
         expected_train_step=0,
         expected_trainer_version=0,
-        expected_bootstrap_fingerprint="fingerprint-v1",
+        expected_bootstrap_fingerprint=_test_bootstrap_fingerprint(),
     )
 
     assert resolved is not None
@@ -708,7 +729,7 @@ def test_resolver_selects_latest_compatible_committed_snapshot(tmp_path):
 
 
 def test_resolver_falls_back_from_corrupt_newest_snapshot(tmp_path):
-    anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
+    anchor = _ensure_test_bootstrap_anchor(tmp_path)
     first = _commit_snapshot(anchor, mutation_version=1)
     second = _commit_snapshot(anchor, mutation_version=2)
     (second / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text("not-json")
@@ -717,17 +738,17 @@ def test_resolver_falls_back_from_corrupt_newest_snapshot(tmp_path):
         anchor,
         expected_train_step=0,
         expected_trainer_version=0,
-        expected_bootstrap_fingerprint="fingerprint-v1",
+        expected_bootstrap_fingerprint=_test_bootstrap_fingerprint(),
     )
 
     assert resolved is not None
     assert resolved.path == first
 
 
-def test_resolver_ignores_snapshot_without_commit_marker(tmp_path):
-    anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
-    committed = _commit_snapshot(anchor, mutation_version=1)
-    incomplete = anchor / "rollout_snapshots" / "snapshot_000002"
+def test_resolver_ignores_unpublished_temporary_snapshot(tmp_path):
+    anchor = _ensure_test_bootstrap_anchor(tmp_path)
+    published = _commit_snapshot(anchor, mutation_version=1)
+    incomplete = anchor / "rollout_snapshots" / "tmp_snapshot_000002"
     incomplete.mkdir()
     (incomplete / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text("{}")
 
@@ -735,23 +756,27 @@ def test_resolver_ignores_snapshot_without_commit_marker(tmp_path):
         anchor,
         expected_train_step=0,
         expected_trainer_version=0,
-        expected_bootstrap_fingerprint="fingerprint-v1",
+        expected_bootstrap_fingerprint=_test_bootstrap_fingerprint(),
     )
 
     assert resolved is not None
-    assert resolved.path == committed
+    assert resolved.path == published
 
 
 def test_resolver_fails_when_no_committed_snapshot_matches_anchor(tmp_path):
-    anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
-    _commit_snapshot(anchor, mutation_version=1, fingerprint="different")
+    anchor = _ensure_test_bootstrap_anchor(tmp_path)
+    _commit_snapshot(
+        anchor,
+        mutation_version=1,
+        fingerprint=_test_bootstrap_fingerprint("different"),
+    )
 
     with pytest.raises(ValueError, match="trainer-anchor mismatch"):
         resolve_latest_snapshot(
             anchor,
             expected_train_step=0,
             expected_trainer_version=0,
-            expected_bootstrap_fingerprint="fingerprint-v1",
+            expected_bootstrap_fingerprint=_test_bootstrap_fingerprint(),
         )
 
 
@@ -761,27 +786,20 @@ def test_commit_snapshot_flushes_payload_before_publication(tmp_path, monkeypatc
     tmp_snapshot, final_snapshot, _ = prepare_snapshot_paths(anchor)
     (tmp_snapshot / "payload").write_text("payload")
     fsync_tree = Mock()
-    fsync_file = Mock()
     fsync_directory = Mock()
     monkeypatch.setattr(rollout_checkpoint, "_fsync_tree", fsync_tree)
-    monkeypatch.setattr(rollout_checkpoint, "_fsync_file", fsync_file)
     monkeypatch.setattr(rollout_checkpoint, "_fsync_directory", fsync_directory)
 
     commit_snapshot(tmp_snapshot, final_snapshot, keep_latest_k=1)
 
     fsync_tree.assert_called_once_with(tmp_snapshot)
-    assert fsync_file.call_args_list == [
-        call(tmp_snapshot / "COMMITTED"),
-    ]
-    assert fsync_directory.call_args_list[:2] == [
-        call(tmp_snapshot),
-        call(anchor / "rollout_snapshots"),
-    ]
-    assert (final_snapshot / "COMMITTED").is_file()
+    assert fsync_directory.call_args_list == [call(anchor / "rollout_snapshots")]
+    assert final_snapshot.is_dir()
+    assert not tmp_snapshot.exists()
 
 
 def test_commit_snapshot_prunes_oldest_committed_snapshot(tmp_path):
-    anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
+    anchor = _ensure_test_bootstrap_anchor(tmp_path)
     first = _commit_snapshot(anchor, mutation_version=1)
     second = _commit_snapshot(anchor, mutation_version=2)
     third_tmp, third, _ = prepare_snapshot_paths(anchor)
@@ -793,7 +811,7 @@ def test_commit_snapshot_prunes_oldest_committed_snapshot(tmp_path):
         sampler_dispatch_index=2,
         mutation_version=3,
         rolled_back_train_group_count=0,
-        bootstrap_fingerprint="fingerprint-v1",
+        bootstrap_fingerprint=_test_bootstrap_fingerprint(),
     )
     (third_tmp / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
         json.dumps(manifest.to_dict())
@@ -804,6 +822,72 @@ def test_commit_snapshot_prunes_oldest_committed_snapshot(tmp_path):
     assert not first.exists()
     assert second.is_dir()
     assert third.is_dir()
+
+
+def test_commit_snapshot_removes_stale_snapshot_from_live_namespace_before_delete(
+    tmp_path,
+    monkeypatch,
+):
+    anchor = _ensure_test_bootstrap_anchor(tmp_path)
+    first = _commit_snapshot(anchor, mutation_version=1)
+    _commit_snapshot(anchor, mutation_version=2)
+    third_tmp, third, _ = prepare_snapshot_paths(anchor)
+    manifest = RolloutSnapshotManifest(
+        schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        base_train_step=0,
+        trainer_version=0,
+        current_epoch=2,
+        sampler_dispatch_index=2,
+        mutation_version=3,
+        rolled_back_train_group_count=0,
+        bootstrap_fingerprint=_test_bootstrap_fingerprint(),
+    )
+    (third_tmp / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
+        json.dumps(manifest.to_dict())
+    )
+    real_rmtree = rollout_checkpoint.shutil.rmtree
+
+    def fail_trash_delete(path: Path) -> None:
+        path = Path(path)
+        if path.name.startswith("trash_snapshot_"):
+            raise OSError("simulated delete failure")
+        real_rmtree(path)
+
+    monkeypatch.setattr(rollout_checkpoint.shutil, "rmtree", fail_trash_delete)
+
+    with pytest.raises(OSError, match="simulated delete failure"):
+        commit_snapshot(third_tmp, third, keep_latest_k=2)
+
+    assert not first.exists()
+    assert (first.parent / f"trash_{first.name}").is_dir()
+    assert third.is_dir()
+    resolved = resolve_latest_snapshot(
+        anchor,
+        expected_train_step=0,
+        expected_trainer_version=0,
+        expected_bootstrap_fingerprint=_test_bootstrap_fingerprint(),
+    )
+    assert resolved is not None
+    assert resolved.path == third
+
+
+def test_prepare_snapshot_paths_sweeps_interrupted_snapshot_garbage(tmp_path):
+    anchor = _ensure_test_bootstrap_anchor(tmp_path)
+    root = anchor / rollout_checkpoint.ROLLOUT_SNAPSHOTS_DIRNAME
+    stale_tmp = root / "tmp_snapshot_000001"
+    stale_trash = root / "trash_snapshot_000002"
+    stale_tmp.mkdir(parents=True)
+    stale_trash.mkdir()
+    (stale_tmp / "stale").write_text("stale")
+    (stale_trash / "stale").write_text("stale")
+
+    tmp_path, final_path, sequence = prepare_snapshot_paths(anchor)
+
+    assert not (root / "trash_snapshot_000002").exists()
+    assert tmp_path == root / "tmp_snapshot_000001"
+    assert not (tmp_path / "stale").exists()
+    assert final_path == root / "snapshot_000001"
+    assert sequence == 1
 
 
 def test_manifest_rejects_bool_for_integer_field():
