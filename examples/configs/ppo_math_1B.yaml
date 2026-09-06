@@ -311,6 +311,8 @@ value:
     name: ${value.model_name}
     chat_template_kwargs: null
   hf_config_overrides: {}
+  # Ray value workers are separate processes, so pass the PPO seed explicitly.
+  seed: ${ppo.seed}
 
   train_global_batch_size: ${policy.train_global_batch_size}
   train_micro_batch_size: ${policy.train_micro_batch_size}
