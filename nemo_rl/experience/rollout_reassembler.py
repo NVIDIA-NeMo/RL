@@ -40,8 +40,11 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
+from tensordict import TensorDict
 
+from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.codec import stack_or_nest
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.payload import pack_payload
@@ -117,6 +120,7 @@ class RolloutReassembler:
         max_seq_len: int,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
+        media_staging_partition: Optional[str] = None,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -129,6 +133,7 @@ class RolloutReassembler:
                 "defer_routed_experts_to_policy requires router replay to be enabled"
             )
         self._staging_partition = staging_partition
+        self._media_staging_partition = media_staging_partition
         # (num_moe_layers, topk), learned from the first rebuilt row that
         # carries routes; placeholder-only groups need it to shape their
         # sentinel tensors consistently with the model.
@@ -364,6 +369,9 @@ class RolloutReassembler:
         mask_sample: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
+        loss_multiplier: float = 1.0,
+        static_multimodal_fields: Optional[list[str]] = None,
+        static_multimodal_tags: Optional[list[dict[str, Any]]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -382,6 +390,14 @@ class RolloutReassembler:
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
         )
+        static_multimodal_fields = list(static_multimodal_fields or [])
+        static_multimodal_tags = list(static_multimodal_tags or [])
+        if static_multimodal_fields and self._media_staging_partition is None:
+            raise ValueError("static multimodal fields require a media staging partition")
+        if static_multimodal_fields and len(static_multimodal_tags) != len(rollout_ids):
+            raise ValueError(
+                "static multimodal tags must be parallel to rollout_ids"
+            )
         _group_t0 = time.perf_counter()
         rows = [
             self.finalize_rollout(rollout_id, receipt, reward=reward)
@@ -511,7 +527,7 @@ class RolloutReassembler:
             input_ids[i, :length] = torch.tensor(row.token_ids, dtype=torch.int64)
             token_mask[i, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
             logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
-            sample_mask[i] = 1.0
+            sample_mask[i] = float(loss_multiplier)
 
         train_batch = {
             "input_ids": input_ids,
@@ -541,6 +557,7 @@ class RolloutReassembler:
                     flush=True,
                 )
                 self._clear_staging(staging_keys)
+                self._clear_media(rollout_ids if static_multimodal_fields else [])
                 metrics["finalize/group_dropped"] = 1.0
                 return FinalizedGroup(
                     meta=None,
@@ -565,6 +582,21 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        if static_multimodal_fields:
+            media_fields = self._fetch_and_mask_media(
+                rollout_ids,
+                field_names=static_multimodal_fields,
+                valid_rows=[row.valid for row in rows],
+                sequence_lengths=seq_lens,
+            )
+            fields.update(media_fields)
+            for index, static_tag in enumerate(static_multimodal_tags):
+                if rows[index].valid:
+                    tags[index].update(static_tag)
+                    continue
+                for key, value in static_tag.items():
+                    if key.endswith("__row_shapes") and isinstance(value, dict):
+                        tags[index][key] = {**value, "shapes": []}
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0
@@ -604,6 +636,7 @@ class RolloutReassembler:
             fields=fields,
             tags=tags,
         )
+        self._clear_media(rollout_ids if static_multimodal_fields else [])
         _put_ms = (time.perf_counter() - _put_t0) * 1000.0
         _clear_ms = 0.0
         if not self._defer_routed_experts_to_policy:
@@ -636,6 +669,67 @@ class RolloutReassembler:
         )
 
     # ── internals ───────────────────────────────────────────────────────────
+
+    def _fetch_and_mask_media(
+        self,
+        sample_ids: list[str],
+        *,
+        field_names: list[str],
+        valid_rows: list[bool],
+        sequence_lengths: list[int],
+    ) -> TensorDict:
+        """Fetch staged media and neutralize fields on placeholder rows."""
+        assert self._media_staging_partition is not None
+        staged = self._call_dp(
+            "get_samples",
+            sample_ids=sample_ids,
+            partition_id=self._media_staging_partition,
+            select_fields=field_names,
+        )
+        if int(staged.batch_size[0]) != len(sample_ids):
+            raise RuntimeError(
+                "media staging fetch returned a partial prompt group: "
+                f"{int(staged.batch_size[0])} != {len(sample_ids)}"
+            )
+
+        masked: dict[str, torch.Tensor] = {}
+        for name in field_names:
+            value = staged[name]
+            rows = list(value.unbind(0))
+            output_rows: list[torch.Tensor] = []
+            for index, row in enumerate(rows):
+                if valid_rows[index]:
+                    if name in PER_TOKEN_MULTIMODAL_FIELDS:
+                        target = torch.zeros(
+                            (sequence_lengths[index], *row.shape[1:]),
+                            dtype=row.dtype,
+                            device=row.device,
+                        )
+                        copied = min(int(row.shape[0]), sequence_lengths[index])
+                        target[:copied] = row[:copied]
+                        row = target
+                    output_rows.append(row)
+                else:
+                    length = 1 if name in PER_TOKEN_MULTIMODAL_FIELDS else 0
+                    output_rows.append(
+                        torch.zeros(
+                            (length, *row.shape[1:]),
+                            dtype=row.dtype,
+                            device=row.device,
+                        )
+                    )
+            masked[name] = stack_or_nest(output_rows)
+        return TensorDict(masked, batch_size=[len(sample_ids)])
+
+    def _clear_media(self, sample_ids: list[str]) -> None:
+        if not sample_ids:
+            return
+        assert self._media_staging_partition is not None
+        self._call_dp(
+            "clear_samples",
+            sample_ids=sample_ids,
+            partition_id=self._media_staging_partition,
+        )
 
     def _build_routed_experts_tensor(
         self,

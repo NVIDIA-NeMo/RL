@@ -15,6 +15,7 @@
 import asyncio
 import gc
 import importlib
+import multiprocessing as mp
 import os
 import threading
 import time
@@ -120,6 +121,8 @@ class MegatronGenerationMixin:
         )
         self._inference_loop = None
         self._inference_thread = None
+        self._token_capture_config: Optional[tuple[dict[str, Any], str]] = None
+        self._token_capture_weight_version = mp.Value("q", 0)
 
     def _get_megatron_inference_wrapper_cls(self) -> Optional[type]:
         """Resolve the configured Megatron inference wrapper, if any.
@@ -560,6 +563,18 @@ class MegatronGenerationMixin:
         else:
             server_port = _get_free_port_local()
 
+        if self._token_capture_config is not None:
+            from nemo_rl.models.generation.megatron.token_capture import (
+                install_megatron_token_capture_hooks,
+            )
+
+            dp_config, staging_partition = self._token_capture_config
+            install_megatron_token_capture_hooks(
+                dp_config,
+                staging_partition,
+                self._token_capture_weight_version,
+            )
+
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
             tokenizer=self.megatron_tokenizer,
@@ -589,6 +604,26 @@ class MegatronGenerationMixin:
                     pass
                 time.sleep(2)
         return base_url
+
+    def setup_token_capture(
+        self, dp_cfg: dict[str, Any], staging_partition: str
+    ) -> bool:
+        """Configure capture before rank zero forks its HTTP frontends."""
+        if torch.distributed.get_rank() != 0:
+            return False
+        if self.base_url is not None:
+            raise RuntimeError(
+                "Megatron token capture must be configured before its HTTP server starts"
+            )
+        self._token_capture_config = (dict(dp_cfg), str(staging_partition))
+        return True
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Atomically rotate the version inherited by HTTP frontend processes."""
+        if type(version) is not int or version < 0:
+            raise ValueError(f"weight version must be non-negative, got {version!r}")
+        with self._token_capture_weight_version.get_lock():
+            self._token_capture_weight_version.value = version
 
     def _run_async_coordinator_start(self):
         """Start the coordinator and engine loop in the background thread."""

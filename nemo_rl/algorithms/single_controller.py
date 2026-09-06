@@ -498,6 +498,7 @@ class SingleControllerActor:
         self._rollout_manager.set_weight_version(self._trainer_version)
 
         restored_replay_groups = await self._maybe_restore_replay_buffer()
+        await self._clear_restored_media_staging()
         await self._maybe_restore_rollout_recovery(
             restored_replay_groups=restored_replay_groups
         )
@@ -573,6 +574,25 @@ class SingleControllerActor:
         }
 
     # ── internal helpers ───────────────────────────────────────────────────
+
+    async def _clear_restored_media_staging(self) -> None:
+        """Drop auxiliary media snapshots before unfinished groups redispatch."""
+        if (
+            self._last_checkpoint_path is None
+            or not self._master_config.token_capture.enabled
+            or not self._master_config.policy.get("is_vlm", False)
+        ):
+            return
+        async with self._data_plane_checkpoint_barrier.mutation():
+            await call_data_plane(
+                self._dp_client,
+                "clear_samples",
+                offload_sync=True,
+                sample_ids=None,
+                partition_id=(
+                    self._master_config.token_capture.media_staging_partition
+                ),
+            )
 
     async def _maybe_restore_replay_buffer(self) -> int:
         """Restore the local replay index for the native TQ checkpoint.
@@ -1212,6 +1232,25 @@ class SingleControllerActor:
                         RuntimeError(
                             "pre-publication staging cleanup failed for "
                             f"group={request.group_id!r}, keys={staging_keys!r}"
+                        )
+                    )
+                    errors[-1].__cause__ = error
+            if request.static_multimodal_fields:
+                try:
+                    await call_data_plane(
+                        self._dp_client,
+                        "clear_samples",
+                        offload_sync=True,
+                        sample_ids=list(request.rollout_ids),
+                        partition_id=(
+                            self._master_config.token_capture.media_staging_partition
+                        ),
+                    )
+                except Exception as error:
+                    errors.append(
+                        RuntimeError(
+                            "pre-publication media cleanup failed for "
+                            f"group={request.group_id!r}, ids={request.rollout_ids!r}"
                         )
                     )
                     errors[-1].__cause__ = error

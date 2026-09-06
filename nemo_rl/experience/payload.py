@@ -23,6 +23,7 @@ from tensordict import TensorDict
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.multimodal_utils import (
+    PER_TOKEN_MULTIMODAL_FIELDS,
     encode_multimodal_for_wire,
     multimodal_row_tags,
 )
@@ -186,6 +187,42 @@ def record_to_train_batch(
         train_data[MALFORMED_THINKING_MASK] = flat[MALFORMED_THINKING_MASK]
     train_data.update(flat.get_multimodal_dict(as_tensors=False))
     return BatchedDataDict[Any](train_data)
+
+
+def pack_static_multimodal_payload(
+    message_log: LLMMessageLogType | VLMMessageLogType,
+    *,
+    num_samples: int,
+    pad_value_dict: Mapping[str, int],
+) -> tuple[TensorDict, list[dict[str, Any]]]:
+    """Encode prompt-static media once per rollout for staging."""
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}")
+
+    from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+
+    flat, lengths = batched_message_log_to_flat_message(
+        [message_log] * num_samples,
+        pad_value_dict=dict(pad_value_dict),  # type: ignore[arg-type]
+    )
+    multimodal = flat.get_multimodal_dict(as_tensors=False)
+    wire_fields: dict[str, torch.Tensor | np.ndarray] = {}
+    for key, value in multimodal.items():
+        wire_value = encode_multimodal_for_wire(key, value)
+        if wire_value is not None:
+            wire_fields[key] = wire_value
+    if not wire_fields:
+        return TensorDict({}, batch_size=[num_samples]), []
+
+    return (
+        pack_jagged_fields(
+            wire_fields,
+            lengths=lengths,
+            token_aligned_fields=PER_TOKEN_MULTIMODAL_FIELDS,
+        ),
+        multimodal_row_tags(multimodal, num_samples)
+        or [{} for _ in range(num_samples)],
+    )
 
 
 def pack_payload(

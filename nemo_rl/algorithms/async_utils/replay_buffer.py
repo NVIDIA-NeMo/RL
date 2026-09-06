@@ -37,6 +37,7 @@ from typing import (
 
 import ray
 import torch
+from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
@@ -1088,6 +1089,61 @@ class TQReplayBuffer:
         )
         self._staging_keys_list.append(None)
         return group_id
+
+    async def stage_unready_fields(
+        self,
+        group_id: str,
+        *,
+        sample_ids: list[str],
+        partition_id: str,
+        fields: TensorDict,
+        tags: list[dict[str, Any]],
+    ) -> KVBatchMeta:
+        """Stage auxiliary rows for a reserved group without marking it ready."""
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the checkpoint barrier before staging"
+            )
+        try:
+            idx = self._group_ids.index(group_id)
+        except ValueError:
+            raise ValueError(f"group {group_id!r} has no live reserved slot") from None
+        expected_ids = self._rollout_ids_list[idx]
+        if expected_ids is None or sample_ids != expected_ids:
+            raise ValueError(
+                f"staged sample IDs do not match reservation: {sample_ids!r} "
+                f"!= {expected_ids!r}"
+            )
+
+        async with self._data_plane_checkpoint_barrier.mutation():
+            return await call_data_plane(
+                self._dp_client,
+                "put_samples",
+                offload_sync=True,
+                sample_ids=sample_ids,
+                partition_id=partition_id,
+                fields=fields,
+                tags=tags,
+            )
+
+    async def clear_auxiliary_fields(
+        self, *, sample_ids: list[str], partition_id: str
+    ) -> None:
+        """Clear auxiliary staging rows under the checkpoint mutation barrier."""
+        if not sample_ids:
+            return
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the checkpoint barrier before clearing"
+            )
+        async with self._data_plane_checkpoint_barrier.mutation():
+            await call_data_plane(
+                self._dp_client,
+                "clear_samples",
+                offload_sync=True,
+                sample_ids=sample_ids,
+                partition_id=partition_id,
+            )
 
     async def commit(
         self,

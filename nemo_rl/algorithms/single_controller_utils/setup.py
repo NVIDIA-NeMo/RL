@@ -997,10 +997,8 @@ def setup_single_controller(
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
-    # Token capture: validate the supported combination loudly at setup
-    # (NeMo-Gym rollout path, vLLM backend, async_engine=true) and give
-    # capture-enabled vLLM workers a venv that carries nemo_gym (the
-    # worker hosts Gym's capture core + adapter in-process).
+    # Token capture: validate the served NeMo-Gym path and give the inference
+    # workers a venv carrying Gym's capture core and backend adapter.
     token_capture_cfg = master_config.token_capture
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
@@ -1009,26 +1007,49 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] != "vllm":
+        generation_backend = generation_config["backend"]
+        if generation_backend not in ("vllm", "megatron"):
             raise NotImplementedError(
-                "token_capture.enabled supports the vllm backend only; got "
-                f"{generation_config['backend']!r}"
+                "token_capture.enabled supports vllm and megatron backends; got "
+                f"{generation_backend!r}"
             )
-        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
-        if not vllm_cfg["async_engine"]:
+        if generation_backend == "vllm":
+            vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
+            if not vllm_cfg["async_engine"]:
+                raise ValueError(
+                    "token_capture.enabled requires "
+                    "policy.generation.vllm_cfg.async_engine=true (the capture "
+                    "host is the worker's in-process HTTP server)"
+                )
+        elif not cast(dict[str, Any], generation_config)[
+            "mcore_generation_config"
+        ]["expose_http_server"]:
             raise ValueError(
-                "token_capture.enabled requires "
-                "policy.generation.vllm_cfg.async_engine=true (the capture "
-                "host is the worker's in-process HTTP server)"
+                "Megatron token capture requires "
+                "policy.generation.mcore_generation_config.expose_http_server=true"
+            )
+        if (
+            processor is not None
+            and token_capture_cfg.media_staging_partition
+            == token_capture_cfg.staging_partition
+        ):
+            raise ValueError(
+                "token_capture.media_staging_partition must differ from "
+                "token_capture.staging_partition"
             )
         from nemo_rl.distributed.ray_actor_environment_registry import (
             ACTOR_ENVIRONMENT_REGISTRY,
         )
         from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
-        ACTOR_ENVIRONMENT_REGISTRY[
-            "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
-        ] = PY_EXECUTABLES.VLLM_GYM
+        if generation_backend == "vllm":
+            ACTOR_ENVIRONMENT_REGISTRY[
+                "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+            ] = PY_EXECUTABLES.VLLM_GYM
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[
+                "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            ] = PY_EXECUTABLES.MCORE_GYM
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token and the process-shared capture
@@ -1333,6 +1354,16 @@ def setup_single_controller(
             else:
                 generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
+            if (
+                token_capture_cfg.enabled
+                and generation_config["backend"] == "megatron"
+            ):
+                # MCore forks separate HTTP frontend processes on its first
+                # wake. Install their inherited capture config beforehand;
+                # the staging partition is registered before rollouts begin.
+                generation.setup_token_capture(
+                    dp_config, token_capture_cfg.staging_partition
+                )
             if megatron_reserved_url is not None:
                 # Gym initialization needs a live URL that will respond to health checks.
                 # Megatron generation can only respond to health checks once initialized.
@@ -1499,13 +1530,21 @@ def setup_single_controller(
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
-        # Host Gym's capture core in every vLLM DP leader (in-worker DP
-        # client + TQTokenSink + the single install_capture call), and give
-        # workers the initial weight version to stamp on captured calls.
-        try:
-            generation.setup_token_capture(
-                dp_config, token_capture_cfg.staging_partition
+        if processor is not None:
+            dp_client.register_partition(
+                partition_id=token_capture_cfg.media_staging_partition,
+                fields=sorted(WIRE_MULTIMODAL_FIELDS),
+                num_samples=num_rollout_samples,
+                consumer_tasks=["finalize"],
             )
+        # Host Gym's capture core in every vLLM DP leader. Megatron was
+        # configured before its initial wake because that wake forks HTTP
+        # frontend processes which inherit the capture state.
+        try:
+            if generation_config["backend"] == "vllm":
+                generation.setup_token_capture(
+                    dp_config, token_capture_cfg.staging_partition
+                )
         except Exception as error:
             if "No module named 'nemo_gym'" in str(error):
                 # Worker venvs are cached by actor class name
@@ -1574,6 +1613,11 @@ def setup_single_controller(
             RolloutReassemblerActorConfig(
                 partition_id=partition_id,
                 staging_partition=token_capture_cfg.staging_partition,
+                media_staging_partition=(
+                    token_capture_cfg.media_staging_partition
+                    if processor is not None
+                    else None
+                ),
                 pad_token_id=pad_id,
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
@@ -1597,6 +1641,11 @@ def setup_single_controller(
         ),
         reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
+        media_staging_partition=(
+            token_capture_cfg.media_staging_partition
+            if token_capture_cfg.enabled and processor is not None
+            else None
+        ),
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,
             generation_s=master_config.async_rl.rollout_failure.native.generation_timeout_s,

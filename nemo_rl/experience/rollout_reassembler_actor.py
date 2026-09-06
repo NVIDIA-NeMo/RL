@@ -63,6 +63,9 @@ class ReassemblyRequest:
     # train pump reads the same ``mask_sample`` field as the native path
     # (SingleController reads it unconditionally).
     mask_sample: tuple[bool, ...]
+    loss_multiplier: float = 1.0
+    static_multimodal_fields: tuple[str, ...] = ()
+    static_multimodal_tags: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,7 @@ class RolloutReassemblerActorConfig:
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
     max_seq_len: int
+    media_staging_partition: Optional[str] = None
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -125,6 +129,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             dp_client,
             partition_id=config.partition_id,
             staging_partition=config.staging_partition,
+            media_staging_partition=config.media_staging_partition,
             pad_token_id=config.pad_token_id,
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
@@ -152,6 +157,11 @@ class RolloutReassemblerActor:  # pragma: no cover
             mask_sample=list(request.mask_sample),
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
+            loss_multiplier=request.loss_multiplier,
+            static_multimodal_fields=list(request.static_multimodal_fields),
+            static_multimodal_tags=[
+                dict(tag) for tag in request.static_multimodal_tags
+            ],
         )
         assert_metadata_only(result)
         return result

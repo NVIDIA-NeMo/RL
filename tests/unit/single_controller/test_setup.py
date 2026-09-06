@@ -1245,6 +1245,10 @@ class TestSetup:
         assert actor_dp_config == mc.data_plane
         assert actor_config.partition_id == "rollout_data"
         assert actor_config.staging_partition == mc.token_capture.staging_partition
+        assert (
+            actor_config.media_staging_partition
+            == mc.token_capture.media_staging_partition
+        )
         assert actor_config.pad_token_id == 9
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
@@ -1253,6 +1257,9 @@ class TestSetup:
         assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
         assert WIRE_MULTIMODAL_FIELDS.isdisjoint(
             partition_calls[1].kwargs["fields"]
+        )
+        assert WIRE_MULTIMODAL_FIELDS <= set(
+            partition_calls[2].kwargs["fields"]
         )
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):

@@ -79,6 +79,11 @@ class PY_EXECUTABLES:
     # worker imports nemo_gym's dependency-free capture core + vLLM adapter.
     VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
 
+    # Megatron's forked HTTP frontends host Gym's capture core when enabled.
+    MCORE_GYM = (
+        f"uv run --locked --extra mcore --extra nemo_gym --directory {git_root}"
+    )
+
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 

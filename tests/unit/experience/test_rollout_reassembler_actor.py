@@ -100,6 +100,9 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "fallback_weight_version",
         "prompt_idx",
         "mask_sample",
+        "loss_multiplier",
+        "static_multimodal_fields",
+        "static_multimodal_tags",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",

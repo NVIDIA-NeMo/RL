@@ -378,6 +378,26 @@ class MegatronGeneration(GenerationInterface):
             ]
         return True
 
+    def setup_token_capture(
+        self, dp_cfg: dict[str, Any], staging_partition: str
+    ) -> None:
+        """Configure capture on rank zero before it forks HTTP frontends."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "setup_token_capture",
+            dp_cfg=dp_cfg,
+            staging_partition=staging_partition,
+        )
+        if not any(ray.get(futures)):
+            raise RuntimeError("no Megatron rank accepted token-capture setup")
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the capture version shared with rank-zero HTTP frontends."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "set_rollout_weight_version",
+            version=version,
+        )
+        ray.get(futures)
+
     def finish_generation(self, *, release_gpu: bool = True) -> bool:
         """Clean up after generation.
 

@@ -1321,6 +1321,7 @@ class RolloutManager:
         mask_env_flagged_samples: bool = True,
         reward_penalty_config: Optional[dict[str, Any]] = None,
         tq_buffer: Optional[TQReplayBuffer] = None,
+        media_staging_partition: Optional[str] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
@@ -1373,6 +1374,7 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
+        self._media_staging_partition = media_staging_partition
         self._recovery_ledger = RolloutRecoveryLedger()
         self._env_handles = task_to_env
         self._weight_version: int = 0
@@ -1889,6 +1891,7 @@ class RolloutManager:
             group_id=group_id,
             rollout_ids=list(rollout_ids),
         )
+        media_staged = False
         try:
             if inflight_registry is not None:
                 current_task = asyncio.current_task()
@@ -1915,6 +1918,29 @@ class RolloutManager:
                 )
                 for c in record.completions
             )
+            static_field_names: tuple[str, ...] = ()
+            static_tags: tuple[dict[str, Any], ...] = ()
+            if self._media_staging_partition is not None:
+                from nemo_rl.experience.payload import (
+                    pack_static_multimodal_payload,
+                )
+
+                static_fields, tag_rows = pack_static_multimodal_payload(
+                    input_sample["message_log"],
+                    num_samples=len(rollout_ids),
+                    pad_value_dict={"token_ids": self._tokenizer.pad_token_id},
+                )
+                if len(static_fields.keys()) > 0:
+                    await self._tq_buffer.stage_unready_fields(
+                        group_id,
+                        sample_ids=list(rollout_ids),
+                        partition_id=self._media_staging_partition,
+                        fields=static_fields,
+                        tags=tag_rows,
+                    )
+                    media_staged = True
+                    static_field_names = tuple(str(key) for key in static_fields.keys())
+                    static_tags = tuple(dict(tag) for tag in tag_rows)
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=rollout_ids,
@@ -1923,6 +1949,9 @@ class RolloutManager:
                 fallback_weight_version=start_version,
                 prompt_idx=record.prompt_idx,
                 mask_sample=mask_sample,
+                loss_multiplier=record.loss_multiplier,
+                static_multimodal_fields=static_field_names,
+                static_multimodal_tags=static_tags,
             )
             from nemo_rl.experience.rollout_reassembler_actor import (
                 assert_metadata_only,
@@ -1931,6 +1960,11 @@ class RolloutManager:
             assert_metadata_only(request)
             return request
         except BaseException:
+            if media_staged and self._media_staging_partition is not None:
+                await self._tq_buffer.clear_auxiliary_fields(
+                    sample_ids=list(rollout_ids),
+                    partition_id=self._media_staging_partition,
+                )
             # Abandoned dispatch: no receipt will name these rollouts' staged
             # rows, so they leak until the staging partition is torn down at
             # run end (there is no prefix-clear primitive in the data plane

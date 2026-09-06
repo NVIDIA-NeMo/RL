@@ -600,6 +600,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # TQ partition holding per-call staged token deltas (cleared by the
     # finalizer; distinct from the canonical rollout partition).
     staging_partition: str = "rollout_staging"
+    # Prompt-static multimodal rows are staged separately so pending
+    # finalization never adds unexpected IDs to the canonical partition.
+    media_staging_partition: str = "rollout_media_staging"
     # Drop the whole group when fewer than this fraction of its rollouts
     # produced valid rows (None keeps every group).
     min_valid_fraction_per_group: Optional[float] = None
