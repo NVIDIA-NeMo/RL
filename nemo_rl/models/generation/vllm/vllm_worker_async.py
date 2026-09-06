@@ -743,6 +743,16 @@ class VllmAsyncGenerationWorkerImpl(
                         task_index = request.nemo_gym_task_index
                         rollout_index = request.nemo_gym_rollout_index
                         target_weight_version = request.nemo_gym_target_weight_version
+                        # Gym can use the policy engine for auxiliary model calls
+                        # (for example, simulator or retrieval requests). Those
+                        # responses are not part of the trainable trajectory and
+                        # intentionally carry no RL rollout identity.
+                        if (
+                            task_index is None
+                            and rollout_index is None
+                            and target_weight_version is None
+                        ):
+                            return response
                         missing_fields = [
                             name
                             for name, value in (
