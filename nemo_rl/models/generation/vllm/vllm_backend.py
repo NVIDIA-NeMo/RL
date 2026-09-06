@@ -344,7 +344,7 @@ class VllmInternalWorkerExtension:
         if not getattr(self, "_nrl_layerwise_reload_active", False):
             return self.model_runner.model.load_weights(weights=policy_weights)
 
-        source_storage_ptrs = set()
+        source_storage_ptrs: set[int] = set()
 
         def track_source_storage() -> Iterator[tuple[str, torch.Tensor]]:
             for name, tensor in policy_weights:
