@@ -233,8 +233,13 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
 
     events = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = object()
-    worker.optimizer = None
+    optimizer = object()
+
+    class _FakeDDP:
+        pass
+
+    worker.model = _FakeDDP()
+    worker.optimizer = optimizer
     worker.optimizer_cpu_offload = False
     worker.should_disable_forward_pre_hook = True
     worker.fp8_cfg = None
@@ -242,7 +247,11 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
     monkeypatch.setattr(
         "nemo_rl.models.policy.workers.megatron_policy_worker.force_param_sync",
-        lambda model, optimizer: events.append("force_param_sync"),
+        lambda model, optimizer: events.append(("force_param_sync", model, optimizer)),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.DistributedDataParallel",
+        _FakeDDP,
     )
     worker.move_model = lambda model, device, move_params, move_grads: (
         events.append("move_model") or model
@@ -268,9 +277,9 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     MegatronPolicyWorkerImpl.offload_before_refit(worker)
 
     assert events[0] == "finalize_async_save"
-    assert events.index("finalize_async_save") < events.index("force_param_sync")
-    assert events.index("force_param_sync") < events.index("move_model")
-    assert events.index("finalize_async_save") < events.index("move_model")
+    sync_event = ("force_param_sync", [worker.model], optimizer)
+    assert events.index("finalize_async_save") < events.index(sync_event)
+    assert events.index(sync_event) < events.index("move_model")
 
 
 @pytest.mark.parametrize("offload_optimizer", [False, True])
@@ -347,7 +356,9 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     worker.move_model = lambda model, device, **kwargs: (
         events.append("move_model") or move_kwargs.append(kwargs) or model
     )
-    worker.offload_before_refit = lambda: events.append("offload_before_refit")
+    worker.offload_before_refit = lambda *, sync_params=True: events.append(
+        ("offload_before_refit", sync_params)
+    )
 
     class _AllocatorWakeup:
         def cuda(self):
@@ -371,6 +382,7 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     assert events.index("finalize_async_save") < events.index("move_model")
     assert events.index("eval") < events.index("move_model")
     assert move_kwargs[0]["move_params"] is expect_move_params
+    assert ("offload_before_refit", False) in events
 
 
 def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):

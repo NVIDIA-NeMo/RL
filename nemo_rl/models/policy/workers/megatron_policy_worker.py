@@ -3380,7 +3380,7 @@ class MegatronPolicyWorkerImpl(
         )
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
-    def offload_before_refit(self):
+    def offload_before_refit(self, *, sync_params: bool = True):
         """Offload the optimizer and buffers to the CPU."""
         # An in-flight async checkpoint keeps references to the CUDA tensors in
         # its sharded state dict until the write is finalized. Offloading swaps
@@ -3391,7 +3391,12 @@ class MegatronPolicyWorkerImpl(
         # With overlapped parameter gathering, optimizer.step() publishes only
         # the local DP shard. Refit reads parameters outside a model forward, so
         # it must force the deferred DP gather before exporting those weights.
-        if self.should_disable_forward_pre_hook:
+        if (
+            sync_params
+            and self.should_disable_forward_pre_hook
+            and isinstance(self.model, DistributedDataParallel)
+            and self.optimizer is not None
+        ):
             force_param_sync([self.model], optimizer=self.optimizer)
 
         no_grad = torch.no_grad()
@@ -3510,7 +3515,7 @@ class MegatronPolicyWorkerImpl(
             self.model, "cpu", move_params=not keep_params_for_generation
         )
         torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
+        self.offload_before_refit(sync_params=False)  # rerun the old offload function
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
