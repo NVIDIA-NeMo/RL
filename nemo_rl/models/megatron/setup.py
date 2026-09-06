@@ -245,6 +245,9 @@ from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
+from nemo_rl.models.megatron.hybridep import (
+    configure_hybridep_packed_input_padding,
+)
 from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
@@ -1040,6 +1043,8 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.moe_flex_dispatcher_backend = config["megatron_cfg"][
             "moe_flex_dispatcher_backend"
         ]
+    configure_hybridep_packed_input_padding(model_cfg, config)
+
     if "moe_hybridep_num_sms" in config["megatron_cfg"]:
         num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
         if hasattr(TransformerConfig, "moe_flex_dispatcher_num_sms"):
