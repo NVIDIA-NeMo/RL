@@ -71,6 +71,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -95,7 +96,21 @@ from tests.unit.single_controller.test_setup import (
 
 # Instantiate the underlying class in-process (same pattern as
 # tests/unit/algorithms/test_async_utils.py for AsyncTrajectoryCollector).
-_ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
+_REAL_ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
+
+
+def _ACTOR_CLS(master_config, actor_args, *args, **kwargs):
+    """Construct the actor with its data-plane client stubbed to the test's fake.
+
+    The actor builds its own client rather than taking the one in ``actor_args``
+    — a TQ client arms its own process, so a cloudpickled one is inert. That
+    means the real factory would need a live TransferQueue here, so point it at
+    whatever ``_FakeDPClient`` the caller passed to ``_make_actor_args``.
+    """
+    with patch.object(
+        single_controller, "build_data_plane_client", return_value=actor_args.dp_client
+    ):
+        return _REAL_ACTOR_CLS(master_config, actor_args, *args, **kwargs)
 
 _PARTITION_ID = "rollout_data"
 

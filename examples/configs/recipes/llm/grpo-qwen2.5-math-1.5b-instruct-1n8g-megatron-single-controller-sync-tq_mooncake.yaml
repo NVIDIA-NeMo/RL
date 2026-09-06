@@ -1,0 +1,6 @@
+# SC x mooncake_cpu: the combination the suite never covered. Guards the
+# per-process arming in SingleControllerActor.__init__.
+defaults: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml
+
+data_plane:
+  backend: mooncake_cpu

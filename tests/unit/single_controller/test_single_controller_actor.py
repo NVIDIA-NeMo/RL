@@ -17,7 +17,7 @@
 import asyncio
 import math
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
@@ -128,11 +128,26 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
 
 def _init_controller(master_config, actor_args):
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
-    return controller_cls(
-        master_config=master_config,
-        actor_args=actor_args,
-        setup_timing_metrics=SetupTimingMetrics(),
-    )
+    # The actor builds its own data-plane client (a TQ client arms its own
+    # process, so a cloudpickled one is inert), which would need a live
+    # TransferQueue here. Stub the factory and give the configs these tests
+    # build with model_construct the data_plane field it reads.
+    if not hasattr(master_config, "data_plane"):
+        master_config.data_plane = {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+        }
+    with patch.object(
+        single_controller,
+        "build_data_plane_client",
+        return_value=getattr(actor_args, "dp_client", None),
+    ):
+        return controller_cls(
+            master_config=master_config,
+            actor_args=actor_args,
+            setup_timing_metrics=SetupTimingMetrics(),
+        )
 
 
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:

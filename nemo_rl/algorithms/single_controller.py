@@ -106,7 +106,11 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
-from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane import (
+    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+    KVBatchMeta,
+    build_data_plane_client,
+)
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
@@ -255,7 +259,17 @@ class SingleControllerActor:
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
         )
-        self._dp_client = actor_args.dp_client
+        # Built here, not taken from actor_args, and FIRST: a TQ client arms its
+        # own process in __init__ (MC_TCP_BIND_ADDRESS, mooncake registration,
+        # staging pool, scalar schema patch), all interpreter-global side
+        # effects. Everything below that arrived from the driver — trainer,
+        # value, buffer — reads and writes through this process, so it is only
+        # correct once this line has run. A cloudpickled client skips the arming
+        # and TQ does not complain: it lazily builds an unpatched one on first
+        # use, so the failure is a corrupt schema rather than an error.
+        self._dp_client = build_data_plane_client(
+            master_config.data_plane, bootstrap=False
+        )
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
@@ -269,6 +283,8 @@ class SingleControllerActor:
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
+        # The buffer arrived from the driver still holding the driver's client.
+        self._buffer._dp_client = self._dp_client
 
         # Direct access, deliberately. A getattr default here reads as defensive but
         # buys a silent failure mode: rename or drop the field and
