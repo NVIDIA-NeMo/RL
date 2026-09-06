@@ -788,6 +788,8 @@ def test_legacy_refit_map_is_built_after_comm_groups_exist(monkeypatch):
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.device = torch.device("cpu")
+    ext.pp_comm_groups = None
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
     ext._validate_native_layerwise_refit = MagicMock()
     expected_map = HFToLocalParamMap()
     ext.build_hf_to_local_param_map = MagicMock(return_value=expected_map)
@@ -812,6 +814,10 @@ def test_legacy_refit_map_is_built_after_comm_groups_exist(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
+    ext.prepare_nccl_reshard_refit_info(refit_info)
+
+    ext.build_hf_to_local_param_map.assert_not_called()
+
     ext.init_nccl_reshard_comm_group(
         rank_prefix=0,
         pp_ips=["127.0.0.1"],
@@ -822,10 +828,6 @@ def test_legacy_refit_map_is_built_after_comm_groups_exist(monkeypatch):
     )
 
     assert ext.pp_comm_groups[0].rank == 8
-    assert ext.build_hf_to_local_param_map.call_count == 0
-
-    ext.prepare_nccl_reshard_refit_info(refit_info)
-
     ext.build_hf_to_local_param_map.assert_called_once_with(refit_info)
     assert ext.hf_to_local_param_map is expected_map
 
