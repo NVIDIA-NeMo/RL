@@ -720,6 +720,14 @@ class VllmAsyncGenerationWorkerImpl(
         if engine_client is None:
             raise RuntimeError("The HTTP engine client is not initialized.")
         model_config = self.llm_async_engine_args.create_model_config()
+        model_stop_token_ids = set(self.cfg.get("stop_token_ids") or ())
+        generation_eos_token_ids = model_config.try_get_generation_config().get(
+            "eos_token_id"
+        )
+        if isinstance(generation_eos_token_ids, int):
+            model_stop_token_ids.add(generation_eos_token_ids)
+        elif generation_eos_token_ids is not None:
+            model_stop_token_ids.update(generation_eos_token_ids)
         base_model_paths = [
             BaseModelPath(
                 name=model_config.served_model_name, model_path=model_config.model
@@ -911,10 +919,10 @@ class VllmAsyncGenerationWorkerImpl(
                     model_prefix_token_ids=model_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
+                    model_stop_token_ids=model_stop_token_ids,
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
-
                 # Clamp after prefix replacement since the prompt length may have changed.
                 if actual_request_max_tokens is not None:
                     self._clamp_max_tokens(
@@ -1286,6 +1294,10 @@ class VllmAsyncGenerationWorkerImpl(
         # We initialize the FastAPI app here in case we want to do some generic configuration before the subsequent server inits
         # e.g. last-run middleware.
         app = FastAPI()
+
+        @app.get("/health")
+        async def health() -> dict[str, str]:
+            return {"status": "ok"}
 
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
