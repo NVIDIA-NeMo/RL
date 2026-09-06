@@ -1783,7 +1783,7 @@ class TQReplayBuffer:
     async def _clear_samples_unlocked(
         self, cut: DataPlaneMutationCut, *, sample_ids: list[str]
     ) -> None:
-        """Clear rows while the caller holds a barrier mutation slot."""
+        """Clear rows while the caller owns the provided live mutation cut."""
         cut.require_live()
         await call_data_plane(
             self._dp_client,
