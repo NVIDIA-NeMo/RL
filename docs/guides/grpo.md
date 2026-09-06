@@ -673,7 +673,9 @@ This is simply $\frac{1}{|T|}\sum_{t \in \text{tokens}}\text{exp}(\text{log}(\pi
 
 Similar to [Multiplicative Token Probability Error](#multiplicative-token-probability-error), this is a measure of how far off your inference backend is from your training framework. However, this metric is meant to find the bias in that error, rather than the variance, as it does not take the absolute value of the error. With some noise, this should hover around 1.
 
-This metric is always calculated and the per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
+This metric is always calculated, and reports the raw ratio above even when `truncated_importance_sampling_type` is set — truncation is a change to the loss, not to what the mismatch actually was, and clamping the metric would make it saturate (`tis`) or read below 1 (`icepop`, which zeroes out-of-band tokens rather than clamping them) exactly when the backend has drifted furthest. How often truncation fires is reported separately as `is_oob_ratio`.
+
+The per-token version (without the mean) is what the loss function uses when [Importance Sampling Correction](#importance-sampling-correction) is enabled; with truncation on, the loss uses the truncated weights while this metric keeps reporting the untruncated ones.
 
 ### Entropy
 This feature is controlled by the parameter `approx_entropy`. It estimates the entropy of the policy distribution, which can be used to encourage exploration and prevent premature convergence during training. We roughly approximate the entropy of the LLM's distribution throughout training by calculating:
