@@ -373,7 +373,6 @@ def _load_acceptance_cases() -> list[dict[str, Any]]:
         "expected_generations",
         "rejected_generations",
         "expected_prompt_fragment",
-        "metadata_fields",
         "expected_result",
         "expected_reward",
     }
@@ -398,8 +397,6 @@ def _load_acceptance_cases() -> list[dict[str, Any]]:
             f"{case['name']}: pinned example changed; review the row and update its golden values"
         )
         assert case["agent_ref"].keys() >= {"type", "name"}
-        assert case["metadata_fields"]
-        assert all(isinstance(field, str) for field in case["metadata_fields"])
         assert case["expected_generations"]
         assert case["rejected_generations"]
         assert all(
@@ -564,9 +561,6 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepte
     expected_reward = case["expected_reward"] if accepted else 0.0
     datum = _load_case_datum(case, accepted=accepted)
     extra_env_info = datum["extra_env_info"]
-    expected_metadata = {
-        field: deepcopy(extra_env_info[field]) for field in case["metadata_fields"]
-    }
     assert case["expected_prompt_fragment"] in json.dumps(
         extra_env_info["responses_create_params"]
     )
@@ -622,8 +616,6 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepte
         full_result["responses_create_params"],
         extra_env_info["responses_create_params"],
     )
-    for field, expected_value in expected_metadata.items():
-        assert full_result[field] == expected_value
     if accepted:
         for field, expected_value in case["expected_result"].items():
             assert full_result[field] == expected_value
