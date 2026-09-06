@@ -66,6 +66,10 @@ def test_is_model_rejects_other_architectures(deepseek_v4_fp8):
     assert deepseek_v4_fp8.is_model(model) is False
 
 
+def test_is_model_rejects_model_without_config(deepseek_v4_fp8):
+    assert deepseek_v4_fp8.is_model(torch.nn.Module()) is False
+
+
 def test_map_checkpoint_name_passes_through_other_architectures(deepseek_v4_fp8):
     model = OtherForCausalLM()
     model.hf_to_vllm_mapper = types.SimpleNamespace(apply_list=lambda _names: [])
@@ -74,6 +78,12 @@ def test_map_checkpoint_name_passes_through_other_architectures(deepseek_v4_fp8)
         deepseek_v4_fp8.map_checkpoint_name(model, "layers.0.attn.wq_a.weight")
         == "layers.0.attn.wq_a.weight"
     )
+
+
+def test_map_checkpoint_name_passes_through_model_without_config(deepseek_v4_fp8):
+    name = "layers.0.attn.wq_a.weight"
+
+    assert deepseek_v4_fp8.map_checkpoint_name(torch.nn.Module(), name) == name
 
 
 def test_map_checkpoint_name_applies_the_vllm_mapper(deepseek_v4_fp8):

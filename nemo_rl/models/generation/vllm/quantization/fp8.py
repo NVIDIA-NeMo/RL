@@ -16,6 +16,7 @@ import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 from unittest.mock import patch
 
 import ray
@@ -199,7 +200,8 @@ def apply_fp8_patches(self, fp8_config):
                     )
                 )
 
-            # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
+            # Static scales mode: patch process_weights_after_loading to preserve
+            # k_scale/v_scale for manual updates.
             if global_fp8_config.kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
                 func5_path = (
                     "vllm.model_executor.layers.quantization.kv_cache."
@@ -604,8 +606,6 @@ def get_quantized_weight_iterator(
     refit_with_reload_api: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Convert trainer weights to the checkpoint tensors expected by vLLM."""
-    ensure_fp8_patches_applied(model_runner)
-    fp8_config = _resolve_fp8_config(model_runner)
     model = model_runner.model
 
     for k, v in weights:
