@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import replace
-from typing import Mapping
+from typing import Any, Mapping
 
 import torch
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -30,6 +30,42 @@ def uses_hybridep_flex_dispatcher(megatron_cfg: Mapping[str, object]) -> bool:
         megatron_cfg.get("moe_token_dispatcher_type") == "flex"
         and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
     )
+
+
+def configure_hybridep_packed_input_padding(
+    model_cfg: Any, config: Mapping[str, Any]
+) -> None:
+    megatron_cfg = config["megatron_cfg"]
+    if megatron_cfg.get("moe_flex_dispatcher_backend") != "hybridep":
+        return
+
+    sequence_packing = config.get("sequence_packing")
+    sequence_packing_enabled = (
+        sequence_packing is not None and sequence_packing["enabled"]
+    )
+    prepad_packed_inputs = megatron_cfg.get("moe_hybridep_prepad_packed_inputs")
+    if prepad_packed_inputs:
+        if megatron_cfg["moe_token_dispatcher_type"] != "flex":
+            raise ValueError(
+                "HybridEP input prepadding requires the flex token dispatcher."
+            )
+        if not sequence_packing_enabled:
+            raise ValueError(
+                "HybridEP input prepadding requires sequence packing to be enabled."
+            )
+        if megatron_cfg["pipeline_model_parallel_size"] != 1:
+            raise ValueError(
+                "HybridEP input prepadding currently requires pipeline parallel size 1."
+            )
+        if megatron_cfg.get("mtp_num_layers"):
+            raise ValueError(
+                "HybridEP input prepadding currently requires MTP disabled."
+            )
+
+    # Packed inputs are aligned once in NeMo-RL before forward. Repeating the
+    # scalar MAX collective inside each MoE layer can interleave with expert
+    # parameter all-gathers on the same EP communicator.
+    model_cfg.moe_hybridep_pad_uneven_dispatch_inputs = not prepad_packed_inputs
 
 
 def _get_hybridep_aligned_seq_len(
