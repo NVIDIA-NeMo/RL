@@ -746,6 +746,53 @@ def _is_trainable_output_item(item: dict) -> bool:
     return bool(item.get("generation_token_ids"))
 
 
+def _warn_on_missing_routed_experts(
+    output_items: Sequence[dict[str, Any]],
+    nemo_gym_row: Any,
+    *,
+    required: bool,
+) -> dict[str, Any] | None:
+    """Warn once when a rollout's trainable turns do not all carry routes.
+
+    This is deliberately an observational preflight: it does not replace the
+    existing fatal router-replay guard in the postprocess loop.  Keeping the
+    scan separate lets the trace report every affected turn in the rollout
+    before the first missing item raises.
+    """
+    if not required:
+        return None
+
+    trainable_turn_count = 0
+    missing_turn_indices: list[int] = []
+    missing_output_indices: list[int] = []
+    for output_index, output_item in enumerate(output_items):
+        if not _is_trainable_output_item(output_item):
+            continue
+        trainable_turn_index = trainable_turn_count
+        trainable_turn_count += 1
+        if output_item.get("routed_experts") is None:
+            missing_turn_indices.append(trainable_turn_index)
+            missing_output_indices.append(output_index)
+
+    if not missing_turn_indices:
+        return None
+
+    coverage = {
+        "response_item_count": len(output_items),
+        "trainable_turn_count": trainable_turn_count,
+        "missing_routed_experts_turn_count": len(missing_turn_indices),
+        "missing_routed_experts_turn_indices": missing_turn_indices,
+        "missing_routed_experts_response_output_indices": missing_output_indices,
+    }
+    emit_nemo_gym_trace(
+        "actor_routed_experts_invariant_violation",
+        level="warning",
+        **summarize_nemo_gym_row(nemo_gym_row),
+        **coverage,
+    )
+    return coverage
+
+
 def _index_per_turn_images(
     output: list[dict],
     input_messages: list[dict] | None = None,
@@ -1155,6 +1202,12 @@ Depending on your data shape, you may want to change these values."""
 
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
+        require_routed_experts = self.cfg.get("require_routed_experts", False)
+        routed_experts_coverage = _warn_on_missing_routed_experts(
+            response["output"],
+            nemo_gym_row,
+            required=require_routed_experts,
+        )
         empty_response_output = (
             isinstance(response.get("output"), list) and not response["output"]
         )
@@ -1222,7 +1275,9 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
-        for output_item_dict in nemo_gym_result["response"]["output"]:
+        for response_output_index, output_item_dict in enumerate(
+            nemo_gym_result["response"]["output"]
+        ):
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
             # Eventually we can maybe be smarter about this, but this is functional for now.
@@ -1328,10 +1383,18 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                             shape=route_shape,
                         )
                     )
-            elif self.cfg.get("require_routed_experts", False):
+            elif require_routed_experts:
+                coverage_detail = (
+                    f" Per-rollout coverage: {routed_experts_coverage}."
+                    if routed_experts_coverage is not None
+                    else ""
+                )
                 raise ValueError(
                     "policy.router_replay.enabled=true requires NeMo Gym output "
                     "items to include routed_experts, but the field was missing. "
+                    f"response_output_index={response_output_index}, "
+                    f"trainable_turn_index={turn_idx}."
+                    f"{coverage_detail} "
                     "Make sure the Gym repo includes routed_experts propagation "
                     "and the NeMo-RL vLLM OpenAI-compatible server is configured "
                     "with enable_return_routed_experts."

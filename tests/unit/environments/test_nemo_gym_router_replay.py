@@ -14,7 +14,10 @@
 
 import pytest
 
-from nemo_rl.environments.nemo_gym import NemoGym
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    _warn_on_missing_routed_experts,
+)
 
 
 class _Tokenizer:
@@ -71,7 +74,80 @@ def test_nemo_gym_postprocess_slices_routed_experts():
     assert message_log[3]["routed_experts"].tolist() == second_turn_routes[5:7]
 
 
-def test_nemo_gym_postprocess_requires_routed_experts_when_configured():
+def test_missing_routed_experts_warning_is_nonfatal_and_aggregates_rollout(capsys):
+    output_items = [
+        {
+            "generation_token_ids": [1],
+            "generation_log_probs": [-0.1],
+            "routed_experts": _routes(1),
+        },
+        {"type": "function_call_output", "output": "tool result"},
+        {
+            "generation_token_ids": [2],
+            "generation_log_probs": [-0.2],
+        },
+        {
+            "generation_token_ids": [],
+            "generation_log_probs": [],
+        },
+        {
+            "generation_token_ids": [3],
+            "generation_log_probs": [-0.3],
+            "routed_experts": None,
+        },
+    ]
+    row = {
+        "_rowidx": 17,
+        "_ng_task_index": 42,
+        "_ng_rollout_index": 3,
+        "_ng_attempt_index": 1,
+        "_ng_target_weight_version": 9,
+        "agent_ref": {"name": "test_agent"},
+        "dataset": "test_dataset",
+        "metadata": {"uuid": "test-uuid"},
+    }
+
+    coverage = _warn_on_missing_routed_experts(
+        output_items,
+        row,
+        required=True,
+    )
+
+    assert coverage == {
+        "response_item_count": 5,
+        "trainable_turn_count": 3,
+        "missing_routed_experts_turn_count": 2,
+        "missing_routed_experts_turn_indices": [1, 2],
+        "missing_routed_experts_response_output_indices": [2, 4],
+    }
+    trace = capsys.readouterr().out
+    assert '"event":"actor_routed_experts_invariant_violation"' in trace
+    assert '"level":"warning"' in trace
+    assert '"task_index":42' in trace
+    assert '"rollout_index":3' in trace
+    assert '"target_weight_version":9' in trace
+    assert '"agent_name":"test_agent"' in trace
+    assert '"missing_routed_experts_turn_indices":[1,2]' in trace
+    assert '"missing_routed_experts_response_output_indices":[2,4]' in trace
+
+
+def test_missing_routed_experts_warning_is_disabled_without_router_replay(capsys):
+    coverage = _warn_on_missing_routed_experts(
+        [
+            {
+                "generation_token_ids": [1],
+                "generation_log_probs": [-0.1],
+            }
+        ],
+        {},
+        required=False,
+    )
+
+    assert coverage is None
+    assert capsys.readouterr().out == ""
+
+
+def test_nemo_gym_postprocess_requires_routed_experts_when_configured(capsys):
     nemo_gym_result = {
         "response": {
             "output": [
@@ -88,10 +164,27 @@ def test_nemo_gym_postprocess_requires_routed_experts_when_configured():
     class _MockSelf:
         cfg = {"require_routed_experts": True}
 
-    with pytest.raises(ValueError, match="requires NeMo Gym output items"):
+    nemo_gym_row = {
+        "_ng_task_index": 42,
+        "_ng_rollout_index": 3,
+        "agent_ref": {"name": "test_agent"},
+    }
+    with pytest.raises(
+        ValueError,
+        match=(
+            "requires NeMo Gym output items.*response_output_index=0, "
+            "trainable_turn_index=0"
+        ),
+    ):
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
+            _MockSelf(), nemo_gym_row, nemo_gym_result, _Tokenizer()
         )
+
+    trace = capsys.readouterr().out
+    assert '"event":"actor_routed_experts_invariant_violation"' in trace
+    assert '"task_index":42' in trace
+    assert '"missing_routed_experts_turn_count":1' in trace
+    assert '"missing_routed_experts_turn_indices":[0]' in trace
 
 
 def test_nemo_gym_postprocess_casts_routed_experts_to_configured_dtype():
