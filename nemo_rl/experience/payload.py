@@ -106,9 +106,9 @@ def record_to_train_batch(
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs,
-        token_mask, an all-ones sample_mask, the raw mask_sample and truncated
-        flags, prompt_ids_for_adv, total_reward, violation counts, and optional
-        routed experts and message-violation masks.
+        token_mask, a prompt-loss-weighted sample_mask, the raw mask_sample and
+        truncated flags, prompt_ids_for_adv, total_reward, violation counts,
+        and optional routed experts and message-violation masks.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
@@ -157,7 +157,7 @@ def record_to_train_batch(
     )
     mask_sample = _mask_sample_flags(c.env_extras for c in completions)
     truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
-    sample_mask = torch.ones(n, dtype=torch.float32)
+    sample_mask = torch.full((n,), float(record.loss_multiplier), dtype=torch.float32)
 
     train_data: dict[str, Any] = {
         "input_ids": flat["token_ids"],

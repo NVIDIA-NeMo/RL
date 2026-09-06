@@ -61,3 +61,5 @@ class PromptGroupRecord:
     metadata: dict[str, Any]
     completions: list["Completion"]
     rollout_metrics: dict[str, Any]
+    # Prompt-level DatumSpec weight; defaults preserve manually-built records.
+    loss_multiplier: float = 1.0
