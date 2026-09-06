@@ -88,6 +88,7 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
+from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
@@ -1346,7 +1347,7 @@ def mock_async_grpo_infrastructure(
     return stack
 
 
-def mock_sync_grpo_infrastructure(policy):
+def mock_sync_grpo_infrastructure(policy, driver_carry_extra=None):
     """Context manager that mocks the TQ/data-plane infrastructure of grpo_train_sync.
 
     Mirrors ``mock_async_grpo_infrastructure``: the Ray rollout actor and the
@@ -1367,6 +1368,7 @@ def mock_sync_grpo_infrastructure(policy):
             "loss_multiplier": torch.tensor([1.0]),
             "truncated": torch.tensor([False]),
             "length": torch.tensor([3]),
+            **(driver_carry_extra or {}),
         }
     )
     meta = MagicMock()
@@ -4335,6 +4337,181 @@ def _enter_stop_test_mocks(
         )
     )
     return "nemo_rl.algorithms.grpo.validate"
+
+
+def _rollout_actor_driver_carry(
+    mask_sample: bool | None, *, mask_env_flagged_samples: bool = True
+) -> BatchedDataDict[Any]:
+    """Run the real actor caller and return the payload consumed by the driver."""
+    from nemo_rl.data.llm_message_utils import MESSAGE_LOG_BULK_FIELDS
+
+    actor_cls = SyncRolloutActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor.policy_generation = None
+    actor.tokenizer = SimpleNamespace(pad_token_id=0)
+    actor.task_to_env = {}
+    actor._dp_client = MagicMock()
+    actor.master_config = SimpleNamespace(
+        policy={
+            "generation": {},
+            "make_sequence_length_divisible_by": 1,
+            "max_total_sequence_length": 8,
+        },
+        logger={"wandb_enabled": False, "wandb": {}},
+        env={},
+        grpo=SimpleNamespace(
+            deduplicate_multimodal_data=False,
+            debug_payload_metrics=False,
+            max_rollout_turns=1,
+        ),
+        reward_penalties=SimpleNamespace(),
+    )
+
+    final_batch_data = {
+        "message_log": [[{"role": "user", "content": "prompt"}]],
+        "length": torch.tensor([1]),
+        "loss_multiplier": torch.tensor([1.0]),
+        "total_reward": torch.tensor([1.0]),
+        "truncated": torch.tensor([False]),
+    }
+    if mask_sample is not None:
+        final_batch_data["mask_sample"] = torch.tensor([mask_sample])
+    final_batch = BatchedDataDict(final_batch_data)
+    flat = BatchedDataDict(
+        {
+            "token_ids": torch.tensor([[1, 2]]),
+            "generation_logprobs": torch.tensor([[0.0, 0.0]]),
+            "token_loss_mask": torch.tensor([[0, 1]]),
+        }
+    )
+    prompt_flat = BatchedDataDict({"token_ids": torch.tensor([[1]])})
+    decomposed = {
+        **{key: [None] for key in MESSAGE_LOG_BULK_FIELDS},
+        "response_token_lengths": torch.tensor([1]),
+    }
+
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.should_use_nemo_gym",
+            return_value=True,
+        ),
+        patch(
+            "nemo_rl.experience.sync_rollout_actor.run_nemo_gym_rollout_sync",
+            return_value=SimpleNamespace(final_batch=final_batch, rollout_metrics={}),
+        ) as rollout,
+        patch(
+            "nemo_rl.experience.sync_rollout_actor.should_mask_flagged_samples",
+            return_value=mask_env_flagged_samples,
+        ),
+        patch(
+            "nemo_rl.experience.sync_rollout_actor._flatten_rollout_message_log_for_tq",
+            return_value=(flat, torch.tensor([2]), prompt_flat),
+        ),
+        patch(
+            "nemo_rl.data.llm_message_utils.decompose_message_log",
+            return_value=decomposed,
+        ),
+        patch(
+            "nemo_rl.experience.sync_rollout_actor.kv_first_write",
+            return_value=MagicMock(),
+        ),
+    ):
+        _, driver_carry, _, _ = actor.rollout_to_tq(
+            BatchedDataDict({"prompt": ["p"]}), partition_id="train"
+        )
+
+    assert (
+        rollout.call_args.kwargs["mask_env_flagged_samples"] is mask_env_flagged_samples
+    )
+    return driver_carry
+
+
+def test_sync_rollout_actor_honors_env_mask_opt_out():
+    driver_carry = _rollout_actor_driver_carry(
+        mask_sample=None, mask_env_flagged_samples=False
+    )
+
+    assert "mask_sample" not in driver_carry
+
+
+def test_grpo_sync_drops_env_flagged_samples_from_the_loss(mock_grpo_components):
+    """``data_plane.enabled`` picks the trainer; it must not pick the objective.
+
+    ``run_grpo.py`` presents grpo.py and grpo_sync.py as two implementations of
+    one synchronous algorithm. grpo.py drops env-flagged rollouts from the loss
+    (``_apply_mask_sample_filter``, called at grpo.py:3313 and :4955); before
+    this fix grpo_sync.py never called it, so a rollout the environment marked
+    unusable still contributed its full policy-gradient term there.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_end = False
+    logger = mock_grpo_components["logger"]
+
+    with ExitStack() as stack:
+        master_config.data_plane = {"enabled": True}
+        stack.enter_context(
+            mock_sync_grpo_infrastructure(
+                mock_grpo_components["policy"],
+                driver_carry_extra=_rollout_actor_driver_carry(mask_sample=True),
+            )
+        )
+        stack.enter_context(
+            patch("nemo_rl.algorithms.grpo_sync.validate_sync", return_value=({}, {}))
+        )
+        grpo_train_sync(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            logger,
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    metrics = _logged_train_metrics_with_key(logger, "num_mask_sample_filtered")
+    assert metrics["num_mask_sample_filtered"] == 1
+
+
+def test_grpo_sync_reports_zero_when_nothing_is_flagged(mock_grpo_components):
+    """The metric has to exist on every step, or a dashboard reads a gap as zero."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_end = False
+    logger = mock_grpo_components["logger"]
+
+    with ExitStack() as stack:
+        master_config.data_plane = {"enabled": True}
+        stack.enter_context(
+            mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
+        )
+        stack.enter_context(
+            patch("nemo_rl.algorithms.grpo_sync.validate_sync", return_value=({}, {}))
+        )
+        grpo_train_sync(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            logger,
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    metrics = _logged_train_metrics_with_key(logger, "num_mask_sample_filtered")
+    assert metrics["num_mask_sample_filtered"] == 0
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
