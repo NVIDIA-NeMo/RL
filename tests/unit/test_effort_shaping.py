@@ -268,7 +268,12 @@ class _RunRolloutsRemote:
 
     def remote(self, inputs, timer_prefix):
         del inputs, timer_prefix
-        return _Stream([_ReadyRef((i, r, None)) for i, r in enumerate(self._results)])
+        return _Stream(
+            [
+                _ReadyRef((i, {"name": "agent"}, result, None))
+                for i, result in enumerate(self._results)
+            ]
+        )
 
 
 def _gym_result(reward: float, response_tokens: int) -> dict:
