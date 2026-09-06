@@ -272,6 +272,8 @@ def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() 
             "partition_id": "staging",
         },
     ]
+
+
 class _SyncDataPlaneClient:
     """Synchronous client like the production TQ adapter; records caller threads."""
 
