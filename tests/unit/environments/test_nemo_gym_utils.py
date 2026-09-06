@@ -311,7 +311,7 @@ def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
 
         with pytest.raises(RuntimeError, match="startup failed"):
             spinup_nemo_gym_actor(
-                _env_configs(),
+                _env_configs(num_gpu_nodes=0),
                 base_urls=["http://vllm-0"],
                 model_name="test-model",
                 tokenizer=MagicMock(),
@@ -359,7 +359,7 @@ def test_spinup_nemo_gym_actor_preserves_startup_error_when_cleanup_fails(
 
         with pytest.raises(RuntimeError) as exc_info:
             spinup_nemo_gym_actor(
-                _env_configs(),
+                _env_configs(num_gpu_nodes=0),
                 base_urls=["http://vllm-0"],
                 model_name="test-model",
                 tokenizer=MagicMock(),
