@@ -154,7 +154,9 @@ def _make_controller(
     # rollouts (upstream #3263). An empty env dict selects the native path, and an
     # empty registry makes _abort_stale_inflight a no-op -- neither is what this test
     # is about, but both have to exist for it to reach the refit.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
     return ctrl, monitor, sync
