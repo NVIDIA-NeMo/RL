@@ -146,6 +146,36 @@ basic_dtensor_test_config: PolicyConfig = {
 }
 
 
+@pytest.mark.parametrize("backend", ["vllm", "dynamo"])
+def test_configure_generation_config_matches_vllm_tiny_temperature_clamp(
+    backend: str,
+):
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config["backend"] = backend
+    generation_config["temperature"] = 1e-4
+
+    configured = configure_generation_config(
+        generation_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["temperature"] == 1e-2
+
+
+@pytest.mark.parametrize("backend", ["sglang", "trtllm", "megatron"])
+def test_configure_generation_config_preserves_other_backend_tiny_temperature(
+    backend: str,
+):
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config["backend"] = backend
+    generation_config["temperature"] = 1e-4
+
+    configured = configure_generation_config(
+        generation_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["temperature"] == 1e-4
+
+
 def test_context_capped_max_new_tokens():
     assert (
         _context_capped_max_new_tokens(

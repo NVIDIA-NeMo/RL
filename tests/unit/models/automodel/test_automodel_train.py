@@ -462,6 +462,17 @@ class TestApplyTemperatureScaling:
 
         assert torch.equal(result, original_logits)
 
+    def test_greedy_temperature_keeps_logits_finite_and_unscaled(self):
+        """Greedy generation logprobs come from the unscaled distribution."""
+        logits = torch.randn(4, 64, 32000)
+        original_logits = logits.clone()
+        sampling_params = TrainingSamplingParams(temperature=0.0)
+
+        result = apply_temperature_scaling(logits, sampling_params)
+
+        assert torch.equal(result, original_logits)
+        assert torch.isfinite(result).all()
+
     def test_temperature_scaling_with_temperature_two(self):
         """Test that logits are divided by the configured temperature=2.0."""
         logits = torch.randn(4, 64, 32000)

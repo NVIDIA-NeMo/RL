@@ -22,6 +22,7 @@ from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
 
 TokenizerType = PreTrainedTokenizerBase
+_VLLM_MIN_NON_ZERO_TEMPERATURE = 1e-2
 
 
 def resolve_generation_class(
@@ -64,6 +65,17 @@ def configure_generation_config(
     trains_mtp: bool = False,
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
+    # vLLM clamps tiny positive temperatures before sampling. Normalize the
+    # shared config at this backend boundary so policy logprob recomputation
+    # receives the same effective temperature without changing other backends.
+    temperature = config.get("temperature")
+    if (
+        config["backend"] in ("vllm", "dynamo")
+        and temperature is not None
+        and 0.0 < temperature < _VLLM_MIN_NON_ZERO_TEMPERATURE
+    ):
+        config["temperature"] = _VLLM_MIN_NON_ZERO_TEMPERATURE
+
     # tokenizer setting
     if "_pad_token_id" in config:
         warnings.warn(

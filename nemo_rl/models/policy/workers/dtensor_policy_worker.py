@@ -52,6 +52,7 @@ from transformers.models.gemma3.modeling_gemma3 import (
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
+    apply_temperature_scaling,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
@@ -571,9 +572,7 @@ class DTensorPolicyWorkerImpl(
     # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.sampling_params is not None and self.sampling_params.temperature != 1.0:
-            logits.div_(self.sampling_params.temperature)
-        return logits
+        return apply_temperature_scaling(logits, self.sampling_params)
 
     def _apply_top_k_top_p_filtering(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply top-k and top-p filtering to the logits locally when TP is disabled."""
