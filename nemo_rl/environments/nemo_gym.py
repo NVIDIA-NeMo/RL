@@ -52,6 +52,13 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
+)
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
@@ -79,6 +86,86 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 NEMO_GYM_POPPED_VALUE_SENTINEL_KEY = "__nemo_rl_popped__"
+_NEMO_GYM_TRACE_IDENTITY_TEXT_LIMIT = 256
+
+
+def _bounded_nemo_gym_identity_value(value: Any) -> Any:
+    if not isinstance(value, str) or len(value) <= _NEMO_GYM_TRACE_IDENTITY_TEXT_LIMIT:
+        return value
+    return (
+        value[:_NEMO_GYM_TRACE_IDENTITY_TEXT_LIMIT]
+        + f"...<truncated {len(value) - _NEMO_GYM_TRACE_IDENTITY_TEXT_LIMIT} chars>"
+    )
+
+
+def summarize_nemo_gym_row(row: Any) -> dict[str, Any]:
+    """Return stable rollout identity without logging the potentially large prompt."""
+    if not isinstance(row, Mapping):
+        return {"row_type": type(row).__name__}
+    agent_ref = row.get("agent_ref") or {}
+    metadata = row.get("metadata") or {}
+    task_index = row.get(NEMO_GYM_TASK_INDEX_KEY)
+    rollout_index = row.get(NEMO_GYM_ROLLOUT_INDEX_KEY)
+    attempt_index = row.get(NEMO_GYM_ATTEMPT_INDEX_KEY)
+    rollout_id = None
+    if task_index is not None and rollout_index is not None:
+        rollout_id = f"{task_index}-{rollout_index}"
+        if isinstance(attempt_index, int) and attempt_index > 0:
+            rollout_id = f"{rollout_id}-a{attempt_index}"
+    summary = {
+        "rollout_id": rollout_id,
+        "row_index": row.get("_rowidx"),
+        "task_index": task_index,
+        "rollout_index": rollout_index,
+        "attempt_index": attempt_index,
+        "target_weight_version": row.get(NEMO_GYM_TARGET_WEIGHT_VERSION_KEY),
+        "agent_name": agent_ref.get("name") if isinstance(agent_ref, Mapping) else None,
+        "dataset": row.get("dataset"),
+        "dataset_uuid": metadata.get("uuid") if isinstance(metadata, Mapping) else None,
+    }
+    return {
+        key: _bounded_nemo_gym_identity_value(value)
+        for key, value in summary.items()
+        if value is not None
+    }
+
+
+def emit_nemo_gym_trace(event: str, **fields: Any) -> None:
+    """Emit one always-on structured event; diagnostics must never alter execution."""
+    try:
+        if event.startswith("actor_"):
+            component = "nemo_rl.nemo_gym_actor"
+        elif event.startswith(("ray_stream_", "consumer_")):
+            component = "nemo_rl.rollout_consumer"
+        elif event.startswith("collector_"):
+            component = "nemo_rl.trajectory_collector"
+        else:
+            component = "nemo_rl"
+        print(
+            "[nemo_gym_trace] "
+            + json.dumps(
+                {
+                    "component": component,
+                    "event": event,
+                    "hostname": os.uname().nodename,
+                    "pid": os.getpid(),
+                    "timestamp": time.time(),
+                    **fields,
+                },
+                default=repr,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+    except BaseException as error:  # pragma: no cover - defensive diagnostics path
+        print(
+            "[nemo_gym_trace] diagnostic serialization failed "
+            f"event={event!r} error={error!r}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _replace_last_routed_experts_ref(
@@ -1068,6 +1155,9 @@ Depending on your data shape, you may want to change these values."""
 
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
+        empty_response_output = (
+            isinstance(response.get("output"), list) and not response["output"]
+        )
         result_input = nemo_gym_result["responses_create_params"].get("input", [])
         request_input = nemo_gym_row.get("responses_create_params", {}).get("input")
         raw_input = (
@@ -1364,6 +1454,36 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 routed_experts_dtype=self.cfg.get("routed_experts_dtype", "int16"),
             )
 
+        if not nemo_rl_message_log and empty_response_output:
+            # Some agents intentionally terminate without asking the policy for
+            # a generation. Keep the row structurally valid so one such result
+            # cannot terminate the rollout stream. Async GRPO consumes the
+            # marker below and zeros this row's loss before training.
+            #
+            # Prefer UNK over padding when padding aliases EOS. This synthetic
+            # token is fully masked, but a non-terminating token is still the
+            # least surprising structural placeholder.
+            placeholder_token_id = getattr(tokenizer, "unk_token_id", None)
+            if placeholder_token_id is None:
+                placeholder_token_id = getattr(tokenizer, "pad_token_id", None)
+            if placeholder_token_id is None:
+                placeholder_token_id = getattr(tokenizer, "eos_token_id", None)
+            if placeholder_token_id is None:
+                placeholder_token_id = 0
+            nemo_rl_message_log.append(
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor(
+                        [int(placeholder_token_id)], dtype=torch.long
+                    ),
+                }
+            )
+            emit_nemo_gym_trace(
+                "actor_empty_response_output_recovered",
+                **summarize_nemo_gym_row(nemo_gym_row),
+            )
+
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
             try:
@@ -1406,6 +1526,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
         }
+        if empty_response_output:
+            result[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] = True
         if not include_initial_multimodal_data:
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result

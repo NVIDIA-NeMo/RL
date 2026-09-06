@@ -62,6 +62,7 @@ from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
 )
+from nemo_rl.experience.interfaces import NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY
 from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     attach_static_multimodal_payload,
@@ -1855,6 +1856,44 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         assert streamed_results[0][1] == {"message_log": []}
 
     asyncio.run(_run())
+
+
+def test_nemo_gym_postprocess_empty_output_returns_masked_placeholder(capsys):
+    class _Tokenizer:
+        unk_token_id = 23
+        pad_token_id = 17
+
+    nemo_gym_row = {
+        "_ng_task_index": 42,
+        "_ng_rollout_index": 3,
+        "_ng_attempt_index": 1,
+        "_ng_target_weight_version": 9,
+        "agent_ref": {"name": "conversational_tool_use_agent"},
+    }
+    nemo_gym_result = {
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_row, nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assert result[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] is True
+    assert result["full_result"]["response"]["output"] == []
+    assert len(result["message_log"]) == 1
+    assert result["message_log"][0]["role"] == "user"
+    assert result["message_log"][0]["token_ids"].tolist() == [23]
+    trace = capsys.readouterr().out
+    assert '"event":"actor_empty_response_output_recovered"' in trace
+    assert '"task_index":42' in trace
+    assert '"target_weight_version":9' in trace
+    assert '"agent_name":"conversational_tool_use_agent"' in trace
 
 
 def test_nemo_gym_postprocess_no_generation_data_raises():

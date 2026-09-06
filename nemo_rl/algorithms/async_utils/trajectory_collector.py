@@ -54,7 +54,9 @@ from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
@@ -1608,6 +1610,15 @@ class AsyncTrajectoryCollector:
     ) -> None:
         """Push one prompt group to the replay buffer with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
+        if isinstance(self.master_config, GRPOMasterConfig):
+            # Keep the target version row-aligned through GRPO replay for
+            # diagnostics. This is the same value already sent to Gym for
+            # routing replay, and also covers native rollout implementations.
+            final_batch_cpu[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] = torch.full(
+                (final_batch_cpu.size,),
+                int(target_weight_version),
+                dtype=torch.long,
+            )
         rollout_metrics = rollout_result.rollout_metrics
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
@@ -1783,6 +1794,12 @@ class AsyncTrajectoryCollector:
                     )
                 ]
                 attempt_batch = repeated_batch.select_indices(pending_row_indices)
+
+            if use_nemo_gym:
+                # A regenerated row must have a fresh cohort identity so a
+                # partial GenRM cohort from an earlier attempt cannot absorb it.
+                for row in attempt_batch["extra_env_info"]:
+                    row[NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt - 1
 
             push_tasks: list[asyncio.Task[None]] = []
             scheduled_group_indices: set[int] = set()

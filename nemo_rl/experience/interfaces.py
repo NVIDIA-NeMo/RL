@@ -22,8 +22,13 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 # This is distinct from RolloutManager's private _rowidx ordering key even
 # though both are assigned the same value when K rollout rows are expanded.
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# Zero-based retry attempt for a NeMo-Gym row. The initial attempt is 0.
+NEMO_GYM_ATTEMPT_INDEX_KEY = "_ng_attempt_index"
 # Opaque async-RL target version; None means the field is not forwarded.
 NEMO_GYM_TARGET_WEIGHT_VERSION_KEY = "_ng_target_weight_version"
+# RL-local marker for a successful Gym response with no output items. Such rows
+# are retained for batch shape/accounting but must never contribute training loss.
+NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY = "_nemo_rl_empty_response_output"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.

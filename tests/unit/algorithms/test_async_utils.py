@@ -58,6 +58,8 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
@@ -2981,9 +2983,15 @@ class TestAsyncTrajectoryCollector:
         class RemoteMethod:
             def __init__(self):
                 self.task_indices = []
+                self.target_versions = []
 
             def remote(self, trajectory_group, *args):
                 self.task_indices.append(trajectory_group["_ng_task_index"])
+                self.target_versions.append(
+                    trajectory_group["batch"][
+                        NEMO_GYM_TARGET_WEIGHT_VERSION_KEY
+                    ].tolist()
+                )
                 return _ReadyResult("success")
 
         class FakeReplayBuffer:
@@ -3029,6 +3037,7 @@ class TestAsyncTrajectoryCollector:
         )
         rollout_calls = 0
         rollout_call_task_indices = []
+        rollout_call_attempt_indices = []
 
         def _rollout_result(task_index):
             return SimpleNamespace(
@@ -3038,7 +3047,9 @@ class TestAsyncTrajectoryCollector:
             )
 
         async def fake_rollouts(**kwargs):
-            nonlocal rollout_calls, rollout_call_task_indices
+            nonlocal rollout_calls
+            nonlocal rollout_call_attempt_indices
+            nonlocal rollout_call_task_indices
             assert kwargs["generation_config"]["stop_token_ids"] is None
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
@@ -3053,6 +3064,12 @@ class TestAsyncTrajectoryCollector:
             rollout_call_task_indices.append(
                 [
                     row["_ng_task_index"]
+                    for row in kwargs["input_batch"]["extra_env_info"]
+                ]
+            )
+            rollout_call_attempt_indices.append(
+                [
+                    row[NEMO_GYM_ATTEMPT_INDEX_KEY]
                     for row in kwargs["input_batch"]["extra_env_info"]
                 ]
             )
@@ -3082,7 +3099,12 @@ class TestAsyncTrajectoryCollector:
 
         assert rollout_calls == 2
         assert rollout_call_task_indices == [[7, 7, 8, 8], [8, 8]]
+        assert rollout_call_attempt_indices == [[0, 0, 0, 0], [1, 1]]
         assert replay_buffer.add.task_indices == [7, 8]
+        assert replay_buffer.add.target_versions == [
+            [target_weight, target_weight],
+            [target_weight, target_weight],
+        ]
         assert target_weight not in collector._generating_targets
         output = capsys.readouterr().out
         traces = [

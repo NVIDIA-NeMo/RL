@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -36,6 +37,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _apply_async_pre_training_sample_masks,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
@@ -45,6 +47,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
+    _pad_async_empty_response_placeholders_for_mcore,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -97,14 +100,21 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
     RESUME_BASE_ORDINAL_KEY,
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
-from nemo_rl.experience.rollouts import calculate_rewards
+from nemo_rl.experience.rollouts import (
+    backfill_missing_routed_experts,
+    calculate_rewards,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
@@ -277,6 +287,92 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+def test_async_pre_training_mask_reasons_are_disjoint(capsys):
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0]),
+            NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY: torch.tensor(
+                [True, True, False, False, False]
+            ),
+            "truncated": torch.tensor([True, True, True, False, False]),
+            "mask_sample": torch.tensor([True, True, True, True, False]),
+            NEMO_GYM_TASK_INDEX_KEY: torch.arange(10, 15),
+            "agent_ref": [{"name": f"agent-{i}"} for i in range(5)],
+        }
+    )
+
+    metrics = _apply_async_pre_training_sample_masks(
+        repeated_batch,
+        overlong_filtering=True,
+    )
+
+    assert repeated_batch["loss_multiplier"].tolist() == [0.0, 0.0, 0.0, 0.0, 1.0]
+    assert metrics == {
+        "num_masked_seqs_by_loss_multiplier": 1,
+        "num_masked_seqs_by_empty_response_output": 1,
+        "num_masked_seqs_by_overlong_filtering": 1,
+        "num_masked_seqs_by_rollout": 1,
+        "num_masked_seqs_by_logprob_error": 0,
+        "num_masked_seqs_total": 4,
+    }
+    events = [
+        event
+        for event in _nemo_gym_trace_events(capsys.readouterr().out)
+        if event["event"] == "sample_masked"
+    ]
+    assert [event["reason"] for event in events] == [
+        "loss_multiplier",
+        "empty_response_output",
+        "overlong_filtering",
+        "rollout",
+    ]
+    assert [event["task_index"] for event in events] == [10, 11, 12, 13]
+
+
+def test_empty_response_mcore_padding_precedes_router_replay_backfill():
+    routed_experts = torch.zeros((2, 3, 2), dtype=torch.int16)
+    repeated_batch = BatchedDataDict(
+        {
+            NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY: torch.tensor([True, False]),
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "",
+                        "token_ids": torch.tensor([23]),
+                    }
+                ],
+                [
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([1, 2]),
+                        "routed_experts": routed_experts,
+                    }
+                ],
+            ],
+        }
+    )
+    tokenizer = type(
+        "_Tokenizer",
+        (),
+        {"unk_token_id": 23, "pad_token_id": 17, "eos_token_id": 19},
+    )()
+    policy_config = {"megatron_cfg": {"context_parallel_size": 2, "mtp_num_layers": 5}}
+
+    _pad_async_empty_response_placeholders_for_mcore(
+        repeated_batch,
+        tokenizer,
+        policy_config,
+    )
+    backfill_missing_routed_experts(repeated_batch["message_log"])
+
+    placeholder = repeated_batch["message_log"][0][0]
+    assert placeholder["token_ids"].tolist() == [23, 23, 23, 23]
+    assert placeholder["routed_experts"].shape == (4, 3, 2)
+    assert torch.all(placeholder["routed_experts"] == -1)
 
 
 def test_take_nemo_gym_training_samples_detaches_selected_snapshots():
@@ -609,7 +705,18 @@ def _logged_train_metrics_with_key(logger, key: str):
     raise AssertionError(f"No train metrics payload contained {key}")
 
 
-def test_apply_message_level_advantage_penalties_targets_flagged_message_spans():
+def _nemo_gym_trace_events(output: str) -> list[dict[str, Any]]:
+    prefix = "[nemo_gym_trace] "
+    return [
+        json.loads(line[len(prefix) :])
+        for line in output.splitlines()
+        if line.startswith(prefix)
+    ]
+
+
+def test_apply_message_level_advantage_penalties_targets_flagged_message_spans(
+    capsys,
+):
     train_data = BatchedDataDict(
         {
             "advantages": torch.tensor(
@@ -622,6 +729,11 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
     )
     repeated_batch = BatchedDataDict(
         {
+            NEMO_GYM_TASK_INDEX_KEY: torch.tensor([7, 8]),
+            NEMO_GYM_ROLLOUT_INDEX_KEY: torch.tensor([0, 1]),
+            NEMO_GYM_ATTEMPT_INDEX_KEY: torch.tensor([0, 0]),
+            NEMO_GYM_TARGET_WEIGHT_VERSION_KEY: torch.tensor([3, 3]),
+            "agent_ref": [{"name": "agent-a"}, {"name": "agent-b"}],
             "message_log": [
                 [
                     {
@@ -658,7 +770,7 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
                         "generation_logprobs": torch.tensor([0.8, 0.9]),
                     },
                 ],
-            ]
+            ],
         }
     )
     _apply_message_level_advantage_penalties(
@@ -666,6 +778,7 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
         message_logs=repeated_batch["message_log"],
         invalid_tool_call_advantage=-5.0,
         malformed_thinking_advantage=-7.0,
+        sample_metadata=repeated_batch,
     )
 
     expected = torch.tensor(
@@ -675,6 +788,18 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
         ]
     )
     torch.testing.assert_close(train_data["advantages"], expected)
+    events = [
+        event
+        for event in _nemo_gym_trace_events(capsys.readouterr().out)
+        if event["event"] == "message_advantage_overridden"
+    ]
+    assert [event["reason"] for event in events] == [
+        "invalid_tool_call",
+        "malformed_thinking",
+    ]
+    assert [event["task_index"] for event in events] == [7, 8]
+    assert [event["agent_name"] for event in events] == ["agent-a", "agent-b"]
+    assert [event["target_weight_version"] for event in events] == [3, 3]
 
 
 def test_apply_message_level_advantage_penalties_materializes_broadcasted_advantages():
@@ -1870,6 +1995,88 @@ def test_async_initial_buffer_wait_is_included_in_first_step_timing(
     assert first_step_counts["total_step_time"] == 2
     # Startup wait + replay sample coordination + pre-refit collector wait.
     assert first_step_counts["exposed_generation"] == 3
+
+
+def test_async_grpo_masks_empty_response_before_training(
+    mock_grpo_components,
+    capsys,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.grpo.overlong_filtering = True
+    master_config.env["should_log_nemo_gym_responses"] = True
+    # The containment must materialize its own storage rather than relying on
+    # outer batch padding to provide four token positions.
+    master_config.policy["make_sequence_length_divisible_by"] = 1
+    master_config.policy["megatron_cfg"] = {
+        "enabled": True,
+        "context_parallel_size": 2,
+        "mtp_num_layers": 5,
+    }
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["message_log"] = [
+        [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([0]),
+            }
+        ]
+    ]
+    mock_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] = torch.tensor([True])
+    mock_batch["truncated"] = torch.tensor([True])
+    mock_batch["mask_sample"] = torch.tensor([True])
+
+    with mock_async_grpo_infrastructure(
+        mock_batch,
+        {"mean_gen_tokens_per_sample": 2.0},
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    train_data = mock_grpo_components["policy"].train.call_args.args[0]
+    assert train_data["sample_mask"].tolist() == [0.0]
+    assert train_data["input_lengths"].tolist() == [4]
+    assert torch.count_nonzero(train_data["token_mask"]) == 0
+
+    metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"],
+        "num_masked_seqs_by_empty_response_output",
+    )
+    assert metrics["num_masked_seqs_by_loss_multiplier"] == 0
+    assert metrics["num_masked_seqs_by_empty_response_output"] == 1
+    assert metrics["num_masked_seqs_by_overlong_filtering"] == 0
+    assert metrics["num_masked_seqs_by_rollout"] == 0
+    assert metrics["num_masked_seqs_by_logprob_error"] == 0
+    assert metrics["num_masked_seqs_pre_train_step"] == 1
+    assert metrics["num_masked_seqs_post_train_step"] == 0
+    assert metrics["num_masked_seqs_total"] == 1
+
+    events = [
+        event
+        for event in _nemo_gym_trace_events(capsys.readouterr().out)
+        if event["event"] == "sample_masked"
+    ]
+    assert len(events) == 1
+    assert events[0]["reason"] == "empty_response_output"
 
 
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:
@@ -5372,7 +5579,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         # Verify sample_mask is unchanged
         assert torch.equal(train_data["sample_mask"], original_sample_mask)
 
-    def test_masking_with_threshold(self):
+    def test_masking_with_threshold(self, capsys):
         """Test that sequences exceeding threshold are masked."""
         batch_size, seq_length = 4, 10
 
@@ -5400,7 +5607,22 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 
         # Use threshold 1.2 which should mask sequences 2 and 3
         result = compute_and_apply_seq_logprob_error_masking(
-            train_data, rewards, seq_logprob_error_threshold=1.2
+            train_data,
+            rewards,
+            seq_logprob_error_threshold=1.2,
+            sample_metadata=BatchedDataDict(
+                {
+                    NEMO_GYM_TASK_INDEX_KEY: torch.tensor([100, 101, 102, 103]),
+                    NEMO_GYM_ROLLOUT_INDEX_KEY: torch.tensor([0, 1, 2, 3]),
+                    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY: torch.full((4,), 11),
+                    "agent_ref": [
+                        {"name": "agent-a"},
+                        {"name": "agent-a"},
+                        {"name": "agent-b"},
+                        {"name": "agent-b"},
+                    ],
+                }
+            ),
         )
 
         # Verify masking occurred
@@ -5417,6 +5639,18 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert torch.allclose(train_data["sample_mask"], expected_mask), (
             "Should mask sequences 2 and 3"
         )
+        events = [
+            event
+            for event in _nemo_gym_trace_events(capsys.readouterr().out)
+            if event["event"] == "sample_masked"
+        ]
+        assert [event["reason"] for event in events] == [
+            "seq_logprob_error",
+            "seq_logprob_error",
+        ]
+        assert [event["task_index"] for event in events] == [102, 103]
+        assert [event["agent_name"] for event in events] == ["agent-b", "agent-b"]
+        assert all(event["target_weight_version"] == 11 for event in events)
 
     def test_no_sequences_masked_when_all_below_threshold(self):
         """Test that no sequences are masked when all are below threshold."""
