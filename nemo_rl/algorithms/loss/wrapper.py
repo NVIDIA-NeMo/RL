@@ -143,10 +143,17 @@ class SequencePackingLossWrapper:
             # aggregate loss and metrics
             loss_accum += loss
             for k, v in metrics.items():
+                # ``*_min``/``*_max`` are extrema, not additive quantities. Use
+                # the same suffix rule as downstream workers so a metric is not
+                # summed here and then min/max-ed there. The previous allowlist
+                # named only the four probs_ratio keys and so missed
+                # MseValueLossFn's values_min/values_max.
+                is_min = k.endswith("_min")
+                is_max = k.endswith("_max")
                 if k not in metrics_accum:
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if is_min:
                         metrics_accum[k] = float("inf")
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif is_max:
                         metrics_accum[k] = float("-inf")
                     else:
                         metrics_accum[k] = 0
@@ -154,10 +161,10 @@ class SequencePackingLossWrapper:
                 val = v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v
 
                 # Skip inf/-inf sentinel values (from sequences with no valid tokens)
-                if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                if is_min:
                     if not math.isinf(val):
                         metrics_accum[k] = min(metrics_accum[k], val)
-                elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                elif is_max:
                     if not math.isinf(val):
                         metrics_accum[k] = max(metrics_accum[k], val)
                 else:
