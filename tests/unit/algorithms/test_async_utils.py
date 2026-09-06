@@ -2485,6 +2485,42 @@ class TestAsyncTrajectoryCollector:
         assert collector._max_trajectory_age_steps == 5
         assert collector._calculate_target_weights(2) == [3, 4, 5]
 
+    def test_collector_reads_ppo_payload_and_failure_settings(self):
+        """The PPO branch must read these, not hard-code them.
+
+        The GRPO branch ten lines above reads all three from config. The PPO
+        branch used to pin them to False/False/0, so no recipe could reach
+        them -- and ``max_generation_failures=0`` makes the very first
+        generation-worker exception fatal, with no way to opt into tolerating
+        transient failures.
+        """
+        from nemo_rl.algorithms.ppo import AsyncPPOConfig, PPOConfig
+        from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+
+        master_config = PPOMasterConfig.model_construct(
+            policy={"make_sequence_length_divisible_by": 1},
+            ppo=PPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=4,
+                max_rollout_turns=1,
+                deduplicate_multimodal_data=True,
+                debug_payload_metrics=True,
+                async_ppo=AsyncPPOConfig(max_generation_failures=3),
+            ),
+        )
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        collector = collector_cls(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=master_config,
+            replay_buffer=mock.MagicMock(),
+        )
+
+        assert collector._deduplicate_multimodal_data is True
+        assert collector._debug_payload_metrics is True
+        assert collector._max_generation_failures == 3
+
     def test_collector_grpo_window_remains_fixed(self):
         collector = self.create_local_collector()
 
@@ -4030,3 +4066,83 @@ def test_turn_count_fallback_priority():
     assert f({"turns_per_sample/max": 5, "turns_per_sample/mean": 3}) == 5.0
     assert f({"turns_per_sample/mean": 6}) == 6.0
     assert f({"reward": 1.0}) is None
+
+
+class TestMultimodalDedupCapability:
+    """``ppo.deduplicate_multimodal_data`` is qualified only on the vLLM
+    backend with the data plane off.
+
+    ``grpo.py`` has rejected everything else at setup since the knob landed
+    (``_validate_multimodal_dedup_capability``). Adding the field to
+    ``PPOConfig`` without the guard would have let PPO accept exactly the
+    configurations GRPO refuses, and run unqualified without saying so.
+    """
+
+    @staticmethod
+    def _config(backend: str, *, dedup: bool, data_plane_enabled: bool):
+        return SimpleNamespace(
+            policy={"generation": {"backend": backend}},
+            value={},
+            env={},
+            loss_fn=SimpleNamespace(),
+            ppo=SimpleNamespace(deduplicate_multimodal_data=dedup),
+            data={},
+            logger={},
+            cluster={},
+            data_plane={"enabled": data_plane_enabled},
+        )
+
+    def _run(self, cfg):
+        from nemo_rl.algorithms.ppo import setup
+
+        setup(
+            master_config=cfg,
+            tokenizer=mock.MagicMock(),
+            dataset=mock.MagicMock(),
+            val_dataset=None,
+        )
+
+    def test_a_non_vllm_backend_with_dedup_is_rejected(self):
+        with pytest.raises(NotImplementedError, match="backend=vllm"):
+            self._run(self._config("sglang", dedup=True, data_plane_enabled=False))
+
+    def test_the_data_plane_with_dedup_is_rejected(self):
+        with pytest.raises(NotImplementedError, match=r"data_plane\.enabled=false"):
+            self._run(self._config("vllm", dedup=True, data_plane_enabled=True))
+
+    @pytest.mark.parametrize("backend", ["vllm", "sglang"])
+    def test_the_default_is_never_rejected(self, backend):
+        """The guard must not fire when the knob is off, which is the shipped
+        default. Setup fails later on the mocks -- that is what keeps this from
+        passing vacuously if the guard were made unconditional."""
+        with pytest.raises(Exception) as excinfo:
+            self._run(self._config(backend, dedup=False, data_plane_enabled=True))
+        assert "deduplicate_multimodal_data" not in str(excinfo.value)
+
+    def test_the_qualified_pairing_gets_past_the_guard(self):
+        with pytest.raises(Exception) as excinfo:
+            self._run(self._config("vllm", dedup=True, data_plane_enabled=False))
+        assert "deduplicate_multimodal_data" not in str(excinfo.value)
+
+    def test_a_real_config_without_a_data_plane_block_reaches_the_guard(self):
+        """No shipped PPO config carries a top-level ``data_plane``.
+
+        ``MasterConfig`` is ``extra="allow"``, which exposes only the keys a
+        config actually carried, so unless the field is declared, reading it
+        raises ``AttributeError`` instead of yielding the ``None`` this guard
+        expects -- and the knob is unusable on precisely the configuration it
+        is qualified for. The ``SimpleNamespace`` fixtures above cannot catch
+        that: they always have the attribute.
+        """
+        from nemo_rl.algorithms.ppo import (
+            MasterConfig,
+            _validate_multimodal_dedup_capability,
+        )
+
+        master_config = MasterConfig.model_construct(
+            policy={"generation": {"backend": "vllm"}},
+            ppo=SimpleNamespace(deduplicate_multimodal_data=True),
+        )
+        assert "data_plane" not in master_config.model_fields_set
+
+        _validate_multimodal_dedup_capability(master_config)

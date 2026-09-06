@@ -65,6 +65,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
@@ -138,6 +139,10 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     # Number of future target steps generation may fill during critic warmup.
     # None uses max_trajectory_age_steps as the generation lead.
     warmup_generation_lead_steps: int | None = Field(default=None, ge=1)
+    # Generation-worker failures tolerated before the AsyncTrajectoryCollector
+    # aborts the run. A successful batch worker resets the count.
+    # 0 makes the very first worker exception fatal.
+    max_generation_failures: int = Field(default=0, ge=0)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
@@ -192,6 +197,11 @@ class PPOConfig(BaseModel, extra="allow"):
     batch_multiplier: float = 1.0
     # Number of actor (policy) passes over each rollout batch.
     ppo_epochs: int = 4
+    # Share and compact immutable image/video/audio payload segments across
+    # logical PPO rows. Prompt identity is never used as proof of equality.
+    deduplicate_multimodal_data: bool = False
+    # Emit exact-boundary and logical-vs-physical payload metrics.
+    debug_payload_metrics: bool = False
     # Number of critic (value) passes over each rollout batch. Defaults to
     # ppo_epochs (see validate_epoch) unless explicitly set.
     critic_ppo_epochs: int = 4
@@ -304,11 +314,44 @@ class MasterConfig(BaseModel, extra="allow"):
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     telemetry: Optional[TelemetryConfig] = None
+    # Declared so ``master_config.data_plane`` resolves. ``extra="allow"`` only
+    # exposes keys the config actually carried, and no shipped PPO config has a
+    # top-level ``data_plane`` block, so reading it undeclared is an
+    # AttributeError rather than the None this guard expects. grpo.py declares
+    # it the same way.
+    data_plane: Optional[DataPlaneConfig] = None
 
 
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
+
+
+def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
+    """Reject configurations whose media transfer path is not qualified.
+
+    Mirrors grpo.py's guard of the same name. The knob is qualified only with
+    the vLLM generation backend and with the data plane off; without this, PPO
+    would accept it on exactly the configurations GRPO rejects and run
+    unqualified without saying so.
+    """
+    # ``getattr``: a hand-built PPO config -- the test doubles elsewhere in the
+    # suite build one -- need not carry every field. A missing knob is an off
+    # knob, which is the shipped default.
+    if not getattr(master_config.ppo, "deduplicate_multimodal_data", False):
+        return
+
+    generation_config = master_config.policy["generation"]
+    if generation_config.get("backend") != "vllm":
+        raise NotImplementedError(
+            "ppo.deduplicate_multimodal_data=true is currently qualified "
+            "only with policy.generation.backend=vllm."
+        )
+    if (master_config.data_plane or {}).get("enabled", False):
+        raise NotImplementedError(
+            "ppo.deduplicate_multimodal_data=true is currently supported "
+            "only when data_plane.enabled=false."
+        )
 
 
 def setup(
@@ -355,6 +398,8 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+
+    _validate_multimodal_dedup_capability(master_config)
     if generation_config["backend"] == "vllm":
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
