@@ -334,7 +334,7 @@ class VllmInternalWorkerExtension:
         return params
 
     def _load_full_hf_weights(
-        self, policy_weights: list[tuple[str, torch.Tensor]]
+        self, policy_weights: Iterable[tuple[str, torch.Tensor]]
     ) -> set[str] | None:
         """Load HF weights and detach any deferred reload tensors from transport storage.
 
@@ -344,12 +344,16 @@ class VllmInternalWorkerExtension:
         if not getattr(self, "_nrl_layerwise_reload_active", False):
             return self.model_runner.model.load_weights(weights=policy_weights)
 
-        source_storage_ptrs = {
-            tensor.untyped_storage().data_ptr() for _, tensor in policy_weights
-        }
+        source_storage_ptrs = set()
+
+        def track_source_storage() -> Iterator[tuple[str, torch.Tensor]]:
+            for name, tensor in policy_weights:
+                source_storage_ptrs.add(tensor.untyped_storage().data_ptr())
+                yield name, tensor
+
         load_error: Exception | None = None
         try:
-            return self.model_runner.model.load_weights(weights=policy_weights)
+            return self.model_runner.model.load_weights(weights=track_source_storage())
         except Exception as error:
             load_error = error
             raise
