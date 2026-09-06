@@ -66,6 +66,25 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
 
 
+def test_check_nccl_reshard_refit_support_rejects_reload_api() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["refit_with_reload_api"] = True
+
+    with pytest.raises(ValueError, match="explicitly unsupported"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["backend"] = "sglang"
+    config.policy["generation"].pop("vllm_cfg")
+
+    with pytest.raises(ValueError) as exc_info:
+        check_nccl_reshard_refit_support(config)
+
+    assert "policy.generation.backend must be 'vllm'" in str(exc_info.value)
+
+
 def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
