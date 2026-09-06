@@ -34,6 +34,7 @@ checkpointing:
   model_save_format: null
 policy:
   model_name: deepseek-ai/DeepSeek-V4-Flash-0731
+  refit_buffer_size_gb: 1
   tokenizer:
     chat_template: deepseek_v4
     chat_template_kwargs:

@@ -33,7 +33,8 @@ _EXPERT_REFIT_PARAMS = (
 
 def is_model(model: torch.nn.Module) -> bool:
     """Return whether a constructed vLLM model is a DeepSeek V4 causal LM."""
-    return model.config.model_type == "deepseek_v4"
+    config = getattr(model, "config", None)
+    return getattr(config, "model_type", None) == "deepseek_v4"
 
 
 def map_checkpoint_name(model: torch.nn.Module, name: str) -> str:
