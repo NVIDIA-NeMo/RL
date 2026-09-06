@@ -136,6 +136,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         last_checkpoint_path=None,
         finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
+        bootstrap_identity=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -708,6 +709,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -838,6 +840,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -1209,6 +1212,9 @@ class _EmptyBuffer:
 
     def training_owned_group_ids(self) -> set[str]:
         return set()
+
+    def release_training_claims(self, group_ids: list[str]) -> None:
+        assert not group_ids
 
 
 class _NoOpTrainer:
