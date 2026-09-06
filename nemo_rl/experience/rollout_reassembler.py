@@ -364,6 +364,7 @@ class RolloutReassembler:
         mask_sample: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
+        loss_multiplier: float = 1.0,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -374,7 +375,9 @@ class RolloutReassembler:
         advantage-stage flag the native ``pack_payload`` path emits from each
         ``Completion``; it rides along unchanged so the train pump's
         environment masking reads the same field on both paths (placeholder
-        rows already train nothing through ``sample_mask`` 0). ``truncated``
+        rows already train nothing through ``sample_mask`` 0).
+        ``loss_multiplier`` supplies the dataset-level weight for every valid
+        row, matching the ordinary ``record_to_train_batch`` path. ``truncated``
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
         instead, from each row's rebuilt length against ``max_seq_len``.
@@ -511,7 +514,7 @@ class RolloutReassembler:
             input_ids[i, :length] = torch.tensor(row.token_ids, dtype=torch.int64)
             token_mask[i, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
             logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
-            sample_mask[i] = 1.0
+            sample_mask[i] = float(loss_multiplier)
 
         train_batch = {
             "input_ids": input_ids,

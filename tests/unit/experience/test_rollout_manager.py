@@ -1020,7 +1020,10 @@ def test_async_rollout_manager(
     - completions hold independent (not aliased) message_log objects
     """
     vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
-    input_sample = single_multi_step_calculator_input_sample
+    input_sample = {
+        **single_multi_step_calculator_input_sample,
+        "loss_multiplier": 0.25,
+    }
     num_generations = 2
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
@@ -1044,6 +1047,7 @@ def test_async_rollout_manager(
         f"Expected {num_generations} completions, got {len(record.completions)}"
     )
     assert record.prompt_idx == input_sample["idx"]
+    assert record.loss_multiplier == input_sample["loss_multiplier"]
 
     for i, completion in enumerate(record.completions):
         assert isinstance(completion, Completion)
@@ -1298,6 +1302,7 @@ def test_async_nemo_gym_rollout_manager(
         f"Expected {num_generations} completions, got {len(record.completions)}"
     )
     assert record.prompt_idx == 0
+    assert record.loss_multiplier == single_prompt["loss_multiplier"]
 
     for i, completion in enumerate(record.completions):
         assert isinstance(completion, Completion)
@@ -1499,7 +1504,9 @@ class _FakeCaptureBuffer(_FakeBuffer):
         )
 
 
-def _receipt_record(rollout_ids, receipts, instance_configs=None):
+def _receipt_record(
+    rollout_ids, receipts, instance_configs=None, *, loss_multiplier=1.0
+):
     instance_configs = instance_configs or [None] * len(rollout_ids)
     completions = [
         Completion(
@@ -1522,6 +1529,7 @@ def _receipt_record(rollout_ids, receipts, instance_configs=None):
         metadata={"task_name": "nemo_gym"},
         completions=completions,
         rollout_metrics={},
+        loss_multiplier=loss_multiplier,
     )
 
 
@@ -1560,6 +1568,7 @@ def _make_capture_manager(
                 rollout_ids,
                 [{"rollout_id": rid} for rid in rollout_ids],
                 instance_configs=instance_configs,
+                loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
             )
 
     mgr._impl = _CaptureImpl()
@@ -1585,7 +1594,11 @@ class TestGenerateForFinalizationFlow:
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf)
 
-        request = _run(mgr.generate_for_finalization({"prompt": "p"}, target_step=5))
+        request = _run(
+            mgr.generate_for_finalization(
+                {"prompt": "p", "loss_multiplier": 0.25}, target_step=5
+            )
+        )
 
         # Rollout ids were minted from the reserved group id and threaded
         # end to end: reserve -> impl -> metadata-only actor request.
@@ -1598,6 +1611,7 @@ class TestGenerateForFinalizationFlow:
         assert [r["rollout_id"] for r in request.receipts] == expected_ids
         assert request.rewards == (0.5, 0.5)
         assert request.mask_sample == (False, False)
+        assert request.loss_multiplier == 0.25
         assert request.fallback_weight_version == 7
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.
