@@ -57,6 +57,7 @@ from megatron.core.utils import unwrap_model
 
 from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.held_port import receive_held_socket
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -90,7 +91,7 @@ class MegatronGenerationMixin:
      - megatron_tokenizer: tokenizer for inference.
      - processor: optional multimodal processor.
      - is_generation_colocated: Whether colocated or distributed.
-     - _reserved_http_server_socket: driver-reserved server socket, or None.
+     - _reserved_http_server_port: driver-reserved server port, or None.
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here
@@ -554,10 +555,16 @@ class MegatronGenerationMixin:
         )
 
         ip = _get_node_ip_local()
-        reserved_socket = self._reserved_http_server_socket
-        if reserved_socket is not None:
+        reserved_port = self._reserved_http_server_port
+        if reserved_port is not None:
+            # Defer fd handoff until immediately before server startup. Holding
+            # this listener across model initialization can leak it into a
+            # long-lived child process, which then receives SO_REUSEPORT traffic
+            # despite never accepting HTTP requests.
+            reserved_socket = receive_held_socket(reserved_port)
             server_port = reserved_socket.getsockname()[1]
         else:
+            reserved_socket = None
             server_port = _get_free_port_local()
 
         start_text_gen_server(
