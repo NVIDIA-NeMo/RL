@@ -31,8 +31,73 @@ from nemo_rl.models.policy.utils import (
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
+    resolve_model_class,
     stream_weights_via_ipc_zmq_impl,
 )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "hf_class_name", "nemo_class_name"),
+    [
+        ("qwen2_5_vl", "hf_image_text", "nemo_image_text"),
+        ("qwen2_5_omni", "hf_text_waveform", "nemo_text_waveform"),
+        ("unknown_model", "hf_causal_lm", "nemo_causal_lm"),
+    ],
+)
+@pytest.mark.parametrize("nemo_available", [False, True])
+def test_resolve_model_class_selects_requested_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    model_type: str,
+    hf_class_name: str,
+    nemo_class_name: str,
+    nemo_available: bool,
+) -> None:
+    """The caller chooses plain Transformers or NeMo AutoModel classes."""
+    hf_classes = {
+        "hf_image_text": object(),
+        "hf_text_waveform": object(),
+        "hf_causal_lm": object(),
+    }
+    nemo_classes = {
+        "nemo_image_text": object(),
+        "nemo_text_waveform": object(),
+        "nemo_causal_lm": object(),
+    }
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.HF_AUTOMODEL_FACTORY",
+        {
+            "qwen2_5_vl": hf_classes["hf_image_text"],
+            "qwen2_5_omni": hf_classes["hf_text_waveform"],
+        },
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.AUTOMODEL_FACTORY",
+        {
+            "qwen2_5_vl": nemo_classes["nemo_image_text"],
+            "qwen2_5_omni": nemo_classes["nemo_text_waveform"],
+        },
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.AutoModelForCausalLM",
+        hf_classes["hf_causal_lm"],
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.NeMoAutoModelForCausalLM",
+        nemo_classes["nemo_causal_lm"],
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.NEMO_AUTOMODEL_AVAILABLE", nemo_available
+    )
+
+    assert (
+        resolve_model_class(model_type, use_nemo_automodel=False)
+        is hf_classes[hf_class_name]
+    )
+    expected_default = (
+        nemo_classes[nemo_class_name] if nemo_available else hf_classes[hf_class_name]
+    )
+    assert resolve_model_class(model_type) is expected_default
 
 
 class TestGetMegatronCheckpointDir:
