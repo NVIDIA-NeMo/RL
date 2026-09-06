@@ -281,7 +281,7 @@ class SiblingSealResult:
     # into a masked placeholder, matching the base token-capture contract.
     receipt: Optional[dict[str, Any]]
     reward: float
-    mask_sample: bool = False
+    mask_sample: bool
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -577,7 +577,7 @@ class RolloutRecoveryLedger:
         gate_rollout_id: str,
         receipt: Optional[dict[str, Any]],
         reward: float,
-        mask_sample: bool = False,
+        mask_sample: bool,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()

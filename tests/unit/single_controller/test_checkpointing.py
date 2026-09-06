@@ -675,6 +675,7 @@ def _sealed_recovery_ledger(staging_key: str) -> RolloutRecoveryLedger:
                     "manifest": [{"staging_key": staging_key}],
                 },
                 reward=1.0,
+                mask_sample=False,
             )
 
     asyncio.run(seed())

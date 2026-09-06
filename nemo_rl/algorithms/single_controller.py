@@ -3921,6 +3921,10 @@ class SingleControllerActor:
             fields_to_put[adv_cfg.returns_field] = returns
             new_fields.append(adv_cfg.returns_field)
 
+        # Trainer-step checkpointing runs later in this same train-pump task, so
+        # this publication cannot race a checkpoint save. If advantage staging
+        # moves to another task, the write must participate in the data-plane
+        # mutation barrier.
         await self._call_dp(
             "put_samples",
             sample_ids=meta.sample_ids,
