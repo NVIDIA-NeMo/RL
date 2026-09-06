@@ -47,6 +47,7 @@ from nemo_rl.data_plane.schema import (
     fields_with_optional_routed_experts,
 )
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
 
@@ -255,7 +256,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs=common_kwargs,
+                common_kwargs={**common_kwargs, **trace_context_kwargs()},
             )
         # Wait for completion; per-rank returns are None.
         self.worker_group.get_all_worker_results(futures)
@@ -376,6 +377,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    **trace_context_kwargs(),
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)
@@ -499,6 +501,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
+                common_kwargs=trace_context_kwargs(),
             )
         # Wait for completion only — workers return None (metrics
         # accumulate in their open-step state until finish_train_step).

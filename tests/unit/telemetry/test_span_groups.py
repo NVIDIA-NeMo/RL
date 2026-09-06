@@ -21,7 +21,6 @@ RL_GROUPS = frozenset(
         "reward",
         "advantage",
         "policy_update",
-        "reference_policy",
         "data_processing",
         "data_plane",
         "efficiency",
@@ -40,10 +39,9 @@ PER_PROMPT_GROUPS = frozenset({"per_prompt"})
 # sync when instrumenting a new group -- that is the point of
 # ``test_every_emitted_group_is_reachable_from_a_shipped_preset``.
 #
-# A superset on purpose: it also holds the groups that are defined and bucketed
-# but have no call site yet (``reference_policy``; see the coverage gaps in
-# docs/observability/span-groups.md), so the preset wiring is already correct
-# when one of them is instrumented rather than needing a second edit here.
+# Exactly the emitted set, not a superset: a registered group with no call site
+# makes a preset advertise spans it cannot deliver, so the two are kept equal
+# and ``test_every_registered_group_has_an_emitter`` holds the line.
 EMITTED_GROUPS = RL_GROUPS | frozenset(
     {"job", "step", "checkpoint", "evaluate", "model_init"}
 )
@@ -72,12 +70,15 @@ def test_default_preset_covers_startup():
         assert {"setup", "model_init"} <= resolved, preset
 
 
-def test_per_step_has_step_and_phases_but_not_job():
+def test_per_step_has_step_and_phases_including_job():
     per_step = RLSpanGroup.resolve("per_step")
     assert "step" in per_step
     assert RL_GROUPS <= per_step
-    # per_step deliberately omits JOB so each step is its own root trace.
-    assert "job" not in per_step
+    # JOB earns its place despite making the run one trace: it is the only
+    # run-scoped span, so without it ``current_trace_carrier`` hands the
+    # trajectory collector an empty carrier and every async rollout span
+    # re-roots away from the run.
+    assert "job" in per_step
 
 
 def test_every_emitted_group_is_reachable_from_a_shipped_preset():

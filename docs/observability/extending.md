@@ -105,12 +105,32 @@ so expose a method that calls `shutdown_telemetry()` and have the driver call it
 first — `AsyncTrajectoryCollector.flush_telemetry` is the worked example.
 
 Ray does not propagate OTel context, so the actor's spans form their own trace
-unless you carry the parent across. On the driver, inside the span that should
-be the root, capture `current_trace_carrier()` and pass it to the actor; in the
-actor, wrap the work in `remote_trace_context(carrier)`. Reattach in **every
-thread** the actor spawns — OTel context is a `ContextVar` and threads inherit
-none — and note the carrier is empty (a harmless no-op) whenever the driver's
-enclosing group is disabled. See
+unless you carry the parent across. For a per-call actor method, use the
+dispatch/receive pair rather than moving the carrier by hand — decorate the
+method with `@accepts_trace_context` and dispatch it with one of:
+
+```python
+# A direct remote() call.
+dispatch_with_trace_context(actor.run_rollouts.options(num_returns="streaming"), batch)
+
+# RayWorkerGroup, which names the method by string and forwards **kwargs.
+self.worker_group.run_all_workers_sharded_data(
+    "train_presharded", meta=metas, common_kwargs={**common_kwargs, **trace_context_kwargs()}
+)
+```
+
+Both halves are required and only the decorator is visible at the definition, so
+a method decorated but dispatched without a carrier still emits root spans while
+looking wired. `test_every_context_accepting_method_is_dispatched_with_a_carrier`
+fails the build in that case; when you add a new decorated method, expect that
+test to tell you if you forgot the sender.
+
+Reach for `current_trace_carrier()` / `remote_trace_context()` directly only
+when the context has to outlive a single call — the async trajectory collector
+takes its carrier once at construction and reattaches it in **every thread** it
+spawns, because OTel context is a `ContextVar` and threads inherit none. The
+carrier is empty (a harmless no-op) whenever the driver's enclosing group is
+disabled. See
 [span groups](span-groups.md#getting-the-collector-into-one-waterfall).
 
 ## Adding a span
@@ -177,7 +197,7 @@ Pick from `RLSpanGroup` before inventing a new one:
 - Once per run, covering the training loop? → `job`
 - Once per training step? → `step`
 - Rollout collection? → `rollout`; generation? → `generation`
-- Log-probs? → `logprob` (or `reference_policy` for the reference model)
+- Log-probs? → `logprob`, the reference model's included
 - Reward / advantage / policy update? → `reward` / `advantage` / `policy_update`
 - Checkpoint / eval? → `checkpoint` / `evaluate`
 - Transfer-queue op? → `data_plane`

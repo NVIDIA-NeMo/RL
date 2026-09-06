@@ -52,6 +52,17 @@ from nemo_rl.experience.failures import (
 )
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
+from nemo_rl.telemetry.instrumentation import (
+    accepts_trace_context,
+    is_span_group_enabled,
+    umbrella_span,
+)
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    instrument_aiohttp_client,
+    shutdown_telemetry,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
@@ -308,6 +319,30 @@ class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
+        # Named explicitly because this actor is built from the environment
+        # registry rather than by RayWorkerGroup, so nothing sets
+        # NRL_WORKER_GROUP for it and its spans would otherwise carry no
+        # rl.worker_group at all.
+        init_telemetry_worker(resource_attributes={"rl.worker_group": "nemo_gym"})
+        # Before _spinup, which is where Gym builds the ClientSession that
+        # carries every rollout: the instrumentor patches the session class, so
+        # a session that already exists keeps the uninstrumented behaviour and
+        # the whole Gym leg of the trace is lost.
+        #
+        # Gated, because the instrumentor spans every request off the global
+        # tracer with no reference to the enabled-group set: whatever turns it
+        # on pays a span per HTTP call for the rest of the run.
+        #
+        # PER_PROMPT rather than ROLLOUT, even though these spans sit inside the
+        # rollout. The group has to describe the volume, not the phase, and this
+        # is the highest-cardinality thing NeMo-RL emits -- prompts x turns x
+        # tool calls, strictly more than the ~2-per-prompt spans PER_PROMPT
+        # exists to fence off. ROLLOUT is in `per_step`, whose stated contract
+        # is that its cost scales with steps rather than dataset size, so
+        # gating here on ROLLOUT would quietly break that for every Gym run.
+        # Ask for the Gym HTTP leg with "per_step,per_prompt".
+        if is_span_group_enabled(RLSpanGroup.PER_PROMPT):
+            instrument_aiohttp_client()
         self.cfg = cfg
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
@@ -482,13 +517,55 @@ Depending on your data shape, you may want to change these values."""
         """
         self._tokenizer = tokenizer
 
+    @accepts_trace_context
     async def run_rollouts(
         self,
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
-        """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
+        """Stream postprocessed rollouts as NeMo-Gym tasks complete.
+
+        A thin span-opening wrapper over :meth:`_stream_rollouts`, which holds
+        the logic. Split so the span covers the whole stream without indenting
+        the body under a ``with``.
+
+        The decorator parents this batch to the caller's span, and everything
+        below inherits it -- including the HTTP requests Gym's own client
+        makes, which are instrumented at the library level (see
+        :func:`instrument_aiohttp_client`) and read the ambient context rather
+        than anything passed here.
+
+        An umbrella span, so it carries no ``rl.bucket``: several batches are
+        in flight at once on the async path, and their durations would sum past
+        the wall clock they happened in.
+
+        Yields:
+            One ``(rowidx, result, timing_metrics)`` triple per completed task,
+            in completion order rather than input order. ``rowidx`` echoes back
+            the ``_rowidx`` the caller stamped on the example, which is how the
+            caller maps a result to its slot. ``timing_metrics`` is ``None`` on
+            every triple but the last, which carries the batch totals.
+        """
+        with umbrella_span(
+            RLSpanGroup.U_ROLLOUT,
+            "rl.gym.run_rollouts",
+            **{"rl.gym.batch_size": len(nemo_gym_examples)},
+        ):
+            async for item in self._stream_rollouts(
+                nemo_gym_examples,
+                timer_prefix,
+                deduplicate_multimodal_data,
+            ):
+                yield item
+
+    async def _stream_rollouts(
+        self,
+        nemo_gym_examples: list[dict],
+        timer_prefix: str,
+        deduplicate_multimodal_data: bool = False,
+    ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
+        """Body of :meth:`run_rollouts`; see there for the tracing wrapper."""
         self._require_spinup()
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
@@ -845,11 +922,16 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
     def shutdown(self) -> None:
         # Teardown runs in a finally block, so it must not turn a real training error
         # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
-        if self.rh is None:
-            return
-        run_helper = self.rh
-        self.rh = None
-        run_helper.shutdown()
+        try:
+            if self.rh is None:
+                return
+            run_helper = self.rh
+            self.rh = None
+            run_helper.shutdown()
+        finally:
+            # Ray reaps this actor, so no atexit handler runs: whatever the span
+            # processor is still holding is dropped unless it is flushed here.
+            shutdown_telemetry()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.

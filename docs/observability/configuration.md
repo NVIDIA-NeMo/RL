@@ -91,7 +91,7 @@ Filter by `run_id` in your backend to isolate a specific run.
 | `dl.tensor_parallel.size` | `policy.megatron_cfg` / `dtensor_cfg` TP size |
 | `dl.pipeline_parallel.size` | `policy.megatron_cfg` PP size |
 | `nv.dl.rank`, `nv.dl.world_size` | this process's rank and group size (`RANK` / `WORLD_SIZE`, or `0` / `1` for the driver and singleton actors) |
-| `rl.worker_group` | worker processes only: the worker group's `name_prefix` (`lm_policy`, `vllm_policy`, ...), from `NRL_WORKER_GROUP` |
+| `rl.worker_group` | worker processes only: the worker group's `name_prefix` (`lm_policy`, `vllm_policy`, ...), from `NRL_WORKER_GROUP`. The `NemoGym` actor reports the literal `nemo_gym` — it is built from the environment registry rather than by `RayWorkerGroup`, so nothing sets the env var for it |
 
 Attribute construction is best-effort: a missing config key simply omits that attribute; it never raises. Plus auto-detected host / GPU / SLURM / Kubernetes attributes from lens's resource detection.
 
@@ -132,4 +132,4 @@ telemetry:
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 ```
 
-`per_step` makes each training step its own root trace (rollout, generation, reward, advantage, policy update). See [Span Groups](span-groups.md).
+`per_step` adds the per-step phases (rollout, generation, reward, advantage, policy update) on top of the run-level `job` span, so the whole run is one trace. See [Span Groups](span-groups.md).

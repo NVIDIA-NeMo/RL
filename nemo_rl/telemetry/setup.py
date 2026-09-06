@@ -42,6 +42,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import threading
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
 
@@ -255,16 +256,18 @@ def init_telemetry_driver(
 
     # Resolved eagerly so a typo is reported here rather than silently selecting
     # less than the user asked for. Lens treats an unknown entry as pending, not
-    # an error, because in general the library that owns it may not have been
-    # imported yet -- but NeMo-RL registers everything it emits at import, so on
-    # the driver a pending entry really is a typo. A warning rather than a raise
-    # for the same reason the rest of this is best-effort: a misspelt group
-    # should not end a training run.
+    # an error, because the library that owns it may not have been imported yet.
+    # On the driver that is usually a typo, but not always: workers receive the
+    # raw spec and resolve it themselves, so a group owned by a library imported
+    # only in the workers (Megatron's forward_backward, say) is pending here and
+    # live there. Hence a warning that says so, rather than a raise.
     _, pending = RLSpanGroup.resolve_with_pending(config.span_groups)
     if pending:
         logger.warning(
-            "nemo-lens: telemetry.span_groups names %s, which match no registered "
-            "span group or preset and will select nothing. Registered groups: %s.",
+            "nemo-lens: telemetry.span_groups names %s, which match nothing "
+            "NeMo-RL registers. They select no driver spans -- check for a typo. "
+            "They still apply in workers if another library registers them "
+            "there. Registered groups: %s.",
             sorted(pending),
             sorted(RLSpanGroup.ALL_GROUPS),
         )
@@ -414,6 +417,60 @@ def init_telemetry_worker(
         return handle
 
 
+#: Set once ``instrument_aiohttp_client`` has patched the client, so a second
+#: call is a no-op. The upstream instrumentor warns and skips on re-entry, and
+#: an actor that spins up more than once would otherwise log that warning on a
+#: path where nothing is wrong.
+_AIOHTTP_INSTRUMENTED = False
+
+
+def instrument_aiohttp_client() -> bool:
+    """Make outgoing ``aiohttp`` requests carry the caller's trace context.
+
+    The NeMo-Gym rollout path leaves this process over HTTP from inside Gym's
+    own client, so there is no request NeMo-RL can add a header to. Patching the
+    client library instead means every request Gym makes is stamped with a W3C
+    ``traceparent`` taken from the ambient context, which is what lets a Gym
+    server running :func:`nemo.lens.contrib.fastapi.instrument_fastapi` continue
+    the trace rather than start one.
+
+    Call after worker telemetry is up and before any ``ClientSession`` exists --
+    the instrumentor patches the class, so sessions built earlier keep the
+    unpatched behaviour.
+
+    Returns:
+        Whether the client is instrumented. ``False`` when telemetry is off, or
+        when the optional dependency is missing -- neither is fatal, because
+        losing the Gym half of a trace is not a reason to fail a rollout.
+    """
+    global _AIOHTTP_INSTRUMENTED
+    if _AIOHTTP_INSTRUMENTED:
+        return True
+    if get_telemetry_handle() is None:
+        return False
+    try:
+        from nemo.lens.contrib.aiohttp import instrument_aiohttp_client as _instrument
+
+        _instrument()
+    except ImportError:
+        # nemo-lens[aiohttp] pulls this in, so it is present in a normal
+        # install. Reachable when lens is pinned without the extra.
+        logger.warning(
+            "nemo-lens: aiohttp instrumentation unavailable, so NeMo-Gym HTTP "
+            "calls will start their own traces; install nemo-lens[aiohttp]",
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "nemo-lens: aiohttp instrumentation failed; continuing without it",
+            exc_info=True,
+        )
+        return False
+    else:
+        _AIOHTTP_INSTRUMENTED = True
+        return True
+
+
 def traced_worker_init(span_name: str, **attributes: Any) -> Callable[[_F], _F]:
     """Decorate a worker ``__init__`` so its model load lands in a span.
 
@@ -467,20 +524,66 @@ def get_telemetry_handle() -> Optional["TelemetryHandle"]:
 
 
 def shutdown_telemetry(timeout_ms: int = 5000) -> None:
-    """Flush and shut down telemetry providers.
+    """Flush and shut down telemetry providers, returning within *timeout_ms*.
 
     Call on the driver at job end, and in each Ray actor's ``shutdown``: span
     and metric processors buffer in the background, so an actor that exits
     without flushing silently drops whatever it had not exported yet. A no-op
     when this process never initialised telemetry.
+
+    The budget is enforced here rather than passed down, because nothing below
+    honours it. ``TelemetryHandle.shutdown`` forwards ``timeout_ms`` to
+    ``force_flush(timeout_millis=...)``, and the SDK's ``BatchProcessor``
+    accepts that argument and then drains the whole queue regardless; the
+    ``provider.shutdown()`` calls that follow take no timeout at all and fall
+    back to the SDK's own 30s. Four unbounded calls in total. Against an
+    unreachable collector each buffered batch is retried with exponential
+    backoff, so the cost scales with the queue: 3k spans took 36s under a 5s
+    budget when measured.
+
+    That mattered because callers size their own timeouts on this one --
+    ``_flush_collector_telemetry`` in async GRPO allows 15s for a 3s quiesce
+    plus "its 5s export", then ``ray.kill``s the collector when the budget
+    blows, dropping the last rollout spans the flush exists to save.
+
+    So: run the flush on a daemon thread and stop waiting at the deadline. A
+    flush that overruns is abandoned rather than joined, which loses the same
+    spans an unreachable collector was going to lose anyway, and being a daemon
+    it never holds up process exit.
     """
     global _TELEMETRY_HANDLE
     handle = _TELEMETRY_HANDLE
     if handle is None:
         return
+    # Cleared before the flush, not after: a second caller should return at once
+    # rather than queue behind an export that is already overrunning, and the
+    # handle's own _shutdown_done guards the underlying providers.
+    _TELEMETRY_HANDLE = None
+
+    def _flush() -> None:
+        try:
+            handle.shutdown(timeout_ms=timeout_ms)
+        except Exception:
+            logger.warning("nemo-lens: error during telemetry shutdown", exc_info=True)
+
+    flusher = threading.Thread(target=_flush, name="nemo-lens-shutdown", daemon=True)
+    flusher.start()
+    flusher.join(timeout_ms / 1000)
+    if flusher.is_alive():
+        logger.warning(
+            "nemo-lens: telemetry flush exceeded %dms and was abandoned; "
+            "buffered spans and metrics may be lost. Usually means the OTLP "
+            "endpoint is unreachable.",
+            timeout_ms,
+        )
+
+    # Spans opened after this point would be built at full cost and then dropped
+    # by the shut-down processor, which also logs per span. Nothing should be
+    # emitting this late, but the paths that could are ordered by convention
+    # rather than enforcement, so close the gate instead of relying on it.
     try:
-        handle.shutdown(timeout_ms=timeout_ms)
+        from nemo.lens.state import set_enabled_span_groups
+
+        set_enabled_span_groups(frozenset())
     except Exception:
-        logger.warning("nemo-lens: error during telemetry shutdown", exc_info=True)
-    finally:
-        _TELEMETRY_HANDLE = None
+        logger.debug("nemo-lens: could not clear enabled span groups", exc_info=True)

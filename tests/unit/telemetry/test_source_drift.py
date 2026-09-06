@@ -32,6 +32,7 @@ _SPAN_EMITTING_DIRS = (
     _REPO / "nemo_rl" / "models" / "value",
     _REPO / "nemo_rl" / "distributed",
     _REPO / "nemo_rl" / "data_plane",
+    _REPO / "nemo_rl" / "environments",
     _REPO / "examples",
 )
 
@@ -259,12 +260,11 @@ def _emitted_span_name(called: str, node: ast.Call) -> str | None:
 def test_every_emitted_span_name_is_documented():
     """Direction is ``emitted <= documented``.
 
-    The docs may list a span that is not wired yet (``forward_backward``,
-    ``optimizer``), but a name that is emitted and undocumented leaves someone
-    filtering a Tempo/Jaeger query on a name that does not exist -- zero
-    results, nothing to explain it. A typo at an emit site fails the same way,
-    and produces a real span under the wrong name, since the goodput rollup keys
-    on ``rl.bucket`` rather than the name.
+    The docs may describe a span in more places than one, but a name that is
+    emitted and undocumented leaves someone filtering a Tempo/Jaeger query on a
+    name that does not exist -- zero results, nothing to explain it. A typo at
+    an emit site fails the same way, and produces a real span under the wrong
+    name, since the goodput rollup keys on ``rl.bucket`` rather than the name.
     """
     documented = set(
         _span_names_in(
@@ -293,6 +293,204 @@ def test_every_emitted_span_name_is_documented():
         f"{undocumented}"
     )
     assert emitted, "found no span names -- has the matcher gone stale?"
+
+
+def test_every_registered_group_has_an_emitter():
+    """Direction is ``registered <= emitted`` -- the reverse of the docs guard.
+
+    A group in ``ALL_GROUPS`` with no call site is worse than a missing one: it
+    is listed in the preset table and accepted by ``span_groups``, so a user who
+    selects it is told they asked for something and gets silence, with no way to
+    tell that apart from a phase that simply did not run. Four groups sat in
+    exactly that state -- ``reference_policy`` (in ``per_step``, so it was
+    advertised) plus ``load_checkpoint``, ``forward_backward`` and
+    ``optimizer``. Register the group in the same change that emits it.
+    """
+    from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+    # Helpers that fix their span group instead of taking it as an argument.
+    fixed_group_helpers = {
+        "startup_span": RLSpanGroup.SETUP,
+        "setup_span": RLSpanGroup.SETUP,
+        "efficiency_span": RLSpanGroup.EFFICIENCY,
+        "traced_worker_init": RLSpanGroup.MODEL_INIT,
+    }
+
+    emitted: set[str] = set()
+    for directory in _SPAN_EMITTING_DIRS:
+        for source in _python_sources(directory):
+            for node in ast.walk(ast.parse(source.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = getattr(node.func, "attr", None) or getattr(
+                    node.func, "id", None
+                )
+                if called in fixed_group_helpers:
+                    emitted.add(fixed_group_helpers[called])
+                elif called in _GROUP_TAKING_HELPERS and node.args:
+                    group = node.args[0]
+                    if isinstance(group, ast.Attribute):
+                        emitted.add(getattr(RLSpanGroup, group.attr, group.attr))
+
+    assert emitted, "found no span groups -- has the matcher gone stale?"
+    unemitted = RLSpanGroup.ALL_GROUPS - emitted
+    assert not unemitted, (
+        "registered as span groups but no call site emits them, so selecting "
+        f"them yields nothing: {sorted(unemitted)}"
+    )
+
+
+def test_every_context_accepting_method_is_dispatched_with_a_carrier():
+    """Both halves of the propagation pair have to be wired, and only one is visible.
+
+    ``@accepts_trace_context`` on a worker method is inert on its own: the
+    caller has to send the carrier too. A decorated method whose dispatch site
+    forgets it looks fully wired at the definition -- which is where anyone
+    checks -- and still emits root spans, exactly the bug this mechanism exists
+    to fix. Three of the six presharded entrypoints were in that state when the
+    guard was written.
+
+    Both dispatch spellings count as sending: ``dispatch_with_trace_context``
+    for a direct ``remote()`` call, and ``trace_context_kwargs()`` spread into
+    a ``RayWorkerGroup.run_all_workers_*`` call, which names its method by
+    string. A bare ``.remote()`` on a decorated method counts as *not* sending.
+    """
+    decorated = _context_accepting_methods()
+    assert decorated, "found no decorated methods -- has the matcher gone stale?"
+    indirect = _indirect_dispatchers()
+
+    dispatched: set[str] = set()
+    unwired: dict[str, str] = {}
+    for source in _python_sources(_REPO / "nemo_rl"):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            targets = _dispatch_targets(node, decorated, indirect)
+            if not targets:
+                continue
+            where = f"{source.relative_to(_REPO).as_posix()}:{node.lineno}"
+            for target, sends_carrier in targets:
+                if sends_carrier:
+                    dispatched.add(target)
+                else:
+                    unwired[target] = where
+
+    assert not unwired, (
+        "methods decorated with @accepts_trace_context whose dispatch site does "
+        f"not send one, so their spans still re-root: {unwired}"
+    )
+    assert decorated <= dispatched, (
+        "methods decorated with @accepts_trace_context that no dispatch site "
+        f"targets, so the decorator is dead weight: {sorted(decorated - dispatched)}"
+    )
+
+
+def _context_accepting_methods() -> set[str]:
+    """Every method under ``nemo_rl/`` carrying ``@accepts_trace_context``."""
+    decorated: set[str] = set()
+    for source in _python_sources(_REPO / "nemo_rl"):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            names = {
+                getattr(decorator, "id", None) or getattr(decorator, "attr", None)
+                for decorator in node.decorator_list
+            }
+            if "accepts_trace_context" in names:
+                decorated.add(node.name)
+    return decorated
+
+
+def _indirect_dispatchers() -> dict[str, bool]:
+    """Helpers that dispatch a method named by one of their own arguments.
+
+    ``TQPolicy._logprob_dispatch`` is the case: it takes ``worker_method`` and
+    forwards it, so the ``run_all_workers_*`` call itself names nothing a static
+    read can attribute. Recording whether the helper sends a carrier lets the
+    guard resolve one level rather than exempting the methods routed through it
+    -- an exemption would hide the helper dropping the carrier later, which is
+    the failure this whole test is about.
+
+    Maps helper name -> whether its dispatch sends a carrier.
+    """
+    dispatchers: dict[str, bool] = {}
+    for source in _python_sources(_REPO / "nemo_rl"):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call):
+                    continue
+                called = getattr(inner.func, "attr", None)
+                if not called or not called.startswith("run_all_workers_"):
+                    continue
+                if _string_arg(inner) or _keyword_string(inner, "method_name"):
+                    continue
+                dispatchers[node.name] = _sends_carrier(inner)
+    return dispatchers
+
+
+def _dispatch_targets(
+    node: ast.Call, decorated: set[str], indirect: dict[str, bool]
+) -> list[tuple[str, bool]]:
+    """The decorated methods *node* dispatches, each with whether it carries.
+
+    Empty when *node* is not a dispatch at all.
+    """
+    called = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+    if called == "dispatch_with_trace_context":
+        target = _decorated_attribute(node.args[0], decorated) if node.args else None
+        return [(target, True)] if target else []
+    if called == "remote":
+        target = _decorated_attribute(node.func, decorated)
+        return [(target, False)] if target else []
+    if called and called.startswith("run_all_workers_"):
+        name = _string_arg(node) or _keyword_string(node, "method_name")
+        return [(name, _sends_carrier(node))] if name in decorated else []
+    if called in indirect:
+        # A call into a helper that forwards the method name it is handed.
+        named = {
+            keyword.value.value
+            for keyword in node.keywords
+            if isinstance(keyword.value, ast.Constant)
+            and keyword.value.value in decorated
+        }
+        return [(name, indirect[called]) for name in sorted(named)]
+    return []
+
+
+def _decorated_attribute(node: ast.expr, decorated: set[str]) -> str | None:
+    """The decorated method named anywhere in an attribute chain.
+
+    Both ``actor.run_rollouts`` and ``actor.run_rollouts.options(...)`` resolve
+    to ``run_rollouts``, so the guard does not care whether the call site
+    reshapes the handle before dispatching it.
+    """
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Attribute) and inner.attr in decorated:
+            return inner.attr
+    return None
+
+
+def _sends_carrier(node: ast.Call) -> bool:
+    """Whether *node* hands the callee a trace carrier."""
+    called = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+    if called == "dispatch_with_trace_context":
+        return True
+    return any(
+        getattr(inner.func, "id", None) == "trace_context_kwargs"
+        for inner in ast.walk(node)
+        if isinstance(inner, ast.Call)
+    )
+
+
+def _keyword_string(node: ast.Call, name: str) -> str | None:
+    """The string literal passed as keyword *name*, if any."""
+    for keyword in node.keywords:
+        if keyword.arg == name and isinstance(keyword.value, ast.Constant):
+            value = keyword.value.value
+            return value if isinstance(value, str) else None
+    return None
 
 
 def _span_names_in(markdown: str) -> set[str]:

@@ -34,7 +34,7 @@ For general concepts — the span-group mechanism, instrumentation primitives, t
 
 ## Install
 
-Nothing to install: `nemo-lens[sdk]` is a base dependency, so a normal `uv sync` covers the driver and every worker venv.
+Nothing to install: `nemo-lens[sdk,aiohttp]` is a base dependency, so a normal `uv sync` covers the driver and every worker venv.
 
 ## Quick start
 

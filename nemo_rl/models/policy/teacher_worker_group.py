@@ -43,6 +43,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 
 
 @dataclass
@@ -332,7 +333,10 @@ class TeacherWorkerGroup:
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
-            common_kwargs={"micro_batch_size": self._micro_batch_size},
+            common_kwargs={
+                "micro_batch_size": self._micro_batch_size,
+                **trace_context_kwargs(),
+            },
         )
         self.worker_group.get_all_worker_results(futures)
 

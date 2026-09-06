@@ -28,6 +28,7 @@ bytes currently held in TQ, i.e. put minus cleared) and
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import monotonic
@@ -51,6 +52,7 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.telemetry.instrumentation import (
     in_per_prompt_scope,
+    is_span_group_enabled,
     managed_span,
     safe_set_span_attributes,
     umbrella_span,
@@ -58,6 +60,10 @@ from nemo_rl.telemetry.instrumentation import (
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 logger = logging.getLogger(__name__)
+
+#: Reused rather than built per op: ``nullcontext`` holds no state, so one
+#: instance is safe to enter concurrently from any number of threads.
+_NO_SPAN = nullcontext(None)
 
 # Span attribute names for a data-plane op. ``op`` and ``partition`` are bounded
 # (a fixed op vocabulary, a handful of partitions), so they are safe as
@@ -95,8 +101,11 @@ def _annotate(span: Any, n_keys: int, n_bytes: int, status: EventStatus) -> None
     timeout from a generic error, which the exception the span already records
     does not.
     """
-    # A None span (group disabled, or telemetry off -- the common case) is
-    # absorbed by nemo_rl's safe_set_span_attributes, not lens's.
+    # safe_set_span_attributes absorbs a None span, but the dict below is built
+    # by the caller before it can: returning first keeps that allocation off
+    # the disabled path, which is the common case and runs once per op.
+    if span is None:
+        return
     safe_set_span_attributes(
         span,
         {
@@ -224,7 +233,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
             Whatever ``fn`` returned.
         """
         t0 = monotonic()
-        attributes = {_OP_ATTR: op, _PARTITION_ATTR: partition_id}
         # One client per process serves both the rollout path, which puts once
         # per prompt, and the batch stages, which put once per step. Same op,
         # counts orders of magnitude apart, so the group has to come from the
@@ -234,14 +242,24 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # the wall clock. Two branches rather than one variable group because
         # the umbrella helper is what marks a span as unbucketed at the call
         # site, and a drift test enforces the pairing statically.
-        if in_per_prompt_scope():
-            span_ctx = umbrella_span(
-                RLSpanGroup.U_PER_PROMPT, f"rl.data_plane.{op}", **attributes
-            )
+        per_prompt = in_per_prompt_scope()
+        group = RLSpanGroup.U_PER_PROMPT if per_prompt else RLSpanGroup.DATA_PLANE
+        if not is_span_group_enabled(group):
+            # Gate before building the name and the attribute dict, and before
+            # either helper's generator is created. This is the most frequent
+            # telemetry call site in the repo -- once per data-plane op, so once
+            # per prompt on the rollout path -- and those three allocations cost
+            # ~1.8us each, which a run that never enabled telemetry should not
+            # be paying. A shared no-op context is safe to reuse: nullcontext
+            # holds no state.
+            span_ctx: Any = _NO_SPAN
         else:
-            span_ctx = managed_span(
-                RLSpanGroup.DATA_PLANE, f"rl.data_plane.{op}", **attributes
-            )
+            name = f"rl.data_plane.{op}"
+            attributes = {_OP_ATTR: op, _PARTITION_ATTR: partition_id}
+            if per_prompt:
+                span_ctx = umbrella_span(RLSpanGroup.U_PER_PROMPT, name, **attributes)
+            else:
+                span_ctx = managed_span(RLSpanGroup.DATA_PLANE, name, **attributes)
         with span_ctx as span:
             try:
                 out = fn()

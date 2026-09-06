@@ -26,11 +26,12 @@ open those through ``umbrella_span`` / ``umbrella_trace_fn`` with the group's
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
-from typing import Any, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional, TypeVar, cast
 
 from nemo.lens import (
     is_span_group_enabled,
@@ -70,6 +71,10 @@ __all__ = [
     "bucket_for_efficiency_category",
     "current_trace_carrier",
     "remote_trace_context",
+    "dispatch_with_trace_context",
+    "trace_context_kwargs",
+    "accepts_trace_context",
+    "TRACE_CARRIER_KWARG",
     "bucket_scope",
     "per_prompt_scope",
     "in_per_prompt_scope",
@@ -134,21 +139,22 @@ UMBRELLA_GROUPS: frozenset[str] = frozenset(
 )
 
 # Default classification for RLSpanGroup members that are leaf work.
-# logprob / advantage / reference_policy count as overhead (prep), not the
-# productive policy gradient update itself.
+# logprob / advantage count as overhead (prep), not the productive policy
+# gradient update itself.
+#
+# Every key is a group something here actually emits. A bucket for a group with
+# no call site is unreachable by construction -- this map is consulted only by
+# NeMo-RL's own managed_span wrapper -- so an entry added ahead of its emitter
+# is dead code that pre-commits the goodput classification without review.
 _DEFAULT_GROUP_BUCKET: Mapping[str, Bucket] = {
     RLSpanGroup.GENERATION: Bucket.PRODUCTIVE,
     RLSpanGroup.REWARD: Bucket.PRODUCTIVE,
     RLSpanGroup.POLICY_UPDATE: Bucket.PRODUCTIVE,
-    RLSpanGroup.FORWARD_BACKWARD: Bucket.PRODUCTIVE,
-    RLSpanGroup.OPTIMIZER: Bucket.PRODUCTIVE,
     RLSpanGroup.DATA_PROCESSING: Bucket.OVERHEAD,
     RLSpanGroup.DATA_PLANE: Bucket.OVERHEAD,
     RLSpanGroup.CHECKPOINT: Bucket.OVERHEAD,
-    RLSpanGroup.LOAD_CHECKPOINT: Bucket.OVERHEAD,
     RLSpanGroup.LOGPROB: Bucket.OVERHEAD,
     RLSpanGroup.ADVANTAGE: Bucket.OVERHEAD,
-    RLSpanGroup.REFERENCE_POLICY: Bucket.OVERHEAD,
 }
 
 # Async efficiency category labels → bucket. Not RLSpanGroup members.
@@ -394,6 +400,182 @@ def remote_trace_context(carrier: Optional[Mapping[str, str]]) -> Iterator[None]
         yield
     finally:
         otel_ctx.detach(token)
+
+
+#: Reserved kwarg the dispatch/receive pair passes the carrier in. Same spelling
+#: lens's ``ray_dispatch_with_context`` uses, so a call dispatched by either
+#: helper is understood by a method decorated with either one.
+TRACE_CARRIER_KWARG = "_otel_carrier"
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def trace_context_kwargs() -> dict[str, Any]:
+    """Carrier kwarg for a Ray call, or ``{}`` when there is nothing to send.
+
+    For dispatch that does not go through ``remote()`` directly -- notably
+    ``RayWorkerGroup.run_all_workers_*``, which takes the method by name and
+    forwards ``**kwargs`` -- spread this at the call site::
+
+        self.worker_group.run_all_workers_single_data(
+            "get_logprobs_presharded", meta, **trace_context_kwargs()
+        )
+
+    Empty rather than a ``None`` carrier so a run with no recording span calls
+    the method with exactly its original signature, which keeps an undecorated
+    method working until it is wired.
+    """
+    carrier = current_trace_carrier()
+    return {TRACE_CARRIER_KWARG: carrier} if carrier else {}
+
+
+#: Methods already reported as not accepting the carrier, so the warning below
+#: is one per method per process rather than one per dispatch.
+_CARRIER_REFUSED: set[str] = set()
+
+
+def dispatch_with_trace_context(
+    remote_method: Any, /, *args: Any, **kwargs: Any
+) -> Any:
+    """``remote_method.remote(...)``, plus the caller's trace context.
+
+    The receiving method should be wrapped in :func:`accepts_trace_context`.
+    When it is not, Ray rejects the extra kwarg on the *caller* -- it validates
+    against the callee's recorded signature before submitting the task -- and
+    this retries without it, warning once. Losing the parent link degrades a
+    trace; raising here would abort a rollout over an observability kwarg,
+    which this module does not do anywhere else.
+    ``test_every_context_accepting_method_is_dispatched_with_a_carrier`` is what
+    actually keeps the two halves wired, at build time rather than at runtime.
+
+    Equivalent to lens's ``ray_dispatch_with_context`` and uses the same kwarg,
+    but skips the kwarg entirely when there is no recording span, so a run with
+    the ``job`` group disabled calls the method with its original signature.
+
+    Returns:
+        Whatever ``.remote()`` returned: normally an ``ObjectRef``, or an
+        ``ObjectRefGenerator`` when the handle was built with
+        ``.options(num_returns="streaming")`` -- which is how both NeMo-Gym
+        call sites use it.
+    """
+    carrier = trace_context_kwargs()
+    if not carrier:
+        return remote_method.remote(*args, **kwargs)
+    try:
+        return remote_method.remote(*args, **carrier, **kwargs)
+    except TypeError as exc:
+        if TRACE_CARRIER_KWARG not in str(exc):
+            raise
+        name = getattr(remote_method, "_method_name", None) or repr(remote_method)
+        if name not in _CARRIER_REFUSED:
+            _CARRIER_REFUSED.add(name)
+            logger.warning(
+                "%s does not accept a trace carrier, so its spans will start "
+                "their own trace; decorate it with @accepts_trace_context: %s",
+                name,
+                exc,
+            )
+        return remote_method.remote(*args, **kwargs)
+
+
+def _advertise_carrier(method: Any) -> None:
+    """Declare the reserved kwarg on the signature Ray actually reads.
+
+    Ray records an actor method's signature from ``inspect.unwrap(method)``
+    (``_ActorClassMethodMetadata.create``) and validates every ``.remote()``
+    call against it *on the caller*, before the task is submitted. A
+    ``functools.wraps`` wrapper sets ``__wrapped__``, so unwrapping walks
+    straight past our ``**kwargs`` to the original signature and the carrier
+    comes back as ``TypeError: got an unexpected keyword argument``. Ray hits
+    exactly this with its own ``_ray_trace_ctx`` and fixes it the same way, on
+    the same object, for the same reason -- see ``ray/util/tracing``.
+
+    A no-op when the unwrapped target already accepts ``**kwargs`` (everything
+    stacked under ``wrap_with_nvtx_name``, whose wrapper does not use
+    ``functools.wraps`` and so absorbs the carrier on its own) and when the
+    parameter is already declared, so decorating twice cannot duplicate it.
+    """
+    target = inspect.unwrap(method)
+    try:
+        current = inspect.signature(target)
+    except (TypeError, ValueError):
+        # Not introspectable, so Ray cannot have recorded a strict signature
+        # for it either. Nothing to advertise.
+        return
+    parameters = current.parameters
+    if TRACE_CARRIER_KWARG in parameters or any(
+        parameter.kind is parameter.VAR_KEYWORD for parameter in parameters.values()
+    ):
+        return
+    target.__signature__ = current.replace(
+        parameters=[
+            *parameters.values(),
+            inspect.Parameter(
+                TRACE_CARRIER_KWARG, inspect.Parameter.KEYWORD_ONLY, default=None
+            ),
+        ]
+    )
+
+
+def accepts_trace_context(method: _F) -> _F:
+    """Let a Ray method be parented to its caller's span.
+
+    Strips the reserved carrier kwarg and runs the body with that context
+    attached, so every span the method opens -- and every span opened by
+    anything it calls, including an ``aiohttp`` request auto-instrumented by
+    lens -- nests under the caller instead of starting a new trace.
+
+    Unlike lens's ``traced_remote_call`` this dispatches on the wrapped
+    callable's kind. That helper wraps everything in a ``def``, which returns a
+    coroutine or async generator without awaiting it, so the context detaches
+    before the body runs -- the async paths are precisely the ones that need
+    this (``NemoGym.run_rollouts`` is a streaming generator). It also does not
+    open a span of its own: the methods this decorates already open theirs, and
+    a second automatic span per call would double the trace's depth.
+
+    The return is cast back to the decorated method's own type: the wrappers
+    take ``**kwargs``, so without it every method this decorates would widen to
+    an untyped callable, and several of them live in files the ``pyrefly``
+    whitelist expects to be fully typed.
+    """
+    _advertise_carrier(method)
+
+    if inspect.isasyncgenfunction(method):
+
+        @functools.wraps(method)
+        async def agen_wrapper(*args: Any, **kwargs: Any) -> Any:
+            carrier = kwargs.pop(TRACE_CARRIER_KWARG, None)
+            # ``async for`` rather than driving ``__anext__`` by hand so that
+            # closing this generator early closes the inner one -- worth more
+            # than the precision the manual form would buy. The cost is that
+            # the context stays attached while the consumer handles each item
+            # instead of only while the body advances. Harmless here: an async
+            # actor call is its own asyncio task, and a task gets a private
+            # copy of the context, so the attachment cannot reach a concurrent
+            # rollout.
+            with remote_trace_context(carrier):
+                async for item in method(*args, **kwargs):
+                    yield item
+
+        return cast(_F, agen_wrapper)
+
+    if inspect.iscoroutinefunction(method):
+
+        @functools.wraps(method)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            carrier = kwargs.pop(TRACE_CARRIER_KWARG, None)
+            with remote_trace_context(carrier):
+                return await method(*args, **kwargs)
+
+        return cast(_F, async_wrapper)
+
+    @functools.wraps(method)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        carrier = kwargs.pop(TRACE_CARRIER_KWARG, None)
+        with remote_trace_context(carrier):
+            return method(*args, **kwargs)
+
+    return cast(_F, wrapper)
 
 
 @contextmanager

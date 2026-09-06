@@ -70,6 +70,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     GenerationSamplingParams,
 )
+from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
@@ -2491,9 +2492,10 @@ async def run_async_nemo_gym_rollout(
                     enabled=debug_payload_metrics,
                 )
             )
-            rollout_gen = nemo_gym_environment.run_rollouts.options(
-                num_returns="streaming"
-            ).remote(*ray_arguments)
+            rollout_gen = dispatch_with_trace_context(
+                nemo_gym_environment.run_rollouts.options(num_returns="streaming"),
+                *ray_arguments,
+            )
         rollout_iterator = rollout_gen.__aiter__()
 
     while True:

@@ -4689,7 +4689,9 @@ def async_grpo_train(
 
     # Captured inside rl.grpo.job, so the collector's spans join this run's
     # trace instead of starting their own roots. Empty unless the job group is
-    # enabled (per_step omits it) — see docs/observability/span-groups.md.
+    # enabled — both shipped presets enable it, but a hand-written group list
+    # need not, and that degrades to roots rather than failing. See
+    # docs/observability/span-groups.md.
     _tc_trace_carrier = current_trace_carrier()
 
     # Initialize trajectory collector with synchronized collection
@@ -4717,9 +4719,11 @@ def async_grpo_train(
         not sent yet goes with the actor -- including the last rollout batches
         of the run. Every path that reaps the collector needs this, not only the
         normal one, and collection is already running by the time this is
-        defined. The timeout covers the callee's quiesce budget *plus* its 5s
-        export; too short and it gives up mid-export, dropping the very spans
-        it exists to save.
+        defined. The timeout covers the callee's quiesce budget *plus* its
+        export budget; too short and it gives up mid-export, dropping the very
+        spans it exists to save. ``shutdown_telemetry`` enforces the latter
+        itself -- the SDK ignores the timeout it is handed -- so this stays
+        ahead of it only as long as that remains true.
         """
         try:
             ray.get(

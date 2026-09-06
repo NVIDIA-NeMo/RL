@@ -506,7 +506,16 @@ class SingleControllerActor:
             # Outside the span so the job span itself is flushed, and off the
             # event loop because the flush blocks: the exporter batches, so
             # without it the last steps' spans die with the process.
-            await asyncio.to_thread(shutdown_telemetry)
+            #
+            # Shielded, and a cancel arriving during it swallowed, because this
+            # is cleanup: teardown is exactly when cancellation lands, and an
+            # unguarded await here would surface CancelledError to the caller
+            # with whatever _run_pumps actually raised gone. Losing the flush is
+            # the smaller failure, and shield avoids even that.
+            try:
+                await asyncio.shield(asyncio.to_thread(shutdown_telemetry))
+            except asyncio.CancelledError:
+                pass
         # After the try, not inside it: pyrefly 0.24.2 reads a return nested in a
         # try/finally as a path that can fall off the end of the function.
         return result

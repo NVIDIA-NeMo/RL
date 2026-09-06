@@ -24,11 +24,17 @@ Metric instruments, resource detection, and the instrumentation primitives thems
 
 Each `examples/run_<algo>.py` calls `init_telemetry_driver(config, algorithm="<algo>")` **before** `init_ray()` (so `NEMO_RL_OTEL_*` is snapshotted into the Ray `runtime_env` and inherited by workers) and `shutdown_telemetry()` from a `finally` block wrapping the whole run, so buffered spans are flushed on the failure path too. `get_telemetry_handle()` returns the process-global `TelemetryHandle`.
 
-OTel providers are process-global, so each Ray actor sets up its own: the policy, value and vLLM generation workers call `init_telemetry_worker()` from `__init__` and `shutdown_telemetry()` from `shutdown` (the latter matters — span/metric processors buffer in the background, and an actor that exits without flushing drops whatever it had not exported). Worker ranks come from the `RANK` / `WORLD_SIZE` env vars, and `RayWorkerGroup` also exports `NRL_WORKER_GROUP` so a worker's spans carry `rl.worker_group` — `RANK` is group-local, so it alone cannot distinguish `lm_policy` rank 3 from `vllm_policy` rank 3.
+OTel providers are process-global, so each Ray actor sets up its own: the policy, value, vLLM generation and NeMo-Gym workers call `init_telemetry_worker()` from `__init__` and `shutdown_telemetry()` from `shutdown` (the latter matters — span/metric processors buffer in the background, and an actor that exits without flushing drops whatever it had not exported). Worker ranks come from the `RANK` / `WORLD_SIZE` env vars, and `RayWorkerGroup` also exports `NRL_WORKER_GROUP` so a worker's spans carry `rl.worker_group` — `RANK` is group-local, so it alone cannot distinguish `lm_policy` rank 3 from `vllm_policy` rank 3.
 
 The async trajectory collector is a singleton actor rather than a group member, so it passes `rank=0, world_size=1`: its `runtime_env` is a copy of the driver's environment, and without an explicit rank every rollout span would be labelled with whatever `RANK` the driver happened to carry. It flushes on demand via `flush_telemetry()` because the driver reaps it with `ray.kill`, which runs no `atexit` handler.
 
-Trace context does not cross the Ray call boundary on its own, so a worker's spans are roots of their own traces, correlated to the driver by `run_id` rather than parented to it. The one exception is the async trajectory collector: the driver hands it a W3C carrier at construction and it reattaches that context per thread, so its rollout spans nest under `rl.grpo.job`. See [span groups — getting the collector into one waterfall](../../docs/observability/span-groups.md#getting-the-collector-into-one-waterfall).
+Trace context does not cross the Ray call boundary on its own, so a worker's spans are roots of their own traces unless something carries the context across. Three paths do:
+
+- **The async trajectory collector** takes a W3C carrier at construction and reattaches it per thread, so its rollout spans nest under `rl.grpo.job`. See [span groups — getting the collector into one waterfall](../../docs/observability/span-groups.md#getting-the-collector-into-one-waterfall).
+- **The presharded worker entrypoints** (`TQPolicy`, `TQValue`, the frozen teacher) are decorated with `@accepts_trace_context` and dispatched with `trace_context_kwargs()`, so their data-plane spans nest under the driver phase that asked for the work. `test_every_context_accepting_method_is_dispatched_with_a_carrier` fails the build if one half of that pair is wired without the other.
+- **The NeMo-Gym actor** takes the carrier on `run_rollouts` and additionally calls `instrument_aiohttp_client()`, which stamps a `traceparent` on the HTTP requests Gym's own client makes. Gated on the `per_prompt` group: the instrumentor spans every request off the global tracer, so its volume is prompts × turns × tool calls. Ask for it with `per_step,per_prompt`.
+
+Everything else still emits root spans, correlated to the driver by `run_id` rather than parented to it — see the gap table below.
 
 Not yet wired:
 
@@ -40,16 +46,16 @@ Not yet wired:
 | Startup sub-phases inside `setup()` | `rl.setup.workers` is one block on the driver: its phases run concurrently in worker threads, which OTel context does not reach. Each worker's own load is a span (`rl.policy.load_model` / `rl.value.load_model` / `rl.vllm.load_model`) in a separate trace; the driver-side per-phase breakdown is in the `rl.setup.duration` metric |
 | Driver-side startup phases as metrics | `rl_init_timer`'s outer phases (`config`, `ray_connect`, `tokenizer`, `data`, `setup`) are printed by the launcher but never logged, so `rl.setup.duration` carries only the phases from inside `setup()`. Summing the metric does not reconstruct `rl.startup` |
 | `rl.init.total` on async PPO | the `init/total` timer is recorded, but `async_ppo_train` is otherwise uninstrumented, so no span is emitted for the initial buffer fill there |
-| SingleController's generation / trainer workers | the actor's phases and the transfer queue are instrumented, but no trace context reaches `TQPolicy` / `TQValue` / generation workers, so their spans form separate traces correlated by `run_id` |
+| SingleController's generation workers | the actor's phases, the transfer queue and the `TQPolicy` / `TQValue` presharded entrypoints are instrumented and parented, but no trace context reaches the generation workers, so their spans form separate traces correlated by `run_id` |
 | `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | no `init_telemetry_driver`, so a `telemetry:` block in those configs parses and the run succeeds while emitting nothing, driver *and* worker |
 | `VllmGeneration.generate_async` | no `rl.vllm.generate` span, so async rollouts and async validation show `rl.grpo.generation` / `rl.grpo.evaluate` with no generate breakdown inside |
 | `SyncRolloutActor` | the sync data-plane counterpart of the collector; no `init_telemetry_worker`, no rollout spans |
 | Worker `shutdown()` on non-async trainers | only `async_grpo_train` calls `policy.shutdown()` / `policy_generation.shutdown()`; elsewhere Ray reaps the actors, so the worker's final flush never runs and its telemetry depends on the periodic export |
-| Trace context into ranked workers | policy/value/vLLM worker spans stay separate traces (see above) |
+| Trace context into the non-presharded worker paths | the presharded entrypoints are parented, but `lm_policy` / `lm_value`'s own `train` / `get_logprobs` / `get_values` and every vLLM worker method are dispatched without a carrier, so those spans stay separate traces |
 
 ## Install
 
-Nothing to install. `nemo-lens[sdk]` is a base dependency, which is what gets it into the *worker* interpreters: Ray actors run under the `PY_EXECUTABLES` entries in `nemo_rl/distributed/virtual_cluster.py` (`uv run --locked --extra vllm`, `--extra mcore`, ...), and those resolve the base dependencies plus one backend extra.
+Nothing to install. `nemo-lens[sdk,aiohttp]` is a base dependency, which is what gets it into the *worker* interpreters — and the `aiohttp` extra has to reach them, because the instrumentor that stamps `traceparent` on Gym's HTTP calls runs inside the `NemoGym` actor: Ray actors run under the `PY_EXECUTABLES` entries in `nemo_rl/distributed/virtual_cluster.py` (`uv run --locked --extra vllm`, `--extra mcore`, ...), and those resolve the base dependencies plus one backend extra.
 
 ## Quick start
 

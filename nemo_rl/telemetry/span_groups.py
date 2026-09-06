@@ -17,12 +17,18 @@
 Lens ships no span-group names of its own: a consuming library registers what
 it emits under its own namespace and users select from that with
 ``telemetry.span_groups``. So the groups that used to arrive from lens's base
-class -- ``job``, ``step``, ``checkpoint``, ``evaluate``, ``model_init``,
-``load_checkpoint``, ``forward_backward``, ``optimizer`` -- are declared here
-alongside the RL-specific ones. They keep their original names, because the
-names are the user-facing vocabulary and Megatron registers the same ones for
-the same phases; a group two libraries both register is shared, which is the
-intended behaviour for a job that drives both.
+class -- ``job``, ``step``, ``checkpoint``, ``evaluate``, ``model_init`` -- are
+declared here alongside the RL-specific ones. They keep their original names,
+because the names are the user-facing vocabulary and Megatron registers some of
+the same ones for the same phases; a group two libraries both register is
+shared, which is the intended behaviour for a job that drives both.
+
+Only names NeMo-RL actually emits are registered. Lens's remaining base names
+(``load_checkpoint``, ``forward_backward``, ``optimizer``) are absent because no
+call site here opens them, and registering a group that emits nothing makes a
+preset advertise spans it cannot deliver. They stay selectable in a job that
+also drives Megatron: the driver hands workers the raw spec string, so a worker
+that imports Megatron resolves the name against Megatron's own registration.
 
 ``RLSpanGroup`` is a bag of ``str`` constants rather than an enum or a lens
 subclass, because ``managed_span`` and ``trace_fn`` take the group as a plain
@@ -65,17 +71,8 @@ class RLSpanGroup:
     MODEL_INIT = "model_init"
     """Model construction and sharding inside a worker."""
 
-    LOAD_CHECKPOINT = "load_checkpoint"
-    """Checkpoint restore spans."""
-
     STEP = "step"
     """One training step."""
-
-    FORWARD_BACKWARD = "forward_backward"
-    """Forward / backward passes within a step."""
-
-    OPTIMIZER = "optimizer"
-    """Optimizer step spans."""
 
     # ------------------------------------------------------------------ #
     # RL-specific groups
@@ -107,8 +104,10 @@ class RLSpanGroup:
     POLICY_UPDATE = "policy_update"
     """Policy gradient update spans."""
 
-    REFERENCE_POLICY = "reference_policy"
-    """Reference policy log-prob computation spans."""
+    # No REFERENCE_POLICY group: the reference model's log-probs are computed
+    # alongside the policy's and emitted as one ``rl.<algo>.policy_and_reference
+    # _logprobs`` span under LOGPROB. A separate group would have nothing to
+    # select, since the two are not timed apart.
 
     DATA_PROCESSING = "data_processing"
     """Data processing / batching spans."""
@@ -185,10 +184,7 @@ class RLSpanGroup:
             CHECKPOINT,
             EVALUATE,
             MODEL_INIT,
-            LOAD_CHECKPOINT,
             STEP,
-            FORWARD_BACKWARD,
-            OPTIMIZER,
             SETUP,
             ROLLOUT,
             GENERATION,
@@ -196,7 +192,6 @@ class RLSpanGroup:
             REWARD,
             ADVANTAGE,
             POLICY_UPDATE,
-            REFERENCE_POLICY,
             DATA_PROCESSING,
             DATA_PLANE,
             PER_PROMPT,
@@ -224,12 +219,18 @@ class RLSpanGroup:
                 SETUP,
             ]
         ),
-        # NOTE: ``per_step`` deliberately omits ``JOB`` so each training step is
-        # its own root trace (bounded size). ``JOB`` — which wraps the whole run
-        # and would nest every step under one giant trace — lives in ``default``
-        # (coarse: job + checkpoint + evaluate) and ``all``.
+        # NOTE: ``JOB`` is in here, which makes the whole run one trace rather
+        # than one trace per step. The cost is real -- a long run nests every
+        # step under a single ever-growing root -- and it is paid deliberately,
+        # because without ``JOB`` there is no run-scoped span for
+        # ``current_trace_carrier`` to hand to the trajectory collector, so the
+        # collector's spans and every worker span downstream of it re-root and
+        # the async rollout path disappears from the waterfall. A trace that is
+        # large beats a trace that is missing its rollouts. Users who want the
+        # bounded-per-step shape can list the groups without ``job``.
         "per_step": frozenset(
             [
+                JOB,
                 CHECKPOINT,
                 EVALUATE,
                 # rl.vllm.load_model is the only span in this group, and it was
@@ -245,7 +246,6 @@ class RLSpanGroup:
                 REWARD,
                 ADVANTAGE,
                 POLICY_UPDATE,
-                REFERENCE_POLICY,
                 DATA_PROCESSING,
                 # Included rather than left to "all" so the single-controller
                 # step, whose phases are largely transfer-queue traffic, is

@@ -75,8 +75,10 @@ dependencies = [
   # venv; `telemetry.enabled` in the config is the on/off switch. Sourced from
   # git in [tool.uv.sources] — see the note there; the floor is above the
   # newest PyPI release so a dropped pin fails to resolve instead of silently
-  # falling back to 0.1.0.
-  "nemo-lens[sdk]>=0.2.0",
+  # falling back to 0.1.0. The aiohttp extra is what stamps a traceparent on
+  # the HTTP calls NeMo-Gym's client makes, so a Gym rollout continues the
+  # run's trace rather than starting its own.
+  "nemo-lens[sdk,aiohttp]>=0.2.0",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'", # for transformer-engine no build isolation
   # tilelang — required by fused DSA TileLang kernels on Blackwell and by the
   # replacement Triton kernel mamba-ssm requires when Triton >= 3.4.0 on Hopper;
@@ -453,7 +455,7 @@ override-dependencies = [
   # shipped `SpanGroup` class) and the consumer-driven metric registry
   # (`MetricSpec`/`register_metric_group`), both of which landed after v0.2.0. Drop
   # this once Megatron-LM bumps to the same or newer rev.
-  "nemo-lens[sdk] @ git+https://github.com/NVIDIA-NeMo/Lens.git@b71263cca56d6e895eb4a07b116cb6af42a67164",
+  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@b71263cca56d6e895eb4a07b116cb6af42a67164",
 ]
 
 # CVE fixes

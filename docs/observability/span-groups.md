@@ -9,7 +9,7 @@ For the general span-group mechanism — how gating works, why a disabled group 
 | Preset | Groups included | Relative cost |
 |---|---|---|
 | `default` | `job`, `checkpoint`, `evaluate`, `setup`, `model_init` | Lowest — safe for production |
-| `per_step` | `step`, `checkpoint`, `evaluate`, `setup`, `model_init`, `rollout`, `generation`, `logprob`, `reward`, `advantage`, `policy_update`, `reference_policy`, `data_processing`, `data_plane`, `efficiency` | Moderate |
+| `per_step` | `job`, `step`, `checkpoint`, `evaluate`, `setup`, `model_init`, `rollout`, `generation`, `logprob`, `reward`, `advantage`, `policy_update`, `data_processing`, `data_plane`, `efficiency` | Moderate |
 | `all` | every group (`job` and `per_prompt` included) | Highest — dev/debug |
 
 ### `per_step` deliberately omits `per_prompt`
@@ -24,11 +24,19 @@ span_groups: per_step,per_prompt
 
 or take `all`. See [Per-prompt spans](#per-prompt-spans) for what you get.
 
-### `per_step` deliberately omits `job`
+### `per_step` includes `job`, and what that costs
 
-`per_step` **excludes** the `job` group on purpose. `job` is the whole-run root span; if it were enabled alongside `step`, every training step would nest under one giant, ever-growing trace. Omitting `job` makes **each training step its own root trace** — bounded in size and easy to search one step at a time.
+`job` is the whole-run root span, so enabling it alongside `step` nests **every training step under one ever-growing trace** rather than giving each step its own root. That is a real cost on a long run: the trace grows without bound and most backends get slow to render it.
 
-`job` lives in `default` (coarse: startup + job + checkpoint + evaluate) and in `all` (one whole-run trace, useful for a short run). Choose `per_step` when you want to inspect individual steps; choose `default`/`all` when you want one trace spanning the run.
+It is included anyway because `job` is the only run-scoped span, and several things depend on one existing. `current_trace_carrier()` captures it to hand to the trajectory collector — with no `job` span the carrier is empty, the collector's spans re-root, and the entire async rollout path vanishes from the waterfall (see [Async rollout spans](#async-rollout-spans-come-from-the-collector-actor)). A trace that is large is more useful than a trace that is missing its rollouts.
+
+If you want the bounded-per-step shape instead, list the groups without `job` rather than using the preset:
+
+```yaml
+span_groups: step,checkpoint,evaluate,setup,model_init,rollout,generation,logprob,reward,advantage,policy_update,data_processing,data_plane,efficiency
+```
+
+There is no subtraction syntax — `SpanRegistry.resolve` only unions presets and bare group names, so `per_step,-job` does not work.
 
 ## `RLSpanGroup`
 
@@ -45,17 +53,13 @@ One consequence worth knowing: registration is an *import side effect*, so a gro
 | `checkpoint` | base | `rl.<algo>.checkpointing` |
 | `evaluate` | base | `rl.<algo>.evaluate` |
 | `model_init` | base | `rl.vllm.load_model` (generation worker), `rl.policy.load_model` / `rl.value.load_model` (training workers) |
-| `load_checkpoint` | base | *reserved — bucketed, but no site emits it yet* |
 | `step` | base | `rl.<algo>.step` (one per training step) |
-| `forward_backward` | base | *reserved — bucketed, but no site emits it yet* |
-| `optimizer` | base | *reserved — bucketed, but no site emits it yet* |
 | `rollout` | RL | `rl.<algo>.generation` |
 | `generation` | RL | the driver-side `rl.vllm.generate` / `rl.vllm.generate_text` spans |
-| `logprob` | RL | `rl.<algo>.policy_and_reference_logprobs`, and `rl.distillation.teacher_logprob_inference` on the distillation path |
+| `logprob` | RL | `rl.<algo>.policy_and_reference_logprobs` — the policy's and the reference model's log-probs are computed together and share this one span, so there is no separate `reference_policy` group — and `rl.distillation.teacher_logprob_inference` on the distillation path |
 | `reward` | RL | `rl.<algo>.reward_calculation` |
 | `advantage` | RL | `rl.<algo>.advantage_calculation` |
 | `policy_update` | RL | `rl.<algo>.policy_training` (and `rl.ppo.value_training` for PPO) |
-| `reference_policy` | RL | *reserved — bucketed, but no site emits it yet* |
 | `data_processing` | RL | `rl.<algo>.data_processing` |
 | `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation (`put`, `get`, `claim_meta`, `clear`, …) from a batch-shaped caller |
 | `per_prompt` | RL | spans emitted once per prompt: `rl.sc.generate_and_push` and the rollout path's `rl.data_plane.put`. A cardinality axis rather than a phase — see [Per-prompt spans](#per-prompt-spans) |
@@ -102,11 +106,12 @@ The controlling group is shown for each; a span is only emitted when its group i
 | **SingleController** | `rl.sc.job`, `rl.sc.step`, `rl.sc.logprob_inference_prep`, `rl.sc.policy_and_reference_logprobs`, `rl.sc.value_inference_prep`, `rl.sc.value_inference`, `rl.sc.advantage_calculation`, `rl.sc.training_prep`, `rl.sc.policy_training`, `rl.sc.policy_optimizer_step`, `rl.sc.value_training`, `rl.sc.checkpointing` — opened inside the `SingleControllerActor`, which is where the run actually lives |
 | **SingleController** (rollout) | `rl.sc.generate_and_push` — `per_prompt` group (umbrella, so unbucketed), one span per dispatch attempt; and `idle/buffer_starvation` / `idle/refit_bubble` reusing async GRPO's `efficiency` category names |
 | **Transfer queue** | `rl.data_plane.<op>` — `data_plane` group, or `per_prompt` when the caller is a rollout; emitted wherever a data-plane client is built (SC actor, `TQPolicy` / `TQValue` workers) |
+| **NeMo-Gym** | `rl.gym.run_rollouts` — `rollout` group (umbrella, so unbucketed: batches overlap on the async path), one span per batch in the `NemoGym` actor, carrying `rl.gym.batch_size`; the HTTP calls Gym makes nest under it — see [NeMo-Gym spans](#nemo-gym-spans-cross-the-http-boundary) |
 | **vLLM** (driver-side) | `rl.vllm.generate`, `rl.vllm.generate_text` — `generation` group; nested under the active rollout span |
 | **vLLM** (worker-side) | `rl.vllm.load_model` — `model_init` group; a root span in the generation worker's process, since Ray carries no trace context into `__init__` |
 | **Policy / value** (worker-side) | `rl.policy.load_model`, `rl.value.load_model` — `model_init` group, `rl.backend` attribute; opened by `traced_worker_init` on the worker's `__init__`, and root spans for the same reason |
 
-`rl.<algo>.job` is a function-level span (via `umbrella_trace_fn`) wrapping the whole run. Under `per_step` it is suppressed, so each `rl.<algo>.step` becomes a root trace.
+`rl.<algo>.job` is a function-level span (via `umbrella_trace_fn`) wrapping the whole run. Both shipped presets enable it, so each `rl.<algo>.step` nests under it. Drop the `job` group from an explicit group list to make every step a root trace instead.
 
 ## Span tags (categorical attributes)
 
@@ -120,6 +125,7 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 | `rl.num_generations_per_prompt` | GRPO group size |
 | `rl.weight_version` / `rl.target_weight_version` | async rollout batch: the weights it generated from, and the training step it targets |
 | `rl.num_prompt_groups` | async rollout batch width, so a gap-filling batch is not read as an unexplained speed-up |
+| `rl.gym.batch_size` | how many examples one `rl.gym.run_rollouts` span covers — the NeMo-Gym counterpart to `rl.num_prompt_groups` |
 | `rl.rollout.attempt` | SingleController dispatch attempt: `0` is a first try, `> 0` a substitution after a skipped group, whose tokens were discarded |
 | `rl.bucket` | goodput bucket: `productive` / `overhead` / `idle` / `wasted` (omit on umbrellas) |
 
@@ -141,8 +147,8 @@ so the call site shows which of the two it is — see
 | Group | `rl.bucket` |
 |---|---|
 | `job`, `step`, `rollout`, `model_init`, `evaluate`, `setup`, `per_prompt` (aliased `U_JOB`, `U_STEP`, …) | *(none — umbrella)* |
-| `generation`, `reward`, `policy_update`, `forward_backward`, `optimizer` | `productive` |
-| `data_processing`, `data_plane`, `checkpoint`, `load_checkpoint`, `logprob`, `advantage`, `reference_policy` | `overhead` |
+| `generation`, `reward`, `policy_update` | `productive` |
+| `data_processing`, `data_plane`, `checkpoint`, `logprob`, `advantage` | `overhead` |
 | `efficiency` | `idle` for the two driver-side phases; *none* for the two collector-side ones (see below) |
 
 Rolled-up `rl.goodput` is **monitor-derived**, not emitted by NeMo-RL.
@@ -287,8 +293,9 @@ as one long span among its peers rather than an average.
 
 `rl.startup` exists because `init_ray()` and the algorithm's `setup()` are
 separate top-level calls in the launcher; without a span across them their
-phases arrive as unrelated root traces. It closes before training, so the run's
-`job` and `step` spans stay separate traces.
+phases arrive as unrelated root traces. It closes before training begins, so
+the `job` span and everything nested under it form a trace of their own rather
+than joining startup's.
 
 `rl.setup.ray_init` is emitted by `init_ray()` itself, so every launcher gets it
 without opting in. It carries `rl.ray.cluster_source`:
@@ -385,20 +392,24 @@ rl.grpo.job                                   (driver)
 
 **This requires the `job` group to be enabled.** `current_trace_carrier()`
 returns an empty dict when no span is recording, and `remote_trace_context({})`
-is a no-op, so the collector falls back to root spans. The `default` preset has
-`job` but not `rollout`/`efficiency`, so the collector emits nothing; `per_step`
-has `rollout`/`efficiency` but deliberately omits `job` so each step is its own
-bounded trace. For the unified view, ask for both:
+is a no-op, so the collector falls back to root spans. `per_step` and `all`
+both enable `job` alongside `rollout`/`efficiency`, so the unified view is what
+you get by default:
 
 ```yaml
 telemetry:
-  span_groups: per_step,job   # or: all
+  span_groups: per_step   # or: all
 ```
 
-Be deliberate about it. A run-long root span means one trace accumulating every
-step and every rollout batch for the whole job, which is exactly the trace-size
-problem `per_step` exists to avoid. Prefer it for debugging a specific run, not
-as a standing default on long jobs.
+`default` is the exception: it has `job` but neither `rollout` nor
+`efficiency`, so the collector emits nothing at all and there is no rollout
+detail to attach.
+
+Note the cost this buys. A run-long root span means one trace accumulating
+every step and every rollout batch for the whole job. That is the deliberate
+trade described in [`per_step` includes `job`](#per_step-includes-job-and-what-that-costs) —
+on a very long run, prefer an explicit group list without `job` and accept
+per-step root traces.
 
 Two consequences worth internalizing before reading an async trace:
 
@@ -415,6 +426,54 @@ Two consequences worth internalizing before reading an async trace:
   span duration. A span-derived goodput ratio on an async run therefore has no
   productive generation term; do not read it as "generation contributed
   nothing."
+
+### NeMo-Gym spans cross the HTTP boundary
+
+A Gym rollout leaves the driver over two hops, and each needs its own
+mechanism:
+
+```
+driver / collector              NemoGym actor                 Gym server
+────────────────────            ─────────────                 ──────────
+rl.grpo.generation
+  └─ run_rollouts.remote() ───▶ rl.gym.run_rollouts
+        Ray hop:                  └─ aiohttp POST ──────────▶ FastAPI
+        carrier kwarg                  HTTP hop:                 server spans
+                                       traceparent header
+```
+
+The Ray hop uses the carrier kwarg described above:
+`dispatch_with_trace_context` injects it at the call site and
+`@accepts_trace_context` on `NemoGym.run_rollouts` reopens it in the actor.
+
+The HTTP hop needs no NeMo-RL code at the call site, because the request is
+made inside Gym's own client rather than by NeMo-RL. The `NemoGym` actor calls
+`instrument_aiohttp_client()` in its constructor, which patches the aiohttp
+client class so every outgoing request carries a `traceparent` taken from the
+ambient context. That is why the Ray hop has to work first: with no context
+attached in the actor, the header carries nothing useful.
+
+The HTTP hop is gated on the `per_prompt` group, so it is off under both
+`default` and `per_step`, and on under `all` or an explicit
+`per_step,per_prompt`. The instrumentor spans every request off the global
+tracer without consulting the enabled-group set, so whatever turns it on pays a
+span per HTTP call for the rest of the run — prompts × turns × tool calls,
+which is a higher volume than the ~2-per-prompt spans `per_prompt` already
+exists to fence off. Gating it on `rollout` instead would put that volume in
+`per_step`, whose contract is that its cost scales with steps rather than
+dataset size. The group has to describe the volume, not the phase, even though
+these spans sit inside the rollout.
+
+Completing the trace on the server side is a change in the Gym repository, not
+this one — its app has to call `nemo.lens.contrib.fastapi.instrument_fastapi`.
+Until it does, the header arrives and is ignored, and Gym's internal spans (if
+any) stay in their own traces. Everything up to and including the client-side
+HTTP span still nests correctly.
+
+Two failure modes degrade quietly rather than breaking a rollout. Without
+`nemo-lens[aiohttp]` installed the constructor logs a warning once and Gym's
+HTTP calls start their own traces; with telemetry disabled entirely both calls
+are no-ops.
 
 ## Per-prompt spans
 
@@ -475,14 +534,14 @@ blanks today, so an empty trace is not read as a broken exporter:
 | `VllmGeneration.generate_async` | no span, so async rollouts and async validation have no generate breakdown under `rl.grpo.generation` / `rl.grpo.evaluate` |
 | `SyncRolloutActor` | the sync data-plane counterpart of the async collector — uninstrumented, so its rollouts produce no spans |
 | Worker flush outside async GRPO | only `async_grpo_train` calls `policy.shutdown()` / `policy_generation.shutdown()`, so on other trainers a worker's last spans depend on the periodic export rather than a flush |
-| `load_checkpoint`, `forward_backward`, `optimizer`, `reference_policy` | the groups are defined and bucketed, but no site emits them, so enabling them adds no spans |
 | `grpo_sync.py` | no spans |
 | Startup phases inside `setup()` | `rl.setup.workers` is one block; its sub-phases run concurrently in worker threads, which OTel context does not reach, so they would detach into their own traces. Read the `rl.setup.duration` metric for the breakdown |
 | `rl.startup` outside GRPO | only `run_grpo.py` and `run_grpo_single_controller.py` open the umbrella, so on other launchers `rl.setup.ray_init` is a root span rather than part of a startup waterfall |
 | `rl.init.total` on async PPO | the timer is recorded, but `async_ppo_train` is otherwise uninstrumented, so the span is not emitted there |
-| SingleController generation / trainer workers | the actor's own phases are instrumented, but `TQPolicy` / `TQValue` / generation workers get no trace context from it, so their spans are separate traces correlated by `run_id` |
+| SingleController generation workers | the actor's own phases are instrumented and the `TQPolicy` / `TQValue` presharded entrypoints are parented, but the generation workers get no trace context, so their spans are separate traces correlated by `run_id` |
 | `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | these call the instrumented loops but never `init_telemetry_driver`, so a `telemetry:` block in their configs parses, the run succeeds, and nothing is emitted — driver or worker |
-| Ranked worker spans | separate traces, correlated by `run_id` — only the async collector's context is propagated |
+| Non-presharded worker calls | the presharded data-plane entrypoints are parented, but `lm_policy` / `lm_value`'s own `train` / `get_logprobs` / `get_values` and every vLLM worker method are dispatched without a carrier, so those spans stay separate traces correlated by `run_id` |
+| Worker `__init__` spans | `rl.*.load_model` is opened before any call carries context, so the load spans are roots no matter what the caller does |
 
 ## Resource attributes (process tags)
 
@@ -494,7 +553,7 @@ Stable-for-the-run values, set once at init and attached to every span/metric: `
 |---|---|---|
 | Disabled (`telemetry.enabled: false`) | None | The default |
 | `default` | Lowest | Safe for all production runs |
-| `per_step` | Moderate | Per-step profiling; each step is its own trace |
+| `per_step` | Moderate | Per-step profiling; one trace for the whole run |
 | `all` | Highest | Development / deep debugging |
 
 Non-exporting ranks have an empty span-group set — `is_span_group_enabled()` returns `False` everywhere, so no span objects are created at all. The disabled path is a `frozenset` lookup and an immediate return. See [lens: architecture](https://github.com/NVIDIA-NeMo/Lens).

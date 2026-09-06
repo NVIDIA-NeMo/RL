@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import inspect
 import json
 import time
 from copy import deepcopy
@@ -66,6 +67,7 @@ from nemo_rl.experience.rollouts import (
     attach_static_multimodal_payload,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
 
 # cluster and tokenizer are fixture imports
 from tests.unit.models.generation.test_vllm_generation import (
@@ -1176,6 +1178,36 @@ def test_run_rollouts_requires_an_installed_tokenizer():
     gym.rh = object()  # satisfies _require_spinup
 
     stream = gym.run_rollouts([{"_rowidx": 0}], "")
+    with pytest.raises(RuntimeError, match="set_tokenizer must be called"):
+        asyncio.run(stream.__anext__())
+
+
+def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
+    """The span wrapper must be invisible to everything except the trace.
+
+    Ray records an actor method's signature from the *unwrapped* function and
+    validates ``.remote()`` arguments against it on the caller, so the reserved
+    kwarg has to be declared there or every dispatch raises ``TypeError``
+    before the task is submitted. Checked here as well as in
+    ``tests/unit/telemetry`` because this is the signature Ray actually reads.
+    """
+    gym_cls = NemoGym.__ray_metadata__.modified_class
+    gym = gym_cls({})
+    gym.rh = object()
+
+    # Still a generator, or Ray would schedule it on the wrong path.
+    assert inspect.isasyncgenfunction(gym_cls.run_rollouts)
+    ray_visible = inspect.signature(inspect.unwrap(gym_cls.run_rollouts))
+    assert TRACE_CARRIER_KWARG in ray_visible.parameters
+    ray_visible.bind(gym, [{"_rowidx": 0}], "", **{TRACE_CARRIER_KWARG: {}})
+    # And still callable the way an uninstrumented run calls it.
+    ray_visible.bind(gym, [{"_rowidx": 0}], "")
+
+    # Constructing the generator runs nothing, so the body's own errors still
+    # surface on first advance rather than at the call.
+    stream = gym.run_rollouts(
+        [{"_rowidx": 0}], "", **{TRACE_CARRIER_KWARG: {"traceparent": "00-a-b-01"}}
+    )
     with pytest.raises(RuntimeError, match="set_tokenizer must be called"):
         asyncio.run(stream.__anext__())
 

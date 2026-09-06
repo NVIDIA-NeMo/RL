@@ -27,6 +27,7 @@ from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_VALUE_TRAIN_FIELDS, VALUE_SEED_FIELDS
 from nemo_rl.models.value.lm_value import Value
+from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.timer import Timer
 
 _REPLICATED_AXES = ["context_parallel", "tensor_parallel", "pipeline_parallel"]
@@ -130,7 +131,10 @@ class TQValue(TQDriverMixin, Value):
                 in_sharded_axes=["data_parallel"],
                 replicate_on_axes=_REPLICATED_AXES,
                 output_is_replicated=_REPLICATED_AXES,
-                common_kwargs={"micro_batch_size": micro_batch_size},
+                common_kwargs={
+                    "micro_batch_size": micro_batch_size,
+                    **trace_context_kwargs(),
+                },
             )
         # Wait for completion; per-rank returns are None.
         self.worker_group.get_all_worker_results(futures)
@@ -191,6 +195,7 @@ class TQValue(TQDriverMixin, Value):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    **trace_context_kwargs(),
                 },
             )
         return _aggregate_train_results(

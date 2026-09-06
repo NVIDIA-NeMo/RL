@@ -66,6 +66,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
 )
+from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -898,9 +899,11 @@ class AsyncNemoGymRolloutImpl:
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
-        async for result_ref in nemo_gym_env.run_rollouts.options(
-            num_returns="streaming"
-        ).remote(pending, timer_prefix):
+        async for result_ref in dispatch_with_trace_context(
+            nemo_gym_env.run_rollouts.options(num_returns="streaming"),
+            pending,
+            timer_prefix,
+        ):
             rowidx, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.

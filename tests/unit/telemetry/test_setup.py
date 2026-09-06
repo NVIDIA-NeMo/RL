@@ -3,8 +3,11 @@
 
 """Tests for the telemetry setup module (driver init, resource attrs, digging)."""
 
+import builtins
 import logging
 import os
+import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +21,7 @@ from nemo_rl.telemetry.setup import (
     get_telemetry_handle,
     init_telemetry_driver,
     init_telemetry_worker,
+    instrument_aiohttp_client,
     shutdown_telemetry,
     telemetry_enabled_in_env,
     traced_worker_init,
@@ -447,6 +451,63 @@ def test_shutdown_swallows_a_failing_flush():
     assert get_telemetry_handle() is None
 
 
+def test_a_hanging_flush_is_abandoned_at_the_deadline(caplog):
+    """The timeout has to be enforced here, because nothing below enforces it.
+
+    ``TelemetryHandle.shutdown`` forwards ``timeout_ms`` to the SDK's
+    ``force_flush``, which accepts the argument and drains the queue anyway, and
+    the ``provider.shutdown()`` calls after it take no timeout at all. Measured
+    against an unreachable collector, 3k buffered spans took 36s under a 5s
+    budget -- long enough to blow the 15s ``ray.get`` in async GRPO's
+    ``_flush_collector_telemetry`` and get the collector killed, losing the
+    spans that call exists to save.
+    """
+    import time
+
+    import nemo_rl.telemetry.setup as setup_mod
+
+    started = threading.Event()
+
+    def _hang(timeout_ms):
+        started.set()
+        time.sleep(10)
+
+    setup_mod._TELEMETRY_HANDLE = SimpleNamespace(shutdown=_hang)
+
+    with caplog.at_level(logging.WARNING):
+        t0 = time.monotonic()
+        shutdown_telemetry(timeout_ms=200)
+        elapsed = time.monotonic() - t0
+
+    assert started.is_set(), "the flush never ran"
+    # Generous upper bound: the point is that it returns on the budget rather
+    # than on the 10s flush, not that the join is precise.
+    assert elapsed < 3.0, f"waited {elapsed:.1f}s for a 200ms budget"
+    assert "abandoned" in caplog.text
+    assert get_telemetry_handle() is None
+
+
+def test_shutdown_closes_the_span_group_gate():
+    """A span opened after shutdown is built at full cost and then discarded.
+
+    The processor is down, so the span goes nowhere and the SDK logs a line per
+    span on the way. Ordering keeps this from happening today, but by convention
+    rather than enforcement.
+    """
+    from nemo.lens.state import is_span_group_enabled, set_enabled_span_groups
+
+    import nemo_rl.telemetry.setup as setup_mod
+    from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+    set_enabled_span_groups(frozenset({RLSpanGroup.GENERATION}))
+    assert is_span_group_enabled(RLSpanGroup.GENERATION)
+
+    setup_mod._TELEMETRY_HANDLE = SimpleNamespace(shutdown=lambda timeout_ms: None)
+    shutdown_telemetry()
+
+    assert not is_span_group_enabled(RLSpanGroup.GENERATION)
+
+
 def test_a_traced_worker_init_runs_the_constructor_with_telemetry_off(monkeypatch):
     """Telemetry off is the common case, and must be transparent.
 
@@ -503,3 +564,59 @@ def test_a_traced_worker_init_preserves_the_wrapped_signature():
     assert Worker.__init__.__doc__ == "Build the model."
     assert Worker(1).total == 3
     assert Worker(1, b=5).total == 6
+
+
+@pytest.fixture
+def _uninstrumented_aiohttp(monkeypatch):
+    """Reset the module-level latch so each test sees a fresh process."""
+    monkeypatch.setattr("nemo_rl.telemetry.setup._AIOHTTP_INSTRUMENTED", False)
+
+
+def test_aiohttp_is_not_instrumented_when_telemetry_is_off(
+    monkeypatch, _uninstrumented_aiohttp
+):
+    """No handle means no providers, so patching the client library buys nothing."""
+    monkeypatch.setattr("nemo_rl.telemetry.setup.get_telemetry_handle", lambda: None)
+
+    assert instrument_aiohttp_client() is False
+
+
+def test_aiohttp_instrumentation_is_reported_and_latched(
+    monkeypatch, _uninstrumented_aiohttp
+):
+    calls = []
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.setup.get_telemetry_handle", lambda: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        "nemo.lens.contrib.aiohttp.instrument_aiohttp_client",
+        lambda: calls.append("patched"),
+    )
+
+    assert instrument_aiohttp_client() is True
+    # Latched: the upstream instrumentor warns and skips on re-entry, and an
+    # actor Ray restarts would otherwise log that on a healthy path.
+    assert instrument_aiohttp_client() is True
+    assert calls == ["patched"]
+
+
+def test_a_missing_aiohttp_extra_warns_once_and_degrades(
+    monkeypatch, caplog, _uninstrumented_aiohttp
+):
+    """Losing the Gym leg of a trace is not a reason to fail a rollout."""
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.setup.get_telemetry_handle", lambda: SimpleNamespace()
+    )
+    monkeypatch.delitem(sys.modules, "nemo.lens.contrib.aiohttp", raising=False)
+    real_import = builtins.__import__
+
+    def _no_aiohttp_extra(name, *args, **kwargs):
+        if name == "nemo.lens.contrib.aiohttp":
+            raise ImportError("No module named 'opentelemetry.instrumentation.aiohttp'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_aiohttp_extra)
+
+    with caplog.at_level(logging.WARNING):
+        assert instrument_aiohttp_client() is False
+    assert "nemo-lens[aiohttp]" in caplog.text
