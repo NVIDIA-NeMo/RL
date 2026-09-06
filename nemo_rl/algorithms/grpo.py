@@ -67,7 +67,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.dataloader import MultipleDataloaderWrapper
+from nemo_rl.data.dataloader import CyclingDataLoader, MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
@@ -77,7 +77,6 @@ from nemo_rl.data.llm_message_utils import (
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
     ClusterConfig,
@@ -112,7 +111,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
     GenerationSamplingParams,
-    resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -158,7 +156,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
@@ -462,10 +460,24 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
             "grpo.deduplicate_multimodal_data=true is currently qualified "
             "only with policy.generation.backend=vllm."
         )
-    if (master_config.data_plane or {}).get("enabled", False):
+    # The data plane accepts deduplicated payloads, so the wire format is not
+    # the constraint -- but note what dedup buys there. ``to_wire`` emits one
+    # row per *logical* row, so a shared segment is concatenated once per
+    # generation: the saving is in driver RAM (the deepcopy memo), not in wire
+    # or TQ-storage bytes, which stay O(G x images). The one gap is NeMo-Gym:
+    # ``grpo_train_sync`` does not call
+    # ``attach_initial_nemo_gym_image_payloads``, which supplies the initial
+    # image tensors a Gym dataset omits from ``extra_env_info``. That helper is
+    # itself gated on ``should_use_nemo_gym``, so non-Gym recipes never needed
+    # it and are unaffected.
+    if (master_config.data_plane or {}).get("enabled", False) and (
+        should_use_nemo_gym(master_config)
+    ):
         raise NotImplementedError(
-            "grpo.deduplicate_multimodal_data=true is currently supported "
-            "only when data_plane.enabled=false."
+            "grpo.deduplicate_multimodal_data=true with data_plane.enabled=true "
+            "is not supported for NeMo-Gym runs: the TransferQueue trainer does "
+            "not attach the initial Gym image payloads. Non-Gym recipes are "
+            "supported."
         )
 
 
@@ -817,19 +829,12 @@ def setup(
     def _spinup_nemo_gym(base_urls, model_name):
         """Spin up the NeMo Gym actor against the given generation server URLs."""
         t0 = time.perf_counter()
-        enable_router_replay = router_replay_enabled(policy_config)
-        routed_experts_dtype = (
-            resolve_routed_experts_dtype_name_for_model(model_name)
-            if enable_router_replay
-            else "int16"
-        )
         actor = spinup_nemo_gym_actor(
-            env_configs=env_configs,
+            env_configs,
             base_urls=base_urls,
             model_name=model_name,
             tokenizer=tokenizer,
-            enable_router_replay=enable_router_replay,
-            routed_experts_dtype=routed_experts_dtype,
+            enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
         return actor, time.perf_counter() - t0
@@ -4411,7 +4416,7 @@ def _raise_if_collector_stopped(
         else "collector errored"
     )
     recovery_advice = (
-        "Increase data.train.max_num_epochs or use a larger dataset."
+        "Check the training dataset and dataloader configuration."
         if collector_status["data_exhausted"]
         else "Inspect the preceding trajectory collector error."
     )
@@ -4518,6 +4523,23 @@ def async_grpo_train(
 
     # Training state
     step = grpo_save_state.current_step
+    max_num_epochs = master_config.grpo.max_num_epochs
+    if max_num_epochs is not None and max_num_epochs > 0:
+        master_config.grpo.max_num_steps = min(
+            master_config.grpo.max_num_steps,
+            max_num_epochs * len(dataloader),
+        )
+    max_num_steps = master_config.grpo.max_num_steps
+    if step >= max_num_steps:
+        print(
+            "Async GRPO training is already complete: "
+            f"current step {step} reached the effective limit of "
+            f"{max_num_steps} steps.",
+            flush=True,
+        )
+        checkpointer.shutdown()
+        return
+
     POLICY_GENERATION_STALE = _initial_policy_generation_stale(policy_generation, step)
     weight_version = step  # Tracks refitted weight versions
     consumed_samples = grpo_save_state.consumed_samples
@@ -4553,28 +4575,9 @@ def async_grpo_train(
     print(f"   - train_global_batch_size: {train_gbs}")
     print(f"   - min_trajectories_needed: {min_trajectories_needed} (async mode)")
 
-    _replay_py_exec = get_actor_python_env(
+    _replay_runtime_env = make_actor_runtime_env(
         "nemo_rl.algorithms.async_utils.ReplayBuffer"
     )
-    if _replay_py_exec.startswith("uv"):
-        # Lazily build a dedicated venv across all Ray nodes on-demand.
-        _replay_py_exec = create_local_venv_on_each_node(
-            _replay_py_exec,
-            "nemo_rl.algorithms.async_utils.ReplayBuffer",
-        )
-
-    _replay_py_venv = os.path.dirname(
-        os.path.dirname(_replay_py_exec)
-    )  # to remove the "bin/python" suffix
-
-    _replay_runtime_env = {
-        "py_executable": _replay_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": _replay_py_venv,
-            "UV_PROJECT_ENVIRONMENT": _replay_py_venv,
-        },
-    }
 
     # Calculate optimal buffer size based on generation limits to prevent length bias
     # Each weight version generates exactly num_prompts_per_step trajectories
@@ -4681,29 +4684,13 @@ def async_grpo_train(
         set(trained_task_indices) if frontier_restore else set()
     )
 
-    _tc_py_exec = get_actor_python_env(
-        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
-    )
-    if _tc_py_exec.startswith("uv"):
-        _tc_py_exec = create_local_venv_on_each_node(
-            _tc_py_exec,
-            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
-        )
-
-    _tc_py_venv = os.path.dirname(
-        os.path.dirname(_tc_py_exec)
-    )  # to remove the "bin/python" suffix
-
-    _tc_runtime_env = {
-        "py_executable": _tc_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": _tc_py_venv,
-            "UV_PROJECT_ENVIRONMENT": _tc_py_venv,
+    _tc_runtime_env = make_actor_runtime_env(
+        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
+        extra_env_vars={
             # Names this actor's spans the way RayWorkerGroup names its groups'.
             "NRL_WORKER_GROUP": "trajectory_collector",
         },
-    }
+    )
 
     # Captured inside rl.grpo.job, so the collector's spans join this run's
     # trace instead of starting their own roots. Empty unless the job group is
@@ -4788,7 +4775,7 @@ def async_grpo_train(
     # collecting. In particular, vLLM and Dynamo start with dummy weights when
     # the first refit supplies model parameters.
     ray.get(trajectory_collector.set_weight_version.remote(weight_version))
-    trajectory_collector.start_collection.remote(dataloader)
+    trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader))
     print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
@@ -4939,13 +4926,11 @@ def async_grpo_train(
 
     # Main training loop
     try:
-        while step < master_config.grpo.max_num_steps:
+        while step < max_num_steps:
             ray.get(trajectory_collector.check_health.remote())
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
-            print(
-                f"\n{'=' * 25} Step {step + 1}/{master_config.grpo.max_num_steps} {'=' * 25}"
-            )
+            print(f"\n{'=' * 25} Step {step + 1}/{max_num_steps} {'=' * 25}")
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
@@ -5387,7 +5372,7 @@ def async_grpo_train(
                         timer=timer,
                     )
 
-                is_last_step = step + 1 == master_config.grpo.max_num_steps
+                is_last_step = step + 1 == max_num_steps
                 should_save_by_step = (
                     is_last_step
                     or (step + 1) % master_config.checkpointing["save_period"] == 0
@@ -5644,6 +5629,7 @@ def async_grpo_train(
 
                 if saving_this_step:
                     grpo_save_state.current_step = step + 1
+                    grpo_save_state.total_steps = step + 1
                     grpo_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
                         grpo_save_state.val_reward = val_metrics["accuracy"]
@@ -5937,10 +5923,10 @@ def async_grpo_train(
                 checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if step >= master_config.grpo.max_num_steps:
+            if step >= max_num_steps:
                 checkpointer.shutdown()
                 print(
-                    "Max number of steps has been reached, stopping training early",
+                    "Effective max number of steps has been reached, stopping training",
                     flush=True,
                 )
                 return

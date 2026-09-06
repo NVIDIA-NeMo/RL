@@ -14,8 +14,11 @@ The maintained Nemotron recipes enable `grpo.deduplicate_multimodal_data` to
 share immutable model-ready media segments across logical GRPO generations and
 re-intern them after batching, replay, and sharding. The representation supports
 image, video, and audio payload keys, although the maintained recipes currently
-qualify image inputs only. Deduplication currently requires the vLLM generation
-backend and `data_plane.enabled=false`.
+qualify image inputs only. Deduplication requires the vLLM generation backend.
+It works with `data_plane.enabled=true` except on NeMo-Gym runs, where the
+TransferQueue trainer does not attach the initial Gym image payloads. On the
+data plane it saves driver RAM only: `PackedTensor.to_wire` emits one row per
+*logical* row, so the wire payload is `O(G x images)` either way.
 
 `grpo.debug_payload_metrics` emits logical, physical, and protocol-5 serialized
 payload sizes for the exact Ray boundaries used by generation, replay, logprobs,

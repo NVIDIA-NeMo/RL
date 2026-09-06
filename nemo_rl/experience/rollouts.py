@@ -19,9 +19,10 @@ import asyncio
 import copy
 import json
 import statistics
+import uuid
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -47,8 +48,10 @@ from nemo_rl.data.multimodal_utils import (
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
     attach_image_model_inputs_to_message,
-    extract_input_images_from_responses_messages,
+    extract_input_media_sources_from_responses_messages,
+    resolve_to_image,
 )
+from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -58,7 +61,12 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -125,7 +133,14 @@ def attach_initial_nemo_gym_image_payloads(
         initial_messages = extra_env_info.get("responses_create_params", {}).get(
             "input", []
         )
-        images = extract_input_images_from_responses_messages(initial_messages)
+        # Load images from Responses-API input messages in encounter order.
+        images = [
+            resolve_to_image(source)
+            for media_type, source in extract_input_media_sources_from_responses_messages(
+                initial_messages
+            )
+            if media_type == "image"
+        ]
         if not images:
             continue
         if processor is None or getattr(processor, "image_processor", None) is None:
@@ -279,16 +294,12 @@ def _add_r3_fallback_metrics(
     )
 
 
-def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
+def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
         [
-            bool(
-                (result["full_result"].get("instance_config") or {}).get(
-                    "mask_sample", False
-                )
-            )
-            for result in results
+            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
+            for extra in extras
         ],
         dtype=torch.bool,
     )
@@ -338,7 +349,7 @@ def _dummy_routed_experts_for_tokens(
 
 def backfill_missing_routed_experts(
     message_logs: Sequence[list[dict]],
-) -> None:
+) -> list[int]:
     """Give every tokenized message a ``routed_experts`` row, in place.
 
     Routes are attached only where generation ran, so a trajectory whose first
@@ -351,21 +362,28 @@ def backfill_missing_routed_experts(
     No-op when the batch carries no routes at all — that is the router-replay-off
     case, and on the TQ paths the producer-side guard must still see the field
     missing so it can report a capture failure.
+
+    Returns:
+        One count per entry in ``message_logs``: how many of its messages were
+        sentinel-filled. A replay_buffer-level "field entirely absent" guard
+        cannot see this — it only catches total absence across the whole
+        batch, not a message backfilled inside an otherwise-routed rollout.
     """
+    backfilled_counts = [0] * len(message_logs)
     template = None
     for message_log in message_logs:
         template = _find_routed_experts_template(message_log)
         if template is not None:
             break
     if template is None:
-        return
+        return backfilled_counts
     if template.dim() != 3:
         raise ValueError(
             "routed_experts messages must have shape [tokens, layers, topk], "
             f"got {tuple(template.shape)}"
         )
 
-    for message_log in message_logs:
+    for log_index, message_log in enumerate(message_logs):
         for msg in message_log:
             token_ids = msg.get("token_ids")
             if not isinstance(token_ids, torch.Tensor):
@@ -378,6 +396,8 @@ def backfill_missing_routed_experts(
                 dtype=template.dtype,
                 device=template.device,
             )
+            backfilled_counts[log_index] += 1
+    return backfilled_counts
 
 
 class EffortLevelsConfig(BaseModel, extra="allow"):
@@ -414,6 +434,48 @@ class _EffortShapingMetrics:
     high_lengths: list[int]
 
 
+def _terminal_completion_length(result: dict) -> Optional[int]:
+    """Terminal assistant completion length for effort shaping, or None.
+
+    Legacy rollouts carry tokens inline: the last ``message_log`` entry is the
+    terminal turn, and its ``token_ids`` length is the completion length (0 if
+    that turn is not an assistant turn, matching the pre-receipt behavior).
+
+    Token-capture receipt rollouts carry ``message_log: []`` by design — the
+    tokens live in the capture ledger. The manifest's ``delta_len`` is NOT the
+    same quantity (a root call's delta stages prompt + generation, per the
+    ledger invariant ``parentless rows have prev_len == 0``), so the length
+    comes from the scored response's usage block instead: ``output_tokens``
+    is the terminal call's generation length, matching the legacy semantics.
+    A receipt row with no usable usage returns None so the caller skips
+    shaping rather than inventing a length.
+    """
+    message_log = result.get("message_log") or []
+    if message_log:
+        last = message_log[-1]
+        return len(last["token_ids"]) if last["role"] == "assistant" else 0
+    # TODO(token-capture): the agent ACCUMULATES usage across model calls onto
+    # the scored response (simple_agent accumulate_response_usage), so
+    # output_tokens equals the terminal generation only for single-call
+    # rollouts; on multi-call rollouts this shapes on the accumulated total
+    # while the legacy path uses the final assistant turn only. All observed
+    # capture runs are single-call (finalize/calls_per_rollout == 1.0). The
+    # durable fix is upstream: per-call generation counts on the receipt
+    # (Gym preserving per-call usage, or CallRecord recording generation
+    # length distinct from staged delta_len).
+    full_result = result.get("full_result")
+    if isinstance(full_result, dict):
+        response = full_result.get("response")
+        if isinstance(response, dict):
+            usage = response.get("usage")
+            if isinstance(usage, dict):
+                for key in ("output_tokens", "completion_tokens"):
+                    tokens = usage.get(key)
+                    if isinstance(tokens, (int, float)):
+                        return int(tokens)
+    return None
+
+
 def _apply_effort_shaping(
     results: list[dict],
     nemo_gym_rows: list[dict],
@@ -442,14 +504,15 @@ def _apply_effort_shaping(
             length_rewards_low, rewards_low, low_lengths, high_lengths
         )
 
-    lengths = [
-        len(r["message_log"][-1]["token_ids"])
-        if r["message_log"][-1]["role"] == "assistant"
-        else 0
-        for r in results
-    ]
+    lengths = [_terminal_completion_length(r) for r in results]
     orig_rewards = [r["full_result"]["reward"] for r in results]
     for i, result in enumerate(results):
+        # Token-capture receipt rows with no resolvable terminal length are
+        # skipped fail-closed: shaping a length we do not have would award the
+        # maximum shortness bonus to a row that may be arbitrarily long.
+        length = lengths[i]
+        if length is None:
+            continue
         prompt = next(
             (
                 msg["content"]
@@ -463,7 +526,7 @@ def _apply_effort_shaping(
         if effort_config.low_string in prompt:
             length_reward = min(
                 1.0,
-                effort_config.low_weight * (1.0 - lengths[i] / effort_config.low_ub),
+                effort_config.low_weight * (1.0 - length / effort_config.low_ub),
             )
             new_reward = (
                 orig_rewards[i]
@@ -473,9 +536,9 @@ def _apply_effort_shaping(
             result["full_result"]["reward"] = new_reward
             length_rewards_low.append(length_reward)
             rewards_low.append(new_reward)
-            low_lengths.append(lengths[i])
+            low_lengths.append(length)
         else:
-            high_lengths.append(lengths[i])
+            high_lengths.append(length)
 
     return _EffortShapingMetrics(
         length_rewards_low, rewards_low, low_lengths, high_lengths
@@ -2287,9 +2350,53 @@ def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
     sampling_params: GenerationSamplingParams,
+    num_generations: int,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    if num_generations <= 0 or len(rows) % num_generations != 0:
+        raise ValueError("NeMo-Gym rows must contain complete prompt groups")
+
+    group_ids: dict[int, str] = {}
+    group_attempts: dict[int, int] = {}
+    for group_index, group_start in enumerate(range(0, len(rows), num_generations)):
+        group_rows = rows[group_start : group_start + num_generations]
+        existing_group_ids = {
+            row[NEMO_GYM_GROUP_ID_KEY]
+            for row in group_rows
+            if row.get(NEMO_GYM_GROUP_ID_KEY)
+        }
+        if len(existing_group_ids) > 1:
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_index} contains inconsistent {NEMO_GYM_GROUP_ID_KEY} values"
+            )
+        group_ids[group_index] = (
+            existing_group_ids.pop() if existing_group_ids else uuid.uuid4().hex
+        )
+        existing_group_attempt_values = [
+            row[NEMO_GYM_GROUP_ATTEMPT_KEY]
+            for row in group_rows
+            if NEMO_GYM_GROUP_ATTEMPT_KEY in row
+        ]
+        if any(
+            not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 0
+            for attempt in existing_group_attempt_values
+        ):
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_index} contains an invalid {NEMO_GYM_GROUP_ATTEMPT_KEY}"
+            )
+        existing_group_attempts = set(existing_group_attempt_values)
+        if len(existing_group_attempts) > 1:
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_index} contains inconsistent "
+                f"{NEMO_GYM_GROUP_ATTEMPT_KEY} values"
+            )
+        group_attempts[group_index] = (
+            existing_group_attempts.pop() if existing_group_attempts else 0
+        )
+
     for row_index, row in enumerate(rows):
+        group_index = row_index // num_generations
+        rollout_index = row_index % num_generations
         responses_create_params = row.get("responses_create_params")
         if not isinstance(responses_create_params, dict):
             raise TypeError(
@@ -2306,6 +2413,9 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+        row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
+        row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
+        row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
 
 
 def _tensorize_nemo_gym_result(result: dict) -> None:
@@ -2464,7 +2574,12 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config, sampling_params)
+        _prepare_nemo_gym_rows(
+            nemo_gym_rows,
+            generation_config,
+            sampling_params,
+            num_generations,
+        )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,
@@ -2848,10 +2963,12 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
-    # Env/agent mask flag: flagged samples are dropped from the loss but still
-    # count for advantages. env.should_mask_flagged_samples=false skips this.
+    # Carry the raw env/agent flag downstream; the advantage stage composes it
+    # into sample_mask. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:
-        final_batch["mask_sample"] = _extract_mask_sample_flags(results)
+        final_batch[MASK_SAMPLE] = _mask_sample_flags(
+            result["full_result"] for result in results
+        )
 
     rollout_metrics.update(_effort_shaping_metrics(shaping))
 

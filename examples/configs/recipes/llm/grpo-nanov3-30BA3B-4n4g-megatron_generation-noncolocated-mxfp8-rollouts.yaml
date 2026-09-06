@@ -1,0 +1,58 @@
+defaults: ../../grpo_math_1B.yaml
+# BF16 training with MXFP8-quantized Megatron inference on a dedicated 8-GPU group:
+# every weight sync quantizes BF16 -> MXFP8 over the NCCL refit,
+# with EP8-sharded expert transfers across NVLink domains.
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-mxfp8-rollouts
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    moe_router_dtype: fp32
+  sequence_packing:
+    enabled: false
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      inference_grouped_gemm_backend: "torch"
+      inference_moe_token_dispatcher_type: nvls
+      tensor_model_parallel_size: 2
+      expert_model_parallel_size: 8
+      sequence_parallel: true
+      logprobs_mode: raw_logprobs
+      fp8_cfg:
+        enabled: true
+        fp8: e4m3
+        fp8_recipe: mxfp8
+        fp8_param: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-mxfp8-rollouts
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 2

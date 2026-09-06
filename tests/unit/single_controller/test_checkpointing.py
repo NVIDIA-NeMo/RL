@@ -100,7 +100,30 @@ _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
 _PARTITION_ID = "rollout_data"
 
 
+def _consumed_meta(*sample_ids: str) -> KVBatchMeta:
+    """A train-consumed canonical meta as the train pump hands to cleanup."""
+    return KVBatchMeta(
+        partition_id=_PARTITION_ID,
+        task_name="train",
+        sample_ids=list(sample_ids),
+        fields=["input_ids"],
+        tags=[{"weight_version": 0} for _ in sample_ids],
+    )
+
+
 # ── fakes ────────────────────────────────────────────────────────────────────
+
+
+class _FakeGeneration:
+    """Generation stand-in for train-pump tests that do not run rollouts."""
+
+    requires_kv_scale_sync = False
+
+    def snapshot_step_metrics(self) -> None:
+        pass
+
+    def get_step_metrics(self) -> dict[str, float]:
+        return {}
 
 
 class _FakeTrainer:
@@ -126,7 +149,9 @@ class _FakeTrainer:
     def begin_train_step(self, loss_fn: Any) -> None:
         pass
 
-    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
         pass
 
     def finish_train_step(self) -> dict[str, Any]:
@@ -541,7 +566,7 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
-        gen_handle=object(),
+        gen_handle=_FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]
@@ -558,6 +583,7 @@ def _make_actor_args(
             save_state if save_state is not None else _initial_grpo_save_state()
         ),
         last_checkpoint_path=last_checkpoint_path,
+        finalizer_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
     )
 
@@ -1186,7 +1212,7 @@ class TestDataPlaneCheckpoint:
             assert started
 
             clear_task = asyncio.create_task(
-                actor._clear_data_plane_samples(["sample-0"])
+                actor._cleanup_consumed_metas([_consumed_meta("sample-0")])
             )
             await asyncio.sleep(0)
             assert dp_client.clear_calls == []
@@ -1208,7 +1234,7 @@ class TestDataPlaneCheckpoint:
                 mc, _make_actor_args(dp_client=dp_client), SetupTimingMetrics()
             )
             event_loop_thread_id = threading.get_ident()
-            await actor._clear_data_plane_samples(["sample-0"])
+            await actor._cleanup_consumed_metas([_consumed_meta("sample-0")])
             actor._checkpointer.shutdown()
             return event_loop_thread_id
 
@@ -1547,6 +1573,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             val_at_start=False,
             val_at_end=False,
         ),
+        logger={"wandb_enabled": False, "wandb": {}},
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,

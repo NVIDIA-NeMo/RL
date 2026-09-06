@@ -58,6 +58,8 @@ _REGISTERED_FIELDS = [
     "advantages",
     "token_mask",
     "sample_mask",
+    "mask_sample",
+    "truncated",
     "total_reward",
     "prompt_ids_for_adv",
 ]
@@ -94,6 +96,8 @@ def _populate_group(
             "input_lengths": torch.tensor([seq_len] * group_size).long(),
             "token_mask": torch.ones(group_size, seq_len, dtype=torch.long),
             "sample_mask": torch.ones(group_size, dtype=torch.long),
+            "mask_sample": torch.zeros(group_size, dtype=torch.bool),
+            "truncated": torch.zeros(group_size, dtype=torch.bool),
             "generation_logprobs": torch.zeros(
                 group_size, seq_len, dtype=torch.float32
             ),
@@ -138,6 +142,11 @@ def _prepopulate_buffer(
     # Group id follows pack_payload's "{group_uuid}_g{i}" convention.
     group_id = meta.sample_ids[0].rpartition("_g")[0]
     buffer._group_ids.append(group_id)
+    # Token-capture bookkeeping: a hand-inserted, already-finalized slot owns
+    # no rollout ids and no staged rows. Every parallel list must stay in
+    # lockstep or remove() indexes past the end.
+    buffer._rollout_ids_list.append(None)
+    buffer._staging_keys_list.append(None)
 
 
 @pytest.fixture(scope="function")
@@ -364,6 +373,7 @@ def test_train_pump_drives_mcore_training_step(
             partition_id=_PARTITION_ID,
             save_state=_initial_grpo_save_state(),
             last_checkpoint_path=None,
+            finalizer_actors=[],
         )
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,
