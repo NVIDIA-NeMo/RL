@@ -31,6 +31,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.train import force_param_sync
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
@@ -3386,6 +3387,12 @@ class MegatronPolicyWorkerImpl(
         # those tensors for CPU storage, so the checkpoint references would keep
         # the old CUDA storage alive and defeat the offload.
         self.finalize_async_save()
+
+        # With overlapped parameter gathering, optimizer.step() publishes only
+        # the local DP shard. Refit reads parameters outside a model forward, so
+        # it must force the deferred DP gather before exporting those weights.
+        if self.should_disable_forward_pre_hook:
+            force_param_sync([self.model], optimizer=self.optimizer)
 
         no_grad = torch.no_grad()
         no_grad.__enter__()

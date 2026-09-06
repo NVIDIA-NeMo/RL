@@ -236,9 +236,14 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     worker.model = object()
     worker.optimizer = None
     worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = True
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.force_param_sync",
+        lambda model, optimizer: events.append("force_param_sync"),
+    )
     worker.move_model = lambda model, device, move_params, move_grads: (
         events.append("move_model") or model
     )
@@ -263,6 +268,8 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     MegatronPolicyWorkerImpl.offload_before_refit(worker)
 
     assert events[0] == "finalize_async_save"
+    assert events.index("finalize_async_save") < events.index("force_param_sync")
+    assert events.index("force_param_sync") < events.index("move_model")
     assert events.index("finalize_async_save") < events.index("move_model")
 
 
@@ -280,6 +287,7 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     worker.model = object()
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = False
     worker.offload_optimizer_for_refit = offload_optimizer
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
