@@ -1130,9 +1130,15 @@ def test_modelopt_moe_manifest_requires_complete_w4a4_family(monkeypatch):
         )
 
 
-def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
+def test_real_quant_load_weights_expands_non_gated_experts_per_expert(
     monkeypatch,
 ):
+    """Non-gated fused W13 payloads must be split into per-expert 2-D shards.
+
+    A batched ``[E, N, K]`` tensor trips vLLM 0.26's
+    ``RoutedExperts.load_weights`` fused gate/up branch, which keys off
+    ``dim() == 3`` alone and chunks a dimension that was never fused.
+    """
     backend = _import_vllm_quant_backend(monkeypatch)
 
     class ModelOptNvFp4FusedMoE:
@@ -1168,10 +1174,12 @@ def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
     extension.prepare_refit_info(state_dict_info)
     extension._nrl_w13_num_shards_by_prefix = {prefix: 1}
     _patch_real_quant_load(monkeypatch, backend, batched_forwarded)
+    w13_block_scale = torch.arange(8).reshape(2, 4, 1)
     assert (
         extension._load_weights(
             [
                 (f"{prefix}.experts.w13_weight", w13_weight),
+                (f"{prefix}.experts.w13_weight_scale", w13_block_scale),
                 (f"{prefix}.experts.w13_weight_scale_2", w13_scale_2),
             ]
         )
@@ -1179,12 +1187,21 @@ def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
     )
     assert [name for name, _ in batched_forwarded] == [
         f"{prefix}.experts.0.up_proj.weight",
+        f"{prefix}.experts.1.up_proj.weight",
+        f"{prefix}.experts.0.up_proj.weight_scale",
+        f"{prefix}.experts.1.up_proj.weight_scale",
         f"{prefix}.experts.0.up_proj.weight_scale_2",
         f"{prefix}.experts.1.up_proj.weight_scale_2",
     ]
-    assert batched_forwarded[0][1] is w13_weight
-    torch.testing.assert_close(batched_forwarded[1][1], w13_scale_2[0, 0])
-    torch.testing.assert_close(batched_forwarded[2][1], w13_scale_2[1, 0])
+    # Every per-expert shard is 2-D, so vLLM's fused-3D branch is never taken.
+    for _, forwarded in batched_forwarded[:4]:
+        assert forwarded.ndim == 2
+    torch.testing.assert_close(batched_forwarded[0][1], w13_weight[0])
+    torch.testing.assert_close(batched_forwarded[1][1], w13_weight[1])
+    torch.testing.assert_close(batched_forwarded[2][1], w13_block_scale[0])
+    torch.testing.assert_close(batched_forwarded[3][1], w13_block_scale[1])
+    torch.testing.assert_close(batched_forwarded[4][1], w13_scale_2[0, 0])
+    torch.testing.assert_close(batched_forwarded[5][1], w13_scale_2[1, 0])
 
     extension = _make_real_quant_extension(
         backend,

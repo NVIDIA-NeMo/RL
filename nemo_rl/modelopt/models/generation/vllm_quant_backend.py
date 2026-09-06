@@ -149,10 +149,10 @@ def _batch_fused_modelopt_moe_weights(
     loader still requires an expert id, so only the tiny per-expert global
     scales are exposed as scalar views.
 
-    Gated ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted
-    as per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
-    fused-3D branch mis-transposes packed NVFP4. See the comment at the
-    emission site below.
+    ``w13`` payloads are the exception on vLLM >= 0.25: both the gated and the
+    non-gated layouts are emitted as per-expert 2-D shards instead, because
+    ``RoutedExperts.load_weights``' fused-3D branch mis-transposes packed
+    NVFP4. See the comments at the emission sites below.
     """
     batched: list[tuple[str, torch.Tensor]] = []
     for name, tensor in weights:
@@ -171,11 +171,27 @@ def _batch_fused_modelopt_moe_weights(
         if target in {"w13_weight", "w13_weight_scale"}:
             target_suffix = "weight" if target == "w13_weight" else "weight_scale"
             if w13_num_shards_by_prefix.get(prefix) == 1:
-                batched.append(
-                    (
-                        f"{prefix}.experts.0.up_proj.{target_suffix}",
-                        tensor,
+                # Non-gated experts (e.g. Nemotron-H) have a single w13
+                # projection, but the payload is still batched [E, N, K/2].
+                # vLLM 0.26 routes it into RoutedExperts.load_weights' fused
+                # branch -- which keys off `loaded_weight.dim() == 3` alone --
+                # so it transposes and `chunk(2, dim=1)`s a dimension that was
+                # never a fused gate/up pair, and the copy shapes disagree.
+                # vLLM <= 0.25.1 escaped this only because Nemotron-H shipped
+                # its own load_weights; 0.26 deleted it in favour of
+                # AutoWeightsLoader. Emit per-expert 2-D shards for the same
+                # reason the gated branch below does.
+                if tensor.ndim != 3:
+                    raise ValueError(
+                        f"Expected a batched [E, N, K] non-gated W13 tensor for "
+                        f"{name}, got {tuple(tensor.shape)}"
                     )
+                batched.extend(
+                    (
+                        f"{prefix}.experts.{expert_id}.up_proj.{target_suffix}",
+                        expert_weight,
+                    )
+                    for expert_id, expert_weight in enumerate(tensor.unbind(0))
                 )
                 continue
             if tensor.ndim < 2 or tensor.shape[1] % 2 != 0:
