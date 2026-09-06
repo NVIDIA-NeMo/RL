@@ -386,14 +386,15 @@ async def _round_trip(
     selected: set[str] = set()
     selected_count = 0
     if select_current_train_weight is not None:
-        selected_meta, selected_count = await sampler_b.select(
+        selection = await sampler_b.select(
             current_train_weight=select_current_train_weight,
             min_prompt_groups=GROUPS_PER_STEP,
             max_prompt_groups=GROUPS_PER_STEP,
         )
-        if selected_meta is not None:
+        selected_count = selection.num_groups
+        if selection.meta is not None:
             selected = {
-                sample_id.rpartition("_g")[0] for sample_id in selected_meta.sample_ids
+                sample_id.rpartition("_g")[0] for sample_id in selection.meta.sample_ids
             }
     return RoundTrip(
         recovered=recovered,

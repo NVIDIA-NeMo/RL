@@ -26,7 +26,10 @@ from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
-from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    BaseSampler,
+    SamplerSelection,
+)
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -1119,7 +1122,7 @@ class _EmptySampler:
 
     async def select(self, **kwargs):
         del kwargs
-        return None, 0
+        return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
 
 
 class _OneThenEmptySampler(_EmptySampler):
@@ -1129,10 +1132,10 @@ class _OneThenEmptySampler(_EmptySampler):
     async def select(self, **kwargs):
         del kwargs
         if self._meta is None:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         meta = self._meta
         self._meta = None
-        return meta, 1
+        return SamplerSelection(meta=meta, num_groups=1, trajectory_ages=(0,))
 
 
 class _EvictingSampler(_OneThenEmptySampler):
@@ -1141,14 +1144,18 @@ class _EvictingSampler(_OneThenEmptySampler):
         return 2
 
     async def select(self, **kwargs):
-        meta, num_groups = await super().select(**kwargs)
-        return meta, 2 if num_groups else 0
+        selection = await super().select(**kwargs)
+        num_groups = 2 if selection.num_groups else 0
+        ages = selection.trajectory_ages * num_groups
+        return SamplerSelection(selection.meta, num_groups, ages)
 
 
 class _FullStepSampler(_OneThenEmptySampler):
     async def select(self, **kwargs):
-        meta, num_groups = await super().select(**kwargs)
-        return meta, 2 if num_groups else 0
+        selection = await super().select(**kwargs)
+        num_groups = 2 if selection.num_groups else 0
+        ages = selection.trajectory_ages * num_groups
+        return SamplerSelection(selection.meta, num_groups, ages)
 
 
 class _ChunkedSampler(_EmptySampler):
@@ -1166,9 +1173,9 @@ class _ChunkedSampler(_EmptySampler):
     async def select(self, **kwargs):
         del kwargs
         if self._remaining == 0:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         self._remaining -= 1
-        return self._meta, 1
+        return SamplerSelection(self._meta, 1, (0,))
 
 
 class _SequenceSampler(_EmptySampler):
@@ -1178,8 +1185,8 @@ class _SequenceSampler(_EmptySampler):
     async def select(self, **kwargs):
         del kwargs
         if not self._metas:
-            return None, 0
-        return self._metas.pop(0), 1
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
+        return SamplerSelection(self._metas.pop(0), 1, (0,))
 
 
 class _EmptyBuffer:
@@ -1471,10 +1478,10 @@ class _DroppingSampler(_OneThenEmptySampler):
         BaseSampler._validate_group_bounds(
             kwargs["min_prompt_groups"], kwargs["max_prompt_groups"]
         )
-        meta, num_groups = await super().select(**kwargs)
-        if meta is None and not self._credit_in_evict:
+        selection = await super().select(**kwargs)
+        if selection.meta is None and not self._credit_in_evict:
             self._credit()
-        return meta, num_groups
+        return selection
 
 
 def _dropping_controller(*, credit_in_evict: bool):
@@ -1561,6 +1568,85 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._batch_shortfall == {5: 1}
+
+
+class _AgeReportingSampler(_EmptySampler):
+    """Yields one meta per configured age list, then goes empty.
+
+    A step is assembled from several selects on the streaming path, so the
+    metric has to accumulate ACROSS them -- an assignment instead of an extend
+    reports only the last select's ages and passes any single-select test.
+    """
+
+    def __init__(self, meta: KVBatchMeta, age_batches: list[list[int]]) -> None:
+        self._meta = meta
+        self._age_batches = list(age_batches)
+
+    async def select(self, **kwargs):
+        del kwargs
+        if not self._age_batches:
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
+        ages = tuple(self._age_batches.pop(0))
+        return SamplerSelection(self._meta, 1, ages)
+
+
+def _age_meta() -> KVBatchMeta:
+    return KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+
+
+def _run_age_pump(age_batches, monkeypatch) -> dict:
+    ctrl = _train_pump_controller(
+        sampler=_AgeReportingSampler(_age_meta(), age_batches)
+    )
+    ctrl._master_config.grpo.num_prompts_per_step = len(age_batches) or 1
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    for call in ctrl._logger.log_metrics.call_args_list:
+        metrics = call.args[0] if call.args else call.kwargs.get("metrics", {})
+        if "avg_trajectory_age" in metrics or "max_trajectory_age" in metrics:
+            return metrics
+    return {}
+
+
+def test_train_pump_accumulates_trajectory_age_across_every_select(monkeypatch):
+    """Two selects in one step. Averaging only the last one would give 5.0."""
+    metrics = _run_age_pump([[1, 3], [5, 5]], monkeypatch)
+
+    assert metrics.get("avg_trajectory_age") == pytest.approx(3.5)
+    assert metrics.get("max_trajectory_age") == 5
+
+
+def test_train_pump_omits_trajectory_age_when_no_ages_are_reported(monkeypatch):
+    """A legacy two-tuple sampler must leave trajectory-age metrics out."""
+
+    class _LegacyOneThenEmptySampler(_OneThenEmptySampler):
+        async def select(self, **kwargs):
+            selection = await super().select(**kwargs)
+            return selection.meta, selection.num_groups
+
+    ctrl = _train_pump_controller(sampler=_LegacyOneThenEmptySampler(_age_meta()))
+    ctrl._master_config.grpo.num_prompts_per_step = 1
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    for call in ctrl._logger.log_metrics.call_args_list:
+        metrics = call.args[0] if call.args else call.kwargs.get("metrics", {})
+        assert "avg_trajectory_age" not in metrics
+        assert "max_trajectory_age" not in metrics
 
 
 @pytest.mark.parametrize(

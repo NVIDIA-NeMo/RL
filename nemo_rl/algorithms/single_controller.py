@@ -74,6 +74,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    SamplerSelection,
     TransactionalAdmissionSampler,
     create_sampler,
 )
@@ -2085,6 +2086,9 @@ class SingleControllerActor:
             version_during_step = self._trainer_version
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
+            # Trajectory age, in trainer versions, of every group this step trains
+            # on. Accumulated across selects: a step is assembled from several.
+            step_trajectory_ages: list[int] = []
             min_sample_version = None
             step_open = False
             chunks_dispatched = 0
@@ -2140,11 +2144,18 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
-                        train_meta, num_groups = await self._sampler.select(
+                        selection = await self._sampler.select(
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
                         )
+                        if isinstance(selection, SamplerSelection):
+                            train_meta = selection.meta
+                            num_groups = selection.num_groups
+                            step_trajectory_ages.extend(selection.trajectory_ages)
+                        else:
+                            # Preserve the two-tuple contract for external samplers.
+                            train_meta, num_groups = selection
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
@@ -2493,6 +2504,25 @@ class SingleControllerActor:
                         )
                     self._retune_lookahead_versions()
                     self._rollout_manager.set_weight_version(self._trainer_version)
+                    if step_trajectory_ages:
+                        # ``avg_trajectory_age`` is the name the pre-SC async GRPO
+                        # path already logs for this quantity (ReplayBuffer.sample
+                        # -> grpo.py metrics), kept so the two paths are comparable
+                        # on one dashboard. The max has no pre-existing counterpart
+                        # and is what shows a ready_first tail: its select puts no
+                        # lower bound on start_weight, and the two counters below
+                        # only report what was discarded -- both structurally zero
+                        # there, since its evict returns 0 and it inherits
+                        # should_abort_inflight -> False.
+                        step_metrics.update(
+                            {
+                                "avg_trajectory_age": (
+                                    sum(step_trajectory_ages)
+                                    / len(step_trajectory_ages)
+                                ),
+                                "max_trajectory_age": max(step_trajectory_ages),
+                            }
+                        )
                     step_metrics.update(
                         {
                             "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
