@@ -112,7 +112,7 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -422,51 +422,71 @@ def test_checkpoint_cut_can_guard_a_ledger_mutation() -> None:
     asyncio.run(exercise())
 
 
-def test_recovery_config_resolves_agent_then_task_then_default() -> None:
+def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
     config = RolloutRecoveryConfig(
         default_granularity=RecoveryGranularity.SIBLING,
-        agent_granularity_overrides={"genrm_agent": RecoveryGranularity.PROMPT_GROUP},
-        task_granularity_overrides={
-            "math": RecoveryGranularity.PROMPT_GROUP,
-            "agent_wins": RecoveryGranularity.SIBLING,
+        task_source_granularity_overrides={
+            "genrm_compare": RecoveryGranularity.PROMPT_GROUP,
+        },
+        agent_granularity_overrides={
+            "legacy_genrm_agent": RecoveryGranularity.PROMPT_GROUP,
+            "sibling_agent": RecoveryGranularity.SIBLING,
         },
     )
 
-    agent_policy = config.resolve_for_prompt(
+    source_policy = config.resolve_for_prompt(
         {
-            "task_name": "agent_wins",
-            "extra_env_info": {"agent_ref": {"name": "genrm_agent"}},
+            "extra_env_info": {
+                "task_source": "genrm_compare",
+                "agent_ref": {"name": "unmapped_agent"},
+            }
         }
     )
-    task_policy = config.resolve_for_prompt(
-        {"task_name": "math", "extra_env_info": None}
+    agent_policy = config.resolve_for_prompt(
+        {
+            "extra_env_info": {
+                "task_source": "genrm_compare",
+                "agent_ref": {"name": "sibling_agent"},
+            }
+        }
     )
     default_policy = config.resolve_for_prompt(
-        {"task_name": "other", "extra_env_info": None}
+        {
+            "extra_env_info": {
+                "task_source": "other",
+                "agent_ref": {"name": "unmapped_agent"},
+            }
+        }
     )
+    with pytest.warns(FutureWarning, match="legacy agent_ref"):
+        legacy_policy = config.resolve_for_prompt(
+            {"extra_env_info": {"agent_ref": {"name": "legacy_genrm_agent"}}}
+        )
 
-    assert agent_policy.agent_name == "genrm_agent"
-    assert agent_policy.granularity is RecoveryGranularity.PROMPT_GROUP
-    assert task_policy.agent_name is None
-    assert task_policy.granularity is RecoveryGranularity.PROMPT_GROUP
-    assert default_policy.agent_name is None
+    assert source_policy.task_source == "genrm_compare"
+    assert source_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert agent_policy.task_source == "genrm_compare"
+    assert agent_policy.granularity is RecoveryGranularity.SIBLING
+    assert default_policy.task_source == "other"
     assert default_policy.granularity is RecoveryGranularity.SIBLING
+    assert legacy_policy.task_source is None
+    assert legacy_policy.granularity is RecoveryGranularity.PROMPT_GROUP
 
 
 @pytest.mark.parametrize(
     ("prompt", "error_fragment"),
     [
         (
-            {"extra_env_info": {"agent_ref": "genrm_agent"}},
+            {"extra_env_info": {"task_source": 7}},
+            "task_source must be a string or None",
+        ),
+        (
+            {"extra_env_info": {"agent_ref": "legacy_agent"}},
             "agent_ref must be a mapping or None",
         ),
         (
             {"extra_env_info": {"agent_ref": {"name": 7}}},
             "agent_ref.name must be a string or None",
-        ),
-        (
-            {"task_name": 7},
-            "task_name must be a string or None",
         ),
     ],
 )
@@ -475,6 +495,17 @@ def test_recovery_config_rejects_malformed_prompt_identity(
 ) -> None:
     with pytest.raises(TypeError, match=error_fragment):
         RolloutRecoveryConfig().resolve_for_prompt(prompt)
+
+
+def test_recovery_config_rejects_removed_task_name_override() -> None:
+    with pytest.raises(ValueError, match="task_source_granularity_overrides"):
+        RolloutRecoveryConfig(
+            **{
+                "task_granularity_overrides": {
+                    "legacy": RecoveryGranularity.PROMPT_GROUP
+                }
+            }
+        )
 
 
 def test_target_step_none_does_not_mean_unadmitted() -> None:
@@ -488,7 +519,7 @@ def test_target_step_none_does_not_mean_unadmitted() -> None:
         expected_generations=2,
         target_step=None,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -508,7 +539,7 @@ def test_reserved_group_can_be_admitted_exactly_once() -> None:
         expected_generations=2,
         target_step=None,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=False,
     )
@@ -545,7 +576,7 @@ def test_canonical_groups_are_discarded_without_touching_unfinished_groups() -> 
             expected_generations=2,
             target_step=7,
             start_weight_version=7,
-            agent_name=None,
+            task_source=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
             admitted=True,
         )
@@ -566,7 +597,7 @@ def test_state_dict_stores_a_prompt_ref_without_the_full_payload() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=7,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -595,7 +626,7 @@ def test_bind_runtime_prompt_accepts_changed_content_with_the_same_identity() ->
         expected_generations=2,
         target_step=7,
         start_weight_version=7,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -620,7 +651,7 @@ def test_bind_runtime_prompt_rejects_the_wrong_dataset_sample() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=7,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -649,7 +680,7 @@ def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
         expected_generations=2,
         target_step=1,
         start_weight_version=0,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -683,7 +714,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -742,7 +773,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=recovery_granularity,
         admitted=True,
     )
@@ -816,21 +847,21 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name="genrm_agent",
+        task_source="genrm_compare",
         recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
 
     state = ledger.state_dict()
-    assert state["groups"][0]["agent_name"] == "genrm_agent"
+    assert state["groups"][0]["task_source"] == "genrm_compare"
     assert state["groups"][0]["recovery_granularity"] == "prompt_group"
 
     restored = RolloutRecoveryLedger.from_state_dict(state)
     _mutate(lambda cut: restored.prepare_for_restart(cut))
     recovered = restored.get_group("g7")
 
-    assert recovered.agent_name == "genrm_agent"
+    assert recovered.task_source == "genrm_compare"
     assert recovered.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
     assert [sibling.current_attempt.status for sibling in recovered.siblings] == [
         RolloutAttemptStatus.ABANDONED,
@@ -856,7 +887,7 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name="genrm_agent",
+        task_source="genrm_compare",
         recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
         admitted=True,
     )
@@ -901,7 +932,7 @@ def test_prompt_group_seal_is_atomic() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name="genrm_agent",
+        task_source="genrm_compare",
         recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
         admitted=True,
     )
@@ -942,7 +973,7 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
         expected_generations=1,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -975,7 +1006,7 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
     [
         ("recovery_granularity", "banana", "invalid recovery_granularity"),
         ("recovery_granularity", None, "recovery_granularity must be a string"),
-        ("agent_name", 123, "agent_name must be a string or None"),
+        ("task_source", 123, "task_source must be a string or None"),
     ],
 )
 def test_restore_rejects_malformed_recovery_policy_fields(
@@ -991,7 +1022,7 @@ def test_restore_rejects_malformed_recovery_policy_fields(
         expected_generations=1,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )

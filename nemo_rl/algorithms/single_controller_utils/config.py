@@ -623,14 +623,15 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
 
 
 @dataclass(frozen=True)
-class AgentRecoveryGranularity:
+class TaskSourceRecoveryGranularity:
     """Recovery granularity selected for a prompt-group reservation.
 
-    ``agent_name`` is copied from the prompt when present. ``granularity`` is
-    selected from an agent override, task override, or the global default.
+    ``task_source`` is copied from the raw Gym row when present. ``granularity``
+    is selected from an explicit agent override, a task-source override, or the
+    global default.
     """
 
-    agent_name: Optional[str]
+    task_source: Optional[str]
     granularity: RecoveryGranularity
 
 
@@ -652,19 +653,40 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """
 
     default_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING
-    # NeMo-Gym agent_ref.name takes precedence over task_name when both match.
+    # Keyed by ``extra_env_info.task_source``, which is available before Gym
+    # resolves the concrete agent used to execute the row.
+    task_source_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+        default_factory=dict
+    )
+    # Keyed by ``extra_env_info.agent_ref.name`` when the input row already has
+    # a concrete Gym route. A matching agent override wins over task_source.
     agent_granularity_overrides: dict[str, RecoveryGranularity] = Field(
         default_factory=dict
     )
-    task_granularity_overrides: dict[str, RecoveryGranularity] = Field(
-        default_factory=dict
-    )
 
-    def resolve_for_prompt(self, prompt: Mapping[str, Any]) -> AgentRecoveryGranularity:
-        """Resolve one new group using agent, then task, then the global default."""
+    @model_validator(mode="after")
+    def _reject_removed_override_keys(self) -> "RolloutRecoveryConfig":
+        """Reject the removed task-name map instead of silently ignoring it."""
+        removed = {"task_granularity_overrides"}.intersection(self.model_extra or {})
+        if removed:
+            raise ValueError(
+                f"rollout_recovery fields {sorted(removed)!r} were replaced by "
+                "task_source_granularity_overrides"
+            )
+        return self
+
+    def resolve_for_prompt(
+        self, prompt: Mapping[str, Any]
+    ) -> TaskSourceRecoveryGranularity:
+        """Resolve using matching agent, matching task source, then default."""
         extra_env_info = prompt.get("extra_env_info")
+        task_source: Optional[str] = None
         agent_name: Optional[str] = None
         if isinstance(extra_env_info, Mapping):
+            raw_task_source = extra_env_info.get("task_source")
+            if raw_task_source is not None and not isinstance(raw_task_source, str):
+                raise TypeError("prompt task_source must be a string or None")
+            task_source = raw_task_source
             agent_ref = extra_env_info.get("agent_ref")
             if agent_ref is not None and not isinstance(agent_ref, Mapping):
                 raise TypeError("prompt agent_ref must be a mapping or None")
@@ -674,18 +696,22 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                     raise TypeError("prompt agent_ref.name must be a string or None")
                 agent_name = raw_agent_name
         if agent_name is not None:
+            if task_source is None:
+                warnings.warn(
+                    "rollout recovery is using legacy agent_ref because "
+                    "task_source is missing; re-collate the dataset with "
+                    "the current NeMo Gym",
+                    FutureWarning,
+                    stacklevel=2,
+                )
             override = self.agent_granularity_overrides.get(agent_name)
             if override is not None:
-                return AgentRecoveryGranularity(agent_name, override)
-
-        task_name = prompt.get("task_name")
-        if task_name is not None and not isinstance(task_name, str):
-            raise TypeError("prompt task_name must be a string or None")
-        if task_name is not None:
-            override = self.task_granularity_overrides.get(task_name)
+                return TaskSourceRecoveryGranularity(task_source, override)
+        if task_source is not None:
+            override = self.task_source_granularity_overrides.get(task_source)
             if override is not None:
-                return AgentRecoveryGranularity(agent_name, override)
-        return AgentRecoveryGranularity(agent_name, self.default_granularity)
+                return TaskSourceRecoveryGranularity(task_source, override)
+        return TaskSourceRecoveryGranularity(task_source, self.default_granularity)
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -1123,8 +1149,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     recovery_config = master_config.rollout_recovery
     if not token_capture_config.enabled and (
         recovery_config.default_granularity is not RecoveryGranularity.SIBLING
+        or recovery_config.task_source_granularity_overrides
         or recovery_config.agent_granularity_overrides
-        or recovery_config.task_granularity_overrides
     ):
         raise ValueError(
             "non-default rollout_recovery policies require "
