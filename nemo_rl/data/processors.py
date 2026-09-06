@@ -490,6 +490,8 @@ def vlm_hf_data_processor(
         pass  # Daily-Omni data is already formatted by DailyOmniDataset.format_data
     elif datum_dict["task_name"] in ("intent-train", "intent-bench"):
         pass  # IntentDataset.format_data already produces the message structure
+    elif "messages" in datum_dict:
+        pass  # Generic ResponseDataset data can already use the message structure
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
@@ -676,8 +678,11 @@ def vlm_hf_data_processor(
         loss_multiplier = 0.0
     else:
         # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
+        # Placeholder-style processors set vllm_content to None so vLLM uses expanded input_ids.
         vllm_kwargs = {
-            "vllm_content": string_formatted_dialog,
+            "vllm_content": (
+                None if uses_placeholder and images else string_formatted_dialog
+            ),
             "vllm_images": images,
             "vllm_audios": audios,
             "vllm_videos": videos,
@@ -799,7 +804,7 @@ def nemo_gym_data_processor(
                 "Gym video data requires a multimodal processor with "
                 "apply_chat_template and tokenizer attributes"
             )
-        from nemo_rl.environments.nemo_gym_video import (
+        from nemo_rl.environments.nemo_gym_multimodal import (
             nemo_gym_example_to_video_datum_spec,
         )
 

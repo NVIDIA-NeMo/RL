@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+from ray.exceptions import ActorDiedError
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
@@ -118,6 +119,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
     )
     args.update(overrides)
@@ -217,7 +219,9 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         setup_timing_metrics=SetupTimingMetrics(),
     )
 
-    logger.log_hyperparams.assert_called_once_with(master_config.model_dump())
+    expected_hparams = master_config.model_dump()
+    expected_hparams["token_capture"]["control_auth_token"] = "<redacted>"
+    logger.log_hyperparams.assert_called_once_with(expected_hparams)
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output
@@ -473,7 +477,9 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     asyncio.run(ctrl._sync_weights())
 
@@ -503,7 +509,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
     calibration_data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[1, 2]]),
@@ -590,7 +598,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(
+        grpo=GRPOConfig(
             seq_logprob_error_threshold=2.0,
             overlong_filtering=True,
             invalid_tool_call_advantage=-5.0,
@@ -601,6 +609,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._message_level_advantage_penalties_enabled = True
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
@@ -687,12 +696,13 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._message_level_advantage_penalties_enabled = False
-    ctrl._algo_cfg = SimpleNamespace(
+    ctrl._algo_cfg = GRPOConfig(
         seq_logprob_error_threshold=None,
         overlong_filtering=overlong_filtering,
     )
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -750,12 +760,13 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        grpo=GRPOConfig(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -784,6 +795,69 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [0]
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
+
+
+def test_advantage_stage_clips_training_values_and_metrics() -> None:
+    batch_size, sequence_length = 2, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([-4.0, 6.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(
+            seq_logprob_error_threshold=None,
+            advantage_clip_low=-1.0,
+            advantage_clip_high=2.0,
+        )
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "sample_masks": [],
+        "masked_advantages": [],
+        "num_mask_sample_filtered": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    assert data_plane.written_fields is not None
+    torch.testing.assert_close(
+        data_plane.written_fields["advantages"],
+        torch.tensor([[-1.0] * sequence_length, [2.0] * sequence_length]),
+    )
+    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
+    assert logged.min().item() == pytest.approx(-1.0)
+    assert logged.max().item() == pytest.approx(2.0)
 
 
 def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
@@ -818,12 +892,13 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0, overlong_filtering=False)
+        grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -878,12 +953,13 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        grpo=GRPOConfig(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -958,12 +1034,16 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        grpo=GRPOConfig(
+            seq_logprob_error_threshold=None,
+            advantage_clip_high=0.1,
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1000,6 +1080,14 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     assert ctrl._opd_stat_sum == pytest.approx(1.0)
     assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
     assert ctrl._opd_stat_count == 4
+    assert ctrl._dp_client.put_fields is not None
+    written_advantages = ctrl._dp_client.put_fields["advantages"]
+    torch.testing.assert_close(
+        written_advantages,
+        torch.full_like(written_advantages, 0.1),
+    )
+    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
+    torch.testing.assert_close(logged, torch.full((4,), 0.1))
 
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
@@ -1222,14 +1310,20 @@ class _StepMetricRecordingTrainer(_NoOpTrainer):
 class _StepMetricRecordingGeneration:
     requires_kv_scale_sync = False
 
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], dies_in: str | None = None) -> None:
         self._events = events
+        self._dies_in = dies_in
+
+    def _record(self, method: str) -> None:
+        self._events.append(method)
+        if method == self._dies_in:
+            raise ActorDiedError()
 
     def snapshot_step_metrics(self) -> None:
-        self._events.append("snapshot_step_metrics")
+        self._record("snapshot_step_metrics")
 
     def get_step_metrics(self) -> dict[str, float]:
-        self._events.append("get_step_metrics")
+        self._record("get_step_metrics")
         return {"vllm/spec_acceptance_rate": 0.8}
 
 
@@ -1300,8 +1394,10 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    ctrl._finalizer_metrics_by_group = {}
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
@@ -1670,9 +1766,12 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
     assert "histogram/gen_tokens_length" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("dies_in", [None, "snapshot_step_metrics", "get_step_metrics"])
 def test_train_pump_collects_generation_metrics_at_step_boundaries(
-    monkeypatch,
+    monkeypatch, dies_in
 ) -> None:
+    """A shard killed mid-step (grpo_dp_single_controller_chaos) must not end the pump
+    from the metrics fan-out; the typed failure belongs to the probe/refit paths."""
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
@@ -1684,7 +1783,7 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
     events: list[str] = []
     ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
     ctrl._trainer = _StepMetricRecordingTrainer(events)
-    ctrl._gen = _StepMetricRecordingGeneration(events)
+    ctrl._gen = _StepMetricRecordingGeneration(events, dies_in=dies_in)
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
@@ -1700,7 +1799,10 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
         "get_step_metrics",
     ]
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
-    assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
+    if dies_in == "get_step_metrics":
+        assert "vllm/spec_acceptance_rate" not in train_metrics
+    else:
+        assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
 
 
 def test_train_pump_skips_generation_metrics_without_generation_handle(
@@ -2158,6 +2260,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],

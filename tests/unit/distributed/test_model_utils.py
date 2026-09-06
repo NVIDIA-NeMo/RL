@@ -26,6 +26,7 @@ from nemo_rl.distributed.model_utils import (
     DistributedLogprob,
     DistributedLogprobWithSampling,
     _compute_distributed_log_softmax,
+    _compute_distributed_selected_logprobs,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
@@ -40,6 +41,104 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+
+
+def test_compute_distributed_selected_logprobs(monkeypatch):
+    """Selected-token path matches gathering a complete log-softmax tensor."""
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+
+    torch.manual_seed(42)
+    logits = torch.randn(2, 5, 11, dtype=torch.float32)
+    target = torch.randint(0, logits.shape[-1], (2, 5))
+    target_mask = torch.zeros_like(target, dtype=torch.bool)
+    target_mask[0, 3] = True
+
+    actual = _compute_distributed_selected_logprobs(
+        logits,
+        masked_target=target,
+        target_mask=target_mask,
+        group=None,
+    )
+    expected = (
+        torch.log_softmax(logits, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    )
+    expected[target_mask] = 0.0
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_compute_distributed_selected_logprobs_without_output_reduce(monkeypatch):
+    """The caller can own the final selected-logprob reduction."""
+    reduce_ops = []
+
+    def fake_all_reduce(tensor, *, op, group):
+        reduce_ops.append(op)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    torch.manual_seed(42)
+    logits = torch.randn(2, 5, 11, dtype=torch.float32)
+    target = torch.randint(0, logits.shape[-1], (2, 5))
+    target_mask = torch.zeros_like(target, dtype=torch.bool)
+
+    actual = _compute_distributed_selected_logprobs(
+        logits,
+        masked_target=target,
+        target_mask=target_mask,
+        group=None,
+        reduce_output=False,
+    )
+    expected = (
+        torch.log_softmax(logits, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert reduce_ops == [
+        torch.distributed.ReduceOp.MAX,
+        torch.distributed.ReduceOp.SUM,
+    ]
+
+
+def test_compute_distributed_selected_logprobs_tp_shards(monkeypatch):
+    """TP-local selected values reduce to full-vocabulary token logprobs."""
+    torch.manual_seed(123)
+    full_logits = torch.randn(2, 5, 12, dtype=torch.float32)
+    target = torch.randint(0, full_logits.shape[-1], (2, 5))
+    global_max = full_logits.amax(dim=-1, keepdim=True)
+    shifted_full_logits = full_logits - global_max
+    global_sum_exp = shifted_full_logits.exp().sum(dim=-1, keepdim=True)
+    expected = (
+        torch.log_softmax(full_logits, dim=-1)
+        .gather(-1, target.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+    shard_size = full_logits.shape[-1] // 2
+    for rank in range(2):
+        vocab_start = rank * shard_size
+        vocab_end = vocab_start + shard_size
+        target_mask = (target < vocab_start) | (target >= vocab_end)
+        masked_target = target - vocab_start
+        masked_target[target_mask] = 0
+        remote_selected_logprobs = expected.masked_fill(~target_mask, 0.0)
+
+        def fake_all_reduce(tensor, *, op, group):
+            if op == torch.distributed.ReduceOp.MAX:
+                tensor.copy_(global_max)
+            elif tensor.shape == global_sum_exp.shape:
+                tensor.copy_(global_sum_exp)
+            else:
+                tensor.add_(remote_selected_logprobs)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        actual = _compute_distributed_selected_logprobs(
+            full_logits[..., vocab_start:vocab_end].contiguous(),
+            masked_target=masked_target,
+            target_mask=target_mask,
+            group=None,
+        )
+        torch.testing.assert_close(actual, expected)
 
 
 @ray.remote(num_gpus=1)

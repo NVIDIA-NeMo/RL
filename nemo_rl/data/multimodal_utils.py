@@ -19,10 +19,10 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from io import BytesIO
-from typing import Any, Optional, Union
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import requests
 import torch
@@ -32,6 +32,11 @@ from transformers import PreTrainedTokenizerBase
 from transformers.audio_utils import load_audio
 from transformers.video_utils import load_video
 
+if TYPE_CHECKING:
+    # Type-only: importing the data plane at module scope here would make
+    # ``nemo_rl.data_plane`` and ``nemo_rl.data`` mutually importing.
+    from nemo_rl.data_plane.interfaces import KVBatchMeta
+
 VLLM_MULTIMODAL_DATA_KEYS = frozenset({"vllm_images", "vllm_videos", "vllm_audios"})
 NATIVE_MULTIMODAL_KEYS = frozenset({"vllm_content", *VLLM_MULTIMODAL_DATA_KEYS})
 IMAGE_CONTENT_TYPES = frozenset({"input_image", "image", "image_url"})
@@ -40,7 +45,6 @@ AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
     {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
-NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
@@ -51,6 +55,8 @@ MEDIA_TAGS = {
     "video-audio": "<video-audio>",
 }
 MEDIA_TAGS_REVERSED = {v: k for k, v in MEDIA_TAGS.items()}
+CACHED_VIDEO_FRAME_MANIFEST_MAGIC = b"NEMO_RL_CACHED_VIDEO_FRAMES_V1\n"
+CACHED_VIDEO_FRAME_MANIFEST_MIME = "video/x-nemo-rl-cached-frames"
 
 DEFAULT_MEDIA_EXTENSIONS = {
     "image": ["png", "jpeg", "jpg", "img"],
@@ -99,6 +105,181 @@ def uses_image_placeholder(processor: Any) -> bool:
         rather than tokenized ``apply_chat_template``.
     """
     return type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
+
+
+# Wire-transport registries for multimodal fields. These are NOT the origin
+# of the packed-vs-per-token classification — ``data/processors.py`` is, where
+# every key from ``get_multimodal_keys_from_processor`` is wrapped in a
+# ``PackedTensor`` and the type maps are kept as plain tensors. These sets
+# mirror that decision by name, because once a value crosses the wire it is a
+# plain tensor and the type distinction is gone; the read-side consumers
+# (materialize's pad skip, get_multimodal_dict, truncate_tensors, both
+# seq-dim validators, the TQ fetch list) can only dispatch on the name.
+# Adding a modality therefore means updating processors.py AND the matching
+# set here; ``encode_multimodal_for_wire`` raises on anything unregistered.
+
+# Per-token: rectangular ``[B, S]`` type maps for text/image/video tokens.
+PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
+    {
+        "token_type_ids",  # gemma3: which tokens are image
+        "mm_token_type_ids",  # qwen2.5-vl (transformers>=5.3): text(0)/image(1)/video(2) for 3D RoPE
+    }
+)
+
+# Packed per-sample: jagged. ``PackedTensor`` in-memory; a single
+# ``torch.nested`` value on the wire, whose rows carry their own shapes.
+PACKED_MULTIMODAL_FIELDS = frozenset(
+    {
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "second_per_grid_ts",  # transformers 4.x spelling; kept for old pins
+        "input_features",
+        # qwen2.5/3-omni: ``Qwen2_5OmniProcessor.model_input_names`` appends
+        # both of these unconditionally, so any omni recipe emits them.
+        "feature_attention_mask",
+        "video_second_per_grid",
+        # nemotron-omni: per-image [H, W] and the RADIO temporal-patching
+        # frame count. Coupled with pixel_values (see
+        # ``batched_data_dict._COUPLED_MULTIMODAL_KEYS``); both pack on dim 0.
+        "imgs_sizes",
+        "num_frames",
+    }
+)
+
+
+# Suffix for the per-sample tag key carrying what ``to_wire``'s flattening
+# removes from the payload. The shapes ride inside ``KVBatchMeta.tags`` --
+# per-sample dicts the data plane transports and projects without knowing what
+# a pad shape is. Reassembly lives here, in the layer that owns
+# ``PackedTensor``.
+ROW_SHAPES_SUFFIX = "__row_shapes"
+
+
+def row_shapes_key(field: str) -> str:
+    """Companion tag key carrying per-row shapes for ``field``."""
+    return field + ROW_SHAPES_SUFFIX
+
+
+# Keys inside the :func:`row_shapes_key` tag value. A plain dict rather than a
+# record because ``tags`` rides TQ's own serializer.
+ROW_GEOMETRY_SHAPES = "shapes"
+ROW_GEOMETRY_PAD = "pad"
+
+
+# Include-list of multimodal fields every forward-running dispatch (logprob
+# *and* train) must ship so the trainer's forward matches the rollout. One wire
+# field per logical field: ``PACKED`` fields travel as a single nested tensor
+# whose rows carry their own shapes, and per-token fields are rectangular and
+# travel as plain tensors.
+WIRE_MULTIMODAL_FIELDS = PER_TOKEN_MULTIMODAL_FIELDS | PACKED_MULTIMODAL_FIELDS
+
+
+def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
+    """Multimodal wire fields the rollout actually wrote for this batch.
+
+    Intersecting with ``meta.fields`` is required, not defensive: the noop
+    adapter and the TQ contract both raise on a fetch for a field that was
+    never written, and text-only runs write none of these. Sorted for a
+    deterministic field list across ranks.
+    """
+    return sorted(WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
+
+
+def multimodal_row_tags(
+    multimodal: dict, sample_count: int
+) -> "Optional[list[dict[str, Any]]]":
+    """Per-sample tag rows carrying what ``to_wire``'s flattening removes.
+
+    ``KVBatchMeta.tags`` is the transport's channel for per-sample primitives:
+    it is aligned 1:1 with ``sample_ids`` and projected automatically by
+    ``subset``/``slice``/``concat``, so a worker holding a shard gets its own
+    rows without anyone re-keying them. The data plane never interprets the
+    contents.
+
+    Carries ``shapes`` (per-row, and unrecoverable once ``to_wire`` flattens)
+    and ``pad`` (the field's policy flag). Deliberately *not* a pad target: the
+    width padding lands at is scratch that the model discards -- mcore crops it
+    via ``imgs_sizes`` before patchification, and the AutoModel path rejects
+    mixed-resolution batches outright -- so each consumer pads to its own view
+    and nothing batch-wide has to be agreed across shards.
+    """
+    tags: list[dict[str, Any]] = [{} for _ in range(sample_count)]
+    for key, value in multimodal.items():
+        if key not in PACKED_MULTIMODAL_FIELDS or not isinstance(value, PackedTensor):
+            continue
+        # ``row_shapes()`` rather than ``to_wire()``: the payload is encoded
+        # separately by ``encode_multimodal_for_wire``, and ``to_wire``'s
+        # ``torch.cat`` would copy the whole column a second time only for it
+        # to be discarded here.
+        shapes = value.row_shapes()
+        if all(not row_shapes for row_shapes in shapes):
+            continue  # every logical row empty -- to_wire skips the field too
+        if len(shapes) != sample_count:
+            raise ValueError(
+                f"{key!r}: PackedTensor holds {len(shapes)} logical rows but the "
+                f"batch has {sample_count} samples. Tags are aligned 1:1 with "
+                "sample_ids, so a disagreement here would pair one sample's "
+                "pixels with another's shapes."
+            )
+        pad = value.pad_to_max_shape
+        for row, row_shapes in enumerate(shapes):
+            tags[row][row_shapes_key(key)] = {
+                ROW_GEOMETRY_SHAPES: row_shapes,
+                ROW_GEOMETRY_PAD: pad,
+            }
+    # ``None`` rather than ``B`` empty dicts: a text-only run has no packed
+    # field, and an all-empty tags list would still be pickled on every
+    # dispatch and re-sliced per DP rank in ``shard_meta_for_dp``.
+    return tags if any(tags) else None
+
+
+def reassemble_packed_multimodal(
+    fields: dict, tags: "Optional[list[dict[str, Any]]]" = None
+) -> None:
+    """In place: rebuild ``PackedTensor`` for packed fields, consuming companions.
+
+    Called by the read path once its columns are materialized. Leaves anything
+    that is not a wire-form packed field untouched, so it is safe to call on any
+    column dict.
+
+    Raises:
+        ValueError: A packed field arrived without its shapes companion. Every
+            producer mints the two together (``multimodal_row_tags`` beside
+            ``encode_multimodal_for_wire``) and every ``KVBatchMeta`` transform
+            projects ``tags`` alongside ``sample_ids``, so a missing companion
+            means the transport dropped it. Reconstructing anyway would hand
+            the model 1-D pixels and train image-blind without an error.
+    """
+    for key in list(fields):
+        if key not in PACKED_MULTIMODAL_FIELDS:
+            continue
+        value = fields[key]
+        if not (isinstance(value, torch.Tensor) and value.is_nested):
+            continue
+        rows = [t.get(row_shapes_key(key)) for t in tags] if tags is not None else None
+        present = [r for r in rows if r] if rows else []
+        if not present:
+            raise ValueError(
+                f"{key!r} arrived as a nested wire value but no sample carries a "
+                f"{row_shapes_key(key)!r} tag"
+                + (
+                    " (tags=None)"
+                    if tags is None
+                    else f" (checked {len(tags)} tag rows)"
+                )
+                + ". to_wire flattens each row, so without the companion the "
+                "true per-segment shapes are unrecoverable."
+            )
+        # Indexed, not ``.get``-with-default: a producer-side rename of either
+        # key must fail here rather than silently restore ``pad=False``, which
+        # changes what ``as_tensor`` hands the vision encoder.
+        fields[key] = PackedTensor.from_wire(
+            value,
+            [[] if r is None else r[ROW_GEOMETRY_SHAPES] for r in rows],  # type: ignore[union-attr]
+            pad_to_max_shape=bool(present[0][ROW_GEOMETRY_PAD]),
+        )
 
 
 class PackedTensor:
@@ -328,6 +509,14 @@ class PackedTensor:
                 raise IndexError(
                     f"dim_to_pack={self.dim_to_pack} is invalid for tensors with rank {rank}"
                 )
+            # Computed locally, never transported. Two shards padding to
+            # different widths is harmless because the width is scratch the
+            # model discards: mcore crops it via ``imgs_sizes`` before
+            # patchification (see
+            # ``test_dynamic_resolution_padding_is_cropped_before_radio_patchification``),
+            # and the AutoModel path rejects mixed-resolution batches outright,
+            # so every image there is already the same size. Keeping this local
+            # is what lets the data plane stay ignorant of padding.
             max_shape = [
                 max(tensor.shape[dim] for tensor in non_none_tensors)
                 for dim in range(rank)
@@ -668,6 +857,241 @@ class PackedTensor:
             pad_to_max_shape=pad_to_max_shapes[0],
         )
 
+    # ── Wire encoding (data-plane roundtrip) ─────────────────────────
+    # PackedTensor is a domain wrapper; the wire only handles
+    # ``torch.Tensor`` (incl. ``torch.nested``) and ``np.ndarray[object]``.
+    # ``to_wire`` / ``from_wire`` are the single boundary between the two
+    # representations.
+    #
+    # The geometry rides on ``KVBatchMeta.tags``, not as a companion column:
+    # ``to_wire`` flattens each row, so the shapes TQ records are flat lengths,
+    # not the true per-segment ones. See :func:`multimodal_row_tags`.
+
+    def _row_segments(self) -> list[list[torch.Tensor]]:
+        """Per logical row, its non-empty physical segments.
+
+        One entry per *logical* row. Under deduplication a logical row maps to
+        several shared physical segments (``_row_offsets`` /
+        ``_segment_indices``), so iterating ``self.tensors`` directly would
+        yield the physical segment count instead of the batch size.
+        ``_row_segment_indices`` degrades to ``[row]`` for the legacy
+        one-tensor-per-row layout.
+        """
+        # Built with an explicit loop rather than a comprehension: the
+        # ``is not None`` filter does not narrow ``Optional[Tensor]`` inside a
+        # comprehension, so the result would type as ``list[list[Tensor | None]]``.
+        row_segments: list[list[torch.Tensor]] = []
+        for row in range(len(self)):
+            segments: list[torch.Tensor] = []
+            for i in self._row_segment_indices(row):
+                segment = self.tensors[i]
+                if segment is not None:
+                    segments.append(segment)
+            row_segments.append(segments)
+        return row_segments
+
+    @staticmethod
+    def _shapes_of(row_segments: list[list[torch.Tensor]]) -> list[list[list[int]]]:
+        """``shapes[row][segment]`` for an already-walked row/segment list.
+
+        Shared by :meth:`row_shapes` and :meth:`to_wire` so the shape encoding
+        cannot drift between the tag minter and the payload encoder.
+        """
+        return [[list(t.shape) for t in segs] for segs in row_segments]
+
+    def row_shapes(self) -> list[list[list[int]]]:
+        """The ``shapes`` half of :meth:`to_wire`, without encoding the payload.
+
+        Callers that only need the geometry -- :func:`multimodal_row_tags` --
+        use this so they do not pay ``to_wire``'s ``torch.cat`` a second time.
+        """
+        return self._shapes_of(self._row_segments())
+
+    def to_wire(
+        self,
+    ) -> tuple[Optional[torch.Tensor], list[list[list[int]]]]:
+        """Encode as a flattened ``torch.jagged`` tensor plus its row shapes.
+
+        Returns ``(None, [])`` when every logical row is empty so the caller
+        can skip the field entirely. Otherwise:
+
+          * ``nested`` — one row per *logical* row, each row the 1-D concat of
+            that row's segments. Flattening is what makes ``torch.jagged``
+            total: rows vary only in dim 0, so ragged trailing dims and mixed
+            rank both encode, and nothing is padded to make a container accept
+            them. Empty rows become zero-length placeholders.
+          * ``shapes`` — ``shapes[row][segment]`` is that segment's true shape.
+            Required because TQ derives ``per_sample_shapes`` from the value it
+            is handed, so flat rows make it record flat lengths. The caller
+            ships this on ``KVBatchMeta.tags``; see
+            :func:`nemo_rl.data.multimodal_utils.multimodal_row_tags`.
+
+        Only ``dim_to_pack=0`` is supported today; other values would
+        need ``ragged_idx`` on the nested tensor and a matching
+        transpose in :meth:`from_wire`.
+        """
+        if self.dim_to_pack != 0:
+            raise NotImplementedError(
+                f"to_wire only supports dim_to_pack=0, got "
+                f"{self.dim_to_pack}. Non-zero requires ragged_idx "
+                "threading in torch.nested and a matching transpose "
+                "on the read side."
+            )
+        row_segments = self._row_segments()
+
+        # Each segment is flattened to 1-D and the row is the 1-D concat of its
+        # segments. Two consequences, both deliberate:
+        #
+        #   * Rows then differ only in dim 0, so ``torch.jagged`` accepts every
+        #     shape -- ragged trailing dims and mixed rank included. No padding
+        #     is materialized into the bytes that cross the wire or land in TQ
+        #     storage, and TQ never falls back to the deprecated strided layout.
+        #   * The per-row concat is 1-D, so it cannot raise on segments whose
+        #     trailing dims differ -- which is what previously forced
+        #     ``pad_to_max_shape`` to pad *before* the concat.
+        #
+        # The true shapes travel beside the payload (see the returned
+        # ``shapes``) because TQ derives ``per_sample_shapes`` from what it is
+        # handed: give it flat rows and it records flat lengths. Padding still
+        # happens for ``pad_to_max_shape`` values, but in worker memory at use
+        # time via :meth:`as_tensor`, not on the wire.
+        shapes = self._shapes_of(row_segments)
+        # ``reshape(-1)`` on contiguous processor output is a view, so the
+        # single-segment row -- one image per sample, the overwhelmingly common
+        # case -- costs nothing here. That is per-row only: the
+        # ``as_nested_tensor`` below routes to ``jagged_from_list``, which
+        # ``torch.cat``s every row into one values buffer, so no row is
+        # zero-copy end to end. One copy of the column is the floor.
+        rows: list[Optional[torch.Tensor]] = [
+            None
+            if not segs
+            else (
+                segs[0].reshape(-1)
+                if len(segs) == 1
+                else torch.cat([t.reshape(-1) for t in segs])
+            )
+            for segs in row_segments
+        ]
+
+        ref = next((t for t in rows if t is not None), None)
+        if ref is None:
+            return None, []
+
+        if any(t is None for t in rows):
+            placeholder = torch.zeros(0, dtype=ref.dtype, device=ref.device)
+            rows = [placeholder if t is None else t for t in rows]
+
+        nested = torch.nested.as_nested_tensor(rows, layout=torch.jagged)  # type: ignore[arg-type]
+        return nested, shapes
+
+    @classmethod
+    def from_wire(
+        cls,
+        nested: torch.Tensor,
+        shapes: list[list[list[int]]],
+        *,
+        pad_to_max_shape: bool = False,
+    ) -> Optional["PackedTensor"]:
+        """Reconstruct from the value produced by :meth:`to_wire`.
+
+        Returns ``None`` for an empty batch (no rows); the caller should
+        skip the field entirely rather than instantiate an empty
+        ``PackedTensor``.
+
+        ``shapes`` is the companion returned by :meth:`to_wire`, carried on
+        ``KVBatchMeta.tags`` (see :func:`multimodal_row_tags`). Each flat row is
+        split by segment ``numel`` and reshaped back to its true shape. It is
+        required, not optional: reconstructing without it yields 1-D segments,
+        which train image-blind without erroring.
+
+        A zero-length row means the sample had no media -- it becomes
+        ``None`` (not a ``(0, ...)`` tensor) so an image-free shard
+        reconstructs as legacy does: ``as_tensor`` returns ``None`` and
+        ``logical_segment_counts_by_row`` reports 0 rather than 1.
+
+        ``pad_to_max_shape`` is restored onto the rebuilt value as a flag, not
+        materialized. Segments come back at their true shapes and stay separate
+        via the CSR row map, so nothing is padded or concatenated here;
+        :meth:`as_tensor` pads at use time.
+
+        Mirrors :meth:`to_wire`; both assume ``dim_to_pack=0``.
+        """
+        if not nested.is_nested:
+            raise TypeError(
+                "from_wire expects the nested value produced by to_wire, got a "
+                f"dense tensor of shape {tuple(nested.shape)}. A dense value here "
+                "means codec.materialize padded the field -- check that its name "
+                "is in PACKED_MULTIMODAL_FIELDS."
+            )
+        unbound = list(nested.unbind())
+        if not unbound:
+            return None
+
+        if len(shapes) != len(unbound):
+            raise ValueError(
+                f"from_wire got {len(unbound)} wire rows but {len(shapes)} shape "
+                "entries; they are minted together by to_wire and must agree."
+            )
+
+        # Segments are rebuilt at their true shapes and kept separate via the
+        # CSR row map. No padding happens here: the data plane transports, and
+        # ``as_tensor`` pads at use time because a rectangle is a *model input*
+        # requirement (the vision encoder consumes one dense tensor), not a
+        # transport one. An empty row contributes no segments, so
+        # ``logical_segment_counts_by_row`` reports 0 as it did for ``None``.
+        segments_flat: list[torch.Tensor] = []
+        row_offsets: list[int] = [0]
+        for flat, row_shapes in zip(unbound, shapes):
+            # ``torch.split`` cuts the whole row in one dispatch; per-segment
+            # slicing costs O(segments) Python ops per row, on every fetch.
+            numels = [torch.Size(shape).numel() for shape in row_shapes]
+            segments_flat.extend(
+                view.reshape(shape)
+                for view, shape in zip(torch.split(flat, numels), row_shapes)
+            )
+            row_offsets.append(len(segments_flat))
+        return cls(
+            segments_flat,  # type: ignore[arg-type]
+            dim_to_pack=0,
+            pad_to_max_shape=pad_to_max_shape,
+            _row_offsets=row_offsets,
+            _segment_indices=list(range(len(segments_flat))),
+        )
+
+
+def encode_multimodal_for_wire(
+    k: str, v: Union["PackedTensor", torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """The wire value for one multimodal field. Dispatched by registry membership.
+
+    Returns ``None`` when the field has nothing to ship (an all-empty packed
+    batch), in which case the caller omits the column entirely. The wire key is
+    always ``k``: one wire field per logical field.
+
+    Payload only. Per-token fields ride rectangular; packed fields ride as one
+    flattened ``torch.jagged`` value. The geometry :meth:`PackedTensor.from_wire`
+    needs to undo that flattening -- per-row segment shapes plus the
+    ``pad_to_max_shape`` flag -- is minted separately by
+    :func:`multimodal_row_tags` and shipped on ``KVBatchMeta.tags``. TQ cannot
+    derive it, because it reads ``per_sample_shapes`` off the flattened rows it
+    is handed.
+    """
+    if k in PACKED_MULTIMODAL_FIELDS:
+        assert isinstance(v, PackedTensor), (
+            f"{k!r}: expected PackedTensor, got {type(v).__name__}"
+        )
+        nested, _shapes = v.to_wire()
+        return nested  # None for an all-empty batch
+    elif k in PER_TOKEN_MULTIMODAL_FIELDS:
+        assert isinstance(v, torch.Tensor), (
+            f"{k!r}: expected Tensor, got {type(v).__name__}"
+        )
+        return v
+    else:
+        raise KeyError(
+            f"unregistered multimodal field {k!r} — add to PACKED_/PER_TOKEN_MULTIMODAL_FIELDS"
+        )
+
 
 def get_multimodal_keys_from_processor(processor) -> list[str]:
     """Get keys of the multimodal data that can be used as model inputs.
@@ -890,24 +1314,25 @@ def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{encoded}"
 
 
-def _encode_single_image_source(source: str) -> str:
-    """Resolve and encode one image source."""
-    image = resolve_to_image(source)
-    try:
-        data_url = image_to_data_url(image)
-    finally:
-        image.close()
-    return data_url
+def get_responses_content_part_url(part: dict[str, Any], *keys: str) -> str:
+    """Return a string media source from a Responses/Chat content part."""
+    for key in keys:
+        value = part.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("path")
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
-def extract_input_image_sources_from_responses_messages(
+def extract_input_media_sources_from_responses_messages(
     messages: Any,
-) -> list[str | Image.Image]:
-    """Extract image sources from Responses-API messages in encounter order."""
+) -> list[tuple[str, Any]]:
+    """Extract tagged image and video sources in encounter order."""
     if not isinstance(messages, list):
         return []
 
-    sources: list[str | Image.Image] = []
+    sources: list[tuple[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -917,24 +1342,37 @@ def extract_input_image_sources_from_responses_messages(
         for part in content:
             if not isinstance(part, dict):
                 continue
-            if part.get("type") not in ("input_image", "image", "image_url"):
+            part_type = part.get("type")
+            if part_type in IMAGE_CONTENT_TYPES:
+                media_type = "image"
+                source = part.get("image") or part.get("image_url") or part.get("url")
+            elif part_type in VIDEO_CONTENT_TYPES:
+                media_type = "video"
+                source = part.get("video") or part.get("video_url") or part.get("url")
+            else:
                 continue
-            source = part.get("image") or part.get("image_url") or part.get("url")
             if isinstance(source, dict):
-                source = source.get("url")
+                source = source.get("url") or source.get("path")
+            # Skip non-str/non-Image sources: callers hand these straight to
+            # `resolve_to_image`, which would raise on e.g. an int `image_url`.
             if isinstance(source, (str, Image.Image)):
-                sources.append(source)
+                sources.append((media_type, source))
     return sources
 
 
-def extract_input_images_from_responses_messages(
-    messages: Any,
-) -> list[Image.Image]:
-    """Load images from Responses-API input messages in encounter order."""
-    return [
-        resolve_to_image(source)
-        for source in extract_input_image_sources_from_responses_messages(messages)
-    ]
+def media_sources_equal(
+    left: tuple[str, Any],
+    right: tuple[str, Any],
+) -> bool:
+    """Compare tagged media by string value or object identity."""
+    if left[0] != right[0]:
+        return False
+    left_source, right_source = left[1], right[1]
+    return (
+        left_source == right_source
+        if isinstance(left_source, str) and isinstance(right_source, str)
+        else left_source is right_source
+    )
 
 
 def _materialize_ragged_pixel_values(
@@ -1042,82 +1480,41 @@ def attach_image_model_inputs_to_message(
     )
 
 
-def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
-    """Replace local image paths in NeMo Gym examples with base64 data URLs.
+_VIDEO_EXT_TO_MIME = {
+    ".mp4": "mp4",
+    ".m4v": "mp4",
+    ".mov": "quicktime",
+    ".webm": "webm",
+    ".mkv": "x-matroska",
+    ".avi": "x-msvideo",
+}
 
-    Walks each example's ``responses_create_params.input[].content[]`` items,
-    collects local image references, encodes each unique source once using a
-    bounded thread pool, and rewrites every corresponding image part with the
-    resulting base64 ``data:`` URL. Parts whose URL already starts with
-    ``http://``, ``https://``, or ``data:`` are left untouched. Malformed items
-    (non-dict entries, missing/empty URLs, non-list ``input``/``content``) are
-    skipped without raising.
 
-    The examples are mutated in place; the same list is also returned for
-    convenience so callers can chain the call.
+def video_path_to_data_url(video_path: str) -> str:
+    """Inline a local or ``file://`` video as a base64 data URL."""
+    if video_path.startswith("data:"):
+        return video_path
 
-    Args:
-        nemo_gym_examples: List of NeMo Gym example dicts. Each example is
-            expected to contain a ``responses_create_params`` mapping with an
-            ``input`` list of Responses API messages.
+    resolved = (
+        video_path.removeprefix("file://")
+        if video_path.startswith("file://")
+        else str(Path(video_path).expanduser().resolve())
+    )
+    path = Path(resolved)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Video path resolved to {resolved!r}, which does not exist."
+        )
 
-    Returns:
-        The same ``nemo_gym_examples`` list, with local image references
-        rewritten to base64 data URLs in place.
-    """
-    targets_by_source: dict[str, list[tuple[dict, str]]] = {}
-
-    for example in nemo_gym_examples:
-        input_items = example.get("responses_create_params", {}).get("input", [])
-        if not isinstance(input_items, list):
-            continue
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if (
-                    not isinstance(part, dict)
-                    or part.get("type") not in IMAGE_CONTENT_TYPES
-                ):
-                    continue
-                media_key = next(
-                    (key for key in ("image_url", "image", "url") if key in part),
-                    None,
-                )
-                if media_key is None:
-                    continue
-                url = part.get(media_key)
-                if isinstance(url, dict):
-                    url = url.get("url") or url.get("path") or ""
-                if not isinstance(url, str) or not url:
-                    continue
-                if url.startswith(("http://", "https://", "data:")):
-                    continue
-                targets_by_source.setdefault(url, []).append((part, media_key))
-
-    sources = list(targets_by_source)
-    if sources:
-        with ThreadPoolExecutor(
-            max_workers=NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
-        ) as executor:
-            encoded_by_source = dict(
-                zip(
-                    sources,
-                    executor.map(_encode_single_image_source, sources),
-                    strict=True,
-                )
-            )
-
-        # Keep payload mutation on the caller thread after worker-owned images
-        # have been closed and every unique source has been encoded.
-        for source, targets in targets_by_source.items():
-            data_url = encoded_by_source[source]
-            for part, media_key in targets:
-                part[media_key] = data_url
-    return nemo_gym_examples
+    ext = path.suffix.lower()
+    mime = _VIDEO_EXT_TO_MIME.get(ext)
+    if mime is None:
+        raise ValueError(
+            f"Unsupported video extension {ext!r} for {resolved!r}. "
+            f"Supported: {sorted(_VIDEO_EXT_TO_MIME)}."
+        )
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:video/{mime};base64,{encoded}"
 
 
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
