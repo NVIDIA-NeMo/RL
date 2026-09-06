@@ -1035,7 +1035,7 @@ def test_native_mxfp8_refit_captures_bf16_destination_before_meta_window(
 
     def begin_update() -> None:
         events.append("begin")
-        bf16_param.data = torch.empty((32, 32), device="meta", dtype=torch.bfloat16)
+        bf16_param.data = torch.empty((32, 32), dtype=torch.bfloat16)
 
     adapter.begin_update = begin_update
     extension._nccl_reshard_refit_adapter = adapter
