@@ -148,6 +148,7 @@ def _make_worker(loss_type):
     # The step summary in finish_train_step reads it eagerly to decide whether
     # this rank prints.
     w.rank = 0
+    w.should_disable_forward_pre_hook = False
     # Also set in __init__: the finish path reads them to put the DDP forward
     # pre-hook back after the first optimizer step.
     w._first_train_step_forward_pre_hook_disabled = False
@@ -1173,6 +1174,38 @@ class TestPrepareForLpInference:
         assert first.args[1] == "cuda"
         assert first.kwargs == {"move_grads": False}
         w.model.eval.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("keep_train_buffers", "expected_param_sync"),
+        [(False, True), (True, False)],
+    )
+    def test_disables_param_gather_before_packed_logprobs(
+        self, mock_module_symbols, keep_train_buffers, expected_param_sync
+    ):
+        w = self._worker()
+        events = []
+        w.should_disable_forward_pre_hook = True
+        w._forward_pre_hook_enabled = MagicMock(return_value=True)
+        w._disable_forward_pre_hook_until_next_train_step = MagicMock(
+            side_effect=lambda **kwargs: events.append(("disable", kwargs))
+        )
+        w.move_model = MagicMock(
+            side_effect=lambda model, device, **kwargs: (
+                events.append(("move", device, kwargs)) or model
+            )
+        )
+
+        with patch("torch.randn"):
+            w.prepare_for_lp_inference(keep_train_buffers=keep_train_buffers)
+
+        assert events[0] == ("move", "cuda", {"move_grads": False})
+        assert events[1] == ("disable", {"param_sync": expected_param_sync})
+        if not keep_train_buffers:
+            assert events[2] == (
+                "move",
+                "cpu",
+                {"move_params": False, "move_grads": True},
+            )
 
     def test_keeps_buffers_across_an_open_step(self, mock_module_symbols):
         """The sequence the streaming pump actually produces: open a step, run a

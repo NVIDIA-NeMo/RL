@@ -742,6 +742,30 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
     assert worker._first_train_step_forward_pre_hook_disabled is True
 
 
+@pytest.mark.parametrize("hook_enabled", [False, True])
+def test_use_reference_model_preserves_forward_pre_hook_state(hook_enabled) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = lambda: hook_enabled
+    hook_events = []
+    worker.disable_forward_pre_hook = lambda: hook_events.append("disable")
+    worker.enable_forward_pre_hook = lambda: hook_events.append("enable")
+    worker.model = SimpleNamespace(state_dict=lambda: {})
+    worker.reference_state_dict = {}
+    worker._apply_state_dict_to_model = lambda *_args, **_kwargs: None
+    worker.sampling_params = None
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+
+    with worker.use_reference_model():
+        pass
+
+    assert hook_events == (["disable", "enable"] if hook_enabled else [])
+
+
 def test_prepare_for_generation_disables_param_gather_hook_before_wake(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

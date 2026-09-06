@@ -2018,7 +2018,10 @@ class MegatronPolicyWorkerImpl(
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         ## disable overlap param gather when swapping weights
-        if self.should_disable_forward_pre_hook:
+        reenable_forward_pre_hook = (
+            self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled()
+        )
+        if reenable_forward_pre_hook:
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
@@ -2074,7 +2077,7 @@ class MegatronPolicyWorkerImpl(
                 torch.cuda.empty_cache()
 
             ## re-enable overlap param gather after weight swap
-            if self.should_disable_forward_pre_hook:
+            if reenable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
@@ -3274,6 +3277,16 @@ class MegatronPolicyWorkerImpl(
         self._log_gpu_mem("lp_prep_enter")
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
+
+        # Packed logprob shards can require different numbers of forwards on
+        # different DP ranks, so their forwards cannot run DP collectives. Do
+        # the one required parameter gather before releasing any train buffer.
+        # During an open split train step, parameters are already gathered and
+        # the accumulated gradients must not be zeroed.
+        if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
+            self._disable_forward_pre_hook_until_next_train_step(
+                param_sync=not keep_train_buffers
+            )
 
         if not keep_train_buffers:
             # offload grads to cpu
