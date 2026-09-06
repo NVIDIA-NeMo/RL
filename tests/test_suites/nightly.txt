@@ -55,6 +55,7 @@ tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.s
 
 # Functional Nemotron-Omni 30B-A3B VLM GRPO runs (Megatron)
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.sh
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.sh
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.sh
 
 # Functional Qwen3.5-35B VLM GRPO run
@@ -62,6 +63,17 @@ tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v
 # https://github.com/vllm-project/vllm/issues/36237). The Megatron variant still
 # hangs in sample_tokens and stays disabled -- see disabled.txt.
 tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
+
+# TQ data-plane coverage for VLM: AutoModel on backend=simple, Megatron on
+# backend=mooncake_cpu. Each wrapper delegates to its base recipe with
+# data_plane.enabled=true.
+#
+# Qwen3.5 adds a gate the base cannot use: it trains one inner step per rollout,
+# so probs_ratio is an exact identity there. Nemotron-Omni adds none -- turning
+# the data plane on must not change what a recipe is held to, so its logprob
+# check lives on the base recipe instead.
+tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16-tq_simple.sh
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1-tq_mooncake.sh
 
 # Removing this until this issue is resolved: https://github.com/huggingface/transformers/issues/41190
 # tests/test_suites/vlm/vlm_grpo-smolvlm2-2.2b-instruct-clevr-1n2g-dtensor2tp1.v2.sh

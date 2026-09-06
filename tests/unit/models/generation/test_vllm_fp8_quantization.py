@@ -33,6 +33,8 @@ def fp8_module():
     old_config = fp8.global_fp8_config
     old_state = fp8.fp8_state
     old_patches_applied = fp8.fp8_patches_applied
+    old_run_engine_core = fp8.EngineCoreProc.run_engine_core
+    old_core_manager_init = fp8.CoreEngineProcManager.__init__
     fp8.global_fp8_config = None
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
@@ -43,10 +45,18 @@ def fp8_module():
         fp8.global_fp8_config = old_config
         fp8.fp8_state = old_state
         fp8.fp8_patches_applied = old_patches_applied
+        fp8.EngineCoreProc.run_engine_core = old_run_engine_core
+        fp8.CoreEngineProcManager.__init__ = old_core_manager_init
 
 
-def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
+@pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize("refit_with_reload_api", [False, True])
+def test_init_fp8_uses_mxfp8_quantization_config(
+    fp8_module, monkeypatch, async_engine, refit_with_reload_api
+):
     fp8 = fp8_module
+    original_run_engine_core = fp8.EngineCoreProc.run_engine_core
+    original_core_manager_init = fp8.CoreEngineProcManager.__init__
     applied_configs = []
 
     monkeypatch.setattr(
@@ -66,9 +76,10 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
         {
             "precision": "fp8",
             "kv_cache_dtype": "auto",
-            "async_engine": False,
+            "async_engine": async_engine,
             "is_mx": True,
             "use_deep_gemm": True,
+            "refit_with_reload_api": refit_with_reload_api,
         },
         "dummy-model",
         model_parallel_size=1,
@@ -85,7 +96,16 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
             }
         },
     }
-    assert applied_configs == [fp8.global_fp8_config]
+    assert fp8.global_fp8_config.refit_with_reload_api is refit_with_reload_api
+    if async_engine:
+        assert applied_configs == []
+        assert fp8.EngineCoreProc.run_engine_core is fp8.my_run_engine_core
+        assert fp8.CoreEngineProcManager.__init__ is fp8.my_init
+    else:
+        assert len(applied_configs) == 1
+        assert applied_configs[0] is fp8.global_fp8_config
+        assert fp8.EngineCoreProc.run_engine_core is original_run_engine_core
+        assert fp8.CoreEngineProcManager.__init__ is original_core_manager_init
     assert fp8.global_fp8_config.is_mx is True
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
@@ -135,6 +155,7 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
         "lm_head",
     ]
     assert quant_config["ignored_layers"] == ["lm_head"]
+    assert fp8.global_fp8_config.refit_with_reload_api is False
 
     modelopt_config = ModelOptMxFp8Config.from_config(quant_config)
     qwen3_quantizable_families = {
@@ -1155,8 +1176,6 @@ def test_init_fp8_rejects_non_pow2_mxfp8_scales(fp8_module, monkeypatch, field, 
         "from_pretrained",
         lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
     )
-    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _fp8_config: None)
-
     with pytest.raises(ValueError, match=error):
         fp8.init_fp8(
             {
@@ -1228,6 +1247,27 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         "ModelOptMxFp8FusedMoE.process_weights_after_loading" in path
         for path in patched_paths
     )
+    assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
+
+    fp8.fp8_state = fp8.FP8State()
+    fp8.fp8_patches_applied = False
+    patched_paths.clear()
+
+    reload_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+        use_activation_pow2_scale=True,
+        refit_with_reload_api=True,
+    )
+    fp8.apply_fp8_patches(None, reload_fp8_config)
+
+    assert fp8.global_fp8_config is reload_fp8_config
+    assert not any(
+        path.endswith("process_weights_after_loading") for path in patched_paths
+    )
+    assert not any("ModelOptMxFp8" in path for path in patched_paths)
+    assert any("per_token_group_quant_fp8" in path for path in patched_paths)
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
@@ -1388,6 +1428,82 @@ def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     assert layer.weight_scale_inv is scale_param
     # The processed values must actually land.
     assert torch.equal(layer.weight.data, torch.ones(4, 4))
+
+
+def test_mxfp8_load_weights_routes_moe_scales_to_checkpoint_params(
+    fp8_module, monkeypatch
+):
+    import torch
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    fp8 = fp8_module
+
+    captured_weights = []
+
+    def capture_load_weights(weights):
+        captured_weights.extend(weights)
+
+    def fake_mxfp8_e4m3_quantize(weight):
+        return (
+            torch.zeros_like(weight, dtype=torch.float8_e4m3fn),
+            torch.ones(*weight.shape[:-1], 1, dtype=torch.uint8),
+        )
+
+    fake_model = types.SimpleNamespace(load_weights=capture_load_weights)
+    fake_runner = types.SimpleNamespace(
+        model=fake_model,
+        vllm_config=types.SimpleNamespace(),
+    )
+
+    fp8.global_fp8_config = fp8.FP8Config(is_mx=True)
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", fake_mxfp8_e4m3_quantize)
+
+    fp8.load_weights(
+        [("model.layers.0.mlp.experts.w13_weight", torch.zeros(2, 32, 32))],
+        fake_runner,
+    )
+
+    assert [name for name, _ in captured_weights] == [
+        "model.layers.0.mlp.experts.w13_weight",
+        "model.layers.0.mlp.experts.w13_weight_scale_from_checkpoint",
+    ]
+
+
+def test_mxfp8_reload_iterator_emits_upstream_checkpoint_names(fp8_module, monkeypatch):
+    import torch
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    fp8 = fp8_module
+
+    def fake_mxfp8_e4m3_quantize(weight):
+        return (
+            torch.zeros_like(weight, dtype=torch.float8_e4m3fn),
+            torch.ones(*weight.shape[:-1], 1, dtype=torch.uint8),
+        )
+
+    fake_runner = types.SimpleNamespace(
+        model=object(),
+        vllm_config=types.SimpleNamespace(),
+    )
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    fp8.global_fp8_config = fp8.FP8Config(is_mx=True)
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", fake_mxfp8_e4m3_quantize)
+
+    quantized = list(
+        fp8.get_quantized_weight_iterator(
+            [("model.layers.0.mlp.experts.w13_weight", torch.zeros(2, 32, 32))],
+            fake_runner,
+            refit_with_reload_api=True,
+        )
+    )
+
+    assert [name for name, _ in quantized] == [
+        "model.layers.0.mlp.experts.w13_weight",
+        "model.layers.0.mlp.experts.w13_weight_scale",
+    ]
+    assert quantized[0][1].dtype == torch.float8_e4m3fn
+    assert quantized[1][1].dtype == torch.uint8
 
 
 def _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model=False):
@@ -1581,26 +1697,3 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
             assert weight.shape == shape
             assert scale.shape == (shape[0] // 128, shape[1] // 128)
             _assert_dequant_close(weight, scale, source[eid])
-
-
-def test_load_weights_rejects_grouped_experts_for_mxfp8(fp8_module, monkeypatch):
-    """Grouped MoE expansion only implements blockwise FP8, not MXFP8."""
-    import torch
-
-    fp8 = fp8_module
-    fp8.global_fp8_config = types.SimpleNamespace(
-        use_weight_pow2_scale=False, is_mx=True
-    )
-    model = _grouped_expert_model(fp8, monkeypatch, torch.float8_e4m3fn)
-    model.load_weights = lambda pairs: pytest.fail("must raise before loading")
-
-    with pytest.raises(NotImplementedError, match="MXFP8"):
-        fp8.load_weights(
-            [
-                (
-                    "model.layers.0.mlp.experts.gate_up_proj",
-                    torch.randn(2, 512, 384).to(torch.bfloat16),
-                )
-            ],
-            types.SimpleNamespace(model=model),
-        )

@@ -615,6 +615,14 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "dynamic expert load balancing can change ownership afterwards)."
         )
 
+    if vllm_cfg.get("refit_with_reload_api"):
+        violations.append(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+            "explicitly unsupported with refit_transport='nccl_reshard' "
+            "(nccl_reshard_refit is its own refit path and does not use "
+            "vLLM's reload_weights API)."
+        )
+
     # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
     # through vLLM's layerwise-reload weight loaders; the bulk xferdtensor
     # path writes directly into param storage, bypassing both.

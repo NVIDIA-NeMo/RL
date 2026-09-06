@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
-
 from nemo_rl.environments.nemo_gym import NemoGym
 
 
@@ -71,7 +69,14 @@ def test_nemo_gym_postprocess_slices_routed_experts():
     assert message_log[3]["routed_experts"].tolist() == second_turn_routes[5:7]
 
 
-def test_nemo_gym_postprocess_requires_routed_experts_when_configured():
+def test_nemo_gym_postprocess_tolerates_missing_routed_experts_when_configured():
+    """A trainable item without routes is kept routeless, not rejected.
+
+    Routes can be legitimately unrecoverable on the echo path (e.g. a
+    context-overflow rollout); ``backfill_missing_routed_experts`` sentinel-fills
+    such messages at flatten time and a batch-wide absence still fails at the
+    rollout actor's ``ROUTED_EXPERTS_FIELD`` guard.
+    """
     nemo_gym_result = {
         "response": {
             "output": [
@@ -88,10 +93,16 @@ def test_nemo_gym_postprocess_requires_routed_experts_when_configured():
     class _MockSelf:
         cfg = {"require_routed_experts": True}
 
-    with pytest.raises(ValueError, match="requires NeMo Gym output items"):
+    result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
             _MockSelf(), {}, nemo_gym_result, _Tokenizer()
         )
+    )
+
+    message_log = result["message_log"]
+    assert [message["role"] for message in message_log] == ["user", "assistant"]
+    assert message_log[1]["token_ids"].tolist() == [3]
+    assert all("routed_experts" not in message for message in message_log)
 
 
 def test_nemo_gym_postprocess_casts_routed_experts_to_configured_dtype():
