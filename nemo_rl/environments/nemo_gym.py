@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import math
 import os
 import subprocess
@@ -223,6 +224,21 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
+    # Ledger-authoritative token capture (token_capture.enabled): the dumped
+    # TokenCaptureConfig. Turns on external staging in Gym's policy model
+    # server, switches run_rollouts to receipt mode, and assembles receipts
+    # from the manifest control route. None/absent = legacy token-echo path.
+    token_capture: NotRequired[Dict[str, Any] | None]
+
+
+# Gym control-plane server name (the model server hosting the ledger) and the
+# opaque run-body key rollout ids ride on (Gym's ROLLOUT_ID_KEY_NAME): the
+# agent derives the id from the run body and stamps /ng-rollout/<id> on every
+# model call, so the TQ sample id IS the capture key end to end.
+_POLICY_SERVER_NAME = "policy_model"
+_NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
+_TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
+_TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -446,6 +462,49 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
+        # Ledger-authoritative token capture: enable external staging in the
+        # policy model server (via the policy_model global-config override
+        # block the env yamls already use) and disable the legacy token echo.
+        token_capture = self.cfg.get("token_capture") or None
+        self._token_capture_enabled = bool(
+            token_capture and token_capture.get("enabled")
+        )
+        self._server_client = None
+        self._control_headers: Dict[str, str] = {}
+        self._control_timeout_s = 60.0
+        if self._token_capture_enabled:
+            policy_overrides = (
+                initial_global_config_dict.setdefault("policy_model", {})
+                .setdefault("responses_api_models", {})
+                .setdefault("vllm_model", {})
+            )
+            policy_overrides["return_token_id_information"] = False
+            capture_dir = os.path.abspath(token_capture["capture_dir"])
+            initial_global_config_dict["token_id_capture"] = {
+                "enabled": True,
+                "all_agents": True,
+                "rebuild_response": False,
+                "dir": capture_dir,
+                # The lineage store is process-shared and doubles as the
+                # per-rollout capture ledger. Every uvicorn worker builds its
+                # own handle over the same root, so token-in ancestry remains
+                # valid when consecutive calls land on different workers.
+                "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
+                "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
+                "external_staging": True,
+                "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
+            }
+            # Gym resolves the credential inside each serving process. Keep
+            # only the variable name in serialized config and inherit the
+            # secret through the server process environment.
+            os.environ[_TOKEN_CAPTURE_CONTROL_ENV] = token_capture["control_auth_token"]
+            self._control_headers = {
+                "Authorization": f"Bearer {token_capture['control_auth_token']}"
+            }
+            self._control_timeout_s = float(
+                token_capture.get("control_timeout_s") or 60.0
+            )
+
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
@@ -486,6 +545,43 @@ Depending on your data shape, you may want to change these values."""
         value, so it still pays per task.
         """
         self._tokenizer = tokenizer
+
+    # ── ledger control plane (token-capture mode) ───────────────────────────
+
+    def _control_client(self):
+        """Gym ServerClient resolving servers by name from the head server."""
+        if self._server_client is None:
+            from nemo_gym.server_utils import ServerClient
+
+            self._server_client = ServerClient.load_from_global_config(
+                self.head_server_config
+            )
+        return self._server_client
+
+    async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
+        headers = {**kwargs.pop("headers", {}), **self._control_headers}
+        try:
+            response = await asyncio.wait_for(
+                self._control_client().request(
+                    server_name=_POLICY_SERVER_NAME,
+                    url_path=path,
+                    method=method,
+                    headers=headers,
+                    **kwargs,
+                ),
+                timeout=self._control_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"ledger control call {method} {path} exceeded "
+                f"{self._control_timeout_s}s (control plane unreachable or stalled)"
+            ) from None
+        if response.status != 200:
+            raise RuntimeError(
+                f"ledger control call {method} {path} failed: "
+                f"HTTP {response.status} {await response.text()}"
+            )
+        return await response.json()
 
     async def run_rollouts(
         self,
@@ -541,15 +637,23 @@ Depending on your data shape, you may want to change these values."""
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_row,
-                    nemo_gym_result,
-                    tokenizer,
-                    include_initial_multimodal_data=not deduplicate_multimodal_data,
-                )
-                if _has_nan_generation_logprobs(nemo_rl_result):
-                    raise RuntimeError("Generation logprobs contain NaN")
-
+                if self._token_capture_enabled:
+                    # Receipt mode: fetch the ledger manifest and assemble the
+                    # receipt locally; token-free result. The canonical row is
+                    # rebuilt by the finalizer, so no message_log walk (and no
+                    # NaN check) applies here.
+                    nemo_rl_result = await self._postprocess_receipt_mode(
+                        nemo_gym_row, nemo_gym_result
+                    )
+                else:
+                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                        nemo_gym_row,
+                        nemo_gym_result,
+                        tokenizer,
+                        include_initial_multimodal_data=not deduplicate_multimodal_data,
+                    )
+                    if _has_nan_generation_logprobs(nemo_rl_result):
+                        raise RuntimeError("Generation logprobs contain NaN")
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):
@@ -579,6 +683,177 @@ Depending on your data shape, you may want to change these values."""
                 )
 
             yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
+
+    async def _postprocess_receipt_mode(
+        self, nemo_gym_row: dict, nemo_gym_result: dict
+    ) -> dict:
+        """Fetch the ledger manifest and assemble the receipt locally.
+
+        The legacy token walk (and its contiguity assert) does not run: the
+        capture ledger owns lineage, output items carry no token arrays, and
+        the canonical row is rebuilt by the finalizer from staged deltas. The
+        Ray return carries only the receipt (~100 B/call) beside the
+        agent-level result.
+        """
+        assert isinstance(nemo_gym_result, dict), (
+            f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
+        )
+        rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
+        # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the
+        # harness kept (``response.id``), not the logical-request header.
+        terminal_response_id = nemo_gym_result.get("terminal_response_id")
+        if not (isinstance(terminal_response_id, str) and terminal_response_id):
+            # A harness that reports no terminal id still gets its manifest
+            # fetched; receipt assembly attributes the terminal from the
+            # scored response, falling back to heuristic selection.
+            terminal_response_id = None
+        scored_response = nemo_gym_result.get("response")
+        if not isinstance(scored_response, dict):
+            scored_response = None
+        receipt = None
+        try:
+            manifest = await self._control(
+                "GET",
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
+            )
+            receipt = self._assemble_receipt(
+                rollout_id,
+                manifest,
+                terminal_response_id=terminal_response_id,
+                scored_response=scored_response,
+                reward=float(nemo_gym_result.get("reward") or 0.0),
+            )
+        except (RuntimeError, OSError) as error:
+            # An unfetchable manifest finalizes as a placeholder row.
+            print(f"manifest({rollout_id}) fetch failed: {error}", flush=True)
+        return {
+            "message_log": [],
+            "input_message_log": [],
+            "full_result": nemo_gym_result,
+            "rollout_id": rollout_id,
+            "receipt": receipt,
+        }
+
+    @staticmethod
+    def _assemble_receipt(
+        rollout_id: str,
+        manifest: dict,
+        *,
+        terminal_response_id: Optional[str],
+        scored_response: Optional[dict] = None,
+        reward: float,
+    ) -> dict:
+        """Build the token-free RolloutReceipt payload from a ledger manifest.
+
+        ``terminal_response_id`` is the served response envelope id the
+        harness reports for the completion it kept (Gym's
+        ``terminal_response_id`` result key), forwarded to ``resolve_terminal``
+        as ``declared_response_id``. It is not the logical-request header.
+
+        Terminal selection is staged, fail-closed at every stage:
+
+        1. Witness attribution (``resolve_terminal``): the declared response
+           id (``terminal_response_id``), the scored response's
+           envelope id, and its content fingerprints each independently name
+           a manifest row through ``CallRecord.response_id`` and the recorded
+           fingerprints. Agreeing witnesses attribute; a declared id that
+           matches no row masks and never falls back; disagreeing witnesses
+           attribute nothing.
+        2. Heuristic fallback (``select_terminal_call``): with no witness,
+           the manifest's explicit parent links infer the terminal
+           (fail-closed: ambiguity masks).
+
+        The receipt records the resolving stage in ``terminal_selection``
+        (``declared``/``response_id``/``content``/``heuristic`` — failed
+        selections stamp the last stage attempted) and the witness trail in
+        ``terminal_attribution_reason``. Retry duplicates are dead-branch
+        rows: they stay in the manifest (their staged rows are fetched,
+        verified, and cleaned) but never join the terminal chain —
+        ``verify_and_linearize`` tolerates rows unreferenced by the terminal
+        chain.
+
+        Poisoning is fail-closed with one carve-out. A failure row whose
+        reason is ``request_finished_without_staged_coordinates`` is a call
+        that never returned a completion (the ledger commit precedes the
+        response leaving the server) and can never be a lineage parent (an
+        uncommitted call has no row to resolve against) — e.g. the doomed
+        final call of a rollout that exhausted the model's context window.
+        Such rows are structurally off-chain and do not poison; if the
+        *terminal* request itself died this way, the missing-terminal-row
+        check below still masks the rollout. Every other failure reason
+        (``worker_capture_failed``, ``invalid_worker_commit_coordinates``)
+        marks a call whose completion WAS served — a hole in the chain —
+        and poisons.
+        """
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
+        from nemo_gym.token_id_capture.staging import resolve_terminal
+        from nemo_gym.token_id_capture.staging.records import CallRecord
+        from nemo_gym.token_id_capture.staging.terminal import select_terminal_call
+
+        records = [dict(record) for record in manifest.get("records") or []]
+        failures = list(manifest.get("failures") or [])
+        deduped: dict[str, dict] = {}
+        for record in records:
+            deduped.setdefault(str(record.get("model_call_id")), record)
+        terminal_record = None
+        selection_reason = None
+        attribution_reason = None
+        terminal_selection = "heuristic"
+        parsed_records = None
+        try:
+            parsed_records = [
+                CallRecord.model_validate(record) for record in deduped.values()
+            ]
+        except ValueError:
+            selection_reason = "invalid_manifest_row"
+        if parsed_records is not None:
+            attribution = resolve_terminal(
+                parsed_records,
+                scored_response,
+                declared_response_id=terminal_response_id,
+            )
+            attribution_reason = attribution.reason or None
+            if attribution.attributed:
+                terminal_selection = attribution.method
+                terminal_record = deduped[attribution.model_call_id]
+            elif terminal_response_id is not None:
+                # A declaration is authoritative: a declared id the ledger
+                # cannot confirm masks and never falls back to the heuristic.
+                terminal_selection = "declared"
+                selection_reason = None
+            else:
+                selection = select_terminal_call(parsed_records)
+                if selection.terminal_model_call_id is not None:
+                    terminal_record = deduped[selection.terminal_model_call_id]
+                else:
+                    selection_reason = selection.reason
+        poisoning_failures = [
+            failure
+            for failure in failures
+            if str(failure.get("reason") or "") != UNCOMMITTED_CALL_REASON
+        ]
+        failure_reason = None
+        if poisoning_failures:
+            failure_reason = str(
+                poisoning_failures[0].get("reason") or "capture_failed"
+            )
+        elif terminal_record is None:
+            failure_reason = selection_reason or "missing_terminal_row"
+        return {
+            "rollout_id": rollout_id,
+            "reward": reward,
+            "terminal_model_call_id": (
+                terminal_record.get("model_call_id")
+                if terminal_record is not None
+                else None
+            ),
+            "manifest": list(deduped.values()),
+            "capture_poisoned": failure_reason is not None,
+            "failure_reason": failure_reason,
+            "terminal_selection": terminal_selection,
+            "terminal_attribution_reason": attribution_reason,
+        }
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
@@ -706,12 +981,22 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         f"{expected_tokens}."
                     )
             elif self.cfg.get("require_routed_experts", False):
-                raise ValueError(
-                    "policy.router_replay.enabled=true requires NeMo Gym output "
-                    "items to include routed_experts, but the field was missing. "
-                    "Make sure the Gym repo includes routed_experts propagation "
-                    "and the NeMo-RL vLLM OpenAI-compatible server is configured "
-                    "with enable_return_routed_experts."
+                # Routes can be legitimately unrecoverable on the echo path
+                # (e.g. a context-overflow rollout whose only persisted
+                # completion record is the gate's synthetic empty response).
+                # Leave the message routeless: backfill_missing_routed_experts
+                # sentinel-fills it at flatten and Megatron self-routes those
+                # tokens; total absence across a batch still fails loudly at
+                # the rollout actor's ROUTED_EXPERTS_FIELD guard.
+                print(
+                    "router_replay: trainable Gym output item without "
+                    "routed_experts — falling back to the missing-route "
+                    "sentinel for this message "
+                    f"[item_idx={len(nemo_rl_message_log) // 2}, "
+                    f"item_type={output_item_dict.get('type')!r}, "
+                    f"n_prompt={len(prompt_token_ids)}, "
+                    f"n_gen={len(generation_token_ids)}]",
+                    flush=True,
                 )
 
             # The next prompt prefill supplies the real route for the previous
@@ -973,6 +1258,7 @@ def build_nemo_gym_config(
     model_name: str,
     enable_router_replay: bool,
     use_fastokens: bool,
+    token_capture: Optional[dict[str, Any]] = None,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a NeMo-Gym actor.
 
@@ -1037,6 +1323,7 @@ def build_nemo_gym_config(
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
+        token_capture=token_capture,
         **multimodal_flags,
     )
 
@@ -1049,6 +1336,7 @@ def spinup_nemo_gym_actor(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    token_capture: Optional[dict[str, Any]] = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -1061,6 +1349,9 @@ def spinup_nemo_gym_actor(
             rollout call. See ``NemoGym.set_tokenizer`` for why that
             distinction is the difference between a working run and a stalled
             one.
+        token_capture: Dumped ``TokenCaptureConfig`` when ledger-authoritative
+            token capture is enabled, else ``None``. Forwarded to
+            ``build_nemo_gym_config``.
 
     Returns:
         The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
@@ -1071,6 +1362,7 @@ def spinup_nemo_gym_actor(
         model_name=model_name,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        token_capture=token_capture,
     )
 
     nemo_gym_opts: dict[str, Any] = {
