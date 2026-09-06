@@ -53,6 +53,12 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
+    """Command each Ray actor launches under, one entry per uv extra combination.
+
+    Every uv command below is rewritten to SYSTEM when NEMO_RL_PY_EXECUTABLES_SYSTEM
+    is set to 1, so callers never apply that check themselves.
+    """
+
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
@@ -82,6 +88,28 @@ class PY_EXECUTABLES:
 
     # Use NeMo-RL direct dependencies and TRT-LLM.
     TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and ModelOpt.
+    MODELOPT_VLLM = (
+        f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+    )
+    MODELOPT_AUTOMODEL = (
+        f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+    )
+    MODELOPT_MCORE = (
+        f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+    )
+
+    @classmethod
+    def _resolve_system_overrides(cls) -> None:
+        """Rewrite every uv command constant to the system executable when the flag is set."""
+        if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") != "1":
+            return
+        for name in [n for n in vars(cls) if n.isupper()]:
+            setattr(cls, name, cls.SYSTEM)
+
+
+PY_EXECUTABLES._resolve_system_overrides()
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200

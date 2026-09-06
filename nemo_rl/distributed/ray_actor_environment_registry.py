@@ -12,34 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
-USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
-VLLM_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.VLLM
-)
-SGLANG_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.SGLANG
-)
-MCORE_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MCORE
-)
-TRTLLM_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.TRTLLM
-)
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
-    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
-    "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": VLLM_EXECUTABLE,
-    "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": SGLANG_EXECUTABLE,
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": PY_EXECUTABLES.VLLM,
+    "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": PY_EXECUTABLES.VLLM,
+    "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": PY_EXECUTABLES.SGLANG,
     "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": PY_EXECUTABLES.FSDP,
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": PY_EXECUTABLES.AUTOMODEL,
     "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2": PY_EXECUTABLES.AUTOMODEL,
-    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
-    "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": MCORE_EXECUTABLE,
-    "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": TRTLLM_EXECUTABLE,
+    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": PY_EXECUTABLES.MCORE,
+    "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": PY_EXECUTABLES.MCORE,
+    "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": PY_EXECUTABLES.TRTLLM,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.math_environment.MathMultiRewardEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.vlm_environment.VLMEnvironment": PY_EXECUTABLES.SYSTEM,
@@ -60,11 +45,13 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
+    # ModelOpt actors need the modelopt extra on top of their backend extra.
+    "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker": PY_EXECUTABLES.MODELOPT_VLLM,
+    "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantAsyncGenerationWorker": PY_EXECUTABLES.MODELOPT_VLLM,
+    "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker": PY_EXECUTABLES.MODELOPT_AUTOMODEL,
+    "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2": PY_EXECUTABLES.MODELOPT_AUTOMODEL,
+    "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker": PY_EXECUTABLES.MODELOPT_MCORE,
 }
-
-from nemo_rl.modelopt.registry import MODELOPT_ACTOR_REGISTRY
-
-ACTOR_ENVIRONMENT_REGISTRY.update(MODELOPT_ACTOR_REGISTRY)
 
 
 def get_actor_python_env(actor_class_fqn: str) -> str:

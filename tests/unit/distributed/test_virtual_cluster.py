@@ -732,3 +732,31 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     # Avoid privileged ports (<1024).
     assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
+
+
+@pytest.mark.parametrize("use_system_executable", [False, True])
+def test_py_executables_honor_system_flag(monkeypatch, use_system_executable):
+    original_values = {
+        name: value for name, value in vars(PY_EXECUTABLES).items() if name.isupper()
+    }
+
+    try:
+        monkeypatch.setenv(
+            "NEMO_RL_PY_EXECUTABLES_SYSTEM", "1" if use_system_executable else "0"
+        )
+        # The flag is resolved once at import, so re-run it after changing the env.
+        PY_EXECUTABLES._resolve_system_overrides()
+
+        current = {
+            name: value
+            for name, value in vars(PY_EXECUTABLES).items()
+            if name.isupper()
+        }
+        if use_system_executable:
+            assert set(current.values()) == {PY_EXECUTABLES.SYSTEM}
+        else:
+            assert current == original_values
+    finally:
+        # _resolve_system_overrides only ever overwrites, so put the uv commands back here.
+        for name, value in original_values.items():
+            setattr(PY_EXECUTABLES, name, value)
