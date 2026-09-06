@@ -943,10 +943,11 @@ def test_process_mxfp8_moe_refit_uses_batched_flashinfer_shuffle(
         is_mx=True,
     )
 
-    w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
-    w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
-    w13_scale = torch.nn.Parameter(torch.zeros(2, 4, 1), requires_grad=False)
-    w2_scale = torch.nn.Parameter(torch.zeros(2, 3, 1), requires_grad=False)
+    w13_rows = 256 if is_gated else 128
+    w13_weight = torch.nn.Parameter(torch.zeros(2, w13_rows, 512), requires_grad=False)
+    w2_weight = torch.nn.Parameter(torch.zeros(2, 512, 128), requires_grad=False)
+    w13_scale = torch.nn.Parameter(torch.zeros(2, w13_rows, 16), requires_grad=False)
+    w2_scale = torch.nn.Parameter(torch.zeros(2, 512, 4), requires_grad=False)
     w13_scale_from_checkpoint = torch.ones_like(w13_scale)
     w2_scale_from_checkpoint = torch.ones_like(w2_scale)
     layer = types.SimpleNamespace(
@@ -1070,13 +1071,13 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     )
 
     layer = torch.nn.Module()
-    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
-    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
+    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 128, 512), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 512, 128), requires_grad=False)
     layer.w13_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 4, 1), requires_grad=False
+        torch.zeros(2, 128, 16), requires_grad=False
     )
     layer.w2_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 3, 1), requires_grad=False
+        torch.zeros(2, 512, 4), requires_grad=False
     )
     layer.w13_weight_scale.weight_loader = object()
     layer.w2_weight_scale.weight_loader = object()
@@ -1161,6 +1162,307 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     }
 
 
+@pytest.mark.parametrize("is_gated", [False, True])
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_process_mxfp8_moe_padding_preserves_refit_tensors(
+    fp8_module, monkeypatch, is_gated, tp_size
+):
+    from vllm.model_executor import parameter as vllm_parameter
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+    )
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+
+    def make_parameter(value):
+        parameter = torch.nn.Parameter(value, requires_grad=False)
+        parameter.weight_loader = lambda *_args, **_kwargs: None
+        return parameter
+
+    layer = torch.nn.Module()
+    w13_rows = 64 if is_gated else 32
+    w13 = torch.ones(1, w13_rows, 128)
+    if is_gated:
+        w13[:, 32:].fill_(5)
+    layer.register_parameter("w13_weight", make_parameter(w13))
+    layer.register_parameter("w2_weight", make_parameter(torch.ones(1, 128, 32)))
+    layer.register_parameter(
+        "w13_weight_scale",
+        make_parameter(torch.full((1, w13_rows, 4), 2, dtype=torch.uint8)),
+    )
+    layer.register_parameter(
+        "w2_weight_scale",
+        make_parameter(torch.full((1, 128, 1), 2, dtype=torch.uint8)),
+    )
+    layer._expert_routing_tables = lambda: (None, None, None)
+
+    moe_config = types.SimpleNamespace(
+        is_act_and_mul=is_gated,
+        hidden_dim=128,
+        hidden_dim_unpadded=128,
+        intermediate_size=32 * tp_size,
+        intermediate_size_per_partition=32,
+        intermediate_size_per_partition_unpadded=32,
+        moe_parallel_config=types.SimpleNamespace(tp_size=tp_size),
+    )
+    kernel = object()
+    kernel_configs = []
+    quant_method = types.SimpleNamespace(
+        moe=moe_config,
+        moe_kernel=None,
+        mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
+        experts_cls=types.SimpleNamespace(is_monolithic=lambda: True),
+        get_fused_moe_quant_config=lambda _layer: object(),
+    )
+
+    def make_kernel(**kwargs):
+        kernel_configs.append(kwargs["moe_config"])
+        return kernel
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8.make_fp8_moe_kernel",
+        make_kernel,
+    )
+    monkeypatch.setattr(
+        fp8,
+        "_shuffle_mxfp8_moe_batched",
+        lambda _layer, w13, w2, s13, s2, _gated, _tile: (w13, w2, s13, s2),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.utils.flashinfer_utils.swap_w13_to_w31",
+        lambda value: value,
+    )
+
+    fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
+
+    assert tuple(layer.w13_weight.shape) == (1, w13_rows, 128)
+    assert tuple(layer.w2_weight.shape) == (1, 128, 32)
+    assert tuple(layer.w13_weight_scale_from_checkpoint.shape) == (1, w13_rows, 4)
+    assert tuple(layer.w2_weight_scale_from_checkpoint.shape) == (1, 128, 1)
+    expected_w13_rows = 256 if is_gated else 128
+    assert tuple(layer.w13_weight_for_apply.shape) == (1, expected_w13_rows, 512)
+    assert tuple(layer.w2_weight_for_apply.shape) == (1, 512, 128)
+    assert tuple(layer.w13_weight_scale.shape) == (1, expected_w13_rows, 16)
+    assert tuple(layer.w2_weight_scale.shape) == (1, 512, 4)
+    assert torch.count_nonzero(layer.w13_weight_for_apply[:, :, 128:]) == 0
+    assert torch.all(layer.w13_weight_scale[:, :, 4:] == 127)
+    if is_gated:
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:128, :]) == 0
+        assert torch.all(layer.w13_weight_for_apply[:, 128:160, :128] == 5)
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 160:, :]) == 0
+        assert torch.all(layer.w13_weight_scale[:, 32:128, :] == 127)
+        assert torch.all(layer.w13_weight_scale[:, 160:, :] == 127)
+    else:
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:, :]) == 0
+        assert torch.all(layer.w13_weight_scale[:, 32:, :] == 127)
+    assert torch.count_nonzero(layer.w2_weight_for_apply[:, 128:, :]) == 0
+    assert torch.count_nonzero(layer.w2_weight_for_apply[:, :, 32:]) == 0
+    assert torch.all(layer.w2_weight_scale[:, 128:, :] == 127)
+    assert torch.all(layer.w2_weight_scale[:, :, 1:] == 127)
+    assert kernel_configs[0].hidden_dim == 512
+    assert kernel_configs[0].intermediate_size_per_partition == 128
+    assert kernel_configs[0].intermediate_size == 128 * tp_size
+
+    x = torch.randn(2, 128)
+    padded_x = torch.nn.functional.pad(x, (0, 512 - x.shape[-1]))
+    if is_gated:
+        reference_hidden = torch.nn.functional.silu(x @ w13[0, :32].T) * (
+            x @ w13[0, 32:].T
+        )
+        padded_hidden = torch.nn.functional.silu(
+            padded_x @ layer.w13_weight_for_apply[0, :128].T
+        ) * (padded_x @ layer.w13_weight_for_apply[0, 128:].T)
+    else:
+        reference_hidden = torch.relu(x @ w13[0].T)
+        padded_hidden = torch.relu(padded_x @ layer.w13_weight_for_apply[0].T)
+    reference_output = reference_hidden @ layer.w2_weight[0].T
+    padded_output = padded_hidden @ layer.w2_weight_for_apply[0].T
+    torch.testing.assert_close(
+        padded_output[:, :128], reference_output, rtol=1e-4, atol=1e-3
+    )
+    assert torch.count_nonzero(padded_output[:, 128:]) == 0
+
+    apply_parameter_ids = {
+        name: id(getattr(layer, name))
+        for name in (
+            "w13_weight_for_apply",
+            "w2_weight_for_apply",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        )
+    }
+    apply_storage_ptrs = {
+        name: getattr(layer, name).data_ptr() for name in apply_parameter_ids
+    }
+    with torch.no_grad():
+        layer.w13_weight.fill_(3)
+        layer.w2_weight.fill_(3)
+        layer.w13_weight_scale_from_checkpoint.fill_(4)
+        layer.w2_weight_scale_from_checkpoint.fill_(4)
+
+    fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
+
+    assert all(
+        id(getattr(layer, name)) == parameter_id
+        for name, parameter_id in apply_parameter_ids.items()
+    )
+    assert all(
+        getattr(layer, name).data_ptr() == data_ptr
+        for name, data_ptr in apply_storage_ptrs.items()
+    )
+    assert torch.all(layer.w13_weight_for_apply[:, :32, :128] == 3)
+    assert torch.all(layer.w2_weight_for_apply[:, :128, :32] == 3)
+    assert torch.all(layer.w13_weight_scale[:, :32, :4] == 4)
+    assert torch.all(layer.w2_weight_scale[:, :128, :1] == 4)
+    assert torch.count_nonzero(layer.w13_weight_for_apply[:, :, 128:]) == 0
+    assert torch.all(layer.w13_weight_scale[:, :, 4:] == 127)
+    if is_gated:
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:128, :]) == 0
+        assert torch.all(layer.w13_weight_for_apply[:, 128:160, :128] == 3)
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 160:, :]) == 0
+        assert torch.all(layer.w13_weight_scale[:, 32:128, :] == 127)
+        assert torch.all(layer.w13_weight_scale[:, 128:160, :4] == 4)
+        assert torch.all(layer.w13_weight_scale[:, 160:, :] == 127)
+    else:
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:, :]) == 0
+        assert torch.all(layer.w13_weight_scale[:, 32:, :] == 127)
+    assert torch.count_nonzero(layer.w2_weight_for_apply[:, 128:, :]) == 0
+    assert torch.count_nonzero(layer.w2_weight_for_apply[:, :, 32:]) == 0
+    assert torch.all(layer.w2_weight_scale[:, 128:, :] == 127)
+    assert torch.all(layer.w2_weight_scale[:, :, 1:] == 127)
+    assert quant_method.moe_kernel is kernel
+    assert len(kernel_configs) == 1
+
+
+def test_process_mxfp8_moe_padding_rejects_modular_kernel(fp8_module, monkeypatch):
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+    fp8 = fp8_module
+    layer = torch.nn.Module()
+    for name, value in (
+        ("w13_weight", torch.ones(1, 32, 128)),
+        ("w2_weight", torch.ones(1, 128, 32)),
+        ("w13_weight_scale", torch.ones(1, 32, 4, dtype=torch.uint8)),
+        ("w2_weight_scale", torch.ones(1, 128, 1, dtype=torch.uint8)),
+    ):
+        parameter = torch.nn.Parameter(value, requires_grad=False)
+        parameter.weight_loader = lambda *_args, **_kwargs: None
+        layer.register_parameter(name, parameter)
+
+    method = types.SimpleNamespace(
+        moe=types.SimpleNamespace(is_act_and_mul=False),
+        moe_kernel=None,
+        mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
+        experts_cls=types.SimpleNamespace(is_monolithic=lambda: False),
+    )
+    monkeypatch.setattr(
+        fp8,
+        "_shuffle_mxfp8_moe_batched",
+        lambda _layer, w13, w2, s13, s2, _gated, _tile: (w13, w2, s13, s2),
+    )
+
+    with pytest.raises(NotImplementedError, match="requires a monolithic kernel"):
+        fp8.process_weights_after_loading_mxfp8_moe(method, layer)
+
+
+@pytest.mark.parametrize("requires_padding", [False, True])
+def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
+    fp8_module, requires_padding
+):
+    fp8 = fp8_module
+    calls = []
+
+    class Kernel:
+        def apply_monolithic(
+            self,
+            x,
+            w13,
+            w2,
+            router_logits,
+            *,
+            activation,
+            global_num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+            num_expert_group,
+            topk_group,
+            e_score_correction_bias,
+            routed_scaling_factor,
+        ):
+            kwargs = {
+                "activation": activation,
+                "global_num_experts": global_num_experts,
+                "expert_map": expert_map,
+                "apply_router_weight_on_input": apply_router_weight_on_input,
+                "num_expert_group": num_expert_group,
+                "topk_group": topk_group,
+                "e_score_correction_bias": e_score_correction_bias,
+                "routed_scaling_factor": routed_scaling_factor,
+            }
+            calls.append((x, w13, w2, router_logits, kwargs))
+            return x + 1
+
+    method = types.SimpleNamespace(is_monolithic=True, moe_kernel=Kernel())
+    layer_kwargs = {
+        "w13_weight": torch.tensor([130]),
+        "w2_weight": torch.tensor([20]),
+        "activation": "relu2",
+        "global_num_experts": 4,
+        "expert_map": "expert-map",
+        "apply_router_weight_on_input": True,
+        "num_expert_group": 8,
+        "topk_group": 2,
+        "e_score_correction_bias": "correction-bias",
+        "routed_scaling_factor": 1.25,
+    }
+    if requires_padding:
+        layer_kwargs.update(
+            {
+                "mxfp8_unpadded_hidden_size": 2688,
+                "mxfp8_padded_hidden_size": 3072,
+                "w13_weight_for_apply": torch.tensor([13]),
+                "w2_weight_for_apply": torch.tensor([2]),
+            }
+        )
+    layer = types.SimpleNamespace(**layer_kwargs)
+    x = torch.arange(2 * 2688, dtype=torch.float32).reshape(2, 2688)
+    router_logits = torch.ones(2, 4)
+
+    output = fp8.apply_monolithic_mxfp8_moe(method, layer, x, router_logits)
+
+    padded_x, w13, w2, actual_logits, _kwargs = calls[0]
+    expected_hidden_size = 3072 if requires_padding else 2688
+    assert tuple(padded_x.shape) == (2, expected_hidden_size)
+    torch.testing.assert_close(padded_x[:, :2688], x)
+    if requires_padding:
+        assert torch.count_nonzero(padded_x[:, 2688:]) == 0
+        assert w13 is layer.w13_weight_for_apply
+        assert w2 is layer.w2_weight_for_apply
+    else:
+        assert w13 is layer.w13_weight
+        assert w2 is layer.w2_weight
+    assert actual_logits is router_logits
+    assert _kwargs == {
+        "activation": "relu2",
+        "global_num_experts": 4,
+        "expert_map": "expert-map",
+        "apply_router_weight_on_input": True,
+        "num_expert_group": 8,
+        "topk_group": 2,
+        "e_score_correction_bias": "correction-bias",
+        "routed_scaling_factor": 1.25,
+    }
+    assert tuple(output.shape) == (2, 2688)
+    torch.testing.assert_close(output, x + 1)
+
+
 @pytest.mark.parametrize(
     ("field", "error"),
     [
@@ -1194,7 +1496,7 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     fp8_module, monkeypatch
 ):
     fp8 = fp8_module
-    patched_paths = []
+    patched_calls = []
 
     class FakePatch:
         def __init__(self, path):
@@ -1204,8 +1506,8 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         def start(self):
             self.started = True
 
-    def fake_patch(path, _replacement):
-        patched_paths.append(path)
+    def fake_patch(path, replacement):
+        patched_calls.append((path, replacement))
         return FakePatch(path)
 
     monkeypatch.setattr(fp8, "patch", fake_patch)
@@ -1214,12 +1516,12 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         None,
         fp8.FP8Config(use_fp8_weights=True, model_parallel_size=1, is_mx=False),
     )
-    assert not any("ModelOptMxFp8" in path for path in patched_paths)
+    assert not any("ModelOptMxFp8" in path for path, _replacement in patched_calls)
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
-    patched_paths.clear()
+    patched_calls.clear()
 
     fp8.apply_fp8_patches(
         None,
@@ -1229,29 +1531,49 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
             use_activation_pow2_scale=True,
         ),
     )
-    assert any("per_token_group_quant_fp8" in path for path in patched_paths)
+    assert any(
+        "per_token_group_quant_fp8" in path for path, _replacement in patched_calls
+    )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
-    patched_paths.clear()
+    patched_calls.clear()
 
     fp8.apply_fp8_patches(
         None,
         fp8.FP8Config(use_fp8_weights=True, model_parallel_size=1, is_mx=True),
     )
 
-    assert any("ModelOptMxFp8LinearMethod" in path for path in patched_paths)
-    assert any("ModelOptMxFp8FusedMoE.create_weights" in path for path in patched_paths)
-    assert any(
-        "ModelOptMxFp8FusedMoE.process_weights_after_loading" in path
-        for path in patched_paths
-    )
+    expected_mxfp8_calls = [
+        (
+            "vllm.model_executor.layers.quantization.modelopt."
+            "ModelOptMxFp8LinearMethod.process_weights_after_loading",
+            fp8.process_weights_after_loading_mxfp8_linear,
+        ),
+        (
+            "vllm.model_executor.layers.quantization.modelopt."
+            "ModelOptMxFp8FusedMoE.create_weights",
+            fp8.create_weights_mxfp8_moe,
+        ),
+        (
+            "vllm.model_executor.layers.quantization.modelopt."
+            "ModelOptMxFp8FusedMoE.process_weights_after_loading",
+            fp8.process_weights_after_loading_mxfp8_moe,
+        ),
+        (
+            "vllm.model_executor.layers.quantization.modelopt."
+            "ModelOptMxFp8FusedMoE.apply_monolithic",
+            fp8.apply_monolithic_mxfp8_moe,
+        ),
+    ]
+    actual_mxfp8_calls = [call for call in patched_calls if "ModelOptMxFp8" in call[0]]
+    assert actual_mxfp8_calls == expected_mxfp8_calls
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
-    patched_paths.clear()
+    patched_calls.clear()
 
     reload_fp8_config = fp8.FP8Config(
         use_fp8_weights=True,
@@ -1264,10 +1586,14 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
 
     assert fp8.global_fp8_config is reload_fp8_config
     assert not any(
-        path.endswith("process_weights_after_loading") for path in patched_paths
+        path.endswith("process_weights_after_loading")
+        for path, _replacement in patched_calls
     )
-    assert not any("ModelOptMxFp8" in path for path in patched_paths)
-    assert any("per_token_group_quant_fp8" in path for path in patched_paths)
+    assert not any("ModelOptMxFp8" in path for path, _replacement in patched_calls)
+    assert any(
+        "per_token_group_quant_fp8" in path
+        for path, _replacement in patched_calls
+    )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
