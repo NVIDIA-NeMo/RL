@@ -241,6 +241,7 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     worker.model = _FakeDDP()
     worker.optimizer = optimizer
     worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = False
     worker.should_disable_forward_pre_hook = True
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
