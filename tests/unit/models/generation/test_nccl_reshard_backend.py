@@ -57,6 +57,7 @@ def _make_ext(vllm_params):
     # an empty module map -> no match -> standard [gate; up] layout (the case
     # these tests assert).  See _build_hf_to_gen_backend_mapping.
     model = SimpleNamespace(
+        modules=lambda: [],
         named_parameters=lambda: list(vllm_params.items()),
         named_modules=lambda: [],
     )
