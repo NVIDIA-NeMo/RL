@@ -14,7 +14,7 @@
 
 import os
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from copy import copy
 from dataclasses import dataclass, field
 from unittest.mock import patch
@@ -264,9 +264,30 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         quantization_ignore_patterns = [
             pattern.strip() for pattern in quantization_ignore_patterns
         ]
+
+    num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
+    num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = (
+        get_text_config()
+        if callable(get_text_config)
+        else getattr(config, "text_config", config)
+    )
+    num_hidden_layers = text_config.num_hidden_layers
+    for field_name, value in (
+        ("num_first_layers_in_bf16", num_first_layers_in_bf16),
+        ("num_last_layers_in_bf16", num_last_layers_in_bf16),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{field_name} must be an integer")
+        if not 0 <= value <= num_hidden_layers:
+            raise ValueError(
+                f"{field_name} must be between 0 and {num_hidden_layers}, got {value}"
+            )
+
     fp8_config_kwargs = {
-        "num_first_layers_in_bf16": vllm_cfg.get("num_first_layers_in_bf16", 0),
-        "num_last_layers_in_bf16": vllm_cfg.get("num_last_layers_in_bf16", 0),
+        "num_first_layers_in_bf16": num_first_layers_in_bf16,
+        "num_last_layers_in_bf16": num_last_layers_in_bf16,
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
@@ -303,8 +324,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         monkey_patch_vllm_ray_executor(global_fp8_config)
 
     # create fp8 kwargs for vllm's LLM(...)
-    num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
-    num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
     if global_fp8_config.is_mx:
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
@@ -323,8 +342,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             layers = [
                 l
                 for l in range(
-                    config.num_hidden_layers - num_last_layers_in_bf16,
-                    config.num_hidden_layers,
+                    num_hidden_layers - num_last_layers_in_bf16,
+                    num_hidden_layers,
                 )
             ]
             bf16_params.extend(_get_params_in_layers(param_names, layers))
@@ -443,57 +462,114 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-def _get_module_from_param_name(model, name: str):
-    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
-    # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split(".")
-    module_path = path_parts[:-1]
-    # Replace with the fused model name
-    packed_modules_mapping = model.packed_modules_mapping
+def _get_mapped_param_name(model, name: str) -> str | None:
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    if mapper is None:
+        return name
+
+    map_name = getattr(mapper, "_map_name", None)
+    if map_name is not None:
+        return map_name(name)
+
+    mapped_name = name
+    if hasattr(mapper, "orig_to_new_substr"):
+        for old, new in mapper.orig_to_new_substr.items():
+            if old in mapped_name:
+                if new is None:
+                    return None
+                mapped_name = mapped_name.replace(old, new, 1)
+    if hasattr(mapper, "orig_to_new_prefix"):
+        for old, new in mapper.orig_to_new_prefix.items():
+            if mapped_name.startswith(old):
+                if new is None:
+                    return None
+                mapped_name = mapped_name.replace(old, new, 1)
+    return mapped_name
+
+
+def _apply_packed_module_mapping(model, module_path: list[str]) -> list[str]:
+    module_path = module_path.copy()
+    if len(module_path) == 0:
+        return module_path
+
+    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     reversed_mapping = {
         original_name: fused_name
         for fused_name, original_names_list in packed_modules_mapping.items()
         for original_name in original_names_list
     }
-    if module_path[-1] in reversed_mapping.keys():
+    if module_path[-1] in reversed_mapping:
         module_path[-1] = reversed_mapping[module_path[-1]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_prefix"
-    ):
-        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
-            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_substr"
-    ):
-        for i in range(len(module_path)):
-            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
-                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
-                    module_path[i]
-                ]
+    return module_path
 
+
+def _module_path_candidates(model, name: str) -> list[list[str]]:
+    mapped_name = _get_mapped_param_name(model, name)
+    if mapped_name is None:
+        return []
+
+    path_parts = mapped_name.split(".")
+    module_path = _apply_packed_module_mapping(model, path_parts[:-1])
+    candidates = [module_path]
+
+    # NeMo layer names usually include a synthetic "model." root for vLLM. Some
+    # vLLM model wrappers expose their decoder directly at the object root.
+    if len(module_path) > 0 and module_path[0] == "model":
+        candidates.append(module_path[1:])
+
+    # Qwen3-VL-style keys are "model.language_model.layers.*", but the vLLM
+    # module graph stores those layers at "language_model.model.layers.*".
+    if module_path[:3] == ["model", "language_model", "layers"]:
+        candidates.append(["language_model", "model", *module_path[2:]])
+
+    deduped_candidates = []
+    for candidate in candidates:
+        if candidate not in deduped_candidates:
+            deduped_candidates.append(candidate)
+    return deduped_candidates
+
+
+def _resolve_module_path(model, module_path: list[str]):
     current_module = model
-    try:
-        # Traverse the model hierarchy
-        for part in module_path:
-            # vLLM 0.25 split the old FusedMoE module into a MoERunner that
-            # delegates to a RoutedExperts submodule owning the expert weights
-            # (w13_weight/w2_weight), so stop at either and return the
-            # weight-owning module.
-            if isinstance(current_module, MoERunner):
-                return current_module.routed_experts
-            if isinstance(current_module, RoutedExperts):
-                return current_module
-            if isinstance(current_module, torch.nn.ModuleList):
-                current_module = current_module[int(part)]
-            else:
-                current_module = getattr(current_module, part)
-    except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
+    # Traverse the model hierarchy. vLLM 0.25 split the old FusedMoE module into
+    # a MoERunner that delegates to a RoutedExperts submodule owning the expert
+    # weights (w13_weight/w2_weight), so stop at either and return the
+    # weight-owning module.
+    for part in module_path:
+        if isinstance(current_module, MoERunner):
+            return current_module.routed_experts
+        if isinstance(current_module, RoutedExperts):
+            return current_module
+        if isinstance(current_module, torch.nn.ModuleList):
+            current_module = current_module[int(part)]
+        else:
+            current_module = getattr(current_module, part)
+
     # Fused param names (e.g. "...experts.w13_weight") end the traversal on the
     # MoERunner itself; normalize to the weight-owning RoutedExperts submodule.
     if isinstance(current_module, MoERunner):
         return current_module.routed_experts
     return current_module
+
+
+def _get_module_from_param_name(model, name: str):
+    last_error = None
+    for module_path in _module_path_candidates(model, name):
+        try:
+            return _resolve_module_path(model, module_path)
+        except (AttributeError, IndexError, ValueError) as e:
+            last_error = e
+
+    if last_error is not None:
+        print(
+            f"Warning: Could not find module for parameter '{name}'. "
+            f"Error: {last_error}"
+        )
+    return model
+
+
+def _is_unsupported_grouped_expert_param(name: str) -> bool:
+    return name.endswith((".experts.gate_up_proj", ".experts.down_proj"))
 
 
 def _is_fp8_weight(name, model):
@@ -535,32 +611,53 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
-def load_weights(weights, model_runner):
+def _quantize_fp8_blockwise_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    param_lp, param_scale = cast_tensor_to_fp8_blockwise(
+        weight.to(torch.float),
+        weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+    )
+    return param_lp, torch.squeeze(param_scale, dim=-1)
+
+
+def load_weights(
+    weights,
+    model_runner,
+    *,
+    model_load_weights: Callable[..., object] | None = None,
+):
     global global_fp8_config
     weights_quantized = []
     model = model_runner.model
 
     for k, v in weights:
+        if _is_unsupported_grouped_expert_param(k):
+            raise NotImplementedError(
+                "Grouped expert refit from packed gate_up_proj/down_proj "
+                "parameters is not supported by this FP8 load_weights path."
+            )
+
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue
+
         # Cast the weight into fp8 and its scale factor
         if global_fp8_config.is_mx:
             param_lp, param_scale = quantize_mxfp8_weight(v)
         else:
-            param_lp, param_scale = cast_tensor_to_fp8_blockwise(
-                v.to(torch.float),
-                weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
-            )
-        param_scale = torch.squeeze(param_scale, dim=-1)
+            param_lp, param_scale = _quantize_fp8_blockwise_weight(v)
         if global_fp8_config.is_mx:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
         else:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_inv", param_scale])
-    # Finally load the weights into vllm
-    model.load_weights(weights_quantized)
+    # Finally load the weights into vllm. Native layerwise reload callers pass
+    # a wrapper that keeps deferred weight-loader tensors off reusable buffers.
+    if model_load_weights is None:
+        model_load_weights = model.load_weights
+    model_load_weights(weights_quantized)
 
 
 def cast_tensor_to_fp8_blockwise(

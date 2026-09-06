@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from unittest.mock import patch
 
 import pytest
@@ -70,6 +71,15 @@ def create_mock_state_dict_info(params):
     return {name: (tensor.shape, tensor.dtype) for name, tensor in params}
 
 
+def test_packed_broadcast_consumer_exposes_buffer_overrides():
+    signature = inspect.signature(packed_broadcast_consumer)
+
+    assert (
+        signature.parameters["buffer_size_bytes"].kind is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert signature.parameters["num_buffers"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_packed_broadcast_producer_consumer_roundtrip():
     """Test that producer and consumer work together correctly."""
@@ -124,6 +134,8 @@ def test_packed_broadcast_producer_consumer_roundtrip():
             group=consumer_group,
             src=0,
             post_unpack_func=post_unpack_func,
+            buffer_size_bytes=target_size,
+            num_buffers=1,
         )
 
     # Verify all parameters were unpacked
