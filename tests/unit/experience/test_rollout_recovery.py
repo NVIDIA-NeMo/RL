@@ -871,6 +871,7 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
                 "manifest": [{"staging_key": f"g7/sibling-{generation_index}/call-0"}],
             },
             reward=1.0,
+            mask_sample=False,
         )
     _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", results))
 
@@ -914,6 +915,7 @@ def test_prompt_group_seal_is_atomic() -> None:
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
+            mask_sample=False,
         )
     }
 
@@ -957,6 +959,7 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
+            mask_sample=False,
         )
     )
     _mutate(lambda cut: ledger.mark_finalization_started(cut, "g7"))
