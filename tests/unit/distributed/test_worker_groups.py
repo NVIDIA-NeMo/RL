@@ -14,7 +14,6 @@
 
 import os
 import sys
-
 import pytest
 import ray
 
@@ -26,6 +25,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import (
+    MultiWorkerFuture,
     RayWorkerBuilder,
     RayWorkerGroup,
     _get_initializer_env_vars,
@@ -80,6 +80,9 @@ class MyTestActor:
 
     def echo(self, x):
         return f"Actor {self.pid} echoes: {x}"
+
+    def fail(self):
+        raise RuntimeError("replicated worker failure must propagate")
 
     def get_rank_world_size_node_rank_local_rank(self):
         return (
@@ -822,6 +825,49 @@ def test_run_all_workers_sharded_data_2d_shard_dp_replicate_tp(
     d3, _, _, c3 = ray.get(worker_group.workers[3].get_recorded_data.remote())
     assert c3 == 1
     assert d3 == data_for_dp1
+
+
+def test_run_all_workers_sharded_data_preserves_object_refs(
+    worker_group_2d_sharding,
+):
+    """Producer refs must reach replicated consumers without ref-to-ref wrapping."""
+    worker_group = worker_group_2d_sharding
+    payloads = [
+        {"producer_rank": 0, "values": [1, 2]},
+        {"producer_rank": 1, "values": [3, 4]},
+    ]
+    payload_refs = [ray.put(payload) for payload in payloads]
+
+    future_bundle = worker_group.run_all_workers_sharded_data(
+        "record_call",
+        payload=payload_refs,
+        in_sharded_axes=["dp"],
+        replicate_on_axes=["tp"],
+    )
+    worker_group.get_all_worker_results(future_bundle)
+
+    for worker_idx, worker in enumerate(worker_group.workers):
+        _, _, kwargs, _ = ray.get(worker.get_recorded_data.remote())
+        assert kwargs["payload"] == payloads[worker_idx // 2]
+
+
+def test_multi_worker_future_propagates_unselected_worker_failure(
+    worker_group_1d_sharding,
+):
+    worker_group = worker_group_1d_sharding
+    selected = worker_group.workers[0].echo.remote("selected")
+    unselected = worker_group.workers[1].fail.remote()
+    future_bundle = MultiWorkerFuture(
+        futures=[selected, unselected],
+        called_workers=[0, 1],
+        return_from_workers=[0],
+    )
+
+    with pytest.raises(
+        ray.exceptions.RayTaskError,
+        match="replicated worker failure must propagate",
+    ):
+        worker_group.get_all_worker_results(future_bundle)
 
 
 def test_run_all_workers_sharded_data_2d_free_axis_dp_shard_tp(

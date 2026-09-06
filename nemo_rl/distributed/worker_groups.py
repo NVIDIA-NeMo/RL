@@ -963,10 +963,18 @@ class RayWorkerGroup:
                     for v in nested_value_list
                 ]
 
+            def _ray_put_if_needed(value: Any) -> ray.ObjectRef:
+                # Preserve producer ObjectRefs so Ray can resolve them directly in
+                # the consumer actor. Wrapping a ref in ray.put would create a
+                # ref-to-ref object and defeat deferred large-payload handoff.
+                if isinstance(value, ray.ObjectRef):
+                    return value
+                return ray.put(value)
+
             kwargs_after_ray_put = dict()
             for key, nested_value_list in kwargs.items():
                 kwargs_after_ray_put[key] = _map_nested_value_list(
-                    nested_value_list, len(in_sharded_axes), ray.put
+                    nested_value_list, len(in_sharded_axes), _ray_put_if_needed
                 )
             kwargs = kwargs_after_ray_put
 
