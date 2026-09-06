@@ -533,6 +533,50 @@ def test_fp8_load_uses_buffer_safe_model_loader(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_fp8_layerwise_reload_passes_entire_quantized_generator(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    received_weights = []
+
+    def model_load_weights(*, weights):
+        received_weights.extend(weights)
+        return {name for name, _ in received_weights}
+
+    model = SimpleNamespace(load_weights=model_load_weights)
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext._nrl_layerwise_reload_active = True
+    source_weights = [("model.weight", torch.ones(2))]
+    quantized_weights = [
+        ("model.weight", torch.ones(2, dtype=torch.float8_e4m3fn)),
+        ("model.weight_scale", torch.ones(1)),
+    ]
+
+    def get_quantized_weight_iterator(
+        weights, model_runner, *, refit_with_reload_api
+    ):
+        assert weights is source_weights
+        assert model_runner is ext.model_runner
+        assert refit_with_reload_api is False
+        yield from quantized_weights
+
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+    monkeypatch.setattr(
+        fp8, "get_quantized_weight_iterator", get_quantized_weight_iterator
+    )
+    monkeypatch.setattr(
+        vllm_backend, "_detach_pending_layerwise_weights", lambda *_args: None
+    )
+
+    ext._load_hf_weights(source_weights)
+
+    assert received_weights == quantized_weights
+
+
+@pytest.mark.vllm
 def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypatch):
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 
