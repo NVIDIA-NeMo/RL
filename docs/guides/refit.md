@@ -19,12 +19,36 @@ topology first, then select one non-colocated transport with
 reads only `refit_cfg.nixl`. Because one selector chooses the transport, sparse
 delta and NIXL cannot both be active.
 
+## vLLM Reload API
+
+For non-colocated vLLM using the default NCCL transport, set
+`policy.generation.vllm_cfg.refit_with_reload_api: true` to install refitted
+weights through vLLM's native `reload_weights` API. The flag is off by default.
+Use this path when vLLM's post-load processing is required after every refit,
+for example `flashinfer_trtllm` MoE models where `process_weights_after_loading`
+reshapes expert weight buffers.
+
+Early measurements from this PR show that reload refit can be faster for Llama
+8B and Qwen3 32B, while Qwen3 30B-A3B was about 44% slower. MXFP8 reload refit
+was about 2x slower in the measured run and used higher peak memory. Leave
+additional KV-cache headroom for MXFP8, for example by lowering
+`policy.generation.vllm_cfg.gpu_memory_utilization`.
+
+The reload API path currently supports only `policy.generation.backend: vllm`,
+`policy.generation.colocated.enabled: false`, and
+`policy.generation.refit_transport: null`. It is explicitly unsupported with
+`nccl_reshard`, ModelOpt quantization (`policy.generation.quant_cfg`), sparse
+refit transports, and checkpoint-engine/NIXL transports. Eagle/MTP draft
+weights refitted from the trainer are not supported yet; use the legacy loader
+for those cases.
+
 ## Constraints
 
 | Transport | Generation backend | Policy backend | Quantization and MoE |
 |---|---|---|---|
 | Colocated CUDA IPC | vLLM or SGLang | DTensor or Megatron | Uses the generation backend's standard loader. |
 | NCCL | vLLM or Megatron | DTensor or Megatron | Uses the standard full-weight loader. |
+| NCCL + reload API | vLLM | DTensor or Megatron | Default non-colocated NCCL only. Rejects colocated refit, `nccl_reshard`, sparse delta, NIXL/checkpoint-engine transports, ModelOpt quantization (`real_quant` or `quant_cfg`), Eagle/MTP trainer-refit draft weights, and grouped-MoE MXFP8 slabs. |
 | SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
 | NCCL reshard | vLLM | Megatron | Requires matching BF16 or blockwise FP8 precision; Megatron ETP must be 1. Currently supporting Megatron+vLLM backends. |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
@@ -34,7 +58,9 @@ delta and NIXL cannot both be active.
 Non-colocated SGLang generation is supported with a Megatron policy and
 `refit_transport: null`; it creates its own NCCL weight-update group. The NIXL
 restrictions are on the generation backend; both Megatron and DTensor policy
-workers can send weights. Sparse delta is currently limited to GRPO. NIXL is
+workers can send weights. vLLM refit also rejects grouped MoE MXFP8 expert
+slabs such as `mlp.experts.gate_up_proj` and `mlp.experts.down_proj`. Sparse
+delta is currently limited to GRPO. NIXL is
 initialized by the GRPO and distillation setup paths; PPO currently requires
 colocated generation.
 
