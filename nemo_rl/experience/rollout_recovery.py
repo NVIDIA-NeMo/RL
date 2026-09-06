@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 5
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
 _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
@@ -53,7 +53,7 @@ _GROUP_STATE_FIELDS = frozenset(
         "admission_id",
         "prompt_id",
         "prompt_ref",
-        "agent_name",
+        "task_source",
         "recovery_granularity",
         "expected_generations",
         "target_step",
@@ -209,7 +209,7 @@ class PromptGroupRecoveryRecord:
     admission_id: str
     prompt_id: str
     prompt_ref: PromptRef
-    agent_name: Optional[str]
+    task_source: Optional[str]
     recovery_granularity: RecoveryGranularity
     runtime_prompt_payload: Optional[DatumSpec]
     expected_generations: int
@@ -331,7 +331,7 @@ class RolloutRecoveryLedger:
         expected_generations: int,
         target_step: Optional[int],
         start_weight_version: int,
-        agent_name: Optional[str] = None,
+        task_source: Optional[str] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
         admitted: bool = True,
         group_id: Optional[str] = None,
@@ -374,7 +374,7 @@ class RolloutRecoveryLedger:
             admission_id=admission_id,
             prompt_id=prompt_id,
             prompt_ref=prompt_ref,
-            agent_name=agent_name,
+            task_source=task_source,
             recovery_granularity=recovery_granularity,
             # Retain the immutable dataloader sample by reference instead of copying
             # a potentially 131k-token payload. This cache is never serialized and
@@ -849,7 +849,7 @@ class RolloutRecoveryLedger:
                         "sample_id": record.prompt_ref.sample_id,
                         "task_name": record.prompt_ref.task_name,
                     },
-                    "agent_name": record.agent_name,
+                    "task_source": record.task_source,
                     "recovery_granularity": record.recovery_granularity.value,
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
@@ -959,7 +959,7 @@ class RolloutRecoveryLedger:
         group_id = raw_group.get("group_id")
         admission_id = raw_group.get("admission_id")
         prompt_id = raw_group.get("prompt_id")
-        agent_name = raw_group.get("agent_name")
+        task_source = raw_group.get("task_source")
         raw_recovery_granularity = raw_group.get("recovery_granularity")
         expected_generations = raw_group.get("expected_generations")
         siblings_state = raw_group.get("siblings")
@@ -969,8 +969,8 @@ class RolloutRecoveryLedger:
             raise ValueError("admission_id must be a non-empty string")
         if not isinstance(prompt_id, str) or not prompt_id:
             raise ValueError("prompt_id must be a non-empty string")
-        if agent_name is not None and not isinstance(agent_name, str):
-            raise ValueError("agent_name must be a string or None")
+        if task_source is not None and not isinstance(task_source, str):
+            raise ValueError("task_source must be a string or None")
         if not isinstance(raw_recovery_granularity, str):
             raise ValueError("recovery_granularity must be a string")
         try:
@@ -1146,7 +1146,7 @@ class RolloutRecoveryLedger:
             admission_id=admission_id,
             prompt_id=prompt_id,
             prompt_ref=PromptRef(sample_id=sample_id, task_name=task_name),
-            agent_name=agent_name,
+            task_source=task_source,
             recovery_granularity=recovery_granularity,
             runtime_prompt_payload=None,
             expected_generations=expected_generations,

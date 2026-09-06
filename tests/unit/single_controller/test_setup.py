@@ -895,6 +895,11 @@ class TestSetup:
                 ValueError,
                 "non-default rollout_recovery policies require",
             ),
+            (
+                "legacy_agent_recovery_override_without_capture",
+                ValueError,
+                "non-default rollout_recovery policies require",
+            ),
         ],
     )
     def test_invalid_config_fails_before_setup_factories(
@@ -939,8 +944,13 @@ class TestSetup:
             mc.rollout_recovery.default_granularity = RecoveryGranularity.PROMPT_GROUP
         elif invalid_case == "recovery_override_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.task_granularity_overrides = {
+            mc.rollout_recovery.task_source_granularity_overrides = {
                 "genrm": RecoveryGranularity.PROMPT_GROUP
+            }
+        elif invalid_case == "legacy_agent_recovery_override_without_capture":
+            mc = _make_master_config()
+            mc.rollout_recovery.agent_granularity_overrides = {
+                "genrm_agent": RecoveryGranularity.PROMPT_GROUP
             }
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")

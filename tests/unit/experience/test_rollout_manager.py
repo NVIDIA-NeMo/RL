@@ -57,6 +57,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutOutcome,
     RolloutRetryPolicy,
     RolloutStats,
+    _nemo_gym_metric_namespace,
 )
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
@@ -409,19 +410,19 @@ class TestGenerateAndPushFlow:
         assert buf._slots == [group_id]
         assert buf.commit_calls[0][0] == group_id
 
-    def test_reservation_persists_the_resolved_agent_recovery_policy(self):
+    def test_reservation_persists_the_resolved_task_source_recovery_policy(self):
         buf = _FakeBuffer()
         mgr = _make_manager(buf, _FakeImpl())
         mgr._rollout_recovery_config = RolloutRecoveryConfig(
-            agent_granularity_overrides={
-                "genrm_agent": RecoveryGranularity.PROMPT_GROUP
+            task_source_granularity_overrides={
+                "genrm_compare": RecoveryGranularity.PROMPT_GROUP
             }
         )
         prompt = {
             "idx": 0,
             "message_log": [],
             "task_name": "nemo_gym",
-            "extra_env_info": {"agent_ref": {"name": "genrm_agent"}},
+            "extra_env_info": {"task_source": "genrm_compare"},
         }
 
         group_id = _with_cut(
@@ -430,7 +431,7 @@ class TestGenerateAndPushFlow:
         )
         group = mgr.recovery_ledger.get_group(group_id)
 
-        assert group.agent_name == "genrm_agent"
+        assert group.task_source == "genrm_compare"
         assert group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
 
     def test_recovery_mutation_requires_the_controller_barrier(self):
@@ -490,7 +491,7 @@ class TestGenerateAndPushFlow:
                 expected_generations=2,
                 target_step=0,
                 start_weight_version=0,
-                agent_name=None,
+                task_source=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
                 admitted=True,
             ),
@@ -721,6 +722,30 @@ def _nemo_gym_impl(
         log_full_result_tables=log_full_result_tables,
         reward_penalty_config=reward_penalty_config,
     )
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        (
+            {
+                "task_source": "shared_resources_server",
+                "agent_ref": {"name": "resolved_agent"},
+            },
+            "resolved_agent",
+        ),
+        (
+            {"task_source": "shared_resources_server"},
+            "task-source:shared_resources_server",
+        ),
+        ({"agent_ref": {"name": "legacy_agent"}}, "legacy_agent"),
+        ({}, "nemo_gym"),
+    ],
+)
+def test_nemo_gym_metric_namespace_supports_task_source_only_rows(
+    row: dict, expected: str
+) -> None:
+    assert _nemo_gym_metric_namespace(row) == expected
 
 
 def _mask_gate_result():

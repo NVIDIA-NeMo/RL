@@ -19,7 +19,7 @@ import copy
 import enum
 import json
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -103,6 +103,20 @@ def _contains_post_write_enrichment_error(error: BaseException) -> bool:
             _contains_post_write_enrichment_error(child) for child in error.exceptions
         )
     return False
+
+
+def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
+    """Return the best available namespace for NeMo-Gym rollout metrics."""
+    agent_ref = row.get("agent_ref")
+    if isinstance(agent_ref, Mapping):
+        agent_name = agent_ref.get("name")
+        if isinstance(agent_name, str) and agent_name:
+            return agent_name
+
+    task_source = row.get("task_source")
+    if isinstance(task_source, str) and task_source:
+        return f"task-source:{task_source}"
+    return "nemo_gym"
 
 
 class RolloutOutcome(str, enum.Enum):
@@ -1209,7 +1223,7 @@ class AsyncNemoGymRolloutImpl:
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
-                completions, inputs[0]["agent_ref"]["name"]
+                completions, _nemo_gym_metric_namespace(inputs[0])
             )
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
@@ -1567,7 +1581,7 @@ class RolloutManager:
             expected_generations=self._num_generations_per_prompt,
             target_step=target_step,
             start_weight_version=self._weight_version,
-            agent_name=recovery_policy.agent_name,
+            task_source=recovery_policy.task_source,
             recovery_granularity=recovery_policy.granularity,
             admitted=admitted,
             admission_id=admission_id,
