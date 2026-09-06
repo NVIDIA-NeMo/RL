@@ -328,6 +328,10 @@ policy:
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
+    # Tokens per FP32 vocab tile in the streaming draft soft-CE. Lower it if the
+    # tile (token_chunk_size x vocab, in fp32) is too large for the device;
+    # raise it if the GPU is launch-bound.
+    token_chunk_size: 4096
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
