@@ -345,8 +345,14 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = _FakeTrainableModel()
+
+    class _FakeDDP(_FakeTrainableModel):
+        def reset_param_sync_dispatch_state(self):
+            events.append("reset_param_sync_dispatch_state")
+
+    worker.model = _FakeDDP()
     worker.model.eval = lambda: events.append("eval")
+    worker.should_disable_forward_pre_hook = True
     worker.cfg = (
         {"generation": {"backend": generation_backend}} if generation_backend else {}
     )
@@ -376,6 +382,10 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
         lambda *args, **kwargs: events.append("memory_reserved") or 0,
     )
     monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.DistributedDataParallel",
+        _FakeDDP,
+    )
 
     MegatronPolicyWorkerImpl.offload_after_refit(worker)
 
@@ -384,6 +394,9 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     assert events.index("eval") < events.index("move_model")
     assert move_kwargs[0]["move_params"] is expect_move_params
     assert ("offload_before_refit", False) in events
+    assert events.index(("offload_before_refit", False)) < events.index(
+        "reset_param_sync_dispatch_state"
+    )
 
 
 def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):

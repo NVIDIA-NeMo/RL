@@ -3517,6 +3517,15 @@ class MegatronPolicyWorkerImpl(
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit(sync_params=False)  # rerun the old offload function
 
+        # offload_before_refit() forced the updated optimizer shards into a complete
+        # parameter snapshot for export. That snapshot has now been consumed, and the
+        # buffers were replaced by the CPU offload above. Make the next policy forward
+        # publish the reloaded buffers instead of treating the exported snapshot as live.
+        if self.should_disable_forward_pre_hook and isinstance(
+            self.model, DistributedDataParallel
+        ):
+            self.model.reset_param_sync_dispatch_state()
+
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
