@@ -361,7 +361,7 @@ class _LedgerFacade:
             expected_generations=2,
             target_step=target_step,
             start_weight_version=7,
-            agent_name=None,
+            task_source=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
             admitted=admitted,
             admission_id=admission_id,
