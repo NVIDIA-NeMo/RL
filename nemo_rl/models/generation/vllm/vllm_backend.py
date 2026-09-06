@@ -1835,8 +1835,8 @@ class VllmInternalWorkerExtension:
             torch.cuda.empty_cache()
             return True
 
-        _receive_bulk_components()
         with self._weight_update_lifecycle("nccl_reshard") as finalize:
+            _receive_bulk_components()
             _receive_misc()
             finalize()
             torch.cuda.empty_cache()

@@ -23,7 +23,7 @@ no GPU).
 skipped where vllm is unavailable.
 """
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
@@ -917,6 +917,55 @@ def test_native_mxfp8_refit_rebuilds_destinations_and_loads_ordered_components(
     ]
     assert torch.all(adapter.loaded[0][2].float() == 3)
     assert torch.all(adapter.loaded[1][2] == 7)
+
+
+def test_legacy_refit_receives_inside_transport_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    param_name = "model.layers.0.mlp.experts.up_proj.weight"
+    extension = _make_ext({})
+    extension.nccl_reshard_refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": param_name,
+                    "global_shape": (1,),
+                    "dtype": "torch.bfloat16",
+                    "src_mesh_info": object(),
+                    "dst_mesh_info": object(),
+                    "src_placements": [],
+                    "dst_placements": [],
+                }
+            ]
+        },
+        "misc_meta": {},
+    }
+    extension.pp_comm_groups = {0: object()}
+    extension.hf_to_local_param_map = HFToLocalParamMap(
+        specs={
+            param_name: LocalParamSpec(
+                base=torch.empty(1),
+                post=lambda _ctx: events.append("load"),
+            )
+        }
+    )
+    extension._receive_and_load_misc_params = lambda: events.append("misc")
+
+    @contextmanager
+    def lifecycle(_transport: str):
+        events.append("enter")
+        yield lambda: events.append("finalize")
+        events.append("exit")
+
+    extension._weight_update_lifecycle = lifecycle
+    _patch_cpu_nccl_refit(monkeypatch, events)
+
+    assert extension.nccl_reshard_refit()
+    assert events.index("enter") < events.index("bulk:weight")
+    assert events.index("load") < events.index("finalize")
+    assert events[-1] == "exit"
 
 
 def test_native_mxfp8_refit_fences_after_finalize_and_mtp(
