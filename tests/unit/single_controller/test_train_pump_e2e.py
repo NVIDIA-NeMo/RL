@@ -310,6 +310,11 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         master_config = MasterConfig.model_construct(
+            data_plane={
+                "enabled": True,
+                "impl": "transfer_queue",
+                "backend": "simple",
+            },
             policy={
                 "train_global_batch_size": train_gbs,
                 "generation": {"colocated": {"enabled": False}},

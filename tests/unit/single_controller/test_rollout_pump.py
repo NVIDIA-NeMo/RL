@@ -1158,6 +1158,11 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     master_config = MasterConfig.model_construct(
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+        },
         policy={
             "train_global_batch_size": expected_samples,
             "generation": {"colocated": {"enabled": False}},

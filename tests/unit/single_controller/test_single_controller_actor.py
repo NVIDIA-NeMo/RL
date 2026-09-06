@@ -17,6 +17,7 @@
 import asyncio
 import math
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -25,7 +26,12 @@ from ray.exceptions import ActorDiedError
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
-from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
+    REPLAY_BUFFER_METADATA_FILENAME,
+    REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    DataPlaneCheckpointBarrier,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -40,7 +46,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
 )
-from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -48,6 +54,17 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 class FakeWeightSynchronizer:
     pass
+
+
+def _data_plane_config(backend: str = "simple") -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": backend,
+    }
+    if backend == "mooncake_cpu":
+        config["mooncake_cpu"] = {"checkpoint": {"enabled": True}}
+    return config
 
 
 class _InitBuffer:
@@ -79,6 +96,7 @@ def _checkpointing_config(tmp_path) -> dict:
 def _grpo_master_config(tmp_path) -> MasterConfig:
     """A minimal GRPO MasterConfig the real __init__ accepts."""
     return MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
             "generation": {"colocated": {"enabled": False}},
@@ -134,9 +152,60 @@ def _init_controller(master_config, actor_args):
     )
 
 
+def test_resumed_mooncake_init_restores_without_partition_registration(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    checkpoint_path = tmp_path / "step_0"
+    data_plane_path = checkpoint_path / DATA_PLANE_CHECKPOINT_DIR
+    data_plane_path.mkdir(parents=True)
+    (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+    metadata = {
+        "data_plane_checkpoint_schema_version": DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+        "single_controller_train_steps": 0,
+        "single_controller_trainer_version": 0,
+        "single_controller_epoch": 0,
+        "partition_id": "rollout_data",
+        "sampler_name": "in_order",
+        "mode": "authoritative",
+        "replay_metadata_schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+        "replay_manifest_digest": "digest-0",
+        "replay_group_count": 0,
+    }
+    dp_client = MagicMock(name="dp_client")
+    dp_client.load_checkpoint.return_value = metadata
+    master_config = _grpo_master_config(tmp_path)
+    master_config.data_plane = _data_plane_config("mooncake_cpu")
+    actor_args = _actor_args_for_init(
+        dp_client=dp_client,
+        last_checkpoint_path=str(checkpoint_path),
+    )
+
+    controller = _init_controller(master_config, actor_args)
+
+    dp_client.load_checkpoint.assert_called_once_with(data_plane_path)
+    dp_client.register_partition.assert_not_called()
+    assert controller._data_plane_checkpoint_metadata == metadata
+
+
+def test_fresh_mooncake_init_registers_partition(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    dp_client = MagicMock(name="dp_client")
+    master_config = _grpo_master_config(tmp_path)
+    master_config.data_plane = _data_plane_config("mooncake_cpu")
+    actor_args = _actor_args_for_init(dp_client=dp_client)
+
+    controller = _init_controller(master_config, actor_args)
+
+    dp_client.load_checkpoint.assert_not_called()
+    dp_client.register_partition.assert_called_once()
+    assert controller._data_plane_checkpoint_metadata is None
+
+
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
     master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 4,
             "generation": {"colocated": {"enabled": False}},
@@ -191,6 +260,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     logger = MagicMock()
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
     master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
             "generation": {"colocated": {"enabled": False}},
@@ -251,6 +321,7 @@ def test_reference_logprobs_required_only_when_kl_enabled(
     """KL-disabled SingleController runs do not request reference logprobs."""
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
     master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
             "generation": {"colocated": {"enabled": False}},
@@ -313,6 +384,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
     logger = MagicMock()
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
     master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
             "generation": {"colocated": {"enabled": False}},

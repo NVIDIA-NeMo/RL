@@ -94,7 +94,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_sampler_buffer_capacity,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    SingleControllerActorArgs,
+    _maybe_restore_native_data_plane_checkpoint,
+    _register_single_controller_partition,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
@@ -248,6 +252,31 @@ class SingleControllerActor:
             reference_logprobs_required=self._reference_logprobs_required,
         )
         self._dp_client = actor_args.dp_client
+        if master_config.data_plane["backend"] == "mooncake_cpu":
+            # actor_args is fully deserialized before __init__, so this process's
+            # Mooncake client and memory segment are attached. Teachers were
+            # attached during driver setup; restore now sees the full topology.
+            data_plane_checkpoint_metadata = (
+                _maybe_restore_native_data_plane_checkpoint(
+                    load_checkpoint=self._dp_client.load_checkpoint,
+                    last_checkpoint_path=actor_args.last_checkpoint_path,
+                    save_state=actor_args.save_state,
+                    partition_id=self._partition_id,
+                    sampler_name=master_config.async_rl.sampler.name,
+                )
+            )
+            # A restored controller already contains the partition schema.
+            # Re-warming it with float32 placeholders conflicts with restored
+            # fields such as int64 input_ids. Fresh Mooncake runs still need
+            # the warm-up before concurrent producers start.
+            if data_plane_checkpoint_metadata is None:
+                _register_single_controller_partition(
+                    self._dp_client,
+                    master_config=master_config,
+                    partition_id=self._partition_id,
+                )
+        else:
+            data_plane_checkpoint_metadata = actor_args.data_plane_checkpoint_metadata
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
@@ -315,7 +344,7 @@ class SingleControllerActor:
         self._save_state: GRPOSaveState = actor_args.save_state
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
         self._data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = (
-            actor_args.data_plane_checkpoint_metadata
+            data_plane_checkpoint_metadata
         )
         self._consumed_samples: int = actor_args.save_state.consumed_samples
         self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens

@@ -133,8 +133,9 @@ from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 class SingleControllerActorArgs:
     """All inputs SingleControllerActor needs, built driver-side by setup_single_controller().
 
-    Passed as a single arg to SingleControllerActor.remote so the actor's __init__ does
-    no construction work — every heavy object is cloudpickled in.
+    Passed as a single arg to SingleControllerActor.remote. Heavy objects are
+    cloudpickled in; Mooncake restore stays actor-side so its process-local memory
+    segment is attached before checkpoint data is loaded.
     """
 
     gen_handle: Any
@@ -168,8 +169,8 @@ class SingleControllerActorArgs:
 
 
 def _maybe_restore_native_data_plane_checkpoint(
-    policy: TQPolicy,
     *,
+    load_checkpoint: Callable[[str | Path], dict[str, Any]],
     last_checkpoint_path: Optional[str],
     save_state: GRPOSaveState,
     partition_id: str,
@@ -214,7 +215,7 @@ def _maybe_restore_native_data_plane_checkpoint(
         )
 
     print(f"📦 Restoring native TQ checkpoint: {data_plane_path}", flush=True)
-    raw_metadata = policy.load_data_plane_checkpoint(data_plane_path)
+    raw_metadata = load_checkpoint(data_plane_path)
     if not isinstance(raw_metadata, dict):
         raise TypeError(
             "Native TQ checkpoint load must return a metadata dictionary, "
@@ -261,6 +262,30 @@ def _maybe_restore_native_data_plane_checkpoint(
         flush=True,
     )
     return metadata
+
+
+def _register_single_controller_partition(
+    dp_client: DataPlaneClient,
+    *,
+    master_config: MasterConfig,
+    partition_id: str,
+) -> None:
+    """Warm the SingleController partition before concurrent data-plane use."""
+    algo_cfg = algo_config(master_config)
+    policy_config = master_config.policy
+    dp_client.register_partition(
+        partition_id=partition_id,
+        fields=fields_with_optional_routed_experts(
+            SC_ROLLOUT_SCHEMA_FIELDS,
+            enabled=router_replay_enabled(policy_config),
+        ),
+        num_samples=(
+            master_config.async_rl.max_buffered_rollouts
+            * algo_cfg.num_generations_per_prompt
+        ),
+        consumer_tasks=["prev_lp", "ref_lp", "train"],
+        grpo_group_size=algo_cfg.num_generations_per_prompt,
+    )
 
 
 def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
@@ -1309,15 +1334,21 @@ def setup_single_controller(
     if "value_time" in time_metrics:
         setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
 
-    # Native TQ restore must run through the trainer's bootstrap client before
-    # the normal SC data-plane client is created or any rollout/train data-plane
-    # operation starts.
-    data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
-        trainer,
-        last_checkpoint_path=last_checkpoint_path,
-        save_state=save_state,
-        partition_id=partition_id,
-        sampler_name=master_config.async_rl.sampler.name,
+    # SimpleStorage's dedicated storage actors already exist, so preserve its
+    # driver-side restore order. Mooncake capacity is contributed by each client
+    # process; defer its restore until actor deserialization has connected the
+    # final process-local client.
+    restore_data_plane_in_actor = dp_config["backend"] == "mooncake_cpu"
+    data_plane_checkpoint_metadata = (
+        None
+        if restore_data_plane_in_actor
+        else _maybe_restore_native_data_plane_checkpoint(
+            load_checkpoint=trainer.load_data_plane_checkpoint,
+            last_checkpoint_path=last_checkpoint_path,
+            save_state=save_state,
+            partition_id=partition_id,
+            sampler_name=master_config.async_rl.sampler.name,
+        )
     )
 
     if use_nemo_gym:
@@ -1364,22 +1395,12 @@ def setup_single_controller(
     # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
-    # SingleController reuses one partition for the run. Warm every known
-    # tensor field before rollout, policy, and teacher writers become
-    # concurrent; TransferQueue otherwise registers field names lazily.
-    dp_client.register_partition(
-        partition_id=partition_id,
-        fields=fields_with_optional_routed_experts(
-            SC_ROLLOUT_SCHEMA_FIELDS,
-            enabled=router_replay_enabled(policy_config),
-        ),
-        num_samples=(
-            master_config.async_rl.max_buffered_rollouts
-            * algo_cfg.num_generations_per_prompt
-        ),
-        consumer_tasks=["prev_lp", "ref_lp", "train"],
-        grpo_group_size=algo_cfg.num_generations_per_prompt,
-    )
+    if not restore_data_plane_in_actor:
+        _register_single_controller_partition(
+            dp_client,
+            master_config=master_config,
+            partition_id=partition_id,
+        )
 
     if weight_synchronizer is None:
         t0 = time.perf_counter()

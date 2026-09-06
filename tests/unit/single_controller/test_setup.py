@@ -1535,7 +1535,7 @@ class TestSetup:
 
 
 class TestNativeTQRecoverySetup:
-    def test_setup_loads_tq_before_creating_single_controller_client(
+    def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories
     ):
         checkpoint_path = tmp_path / "step_3"
@@ -1558,12 +1558,49 @@ class TestNativeTQRecoverySetup:
         checkpointer.load_training_info.return_value = vars(save_state)
         checkpointer.get_resume_paths.return_value = (None, None)
         mc = _make_master_config()
+        mc.data_plane["backend"] = "simple"
 
         with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert events == ["load", "build"]
         assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+
+    def test_mooncake_setup_defers_restore_and_warmup_decision_to_actor(
+        self, tmp_path, patched_factories
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        torch.save({}, checkpoint_path / "train_dataloader.pt")
+        save_state = _save_state()
+        policy = patched_factories["fake_policy"]
+        dp_client = MagicMock(name="dp_client")
+        events: list[str] = []
+        policy.load_data_plane_checkpoint.side_effect = lambda checkpoint_dir: (
+            events.append("load") or _native_tq_metadata()
+        )
+        patched_factories["build_data_plane_client"].side_effect = (
+            lambda *args, **kwargs: events.append("build") or dp_client
+        )
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(save_state)
+        checkpointer.get_resume_paths.return_value = (None, None)
+        mc = _make_master_config()
+        mc.data_plane["backend"] = "mooncake_cpu"
+        mc.data_plane["mooncake_cpu"] = {"checkpoint": {"enabled": True}}
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = True
+
+        with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert events == ["build"]
+        policy.load_data_plane_checkpoint.assert_not_called()
+        dp_client.register_partition.assert_not_called()
+        assert actor_args.last_checkpoint_path == str(checkpoint_path)
+        assert actor_args.data_plane_checkpoint_metadata is None
 
     def test_loads_authoritative_tq_checkpoint_when_metadata_file_exists(
         self, tmp_path
@@ -1577,7 +1614,7 @@ class TestNativeTQRecoverySetup:
         save_state = _save_state()
 
         restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-            policy,
+            load_checkpoint=policy.load_data_plane_checkpoint,
             last_checkpoint_path=str(checkpoint_path),
             save_state=save_state,
             partition_id="rollout_data",
@@ -1598,7 +1635,7 @@ class TestNativeTQRecoverySetup:
         policy.load_data_plane_checkpoint.return_value = metadata
 
         restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-            policy,
+            load_checkpoint=policy.load_data_plane_checkpoint,
             last_checkpoint_path=str(checkpoint_path),
             save_state=_save_state(trainer_version=7),
             partition_id="rollout_data",
@@ -1615,7 +1652,7 @@ class TestNativeTQRecoverySetup:
 
         with pytest.raises(RuntimeError, match="legacy replay_buffer.pt"):
             sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-                policy,
+                load_checkpoint=policy.load_data_plane_checkpoint,
                 last_checkpoint_path=str(checkpoint_path),
                 save_state=_save_state(),
                 partition_id="rollout_data",
@@ -1632,7 +1669,7 @@ class TestNativeTQRecoverySetup:
         policy = MagicMock()
 
         restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-            policy,
+            load_checkpoint=policy.load_data_plane_checkpoint,
             last_checkpoint_path=str(checkpoint_path),
             save_state=_save_state(),
             partition_id="rollout_data",
@@ -1654,7 +1691,7 @@ class TestNativeTQRecoverySetup:
 
         with pytest.raises(FileNotFoundError, match="matching native TQ checkpoint"):
             sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-                MagicMock(),
+                load_checkpoint=MagicMock(),
                 last_checkpoint_path=str(checkpoint_path),
                 save_state=_save_state(),
                 partition_id="rollout_data",
@@ -1670,7 +1707,7 @@ class TestNativeTQRecoverySetup:
 
         with pytest.raises(ValueError, match="does not match the trainer checkpoint"):
             sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-                policy,
+                load_checkpoint=policy.load_data_plane_checkpoint,
                 last_checkpoint_path=str(checkpoint_path),
                 save_state=_save_state(),
                 partition_id="rollout_data",
