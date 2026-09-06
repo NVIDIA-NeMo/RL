@@ -73,6 +73,7 @@ project-includes = [
   "nemo_rl/data/__init__.py",
   "nemo_rl/data/chat_templates.py",
   "nemo_rl/data/collate_fn.py",
+  "nemo_rl/data/deepseek_v4_encoding.py",
   "nemo_rl/data/dataloader.py",
   "nemo_rl/data/datasets/__init__.py",
   "nemo_rl/data/datasets/eval_datasets/__init__.py",
