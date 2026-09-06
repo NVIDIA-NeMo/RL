@@ -85,7 +85,10 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_release_grads_before_refit,
+)
 
 # ===============================================================================
 # Configuration
@@ -249,6 +252,17 @@ def setup(
                 "https://github.com/NVIDIA-NeMo/RL/issues/3275."
             )
         checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
+
+    release_grads_before_refit = policy_config.get("release_grads_before_refit") is True
+    validate_release_grads_before_refit(
+        enabled=release_grads_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=generation_config["backend"],
+        colocated=generation_config["colocated"]["enabled"],
+        refit_transport=generation_config.get("refit_transport"),
+    )
 
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
@@ -580,7 +594,8 @@ def setup(
         init_reference_model=False,
     )
 
-    if checkpoint_engine_config is not None:
+    managed_refit = checkpoint_engine_config is not None or release_grads_before_refit
+    if managed_refit:
         assert isinstance(student_generation, VllmGeneration)
         student_generation.weight_synchronizer = create_weight_synchronizer(
             policy=student_policy,
@@ -596,7 +611,7 @@ def setup(
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference and checkpoint_engine_config is None:
+    if not colocated_inference and not managed_refit:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = train_cluster.world_size()

@@ -160,7 +160,10 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_release_grads_before_refit,
+)
 
 # ===============================================================================
 # Configuration
@@ -490,6 +493,19 @@ def _needs_hf_refit_handshake(
     if generation_backend == "megatron":
         return False
     return not (nccl_reshard_refit_enabled and not colocated_inference)
+
+
+def _uses_managed_noncolocated_refit(
+    generation_backend: str,
+    nccl_reshard_refit_enabled: bool,
+    release_grads_before_refit: bool,
+) -> bool:
+    """Whether non-colocated setup must attach a weight synchronizer."""
+    return (
+        nccl_reshard_refit_enabled
+        or generation_backend == "dynamo"
+        or release_grads_before_refit
+    )
 
 
 def shutdown_environments(
@@ -1184,6 +1200,16 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
+    release_grads_before_refit = policy_config.get("release_grads_before_refit") is True
+    validate_release_grads_before_refit(
+        enabled=release_grads_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=backend,
+        colocated=colocated_inference,
+        refit_transport=generation_config.get("refit_transport"),
+    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
@@ -1740,7 +1766,11 @@ def setup(
     ):
         t0 = time.perf_counter()
         # init collective
-        if nccl_reshard_refit_enabled or backend == "dynamo":
+        if _uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
+            release_grads_before_refit=release_grads_before_refit,
+        ):
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
