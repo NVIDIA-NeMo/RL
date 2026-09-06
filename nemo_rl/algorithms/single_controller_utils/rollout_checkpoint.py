@@ -606,9 +606,19 @@ def resolve_latest_snapshot(
         if (
             manifest.base_train_step != expected_train_step
             or manifest.trainer_version != expected_trainer_version
-            or manifest.bootstrap_fingerprint != expected_bootstrap_fingerprint
         ):
-            errors.append(f"{candidate.name}: trainer-anchor mismatch")
+            errors.append(
+                f"{candidate.name}: belongs to a different trainer lineage "
+                f"(step={manifest.base_train_step}, "
+                f"version={manifest.trainer_version}); expected "
+                f"step={expected_train_step}, version={expected_trainer_version}"
+            )
+            continue
+        if manifest.bootstrap_fingerprint != expected_bootstrap_fingerprint:
+            errors.append(
+                f"{candidate.name}: bootstrap lineage fingerprint does not "
+                "match the selected trainer anchor"
+            )
             continue
         return ResolvedRolloutCheckpoint(candidate, manifest)
 
@@ -616,5 +626,7 @@ def resolve_latest_snapshot(
         raise ValueError(
             "no committed rollout snapshot matches the selected trainer anchor: "
             + "; ".join(errors)
+            + ". These snapshot directories contain stale or corrupted state; "
+            "inspect and remove them, or use a fresh checkpointing.checkpoint_dir."
         )
     return None

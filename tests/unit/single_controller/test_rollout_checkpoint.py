@@ -771,13 +771,40 @@ def test_resolver_fails_when_no_committed_snapshot_matches_anchor(tmp_path):
         fingerprint=_test_bootstrap_fingerprint("different"),
     )
 
-    with pytest.raises(ValueError, match="trainer-anchor mismatch"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "bootstrap lineage fingerprint does not match the selected trainer anchor"
+        ),
+    ):
         resolve_latest_snapshot(
             anchor,
             expected_train_step=0,
             expected_trainer_version=0,
             expected_bootstrap_fingerprint=_test_bootstrap_fingerprint(),
         )
+
+
+def test_resolver_reports_trainer_lineage_mismatch(tmp_path):
+    anchor = _ensure_test_bootstrap_anchor(tmp_path)
+    _commit_snapshot(
+        anchor,
+        mutation_version=1,
+        trainer_version=4,
+    )
+
+    with pytest.raises(ValueError) as error:
+        resolve_latest_snapshot(
+            anchor,
+            expected_train_step=1,
+            expected_trainer_version=2,
+            expected_bootstrap_fingerprint=_test_bootstrap_fingerprint(),
+        )
+
+    message = str(error.value)
+    assert "step=4, version=4" in message
+    assert "expected step=1, version=2" in message
+    assert "fresh checkpointing.checkpoint_dir" in message
 
 
 def test_commit_snapshot_flushes_payload_before_publication(tmp_path, monkeypatch):
