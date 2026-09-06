@@ -133,6 +133,7 @@ def prepare_loss_input(
     sampling_params: Optional[TrainingSamplingParams] = None,
     d2t: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
+    precomputed_logprobs: bool = False,
     cp_sharder: Optional["ContextParallelSharder"] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
@@ -167,7 +168,13 @@ def prepare_loss_input(
     elif loss_fn.input_type == LossInputType.LOGPROB:
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
-        if (
+        if precomputed_logprobs:
+            # Masked diffusion policies arrive with a per-position ELBO already
+            # accumulated over the quadrature points, so there is no logits
+            # tensor to reduce and no causal shift to apply: the ELBO scores
+            # token i at position i and keeps the full sequence length.
+            logprobs = logits.to(torch.float32)
+        elif (
             hasattr(loss_fn, "use_fused_linear_logprobs")
             and loss_fn.use_fused_linear_logprobs
         ):
