@@ -566,6 +566,16 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
+    # Validate this before logger, checkpoint, dataloader, or cluster setup can
+    # produce side effects for a configuration that cannot train correctly.
+    if (
+        grpo_config.skip_reference_policy_logprobs_calculation
+        and loss_config.reference_policy_kl_penalty != 0
+    ):
+        raise ValueError(
+            "Skipping reference logprobs requires loss_fn.reference_policy_kl_penalty=0"
+        )
+
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
@@ -799,10 +809,6 @@ def setup(
 
     # Validate skip_reference_policy_logprobs_calculation
     if grpo_config.skip_reference_policy_logprobs_calculation:
-        assert loss_config.reference_policy_kl_penalty == 0, (
-            "grpo.skip_reference_policy_logprobs_calculation=True requires "
-            "loss_fn.reference_policy_kl_penalty == 0"
-        )
         print(
             "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
         )
