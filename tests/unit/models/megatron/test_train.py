@@ -167,6 +167,110 @@ class TestModelForward:
         assert call_kwargs["position_ids"] is None
 
 
+class TestLinearCeFusionThroughVlmWrapper:
+    """Linear CE fusion must reach the GPTModel the patch rebound."""
+
+    @staticmethod
+    def _gpt_model():
+        from megatron.core.models.gpt import GPTModel
+
+        return MagicMock(spec=GPTModel)
+
+    def _run(self, model):
+        from nemo_rl.models.megatron.train import model_forward
+
+        data_dict = MagicMock()
+        data_dict.get_multimodal_dict.return_value = {}
+        model_forward(
+            model=model,
+            data_dict=data_dict,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            attention_mask=torch.ones(1, 3),
+            use_fused_linear_logprobs=True,
+        )
+
+    def test_plain_gpt_model_still_receives_the_kwarg(self):
+        """Unwrapped models keep the existing behaviour."""
+        model = self._gpt_model()
+        model.return_value = torch.randn(1, 3)
+
+        self._run(model)
+
+        kwargs = model.call_args[1]
+        assert kwargs["return_logprobs_for_linear_ce_fusion"] is True
+        assert "labels" in kwargs
+
+    def test_vlm_wrapper_is_not_handed_the_kwarg(self):
+        """The wrapper's forward() would raise TypeError on it."""
+        inner = self._gpt_model()
+
+        class Gemma4VLModel(MagicMock):
+            pass
+
+        wrapper = Gemma4VLModel()
+        wrapper.language_model = inner
+        wrapper.return_value = torch.randn(1, 3)
+
+        self._run(wrapper)
+
+        kwargs = wrapper.call_args[1]
+        assert "return_logprobs_for_linear_ce_fusion" not in kwargs
+        # labels are still required by the fused forward.
+        assert "labels" in kwargs
+
+    def test_vlm_wrapper_arms_the_inner_gpt_model(self):
+        """Fusion is requested via the inner instance instead."""
+        inner = self._gpt_model()
+        seen = {}
+
+        class Gemma4VLModel(MagicMock):
+            pass
+
+        wrapper = Gemma4VLModel()
+        wrapper.language_model = inner
+
+        def _capture(*args, **kwargs):
+            seen["armed"] = getattr(inner, "_linear_ce_fusion_armed", False)
+            return torch.randn(1, 3)
+
+        wrapper.side_effect = _capture
+
+        self._run(wrapper)
+
+        assert seen["armed"] is True, "inner GPTModel was not armed during forward"
+
+    def test_arming_is_reverted_after_the_call(self):
+        """The flag must not leak into later non-fused forwards."""
+        inner = self._gpt_model()
+
+        class Gemma4VLModel(MagicMock):
+            pass
+
+        wrapper = Gemma4VLModel()
+        wrapper.language_model = inner
+        wrapper.return_value = torch.randn(1, 3)
+
+        self._run(wrapper)
+
+        assert not getattr(inner, "_linear_ce_fusion_armed", False)
+
+    def test_arming_is_reverted_when_forward_raises(self):
+        inner = self._gpt_model()
+
+        class Gemma4VLModel(MagicMock):
+            pass
+
+        wrapper = Gemma4VLModel()
+        wrapper.language_model = inner
+        wrapper.side_effect = RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            self._run(wrapper)
+
+        assert not getattr(inner, "_linear_ce_fusion_armed", False)
+
+
 class TestApplyTemperatureScaling:
     """Tests for apply_temperature_scaling function."""
 
