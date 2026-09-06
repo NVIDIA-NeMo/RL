@@ -652,6 +652,7 @@ def tiny_qwen2_model_path():
         vocab_size=151936,
         tie_word_embeddings=False,
         num_key_value_heads=None,
+        classifier_dropout=0.0,
     )
     model = Qwen2ForCausalLM(config=config)
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-1.5B")
