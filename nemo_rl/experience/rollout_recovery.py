@@ -1062,7 +1062,9 @@ class RolloutRecoveryLedger:
                     if not isinstance(reward, (int, float)):
                         raise ValueError("sealed attempts require a reward")
                     if not isinstance(mask_sample, bool):
-                        raise ValueError("sealed attempts require a boolean mask_sample")
+                        raise ValueError(
+                            "sealed attempts require a boolean mask_sample"
+                        )
                     if receipt is None:
                         if staging_keys:
                             raise ValueError(

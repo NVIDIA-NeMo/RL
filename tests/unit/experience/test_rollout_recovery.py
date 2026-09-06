@@ -30,11 +30,11 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.experience.rollout_recovery import (
-    ROLLOUT_RECOVERY_SCHEMA_VERSION,
     _ATTEMPT_STATE_FIELDS,
     _GROUP_STATE_FIELDS,
     _PROMPT_REF_STATE_FIELDS,
     _SIBLING_STATE_FIELDS,
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
     PromptGroupRecoveryRecord,
     PromptRef,

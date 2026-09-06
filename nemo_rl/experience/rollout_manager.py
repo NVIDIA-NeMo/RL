@@ -2021,9 +2021,9 @@ class RolloutManager:
         attempt_extra_env_info = attempt_input_sample.get("extra_env_info")
         if isinstance(attempt_extra_env_info, dict):
             attempt_extra_env_info[NEMO_GYM_GROUP_ID_KEY] = group_id
-            attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = max(
-                len(sibling.attempts) for sibling in recovery_group.siblings
-            ) - 1
+            attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
+                max(len(sibling.attempts) for sibling in recovery_group.siblings) - 1
+            )
         self._tq_buffer.reserve(
             weight_version=start_version,
             target_step=recovery_group.target_step,
@@ -2071,9 +2071,11 @@ class RolloutManager:
                     f"expected={gate_rollout_id!r}"
                 )
             mask_sample = bool(
-                (((completion.env_extras or {}).get("instance_config") or {}).get(
-                    MASK_SAMPLE, False
-                ))
+                (
+                    ((completion.env_extras or {}).get("instance_config") or {}).get(
+                        MASK_SAMPLE, False
+                    )
+                )
             )
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
