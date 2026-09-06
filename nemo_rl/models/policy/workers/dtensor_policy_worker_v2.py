@@ -110,7 +110,7 @@ def dtensor_params_generator(
     """
     module_map = dict(model.named_modules())
     for name, tensor in model.state_dict().items():
-        if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+        if _is_lora_adapter_tensor(name):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
@@ -128,12 +128,66 @@ def dtensor_params_generator(
         del full_tensor
 
 
+# Automodel's grouped-expert LoRA (GroupedExpertsLoRA / GroupedExpertsDeepEPLoRA) keeps its
+# adapters as bare parameters on the expert module rather than as LinearLoRA submodules, so
+# neither the skip filters nor the merge below recognise them without these helpers. Without
+# them the adapters are streamed to the inference engine as unknown keys and the base expert
+# weights are refit unmerged, i.e. generation silently uses an unadapted policy.
+_GROUPED_EXPERT_LORA_ADAPTERS = (
+    "lora_gate_and_up_A",
+    "lora_gate_and_up_B",
+    "lora_down_A",
+    "lora_down_B",
+)
+_GROUPED_EXPERT_BASE_WEIGHTS = ("gate_and_up_projs", "down_projs")
+
+
+def _is_lora_adapter_tensor(fqn: str) -> bool:
+    """True for adapter tensors that must never be sent to the inference engine."""
+    if fqn.endswith(".lora_A.weight") or fqn.endswith(".lora_B.weight"):
+        return True
+    return fqn.rpartition(".")[2] in _GROUPED_EXPERT_LORA_ADAPTERS
+
+
+def _grouped_expert_lora_adapters(
+    module_map: dict[str, nn.Module], fqn: str
+) -> tuple[Optional[nn.Module], Optional[tuple[torch.Tensor, torch.Tensor]]]:
+    """Return (module, (A, B)) when `fqn` is a grouped-expert base weight carrying LoRA."""
+    parent_name, _, leaf = fqn.rpartition(".")
+    if leaf not in _GROUPED_EXPERT_BASE_WEIGHTS:
+        return None, None
+    module = module_map.get(parent_name)
+    if module is None or not hasattr(module, "lora_gate_and_up_A"):
+        return None, None
+    if leaf == "gate_and_up_projs":
+        return module, (module.lora_gate_and_up_A, module.lora_gate_and_up_B)
+    return module, (module.lora_down_A, module.lora_down_B)
+
+
 @torch.no_grad()
 def _maybe_merge_lora_weight(
     module_map: dict[str, nn.Module],
     fqn: str,
     tensor: torch.Tensor,
 ) -> torch.Tensor:
+    expert_module, expert_adapters = _grouped_expert_lora_adapters(module_map, fqn)
+    if expert_module is not None:
+        # GroupedExperts(DeepEP)LoRA computes `x @ W + (x @ A @ B) * scale` per expert, so
+        # the merge is a per-expert batched matmul in the same orientation as W -- no
+        # transpose. A/B are sharded over the expert dimension exactly as W is under expert
+        # parallelism, so full_tensor() gathers them in the same expert order.
+        lora_a, lora_b = (
+            adapter.full_tensor() if isinstance(adapter, DTensor) else adapter
+            for adapter in expert_adapters
+        )
+        delta = torch.bmm(
+            lora_a.to(device=tensor.device, dtype=tensor.dtype),
+            lora_b.to(device=tensor.device, dtype=tensor.dtype),
+        )
+        merged = tensor + delta * getattr(expert_module, "scale", 1.0)
+        del delta
+        return merged
+
     if not fqn.endswith(".weight"):
         return tensor
     module_name = fqn[: -len(".weight")]
@@ -1045,7 +1099,7 @@ class DTensorPolicyWorkerV2Impl(
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
-            if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+            if _is_lora_adapter_tensor(name):
                 continue
             full_tensor = (
                 tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
