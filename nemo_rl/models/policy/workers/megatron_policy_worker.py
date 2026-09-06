@@ -65,7 +65,14 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    parse_nvfp4_pertoken_rollout,
+)
+from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+    NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
+    NvFp4PerTokenRolloutConfig,
+)
 from nemo_rl.models.megatron.common import (
     get_aux_loss_track_names,
     get_moe_metrics,
@@ -559,7 +566,9 @@ class MegatronPolicyWorkerImpl(
             "defer_fp32_logits", None
         ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
 
-        # Store FP8 config for later use
+        # Store FP8 config for later use. NVTE recipe environment variables are
+        # import-time settings in Transformer Engine, so they must be supplied
+        # process-wide through megatron_cfg.env_vars before this actor imports TE.
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
 
         # Full-iteration CUDA graphs cannot be interrupted, so disable the
@@ -2507,6 +2516,24 @@ class MegatronPolicyWorkerImpl(
                 )
             )
         return param_info
+
+    def _nvfp4_pertoken_rollout_cfg(
+        self,
+    ) -> NvFp4PerTokenRolloutConfig | None:
+        """Return validated per-token rollout config when the mode is enabled."""
+        generation_cfg = self.cfg.get("generation")
+        if not generation_cfg or generation_cfg.get("backend") != "vllm":
+            return None
+        return parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_cfg))
+
+    def maybe_init_zmq(self) -> None:
+        """Allow extra time for the first quantized refit and kernel autotune."""
+        super().maybe_init_zmq()
+        if self._nvfp4_pertoken_rollout_cfg() is not None:
+            import zmq
+
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
 
     def _iter_params_with_optional_kv_scales(
         self,

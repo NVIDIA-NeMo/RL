@@ -149,10 +149,10 @@ def _batch_fused_modelopt_moe_weights(
     loader still requires an expert id, so only the tiny per-expert global
     scales are exposed as scalar views.
 
-    Gated ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted
-    as per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
-    fused-3D branch mis-transposes packed NVFP4. See the comment at the
-    emission site below.
+    ``w13`` payloads are the exception on vLLM >= 0.25: both the gated and the
+    non-gated layouts are emitted as per-expert 2-D shards instead, because
+    ``RoutedExperts.load_weights``' fused-3D branch mis-transposes packed
+    NVFP4. See the comments at the emission sites below.
     """
     batched: list[tuple[str, torch.Tensor]] = []
     for name, tensor in weights:
@@ -171,11 +171,27 @@ def _batch_fused_modelopt_moe_weights(
         if target in {"w13_weight", "w13_weight_scale"}:
             target_suffix = "weight" if target == "w13_weight" else "weight_scale"
             if w13_num_shards_by_prefix.get(prefix) == 1:
-                batched.append(
-                    (
-                        f"{prefix}.experts.0.up_proj.{target_suffix}",
-                        tensor,
+                # Non-gated experts (e.g. Nemotron-H) have a single w13
+                # projection, but the payload is still batched [E, N, K/2].
+                # vLLM 0.26 routes it into RoutedExperts.load_weights' fused
+                # branch -- which keys off `loaded_weight.dim() == 3` alone --
+                # so it transposes and `chunk(2, dim=1)`s a dimension that was
+                # never a fused gate/up pair, and the copy shapes disagree.
+                # vLLM <= 0.25.1 escaped this only because Nemotron-H shipped
+                # its own load_weights; 0.26 deleted it in favour of
+                # AutoWeightsLoader. Emit per-expert 2-D shards for the same
+                # reason the gated branch below does.
+                if tensor.ndim != 3:
+                    raise ValueError(
+                        f"Expected a batched [E, N, K] non-gated W13 tensor for "
+                        f"{name}, got {tuple(tensor.shape)}"
                     )
+                batched.extend(
+                    (
+                        f"{prefix}.experts.{expert_id}.up_proj.{target_suffix}",
+                        expert_weight,
+                    )
+                    for expert_id, expert_weight in enumerate(tensor.unbind(0))
                 )
                 continue
             if tensor.ndim < 2 or tensor.shape[1] % 2 != 0:
@@ -600,6 +616,10 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         ``_patch_named_parameters_to_include_buffers`` no longer fires and
         quantizer amax buffers arrive without a loader (AttributeError:
         'Tensor' object has no attribute 'weight_loader').
+
+        It also aliases the MoE amax buffers under the dotted name vLLM's
+        ``RoutedExperts.load_weights`` looks up; see
+        ``_alias_moe_quantizer_amax_buffers``.
         """
 
         def input_amax_loader(param, loaded_weight, *args, **kwargs):
@@ -612,11 +632,65 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             if not hasattr(buf, "weight_loader"):
                 buf.weight_loader = input_amax_loader
                 attached.append(buf)
+        aliased = self._alias_moe_quantizer_amax_buffers(model)
         try:
             yield
         finally:
+            for module, alias in aliased:
+                delattr(module, alias)
             for buf in attached:
                 del buf.weight_loader
+
+    def _alias_moe_quantizer_amax_buffers(
+        self, model
+    ) -> list[tuple[torch.nn.Module, str]]:
+        """Expose MoE amax buffers under the dotted name vLLM resolves.
+
+        vLLM's two refit loaders disagree on how deep a target name may be.
+        ``LinearBase.load_weights`` rpartitions the name and walks into the
+        submodule, so ``in_proj.input_quantizer._amax`` resolves. vLLM 0.26's
+        ``RoutedExperts.load_weights`` instead does a single
+        ``getattr(self, param_name)``. Its expert mapping rewrites an incoming
+        ``experts.<E>.up_proj.input_quantizer._amax`` key into the relative name
+        ``w13_input_quantizer._amax``, which is one level deeper than a plain
+        ``w13_weight``, so the single getattr raises AttributeError and the
+        whole refit fails.
+
+        vLLM <= 0.25.1 never hit this because the models that own MoE experts
+        (e.g. ``NemotronHForCausalLM``) carried a hand-written ``load_weights``
+        that looked targets up in ``dict(self.named_parameters())`` — a dict
+        lookup takes the full dotted key. 0.26 replaced those with
+        ``AutoWeightsLoader``, which delegates to the per-module loader.
+
+        Aliasing the buffer onto its owning module under the dotted name is
+        enough to bridge that: the alias is the *same* tensor, so the
+        ``max()`` fan-in in ``input_amax_loader`` still writes the real buffer,
+        and because the name is not a valid identifier chain it lands in
+        ``__dict__`` and leaves ``named_buffers()``/``state_dict()`` untouched.
+
+        Only ``w13_``/``w2_`` quantizers are aliased: those are the MoE layout
+        owned by RoutedExperts, and every other quantizer is reached through
+        LinearBase, which already resolves dotted names.
+
+        Returns:
+            The ``(module, alias)`` pairs to delete once loading is done.
+        """
+        aliased: list[tuple[torch.nn.Module, str]] = []
+        for module in model.modules():
+            for child_name, child in module.named_children():
+                if not child_name.startswith(("w13_", "w2_")):
+                    continue
+                if not child_name.endswith("_quantizer"):
+                    continue
+                for buf_name, buf in child.named_buffers(recurse=False):
+                    if not buf_name.endswith("_amax"):
+                        continue
+                    alias = f"{child_name}.{buf_name}"
+                    if hasattr(module, alias):
+                        continue
+                    setattr(module, alias, buf)
+                    aliased.append((module, alias))
+        return aliased
 
     def _load_weights(self, weights):
         """Load pre-folded weights and activation-quantizer amax buffers.

@@ -17,7 +17,7 @@ import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Protocol
 
 import torch
 import zmq
@@ -180,6 +180,22 @@ class _IPCWeightManifest:
             details.append(_format_refit_key_error("missing keys", missing_keys))
         if details:
             raise IPCWeightManifestError("; ".join(details))
+
+
+class _ReloadWeightPreparer(Protocol):
+    """Turn transport batches into reload-safe checkpoint tensors.
+
+    Tensors returned by ``process`` must not reference the source IPC buffer,
+    because it is released as soon as the batch is acknowledged.
+    """
+
+    def reset(self) -> None: ...
+
+    def process(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]: ...
+
+    def finish(self) -> None: ...
 
 
 class NixlVllmWorker(VllmWorker):
@@ -938,6 +954,172 @@ class VllmInternalWorkerExtension:
         """Fence work consuming one IPC data batch before its acknowledgment."""
         torch.cuda.current_stream().synchronize()
 
+    def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer | None:
+        """Return this worker's transport-neutral checkpoint preparer."""
+        return None
+
+    def _drain_ipc_reload_sender(self) -> None:
+        """Release a REQ sender after a native reload has failed."""
+        while True:
+            payload = self.zmq_socket.recv_pyobj()
+            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+            if payload == IPCProtocol.COMPLETE:
+                return
+
+    def _update_weights_via_ipc_zmq_with_reload(
+        self, preparer: _ReloadWeightPreparer
+    ) -> bool:
+        """Receive IPC batches through vLLM's native layerwise reload API."""
+        try:
+            self.maybe_init_zmq()
+            manifest = _IPCWeightManifest(self.state_dict_info)
+            complete_received = False
+
+            def iter_prepared_weights() -> Iterator[tuple[str, torch.Tensor]]:
+                nonlocal complete_received
+                while True:
+                    payload = self.zmq_socket.recv_pyobj()
+
+                    if payload == IPCProtocol.COMPLETE:
+                        complete_received = True
+                        manifest.require_complete()
+                        preparer.finish()
+                        return
+
+                    buffer = None
+                    weight = None
+                    weights = None
+                    prepared_weights = None
+                    batch_keys = None
+                    batch_error = None
+                    try:
+                        ipc_handle, list_keys, used_bytes = payload
+                        batch_keys = manifest.validate_batch(list_keys)
+                        if batch_keys is None:
+                            continue
+
+                        buffer = rebuild_cuda_tensor_from_ipc(
+                            ipc_handle, self.device.index
+                        )
+                        weights = []
+                        offset = 0
+                        for key in list_keys:
+                            shape, dtype = self.state_dict_info[key]  # pyrefly
+                            if isinstance(shape, list):
+                                shape = torch.Size(shape)
+
+                            size_in_bytes = dtype.itemsize * shape.numel()
+                            weight = (
+                                buffer[offset : offset + size_in_bytes]
+                                .view(dtype=dtype)
+                                .view(shape)
+                            )
+                            weights.append((key, weight))
+                            offset += calculate_aligned_size(size_in_bytes)
+
+                        assert offset == used_bytes, (
+                            "Offset is not equal to used bytes, usually indicate "
+                            "inaccurate info like keys or cached dtype in "
+                            "state_dict_info"
+                        )
+                        prepared_weights = preparer.process(weights)
+                    except Exception as error:
+                        batch_error = error
+                        batch_desc = ", ".join(
+                            f"{k}: {tuple(w.shape)} {w.dtype}"
+                            for k, w in (weights or [])[:40]
+                        )
+                        logger.exception(
+                            "IPC reload batch preparation failed (batch: %s)",
+                            batch_desc,
+                        )
+                    finally:
+                        if buffer is not None:
+                            try:
+                                self._synchronize_before_ipc_data_ack()
+                            except Exception as error:
+                                if batch_error is None:
+                                    batch_error = error
+                                logger.exception(
+                                    "IPC reload batch synchronization failed"
+                                )
+
+                        if batch_error is not None:
+                            manifest.record_load_failure(batch_error)
+                        elif batch_keys is not None:
+                            manifest.record_loaded(batch_keys)
+
+                        # Prepared weights must own their storage. Drop every raw
+                        # IPC view before ACK permits sender-side buffer reuse.
+                        del weight, weights, buffer
+                        weight = None
+                        weights = None
+                        buffer = None
+                        try:
+                            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                        except Exception:
+                            if batch_error is None:
+                                raise
+                            logger.exception(
+                                "Failed to ACK an IPC batch after preparation failed"
+                            )
+
+                    if batch_error is not None:
+                        raise batch_error
+                    if prepared_weights is not None:
+                        yield from prepared_weights
+
+            prepared_iterator: Iterator[tuple[str, torch.Tensor]] | None = None
+            try:
+                preparer.reset()
+                prepared_iterator = iter_prepared_weights()
+                self.model_runner.reload_weights(
+                    weights_iterator=prepared_iterator,
+                    is_checkpoint_format=True,
+                )
+
+                if not complete_received:
+                    raise RuntimeError(
+                        "vLLM reload_weights returned before exhausting the IPC "
+                        "weight iterator"
+                    )
+
+                torch.accelerator.synchronize()
+            except Exception:
+                if prepared_iterator is not None:
+                    try:
+                        prepared_iterator.close()
+                    except Exception:
+                        logger.exception(
+                            "Failed to close the IPC reload weight iterator"
+                        )
+                try:
+                    if complete_received:
+                        self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                    else:
+                        self._drain_ipc_reload_sender()
+                except Exception:
+                    logger.exception(
+                        "Failed to release the IPC sender after reload failure"
+                    )
+                raise
+
+            # COMPLETE is deliberately acknowledged only after reload finalization
+            # and the final device fence have both succeeded.
+            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            return True
+        except Exception as e:
+            if self._weight_update_errors_are_fatal():
+                raise
+            logger.exception(
+                "Error in native IPC reload for VllmInternalWorkerExtension: %s",
+                e,
+            )
+            return False
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -945,6 +1127,10 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if weights were successfully updated.
         """
+        preparer = self._get_reload_weight_preparer()
+        if preparer is not None:
+            return self._update_weights_via_ipc_zmq_with_reload(preparer)
+
         buffer = None
         weight = None
         weights = None

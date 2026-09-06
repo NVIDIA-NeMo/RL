@@ -1,0 +1,44 @@
+defaults: performance/grpo-qwen3-30ba3b-4n4g.yaml
+grpo:
+  max_num_steps: 20
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
+policy:
+  train_global_batch_size: 16
+  logprob_batch_size: 1
+  router_replay:
+    enabled: true
+  generation:
+    nvfp4_pertoken_rollout:
+      enabled: true
+    vllm_kwargs:
+      moe_backend: auto
+  megatron_cfg:
+    moe_router_dtype: fp32
+    optimizer:
+      use_precision_aware_optimizer: false
+    fp4_cfg:
+      enabled: true
+      fp4: e2m1
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 2
+    num_layers_at_end_in_bf16: 4
+    te_precision_config_file: examples/te_precision/attn_bf16_mlp_nvfp4.yaml
+    env_vars:
+      NVTE_NVFP4_ROW_SCALED_ACTIVATION: '1'
+      NVTE_NVFP4_DISABLE_RHT: '1'
+      NVTE_NVFP4_DISABLE_2D_QUANTIZATION: '1'
+      NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: '1'
+      NVTE_BACKWARD_OVERRIDE: dequantized
+cluster:
+  # The performance recipe this inherits from pins segment_size=4 so all four
+  # nodes land in one NVLink domain. A 20-step smoke does not need that
+  # locality, and requiring it fails outright on clusters whose allocation
+  # spans domains (ResourceInsufficientError before any training runs).
+  segment_size: null
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
+  wandb:
+    name: grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
