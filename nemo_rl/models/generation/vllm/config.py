@@ -109,6 +109,10 @@ class VllmSpecificArgs(TypedDict):
     # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
     # affecting other test cases.
     env_vars: NotRequired[dict[str, str]]
+    # Opt into vLLM's native reload_weights API for refit. The default stays
+    # False so existing IPC/NCCL refit behavior keeps using NeMo-RL's legacy
+    # loader path.
+    refit_with_reload_api: NotRequired[bool]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
 

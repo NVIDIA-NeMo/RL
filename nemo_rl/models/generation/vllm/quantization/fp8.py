@@ -14,8 +14,9 @@
 
 import os
 import warnings
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 from unittest.mock import patch
 
 import ray
@@ -36,6 +37,7 @@ from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
 from nemo_rl.models.generation.vllm.quantization.utils import (
     resolve_module_from_param_name,
 )
+from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
 
 logger = init_logger(__name__)
 
@@ -64,6 +66,7 @@ class FP8Config:
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
     is_mx: bool = False
+    refit_with_reload_api: bool = False
 
 
 @dataclass()
@@ -161,36 +164,46 @@ def apply_fp8_patches(self, fp8_config):
 
     # Apply weight-related patches only when using FP8 weights (precision=fp8)
     if global_fp8_config.use_fp8_weights:
-        # This patch is used to support torch.compile with vllm parameter subclasses, such as
-        # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
-        # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
-        # with pytorch 2.8, parameter subclassing with torch.compile will be natively supported, in
-        # which this patch can be removed.
-        func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
-        patcher1 = patch(func1_path, process_weights_after_loading)
-        fp8_state.vllm_patches.append(patcher1)
-        func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
-        patcher2 = patch(func2_path, process_weights_after_loading_moe)
-        fp8_state.vllm_patches.append(patcher2)
-        if global_fp8_config.is_mx:
-            fp8_state.vllm_patches.append(
-                patch(
-                    "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8LinearMethod.process_weights_after_loading",
-                    process_weights_after_loading_mxfp8_linear,
+        if not global_fp8_config.refit_with_reload_api:
+            # Native reload_weights owns weight materialization and post-load
+            # processing; these patches are only needed by the legacy refit path.
+            # This patch is used to support torch.compile with vllm parameter
+            # subclasses, such as PerTensorScaleParameter. Because we need
+            # weight loaders to update fp8 weights each refit, we patch fp8
+            # parameters to have a reference to their weight loader. Eventually
+            # with pytorch 2.8, parameter subclassing with torch.compile will be
+            # natively supported, in which this patch can be removed.
+            func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
+            patcher1 = patch(func1_path, process_weights_after_loading)
+            fp8_state.vllm_patches.append(patcher1)
+            func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
+            patcher2 = patch(func2_path, process_weights_after_loading_moe)
+            fp8_state.vllm_patches.append(patcher2)
+            if global_fp8_config.is_mx:
+                fp8_state.vllm_patches.append(
+                    patch(
+                        "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8LinearMethod.process_weights_after_loading",
+                        process_weights_after_loading_mxfp8_linear,
+                    )
                 )
-            )
-            fp8_state.vllm_patches.append(
-                patch(
-                    "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.create_weights",
-                    create_weights_mxfp8_moe,
+                fp8_state.vllm_patches.append(
+                    patch(
+                        "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.create_weights",
+                        create_weights_mxfp8_moe,
+                    )
                 )
-            )
-            fp8_state.vllm_patches.append(
-                patch(
-                    "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.process_weights_after_loading",
-                    process_weights_after_loading_mxfp8_moe,
+                fp8_state.vllm_patches.append(
+                    patch(
+                        "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.process_weights_after_loading",
+                        process_weights_after_loading_mxfp8_moe,
+                    )
                 )
-            )
+
+            # Static scales mode: patch process_weights_after_loading to preserve
+            # k_scale/v_scale for manual updates.
+            func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+            patcher5 = patch(func5_path, process_weights_after_loading_kv)
+            fp8_state.vllm_patches.append(patcher5)
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
         # SNR compared to plain fp32 scaling factors. This feature is still under active research.
@@ -202,11 +215,6 @@ def apply_fp8_patches(self, fp8_config):
             patcher3 = patch(func3_path, _per_token_group_quant_fp8)
             patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
             fp8_state.vllm_patches.extend([patcher2, patcher3, patcher4])
-
-        # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
-        func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-        patcher5 = patch(func5_path, process_weights_after_loading_kv)
-        fp8_state.vllm_patches.append(patcher5)
 
     for p in fp8_state.vllm_patches:
         p.start()
@@ -264,6 +272,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
+        "refit_with_reload_api": bool(vllm_cfg.get("refit_with_reload_api")),
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
@@ -288,12 +297,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
     if vllm_cfg["async_engine"]:
-        # for async engine, vllm spawns a process for each DP, so we patch
-        # vllm so that upon spawning the thread it applies our FP8 patches
         EngineCoreProc.run_engine_core = my_run_engine_core
         CoreEngineProcManager.__init__ = my_init
     else:
-        # if not async, just directly monkey patch the ray executor
         monkey_patch_vllm_ray_executor(global_fp8_config)
 
     # create fp8 kwargs for vllm's LLM(...)
@@ -472,6 +478,15 @@ def _is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 
+def _is_fp8_grouped_moe_expert(name: str, model: Any) -> bool:
+    experts_module = get_module_from_param_name(model, name)
+    return (
+        isinstance(experts_module, RoutedExperts)
+        and experts_module.w13_weight.dtype == torch.float8_e4m3fn
+        and experts_module.w2_weight.dtype == torch.float8_e4m3fn
+    )
+
+
 def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a checkpoint-layout weight for MXFP8 weight loading and refit.
 
@@ -491,9 +506,13 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
-def load_weights(weights, model_runner):
-    global global_fp8_config
-    weights_quantized = []
+def get_quantized_weight_iterator(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    model_runner: Any,
+    *,
+    refit_with_reload_api: bool,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Convert trainer weights to the checkpoint tensors expected by vLLM."""
     model = model_runner.model
 
     for k, v in weights:
@@ -502,9 +521,7 @@ def load_weights(weights, model_runner):
         # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
         # layout, then reshape to 2D [num_experts, out_features, in_features] -> [num_experts*out_features, in_features]
         # so the block scales can be quantized and routed correctly.
-        if k.endswith("mlp.experts.gate_up_proj") or k.endswith(
-            "mlp.experts.down_proj"
-        ):
+        if is_grouped_moe_expert_weight_name(k):
             # Quantize only if vLLM built this layer's experts as FP8. Experts
             # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
             # quantization_ignored_layer_kws) are built unquantized, with bf16
@@ -512,25 +529,17 @@ def load_weights(weights, model_runner):
             # FP8 + scale entries would have nowhere to load. Pass the grouped
             # bf16 slab through instead; vLLM's fused expert mapping loads it
             # directly, same as a bf16 refit.
-            experts_module = get_module_from_param_name(model, k)
-            if (
-                isinstance(experts_module, RoutedExperts)
-                and experts_module.w13_weight.dtype == torch.float8_e4m3fn
-                and experts_module.w2_weight.dtype == torch.float8_e4m3fn
-            ):
-                if global_fp8_config.is_mx:
-                    raise NotImplementedError(
-                        "MXFP8 refit does not support grouped MoE expert weights."
-                    )
-                weights_quantized.extend(_expand_grouped_moe_expert_to_fp8(k, v))
+            if _is_fp8_grouped_moe_expert(k, model):
+                yield from _expand_grouped_moe_expert_to_fp8(k, v)
             else:
-                weights_quantized.append((k, v))
+                yield k, v
             continue
         if not _is_fp8_weight(k, model):
-            weights_quantized.append((k, v))
+            yield k, v
             continue
+        is_mx = global_fp8_config.is_mx
         # Cast the weight into fp8 and its scale factor
-        if global_fp8_config.is_mx:
+        if is_mx:
             param_lp, param_scale = quantize_mxfp8_weight(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
@@ -538,14 +547,30 @@ def load_weights(weights, model_runner):
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        if global_fp8_config.is_mx:
-            weights_quantized.append([k, param_lp])
-            weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
+        if is_mx:
+            if refit_with_reload_api:
+                yield k, param_lp
+                yield k + "_scale", param_scale
+            else:
+                yield k, param_lp
+                yield k + "_scale_from_checkpoint", param_scale
         else:
-            weights_quantized.append([k, param_lp])
-            weights_quantized.append([k + "_scale_inv", param_scale])
+            yield k, param_lp
+            yield k + "_scale_inv", param_scale
+
+
+def load_weights(
+    weights: Iterable[tuple[str, torch.Tensor]], model_runner: Any
+) -> None:
+    """Quantize weights for the legacy direct model-loading path."""
     # Finally load the weights into vllm
-    model.load_weights(weights_quantized)
+    model_runner.model.load_weights(
+        get_quantized_weight_iterator(
+            weights,
+            model_runner,
+            refit_with_reload_api=False,
+        )
+    )
 
 
 def cast_tensor_to_fp8_blockwise(

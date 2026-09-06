@@ -328,6 +328,29 @@ class VllmInternalWorkerExtension:
             return
         self._load_full_hf_weights(policy_weights)
 
+    def _prepare_reload_weight_iterator(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Prepare checkpoint-format weights for vLLM's native reload API."""
+        if (
+            "Gemma3ForConditionalGeneration"
+            in self.model_runner.vllm_config.model_config.architectures
+        ):
+            weights = (
+                (fix_gemma3_vision_weight_name(name), weight)
+                for name, weight in weights
+            )
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            return fp8.get_quantized_weight_iterator(
+                weights,
+                self.model_runner,
+                refit_with_reload_api=True,
+            )
+        return weights
+
     def bind_numa(self) -> bool:
         """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
 
@@ -1115,6 +1138,7 @@ class VllmInternalWorkerExtension:
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
+
             with self._weight_update_lifecycle("ipc") as finalize:
                 while True:
                     # Blocking receive with timeout (this is the main operation)
@@ -1213,13 +1237,19 @@ class VllmInternalWorkerExtension:
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
     def update_weights_from_collective(
-        self, refit_timeout_s: float | None = None
+        self,
+        refit_timeout_s: float | None = None,
+        refit_with_reload_api: bool = False,
     ) -> bool:
         """Update the model weights from collective communication.
 
         Guarded for the same reason as the producer side: if a peer rank dies mid-refit
         this blocks in NCCL forever. Note the buffers hold PARTIAL weights once aborted,
         so the caller must not serve from this engine until a later refit completes.
+
+        Args:
+            refit_timeout_s: Refit watchdog timeout in seconds.
+            refit_with_reload_api: Whether to use vLLM's native reload API.
         """
         from nemo_rl.distributed.refit_watchdog import (
             RefitAborted,
@@ -1229,7 +1259,7 @@ class VllmInternalWorkerExtension:
 
         with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
             hold_refit_for_fault_injection()
-            result = self._update_weights_from_collective()
+            result = self._update_weights_from_collective(refit_with_reload_api)
         if guard.fired:
             raise RefitAborted(
                 f"refit receive exceeded {refit_timeout_s}s and was aborted; "
@@ -1237,26 +1267,54 @@ class VllmInternalWorkerExtension:
             )
         return result
 
-    def _update_weights_from_collective(self) -> bool:
+    def _update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
         )
 
         try:
-            native_layerwise_refit = self._uses_native_layerwise_refit("collective")
-            with self._weight_update_lifecycle("collective") as finalize:
-                packed_broadcast_consumer(
+            if refit_with_reload_api:
+                weight_iterator = packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=self._load_weights,
-                    # Double buffering (num_buffers > 1) causes a race condition
-                    # when using native_layerwise_refit: deferred weight_loader
-                    # replays may read a buffer while the other stream refills it.
-                    num_buffers=1 if native_layerwise_refit else None,
+                    post_unpack_func=None,
+                    return_iterator=True,
                 )
-                finalize()
+                assert weight_iterator is not None
+                reload_weight_iterator = self._prepare_reload_weight_iterator(
+                    weight_iterator
+                )
+                try:
+                    self.model_runner.reload_weights(
+                        weights_iterator=reload_weight_iterator
+                    )
+                finally:
+                    iterators_to_close = [reload_weight_iterator]
+                    if reload_weight_iterator is not weight_iterator:
+                        iterators_to_close.append(weight_iterator)
+
+                    for iterator_to_close in iterators_to_close:
+                        close_weight_iterator = getattr(
+                            iterator_to_close, "close", None
+                        )
+                        if close_weight_iterator is not None:
+                            close_weight_iterator()
+            else:
+                native_layerwise_refit = self._uses_native_layerwise_refit("collective")
+                with self._weight_update_lifecycle("collective") as finalize:
+                    packed_broadcast_consumer(
+                        iterator=iter(self.state_dict_info.items()),
+                        group=self.model_update_group,
+                        src=0,
+                        post_unpack_func=self._load_weights,
+                        # Double buffering (num_buffers > 1) causes a race condition
+                        # when using native_layerwise_refit: deferred weight_loader
+                        # replays may read a buffer while the other stream refills it.
+                        num_buffers=1 if native_layerwise_refit else None,
+                    )
+                    finalize()
 
         except Exception as e:
             if self._weight_update_errors_are_fatal():
