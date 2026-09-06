@@ -32,7 +32,10 @@ from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+    spinup_nemo_gym_actor,
+)
 from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 
 _REPO_ROOT = Path(__file__).parents[3]
@@ -543,7 +546,10 @@ def l0_nemo_gym(scripted_openai_base_url):
         try:
             # The shared actor owns many Gym subprocesses, which are reaped
             # sequentially during graceful shutdown.
-            ray.get(env.shutdown.remote(), timeout=60)
+            ray.get(
+                env.shutdown.remote(),
+                timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+            )
         finally:
             ray.kill(env)
 
@@ -561,6 +567,17 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepte
     expected_reward = case["expected_reward"] if accepted else 0.0
     datum = _load_case_datum(case, accepted=accepted)
     extra_env_info = datum["extra_env_info"]
+    expected_responses_create_params = deepcopy(
+        extra_env_info["responses_create_params"]
+    )
+    expected_responses_create_params["temperature"] = _GENERATION_CONFIG["temperature"]
+    expected_responses_create_params["top_p"] = _GENERATION_CONFIG["top_p"]
+    row_max_output_tokens = expected_responses_create_params.get("max_output_tokens")
+    expected_responses_create_params["max_output_tokens"] = (
+        min(row_max_output_tokens, _GENERATION_CONFIG["max_new_tokens"])
+        if row_max_output_tokens is not None
+        else _GENERATION_CONFIG["max_new_tokens"]
+    )
     assert case["expected_prompt_fragment"] in json.dumps(
         extra_env_info["responses_create_params"]
     )
@@ -614,7 +631,7 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepte
     full_result = json.loads(full_result_table.data[0][0])
     _assert_contract_preserved(
         full_result["responses_create_params"],
-        extra_env_info["responses_create_params"],
+        expected_responses_create_params,
     )
     if accepted:
         for field, expected_value in case["expected_result"].items():
