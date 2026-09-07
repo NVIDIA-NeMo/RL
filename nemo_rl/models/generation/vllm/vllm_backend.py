@@ -61,6 +61,11 @@ WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
 UnsupportedNativeRefitTransport = Literal["checkpoint_engine", "sparse_delta"]
 WeightUpdateFinalizer = Callable[[], None]
 
+_GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS = (
+    "model.embed_vision.",
+    "model.embed_audio.",
+)
+
 
 def _format_refit_key_error(label: str, keys: set[str]) -> str:
     """Format a bounded refit-key diagnostic."""
@@ -797,6 +802,29 @@ class VllmInternalWorkerExtension:
         ):
             for idx, (key, weight) in enumerate(weights):
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
+
+        model_config = self.model_runner.vllm_config.model_config
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        if any("Gemma4Unified" in arch for arch in model_config.architectures) and (
+            multimodal_config is not None and multimodal_config.language_model_only
+        ):
+            # HF loads the full unified checkpoint, while text-only vLLM uses
+            # encoder-free multimodal stubs with a different parameter layout.
+            # The recipe freezes these towers and never invokes them, so only
+            # refit the language path and leave the unused vLLM stubs untouched.
+            num_weights = len(weights)
+            weights = [
+                (key, weight)
+                for key, weight in weights
+                if not key.startswith(_GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS)
+            ]
+            num_dropped = num_weights - len(weights)
+            if num_dropped:
+                logger.info(
+                    "Gemma4 Unified text-only refit dropped %d frozen "
+                    "vision/audio weights",
+                    num_dropped,
+                )
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         self._load_hf_weights(policy_weights)

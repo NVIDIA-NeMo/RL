@@ -3,18 +3,18 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=1
+NUM_NODES=2
 STEPS_PER_RUN=20
 MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=120
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_vlm_grpo.py \
+uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
@@ -33,14 +33,15 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # Calibrated from recent nvidia/nemo-rl nightly runs through 2026-09-04.
+    # Calibrated from W&B runs spg9333n and g412b200.
     uv run tests/check_metrics.py $JSON_METRICS \
         'all_finite(data["train/loss"])' \
         'all_finite(data["train/grad_norm"])' \
         'all_finite(data["train/token_mult_prob_error"])' \
         'median(data["train/token_mult_prob_error"]) < 1.05' \
         'mean(data["train/gen_kl_error"]) < 0.001' \
-        'mean(data["train/reward"]) > 0.4'
+        'mean(data["train/reward"]) > 0.1' \
+        'mean(data["train/filtered_reward"]) > -0.15'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

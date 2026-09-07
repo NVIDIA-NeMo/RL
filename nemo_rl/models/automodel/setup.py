@@ -585,6 +585,15 @@ def setup_model_and_optimizer(
                 "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
             )
 
+        if model_config.model_type == "gemma4_unified":
+            raise AssertionError(
+                "Context parallel is not supported for the Gemma 4 unified "
+                "checkpoint (model_type='gemma4_unified'). Its global-attention "
+                "GQA uses head_dim=512, for which no CP SDPA kernel is available. "
+                "Set policy.dtensor_cfg.context_parallel_size = 1. See "
+                "docs/guides/models/gemma/gemma4.md."
+            )
+
         if tp_size > 1 and sequence_parallel_enabled:
             raise AssertionError(
                 "It's a known issue that context parallel can't be used together with sequence parallel in DTensor worker. "

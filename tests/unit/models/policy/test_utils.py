@@ -31,8 +31,13 @@ from nemo_rl.models.policy.utils import (
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
+    resolve_model_class,
     stream_weights_via_ipc_zmq_impl,
 )
+
+
+def test_resolve_model_class_routes_gemma4_unified_to_image_text_model():
+    assert "ImageTextToText" in resolve_model_class("gemma4_unified").__name__
 
 
 class TestGetMegatronCheckpointDir:
