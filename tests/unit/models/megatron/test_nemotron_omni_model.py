@@ -79,7 +79,7 @@ class _TinyOmniProvider(NemotronOmniModelProvider):
     use_vision_backbone_fp8_arch: bool = False
     vision_proj_ffn_hidden_size: int = 256
     pipeline_model_parallel_size: int = 1
-    use_cpu_initialization: bool = True
+    use_cpu_initialization: bool = False
     gradient_accumulation_fusion: bool = False
     nemotron_omni_contract: str = NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
 
@@ -151,6 +151,7 @@ def _build_distributed_model(
             use_distributed_optimizer=False,
             check_for_nan_in_grad=True,
         ),
+        use_cpu_initialization=False,
         wrap_with_ddp=True,
         mixed_precision_wrapper=None,
     )

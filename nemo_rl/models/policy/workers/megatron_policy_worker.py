@@ -16,7 +16,6 @@ import gc
 import logging
 import os
 import re
-import socket
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -58,7 +57,6 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.held_port import receive_held_socket
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -481,14 +479,12 @@ class MegatronPolicyWorkerImpl(
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
-        # Adopt the driver-reserved OpenAI server socket before any heavy init.
-        # The port holder has kept it bound and listening since reservation, so
-        # there was no window in which the pre-published URL could be stolen.
-        self._reserved_http_server_socket: Optional[socket.socket] = None
-        if reserved_http_server_port is not None and self.rank == 0:
-            self._reserved_http_server_socket = receive_held_socket(
-                reserved_http_server_port
-            )
+        # Store the reserved HTTP server port for inference server initialization.
+        # Megatron-LLM's inference server lives on Rank 0 only.
+        # TODO: Multiple inference servers for each MP coordinator.
+        self._reserved_http_server_port = (
+            reserved_http_server_port if self.rank == 0 else None
+        )
 
         # Step 1: Setup distributed
         setup_distributed(config)
@@ -735,6 +731,20 @@ class MegatronPolicyWorkerImpl(
         self._first_train_step_param_sync_func = model_config.param_sync_func
         model_config.param_sync_func = None
         self._first_train_step_forward_pre_hook_disabled = True
+
+    def _restore_first_train_step_param_sync(self, update_successful: bool) -> None:
+        if (
+            not self._first_train_step_forward_pre_hook_disabled
+            or not update_successful
+        ):
+            return
+
+        self.enable_forward_pre_hook()
+        get_model_config(
+            self.model
+        ).param_sync_func = self._first_train_step_param_sync_func
+        self._first_train_step_param_sync_func = None
+        self._first_train_step_forward_pre_hook_disabled = False
 
     def _copy_main_params_to_param_buffer(self, zero_grad_buffer: bool = False) -> None:
         if not isinstance(self.model, DistributedDataParallel):
@@ -1020,17 +1030,8 @@ class MegatronPolicyWorkerImpl(
                 draft_grad_norm = reduce_max_stat_across_model_parallel_group(
                     draft_grad_norm, mp_group=pg_collection.mp
                 )
-                if (
-                    not eval_mode
-                    and self._first_train_step_forward_pre_hook_disabled
-                    and update_successful
-                ):
-                    self.enable_forward_pre_hook()
-                    get_model_config(
-                        self.model
-                    ).param_sync_func = self._first_train_step_param_sync_func
-                    self._first_train_step_param_sync_func = None
-                    self._first_train_step_forward_pre_hook_disabled = False
+                if not eval_mode:
+                    self._restore_first_train_step_param_sync(update_successful)
 
                 warn_if_inf_grad_norm(grad_norm)
 
@@ -1454,27 +1455,7 @@ class MegatronPolicyWorkerImpl(
         explicitly in ``finish_train_step``. Returns nothing: gradients
         land in ``param.main_grad`` and per-microbatch metrics accumulate
         in the open-step state until ``finish_train_step`` surfaces them.
-
-        Raises:
-            NotImplementedError: The model is multimodal. Unlike ``train`` /
-                ``get_logprobs`` / ``get_topk_logits``, this path builds its
-                microbatch iterator without the media-token validity mask or
-                any of the packing/CP capability flags, so a multimodal model
-                would silently be handed CP-sliced rows it believes are full.
         """
-        if self.media_placeholder_token_id is not None or (
-            self.model_slices_context_parallel_inputs
-        ):
-            raise NotImplementedError(
-                "train_microbatch does not support multimodal models: its "
-                "microbatch iterator is built without "
-                "attach_media_token_validity_mask, delegate_pack_to_model, "
-                "delegate_mtp_loss_mask_to_model or "
-                "model_slices_context_parallel_inputs, all of which the train / "
-                "get_logprobs / get_topk_logits paths pass. Threading them here "
-                "needs a SingleController VLM recipe to verify against; until "
-                "then use train_presharded, which delegates to train."
-            )
         state = self._assert_step_open()
         try:
             self._train_microbatch_body(state, data)
@@ -1559,6 +1540,7 @@ class MegatronPolicyWorkerImpl(
         # Build the per-call iterator. Each ``train_microbatches_from_meta``
         # call carries one DP slice; the iterator subdivides into pipeline
         # microbatches.
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
         (
             data_iterator,
             num_microbatches,
@@ -1794,13 +1776,7 @@ class MegatronPolicyWorkerImpl(
 
         # Mirrors train(): without re-enabling the pre-hook __init__ removed, the
         # param all-gather never runs and each forward sees only its own shard.
-        if self._first_train_step_forward_pre_hook_disabled and update_successful:
-            self.enable_forward_pre_hook()
-            get_model_config(
-                self.model
-            ).param_sync_func = self._first_train_step_param_sync_func
-            self._first_train_step_param_sync_func = None
-            self._first_train_step_forward_pre_hook_disabled = False
+        self._restore_first_train_step_param_sync(update_successful)
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
