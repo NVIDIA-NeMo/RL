@@ -2166,6 +2166,10 @@ def _write_periodic_snapshot(step_dir: Path) -> Path:
         {"fake_position": 7},
         tmp_snapshot / "train_dataloader.pt",
     )
+    # Production periodic snapshots include replay metadata alongside the
+    # dataloader and manifest. Keep this fixture representative so setup
+    # exercises rollout-payload restore timing as well as cursor restoration.
+    torch.save({"groups": []}, tmp_snapshot / REPLAY_BUFFER_METADATA_FILENAME)
     manifest = RolloutSnapshotManifest(
         schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
         base_train_step=3,
