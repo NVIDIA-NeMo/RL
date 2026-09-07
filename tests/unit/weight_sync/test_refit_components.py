@@ -232,6 +232,7 @@ def test_native_mxfp8_param_names_requires_canonical_dtype_pair() -> None:
     )
     assert native_mxfp8_param_names(refit_info) == set()
 
+
 @pytest.mark.parametrize(
     ("param_info", "match"),
     [

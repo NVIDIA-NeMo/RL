@@ -218,7 +218,7 @@ def test_init_collective_keeps_generation_ranks_after_the_training_ranks(
 
 def _unquantized_moe_module(
     moe_backend: str, expert_placement_strategy: str | None = "linear"
-) -> SimpleNamespace:
+) -> torch.nn.Module:
     """A realized unquantized MoE layer.
 
     ``expert_placement_strategy=None`` builds a module that carries no placement
@@ -233,34 +233,43 @@ def _unquantized_moe_module(
     )
 
     quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+    torch.nn.Module.__init__(quant_method)
     quant_method.unquantized_backend = UnquantizedMoeBackend(moe_backend)
-    if expert_placement_strategy is None:
-        return SimpleNamespace(quant_method=quant_method)
-    return SimpleNamespace(
-        quant_method=quant_method,
-        expert_map_manager=SimpleNamespace(
+    module = torch.nn.Module()
+    module.quant_method = quant_method
+    if expert_placement_strategy is not None:
+        module.expert_map_manager = SimpleNamespace(
             placement_strategy=expert_placement_strategy
-        ),
-    )
+        )
+    return module
 
 
-def _quantized_moe_module() -> SimpleNamespace:
+def _quantized_moe_module() -> torch.nn.Module:
     """A MoE layer inside the quantization recipe, so not an unquantized method."""
-    return SimpleNamespace(quant_method=object())
+    module = torch.nn.Module()
+    module.quant_method = object()
+    return module
+
+
+def _moe_model(modules: list[torch.nn.Module]) -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.quant_method = object()
+    model.layers = torch.nn.ModuleList(modules)
+    return model
 
 
 def _make_unquantized_moe_model(
     moe_backend: str, expert_placement_strategy: str | None = "linear"
-) -> SimpleNamespace:
+) -> torch.nn.Module:
     module = _unquantized_moe_module(moe_backend, expert_placement_strategy)
-    return SimpleNamespace(modules=lambda: [module])
+    return _moe_model([module])
 
 
-def _make_quantized_moe_model() -> SimpleNamespace:
-    return SimpleNamespace(modules=lambda: [_quantized_moe_module()])
+def _make_quantized_moe_model() -> torch.nn.Module:
+    return _moe_model([_quantized_moe_module()])
 
 
-def _make_mixed_precision_moe_model(moe_backend: str) -> SimpleNamespace:
+def _make_mixed_precision_moe_model(moe_backend: str) -> torch.nn.Module:
     """The production layout: BF16 boundary layers beside quantized ones.
 
     ``keep_bf16_first_layers``/``keep_bf16_last_layers`` put the boundary layers
@@ -275,7 +284,7 @@ def _make_mixed_precision_moe_model(moe_backend: str) -> SimpleNamespace:
         _quantized_moe_module(),
         _unquantized_moe_module(moe_backend),
     ]
-    return SimpleNamespace(modules=lambda: modules)
+    return _moe_model(modules)
 
 
 @pytest.mark.vllm
@@ -671,7 +680,9 @@ def test_the_non_native_finalizer_clears_the_exactly_once_guard(monkeypatch):
     quantized = [
         module
         for module in model.modules()
-        if not isinstance(module.quant_method, UnquantizedFusedMoEMethod)
+        if not isinstance(
+            getattr(module, "quant_method", None), UnquantizedFusedMoEMethod
+        )
     ]
     model_config = object()
     vllm_config = SimpleNamespace(
