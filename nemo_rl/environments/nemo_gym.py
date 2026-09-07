@@ -341,6 +341,9 @@ class NemoGym(EnvironmentInterface):
         # here rather than in _spinup so a second spinup cannot wipe an installed
         # tokenizer and then report that set_tokenizer was never called.
         self._tokenizer: Optional[PreTrainedTokenizerBase] = None
+        # _spinup replaces this from cfg. Keep restarted/unspun actors internally
+        # complete so diagnostics and focused tests do not fail with AttributeError.
+        self._token_capture_enabled = False
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -587,7 +590,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
-    ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
+    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         self._require_spinup()
         if not nemo_gym_examples:
@@ -602,18 +605,20 @@ Depending on your data shape, you may want to change these values."""
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
-        timer = Timer()
-        counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
-
         # Normalize local media before shipping requests to vLLM. Helper is a no-op
         # for text-only rows and already-qualified URLs.
         # Megatron's HTTP backend consumes the same normalized Responses payload.
         normalize_media_in_examples(nemo_gym_examples)
 
+        timer = Timer()
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
+        # Current Gym collates data with ``task_source`` rather than a baked-in
+        # ``agent_ref``. ``run_examples`` resolves that routing synchronously and
+        # stamps each input row before returning its result iterator.
+        counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
         for task in nemo_gym_result_iterator:
@@ -681,7 +686,15 @@ Depending on your data shape, you may want to change these values."""
                     file=sys.stderr,
                 )
 
-            yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
+            # task_source is resolved to agent_ref inside this Ray actor, after
+            # the caller's row was serialized. Return the resolved ref explicitly
+            # so the caller can hydrate its own row copy before postprocessing.
+            yield (
+                nemo_gym_row["_rowidx"],
+                nemo_gym_row["agent_ref"],
+                nemo_rl_result,
+                timing_metrics,
+            )
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict

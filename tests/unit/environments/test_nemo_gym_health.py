@@ -24,6 +24,10 @@ __init__ only, which does not start the Gym servers, so a restarted NemoGym reac
 state and previously surfaced it as an AttributeError from deep inside a rollout.
 """
 
+import asyncio
+from collections.abc import AsyncIterator
+from typing import Any
+
 import pytest
 
 from nemo_rl.environments.nemo_gym import NemoGym
@@ -52,6 +56,39 @@ class _FakeRunHelper:
 
     def shutdown(self) -> None:
         self.shutdowns += 1
+
+
+class _TaskSourceResolvingRolloutHelper:
+    """Mimic Gym's synchronous task_source-to-agent_ref resolution."""
+
+    def run_examples(
+        self, examples: list[dict[str, Any]], head_server_config: str
+    ) -> list[Any]:
+        assert head_server_config == "head-server"
+        assert all("agent_ref" not in example for example in examples)
+        for example in examples:
+            example["agent_ref"] = {
+                "type": "responses_api_agents",
+                "name": "workplace_assistant_simple_agent",
+            }
+        return []
+
+
+class _TaskSourceResolvingRolloutHelperWithResult(_TaskSourceResolvingRolloutHelper):
+    def run_examples(
+        self, examples: list[dict[str, Any]], head_server_config: str
+    ) -> list[Any]:
+        super().run_examples(examples, head_server_config)
+
+        async def completed(example):
+            return example, {}
+
+        return [completed(example) for example in examples]
+
+
+async def _drain(async_generator: AsyncIterator[Any]) -> None:
+    async for _ in async_generator:
+        pass
 
 
 class TestHealthCheck:
@@ -96,3 +133,44 @@ class TestUnspunActor:
         env.shutdown()
         assert run_helper.shutdowns == 1
         assert env.rh is None
+
+
+def test_run_rollouts_resolves_task_source_before_reading_agent_ref():
+    """Gym 0.15 collated rows are task_source-routed until run_examples."""
+    env = _unspun()
+    env.rh = _FakeRunHelper()
+    env._tokenizer = object()
+    env.head_server_config = "head-server"
+    env.rch = _TaskSourceResolvingRolloutHelper()
+
+    rows = [{"task_source": "workplace_assistant"}]
+    asyncio.run(_drain(env.run_rollouts(rows, "timing/test")))
+
+    assert rows[0]["agent_ref"]["name"] == "workplace_assistant_simple_agent"
+
+
+def test_run_rollouts_echoes_resolved_agent_ref_with_streamed_result():
+    """The caller's serialized row copy cannot observe actor-local mutation."""
+    env = _unspun()
+    env.rh = _FakeRunHelper()
+    env._tokenizer = object()
+    env.head_server_config = "head-server"
+    env.rch = _TaskSourceResolvingRolloutHelperWithResult()
+    env._postprocess_nemo_gym_to_nemo_rl_result = lambda *_args, **_kwargs: {
+        "message_log": []
+    }
+
+    async def collect():
+        return [
+            item
+            async for item in env.run_rollouts(
+                [{"task_source": "workplace_assistant", "_rowidx": 0}],
+                "timing/test",
+            )
+        ]
+
+    streamed = asyncio.run(collect())
+    assert streamed[0][1] == {
+        "type": "responses_api_agents",
+        "name": "workplace_assistant_simple_agent",
+    }

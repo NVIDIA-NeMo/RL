@@ -440,8 +440,8 @@ class TestDeadlineHelper:
 
 
 def _gym_rows(count: int) -> list[dict]:
-    """Rows shaped the way _build_inputs stamps them: each carries its own index."""
-    return [{"_rowidx": i, "agent_ref": {"name": "agent"}} for i in range(count)]
+    """Gym 0.15 rows carry task_source until the remote actor resolves an agent."""
+    return [{"_rowidx": i, "task_source": "workplace_assistant"} for i in range(count)]
 
 
 class _PartialGymMethod:
@@ -480,6 +480,7 @@ async def _row_result(rowidx: int):
     """A minimally complete NeMo-Gym result, enough to build a Completion."""
     return (
         rowidx,
+        {"name": "agent"},
         {
             "input_message_log": [{"role": "user", "token_ids": [1]}],
             "message_log": [{"role": "assistant", "token_ids": [2]}],
@@ -507,7 +508,12 @@ class _FakeGymMethod:
 
     async def _stream(self, num_inputs):
         async def _result(rowidx):
-            return rowidx, {"input_message_log": [], "message_log": []}, None
+            return (
+                rowidx,
+                {"name": "agent"},
+                {"input_message_log": [], "message_log": []},
+                None,
+            )
 
         for rowidx in range(min(self._rows_to_yield, num_inputs)):
             yield _result(rowidx)
