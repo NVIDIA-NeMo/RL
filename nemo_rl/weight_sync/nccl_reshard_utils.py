@@ -37,6 +37,11 @@ import torch
 from torch.distributed._tensor import Shard
 from torch.distributed.tensor.placement_types import Replicate
 
+from nemo_rl.weight_sync.refit_components import (
+    component_plan_digest,
+    normalize_refit_components,
+)
+
 # =========================================================================
 # MeshInfo — lightweight mesh wrapper type
 # =========================================================================
@@ -109,13 +114,23 @@ class HFToLocalParamMap:
     Holds LocalParamSpec for each HF param name.
     """
 
-    specs: dict[str, LocalParamSpec] = field(default_factory=dict)
+    specs: dict[str | tuple[str, str], LocalParamSpec] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.specs = {
+            (key, "weight") if isinstance(key, str) else key: value
+            for key, value in self.specs.items()
+        }
 
     def get(
-        self, hf_name: str, default: Optional[LocalParamSpec] = None
+        self,
+        hf_name: str,
+        default: Optional[LocalParamSpec] = None,
+        *,
+        role: str = "weight",
     ) -> Optional[LocalParamSpec]:
         """Spec for ``hf_name`` or ``default`` (``None``); loops assert non-None."""
-        return self.specs.get(hf_name, default)
+        return self.specs.get((hf_name, role), default)
 
 
 # =========================================================================
@@ -278,6 +293,13 @@ def make_nccl_reshard_refit_info_wire_safe(refit_info: dict) -> dict:
             return {}
         return placement
 
+    def _wire_component(component: dict[str, Any]) -> dict[str, Any]:
+        wire_component = dict(component)
+        for key in ("src_placements", "dst_placements"):
+            if key in wire_component:
+                wire_component[key] = [_wire_placement(p) for p in wire_component[key]]
+        return wire_component
+
     wire_info = dict(refit_info)
     wire_layers = {}
     for layer_name, params in refit_info.get("per_layer_params", {}).items():
@@ -290,6 +312,10 @@ def make_nccl_reshard_refit_info_wire_safe(refit_info: dict) -> dict:
             for key in ("src_placements", "dst_placements"):
                 if key in wire_param:
                     wire_param[key] = [_wire_placement(p) for p in wire_param[key]]
+            if "components" in wire_param:
+                wire_param["components"] = [
+                    _wire_component(component) for component in wire_param["components"]
+                ]
             wire_params.append(wire_param)
         wire_layers[layer_name] = wire_params
     wire_info["per_layer_params"] = wire_layers
@@ -305,6 +331,7 @@ def restore_refit_info_placements(refit_info: dict) -> dict:
     ``xferdtensor`` (which relies on ``isinstance(p, Shard)``) works
     correctly.  Idempotent — safe to call on already-restored ``refit_info``.
     """
+    received_plan_digest = refit_info.get("plan_digest")
     for layer_name in refit_info.get("layer_names", []):
         for param_info in refit_info.get("per_layer_params", {}).get(layer_name, []):
             param_info["src_placements"] = [
@@ -313,6 +340,10 @@ def restore_refit_info_placements(refit_info: dict) -> dict:
             param_info["dst_placements"] = [
                 _restore_placement(p) for p in param_info["dst_placements"]
             ]
+            for component in param_info.get("components", []):
+                for key in ("src_placements", "dst_placements"):
+                    if key in component:
+                        component[key] = [_restore_placement(p) for p in component[key]]
             # Reconstruct MeshInfo if serialized to dict
             for key in ("src_mesh_info", "dst_mesh_info"):
                 mesh = param_info.get(key)
@@ -322,6 +353,14 @@ def restore_refit_info_placements(refit_info: dict) -> dict:
                         if not isinstance(mesh_tensor, torch.Tensor):
                             mesh_tensor = torch.tensor(mesh_tensor)
                         param_info[key] = MeshInfo(mesh_tensor)
+    if received_plan_digest is not None:
+        recomputed_plan_digest = component_plan_digest(refit_info)
+        if received_plan_digest != recomputed_plan_digest:
+            raise ValueError(
+                "refit plan digest mismatch: "
+                f"received={received_plan_digest}, "
+                f"recomputed={recomputed_plan_digest}"
+            )
     return refit_info
 
 
@@ -469,8 +508,8 @@ def group_expert_params_in_metadata(
             e_global, inter, hidden = meta["shape"]
             for role in ("gate_proj", "up_proj"):
                 grouped_metadata[f"{prefix}.{role}.weight"] = {
+                    **_split_grouped_gate_up_metadata(meta),
                     "shape": [e_global, inter // 2, hidden],
-                    "dtype": meta["dtype"],
                     "grouped_expert_proj": role,
                 }
             pre_grouped_experts = True
@@ -494,14 +533,46 @@ def group_expert_params_in_metadata(
     # HF entry.
     for (prefix, proj), entries in expert_groups.items():
         num_experts_global = len(entries)
-        per_expert_shape = list(entries[0][1]["shape"])
         grouped_metadata[f"{prefix}.{proj}.weight"] = {
-            "shape": [num_experts_global, *per_expert_shape],
-            "dtype": entries[0][1]["dtype"],
+            **_prepend_grouped_expert_dim(entries[0][1], num_experts_global),
             "grouped_expert_proj": proj,
         }
 
     return grouped_metadata
+
+
+def _prepend_grouped_expert_dim(
+    metadata: dict[str, Any], num_experts: int
+) -> dict[str, Any]:
+    """Add the grouped-expert axis to logical and component metadata shapes."""
+    grouped_metadata = dict(metadata)
+    grouped_metadata["shape"] = [num_experts, *metadata["shape"]]
+    components = metadata.get("components")
+    if components is not None:
+        grouped_metadata["components"] = [
+            {**component, "shape": [num_experts, *component["shape"]]}
+            for component in components
+        ]
+    return grouped_metadata
+
+
+def _split_grouped_gate_up_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Split pre-grouped gate/up metadata while retaining component roles."""
+    split_metadata = dict(metadata)
+    components = metadata.get("components")
+    if components is not None:
+        split_metadata["components"] = [
+            {
+                **component,
+                "shape": [
+                    *component["shape"][:-2],
+                    component["shape"][-2] // 2,
+                    component["shape"][-1],
+                ],
+            }
+            for component in components
+        ]
+    return split_metadata
 
 
 # =========================================================================
@@ -686,10 +757,25 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
         # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
-        fp8_param = fp8_cfg.get("fp8_param", False)
+        fp8_param = bool(
+            fp8_cfg.get("enabled", False) and fp8_cfg.get("fp8_param", False)
+        )
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
         trainer_precision = policy.get("precision")
         gen_precision = vllm_cfg.get("precision", None)
+        native_mxfp8 = bool(
+            fp8_param
+            and fp8_recipe == "mxfp8"
+            and gen_precision == "fp8"
+            and vllm_cfg.get("is_mx") is True
+        )
+
+        if native_mxfp8 and (megatron_cfg.get("mtp_num_layers", 0) or 0) > 0:
+            violations.append(
+                "native MXFP8 refit does not yet support co-trained MTP layers; "
+                "set policy.megatron_cfg.mtp_num_layers=0 and load static MTP "
+                "weights from the generation checkpoint"
+            )
 
         # The refit byte-copies weights train -> gen, so gen dtype must match
         # train: BF16 (unset / "auto" / "bf16" / "bfloat16") or FP8 ("fp8").  A
@@ -707,7 +793,16 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
 
         if gen_precision == "fp8":
             if fp8_param:
-                if vllm_cfg.get("is_mx"):
+                if native_mxfp8:
+                    pass
+                elif fp8_recipe == "mxfp8":
+                    violations.append(
+                        "native MXFP8 storage requires "
+                        "policy.generation.vllm_cfg.is_mx=True "
+                        "(native MXFP8 values and E8M0 scales cannot be "
+                        "loaded by a blockwise-FP8 target)."
+                    )
+                elif vllm_cfg.get("is_mx"):
                     violations.append(
                         "policy.generation.vllm_cfg.is_mx=True does not support "
                         "blockwise-FP8 storage from "
@@ -891,8 +986,9 @@ def build_nccl_reshard_refit_info(
 
     per_layer_params: dict[str, list] = OrderedDict()
     for name, meta in state_dict_metadata.items():
+        normalized_components = normalize_refit_components(name, meta)
+        logical_weight = normalized_components[0]
         layer = _extract_layer_name(name)
-        ndim = len(meta["shape"])
         expert = is_expert_param(name)
         # Pick the gen (dst) mesh: experts go to the EP/TP-expert mesh, all other
         # params to the TP non-expert mesh (identical when gen EP is off).
@@ -914,15 +1010,15 @@ def build_nccl_reshard_refit_info(
                 if expert
                 else per_stage_src_nonexpert[stage]
             )
+            src_mesh = stage_src_mesh
+            src_dim_map = stage_src_dim_map
             info = {
                 "name": name,
-                "global_shape": tuple(meta["shape"]),
-                "dtype": meta["dtype"],
+                "global_shape": logical_weight.global_shape,
+                "dtype": logical_weight.dtype,
                 "pp_stage": stage,
-                "src_mesh_info": stage_src_mesh,
-                "src_placements": get_placements(name, stage_src_dim_map, ndim),
+                "src_mesh_info": src_mesh,
                 "dst_mesh_info": dst_mesh,
-                "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
         else:
             this_src_mesh, this_src_dim_map = (
@@ -930,15 +1026,59 @@ def build_nccl_reshard_refit_info(
                 if expert
                 else (non_expert_mesh, non_expert_dim_map)
             )
+            src_mesh = this_src_mesh
+            src_dim_map = this_src_dim_map
             info = {
                 "name": name,
-                "global_shape": tuple(meta["shape"]),
-                "dtype": meta["dtype"],
-                "src_mesh_info": this_src_mesh,
-                "src_placements": get_placements(name, this_src_dim_map, ndim),
+                "global_shape": logical_weight.global_shape,
+                "dtype": logical_weight.dtype,
+                "src_mesh_info": src_mesh,
                 "dst_mesh_info": dst_mesh,
-                "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
+
+        component_infos = []
+        for component in normalized_components:
+            src_placements = get_placements(
+                name, src_dim_map, len(component.global_shape)
+            )
+            dst_placements = get_placements(
+                name, dst_dim_map, len(component.global_shape)
+            )
+            _validate_component_placement_dims(
+                name, component.role, component.global_shape, src_placements
+            )
+            _validate_component_placement_dims(
+                name, component.role, component.global_shape, dst_placements
+            )
+            component_info = component.to_wire()
+            component_info["global_shape"] = component.global_shape
+            component_info["src_placements"] = src_placements
+            component_info["dst_placements"] = dst_placements
+            component_infos.append(component_info)
+
+        if len(normalized_components) == 2:
+            weight_shape = normalized_components[0].global_shape
+            _validate_native_local_block_width(
+                name,
+                "source",
+                weight_shape,
+                src_mesh,
+                component_infos[0]["src_placements"],
+            )
+            _validate_native_local_block_width(
+                name,
+                "destination",
+                weight_shape,
+                dst_mesh,
+                component_infos[0]["dst_placements"],
+            )
+
+        weight_component = next(
+            component for component in component_infos if component["role"] == "weight"
+        )
+        info["src_placements"] = weight_component["src_placements"]
+        info["dst_placements"] = weight_component["dst_placements"]
+        info["components"] = component_infos
 
         # Propagate the grouped-expert projection tag (gate_proj/up_proj/
         # down_proj) so the train side stacks the matching per-expert tensors
@@ -957,3 +1097,43 @@ def build_nccl_reshard_refit_info(
         "pp_size": pp_size,
         "gen_tp_size": gen_parallelism.get("tp_size", 1),
     }
+
+
+def _validate_component_placement_dims(
+    logical_name: str,
+    role: str,
+    shape: tuple[int, ...],
+    placements: list[Any],
+) -> None:
+    """Reject placements that shard outside a component's tensor rank."""
+    for placement in placements:
+        if isinstance(placement, Shard) and not 0 <= placement.dim < len(shape):
+            raise ValueError(
+                f"{logical_name} {role} placement shards dimension {placement.dim} "
+                f"outside component rank {len(shape)}"
+            )
+
+
+def _validate_native_local_block_width(
+    logical_name: str,
+    endpoint: str,
+    shape: tuple[int, ...],
+    mesh: MeshInfo,
+    placements: list[Any],
+) -> None:
+    """Require each local K shard to contain complete 32-value MXFP8 blocks."""
+    shard_count = 1
+    for mesh_dim, placement in enumerate(placements):
+        if isinstance(placement, Shard) and placement.dim == len(shape) - 1:
+            shard_count *= int(mesh.mesh.shape[mesh_dim])
+    if shape[-1] % shard_count:
+        raise ValueError(
+            f"{logical_name} native MXFP8 {endpoint} K={shape[-1]} is not "
+            f"divisible by the K shard count {shard_count}"
+        )
+    local_k = shape[-1] // shard_count
+    if local_k % 32:
+        raise ValueError(
+            f"{logical_name} native MXFP8 {endpoint} local K={local_k} must be "
+            "divisible by 32"
+        )
