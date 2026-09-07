@@ -134,7 +134,7 @@ tests/test_suites/llm/grpo-qwen3-1.7b-2n8g-megatron-super-rlhf.sh
 
 # Nemotron 3 Super 120B-A12B math tests (Megatron and DTensor backends)
 tests/test_suites/llm/grpo-nemotron3-super-120BA12B-16n8g-megatron.sh
-tests/test_suites/llm/grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.sh
+tests/test_suites/llm/grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.v2.sh
 
 # Lora
 tests/test_suites/llm/grpo-qwen3-8B-base-1n8g-fsdp2-lora.sh
