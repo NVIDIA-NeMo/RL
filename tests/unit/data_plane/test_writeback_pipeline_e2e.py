@@ -84,7 +84,7 @@ def test_writeback_only_leader_writes():
     )
     sibling._write_back_result_field(
         meta,
-        BatchedDataDict({"logprobs": torch.full((1, 4), 99.0)}),
+        BatchedDataDict(),
         result_key="logprobs",
         tq_field="prev_logprobs",
     )

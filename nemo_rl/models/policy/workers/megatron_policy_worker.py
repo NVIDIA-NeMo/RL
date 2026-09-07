@@ -1195,6 +1195,8 @@ class MegatronPolicyWorkerImpl(
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        if "logprobs" not in reference_logprobs:
+            return return_data
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
@@ -2048,6 +2050,11 @@ class MegatronPolicyWorkerImpl(
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
+
+        # Logprobs are replicated across TP/CP/PP, and only rank zero on those
+        # axes is consumed. Avoid copying the discarded replicas to host.
+        if not self._is_replica_leader():
+            return BatchedDataDict[LogprobOutputSpec]()
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
 
     def _apply_state_dict_to_model(
