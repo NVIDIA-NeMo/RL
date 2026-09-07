@@ -60,21 +60,23 @@ def _make_refit_task(
     local_specs: tuple[tuple[str, str], ...] = (),
     mapping: object | None = None,
 ):
-    from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
-
     from nemo_rl.models.generation.megatron.megatron_worker import (
         _MegatronRefitTask,
     )
 
-    specs = tuple(
-        LocalHFParamSpec(
-            name,
-            None if component == "full" else -2,
-            1 if component == "up" else 0,
-            1 if component == "full" else 2,
+    specs = ()
+    if local_specs:
+        from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
+        specs = tuple(
+            LocalHFParamSpec(
+                name,
+                None if component == "full" else -2,
+                1 if component == "up" else 0,
+                1 if component == "full" else 2,
+            )
+            for name, component in local_specs
         )
-        for name, component in local_specs
-    )
 
     def combine_local_hf_weights(weights):
         if len(specs) == 1:
@@ -89,6 +91,8 @@ def _make_refit_task(
 
     conversion_task = SimpleNamespace(
         param_name=param_name,
+        global_param_name=param_name,
+        vp_stage=0,
         hf_param_names=dependencies,
         mapping=mapping if mapping is not None else MagicMock(),
         local_hf_param_specs=lambda: specs,
@@ -195,7 +199,7 @@ def test_megatron_fp8_refit_tasks_match_payload_mode() -> None:
     assert worker._build_refit_conversion_tasks() == logical_tasks[1:]
     worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
 
-    worker.refit_payload_mode = "bridge_export"
+    worker.refit_payload_mode = "hf_export"
     assert worker._build_refit_conversion_tasks() == physical_tasks
     worker.megatron_bridge.get_export_fp8_tasks.assert_called_once_with(worker.model)
 
@@ -236,7 +240,7 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     )
 
     worker.cfg = {"generation": {"backend": "vllm"}}
-    worker.refit_payload_mode = "bridge_export"
+    worker.refit_payload_mode = "hf_export"
     list(worker._iter_params_with_optional_kv_scales())
     forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
         "conversion_tasks"
@@ -406,7 +410,7 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
     worker._build_layer_to_pp_stage.assert_not_called()
 
 
-def test_destination_refit_role_uses_common_worker_interface(
+def test_refit_destination_uses_common_worker_interface(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -414,7 +418,7 @@ def test_destination_refit_role_uses_common_worker_interface(
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.refit_role = "destination"
+    worker.is_refit_destination = True
     worker.model_update_group = object()
     worker._generation_nccl_reshard_groups = {}
     tasks = [object()]
@@ -453,6 +457,57 @@ def test_destination_refit_role_uses_common_worker_interface(
         refit_timeout_s=None
     )
     assert set_device.call_args_list == [call(3), call(3)]
+
+
+def test_m2n_destination_refreshes_flashinfer_after_misc_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    worker.nccl_reshard_refit_info = {
+        "layer_names": [],
+        "per_layer_params": {},
+    }
+    worker._generation_nccl_reshard_groups = {}
+    worker._update_destination_weights_from_collective = MagicMock(return_value=True)
+    worker._refresh_flashinfer_mxfp8_weights = MagicMock()
+
+    monkeypatch.setattr(torch.cuda, "Stream", MagicMock)
+    monkeypatch.setattr(torch.cuda, "current_stream", MagicMock)
+    monkeypatch.setattr(torch.cuda, "empty_cache", MagicMock())
+    monkeypatch.setattr(
+        "nemo_rl.distributed.refit_watchdog.sync_stream_within", MagicMock()
+    )
+
+    assert worker._destination_nccl_reshard_refit(refit_timeout_s=30.0)
+    worker._update_destination_weights_from_collective.assert_called_once_with(
+        refit_timeout_s=30.0,
+        refresh_mxfp8=False,
+    )
+    worker._refresh_flashinfer_mxfp8_weights.assert_called_once_with()
+
+
+@pytest.mark.parametrize("did_refresh", [False, True])
+def test_flashinfer_mxfp8_refresh_synchronizes_only_after_repacking(
+    monkeypatch: pytest.MonkeyPatch,
+    did_refresh: bool,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    core = torch.nn.Module()
+    core.experts = torch.nn.Module()
+    core.experts.refresh_flashinfer_mxfp8_weights = MagicMock(return_value=did_refresh)
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    worker.model = core
+    synchronize = MagicMock()
+    monkeypatch.setattr(worker_module, "unwrap_model", lambda model: model)
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+
+    worker._refresh_flashinfer_mxfp8_weights()
+
+    core.experts.refresh_flashinfer_mxfp8_weights.assert_called_once_with()
+    assert synchronize.call_count == int(did_refresh)
 
 
 def test_megatron_destination_misc_plan_uses_shipped_misc_metadata() -> None:
@@ -639,8 +694,10 @@ def test_megatron_m2n_rejects_weights_with_no_local_destination(
         worker._build_destination_hf_to_local_param_map(refit_info, [])
 
 
-def test_prepare_mxfp8_refit_replaces_only_quantized_parameters(
+@pytest.mark.parametrize("grouped_gemm_backend", ["torch", "flashinfer"])
+def test_prepare_mxfp8_refit_replaces_only_quantized_parameters_idempotently(
     monkeypatch: pytest.MonkeyPatch,
+    grouped_gemm_backend: str,
 ) -> None:
     from nemo_rl.models.generation.megatron import megatron_worker as worker_module
     from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -651,7 +708,7 @@ def test_prepare_mxfp8_refit_replaces_only_quantized_parameters(
     core.config = SimpleNamespace(
         transformer_impl="inference_optimized",
         fp8_recipe="mxfp8",
-        inference_grouped_gemm_backend="torch",
+        inference_grouped_gemm_backend=grouped_gemm_backend,
     )
     core.decoder = torch.nn.Module()
     core.decoder.weight = torch.nn.Parameter(torch.zeros(2, 2))
@@ -675,11 +732,42 @@ def test_prepare_mxfp8_refit_replaces_only_quantized_parameters(
     worker = object.__new__(MegatronGenerationRefitMixin)
     worker.model = core
     worker._inference_engine_initialized = False
+    worker._generation_mxfp8_destinations = None
+    worker._generation_mxfp8_refit_tasks = None
 
     worker._prepare_mxfp8_refit([weight_task, norm_task])
 
     assert weight_task.destination is quantized_destination
     assert norm_task.destination is core.decoder.norm
+    quantize.assert_called_once_with(core.decoder, backend="triton")
+
+    # Rebuilds happen after lazy engine initialization. They must reuse the
+    # persistent destination map instead of quantizing/rebinding storage again.
+    rebuilt_weight_task = _make_refit_task(
+        param_name="weight",
+        destination=core.decoder.weight,
+        dependencies=("weight",),
+    )
+    rebuilt_norm_task = _make_refit_task(
+        param_name="norm",
+        destination=core.decoder.norm,
+        dependencies=("norm",),
+    )
+    worker._inference_engine_initialized = True
+    worker._prepare_mxfp8_refit([rebuilt_weight_task, rebuilt_norm_task])
+
+    assert rebuilt_weight_task.destination is quantized_destination
+    assert rebuilt_norm_task.destination is core.decoder.norm
+    quantize.assert_called_once()
+
+    # Bridge enumerates nn.Parameters, but quantization replaces the weight with
+    # an MXFP8Tensor attribute. Recovery therefore reuses the complete ordered
+    # plan rather than asking Bridge to rediscover a now-invisible task.
+    worker.megatron_bridge = MagicMock()
+    model_chunks, rebuilt_tasks = worker._build_generation_refit_tasks()
+    assert model_chunks == [core]
+    assert rebuilt_tasks == [weight_task, norm_task]
+    worker.megatron_bridge.get_conversion_tasks.assert_not_called()
 
 
 def test_megatron_generation_joins_all_m2n_pipeline_groups(

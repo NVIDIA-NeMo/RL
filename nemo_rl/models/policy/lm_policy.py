@@ -44,7 +44,6 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
-    RefitRole,
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
@@ -104,7 +103,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         processor: Optional[AutoProcessor] = None,
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
-        refit_role: RefitRole = "source",
+        is_refit_destination: bool = False,
         reserved_http_server_port: Optional[int] = None,
     ):
         self.debug_payload_metrics = False
@@ -312,9 +311,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pre_init_communication_queue=pre_init_queue,
         )
         if megatron_enable:
-            worker_kwargs["refit_role"] = refit_role
-        elif refit_role != "source":
-            raise ValueError("refit_role='destination' requires the Megatron backend.")
+            worker_kwargs["is_refit_destination"] = is_refit_destination
+        elif is_refit_destination:
+            raise ValueError("is_refit_destination=True requires the Megatron backend.")
         if skip_weight_load:
             worker_kwargs["skip_weight_load"] = True
         if reserved_http_server_port is not None:
@@ -1050,26 +1049,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def prepare_refit_info(
         self,
         *,
-        refit_payload_mode: Optional[RefitPayloadMode] = None,
+        refit_payload_mode: RefitPayloadMode,
     ) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 
         Returns:
             dict: A dictionary containing the info for refit.
         """
-        worker_kwargs = {}
-        if self.cfg.get("megatron_cfg", {}).get("enabled", False):
-            if refit_payload_mode is None:
-                generation_cfg = self.cfg.get("generation")
-                refit_payload_mode = (
-                    "logical_weights"
-                    if generation_cfg is not None
-                    and generation_cfg.get("backend") == "megatron"
-                    else "bridge_export"
-                )
-            worker_kwargs["refit_payload_mode"] = refit_payload_mode
         futures = self.worker_group.run_all_workers_single_data(
-            "prepare_refit_info", **worker_kwargs
+            "prepare_refit_info", refit_payload_mode=refit_payload_mode
         )
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
@@ -1288,17 +1276,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         train_world_size: int,
         gen_world_size: int,
         *,
-        refit_payload_mode: Optional[RefitPayloadMode] = None,
+        refit_payload_mode: RefitPayloadMode,
     ) -> dict[str, Any]:
         """Prepare per-layer param metadata for nccl_reshard refit."""
-        if refit_payload_mode is None:
-            generation_cfg = self.cfg.get("generation")
-            refit_payload_mode = (
-                "logical_weights"
-                if generation_cfg is not None
-                and generation_cfg.get("backend") == "megatron"
-                else "bridge_export"
-            )
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_nccl_reshard_refit_info",
             train_parallelism=train_parallelism,

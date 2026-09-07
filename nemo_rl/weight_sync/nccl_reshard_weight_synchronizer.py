@@ -25,7 +25,8 @@ between layouts, avoiding a full gather + broadcast.
 Lifecycle:
   init_communicator():
     1. policy/generation.init_collective()           -- model_update_group (misc)
-    2. policy/generation.init_nccl_reshard_comm_group()  -- per-PP-stage bulk groups
+    2. policy.init_nccl_reshard_comm_group() and
+       generation.rebuild_nccl_reshard_comm_group()     -- per-PP-stage bulk groups
     3. policy.prepare_nccl_reshard_refit_info()
        -> generation.prepare_nccl_reshard_refit_info()   -- backend-agnostic metadata
   sync_weights():

@@ -76,7 +76,7 @@ def test_mxfp8_skip_weight_load_defers_http_server_until_refit(
 
     prepare_for_generation.assert_not_called()
     assert generation.dp_openai_server_base_urls == []
-    assert lm_policy.Policy.call_args.kwargs["refit_role"] == "destination"
+    assert lm_policy.Policy.call_args.kwargs["is_refit_destination"] is True
 
 
 @pytest.mark.mcore
@@ -98,6 +98,7 @@ def test_nccl_m2n_refit_backend_requires_non_colocated_generation() -> None:
 def test_null_refit_transport_selects_packed_collective() -> None:
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["refit_transport"] = None
+    config["generation"]["mcore_generation_config"]["refit_backend"] = None
 
     generation = MegatronGeneration(
         config=config,
@@ -106,6 +107,34 @@ def test_null_refit_transport_selects_packed_collective() -> None:
     )
 
     assert not generation.uses_native_refit
+
+
+@pytest.mark.mcore
+def test_native_refit_requires_explicit_backend() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["mcore_generation_config"]["refit_backend"] = None
+
+    with pytest.raises(ValueError, match="got None"):
+        MegatronGeneration(
+            config=config,
+            tokenizer=MagicMock(),
+            policy=MagicMock(),
+        )
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("refit_transport", [None, "nccl_reshard"])
+def test_non_native_refit_rejects_mcore_backend(refit_transport) -> None:
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["refit_transport"] = refit_transport
+    config["generation"]["mcore_generation_config"]["refit_backend"] = "nccl"
+
+    with pytest.raises(ValueError, match="only read by the native MCore refit"):
+        MegatronGeneration(
+            config=config,
+            tokenizer=MagicMock(),
+            policy=MagicMock(),
+        )
 
 
 @pytest.mark.mcore
@@ -219,22 +248,27 @@ def test_megatron_generation_m2n_transport_uses_packed_collective_api() -> None:
 
 
 @pytest.mark.mcore
-def test_megatron_generation_uses_common_refit_worker_api() -> None:
+def test_megatron_generation_uses_common_refit_worker_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workers = [MagicMock(), MagicMock()]
     generation = object.__new__(MegatronGeneration)
-    generation._policy = MagicMock()
+    generation._policy = SimpleNamespace(worker_group=SimpleNamespace(workers=workers))
     generation._owns_policy = False
     generation._refit_membership = None
-    generation._policy.worker_group.run_all_workers_single_data.return_value = []
+    monkeypatch.setattr(megatron_generation.ray, "get", lambda refs: refs)
     refit_info = {"layer_names": [], "per_layer_params": {}}
 
     generation.prepare_nccl_reshard_refit_info(refit_info)
-    generation.nccl_reshard_refit()
+    assert generation.nccl_reshard_refit() == [
+        worker.nccl_reshard_refit.remote.return_value for worker in workers
+    ]
 
-    calls = generation._policy.worker_group.run_all_workers_single_data.call_args_list
-    assert calls[0].args == ("prepare_nccl_reshard_refit_info",)
-    assert calls[0].kwargs == {"refit_info": refit_info}
-    assert calls[1].args == ("nccl_reshard_refit",)
-    assert calls[1].kwargs == {"refit_timeout_s": None}
+    for worker in workers:
+        worker.prepare_nccl_reshard_refit_info.remote.assert_called_once_with(
+            refit_info=refit_info
+        )
+        worker.nccl_reshard_refit.remote.assert_called_once_with(refit_timeout_s=None)
 
 
 @pytest.mark.mcore
@@ -347,6 +381,9 @@ def test_bridge_refit_finalizes_import_before_return(
     worker.megatron_bridge.finalize_hf_import.side_effect = (
         lambda _model_chunks: events.append("finalize")
     )
+    worker._refresh_flashinfer_mxfp8_weights = MagicMock(
+        side_effect=lambda: events.append("refresh")
+    )
 
     monkeypatch.setattr(
         worker_module,
@@ -359,7 +396,7 @@ def test_bridge_refit_finalizes_import_before_return(
     )
 
     assert worker._update_destination_weights_from_collective()
-    assert events == ["receive", "finalize", "sync"]
+    assert events == ["receive", "finalize", "refresh", "sync"]
     worker.megatron_bridge.finalize_hf_import.assert_called_once_with(
         worker._generation_refit_model_chunks
     )

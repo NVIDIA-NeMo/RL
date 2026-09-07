@@ -3215,7 +3215,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         def init_collective(self, *_args, **_kwargs):
             return []
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     def legacy_policy_factory(
@@ -3252,6 +3252,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
 
         def prepare_refit_info(self, _state):
             pass
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
         def init_collective(self, *_args, **_kwargs):
             return []
@@ -3354,7 +3357,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         def print_node_ip_and_gpu_id(self):
             pass
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     class DummyTrtllmGeneration:
@@ -3366,6 +3369,9 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
 
         def prepare_refit_info(self, _state):
             pass
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
     nemo_gym_actor = object()
     spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)

@@ -21,14 +21,11 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-# ``bridge_export`` preserves the universal refit contract: the source exports
-# an HF-named, backend-independent representation and each destination converts
-# it into local storage. ``logical_weights`` is an explicit Megatron-to-Megatron
-# exception: Megatron generation may assume a Megatron training source and ask
-# it to materialize logical weights. Megatron training must continue to use the
-# universal mode for other destinations (such as vLLM), and new backends should
-# not inherit this coupling implicitly.
-RefitPayloadMode = Literal["bridge_export", "logical_weights"]
+# The universal contract is hf_export: the source exports an HF-named,
+# backend-independent representation that each destination converts locally.
+# logical_weights is a Megatron-to-Megatron exception, read only by the Megatron
+# policy worker; new backends should not inherit that coupling implicitly.
+RefitPayloadMode = Literal["hf_export", "logical_weights"]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -421,18 +418,17 @@ def reject_unenforceable_refit_deadline(
     Accepting it and doing nothing would be worse than refusing. The deadline exists so
     that a generation rank dying mid-refit cannot hang the weight-sync collective
     forever; a user who sets it on a backend that ignores it gets exactly that hang,
-    while believing they are protected. Only vLLM threads the deadline down to the
-    collective today.
+    while believing they are protected. Only transports whose workers own an
+    abortable collective can enforce it.
 
-    ``None`` -- every path that does not configure a deadline, which is all of them by
-    default -- passes through untouched, so this is inert unless someone opts in.
+    ``None`` disables the deadline and passes through untouched.
     """
     if refit_timeout_s is not None:
         raise NotImplementedError(
-            f"{backend} generation cannot enforce a refit deadline "
-            f"(refit_timeout_s={refit_timeout_s}). Only the vLLM backend threads it "
-            "into the refit collective. Unset "
-            "async_rl.generation_fleet_health.refit_timeout_s, or use vLLM generation."
+            f"{backend} refit cannot enforce a refit deadline "
+            f"(refit_timeout_s={refit_timeout_s}). Unset "
+            "async_rl.generation_fleet_health.refit_timeout_s, or select a refit "
+            "transport with worker-side watchdog support."
         )
 
 
@@ -532,7 +528,7 @@ class GenerationInterface(ABC):
 
     def get_refit_payload_mode(self) -> RefitPayloadMode:
         """Return the backend's required representation for transferred weights."""
-        return "bridge_export"
+        return "hf_export"
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""

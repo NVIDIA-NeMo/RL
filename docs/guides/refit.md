@@ -98,6 +98,8 @@ policy:
   generation:
     backend: megatron
     refit_transport: mcore
+    mcore_generation_config:
+      refit_backend: nccl  # gloo | nccl | nccl_m2n (nvshmem is broken; see #3646)
 ```
 
 For NCCL reshard with Megatron policy training and vLLM generation:

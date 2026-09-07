@@ -17,6 +17,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.generation.interfaces import reject_unenforceable_refit_deadline
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
@@ -49,17 +50,23 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         colocated: bool,
         train_cluster: Optional[Any] = None,
         inference_cluster: Optional[Any] = None,
+        refit_timeout_s: Optional[float] = None,
     ):
         if not colocated and (train_cluster is None or inference_cluster is None):
             raise ValueError(
                 "train_cluster and inference_cluster are required for "
                 "non-colocated Megatron weight synchronization."
             )
+        if not colocated and generation.uses_native_refit:
+            # Native MCore's copy service does not expose an abortable collective.
+            # Reject during setup, before either side can enter a refit.
+            reject_unenforceable_refit_deadline("native MCore", refit_timeout_s)
         self._policy = policy
         self._generation = generation
         self._colocated = colocated
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
+        self._refit_timeout_s = refit_timeout_s
         self._refit_backend: Optional[str] = None
         self._transport: Optional[WeightSynchronizer] = None
         if colocated:
@@ -67,7 +74,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             # any other transport is inert. Reject rather than silently ignoring it:
             # a user asking for packed collective refit would otherwise get the
             # native one with no indication their setting did nothing.
-            if generation.cfg.get("refit_transport") != "mcore":
+            if not generation.uses_native_refit:
                 raise ValueError(
                     "policy.generation.refit_transport must be 'mcore' with "
                     "colocated Megatron generation, which always uses the in-place "
@@ -81,6 +88,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
                     generation=generation,
                     train_cluster=train_cluster,
                     inference_cluster=inference_cluster,
+                    refit_timeout_s=refit_timeout_s,
                 )
             else:
                 self._transport = CollectiveWeightSynchronizer(
@@ -88,6 +96,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
                     generation=generation,
                     train_cluster=train_cluster,
                     inference_cluster=inference_cluster,
+                    refit_timeout_s=refit_timeout_s,
                 )
         self._stale = True
 
@@ -125,7 +134,6 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             port,
             world_size,
             train_world_size=train_world_size,
-            refit_backend=self._refit_backend,
         )
         ray.get(futures_train + futures_inference)
 
@@ -166,8 +174,12 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             if self._transport is not None:
                 self._transport.sync_weights(kv_scales=kv_scales)
             else:
+                # Dispatch the destination first: unsupported deadlines are rejected
+                # before any source rank can enter the blocking native transfer.
+                futures_inference = self._generation.update_weights_from_collective(
+                    refit_timeout_s=self._refit_timeout_s
+                )
                 futures_train = self._policy.swap_weights_via_reshard(is_source=True)
-                futures_inference = self._generation.update_weights_from_collective()
                 ray.get(futures_train)
                 results = ray.get(futures_inference)
                 if not all(result for result in results if result is not None):

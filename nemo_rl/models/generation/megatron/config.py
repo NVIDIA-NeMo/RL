@@ -69,7 +69,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     allow_stale_multimodal_embeddings: NotRequired[bool]
 
     # Copy-service backend used only when refit_transport="mcore".
-    refit_backend: Literal["gloo", "nccl", "nccl_m2n", "nvshmem"]
+    refit_backend: NotRequired[Literal["gloo", "nccl", "nccl_m2n", "nvshmem"] | None]
     # Soft per-rank staging limit for native MCore refit. None uses the same
     # dynamic packed-buffer target as NeMo-RL's existing collective refit.
     refit_execution_batch_bytes: int | None

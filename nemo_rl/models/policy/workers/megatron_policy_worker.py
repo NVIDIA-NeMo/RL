@@ -106,7 +106,6 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
-    RefitRole,
 )
 from nemo_rl.models.policy.utils import (
     broadcast_hf_buckets_via_distributed_impl,
@@ -424,8 +423,8 @@ class MegatronPolicyWorkerImpl(
 ):
     # Tests and extension classes that bypass __init__ retain the historical
     # training/source behavior unless they explicitly select destination.
-    refit_role: RefitRole = "source"
-    refit_payload_mode: RefitPayloadMode = "bridge_export"
+    is_refit_destination: bool = False
+    refit_payload_mode: RefitPayloadMode = "hf_export"
     # Holds the split-API train-step state between begin/finish or
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
@@ -549,17 +548,13 @@ class MegatronPolicyWorkerImpl(
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
-        refit_role: RefitRole = "source",
+        is_refit_destination: bool = False,
         reserved_http_server_port: Optional[int] = None,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
-        if refit_role not in ("source", "destination"):
-            raise ValueError(
-                f"refit_role must be 'source' or 'destination', got {refit_role!r}."
-            )
-        self.refit_role = refit_role
-        self.refit_payload_mode: RefitPayloadMode = "bridge_export"
+        self.is_refit_destination = is_refit_destination
+        self.refit_payload_mode: RefitPayloadMode = "hf_export"
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
         # not initialize a CUDA context ahead of the set_device below.
         log_gpu_memory_diagnostics(
@@ -2427,10 +2422,10 @@ class MegatronPolicyWorkerImpl(
         self,
         state_dict_info: Optional[dict[str, Any]] = None,
         *,
-        refit_payload_mode: RefitPayloadMode = "bridge_export",
+        refit_payload_mode: RefitPayloadMode = "hf_export",
     ) -> Optional[dict[str, tuple[torch.Size, torch.dtype]]]:
         """Prepare refit state for this worker's explicit source/destination role."""
-        if self.refit_role == "destination":
+        if self.is_refit_destination:
             if state_dict_info is None:
                 raise ValueError("Destination refit requires state_dict_info.")
             self._prepare_destination_refit_info(state_dict_info)
@@ -2443,7 +2438,7 @@ class MegatronPolicyWorkerImpl(
         self, refit_timeout_s: Optional[float] = None
     ) -> bool:
         """Receive a collective refit without blocking this actor's event loop."""
-        if self.refit_role != "destination":
+        if not self.is_refit_destination:
             raise RuntimeError(
                 "update_weights_from_collective is only valid for destination-role workers."
             )
@@ -2619,10 +2614,6 @@ class MegatronPolicyWorkerImpl(
             and self.fp8_cfg.get("fp8_recipe") == "blockwise"
         )
 
-    def _uses_logical_refit_payload(self) -> bool:
-        """Return whether the destination requested logical floating-point weights."""
-        return self.refit_payload_mode == "logical_weights"
-
     def _build_refit_conversion_tasks(self) -> list:
         """Build the conversion-task list driving refit (BF16 or FP8 export).
 
@@ -2633,7 +2624,7 @@ class MegatronPolicyWorkerImpl(
         from nemo_rl.models.megatron.draft import draft_model_detached
 
         with draft_model_detached([self.model]):
-            if self._is_fp8_export() and not self._uses_logical_refit_payload():
+            if self._is_fp8_export() and self.refit_payload_mode != "logical_weights":
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
             return [
                 task
@@ -2735,7 +2726,7 @@ class MegatronPolicyWorkerImpl(
         # native refit wire format; Bridge's training FP8 is not inference MXFP8.
         # Other backends keep Bridge's physical FP8 payload and scale_inv sibling;
         # mixing that scale with BF16 would corrupt the imported weight.
-        if self._uses_logical_refit_payload():
+        if self.refit_payload_mode == "logical_weights":
             conversion_tasks = self._iter_logical_refit_conversion_tasks(
                 conversion_tasks
             )
@@ -2851,7 +2842,7 @@ class MegatronPolicyWorkerImpl(
         task is the physical fp8 view its ``_scale_inv`` sibling describes;
         dequantizing it here would ship BF16 bytes under an fp8 scale.
         """
-        uses_logical_payload = self._uses_logical_refit_payload()
+        uses_logical_payload = self.refit_payload_mode == "logical_weights"
         for task in self.refit_conversion_tasks:
             if uses_logical_payload:
                 local_tensor = _get_refit_task_source(task)
@@ -3343,10 +3334,10 @@ class MegatronPolicyWorkerImpl(
         gen_world_size: Optional[int] = None,
         *,
         refit_info: Optional[dict[str, Any]] = None,
-        refit_payload_mode: RefitPayloadMode = "bridge_export",
+        refit_payload_mode: RefitPayloadMode = "hf_export",
     ) -> Optional[dict[str, Any]]:
         """Prepare NCCL-reshard state for the worker's explicit refit role."""
-        if self.refit_role == "destination":
+        if self.is_refit_destination:
             if refit_info is None:
                 raise ValueError("Destination NCCL refit requires refit_info.")
             if any(
@@ -3485,7 +3476,7 @@ class MegatronPolicyWorkerImpl(
         destination_tasks: Optional[list[Any]] = None,
     ) -> HFToLocalParamMap:
         """Build the local map for this worker's source or destination role."""
-        if self.refit_role == "destination":
+        if self.is_refit_destination:
             if destination_tasks is None:
                 _, destination_tasks = self._build_generation_refit_tasks()
             return self._build_destination_hf_to_local_param_map(
@@ -3549,7 +3540,7 @@ class MegatronPolicyWorkerImpl(
             RefitAbortWatchdog,
         )
 
-        if self.refit_role == "destination":
+        if self.is_refit_destination:
             if kv_scales is not None:
                 raise ValueError("Destination NCCL refit does not accept kv_scales.")
             generation_groups = (
@@ -3560,7 +3551,7 @@ class MegatronPolicyWorkerImpl(
             groups = [self.pp_comm_group, self.model_update_group]
 
         with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
-            if self.refit_role == "destination":
+            if self.is_refit_destination:
                 result = self._destination_nccl_reshard_refit(
                     refit_timeout_s=refit_timeout_s
                 )

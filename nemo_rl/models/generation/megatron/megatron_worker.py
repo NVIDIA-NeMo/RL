@@ -125,7 +125,7 @@ def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
     )
 
 
-def _configure_inference_optimized_layer_spec(model_provider: Any) -> bool:
+def _configure_inference_optimized_layer_spec(model_provider: Any) -> None:
     """Select MCore inference linears for a Bridge generic-GPT provider.
 
     Only the generic path needs this. Model-specific providers (DeepSeek,
@@ -139,22 +139,16 @@ def _configure_inference_optimized_layer_spec(model_provider: Any) -> bool:
     ``HybridModelProvider``) are not ``GPTModelProvider`` subclasses and resolve
     ``inference_optimized`` through their own stack spec, so this is a no-op for
     them rather than an error.
-
-    Returns:
-        True if the provider's layer spec was replaced, False if the provider
-        carries a model-specific spec (or is not a GPT provider) and handles
-        inference selection itself.
     """
     # Bridge imports ModelOpt plugins that can re-enter MCore while this module
     # is still initializing, so keep this cycle-sensitive provider import local.
     from megatron.bridge.models.gpt_provider import GPTModelProvider, default_layer_spec
 
     if not isinstance(model_provider, GPTModelProvider):
-        return False
+        return
     if model_provider.transformer_layer_spec is not default_layer_spec:
-        return False
+        return
     model_provider.transformer_layer_spec = _inference_optimized_transformer_layer_spec
-    return True
 
 
 def _resolve_mxfp8_refit_backend(model_config: Any) -> str:
@@ -173,6 +167,14 @@ class _MegatronRefitTask:
     @property
     def param_name(self) -> str:
         return self.conversion_task.param_name
+
+    @property
+    def cache_key(self) -> tuple[int | None, str]:
+        """Stable identity across Bridge task rebuilds."""
+        return (
+            self.conversion_task.vp_stage,
+            self.conversion_task.global_param_name,
+        )
 
     @property
     def dependencies(self) -> tuple[str, ...]:
@@ -1183,6 +1185,14 @@ class MegatronGenerationRefitMixin:
         self._generation_refit_tasks = None
         self._generation_refit_model_chunks = None
         self._generation_refit_dependency_counts = None
+        self._generation_mxfp8_destinations: (
+            dict[tuple[int | None, str], MXFP8Tensor] | None
+        ) = None
+        # MXFP8 conversion removes the original nn.Parameters, so Bridge cannot
+        # rediscover those tasks through named_parameters() during a later shard
+        # recovery. Preserve the complete ordered task plan once destinations are
+        # made persistent.
+        self._generation_mxfp8_refit_tasks: list[_MegatronRefitTask] | None = None
         # Per-refit progress, reset at the start of each transfer.
         self._generation_refit_task_index = 0
         self._generation_refit_remaining_dependencies = {}
@@ -1540,6 +1550,14 @@ class MegatronGenerationRefitMixin:
 
     def _prepare_mxfp8_refit(self, tasks: list[_MegatronRefitTask]) -> None:
         """Install persistent MCore MXFP8 destinations before engine initialization."""
+        if self._generation_mxfp8_destinations is not None:
+            for task in tasks:
+                destination = self._generation_mxfp8_destinations.get(task.cache_key)
+                if destination is not None:
+                    task.destination = destination
+                    task.target_id = id(destination)
+            return
+
         model_chunks = (
             self.model if isinstance(self.model, (list, tuple)) else [self.model]
         )
@@ -1551,6 +1569,7 @@ class MegatronGenerationRefitMixin:
             and getattr(core.config, "fp8_recipe", None) == "mxfp8"
         ]
         if not mxfp8_cores:
+            self._generation_mxfp8_destinations = {}
             return
         if self._inference_engine_initialized:
             raise RuntimeError(
@@ -1575,9 +1594,31 @@ class MegatronGenerationRefitMixin:
                 }
             )
 
+        destinations: dict[tuple[int | None, str], MXFP8Tensor] = {}
         for task in tasks:
             if task.target_id in destination_by_id:
                 task.destination = destination_by_id[task.target_id]
+                task.target_id = id(task.destination)
+                destinations[task.cache_key] = task.destination
+        self._generation_mxfp8_destinations = destinations
+        self._generation_mxfp8_refit_tasks = list(tasks)
+
+    def _refresh_flashinfer_mxfp8_weights(self) -> None:
+        """Refresh derived FlashInfer expert storage after canonical weights change."""
+        model_chunks = (
+            self.model if isinstance(self.model, (list, tuple)) else [self.model]
+        )
+        refreshed = False
+        for model in model_chunks:
+            core = unwrap_model(model)
+            for module in core.modules():
+                refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
+                if refresh is not None:
+                    refreshed = bool(refresh()) or refreshed
+        if refreshed:
+            # Repacking is asynchronous. Finish before another stream replays
+            # CUDA graphs that read the derived expert buffers.
+            torch.cuda.synchronize()
 
     def _build_generation_refit_tasks(
         self,
@@ -1586,6 +1627,9 @@ class MegatronGenerationRefitMixin:
         model_chunks = (
             list(self.model) if isinstance(self.model, (list, tuple)) else [self.model]
         )
+        if self._generation_mxfp8_refit_tasks is not None:
+            return model_chunks, list(self._generation_mxfp8_refit_tasks)
+
         conversion_tasks = self.megatron_bridge.get_conversion_tasks(model_chunks)
         tasks: list[_MegatronRefitTask] = []
         for conversion_task in conversion_tasks:
@@ -1754,9 +1798,12 @@ class MegatronGenerationRefitMixin:
                     f"{sorted(self._generation_m2n_pending)}"
                 )
             torch.cuda.empty_cache()
-            return self._update_destination_weights_from_collective(
-                refit_timeout_s=refit_timeout_s
+            result = self._update_destination_weights_from_collective(
+                refit_timeout_s=refit_timeout_s,
+                refresh_mxfp8=False,
             )
+            self._refresh_flashinfer_mxfp8_weights()
+            return result
         finally:
             self._generation_m2n_pending.clear()
 
@@ -1854,7 +1901,10 @@ class MegatronGenerationRefitMixin:
 
     @torch.no_grad()
     def _update_destination_weights_from_collective(
-        self, refit_timeout_s: Optional[float] = None
+        self,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        refresh_mxfp8: bool = True,
     ) -> bool:
         """Receive packed HF tensors and import them into the Megatron model."""
         from nemo_rl.distributed.refit_watchdog import sync_stream_within
@@ -1890,6 +1940,8 @@ class MegatronGenerationRefitMixin:
                 )
 
             self.megatron_bridge.finalize_hf_import(self._generation_refit_model_chunks)
+            if refresh_mxfp8:
+                self._refresh_flashinfer_mxfp8_weights()
             sync_stream_within(
                 torch.cuda.current_stream(),
                 refit_timeout_s,

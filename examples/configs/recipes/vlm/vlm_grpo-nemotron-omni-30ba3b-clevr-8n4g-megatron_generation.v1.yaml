@@ -41,6 +41,7 @@ policy:
     max_new_tokens: 2048
     bad_words: null
     mcore_generation_config:
+      refit_backend: nccl
       buffer_size_gb: 8
       async_sched_mode: async
       num_cuda_graphs: -1

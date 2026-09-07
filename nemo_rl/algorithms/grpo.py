@@ -1828,7 +1828,9 @@ def setup(
         ) is None and _needs_hf_refit_handshake(
             backend, nccl_reshard_refit_enabled, colocated_inference
         ):
-            state_dict_info = policy.prepare_refit_info()
+            state_dict_info = policy.prepare_refit_info(
+                refit_payload_mode=policy_generation.get_refit_payload_mode()
+            )
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
 

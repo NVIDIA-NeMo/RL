@@ -33,14 +33,16 @@ single `ValueError` listing every violation. The current requirements are:
 * Training-side Megatron supports expert tensor parallelism. Custom PP layouts
   (`pipeline_model_parallel_layout`, virtual PP > 1,
   embedding/loss pipeline-split accounting) are not supported yet.
-* **Generation-side ETP is pinned to 1.** MCore's `inference_optimized` MoE
+* **Generation-side ETP with `inference_optimized` is pinned to 1.** Those MoE
   layers do not implement expert tensor parallelism and raise whenever the
   *resolved* ETP exceeds 1 — and an omitted ETP resolves to TP, not 1. So
   `merged_inference_megatron_cfg` pins generation-side
-  `expert_tensor_parallel_size` to 1, which is what lets generation-side TP > 1
-  work; the reshard then handles the train-ETP → gen-ETP=1 gather. An explicitly
-  requested generation-side ETP > 1 is rejected by config key name rather than
-  surfacing as a raw MCore assert at model build.
+  `expert_tensor_parallel_size` to 1 for that transformer implementation, which
+  is what lets generation-side TP > 1 work; the reshard then handles the
+  train-ETP → gen-ETP=1 gather. Other transformer implementations retain their
+  configured ETP. An explicitly requested generation-side ETP > 1 with
+  `inference_optimized` is rejected by config key name rather than surfacing as
+  a raw MCore assert at model build.
 * **Precision** for vLLM supports BF16 train ↔ BF16 gen, blockwise-FP8 train
   (`fp8_param=true` + blockwise recipe) ↔ FP8 gen, and BF16 train → MXFP8 gen
   (`vllm_cfg.precision=fp8`, `vllm_cfg.is_mx=true`). Blockwise-FP8 train →
@@ -72,8 +74,8 @@ single `ValueError` listing every violation. The current requirements are:
   engine), not bandwidth.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`.
-* Megatron generation supports expert parallelism and expert tensor
-  parallelism, including using both together.
+* Megatron generation supports expert parallelism; generation-side expert tensor
+  parallelism is available only when `transformer_impl` is not `inference_optimized`.
 * Megatron generation uses the same top-level selector as other backends:
   `refit_transport=null` selects NeMo-RL's packed collective,
   `refit_transport=mcore` selects Megatron Core's native refit, and
@@ -140,11 +142,10 @@ source worker does not inspect or branch on the destination backend's name. Requ
 logical weights is a Megatron-inference-specific exception: vLLM keeps the universal
 Bridge-export representation, while Megatron inference requests logical weights because
 its destination storage is built by MCore rather than Bridge. Megatron workers are assigned
-an explicit `source` or `destination` refit role and expose the same
+an explicit source or destination refit role and expose the same
 `prepare_refit_info`, `build_hf_to_local_param_map`,
 `prepare_nccl_reshard_refit_info`, and `nccl_reshard_refit` entry points in either
-role. The older generation-specific method names remain compatibility aliases for
-external callers.
+role.
 
 1. **`init_collective()`** — creates the `model_update_group`, a NCCL group spanning all
    training and generation ranks. The bulk path does not use it; it carries the misc
@@ -265,8 +266,8 @@ generation side maps those HF names onto whatever its own storage layout is.
   packed-broadcast import path.
 
 **To extend to a new backend**, provide a destination map from canonical HF weights
-to that backend's local storage. vLLM implements this as
-`build_hf_to_local_param_map`; Megatron derives it from Bridge conversion tasks.
+to that backend's local storage. Both backends implement this as
+`build_hf_to_local_param_map`; Megatron derives its targets from Bridge conversion tasks.
 Everything else follows the fixed transport contract.
 
 **The backend-specific destination map:** resolve each bulk HF name to local storage

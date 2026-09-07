@@ -20,6 +20,8 @@ policy:
   generation:
     backend: megatron
     refit_transport: mcore
+    mcore_generation_config:
+      refit_backend: nccl
     max_new_tokens: 512
     vllm_cfg:
       max_model_len: 512

@@ -37,6 +37,7 @@ policy:
     refit_transport: mcore
     bad_words: null
     mcore_generation_config:
+      refit_backend: nccl
       expose_http_server: true
       buffer_size_gb: 8
       num_cuda_graphs: -1

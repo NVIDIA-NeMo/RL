@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
@@ -249,10 +248,8 @@ class MegatronGeneration(GenerationInterface):
                 "policy.generation.refit_transport must be null, 'mcore', or "
                 f"'nccl_reshard' for Megatron generation, got {refit_transport!r}."
             )
-        if refit_transport == "mcore":
-            refit_backend = self.cfg["mcore_generation_config"].get(
-                "refit_backend", "gloo"
-            )
+        if self.uses_native_refit:
+            refit_backend = self.cfg["mcore_generation_config"].get("refit_backend")
             if refit_backend not in ("gloo", "nccl", "nccl_m2n", "nvshmem"):
                 raise ValueError(
                     "policy.generation.mcore_generation_config.refit_backend "
@@ -264,25 +261,15 @@ class MegatronGeneration(GenerationInterface):
                     "policy.generation.mcore_generation_config.refit_backend="
                     "'nccl_m2n' is only supported with non-colocated generation."
                 )
-        elif self.cfg["mcore_generation_config"].get("refit_backend") in (
-            "nccl_m2n",
-            "nvshmem",
-        ):
-            # Only the native MCore copy service reads refit_backend. Warn rather
-            # than raise: every shipped exemplar sets refit_backend unconditionally,
-            # so another transport legitimately inherits a non-null value. A user
-            # who explicitly asked for a non-default transport, though, would
-            # otherwise silently get neither.
-            # .get(): unlike the 'mcore' branch above, the other paths never
-            # requires this key, so reading it must not turn an omitted key into a
-            # KeyError.
-            warnings.warn(
-                "policy.generation.mcore_generation_config.refit_backend="
-                f"{self.cfg['mcore_generation_config']['refit_backend']!r} is "
-                f"ignored when refit_transport={refit_transport!r}; it is only "
-                "read by the native MCore refit (refit_transport='mcore').",
-                stacklevel=2,
-            )
+        else:
+            refit_backend = self.cfg["mcore_generation_config"].get("refit_backend")
+            if refit_backend is not None:
+                raise ValueError(
+                    "policy.generation.mcore_generation_config.refit_backend="
+                    f"{refit_backend!r} is "
+                    f"invalid when refit_transport={refit_transport!r}; it is only "
+                    "read by the native MCore refit (refit_transport='mcore')."
+                )
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         # Installed by setup via create_weight_synchronizer.
@@ -318,7 +305,7 @@ class MegatronGeneration(GenerationInterface):
             init_optimizer=False,
             init_reference_model=False,
             skip_weight_load=skip_weight_load,
-            refit_role="destination",
+            is_refit_destination=True,
             reserved_http_server_port=reserved_http_server_port,
         )
 
@@ -334,7 +321,7 @@ class MegatronGeneration(GenerationInterface):
         return self.cfg.get("refit_transport") == "mcore"
 
     def get_refit_payload_mode(self) -> RefitPayloadMode:
-        """Use the Megatron-to-Megatron logical-weight exception for M-to-N."""
+        """Megatron inference receives logical weights on every refit path."""
         return "logical_weights"
 
     @property
@@ -349,7 +336,6 @@ class MegatronGeneration(GenerationInterface):
         world_size: int,
         *,
         train_world_size: int,
-        refit_backend: Optional[str] = None,
     ) -> list[ray.ObjectRef]:
         """Join the configured refit collective after the training ranks.
 
@@ -358,19 +344,11 @@ class MegatronGeneration(GenerationInterface):
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             train_world_size: Number of training workers (used to offset ranks).
-            refit_backend: Optional override for the native MCore copy-service
-                backend ("gloo", "nccl", or "nccl_m2n"; "nvshmem" is
-                currently broken and warns at setup, see
-                https://github.com/NVIDIA-NeMo/RL/issues/3646). Ignored by
-                the packed collective and nccl_reshard transports.
 
         Returns:
             List of Ray ObjectRefs for the collective init futures.
         """
         if self.uses_native_refit:
-            backend = (
-                refit_backend or self.cfg["mcore_generation_config"]["refit_backend"]
-            )
             return self._policy.init_collective_mcore_generation(
                 ip,
                 port,
@@ -379,7 +357,7 @@ class MegatronGeneration(GenerationInterface):
                 refit_execution_batch_bytes=self.cfg["mcore_generation_config"][
                     "refit_execution_batch_bytes"
                 ],
-                refit_backend=backend,
+                refit_backend=self.cfg["mcore_generation_config"]["refit_backend"],
             )
         return self._policy.init_collective(
             ip,
@@ -429,7 +407,10 @@ class MegatronGeneration(GenerationInterface):
         """Return ``(actor, rebuilt rank, original rank)`` for live workers."""
         active = membership or self._refit_membership
         if active is None:
-            raise RuntimeError("Refit membership has not been initialized.")
+            return [
+                (worker, rank, rank)
+                for rank, worker in enumerate(self.worker_group.workers)
+            ]
 
         workers = self.worker_group.workers
         ranked_workers: list[tuple[Any, int, int]] = []
@@ -490,25 +471,16 @@ class MegatronGeneration(GenerationInterface):
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict[str, Any]) -> None:
         """Build each inference worker's HF-to-Megatron M-to-N receive map."""
-        if self._refit_membership is None:
-            futures = self._policy.worker_group.run_all_workers_single_data(
-                "prepare_nccl_reshard_refit_info", refit_info=refit_info
-            )
-        else:
-            futures = [
-                worker.prepare_nccl_reshard_refit_info.remote(refit_info=refit_info)
-                for worker, _rank, _original_rank in self._refit_ranked_workers()
-            ]
+        futures = [
+            worker.prepare_nccl_reshard_refit_info.remote(refit_info=refit_info)
+            for worker, _rank, _original_rank in self._refit_ranked_workers()
+        ]
         ray.get(futures)
 
     def nccl_reshard_refit(
         self, refit_timeout_s: Optional[float] = None
     ) -> list[ray.ObjectRef]:
         """Receive one NCCL M-to-N refit on every Megatron inference worker."""
-        if self._refit_membership is None:
-            return self._policy.worker_group.run_all_workers_single_data(
-                "nccl_reshard_refit", refit_timeout_s=refit_timeout_s
-            )
         return [
             worker.nccl_reshard_refit.remote(refit_timeout_s=refit_timeout_s)
             for worker, _rank, _original_rank in self._refit_ranked_workers()

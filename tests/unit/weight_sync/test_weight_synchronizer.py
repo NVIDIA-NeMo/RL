@@ -82,7 +82,7 @@ def _mock_generation(**overrides):
     gen.worker_group.workers = [MagicMock()]
     gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
     gen.get_inference_world_size.return_value = None
-    gen.get_refit_payload_mode.return_value = "bridge_export"
+    gen.get_refit_payload_mode.return_value = "hf_export"
     for k, v in overrides.items():
         setattr(gen, k, v)
     return gen
@@ -194,7 +194,9 @@ class TestIPCWeightSynchronizer:
         sync = IPCWeightSynchronizer(policy, gen)
 
         sync.init_communicator()
-        policy.prepare_refit_info.assert_called_once()
+        policy.prepare_refit_info.assert_called_once_with(
+            refit_payload_mode="hf_export"
+        )
         gen.prepare_refit_info.assert_called_once()
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
@@ -394,7 +396,9 @@ class TestSGLangColocatedWeightSynchronizer:
         sync = SGLangColocatedWeightSynchronizer(policy, gen)
 
         sync.init_communicator()
-        policy.prepare_refit_info.assert_called_once()
+        policy.prepare_refit_info.assert_called_once_with(
+            refit_payload_mode="hf_export"
+        )
         gen.prepare_refit_info.assert_called_once()
 
     def test_phase_restoration_on_transfer_failure(self, mock_ray):
@@ -580,7 +584,7 @@ class TestCollectiveWeightSynchronizer:
         sync.init_communicator()
 
         policy.prepare_refit_info.assert_called_once_with(
-            refit_payload_mode="bridge_export"
+            refit_payload_mode="hf_export"
         )
         gen.prepare_refit_info.assert_called_once()
         policy.init_collective.assert_called_once_with(
@@ -687,7 +691,7 @@ class TestNcclReshardWeightSynchronizer:
             {"tp_size": 4, "ep_size": 1, "etp_size": 4, "pp_size": 1},
             2,
             4,
-            refit_payload_mode="bridge_export",
+            refit_payload_mode="hf_export",
         )
         gen.prepare_nccl_reshard_refit_info.assert_called_once()
         (shipped,), _ = gen.prepare_nccl_reshard_refit_info.call_args
@@ -763,6 +767,15 @@ class TestMegatronWeightSynchronizer:
             colocated=False,
             train_cluster=_mock_cluster(),
             inference_cluster=_mock_cluster(),
+            refit_timeout_s=17.0,
+        )
+
+        mock_m2n_cls.assert_called_once_with(
+            policy=policy,
+            generation=gen,
+            train_cluster=sync._train_cluster,
+            inference_cluster=sync._inference_cluster,
+            refit_timeout_s=17.0,
         )
 
         sync.init_communicator()
@@ -805,13 +818,13 @@ class TestMegatronWeightSynchronizer:
             == refit_backend
         )
         gen.init_collective.assert_called_once()
-        assert gen.init_collective.call_args.kwargs["refit_backend"] == refit_backend
+        assert "refit_backend" not in gen.init_collective.call_args.kwargs
 
         assert sync.sync_weights() == {}
         gen.suspend_for_refit.assert_called_once()
         policy.offload_before_refit.assert_called_once()
         policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
-        gen.update_weights_from_collective.assert_called_once()
+        gen.update_weights_from_collective.assert_called_once_with(refit_timeout_s=None)
         gen.resume_after_refit.assert_called_once()
         # prepare called for the weights phase and then the kv_cache phase
         tags = [c.kwargs.get("tags") for c in gen.prepare_for_generation.call_args_list]
@@ -819,6 +832,17 @@ class TestMegatronWeightSynchronizer:
         # no nvshmem preinit on the nccl backend
         policy.preinit_nvshmem.assert_not_called()
         assert not sync.is_stale
+
+    def test_native_refit_rejects_unenforceable_deadline_during_setup(self):
+        with pytest.raises(NotImplementedError, match="native MCore refit cannot"):
+            MegatronWeightSynchronizer(
+                _mock_megatron_policy(),
+                _mock_megatron_generation(),
+                colocated=False,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
+                refit_timeout_s=30.0,
+            )
 
     def test_non_colocated_requires_clusters(self):
         with pytest.raises(ValueError):

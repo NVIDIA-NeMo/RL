@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Literal, Optional, TypedDict
+from typing import Any, Optional, TypedDict
 
 import ray
 import torch
@@ -21,8 +21,6 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
 from nemo_rl.utils.timer import Timer
-
-RefitRole = Literal["source", "destination"]
 
 
 class LogprobOutputSpec(TypedDict):
@@ -194,7 +192,7 @@ class ColocatablePolicyInterface(PolicyInterface):
     def prepare_refit_info(
         self,
         *,
-        refit_payload_mode: Optional[RefitPayloadMode] = None,
+        refit_payload_mode: RefitPayloadMode,
     ) -> Optional[dict[str, Any]]:
         pass
 
@@ -271,7 +269,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         train_world_size: int,
         gen_world_size: int,
         *,
-        refit_payload_mode: Optional[RefitPayloadMode] = None,
+        refit_payload_mode: RefitPayloadMode,
     ) -> Any:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError

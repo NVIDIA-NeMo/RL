@@ -1990,6 +1990,10 @@ class TestSetup:
         assert factory_kwargs["generation_backend"] == "megatron"
         assert factory_kwargs["colocated"] is colocated
         assert factory_kwargs["inference_cluster"] is inference_cluster
+        assert (
+            factory_kwargs["refit_timeout_s"]
+            == mc.async_rl.generation_fleet_health.refit_timeout_s
+        )
         if gym:
             assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
             assert metrics.nemo_gym_init_time_s is not None
