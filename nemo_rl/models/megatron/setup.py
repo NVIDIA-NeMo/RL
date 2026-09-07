@@ -632,9 +632,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
 
-def validate_megatron_config(
-    megatron_cfg: Any, config: Mapping[str, Any]
-) -> None:
+def validate_megatron_config(megatron_cfg: Any, config: Mapping[str, Any]) -> None:
     """Validate Bridge config while preserving NeMo-owned HybridEP prepadding."""
     megatron_cfg.validate()
 
