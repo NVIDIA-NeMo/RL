@@ -25,7 +25,10 @@ from omegaconf import OmegaConf
 from pydantic import ValidationError
 
 from nemo_rl.algorithms.distillation import DistillationConfig
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _train_fields_for_step,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
@@ -218,6 +221,14 @@ class TestTrainFieldSelection:
 
         for field in DistillationLossDataDict.__annotations__:
             assert field in DP_DISTILLATION_TRAIN_FIELDS, field
+
+    def test_controller_selects_distillation_fields_without_logprob_columns(self):
+        fields = _train_fields_for_step(
+            policy_logprobs_required=False,
+            reference_logprobs_required=False,
+            distillation=True,
+        )
+        assert fields == DP_DISTILLATION_TRAIN_FIELDS
 
 
 class TestTheShippedRecipe:
