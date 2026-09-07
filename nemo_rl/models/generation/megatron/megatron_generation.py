@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -210,8 +211,8 @@ class MegatronGeneration(GenerationInterface):
         Args:
             config: PolicyConfig for the Megatron model.
             tokenizer: The tokenizer for the model.
-            cluster: Cluster to deploy a dedicated inference Policy on.
-            policy: Existing training Policy to reuse for generation.
+            cluster: Cluster for a dedicated, non-colocated inference Policy.
+            policy: Existing training Policy reused for colocated generation.
             name_prefix: Prefix for naming the worker group (non-colocated only).
             processor: Optional processor for VLMs (non-colocated only).
             skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
@@ -232,7 +233,8 @@ class MegatronGeneration(GenerationInterface):
         )
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
-        # `self._policy_config` keeps a reference to the full PolicyConfig.
+        # `self._policy_config` keeps a reference to the full PolicyConfig. Dedicated
+        # inference receives a copy because worker setup may modify it.
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
         # Populated after the first prepare_for_generation (which starts the HTTP server).
@@ -252,7 +254,7 @@ class MegatronGeneration(GenerationInterface):
         # Stand up a dedicated inference-only policy.
         self._owns_policy = True
         self._policy_config = {
-            **config,
+            **deepcopy(config),
             "megatron_cfg": self.effective_megatron_cfg(config),
         }
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.

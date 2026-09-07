@@ -205,7 +205,7 @@ def test_mixed_batch_routes_correctly():
 #
 # The cases above exercise `_apply_effort_shaping` in isolation. These drive the
 # real `_run_rollouts` so they also pin down *where* the shaping happens: it must
-# land before `_result_to_completion`, or `Completion.reward` -- the value that
+# land before `_results_to_completions`, or `Completion.reward` -- the value that
 # becomes `total_reward` in the train batch -- keeps the env's raw reward.
 # ---------------------------------------------------------------------------
 
@@ -268,7 +268,12 @@ class _RunRolloutsRemote:
 
     def remote(self, inputs, timer_prefix):
         del inputs, timer_prefix
-        return _Stream([_ReadyRef((i, r, None)) for i, r in enumerate(self._results)])
+        return _Stream(
+            [
+                _ReadyRef((i, {"name": "agent"}, result, None))
+                for i, result in enumerate(self._results)
+            ]
+        )
 
 
 def _gym_result(reward: float, response_tokens: int) -> dict:

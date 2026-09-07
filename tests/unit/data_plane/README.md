@@ -4,19 +4,15 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 
 ---
 
-## `test_architecture_invariants.py` (11 tests)
+## `test_architecture_invariants.py` (7 test functions)
 
-- `test_grpo_sync_engages_tq_policy` — Sync trainer must require a TQ-mediated policy.
-- `test_grpo_sync_requires_data_plane_enabled` — Sync trainer hard-fails when invoked without `data_plane.enabled=true`.
-- `test_no_feature_gate_pattern_in_either_trainer` — Catch the next "just one if branch" temptation in either trainer.
-- `test_factory_does_not_construct_noop` — Production factory must not return a NoOp client.
-- `test_factory_rejects_disabled_impl` — Factory must raise — not return None / NoOp — when disabled.
-- `test_run_grpo_dispatches_both_trainers` — `examples/run_grpo.py._select_trainer` returns legacy vs sync per config.
-- `test_legacy_does_not_import_sync` — Dependency direction: `grpo_sync.py` imports from `grpo.py`, not the reverse.
-- `test_pack_per_token_field_is_exported` — `pack_per_token_field` must be importable from `nemo_rl.data_plane.codec`.
-- `test_pack_per_token_field_is_wired_into_writeback` — **xfail.** At least one write-back call site must import it (wiring incomplete).
-- `test_abc_method_present` — Renaming an ABC method is a wire break — keep the swap surface stable.
-- `test_fp8_calib_filter_then_seqlen_check_no_crash` — End-to-end behavioral repro of the job 11920261 calib-vs-seqlen bug.
+- `test_select_sync_trainer_dispatches_both_trainers` — `data_plane.factory.select_sync_trainer` returns `grpo_train` vs `grpo_train_sync` per config.
+- `test_make_policy_factory_pairs_tq_policy_with_the_sync_trainer` — `make_policy_factory` returns `None` when the data plane is off, and threads `dp_cfg` into a `TQPolicy` when it is on.
+- `test_launchers_dispatch_through_the_shared_helpers` — Parametrized over `run_grpo.py` / `run_vlm_grpo.py`: each launcher must call both helpers, so a third launcher inherits the invariant.
+- `test_sync_trainer_is_call_compatible_with_legacy_trainer` — Sync and legacy trainers keep the same call signature.
+- `test_both_trainers_wire_deduplicate_multimodal_data_into_repeat_interleave` — Both trainers pass the dedup flag through.
+- `test_sync_trainer_rejects_message_level_advantage_penalties` — Sync trainer hard-fails on an unsupported penalty shape.
+- `test_data_plane_client_abc_method_present` — Parametrized: renaming an ABC method is a wire break — keep the swap surface stable.
 
 ## `test_codec_jagged.py` (9 tests)
 
@@ -32,11 +28,9 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 
 ## `test_codec_mooncake.py`
 
-- `test_promote_1d_leaves_unsqueezes_1d` — `_promote_1d_leaves` turns schema-declared scalar fields from `(N,)` into `(N, 1)` for the Mooncake wire.
-- `test_promote_1d_roundtrip_via_from_wire` — `_promote_1d_leaves` + `_from_wire` restores the schema-declared field's original `(N,)` shape and values.
+- `test_from_wire_densifies_uniform_nested_rows` — Uniform nested rows come back dense on the read side.
 - `test_from_wire_rejects_invalid_declared_field_shape` — Corrupt or incompatible scalar wire shapes fail at the data-plane boundary.
-- `test_promote_1d_leaves_rejects_undeclared_1d_field` — Unknown dense 1D Mooncake fields fail loudly instead of silently hitting TQ's shape mismatch.
-- `test_put_samples_uses_schema_without_private_shape_tags` — Promotion does not add per-row adapter metadata to user tags.
+- `test_put_samples_uses_schema_without_private_shape_tags` — The scalar-field schema patch does not add per-row adapter metadata to user tags.
 - `test_get_samples_uses_static_shape_schema` — Reads restore scalar fields by the shared schema while preserving genuine `(N, 1)` columns.
 - `test_pack_per_token_field_truncates_sp_padding` — pack_per_token_field slices each row to its own length, dropping SP padding.
 - `test_pack_per_token_field_exact_fit_matches_to_nested_by_length` — At exact fit, `pack_per_token_field` matches `to_nested_by_length`.
@@ -99,9 +93,10 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_tags_travel_with_subset_slice_concat` — Per-key tags follow keys through subset/slice/concat.
 - `test_tags_none_when_either_side_missing_in_concat` — concat drops tags if either side has none.
 
-## `test_leader_broadcast.py` (2 tests)
+## `test_leader_broadcast.py` (3 tests)
 
-- `test_leader_broadcast_round_trip` — 2-rank gloo broadcast of a BatchedDataDict round-trips.
+- `test_leader_broadcast_round_trip` — 2-rank gloo broadcast of a BatchedDataDict round-trips, including a `PackedTensor` with ragged rows and one media-free sample.
+- `test_leader_broadcast_keeps_media_free_packed_key` — An all-empty packed field keeps its key on both sides, so a media-free shard emits the same key set as the independent-fetch path.
 - `test_get_replica_group_default_is_none` — `TQWorkerMixin._get_replica_group` default is None.
 
 ## `test_local_node_ip.py` (5 tests)
@@ -137,13 +132,15 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_close_propagates` — close() is forwarded to wrapped client.
 - `test_factory_wraps_when_observability_enabled` — factory.py uses the same MetricsDataPlaneClient.
 
-## `test_preshard_extras.py` (10 tests)
+## `test_preshard_extras.py` (13 tests)
 
 - `test_kv_first_write_writes_seed_fields` — Seed fields written to TQ.
 - `test_kv_first_write_carries_multimodal_extras` — VLM extras (pixel_values) ride along, no schema declaration needed.
 - `test_kv_first_write_keys_match_uids_x_ngen` — Keys round-trip: `f"{uid}_g{i}"` preserved.
 - `test_shard_meta_for_dp_partitions_keys_disjointly` — Sum of shards == total, disjoint.
 - `test_shard_meta_for_dp_preserves_partition_id` — partition_id preserved across DP shards.
+- `test_shard_meta_for_dp_permutes_tags_with_sample_ids` — Each shard's row-shape tags stay paired with their own `sample_id` under the length-sort permutation.
+- `test_shard_meta_for_dp_leaves_tags_none_when_absent` — Text-only runs keep `tags=None` rather than a list of empty dicts.
 - `test_shard_meta_for_dp_unsorted_round_trip` — `unsorted_indices` reconstructs input order from concat.
 - `test_kvbatchmeta_subset_filters_keys_and_seqlens` — `subset` filters keys + seq_lengths.
 - `test_kvbatchmeta_concat_joins_keys_and_seqlens` — `concat` joins.

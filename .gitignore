@@ -49,3 +49,15 @@ code_snapshots*/
 
 # Claude Code review memory (local only)
 .claude/review-memory/
+
+# Agent config placeholders that appear in whatever directory a tool ran in.
+# The repo's own .claude/ and .mcp.json at the root are tracked and unaffected.
+*/**/.claude/
+*/**/.mcp.json
+
+# Running a recipe .sh by hand writes its outputs to tests/test_suites/
+# <domain>/<exp_name>/ (common.env sets EXP_DIR=$SCRIPT_DIR/$EXP_NAME). ckpts/,
+# *logs/, wandb/ and *.log above already cover all of it but metrics.json.
+# Named rather than ignoring the directory shape: tests/test_suites/llm/
+# performance/ sits at that depth and is tracked.
+/tests/test_suites/**/metrics.json

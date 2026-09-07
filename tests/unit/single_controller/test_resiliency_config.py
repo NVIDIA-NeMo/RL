@@ -21,7 +21,6 @@ hour three of a run.
 """
 
 import warnings
-from types import SimpleNamespace
 from typing import get_args
 
 import pytest
@@ -29,6 +28,7 @@ from pydantic import ValidationError
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     FleetHealthConfig,
@@ -39,6 +39,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+)
 
 
 def _all_sampler_names() -> list[str]:
@@ -68,9 +72,7 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
             "train_global_batch_size": num_prompts_per_step * 4,
             "generation": {"colocated": {"enabled": False}},
         },
-        # The last two are read only on the ready_first branch, which rejects a run
-        # without them before it reaches anything under test here.
-        loss_fn=SimpleNamespace(
+        loss_fn=ClippedPGLossConfig(
             reference_policy_kl_penalty=0,
             use_importance_sampling_correction=True,
             force_on_policy_ratio=False,
@@ -409,7 +411,7 @@ class TestWrongPathFaultToleranceIsRejected:
                 "train_global_batch_size": 8,
                 "generation": {"colocated": {"enabled": False}},
             },
-            loss_fn=SimpleNamespace(reference_policy_kl_penalty=0),
+            loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0),
             env={"should_use_nemo_gym": use_nemo_gym},
             # Read by the metric_name check upstream #3429 added to this same
             # validator, which runs before the wrong-path check under test.
@@ -476,14 +478,20 @@ class TestWrongPathFaultToleranceIsRejected:
 
 
 class TestGenerationRouterPortAndTimeoutValidation:
+    def test_default_port_range_uses_the_reserved_router_band(self):
+        cfg = GenerationRouterConfig()
+
+        assert cfg.port_range_low == DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        assert cfg.port_range_high == DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+
     def test_a_transposed_port_range_is_rejected(self):
         """Otherwise it surfaces as 'empty range for randrange()' far from the typo."""
         with pytest.raises(ValidationError, match="port_range_low"):
-            GenerationRouterConfig(port_range_low=6099, port_range_high=6000)
+            GenerationRouterConfig(port_range_low=1300, port_range_high=1202)
 
     def test_an_equal_port_range_is_rejected(self):
         with pytest.raises(ValidationError, match="port_range_low"):
-            GenerationRouterConfig(port_range_low=6000, port_range_high=6000)
+            GenerationRouterConfig(port_range_low=1202, port_range_high=1202)
 
     def test_the_connect_timeout_defaults_well_below_the_backend_timeout(self):
         """A handshake to a local vLLM is ms-or-never; the generation is minutes."""

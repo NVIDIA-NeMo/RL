@@ -15,7 +15,7 @@
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss.interfaces import (
     LossFunction,
@@ -126,7 +126,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     ratio_clip_c: Optional[float] = None
 
     # --- KL regularization ---
-    reference_policy_kl_penalty: float = 0.01
+    reference_policy_kl_penalty: float = Field(default=0.01, ge=0, allow_inf_nan=False)
     # Can be set to k1, k2, k3
     # For more details, see http://joschu.net/blog/kl-approx.html
     reference_policy_kl_type: str = "k3"

@@ -34,9 +34,15 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
     SamplerConfig,
     required_buffer_capacity_for_config,
+    sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.algorithms.distillation import DistillationConfig
-from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
+from nemo_rl.algorithms.grpo import (
+    _REWARD_PENALTY_FLAGS,
+    GRPOConfig,
+    GRPOLoggerConfig,
+    RewardPenaltyConfig,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import (
     DistillationLossConfig,
@@ -46,7 +52,16 @@ from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
-from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+)
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+    ClusterConfig,
+)
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -358,11 +373,12 @@ class GenerationRouterConfig(BaseModel, extra="allow"):
 
     # When true, NeMo-Gym receives the router's URL instead of the raw backend URLs.
     enabled: bool = False
-    # Range the router reserves its fixed port from. Deliberately distinct from Gym
-    # (5000-5999) and vLLM (7000-8999). The port is fixed for the life of the run so the
-    # URL Gym holds never changes.
-    port_range_low: PositiveInt = 6000
-    port_range_high: PositiveInt = 6099
+    # Range the router reserves its fixed port from. It sits between Ray's client
+    # port (1201) and management ports (1301+) so it cannot collide with Gym,
+    # sandbox, or generation services. The port is fixed for the life of the run
+    # so the URL Gym holds never changes.
+    port_range_low: PositiveInt = DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+    port_range_high: PositiveInt = DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
     # Router -> backend deadline, covering the whole generation. This is the timeout
     # Gym's own client never sets.
     backend_timeout_s: PositiveFloat = 600.0
@@ -576,6 +592,39 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
+class TokenCaptureConfig(BaseModel, extra="allow"):
+    """Ledger-authoritative token capture (token-in/token-out via NeMo-Gym).
+
+    Dormant by default: with ``enabled=False`` every legacy codepath behaves
+    exactly as before — no staging partition is registered, no ledger is
+    installed, and rollouts ride the token-echo path.
+    """
+
+    enabled: bool = False
+    # TQ partition holding per-call staged token deltas (cleared by the
+    # finalizer; distinct from the canonical rollout partition).
+    staging_partition: str = "rollout_staging"
+    # Drop the whole group when fewer than this fraction of its rollouts
+    # produced valid rows (None keeps every group).
+    min_valid_fraction_per_group: Optional[float] = None
+    # Bearer token for Gym's token-capture control routes. None =
+    # minted per run at setup; set explicitly only for multi-controller
+    # setups that must share one ledger.
+    control_auth_token: Optional[str] = None
+    # Hard deadline per control-plane call (S5 finding: control-plane death must
+    # surface as a failed dispatch, not a silent retry stall).
+    control_timeout_s: float = 60.0
+    # Root for Gym's per-rollout capture ledgers and base capture layer. None =
+    # derived at setup
+    # under the run's log dir.
+    capture_dir: Optional[str] = None
+    # Keep routed_experts out of canonical rows and assemble them on policy
+    # workers from strict staged-fragment plans.
+    defer_routed_experts_to_policy: bool = False
+    # Fixed CPU finalizer pool size; actors are never automatically replaced.
+    num_reassembler_workers: PositiveInt = 2
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -592,9 +641,11 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
@@ -819,8 +870,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward shaping and
-    filtering knobs SC reads on neither path.
+    one a GRPO run carries and would never build. Plus the reward-shaping and
+    sampling knobs SC reads on neither path.
     """
     algo_cfg = algo_config(master_config)
 
@@ -834,14 +885,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "with max_num_steps."
         )
 
-    # SC reads none of these on either path, so an enabled one describes shaping
-    # this run does not do. Async GRPO rejects three of them the same way.
-    #
-    # ``getattr``: DistillationConfig declares none of them -- there is no
-    # reward to shape or filter on -- and a knob that cannot be set cannot be
-    # set wrong. Reading them defensively keeps distillation on this same
-    # function rather than around it, so the checks below that ARE
-    # algorithm-agnostic keep firing on a distillation run.
+    # DistillationConfig declares none of these: there is no reward to shape or
+    # dynamically filter. Read them defensively so the algorithm-independent
+    # validation below still applies to distillation runs.
     def _knob(path: str) -> bool:
         obj: Any = algo_cfg
         for part in path.split("."):
@@ -853,7 +899,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     unsupported = [
         name
         for name, enabled in (
-            ("overlong_filtering", _knob("overlong_filtering")),
             ("use_dynamic_sampling", _knob("use_dynamic_sampling")),
             ("reward_scaling", _knob("reward_scaling.enabled")),
             ("reward_shaping", _knob("reward_shaping.enabled")),
@@ -921,21 +966,19 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    if algo_cfg.ppo_epochs < 1:
-        raise ValueError("ppo.ppo_epochs must be at least 1")
-
-    # Without it the critic steps once per chunk and the policy once per step,
-    # which is two effective learning rates from one config, and no error.
+    # Each PPO epoch must consume the complete RL batch. Without this guard, every
+    # chunk would independently run the configured actor and critic optimizer steps.
     if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
         raise ValueError(
             "PPO on the SingleController path requires "
             "async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train}) == "
             f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
-            "step is assembled from a single chunk: the critic steps its "
-            "optimizer once per chunk and the policy once per step. Streaming "
-            "PPO needs a split train API on the value workers, which they do "
-            "not have yet (#2625)."
+            "step is assembled from a single chunk. Otherwise each chunk would "
+            "run ppo.critic_ppo_epochs critic optimizer steps and ppo.ppo_epochs "
+            "policy optimizer steps on only part of the RL batch. Streaming PPO "
+            "needs a split train API on the value workers, which they do not have "
+            "yet (#2625)."
         )
 
     failure_config = async_config.rollout_failure
@@ -988,8 +1031,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         raise ValueError(
             "num_prompts_per_step * num_generations_per_prompt "
             f"({rl_step_samples}) must equal value.train_global_batch_size "
-            f"({value_global_batch_size}) so that one RL step maps to exactly one "
-            "critic optimizer.step."
+            f"({value_global_batch_size}) so that each critic epoch consumes one "
+            "complete RL batch."
         )
 
 
@@ -999,6 +1042,15 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    reward_penalties_enabled = any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    )
+    if reward_penalties_enabled and not master_config.env.get("should_use_nemo_gym"):
+        raise ValueError(
+            "reward_penalties require the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true) on SingleController"
+        )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(
@@ -1031,12 +1083,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     )
 
     if isinstance(async_config.sampler, ReadyFirstSamplerConfig):
-        if not master_config.loss_fn.use_importance_sampling_correction:
+        if not getattr(
+            master_config.loss_fn, "use_importance_sampling_correction", False
+        ):
             raise ValueError(
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
-        if master_config.loss_fn.force_on_policy_ratio:
+        if getattr(master_config.loss_fn, "force_on_policy_ratio", True):
             raise ValueError(
                 "the ready_first sampler requires "
                 "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
@@ -1058,6 +1112,62 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "'train:loss') or set checkpointing.metric_name=null."
         )
 
+    token_capture_config = master_config.token_capture
+    if token_capture_config.defer_routed_experts_to_policy and not (
+        token_capture_config.enabled
+    ):
+        raise ValueError(
+            "token_capture.defer_routed_experts_to_policy requires "
+            "token_capture.enabled=true"
+        )
+    if (
+        token_capture_config.enabled
+        and token_capture_config.num_reassembler_workers
+        > async_config.max_buffered_rollouts
+    ):
+        warnings.warn(
+            "token_capture.num_reassembler_workers exceeds "
+            "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
+            stacklevel=2,
+        )
+    if (
+        token_capture_config.enabled
+        and master_config.checkpointing["enabled"]
+        and master_config.checkpointing.get("save_data_plane")
+        and sampler_supports_buffer_checkpoint(async_config.sampler)
+    ):
+        raise NotImplementedError(
+            "token_capture.enabled does not support rollout-recovery "
+            "checkpointing (checkpointing.save_data_plane=true with a "
+            "replay-checkpoint-capable sampler): the capture dispatch path "
+            "does not thread lineage group ids, so the recovery ledger would "
+            "never be reaped and a resume would re-dispatch every restored "
+            "prompt on top of the recovered replay groups. Set "
+            "checkpointing.enabled=false, or use a sampler without buffer "
+            "checkpointing."
+        )
+    if token_capture_config.enabled and reward_penalties_enabled:
+        warnings.warn(
+            "reward_penalties are enabled but token-capture receipt rollouts "
+            "carry no generated tokens/text at rollout time, so the penalty "
+            "checks are skipped and capture-path rewards stay unpenalized "
+            "(penalty-rate metrics will read 0). Disable the reward_penalties "
+            "flags to make this explicit, or run without token capture to "
+            "train with penalized rewards.",
+            stacklevel=2,
+        )
+    if (
+        token_capture_config.enabled
+        and async_config.rollout_failure.max_skipped_prompts
+    ):
+        warnings.warn(
+            "async_rl.rollout_failure.max_skipped_prompts does nothing with "
+            "token_capture.enabled=true: the capture dispatch path re-raises a "
+            "deterministic failure instead of skipping the prompt, so the run "
+            "ends on the first prompt that exhausts max_data_attempts.",
+            stacklevel=2,
+        )
+
     # A non-zero reference-policy KL penalty makes the loss read
     # ``reference_policy_logprobs``, but the SC train pump only computes them
     # when ``skip_reference_policy_logprobs_calculation`` is false (see
@@ -1074,9 +1184,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "use 0 to disable the KL penalty."
         )
 
-    if (
-        reference_policy_kl_penalty
-        and algo_cfg.skip_reference_policy_logprobs_calculation
+    if reference_policy_kl_penalty and getattr(
+        algo_cfg, "skip_reference_policy_logprobs_calculation", True
     ):
         raise ValueError(
             "loss_fn.reference_policy_kl_penalty="
@@ -1087,9 +1196,50 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
+    if (
+        getattr(master_config.loss_fn, "use_kl_in_reward", False)
+        and reference_policy_kl_penalty > 0
+        and getattr(master_config.loss_fn, "force_on_policy_ratio", False)
+        and getattr(algo_cfg, "seq_logprob_error_threshold", None) is None
+    ):
+        raise ValueError(
+            "loss_fn.use_kl_in_reward=true with a nonzero "
+            "loss_fn.reference_policy_kl_penalty requires policy logprobs, but "
+            "loss_fn.force_on_policy_ratio=true without "
+            "seq_logprob_error_threshold skips them. Set "
+            "loss_fn.force_on_policy_ratio=false or configure "
+            "seq_logprob_error_threshold."
+        )
+
     # ``env`` is required in production configs, but model_construct-based unit
     # configs can omit it. Only apply rollout-path validation when it is present.
     env_config = getattr(master_config, "env", None)
+
+    penalties_enabled = (
+        getattr(algo_cfg, "invalid_tool_call_advantage", None) is not None
+        or getattr(algo_cfg, "malformed_thinking_advantage", None) is not None
+    )
+    if penalties_enabled and token_capture_config.enabled:
+        # TODO(token-capture): thread the per-message violation flags through
+        # capture receipts/staging so RolloutReassembler can emit
+        # invalid_tool_call_mask/malformed_thinking_mask; then drop this guard.
+        # Checked before the gym-path validation: the conflict exists
+        # regardless of how the rollout path is configured.
+        raise NotImplementedError(
+            "invalid_tool_call_advantage/malformed_thinking_advantage require "
+            "the invalid_tool_call_mask/malformed_thinking_mask train-batch "
+            "columns, which the token-capture finalizer does not emit — the "
+            "first streamed group would crash the train pump with a KeyError "
+            "at the advantage stage. Set grpo.invalid_tool_call_advantage=null "
+            "and grpo.malformed_thinking_advantage=null to run with token "
+            "capture; mask support on the capture path is a follow-up."
+        )
+    if penalties_enabled and not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "invalid_tool_call_advantage and malformed_thinking_advantage on the "
+            "active algorithm block require the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true) on SingleController."
+        )
 
     opd_enabled = opd_module.is_opd_enabled(master_config)
     if opd_enabled and (
@@ -1183,6 +1333,10 @@ class AdvantageConfig:
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
+    invalid_tool_call_mask_field: str = INVALID_TOOL_CALL_MASK
+    malformed_thinking_mask_field: str = MALFORMED_THINKING_MASK
+    mask_sample_field: str = "mask_sample"
+    truncated_field: str = "truncated"
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
     generation_logprobs_field: str = "generation_logprobs"

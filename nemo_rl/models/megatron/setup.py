@@ -260,6 +260,42 @@ from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
+_OPTIMIZER_DTYPE_KEYS = (
+    "params_dtype",
+    "main_grads_dtype",
+    "main_params_dtype",
+    "exp_avg_dtype",
+    "exp_avg_sq_dtype",
+)
+
+
+def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Resolve optimizer dtype strings, including TE's uint8-backed FP8 moments."""
+    resolved = dict(optimizer_cfg)
+    dtype_aliases = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp8": torch.uint8,
+        "uint8": torch.uint8,
+    }
+    for key in _OPTIMIZER_DTYPE_KEYS:
+        value = resolved.get(key)
+        if isinstance(value, str):
+            normalized = value.lower().removeprefix("torch.")
+            try:
+                resolved[key] = dtype_aliases[normalized]
+            except KeyError as e:
+                raise ValueError(
+                    f"Unsupported optimizer dtype {value!r} for {key}. "
+                    "Supported Transformer Engine FusedAdam dtype aliases: "
+                    f"{', '.join(dtype_aliases)}"
+                ) from e
+    return resolved
+
 
 def destroy_parallel_state():
     """Safely destroy parallel state and reset async call tracking.
@@ -1501,7 +1537,7 @@ def _create_megatron_config(
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
-        **config["megatron_cfg"]["optimizer"],
+        **_resolve_optimizer_dtype_kwargs(config["megatron_cfg"]["optimizer"]),
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
