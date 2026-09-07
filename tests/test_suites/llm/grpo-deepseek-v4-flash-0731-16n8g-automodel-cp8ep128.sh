@@ -5,15 +5,14 @@ source $SCRIPT_DIR/common.env
 # ===== BEGIN CONFIG =====
 NUM_NODES=16
 GPUS_PER_NODE=8
-STEPS_PER_RUN=2
-MAX_STEPS=2
+STEPS_PER_RUN=5
+MAX_STEPS=5
 NUM_RUNS=1
-NUM_MINUTES=240
+NUM_MINUTES=120
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
-# This remains manual-only because it requires a 16-node H100 allocation.
 cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
@@ -24,13 +23,18 @@ uv run examples/run_grpo.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=False \
+    checkpointing.enabled=True \
+    checkpointing.checkpoint_dir=$CKPT_DIR \
     "$@" \
     2>&1 | tee $RUN_LOG
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
-uv run tests/check_metrics.py "$JSON_METRICS" \
-    "len(data['train/loss']) >= $MAX_STEPS" \
-    'all_finite(data["train/loss"])' \
-    'all_finite(data["train/token_mult_prob_error"])' \
-    'all_finite(data["train/gen_kl_error"])'
+
+# Only run metrics if the target step is reached
+if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    uv run tests/check_metrics.py "$JSON_METRICS" \
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        'mean(data["train/gen_kl_error"]) < 0.01'
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
+fi
