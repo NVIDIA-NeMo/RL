@@ -170,6 +170,9 @@ ENV UV_LINK_MODE=copy
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
+# Build HybridEP with inter-node transport support.
+ENV HYBRID_EP_MULTINODE=1
+
 # Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
 ENV CUDA_HOME=/usr/local/cuda
 
@@ -235,6 +238,7 @@ fi
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
+uv cache clean deep-ep
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project
