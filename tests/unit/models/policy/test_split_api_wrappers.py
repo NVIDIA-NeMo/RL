@@ -228,6 +228,31 @@ class TestTQPolicySplitFanout:
         # _aggregate_train_results surfaces global_loss under "loss"
         assert out["loss"] == 1.0
 
+    def test_finish_propagates_mtp_metrics(self):
+        """Worker-reduced MTP metrics survive the TQPolicy aggregation layer."""
+        p, _ = _make_tq_policy()
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                {
+                    "global_loss": 1.0,
+                    "grad_norm": 0.5,
+                    "all_mb_metrics": {"loss": [0.1]},
+                    "mtp_metrics": {
+                        "mtp_1_loss": 0.25,
+                        "mtp_1_acceptance_rate": 75.0,
+                        "grad_norm": 1.25,
+                    },
+                    "is_replica_leader": True,
+                }
+            ]
+            out = p.finish_train_step()
+
+        assert out["mtp_metrics"] == {
+            "mtp_1_loss": 0.25,
+            "mtp_1_acceptance_rate": 75.0,
+            "grad_norm": 1.25,
+        }
+
     def test_abort_consumes_single_data_futures_with_ray_get(self):
         p, wg = _make_tq_policy()
         with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:

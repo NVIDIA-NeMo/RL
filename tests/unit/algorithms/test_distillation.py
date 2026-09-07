@@ -14,7 +14,7 @@
 
 import copy
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -1041,8 +1041,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         patch.object(
             distil_mod, "create_weight_synchronizer"
         ) as mock_create_synchronizer,
-        patch.object(distil_mod, "get_nemo_gym_uv_cache_dir") as mock_uv_cache_dir,
-        patch.object(distil_mod, "get_nemo_gym_venv_dir") as mock_uv_venv_dir,
+        patch.object(distil_mod, "spinup_nemo_gym_actor") as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
@@ -1055,8 +1054,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         # Basic shape check of returned tuple
         assert isinstance(result, tuple)
         assert result[3] is None
-        mock_uv_cache_dir.assert_not_called()
-        mock_uv_venv_dir.assert_not_called()
+        mock_spinup_nemo_gym.assert_not_called()
         if refit_transport == "nixl":
             mock_create_synchronizer.assert_called_once()
             mock_create_synchronizer.return_value.init_communicator.assert_called_once()
@@ -1068,35 +1066,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
             assert DummyVllmGeneration.collective_calls
 
 
-@pytest.mark.parametrize(
-    (
-        "configured_uv_cache_dir",
-        "configured_uv_venv_dir",
-        "expected_uv_cache_dir",
-        "expected_uv_venv_dir",
-    ),
-    [
-        (
-            None,
-            None,
-            "/opt/nemo-gym/.uv-cache",
-            "/opt/nemo-gym/venvs",
-        ),
-        (
-            "/custom/cache",
-            "/custom/venvs",
-            "/custom/cache",
-            "/custom/venvs",
-        ),
-    ],
-)
-def test_distillation_setup_nemo_gym_uses_deferred_vllm(
-    monkeypatch,
-    configured_uv_cache_dir,
-    configured_uv_venv_dir,
-    expected_uv_cache_dir,
-    expected_uv_venv_dir,
-):
+def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
     import nemo_rl.algorithms.distillation as distil_mod
 
     nemo_gym_config = {
@@ -1105,10 +1075,6 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         "thinking_tags": ["<think>"],
         "config_paths": ["gym.yaml"],
     }
-    if configured_uv_cache_dir is not None:
-        nemo_gym_config["uv_cache_dir"] = configured_uv_cache_dir
-    if configured_uv_venv_dir is not None:
-        nemo_gym_config["uv_venv_dir"] = configured_uv_venv_dir
 
     master_config = MasterConfig.model_construct(
         **{
@@ -1210,16 +1176,6 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
             self.prepare_refit_info_called = True
 
     nemo_gym_actor = MagicMock()
-    nemo_gym_actor._spinup.remote.return_value = "spinup-ref"
-    nemo_gym_cls = MagicMock()
-    nemo_gym_cls.options.return_value.remote.return_value = nemo_gym_actor
-    runtime_env = {
-        "py_executable": "/venv/bin/python",
-        "env_vars": {
-            "VIRTUAL_ENV": "/venv",
-            "UV_PROJECT_ENVIRONMENT": "/venv",
-        },
-    }
 
     with (
         patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
@@ -1228,22 +1184,9 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         patch.object(distil_mod, "StatefulDataLoader"),
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
-        patch.object(distil_mod, "NemoGym", nemo_gym_cls),
         patch.object(
-            distil_mod,
-            "make_actor_runtime_env",
-            return_value=runtime_env,
-        ) as mock_runtime_env,
-        patch.object(
-            distil_mod,
-            "get_nemo_gym_uv_cache_dir",
-            return_value="/opt/nemo-gym/.uv-cache",
-        ),
-        patch.object(
-            distil_mod,
-            "get_nemo_gym_venv_dir",
-            return_value="/opt/nemo-gym/venvs",
-        ),
+            distil_mod, "spinup_nemo_gym_actor", return_value=nemo_gym_actor
+        ) as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
@@ -1261,33 +1204,19 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
     assert result[2] is created_vllm[0]
     assert result[3] is nemo_gym_actor
 
-    mock_runtime_env.assert_called_once_with("nemo_rl.environments.nemo_gym.NemoGym")
-    nemo_gym_options_kwargs = nemo_gym_cls.options.call_args.kwargs
-    assert nemo_gym_options_kwargs["runtime_env"] == runtime_env
-    assert isinstance(
-        nemo_gym_options_kwargs["scheduling_strategy"],
-        distil_mod.NodeAffinitySchedulingStrategy,
+    # The gym actor must target the deferred vLLM's servers, and distillation
+    # must not require routed experts (it never configures vLLM to emit them).
+    # The tokenizer is installed on the actor at spinup, inside the factory,
+    # rather than passed per rollout call.
+    mock_spinup_nemo_gym.assert_called_once_with(
+        master_config.env,
+        base_urls=["http://reserved-vllm"],
+        model_name="test-policy",
+        tokenizer=tokenizer,
+        enable_router_replay=False,
+        use_fastokens=False,
     )
-    nemo_gym_cfg = nemo_gym_cls.options.return_value.remote.call_args.args[0]
-    assert nemo_gym_cfg["model_name"] == "test-policy"
-    assert nemo_gym_cfg["base_urls"] == ["http://reserved-vllm"]
-    assert nemo_gym_cfg["invalid_tool_call_patterns"] == ["bad_call"]
-    assert nemo_gym_cfg["thinking_tags"] == ["<think>"]
-    assert nemo_gym_cfg["initial_global_config_dict"] == {
-        "num_gpu_nodes": 1,
-        "config_paths": ["gym.yaml"],
-        "uv_cache_dir": expected_uv_cache_dir,
-        "uv_venv_dir": expected_uv_venv_dir,
-    }
     assert master_config.env["nemo_gym"] == nemo_gym_env_before
-    nemo_gym_actor._spinup.remote.assert_called_once_with()
-    # Two waits, in order: the spinup, then the tokenizer install. Distillation
-    # builds its actor inline rather than through spinup_nemo_gym_actor, so it
-    # is the one call site that has to set the tokenizer itself -- passing it
-    # per rollout is what made the actor deserialize it once per prompt.
-    assert mock_ray.get.call_args_list[0] == call("spinup-ref")
-    assert mock_ray.get.call_count == 2
-    nemo_gym_actor.set_tokenizer.remote.assert_called_once_with(tokenizer)
 
 
 def test_nemo_gym_distillation_runner_uses_setup_actor():

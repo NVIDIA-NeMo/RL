@@ -1566,6 +1566,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             cfg = {}
             rch = _RolloutCollectionHelper()
             head_server_config = object()
+            _token_capture_enabled = False
 
             def _require_spinup(self):
                 pass
@@ -1599,7 +1600,8 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
 
         assert postprocess_calls == [(nemo_gym_row, nemo_gym_result, tokenizer, True)]
         assert streamed_results[0][0] == 7
-        assert streamed_results[0][1] == {"message_log": []}
+        assert streamed_results[0][1] == nemo_gym_row["agent_ref"]
+        assert streamed_results[0][2] == {"message_log": []}
 
     asyncio.run(_run())
 
@@ -1682,6 +1684,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             head_server_config = SimpleNamespace(backend="megatron")
             _tokenizer = _Tokenizer()
             _processor = None
+            _token_capture_enabled = False
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
@@ -1695,8 +1698,9 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
         ):
             streamed.append(item)
 
-        row_index, result, _metrics = streamed[0]
+        row_index, agent_ref, result, _metrics = streamed[0]
         assert row_index == 3
+        assert agent_ref == row["agent_ref"]
         assert [message["role"] for message in result["message_log"]] == [
             "user",
             "assistant",
@@ -1802,7 +1806,7 @@ def test_nemo_gym_sanity(
     for result_ref in nemo_gym.run_rollouts.options(num_returns="streaming").remote(
         nemo_gym_sanity_test_data["input"], ""
     ):
-        rowidx, result, _ = ray.get(result_ref)
+        rowidx, _agent_ref, result, _ = ray.get(result_ref)
         actual_result[rowidx] = result
     expected_result = nemo_gym_sanity_test_data["expected_output"]
 
