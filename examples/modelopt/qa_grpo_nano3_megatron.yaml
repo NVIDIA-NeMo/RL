@@ -25,6 +25,7 @@ policy:
   # Nano3 is a hybrid MoE/Mamba model. This recipe keeps attention and the
   # known Nano3-sensitive layers in BF16, while applying NVFP4 to weights.
   quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml"
+  quant_fold_frozen_weight_snap: false
   quant_calib_data: "cnn_dailymail"
   quant_calib_size: 512
   quant_batch_size: 1
