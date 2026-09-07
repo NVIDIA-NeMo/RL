@@ -59,6 +59,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollouts import EffortLevelsConfig
@@ -400,8 +401,11 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     assert teacher_topology is None
 
 
-def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
+def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch):
     """The inherited recipe resolves exactly as the SC entrypoint consumes it."""
+    # The parent recipe locates its fixture data below HF_HOME. This test only
+    # validates config resolution, so it needs a stable path, not real data.
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
     register_omegaconf_resolvers()
     repo_root = Path(__file__).resolve().parents[3]
     recipe = repo_root / (
@@ -1045,16 +1049,37 @@ class TestSetup:
         """setup_response_data receives master_config.env and supplies env handles."""
         math_env_cfg = {"some": "value"}
         mc = _make_master_config(env={"math": math_env_cfg})
+        tokenizer = MagicMock(pad_token_id=0)
 
-        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        actor_args, _ = setup_single_controller(mc, tokenizer)
 
-        _, call_kwargs = patched_factories["setup_response_data"].call_args
+        call_args, call_kwargs = patched_factories["setup_response_data"].call_args
+        assert call_args[0] is tokenizer
         assert call_kwargs["env_configs"] == {"math": math_env_cfg}
+        assert call_kwargs["is_vlm"] is False
         assert actor_args.env_handles is patched_factories["env_handles"]
+
+    def test_vlm_processor_used_for_data_and_environment_setup(self, patched_factories):
+        mc = _make_master_config(env={"clevr-cogent": {"some": "value"}})
+        tokenizer = MagicMock(pad_token_id=0)
+        processor = MagicMock(tokenizer=tokenizer)
+        processor.model_input_names = ["input_ids", "pixel_values", "image_grid_thw"]
+
+        actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
+
+        call_args, call_kwargs = patched_factories["setup_response_data"].call_args
+        assert call_args[0] is processor
+        assert call_kwargs["env_configs"] == {"clevr-cogent": {"some": "value"}}
+        assert call_kwargs["is_vlm"] is True
+        warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
+            "fields"
+        ]
+        assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
     def test_weight_sync_factory_args(self, patched_factories):
         """create_weight_synchronizer receives policy / generation / topology."""
         mc = _make_master_config(colocated=False, backend="vllm")
+        mc.async_rl.generation_fleet_health.refit_timeout_s = 42.0
         tokenizer = MagicMock(pad_token_id=0)
 
         setup_single_controller(mc, tokenizer)
@@ -1064,6 +1089,11 @@ class TestSetup:
         assert factory_kwargs["generation"] is patched_factories["fake_gen"]
         assert factory_kwargs["generation_backend"] == "vllm"
         assert factory_kwargs["colocated"] is False
+        assert factory_kwargs["refit_timeout_s"] == 42.0
+        assert (
+            patched_factories["fake_gen"].weight_synchronizer
+            is patched_factories["create_weight_synchronizer"].return_value
+        )
 
     def test_custom_partition_id(self, patched_factories):
         mc = _make_master_config()
@@ -1167,8 +1197,13 @@ class TestSetup:
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
             tokenizer = MagicMock(pad_token_id=0)
-            actor_args, _ = setup_single_controller(mc, tokenizer)
+            processor = MagicMock(tokenizer=tokenizer)
+            actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
 
+        data_args, data_kwargs = patched_factories["setup_response_data"].call_args
+        assert data_args[0] is processor
+        assert data_kwargs["env_configs"] is None
+        assert data_kwargs["is_vlm"] is True
         mock_spinup.assert_called_once_with(
             env_configs=mc.env,
             base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
@@ -1181,6 +1216,10 @@ class TestSetup:
             token_capture=None,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+        warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
+            "fields"
+        ]
+        assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
     def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
         mc = _make_master_config(backend="vllm")
@@ -1203,6 +1242,8 @@ class TestSetup:
             None,
         )
         fake_actors = [MagicMock(name=f"finalizer_{index}") for index in range(3)]
+        tokenizer = MagicMock(pad_token_id=9)
+        processor = MagicMock(tokenizer=tokenizer)
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
@@ -1215,7 +1256,7 @@ class TestSetup:
                 return_value=fake_actors,
             ) as mock_create_finalizer_actors,
         ):
-            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
+            actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
 
         (actor_dp_config, actor_config), actor_kwargs = (
             mock_create_finalizer_actors.call_args
@@ -1227,6 +1268,9 @@ class TestSetup:
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
+        partition_calls = actor_args.dp_client.register_partition.call_args_list
+        assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
+        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(partition_calls[1].kwargs["fields"])
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""
@@ -1533,13 +1577,15 @@ class TestSetup:
         mock_megatron.return_value.finish_generation.assert_called_once_with()
         if gym:
             # Gym spins up on the reserved URL, before the served-address
-            # cross-check — so the mismatch leg sees it too.
+            # cross-check — so the mismatch leg sees it too. The initial refit
+            # must happen during that wait because it starts Megatron's server.
             _, spinup_kwargs = mock_spinup.call_args
             assert spinup_kwargs["base_urls"] == [reserved_url]
             # The initial refit ran in setup, against the collective brought up
             # there; the served-address check reads the URLs it populated.
             weight_sync.init_communicator.assert_called_once_with()
             weight_sync.sync_weights.assert_called_once_with()
+            assert mock_megatron.return_value.weight_synchronizer is weight_sync
         else:
             mock_spinup.assert_not_called()
             # Native: the actor's startup sync performs the initial refit.
