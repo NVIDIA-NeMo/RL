@@ -129,6 +129,9 @@ ENV RAY_USAGE_STATS_ENABLED=0
 # There is severe contention and performance issues with this enabled considering our dependencies are so large and occasionally
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+# Set once here: `hermetic` and `release` both derive from `base`, so they inherit it.
+# The worker-venv prefetch in the hermetic stage reads it -- do not re-declare it in a
+# later stage, or the value the prefetch uses and the value the image ships can drift.
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
 
@@ -197,6 +200,10 @@ ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/z3/lib:/opt/
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
+# The single source of truth for which extras each Ray actor's venv needs. Run as a
+# script by the prefetch below; imported by nemo_rl.distributed.ray_actor_environment_registry
+# at runtime. Kept dependency-free so it can be copied in without the rest of the source.
+COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl --link research/ ./research/
@@ -234,7 +241,7 @@ fi
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
 
-# The venv is symlinked to avoid bloating the layer size
+# Everything is hardlinked against the uv cache; this layer holds exactly one real copy of every wheel.
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project
@@ -242,10 +249,57 @@ fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --frozen --extra sglang --no-install-project
 fi
-uv sync --link-mode symlink --frozen --extra mcore --no-install-project
-uv sync --link-mode symlink --frozen --extra automodel --no-install-project
-uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
-uv sync --link-mode symlink --frozen --all-groups --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --extra mcore --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --extra automodel --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --extra modelopt --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
+
+# Worker-venv prefetch, phase 1: third-party packages only.
+#
+# Each Ray actor runs in its own venv under NEMO_RL_VENV_DIR. Build them HERE, in the same
+# layer as the uv cache above, because a hardlink into an already-finished layer makes
+# overlayfs copy the file up -- so building them later would trade ~1.5M symlinks for
+# gigabytes of duplicated wheels. Built here, the N venvs cost directory entries and share
+# one copy of every wheel with the cache.
+#
+# Why not just run nemo_rl/utils/prefetch_venvs.py, which already knows how to build these?
+# Because it installs the nemo_rl project into each venv, and the source tree does not exist
+# yet -- this layer has only pyproject.toml, uv.lock and a couple of standalone files (see
+# the COPY above). The source arrives much later, in the release stage, deliberately: copying
+# it earlier would make every source edit invalidate this hour-long dependency build.
+# So the work is split. Here we do the expensive, cacheable half: every third-party package,
+# hardlinked, with --no-install-project so nemo_rl itself is left out. prefetch_venvs.py then
+# runs in the release stage and does the cheap half -- the editable nemo_rl install (a .pth
+# file) plus the python-<ClassName> wrapper scripts. Same venvs, finished in two places.
+#
+# nemo_rl/distributed/actor_environments.py is the single source of truth for which extras
+# each actor needs; the runtime registry imports the same dict. It is run as a script rather
+# than imported, because importing it would execute nemo_rl/__init__.py, which does real work
+# (fingerprint check, sys.path setup) that cannot run in this layer.
+SKIP_EXTRAS=""
+if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
+    SKIP_EXTRAS="$SKIP_EXTRAS vllm"
+fi
+if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
+    SKIP_EXTRAS="$SKIP_EXTRAS sglang"
+fi
+if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    SKIP_EXTRAS="$SKIP_EXTRAS trtllm"
+fi
+# Write the list once, in a plain redirect so `set -e` catches a failure here
+# instead of silently prefetching nothing.
+"${UV_PROJECT_ENVIRONMENT}/bin/python" nemo_rl/distributed/actor_environments.py all $SKIP_EXTRAS \
+    > /opt/actor_venvs.tsv
+test -s /opt/actor_venvs.tsv
+while IFS=$'\t' read -r venv_name stage extras; do
+    if [[ "$stage" == "trtllm" ]]; then
+        # tensorrt_llm does not exist yet; warm the base and finish in the TRT-LLM layer.
+        extras=""
+    fi
+    venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
+    uv venv --allow-existing "$venv_path"
+    UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
+done < /opt/actor_venvs.tsv
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
@@ -298,8 +352,14 @@ du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
 TRTLLM_SYNC_LOG=$(mktemp /tmp/trtllm-sync.XXXXXX.log)
 set +e
+# Build TRT-LLM into a throwaway venv instead of the main one:
+# the main venv is fully hardlinked from the dependency layer,
+# and churning it here would copy files up into this layer.
+# The throwaway venv must be symlink-mode: hardlinks to files in the dependency layer's uv
+# cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+    UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
     uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
     | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
@@ -317,17 +377,35 @@ rm -f "$TRTLLM_SYNC_LOG"
 echo "TRT-LLM cache state after build:"
 du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
-# Restore the intended default environment in the same layer so the transient
-# TRT-LLM installation does not add a large intermediate venv layer.
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+# Worker-venv prefetch, phase 1 for the "trtllm"-stage actors:
+# the dependency layer gave them a base-only warm; now that the tensorrt_llm wheel exists,
+# top off the venv with the full extra set so that the added files hardlink in-layer.
+# tensorrt_llm itself is new in this layer; trtllm-extra deps already present in the
+# dependency layer's cache (e.g. tilelang) get copied up here, a small accepted cost.
+# The dependency layer already wrote the actor list to /opt/actor_venvs.tsv, so this layer
+# reuses it rather than re-deriving it -- one reader, one place it can go wrong.
+while IFS=$'\t' read -r venv_name stage extras; do
+    if [[ "$stage" != "trtllm" ]]; then
+        continue
+    fi
+    venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
+    uv venv --allow-existing "$venv_path"
+    UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink \
+        TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+        TRTLLM_REQUIRE_CACHED_WHEEL=1 \
+        uv sync --frozen $extras --no-install-project
+done < /opt/actor_venvs.tsv
 
-# The final sync can repopulate the shared uv cache, so repeat the security
+# The main venv was never touched (the build ran in the throwaway venv), so
+# the previous "restore the default environment" sync is no longer needed.
+rm -rf /tmp/trtllm-build-venv
+
+# The syncs above can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
-ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 # Custom setup layer (override with: --build-context custom-setup=<dir> --build-arg CUSTOM_SETUP_FNAME=<script>)
 # To skip: --build-arg CUSTOM_SETUP_FNAME=
@@ -367,7 +445,6 @@ ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
-ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 ENV NEMO_RL_DYNAMO_VENV_DIR=/opt/dynamo_venv
 
 # AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
@@ -400,16 +477,6 @@ EOF
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 ARG BASE_IMAGE
 RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
-NEGATIVE_FILTERS=""
-if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
-fi
-if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
-fi
-if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS trtllm"
-fi
 # Reuse the custom wheel produced by the hermetic stage. Normal uv artifacts
 # stay in /root/.cache/uv, which remains available to symlinked environments.
 # Mirror only the current content-addressed TRT-LLM wheel into the image so
@@ -417,16 +484,32 @@ fi
 export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
 export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
-if [[ -n "$NEGATIVE_FILTERS" ]]; then
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
-else
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
-fi
+# Worker-venv prefetch, phase 2: the nemo_rl project itself.
+#
+# The other half of the split described in the dependency stage. Every venv already holds
+# its third-party packages, hardlinked in the layer that owns the uv cache. What was missing
+# is nemo_rl, because the source did not exist back there. It does now (COPY above), so
+# prefetch_venvs.py adds the editable install to each venv -- a .pth file, so this stays
+# cheap -- and writes the python-<ClassName> wrapper scripts into /usr/local/bin.
+#
+# This is why the venvs cannot simply be built here in one pass: hardlinking against the
+# dependency layer's cache from this layer would make overlayfs copy every wheel up.
+# Build exactly the venvs phase 1 built, by name. Re-deriving the list here would
+# mean filtering on the actor name again, which cannot tell that e.g.
+# AsyncTrajectoryCollector needs the vLLM extra -- so under SKIP_VLLM_BUILD the two
+# passes would disagree and this layer would build three venvs the dependency layer
+# deliberately skipped. prefetch_venvs.py matches these positionally as substrings,
+# and a full FQN matches only itself.
+UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py $(cut -f1 /opt/actor_venvs.tsv)
 EOF
 
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
 # into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
 # source COPY above so examples/nemo_gym/prefetch_venvs.py is present.
+# UV_LINK_MODE=symlink below applies to this outer `uv run` only. The gym server venvs
+# themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
+# UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
+# out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
 # Gym pins vllm==0.24.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
