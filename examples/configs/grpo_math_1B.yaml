@@ -328,6 +328,7 @@ policy:
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
+    loss_seq_chunk_size: null # sequence-dim tile for the multi-pass draft loss internals; null = 4096
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
