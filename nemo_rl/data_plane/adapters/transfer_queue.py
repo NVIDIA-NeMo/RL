@@ -762,24 +762,7 @@ def _from_wire(td: TensorDict) -> TensorDict:
                 if rows and all(row.shape == rows[0].shape for row in rows[1:]):
                     v = torch.stack(rows)
                     changed = True
-            if field_name in PROMOTE_1D_FIELDS:
-                if not isinstance(v, torch.Tensor) or v.is_nested:
-                    raise ValueError(
-                        f"Mooncake scalar field {field_name!r} could not be "
-                        "restored as a dense tensor."
-                    )
-                if v.dim() == 1:
-                    new_dict[field_name] = v
-                elif v.dim() == 2 and v.shape[-1] == 1:
-                    new_dict[field_name] = v.squeeze(-1).contiguous()
-                    changed = True
-                else:
-                    raise ValueError(
-                        f"Mooncake scalar field {field_name!r} must decode as "
-                        f"(N,) or (N, 1), got shape {tuple(v.shape)}."
-                    )
-            else:
-                new_dict[field_name] = v
+            new_dict[field_name] = v
         if not changed:
             # The traversal still ran; only the rebuild was skipped.
             return td
