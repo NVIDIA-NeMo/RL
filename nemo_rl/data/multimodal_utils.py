@@ -41,6 +41,12 @@ MULTIMODAL_CONTENT_TYPES = frozenset(
     {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
 NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
+# Provenance marker set on user messages whose media tensors were attached
+# rollout-matched (repaired to the rollout's per-image placeholder runs). The
+# driver-side static reattach must not overwrite such media; key presence
+# alone is not provenance (targets may carry placeholder or stale payloads
+# that the reattach is expected to replace).
+ROLLOUT_MATCHED_MEDIA_KEY = "_rollout_matched_media"
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
@@ -100,6 +106,31 @@ def uses_image_placeholder(processor: Any) -> bool:
         rather than tokenized ``apply_chat_template``.
     """
     return type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
+
+
+def image_size_from_source(source: "str | Image.Image") -> tuple[int, int]:
+    """(width, height) of an image source, without decoding pixel data."""
+    if isinstance(source, Image.Image):
+        return source.width, source.height
+    if isinstance(source, str) and source.startswith("data:"):
+        _, encoded = source.split(",", 1)
+        with Image.open(BytesIO(base64.b64decode(encoded))) as image:
+            return image.width, image.height
+    if isinstance(source, str) and source.startswith("file://"):
+        with Image.open(source.removeprefix("file://")) as image:
+            return image.width, image.height
+    if isinstance(source, str) and not source.startswith(("http://", "https://")):
+        with Image.open(source) as image:
+            return image.width, image.height
+    image = resolve_to_image(source)
+    return image.width, image.height
+
+_FIXED_TILE_IMAGE_PROCESSOR_NAMES = frozenset({"NemotronNanoVLV2Processor"})
+
+
+def uses_fixed_tile_image_processor(processor: Any) -> bool:
+    """Return whether stacked image tiles must keep their legacy metadata contract."""
+    return type(processor).__name__ in _FIXED_TILE_IMAGE_PROCESSOR_NAMES
 
 
 class PackedTensor:
@@ -1008,16 +1039,45 @@ def _restore_tensors(processed: dict[str, Any]) -> None:
                 continue
 
 
+def _image_num_tokens_from_processed(processed: dict[str, Any]) -> list[int]:
+    value = processed.get("num_tokens")
+    if value is None:
+        raise ValueError(
+            "Processor output has no per-image 'num_tokens'; cannot verify "
+            "image parity with the rollout tokens."
+        )
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.tolist()]
+    return [int(item) for item in value]
+
+
 def attach_image_model_inputs_to_message(
     message: dict[str, Any],
     *,
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
+    expected_num_tokens_per_image: "Sequence[int] | None" = None,
 ) -> None:
-    """Attach processor-owned image tensors without replacing rollout tokens."""
+    """Attach processor-owned image tensors without replacing rollout tokens.
+
+    When ``expected_num_tokens_per_image`` is given (per-image placeholder run
+    lengths read off the rollout's token ids), the processor output is verified
+    against it and mismatching turns are re-processed at the rollout's exact
+    per-image budgets, so the training-side projected feature count always
+    matches the rollout placeholders. Raises ValueError when parity cannot be
+    established, rather than attaching misaligned media.
+    """
     if not images or processor is None:
         return
+    if expected_num_tokens_per_image is not None and len(
+        expected_num_tokens_per_image
+    ) != len(images):
+        raise ValueError(
+            f"Got {len(images)} images but {len(expected_num_tokens_per_image)} "
+            "rollout placeholder runs for this turn. Refusing to train on "
+            "misaligned media."
+        )
 
     image_token = getattr(processor, "image_token", "<image>")
     # Processors that emit dynamic per-image resolutions return a ragged CHW list
@@ -1031,6 +1091,24 @@ def attach_image_model_inputs_to_message(
         return_tensors=None if allow_ragged_output else "pt",
     )
     processed = dict(processed)
+    if expected_num_tokens_per_image is not None:
+        expected = [int(count) for count in expected_num_tokens_per_image]
+        if _image_num_tokens_from_processed(processed) != expected:
+            # Local import: the exact-count repair is Nemotron-processor
+            # specific and lives with the other Nemotron helpers.
+            from nemo_rl.environments.nemotron_utils import (
+                reprocess_images_at_rollout_budgets,
+            )
+
+            processed = reprocess_images_at_rollout_budgets(processor, images, expected)
+            # Corrected tiles may be ragged even when the originals were not.
+            allow_ragged_output = len(images) > 1
+            # Explicit provenance for the driver-side static reattach: only a
+            # REPAIRED turn carries media that differs from the statically
+            # budgeted prompt copy and must not be overwritten. Unrepaired
+            # turns keep no marker, so the reattach still restores the shared
+            # tensor set across a prompt group's repeated rows.
+            message[ROLLOUT_MATCHED_MEDIA_KEY] = True
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
     model_inputs = extract_multimodal_model_inputs(processor, processed)

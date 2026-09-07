@@ -219,6 +219,48 @@ def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
     assert set(message) == {"role", "content", "token_ids"}
 
 
+def test_reattach_preserves_rollout_matched_media_marker():
+    """Media the Gym actor attached rollout-matched must not be overwritten.
+
+    Provenance is the explicit marker, not key presence: an unmarked
+    placeholder value is still replaced (see the neighboring test), while a
+    marked turn keeps its actor-attached tensors and the marker is consumed.
+    """
+    from nemo_rl.data.multimodal_utils import ROLLOUT_MATCHED_MEDIA_KEY
+
+    static_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    rollout_matched = PackedTensor(torch.tensor([[9.0]]), dim_to_pack=0)
+    original_logs = [
+        [
+            {"role": "user", "content": "first", "pixel_values": static_image},
+        ]
+    ]
+    results = [
+        {
+            "_initial_multimodal_data_omitted": True,
+            "input_message_log": [
+                {"role": "user", "content": "first"},
+            ],
+            "message_log": [
+                {
+                    "role": "user",
+                    "content": "first",
+                    "pixel_values": rollout_matched,
+                    ROLLOUT_MATCHED_MEDIA_KEY: True,
+                },
+            ],
+        }
+    ]
+
+    _reattach_original_multimodal_payloads(results, original_logs)
+
+    marked_user = results[0]["message_log"][0]
+    assert marked_user["pixel_values"] is rollout_matched
+    assert ROLLOUT_MATCHED_MEDIA_KEY not in marked_user
+    # The unmarked representation is still restored from the static source.
+    assert results[0]["input_message_log"][0]["pixel_values"] is static_image
+
+
 def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
     first_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
     second_image = PackedTensor(torch.tensor([[2.0]]), dim_to_pack=0)
