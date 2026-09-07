@@ -128,6 +128,7 @@ uv sync --link-mode symlink --locked --inexact --extra automodel --no-install-pr
 uv sync --link-mode symlink --locked --inexact --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 apt-get purge -y libnvidia-ml-dev
+apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
 EOF
 

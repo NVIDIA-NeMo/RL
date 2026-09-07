@@ -30,6 +30,18 @@ def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
         )
         cache_clean = "uv cache clean deep-ep"
         nvml_stub_purge = "apt-get purge -y libnvidia-ml-dev"
+        nvml_stub_dependencies_purge = "apt-get autoremove -y"
+        nvml_stub_purge_index = lines.index(nvml_stub_purge)
+        nvml_stub_dependencies_purge_index = next(
+            (
+                index
+                for index, line in enumerate(
+                    lines[nvml_stub_purge_index + 1 :], nvml_stub_purge_index + 1
+                )
+                if line == nvml_stub_dependencies_purge
+            ),
+            None,
+        )
         first_sync_index = next(
             index
             for index, line in enumerate(lines)
@@ -46,10 +58,14 @@ def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
         assert nvml_stub_purge in lines, (
             f"{dockerfile} does not remove the NVML link stub after the build"
         )
+        assert nvml_stub_dependencies_purge_index is not None, (
+            f"{dockerfile} retains the NVML stub's driver-side dependencies"
+        )
         assert (
             lines.index(setting)
             < lines.index(nvml_stub_install)
             < lines.index(cache_clean)
             < first_sync_index
-            < lines.index(nvml_stub_purge)
+            < nvml_stub_purge_index
+            < nvml_stub_dependencies_purge_index
         ), f"{dockerfile} does not prepare multi-node DeepEP before dependency sync"
