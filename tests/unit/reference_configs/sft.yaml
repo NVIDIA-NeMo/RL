@@ -212,6 +212,7 @@ policy:
       fp8_param: false
 
 data:
+  backend: hf
   max_input_seq_length: ${policy.max_total_sequence_length}
   add_bos: true
   add_eos: true
@@ -289,3 +290,7 @@ cluster:
   gpus_per_node: 1
   num_nodes: 1
   segment_size: null
+
+# OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
+# field on the MasterConfig, which stays None unless a run opts in.
+telemetry: null

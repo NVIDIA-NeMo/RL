@@ -31,12 +31,30 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig as AutomodelCheckpointingConfig,
 )
+from nemo_automodel.components.checkpoint.config import (
+    SaveConsolidatedMode,
+    _normalize_save_consolidated,
+)
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
 
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
+
+
+def _normalize_supported_save_consolidated(
+    value: bool | str | SaveConsolidatedMode,
+) -> SaveConsolidatedMode:
+    """Normalize the consolidated-save mode supported by NeMo-RL."""
+    mode = _normalize_save_consolidated(value)
+    if mode == SaveConsolidatedMode.FINAL:
+        raise ValueError(
+            "save_consolidated: final is not supported because NeMo-RL does not "
+            "mark final checkpoint saves. Use save_consolidated: true to export "
+            "consolidated weights."
+        )
+    return mode
 
 
 def _patch_qwen_vl_vision_key_mapping() -> None:
@@ -77,6 +95,10 @@ def _patch_qwen_vl_vision_key_mapping() -> None:
             result = dict(result or {})
             if not any(str(t).startswith("model.visual") for t in result.values()):
                 result[r"^visual\."] = "model.visual."
+            if not any(
+                str(t).startswith("model.language_model") for t in result.values()
+            ):
+                result[r"^model(?!\.(language_model|visual))"] = "model.language_model"
         return result or None
 
     _patched_get_combined_key_mapping._nrl_vision_patch = True
@@ -168,7 +190,9 @@ class AutomodelCheckpointManager:
             model_save_format=config_updates.get("model_save_format", "safetensors"),
             model_cache_dir=config_updates.get("model_cache_dir", ""),
             model_repo_id=config_updates.get("model_repo_id", ""),
-            save_consolidated=config_updates.get("save_consolidated", False),
+            save_consolidated=_normalize_supported_save_consolidated(
+                config_updates.get("save_consolidated", False)
+            ),
             is_peft=config_updates.get("is_peft", False),
             is_async=config_updates.get("is_async", False),
             dequantize_base_checkpoint=config_updates.get(
@@ -217,6 +241,12 @@ class AutomodelCheckpointManager:
             if k == "model_save_format":
                 # Ensure enum type
                 v = SerializationFormat[v.upper()] if isinstance(v, str) else v
+            elif k == "save_consolidated":
+                # Automodel normalizes legacy bools/strings to SaveConsolidatedMode in
+                # CheckpointingConfig.__post_init__, which setattr bypasses. Without this
+                # a bool True would silently compare unequal to SaveConsolidatedMode.EVERY
+                # and disable consolidated HF export.
+                v = _normalize_supported_save_consolidated(v)
             setattr(cfg, k, v)
 
         # Rebuild _addons list based on updated config
@@ -237,12 +267,33 @@ class AutomodelCheckpointManager:
             ConsolidatedHFAddon,
             PeftAddon,
         )
+        from nemo_automodel.components.checkpoint.checkpointing import (
+            _should_write_hf_metadata,
+        )
 
         self.checkpointer._addons = []
-        if self.checkpointer._should_write_hf_metadata():
+        if _should_write_hf_metadata(self.checkpointer.config):
             self.checkpointer._addons.append(ConsolidatedHFAddon())
         if self.checkpointer.config.is_peft:
             self.checkpointer._addons.append(PeftAddon())
+
+    def finalize_async_save(self) -> None:
+        """Block until in-flight async checkpoint writes have landed on disk.
+
+        With ``is_async=True`` the Automodel Checkpointer hands both the model
+        and optimizer state to ``dcp.async_save``, which stages them and uploads
+        from a separate process. Those writes address files by path, so the
+        caller must not rename ``tmp_step_N`` to ``step_N`` until they finish --
+        otherwise the writer re-creates ``tmp_step_N`` and the promoted
+        checkpoint is missing its optimizer shards and ``.metadata``.
+
+        Safe to call when async saving is off or no save is in flight; both
+        underlying calls are no-ops in that case.
+        """
+        if self.checkpointer is None:
+            return
+        self.checkpointer.maybe_wait_for_staging()
+        self.checkpointer.async_wait()
 
     def save_checkpoint(
         self,
@@ -292,16 +343,16 @@ class AutomodelCheckpointManager:
                 "model_save_format",
                 "save_consolidated",
                 "is_peft",
-                "peft_config",
                 "model_cache_dir",
                 "model_repo_id",
                 "is_async",
                 "dequantize_base_checkpoint",
             }
         }
+        save_peft_config = checkpointing_cfg.get("peft_config")
         if lora_enabled:
             checkpoint_kwargs["is_peft"] = True
-            checkpoint_kwargs["peft_config"] = peft_config
+            save_peft_config = peft_config
 
         checkpoint_root = _infer_checkpoint_root(weights_path)
 
@@ -313,7 +364,7 @@ class AutomodelCheckpointManager:
         self.checkpointer.save_model(
             model=model,
             weights_path=weights_path,
-            peft_config=checkpoint_kwargs.get("peft_config"),
+            peft_config=save_peft_config,
             tokenizer=tokenizer if tokenizer_path is None else None,
         )
 

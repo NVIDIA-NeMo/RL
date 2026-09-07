@@ -30,6 +30,7 @@ from nemo_rl.data_plane.interfaces import (
     MooncakeCpuConfig,
     SimpleStorageConfig,
     backend_config,
+    data_plane_supports_checkpointing,
 )
 
 _BASE = {
@@ -41,6 +42,20 @@ _BASE = {
 
 def _cfg(backend: str, **extra) -> dict:
     return {**_BASE, "backend": backend, **extra}
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        ("simple", True),
+        ("mooncake_cpu", False),
+        ("future_backend", False),
+    ],
+)
+def test_checkpointing_capability_defaults_to_unsupported(
+    backend: str, expected: bool
+) -> None:
+    assert data_plane_supports_checkpointing(_cfg(backend)) is expected
 
 
 def test_nested_block_is_used() -> None:

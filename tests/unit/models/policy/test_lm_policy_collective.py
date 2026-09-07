@@ -122,6 +122,11 @@ def test_policy_forwards_packed_collective_options_to_workers():
             "broadcast_weights_for_collective",
             {
                 "kv_scales": {"k_scale": 1.25},
+                # Forwarded unconditionally alongside the packing options, and asserted
+                # here because this test pins the exact kwarg set: every worker has to
+                # accept all of it, and one that does not fails at the Ray boundary
+                # rather than anywhere near its own signature.
+                "refit_timeout_s": None,
                 "buffer_size_bytes": 1024**3,
                 "num_buffers": 2,
             },

@@ -37,6 +37,8 @@ import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
+    from transformers import AutoProcessor
+
     from nemo_rl.models.policy.tq_policy import TQPolicy
 
 import numpy as np
@@ -44,12 +46,15 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms.metric_utils import normalize_filter_aware_mb_metrics
+
 # Re-imports from grpo so this file is a thin trainer-only fork.
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
     _clip_grpo_advantages,
     _create_advantage_estimator,
+    _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
@@ -73,6 +78,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -390,6 +396,19 @@ def grpo_train_sync(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    # Unused here, and present only so the shared VLM launcher can pass one
+    # fixed kwarg set to whichever trainer ``select_sync_trainer`` returns.
+    # ``grpo_train``'s sole use of it is
+    # ``attach_initial_nemo_gym_image_payloads``, gated on
+    # ``grpo.deduplicate_multimodal_data`` *and* ``should_use_nemo_gym`` — the
+    # combination ``setup()`` rejects via
+    # ``_validate_multimodal_dedup_capability``. Non-Gym dedup runs never call
+    # that helper, so they need no processor here either.
+    #
+    # TODO: replace this parity kwarg with a ``ProcessorInterface`` both
+    # trainers consume, rather than threading ``Optional[AutoProcessor]``
+    # through every signature — ``grpo.py`` repeats it at seven sites.
+    processor: Optional["AutoProcessor"] = None,
 ) -> None:
     """Run GRPO training algorithm — TransferQueue-mediated.
 
@@ -414,7 +433,13 @@ def grpo_train_sync(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    POLICY_GENERATION_STALE = True
+    # Skip a redundant iter-1 refit when setup() already synced weights
+    # (synchronizer not stale, fresh run). The redundant refit resets
+    # vLLM CUDA-graph / KV-cache state and yields a step-1
+    # token_mult_prob_error spike that converges by step 3.
+    POLICY_GENERATION_STALE = _initial_policy_generation_stale(
+        policy_generation, grpo_save_state.total_steps
+    )
     assert policy_generation is not None
 
     if master_config.grpo.skip_reference_policy_logprobs_calculation:
@@ -577,9 +602,18 @@ def grpo_train_sync(
             with timer.time("total_step_time"):
                 print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
+                    # ``share_immutable_media`` must be passed here exactly as
+                    # ``grpo_train`` passes it (grpo.py). Without it
+                    # ``_prepare_multimodal_sharing`` never runs, so
+                    # ``deduplicate_multimodal_data`` becomes a silent no-op on
+                    # this trainer and the deepcopy below makes G independent
+                    # copies of every image in driver RAM.
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
-                            master_config.grpo.num_generations_per_prompt
+                            master_config.grpo.num_generations_per_prompt,
+                            share_immutable_media=(
+                                master_config.grpo.deduplicate_multimodal_data
+                            ),
                         )
                     )
 
@@ -950,9 +984,14 @@ def grpo_train_sync(
                         # (logprobs/advantages/masks) and wire-only message
                         # log bulk fields are skipped by virtue of not being
                         # in DP_CALIB_INPUT_FIELDS.
+                        # VLM extras cannot be named in
+                        # ``DP_CALIB_INPUT_FIELDS``: the rollout writes
+                        # pixel_values / image_grid_thw / … individually and
+                        # which of them exist is per-processor, so the static
+                        # list alone would calibrate image-blind.
                         _calib_fields = [
                             f for f in (meta.fields or []) if f in DP_CALIB_INPUT_FIELDS
-                        ]
+                        ] + present_multimodal_fields(meta)
                         calibration_data = policy.read_from_dataplane(
                             meta,
                             select_fields=_calib_fields,
@@ -1079,7 +1118,9 @@ def grpo_train_sync(
                     metrics["filtered_reward"] = rewards.numpy()
                     metrics["reward"] = unfiltered_rewards.numpy()
 
-                metrics.update(train_results["all_mb_metrics"])
+                metrics.update(
+                    normalize_filter_aware_mb_metrics(train_results["all_mb_metrics"])
+                )
                 metrics.update(gen_step_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:

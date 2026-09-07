@@ -15,7 +15,7 @@
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss.interfaces import (
     LossFunction,
@@ -42,6 +42,7 @@ from nemo_rl.distributed.model_utils import (
     DistributedCrossEntropy,
     cp_shift_next,
     group_all_reduce_sum,
+    group_all_reduce_sum_with_grad,
     vocab_parallel_full_log_softmax,
     vocab_parallel_gather_columns,
     vocab_parallel_log_softmax,
@@ -125,7 +126,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     ratio_clip_c: Optional[float] = None
 
     # --- KL regularization ---
-    reference_policy_kl_penalty: float = 0.01
+    reference_policy_kl_penalty: float = Field(default=0.01, ge=0, allow_inf_nan=False)
     # Can be set to k1, k2, k3
     # For more details, see http://joschu.net/blog/kl-approx.html
     reference_policy_kl_type: str = "k3"
@@ -364,6 +365,12 @@ class ClippedPGLossFn(LossFunction):
             "probs_ratio_max": MetricNormalizer.NONE,
             "probs_ratio_clamped_min": MetricNormalizer.NONE,
             "probs_ratio_clamped_max": MetricNormalizer.NONE,
+            # Raw local counts used by the step-level metric reducer to undo
+            # the original-token denominator when a diagnostic mask narrows.
+            "_actor_valid_toks": MetricNormalizer.NONE,
+            "_prev_valid_toks": MetricNormalizer.NONE,
+            "_sampling_importance_ratio_valid_toks": MetricNormalizer.NONE,
+            "_is_oob_valid_toks": MetricNormalizer.NONE,
         }
         if self.truncated_importance_sampling_type is not None:
             # Keyed on the TIS type, NOT loss_type: seq-mask-tis masks whole
@@ -434,6 +441,8 @@ class ClippedPGLossFn(LossFunction):
         # so those reductions read exp(|log pi_gen|) at each filtered position.
         prev_token_mask = actor_token_mask if self.force_on_policy_ratio else token_mask
         prev_mask = actor_mask if self.force_on_policy_ratio else mask
+        actor_valid_toks = actor_mask.sum().item()
+        prev_valid_toks = prev_mask.sum().item()
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -800,6 +809,17 @@ class ClippedPGLossFn(LossFunction):
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
+        filter_aware_counts = {
+            "_actor_valid_toks": actor_valid_toks,
+            "_prev_valid_toks": prev_valid_toks,
+        }
+        if not self.sequence_level_importance_ratios:
+            filter_aware_counts["_sampling_importance_ratio_valid_toks"] = (
+                prev_valid_toks
+            )
+        if self.truncated_importance_sampling_type in ("tis", "icepop"):
+            filter_aware_counts["_is_oob_valid_toks"] = prev_valid_toks
+
         return (
             loss,
             {
@@ -820,6 +840,7 @@ class ClippedPGLossFn(LossFunction):
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 "positive_nll_loss": nll_loss.item(),
+                **filter_aware_counts,
             },
         )
 
@@ -1656,6 +1677,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         *,
+        student_next_token_logprobs: Optional[torch.Tensor] = None,
+        student_next_token_mask: Optional[torch.Tensor] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1669,9 +1692,16 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         ``student_logits_contig`` (CP-relaid) and the per-teacher ``aligns_by_idx``
         / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
-        the raw ``logits`` is kept for the CE term.
+        the Automodel CP path also supplies its sequence-local CE inputs.
         """
-        ce_loss = self._compute_ce(logits, data, global_valid_toks)
+        ce_loss = self._compute_ce(
+            logits,
+            data,
+            global_valid_toks,
+            student_next_token_logprobs=student_next_token_logprobs,
+            student_next_token_mask=student_next_token_mask,
+            cp_group=cp_group,
+        )
 
         if self.kd_loss_mode == "sum":
             total_kd, per_teacher_metrics = self._sum_kd(
@@ -2685,8 +2715,29 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         logits: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         global_valid_toks: torch.Tensor,
+        *,
+        student_next_token_logprobs: Optional[torch.Tensor] = None,
+        student_next_token_mask: Optional[torch.Tensor] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> torch.Tensor:
         """Next-token CE on the student side (TP/CP handled by the helpers)."""
+        if student_next_token_logprobs is not None:
+            assert student_next_token_mask is not None
+            label_mask = student_next_token_mask.to(
+                student_next_token_logprobs.dtype
+            ) * to_local_if_dtensor(data["sample_mask"]).to(
+                student_next_token_logprobs.device
+            ).unsqueeze(-1)
+            local_ce = masked_mean(
+                -student_next_token_logprobs,
+                label_mask,
+                global_normalization_factor=global_valid_toks,
+            )
+            # Forward SUM gives every CP rank the same full-sequence CE (and
+            # therefore the same dynamic KD scale). Identity backward keeps the
+            # disjoint rank-local windows at a single gradient fanout.
+            return group_all_reduce_sum_with_grad(local_ce, cp_group)
+
         per_token_ce = student_next_token_ce(
             logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
         )

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,7 +27,11 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    DataPlaneMutationCut,
+    TQReplayBuffer,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     WeightFifoSampler,
@@ -43,6 +49,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
+from nemo_rl.experience.rollout_recovery import (
+    RolloutRecoveryLedger,
+    RolloutRecoveryLedgerState,
+)
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (
@@ -90,7 +100,26 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    # Empty means the legacy (non-token-capture) dispatch path.
+    ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
+    ctrl._rollout_recovery_enabled = False
+
+
+class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
+    """Hold a mutation after its body so a concurrent checkpoint can be observed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mutation_applied = asyncio.Event()
+        self.release_mutation = asyncio.Event()
+
+    @asynccontextmanager
+    async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
+        async with super().mutation() as cut:
+            yield cut
+            self.mutation_applied.set()
+            await self.release_mutation.wait()
 
 
 class _RecordingBuffer:
@@ -164,7 +193,9 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    ctrl._finalizer_actors = []
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
     ctrl._sampler = make_sampler(buffer)
@@ -223,6 +254,7 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _OutcomeRolloutManager()
     ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
     ctrl._dataloader = [
@@ -277,6 +309,7 @@ def test_rollout_pump_tops_up_restored_target_step(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # lookahead=0 keeps the single batch on target_step 0.
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
@@ -354,6 +387,7 @@ def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _SkippingRolloutManager()
     ctrl._sampler = make_sampler(buffer)
     prompt_batch = BatchedDataDict(
@@ -433,6 +467,7 @@ def _pump_controller(
             max_num_epochs=1, num_prompts_per_step=num_prompts_per_step
         )
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = manager
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=1)
     ctrl._dataloader = dataloader
@@ -716,6 +751,7 @@ class TestTargetGroupsForStep:
                 num_prompts_per_step=num_prompts_per_step,
             )
         )
+        ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._async_cfg = SimpleNamespace(
             rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction)
         )
@@ -765,21 +801,150 @@ def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
         stale = asyncio.create_task(asyncio.Event().wait())
         await asyncio.sleep(0)
 
+        ledger = RolloutRecoveryLedger()
+        barrier = DataPlaneCheckpointBarrier()
+        async with barrier.mutation() as cut:
+            for group_id, prompt_idx, start_weight_version in (
+                ("fresh", 50, 5),
+                ("stale", 10, 1),
+            ):
+                ledger.reserve_group(
+                    cut,
+                    group_id=group_id,
+                    prompt_id=str(prompt_idx),
+                    prompt_payload={"idx": prompt_idx, "message_log": []},
+                    expected_generations=2,
+                    target_step=None,
+                    start_weight_version=start_weight_version,
+                    admitted=True,
+                )
+
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
+        ctrl._rollout_recovery_enabled = True
+        ctrl._data_plane_checkpoint_barrier = barrier
+        ctrl._rollout_manager = SimpleNamespace(
+            recovery_ledger=ledger,
+            discard_prompt_group=ledger.discard_group,
+        )
 
         aborted = await ctrl._abort_stale_inflight()
 
         assert aborted == 1
         assert stale.cancelled()
         assert not fresh.cancelled()
+        assert [group.group_id for group in ledger.groups()] == ["fresh"]
 
         fresh.cancel()
         with pytest.raises(asyncio.CancelledError):
             await fresh
+
+    asyncio.run(_main())
+
+
+def test_abort_stale_inflight_rechecks_registry_after_checkpoint_wait() -> None:
+    """A group completed while checkpoint-blocked is not subsequently aborted."""
+
+    async def _main() -> None:
+        completed = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+        ledger = RolloutRecoveryLedger()
+        barrier = DataPlaneCheckpointBarrier()
+        async with barrier.mutation() as cut:
+            ledger.reserve_group(
+                cut,
+                group_id="completed",
+                prompt_id="10",
+                prompt_payload={"idx": 10, "message_log": []},
+                expected_generations=2,
+                target_step=None,
+                start_weight_version=1,
+                admitted=True,
+            )
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"completed": (completed, 1)}
+        ctrl._rollout_recovery_enabled = True
+        ctrl._data_plane_checkpoint_barrier = barrier
+        ctrl._rollout_manager = SimpleNamespace(
+            recovery_ledger=ledger,
+            discard_prompt_group=ledger.discard_group,
+        )
+
+        async with ctrl._data_plane_checkpoint_barrier.checkpoint() as cut:
+            abort_task = asyncio.create_task(ctrl._abort_stale_inflight())
+            await asyncio.sleep(0)
+            assert not abort_task.done()
+            ctrl._inflight_by_group_id.pop("completed")
+            ledger.discard_group(cut, "completed")
+
+        assert await asyncio.wait_for(abort_task, timeout=1.0) == 0
+        assert not completed.cancelled()
+
+        completed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await completed
+
+    asyncio.run(_main())
+
+
+def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
+    """A checkpoint waiting on stale abort cannot persist its discarded owner."""
+
+    async def _main() -> None:
+        stale = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+        ledger = RolloutRecoveryLedger()
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            ledger.reserve_group(
+                cut,
+                group_id="stale",
+                prompt_id="10",
+                prompt_payload={"idx": 10, "message_log": []},
+                expected_generations=2,
+                target_step=None,
+                start_weight_version=1,
+                admitted=True,
+            )
+        barrier = _PausingMutationBarrier()
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"stale": (stale, 1)}
+        ctrl._rollout_recovery_enabled = True
+        ctrl._data_plane_checkpoint_barrier = barrier
+        ctrl._rollout_manager = SimpleNamespace(
+            recovery_ledger=ledger,
+            discard_prompt_group=ledger.discard_group,
+        )
+
+        abort_task = asyncio.create_task(ctrl._abort_stale_inflight())
+        await asyncio.wait_for(barrier.mutation_applied.wait(), timeout=1.0)
+
+        checkpoint_entered = asyncio.Event()
+
+        async def checkpoint_snapshot() -> RolloutRecoveryLedgerState:
+            async with barrier.checkpoint():
+                checkpoint_entered.set()
+                return ledger.state_dict()
+
+        checkpoint_task = asyncio.create_task(checkpoint_snapshot())
+        await asyncio.sleep(0)
+        assert not checkpoint_entered.is_set()
+
+        barrier.release_mutation.set()
+        checkpoint_state = await asyncio.wait_for(checkpoint_task, timeout=1.0)
+        assert await asyncio.wait_for(abort_task, timeout=1.0) == 1
+        assert checkpoint_state["groups"] == []
+        assert stale.cancelled()
 
     asyncio.run(_main())
 
@@ -800,6 +965,7 @@ def test_abort_stale_inflight_aggregates_cleanup_failures() -> None:
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=0)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"g": (task, 0)}
+        ctrl._rollout_recovery_enabled = False
 
         with pytest.raises(BaseExceptionGroup) as exc_info:
             await ctrl._abort_stale_inflight()
@@ -850,7 +1016,9 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(max_num_epochs=1)
         )
+        ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = manager
+        ctrl._finalizer_actors = []
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
@@ -938,7 +1106,9 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(max_num_epochs=1)
         )
+        ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = _NeverCalledRolloutManager()
+        ctrl._finalizer_actors = []
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
@@ -962,6 +1132,89 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         assert created_semaphores[0]._value == 1
         assert ctrl._inflight_rollouts == 0
         assert ctrl._dispatched_rollouts == set()
+        assert ctrl._rollout_exhausted.is_set()
+
+    asyncio.run(_main())
+
+
+def test_actor_path_releases_generation_permit_before_finalization() -> None:
+    class _SplitRolloutManager:
+        def __init__(self) -> None:
+            self.generated = 0
+            self.two_generated = asyncio.Event()
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        ) -> Any:
+            del prompt, target_step, inflight_registry
+            self.generated += 1
+            if self.generated == 2:
+                self.two_generated.set()
+            return SimpleNamespace(group_id=f"g{self.generated}")
+
+    async def _main() -> None:
+        manager = _SplitRolloutManager()
+        release_finalizers = asyncio.Event()
+        finalizers_started = 0
+
+        async def _delayed_finalize(request: Any) -> bool:
+            nonlocal finalizers_started
+            del request
+            finalizers_started += 1
+            await release_finalizers.wait()
+            return True
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1,
+            diagnostics=False,
+            rollout_failure=_failure_cfg(),
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        ctrl._rollout_manager = manager
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = _delayed_finalize
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "message_log": [
+                        [{"role": "user", "content": "first"}],
+                        [{"role": "user", "content": "second"}],
+                    ]
+                }
+            )
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(2)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        pump = asyncio.create_task(ctrl._rollout_pump())
+        await asyncio.wait_for(manager.two_generated.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert finalizers_started == 2
+        assert ctrl._inflight_rollouts == 0
+        release_finalizers.set()
+        await asyncio.wait_for(pump, timeout=1.0)
+
+        # Successful commits transfer both buffer permits to the train pump.
+        assert ctrl._buffer_capacity._value == 0
         assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
@@ -993,7 +1246,10 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     master_config = MasterConfig.model_construct(
-        policy={"train_global_batch_size": expected_samples},
+        policy={
+            "train_global_batch_size": expected_samples,
+            "generation": {"colocated": {"enabled": False}},
+        },
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=num_prompts,
             num_generations_per_prompt=num_generations,
@@ -1036,6 +1292,7 @@ def test_rollout_pump_writes_expected_tq_data(
         dp_adapter,
         partition_id=_PARTITION_ID,
         pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
+        include_message_violation_fields=False,
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
@@ -1063,6 +1320,7 @@ def test_rollout_pump_writes_expected_tq_data(
         partition_id=_PARTITION_ID,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        finalizer_actors=[],
     )
     ctrl = SingleControllerActor.remote(
         master_config=master_config,
@@ -1103,6 +1361,8 @@ def test_rollout_pump_writes_expected_tq_data(
         bulk["sample_mask"].float(),
         torch.ones(expected_samples, dtype=torch.float32),
     )
+    assert not bulk["mask_sample"].bool().any()
+    assert not bulk["truncated"].bool().any()
 
     # Same deterministic prompt as test_async_rollout_manager: the model
     # solves the calculator task every time -> reward == 1.0 and decoded
@@ -1132,5 +1392,13 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     for tag in tags:
         assert tag["weight_version"] == 0
-        # Slim tag schema: weight_version is the only field producers stamp.
-        assert set(tag) == {"weight_version"}
+        assert tag["prompt_idx"] == input_sample["idx"]
+        # Tag schema: recovery identity plus per-row violation counts.
+        assert set(tag) == {
+            "weight_version",
+            "prompt_idx",
+            "num_invalid_tool_calls",
+            "num_malformed_thinking",
+            "num_assistant_messages",
+            "num_routed_experts_backfilled",
+        }

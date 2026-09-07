@@ -22,11 +22,16 @@ import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration, megatron_generation
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
+)
+from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
+from nemo_rl.models.generation.megatron.utils import (
+    build_prompt_and_multimodal_data,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -36,6 +41,209 @@ from nemo_rl.weight_sync.megatron_weight_synchronizer import (
 from tests.unit.test_utils import SimpleLossFn
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+@pytest.mark.mcore
+def test_multimodal_preprocessing_requires_policy_processor():
+    class _ImageWrapper:
+        supports_image = True
+
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._get_megatron_inference_wrapper_cls = lambda: _ImageWrapper
+
+    with pytest.raises(ValueError, match="requires the policy processor"):
+        worker._build_image_preprocessing_config({})
+
+
+@pytest.mark.mcore
+def test_multimodal_preprocessing_forwards_vision_model_type():
+    class _ImageWrapper:
+        supports_image = True
+
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._get_megatron_inference_wrapper_cls = lambda: _ImageWrapper
+    worker.processor = SimpleNamespace(
+        image_processor=SimpleNamespace(
+            patch_size=14,
+            min_num_patches=1,
+            max_num_patches=32,
+            norm_mean=[0.1, 0.2, 0.3],
+            norm_std=[0.4, 0.5, 0.6],
+        )
+    )
+
+    config = worker._build_image_preprocessing_config({"vision_model_type": "qwen-vl"})
+
+    assert config.vision_model_type == "qwen-vl"
+
+
+@pytest.mark.mcore
+def test_direct_megatron_media_request_preserves_preexpanded_prompt():
+    def fake_sample_vision_tensors(data, index):
+        return torch.ones(1, 2, 4), torch.tensor([[2, 2]]), None
+
+    data = {
+        "input_ids": torch.tensor([[10, 99, 99, 20, 0]]),
+        "input_lengths": torch.tensor([4]),
+    }
+
+    prompt, multi_modal_data = build_prompt_and_multimodal_data(
+        data,
+        0,
+        sample_tensors=fake_sample_vision_tensors,
+        supports_modality=lambda modality: modality == "image",
+    )
+
+    assert prompt == [10, 99, 99, 20]
+    assert multi_modal_data["media_tokens_preexpanded"] is True
+    assert "image" in multi_modal_data
+
+
+@pytest.mark.mcore
+def test_text_only_request_does_not_resolve_multimodal_capabilities():
+    data = {
+        "input_ids": torch.tensor([[10, 20, 0]]),
+        "input_lengths": torch.tensor([2]),
+    }
+
+    prompt, multi_modal_data = build_prompt_and_multimodal_data(
+        data,
+        0,
+        supports_modality=lambda modality: pytest.fail(
+            f"unexpected capability lookup for {modality}"
+        ),
+    )
+
+    assert prompt == [10, 20]
+    assert multi_modal_data is None
+
+
+@pytest.mark.mcore
+def test_direct_megatron_video_request_marks_preexpanded_prompt():
+    def fake_sample_vision_tensors(data, index):
+        return (
+            torch.ones(1, 4, 4),
+            torch.tensor([[2, 2], [2, 2], [2, 2], [2, 2]]),
+            torch.tensor([4]),
+        )
+
+    data = {
+        "input_ids": torch.tensor([[10, 99, 99, 20]]),
+        "input_lengths": torch.tensor([4]),
+    }
+
+    prompt, multi_modal_data = build_prompt_and_multimodal_data(
+        data,
+        0,
+        sample_tensors=fake_sample_vision_tensors,
+        supports_modality=lambda modality: modality == "video",
+    )
+
+    assert prompt == [10, 99, 99, 20]
+    assert multi_modal_data["media_tokens_preexpanded"] is True
+    assert "video" in multi_modal_data
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("modality", "num_frames"),
+    [("image", torch.tensor([1])), ("video", torch.tensor([4]))],
+)
+def test_direct_megatron_multimodal_generate_round_trip(
+    monkeypatch, modality, num_frames
+):
+    """Exercise RL request construction and response packing around a mocked MCore LLM."""
+
+    class _MultimodalWrapper:
+        supports_text = True
+        supports_image = True
+        supports_video = True
+        supports_audio = False
+
+    worker = object.__new__(MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {
+            "temperature": 1.0,
+            "top_k": None,
+            "top_p": 1.0,
+            "max_new_tokens": 2,
+            "stop_strings": None,
+            "mcore_generation_config": {},
+        }
+    }
+    worker.tokenizer = SimpleNamespace(pad_token_id=0)
+    worker.megatron_tokenizer = SimpleNamespace(eod=2)
+    worker._inference_loop = object()
+    worker._get_megatron_inference_wrapper_cls = lambda: _MultimodalWrapper
+
+    frame_count = int(num_frames.sum())
+    pixels = torch.arange(frame_count * 12, dtype=torch.float32).reshape(
+        frame_count, 3, 2, 2
+    )
+    sizes = torch.tensor([[2, 2]] * frame_count)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[10, 99, 99, 20]]),
+            "input_lengths": torch.tensor([4]),
+            "pixel_values": PackedTensor([pixels], dim_to_pack=0),
+            "imgs_sizes": PackedTensor([sizes], dim_to_pack=0),
+            "num_frames": PackedTensor([num_frames], dim_to_pack=0),
+        }
+    )
+
+    captured = {}
+    mocked_call = object()
+
+    def mock_generate(prompts, multi_modal_data, sampling_params):
+        captured.update(
+            prompts=prompts,
+            multi_modal_data=multi_modal_data,
+            sampling_params=sampling_params,
+        )
+        return mocked_call
+
+    replies = [
+        SimpleNamespace(
+            prompt_tokens=torch.tensor([10, 99, 99, 20]),
+            generated_tokens=[71, 72],
+            generated_log_probs=[-0.25, -0.5],
+        )
+    ]
+    worker._generate_with_persistent_engine = mock_generate
+
+    class _CompletedFuture:
+        def result(self):
+            return replies
+
+    def mock_run_coroutine_threadsafe(call, loop):
+        assert call is mocked_call
+        assert loop is worker._inference_loop
+        return _CompletedFuture()
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.asyncio.run_coroutine_threadsafe",
+        mock_run_coroutine_threadsafe,
+    )
+
+    output = worker.generate(data=data)
+
+    assert captured["prompts"] == [[10, 99, 99, 20]]
+    media = captured["multi_modal_data"][0]
+    assert media["media_tokens_preexpanded"] is True
+    assert set(media) == {modality, "media_tokens_preexpanded"}
+    assert torch.equal(media[modality]["imgs"], pixels)
+    assert torch.equal(media[modality]["imgs_sizes"], sizes)
+    if modality == "video":
+        assert torch.equal(media["video"]["num_frames"], num_frames.to(torch.int32))
+    else:
+        assert "num_frames" not in media["image"]
+    assert captured["sampling_params"][0].return_prompt_tokens is True
+
+    assert output["output_ids"][0].tolist() == [10, 99, 99, 20, 71, 72]
+    assert output["logprobs"][0].tolist() == [0.0, 0.0, 0.0, 0.0, -0.25, -0.5]
+    assert output["generation_lengths"].tolist() == [2]
+    assert output["unpadded_sequence_lengths"].tolist() == [6]
+
 
 basic_megatron_test_config: PolicyConfig = {
     "model_name": model_name,
@@ -51,6 +259,7 @@ basic_megatron_test_config: PolicyConfig = {
     "dtensor_cfg": {"enabled": False},
     "dynamic_batching": {"enabled": False},
     "sequence_packing": {"enabled": False},
+    "make_sequence_length_divisible_by": 1,
     "megatron_cfg": {
         "enabled": True,
         "empty_unused_memory_level": 0,
@@ -144,6 +353,7 @@ basic_megatron_test_config: PolicyConfig = {
             "kv_cache_management_mode": "persist",
             "materialize_only_last_token_logits": True,
             "num_speculative_tokens": 0,
+            "logprobs_mode": "processed_logprobs",
             "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
             "parsers": [],
             "expose_http_server": False,
@@ -276,13 +486,14 @@ async def _generate_async(mg, tokenizer, test_input_data, greedy=False):
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
-    "tensor_parallel_size,pipeline_parallel_size,top_p,top_k",
+    "tensor_parallel_size,pipeline_parallel_size,top_p,top_k,logprobs_mode",
     [
-        (1, 1, 1.0, None),
-        (2, 1, 1.0, None),
-        (1, 2, 1.0, None),
-        (1, 1, 0.9, 8000),
-        (1, 1, 1.0, 1),
+        (1, 1, 1.0, None, "processed_logprobs"),
+        (2, 1, 1.0, None, "processed_logprobs"),
+        (1, 2, 1.0, None, "processed_logprobs"),
+        (1, 1, 0.9, 8000, "processed_logprobs"),
+        (1, 1, 1.0, 1, "processed_logprobs"),
+        (1, 1, 1.0, 1, "raw_logprobs"),
     ],
 )
 def test_megatron_policy_generation(
@@ -293,6 +504,7 @@ def test_megatron_policy_generation(
     pipeline_parallel_size,
     top_p,
     top_k,
+    logprobs_mode,
 ):
     """Standalone Megatron generation across tp/pp and sampling params."""
     if cluster.num_gpus_per_node < tensor_parallel_size * pipeline_parallel_size:
@@ -301,11 +513,18 @@ def test_megatron_policy_generation(
             f"tp={tensor_parallel_size} pp={pipeline_parallel_size}"
         )
 
+    if pipeline_parallel_size > 1:
+        pytest.xfail(
+            "FIXME(@cspades/@tdene): MCore async-scheduled generation segfaults with PP>1 "
+            "in dynamic_context.calculate_log_probs_tensors when slicing log_probs."
+        )
+
     config = deepcopy(basic_megatron_test_config)
     config["megatron_cfg"]["tensor_model_parallel_size"] = tensor_parallel_size
     config["megatron_cfg"]["pipeline_model_parallel_size"] = pipeline_parallel_size
     config["generation"]["top_p"] = top_p
     config["generation"]["top_k"] = top_k
+    config["generation"]["mcore_generation_config"]["logprobs_mode"] = logprobs_mode
     # config-level stop string, unioned with the per-sample stop strings below.
     config["generation"]["stop_strings"] = ["</s>"]
 
@@ -329,14 +548,21 @@ def test_megatron_policy_generation(
                 start = test_input_data["input_lengths"][i].item()
                 end = start + sampled["generation_lengths"][i].item()
                 gen_logprobs = sampled["logprobs"][i, start:end]
-                # Processed logprobs are exactly 0.0 where the argmax is unique;
-                # bf16 max-ties renormalize to log(1/n). Raw logprobs are never
-                # exactly 0, so a mostly-exact-0 row pins the processed mode.
-                assert (gen_logprobs <= 0).all() and (
-                    (gen_logprobs == 0.0).float().mean() >= 0.5
-                ), (
-                    f"expected mostly-exact-0 processed logprobs under top_k=1, got {gen_logprobs}"
-                )
+                assert (gen_logprobs <= 0).all()
+                if logprobs_mode == "processed_logprobs":
+                    # Processed logprobs are exactly 0.0 where the argmax is
+                    # unique; bf16 max-ties renormalize to log(1/n).
+                    assert (gen_logprobs == 0.0).float().mean() >= 0.5, (
+                        "expected mostly-exact-0 processed logprobs under "
+                        f"top_k=1, got {gen_logprobs}"
+                    )
+                else:
+                    # Raw model probabilities are computed before top-k=1 and
+                    # therefore retain nonzero uncertainty.
+                    assert (gen_logprobs < 0.0).float().mean() >= 0.5, (
+                        "expected mostly-negative raw logprobs under top_k=1, "
+                        f"got {gen_logprobs}"
+                    )
 
         # per-sample stop strings are merged with the config stop string (may stop early,
         # so don't require a generated token)
@@ -565,8 +791,9 @@ def test_megatron_generation_non_colocated_refit(
 ):
     """Non-colocated Megatron generation.
 
-    With skip_weight_load the inference engine builds without loading the
-    checkpoint and must still generate correctly once refit delivers weights.
+    With skip_weight_load, inference-engine initialization is deferred until
+    refit delivers the final weight objects. This is required for CUDA graphs
+    to capture persistent refit-buffer addresses.
     """
     generation_cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[1],
@@ -605,6 +832,12 @@ def test_megatron_generation_non_colocated_refit(
             tokenizer=tokenizer,
             cluster=generation_cluster,
             skip_weight_load=skip_weight_load,
+        )
+        assert mg._policy_config is not config
+        assert mg._policy_config["generation"] is not config["generation"]
+        assert (
+            mg._policy_config["generation"]["mcore_generation_config"]
+            is not config["generation"]["mcore_generation_config"]
         )
 
         # Wire the refit collective the way grpo.setup does: through the

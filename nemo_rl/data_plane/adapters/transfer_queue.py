@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import contextlib
 import glob
+import importlib
 import ipaddress
+import json
 import os
 import resource
 import socket
@@ -33,6 +35,7 @@ import time
 import warnings
 import weakref
 from importlib import resources
+from pathlib import Path
 from queue import Empty, SimpleQueue
 from typing import Any, cast
 
@@ -49,8 +52,8 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     KVBatchMeta,
     backend_config,
+    data_plane_supports_checkpointing,
 )
-from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -340,6 +343,142 @@ def _patch_mooncake_register_check() -> None:
     cls._nrl_register_checked = True
 
 
+def _assert_tq_stores_scalar_rows_0d() -> None:
+    """Confirm a dense 1-D field really is stored as 0-d rows.
+
+    :func:`_patch_scalar_field_schema` rewrites the reported sample shape to
+    ``()`` on that premise, and nothing reshapes the payload to compensate
+    any more. If a TQ revision started storing 1-D fields as ``(1,)`` rows
+    instead — fixing the same bug from the other side — the rewrite would
+    turn a correct schema into a wrong one, and the symptom would be
+    corrupt reads rather than an import error.
+
+    So ask TQ directly rather than trusting the pin.
+
+    Raises rather than skipping when the storage module is gone: the caller
+    reached here only after importing ``transfer_queue.metadata``, so "TQ isn't
+    installed" is no longer a live explanation — a missing module means the
+    layout moved, which is exactly what this guard exists to catch.
+    """
+    try:
+        from transfer_queue.storage.managers.base import KVStorageManager
+    except ImportError as e:
+        raise _tq_shape_drift_error(
+            "storage.managers.base is no longer importable",
+            "the dense-1-D storage layout the scalar schema patch assumes "
+            "cannot be verified, and a wrong assumption corrupts reads",
+            "probe",
+        ) from e
+
+    generate = getattr(KVStorageManager, "_generate_values", None)
+    if generate is None:
+        raise _tq_shape_drift_error(
+            "KVStorageManager no longer has _generate_values",
+            "the dense-1-D storage layout the scalar schema patch assumes "
+            "cannot be verified, and a wrong assumption corrupts reads",
+            "probe",
+        )
+
+    probe = TensorDict({"_nrl_probe": torch.zeros(2)}, batch_size=[2])
+    rows = generate(probe)
+    if len(rows) != 2 or any(getattr(r, "ndim", None) != 0 for r in rows):
+        shapes = [tuple(getattr(r, "shape", ())) for r in rows]
+        raise _tq_shape_drift_error(
+            "a dense 1-D field no longer stores as 0-d rows "
+            f"(probe yielded {len(rows)} rows with shapes {shapes})",
+            "rewriting the reported sample shape to () would now disagree "
+            "with the stored rows and corrupt scalar columns",
+            "patch (it may simply be unnecessary — check whether upstream "
+            "fixed extract_field_schema)",
+        )
+
+
+def _patch_scalar_field_schema() -> None:
+    """Report the true ``()`` sample shape for dense 1-D fields.
+
+    Upstream ``transfer_queue.metadata.extract_field_schema`` rebinds a
+    *local* for 1-D inputs::
+
+        if len(value.shape) == 1:
+            value = value.unsqueeze(-1)     # local only
+        first_item = value[0]               # -> shape (1,)
+
+    but the value that reaches storage is the original ``(N,)`` tensor,
+    which ``KVStorageManager._generate_values`` iterates into ``N`` **0-d**
+    rows. So the schema claims a per-sample shape of ``(1,)`` while the
+    stored rows are ``()``.
+
+    Only the KV path notices. ``BatchMeta.get_shapes`` repeats the uniform
+    ``shape`` per sample for non-nested fields, and ``KVStorageManager``
+    hands that list to the client, which reshapes raw bytes with it — so
+    a scalar column reconstructs as ``(1,)`` rows and
+    ``_merge_tensors_to_tensordict`` then re-nests it instead of taking
+    its ``all(dim() == 0) -> torch.stack`` branch. ``SimpleStorage``
+    fetches stored objects by ``(index, field)`` and never consults the
+    schema, which is why the symptom is ``mooncake_cpu``-only.
+
+    Byte counts are unaffected either way (``prod(()) == prod((1,)) == 1``);
+    this is a reshape/dtype-of-container bug, not a sizing one.
+
+    Applied on every backend so one partition's schema cannot disagree with
+    itself across processes. There is no payload-side fallback, so the
+    premise is verified against TQ itself before the patch is installed —
+    see :func:`_assert_tq_stores_scalar_rows_0d`.
+    """
+    try:
+        from transfer_queue import metadata as _md
+    except ImportError:
+        return
+    if getattr(_md, "_nrl_scalar_schema_patched", False):
+        return
+
+    orig = getattr(_md, "extract_field_schema", None)
+    if orig is None:
+        raise _tq_shape_drift_error(
+            "metadata module no longer exposes extract_field_schema",
+            "dense 1-D fields would keep reporting a (1,) sample shape and "
+            "reconstruct as nested (1,) rows on the KV path",
+            "function",
+        )
+
+    _assert_tq_stores_scalar_rows_0d()
+
+    # Bound to a fresh name after the ``None`` check: a type checker does not
+    # carry narrowing of ``orig`` into the closure below, since a closure can
+    # run after its captured names change.
+    upstream = orig
+
+    def extract_field_schema(data):  # type: ignore[no-untyped-def]
+        schema = upstream(data)
+        for name in data.keys():
+            value = data.get(name)
+            if (
+                isinstance(value, torch.Tensor)
+                and not value.is_nested
+                and value.dim() == 1
+                and str(name) in schema
+            ):
+                # ``_generate_values`` iterates this into 0-d rows; say so.
+                schema[str(name)]["shape"] = torch.Size([])
+        return schema
+
+    # Both storage managers bound the name at import time
+    # (``from transfer_queue.metadata import extract_field_schema``), so
+    # rebinding only the defining module would leave them on the original.
+    _md.extract_field_schema = extract_field_schema
+    for mod_path in (
+        "transfer_queue.storage.managers.base",
+        "transfer_queue.storage.managers.simple_storage_manager",
+    ):
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        if hasattr(mod, "extract_field_schema"):
+            mod.extract_field_schema = extract_field_schema
+    _md._nrl_scalar_schema_patched = True
+
+
 def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     """Reuse RDMA-registered host buffers for mooncake tensor GETs and PUTs.
 
@@ -571,98 +710,51 @@ def _assert_no_key_loss(src_dict: dict, new_td: TensorDict, fn: str) -> None:
         )
 
 
-def _promote_1d_leaves(td: TensorDict) -> TensorDict:
-    """Promote declared scalar leaves to ``(N, 1)`` for Mooncake.
-
-    The authoritative field list lives in
-    :data:`nemo_rl.data_plane.schema.PROMOTE_1D_FIELDS`. Declared fields must
-    arrive as dense ``(N,)`` tensors. Any other dense 1D tensor is rejected so
-    it cannot silently encounter TQ v0.1.9's schema/data mismatch.
-    ``NonTensorStack`` and ``NonTensorData`` leaves pass through.
-
-    Args:
-        td: TensorDict to validate and encode for the Mooncake wire format.
-
-    Returns:
-        TensorDict with declared scalar leaves promoted to ``(N, 1)``.
-
-    Raises:
-        ValueError: If a declared field is not a dense 1D tensor, or an
-            undeclared field is a dense 1D tensor.
-    """
-    # td.keys() (top-level) includes NonTensorData / NonTensorStack leaves.
-    # keys(include_nested=True, leaves_only=True) enumerates tensor leaves
-    # only — non-tensor leaves would silently fall out of the rebuilt dict.
-    new_dict: dict[str, Any] = {}
-    changed = False
-    for k in td.keys():
-        v = td.get(k)
-        field_name = str(k)
-        if field_name in PROMOTE_1D_FIELDS:
-            if not isinstance(v, torch.Tensor) or v.is_nested or v.dim() != 1:
-                shape = tuple(v.shape) if isinstance(v, torch.Tensor) else None
-                raise ValueError(
-                    f"Mooncake scalar field {field_name!r} must be a dense "
-                    f"1D tensor with shape (N,), got {type(v).__name__} "
-                    f"with shape {shape}."
-                )
-            new_dict[str(k)] = v.unsqueeze(-1).contiguous()
-            changed = True
-        elif isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
-            raise ValueError(
-                f"Mooncake field {field_name!r} is a dense 1D tensor but is "
-                "not declared in data_plane.schema.PROMOTE_1D_FIELDS. Add "
-                "the field to the schema if it is a per-sample scalar."
-            )
-        else:
-            new_dict[str(k)] = v
-    if not changed:
-        return td
-    new_td = TensorDict(new_dict, batch_size=td.batch_size)
-    _assert_no_key_loss(new_dict, new_td, "_promote_1d_leaves")
-    return new_td
-
-
 def _from_wire(td: TensorDict) -> TensorDict:
-    """Normalize TQ reads and invert :func:`_promote_1d_leaves` when needed.
+    """Densify uniform nested tensors coming back from TQ.
 
-    Both TQ v0.1.9 storage managers reconstruct every non-scalar field as a
-    nested tensor, including fields whose rows all have the same shape.
-    Densify those uniform nested tensors first so regular batched inputs retain
-    their dense representation. Truly ragged fields remain nested. Finally,
-    squeeze only singleton dimensions declared in
-    :data:`nemo_rl.data_plane.schema.PROMOTE_1D_FIELDS`.
+    Both storage managers reconstruct every non-scalar field as a nested
+    tensor, including fields whose rows all share a shape. Densify those so
+    regular batched inputs retain their dense representation; truly ragged
+    fields stay nested.
+
+    Per-sample scalar columns need no handling here: with
+    :func:`_patch_scalar_field_schema` applied they are stored and reported
+    as 0-d rows, which ``_merge_tensors_to_tensordict`` stacks into a dense
+    ``(N,)`` column before it ever reaches this function.
+
+    Packed multimodal fields are excluded: their rows are per-sample media,
+    not a padded sequence, and "all rows share a shape" is a data-dependent
+    accident (every sample happening to carry one image). Stacking them
+    discards the row boundaries that ``PackedTensor.from_wire`` needs, and
+    the dense value then fails the ``is_nested`` check in
+    ``codec.materialize`` and reaches ``get_multimodal_dict`` unreassembled.
+    ``codec.materialize`` applies the same exclusion.
     """
-    # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
-    # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
+    # NonTensorData / NonTensorStack leaves are only visible via td.keys(),
+    # not keys(leaves_only=True) — iterating the latter would silently drop
+    # them from the rebuilt dict.
+    # Deferred: ``multimodal_utils`` pulls PIL, requests and a few hundred
+    # transformers submodules, and this adapter is imported by every process
+    # that constructs a TQ client. ``codec.materialize`` defers the same import
+    # for the same reason.
+    from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+
     new_dict: dict[str, Any] = {}
     changed = False
     for k in td.keys():
         v = td.get(k)
         field_name = str(k)
-        if isinstance(v, torch.Tensor) and v.is_nested:
+        if (
+            isinstance(v, torch.Tensor)
+            and v.is_nested
+            and field_name not in PACKED_MULTIMODAL_FIELDS
+        ):
             rows = list(v.unbind())
             if rows and all(row.shape == rows[0].shape for row in rows[1:]):
                 v = torch.stack(rows)
                 changed = True
-        if field_name in PROMOTE_1D_FIELDS:
-            if not isinstance(v, torch.Tensor) or v.is_nested:
-                raise ValueError(
-                    f"Mooncake scalar field {field_name!r} could not be "
-                    "restored as a dense tensor."
-                )
-            if v.dim() == 1:
-                new_dict[field_name] = v
-            elif v.dim() == 2 and v.shape[-1] == 1:
-                new_dict[field_name] = v.squeeze(-1).contiguous()
-                changed = True
-            else:
-                raise ValueError(
-                    f"Mooncake scalar field {field_name!r} must decode as "
-                    f"(N,) or (N, 1), got shape {tuple(v.shape)}."
-                )
-        else:
-            new_dict[field_name] = v
+        new_dict[field_name] = v
     if not changed:
         return td
     new_td = TensorDict(new_dict, batch_size=td.batch_size)
@@ -720,12 +812,15 @@ class TQDataPlaneClient(DataPlaneClient):
             if mooncake_cfg.reuse_registered_buffers:
                 _patch_mooncake_staging_buffers(mooncake_cfg.staging_buffer_size)
 
-        # Workaround for TQ KVStorageManager's 1D-field schema/data
-        # mismatch (only `mooncake_cpu` goes through that path; `simple`
-        # is unaffected). Writer unsqueezes 1D → (N, 1) on put; reader
-        # squeezes the trailing 1 back on get. Drop when upstream TQ
-        # unifies the schema/data shapes for 1D fields.
-        self._promote_1d = cfg["backend"] == "mooncake_cpu"
+        self._backend = cfg["backend"]
+        self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
+        # Fix TQ's 1-D field schema at the source rather than reshaping the
+        # payload around it: the schema now reports the ``()`` sample shape
+        # the stored rows actually have. Applied on every backend and in
+        # every process that builds a client, before ``_init_tq`` /
+        # ``_connect_existing``, so no put can land under the old schema.
+        # Self-verifying — see :func:`_assert_tq_stores_scalar_rows_0d`.
+        _patch_scalar_field_schema()
 
         if bootstrap:
             _init_tq(cfg)
@@ -733,10 +828,35 @@ class TQDataPlaneClient(DataPlaneClient):
             _connect_existing()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
+        # TQ restore is non-transactional and requires a globally clean system.
+        # This process-local guard catches incorrect ordering through this
+        # adapter; setup must still ensure no other client has touched TQ.
+        self._data_operations_started = False
         # Fields whose schema this process has already warmed, per partition.
-        # See register_partition: the controller's field map is append-only,
-        # so a field only ever needs warming once.
+        # The controller's field map is append-only, so each field only needs
+        # warming once for the lifetime of this client.
         self._warmed_fields: dict[str, set[str]] = {}
+
+    def _require_checkpointing_support(self) -> None:
+        """Reject backends that cannot round-trip all data-plane state."""
+        if not self._supports_checkpointing:
+            raise NotImplementedError(
+                "TQ checkpointing is not supported for "
+                f"data_plane.backend={self._backend!r}: the backend cannot "
+                "persist and restore all storage rows."
+            )
+
+    def _mark_data_operation_started(self) -> None:
+        """Make a later checkpoint load fail instead of mixing TQ states."""
+        self._data_operations_started = True
+
+    def _require_clean_for_load(self) -> None:
+        """Reject restore after this client has performed a data operation."""
+        if self._data_operations_started:
+            raise RuntimeError(
+                "load_checkpoint requires a clean TQ client before any "
+                "register, claim, get, list, put, clear, or consumption operation"
+            )
 
     # ── (A) task-mediated ───────────────────────────────────────────────
 
@@ -774,6 +894,7 @@ class TQDataPlaneClient(DataPlaneClient):
         # (``0@field`` at the Mooncake storage layer). Mooncake does not
         # support upsert, so repeated schema warmups can collide with
         # stale metadata from a previous registration.
+        self._mark_data_operation_started()
         schema_key = (
             f"__schema__:{partition_id}:{os.getpid()}:{id(self)}:{time.time_ns()}"
         )
@@ -803,6 +924,7 @@ class TQDataPlaneClient(DataPlaneClient):
         blocking: bool = True,
         timeout_s: float = 60.0,
     ) -> KVBatchMeta:
+        self._mark_data_operation_started()
         client = tq.get_client()
         deadline = time.time() + max(0.0, timeout_s)
         sampling_config: dict[str, Any] = {}
@@ -874,6 +996,7 @@ class TQDataPlaneClient(DataPlaneClient):
     def check_consumption_status(
         self, partition_id: str, task_names: list[str]
     ) -> bool:
+        self._mark_data_operation_started()
         client = tq.get_client()
         for t in task_names:
             if not client.check_consumption_status(
@@ -910,11 +1033,10 @@ class TQDataPlaneClient(DataPlaneClient):
                 TensorDict,
                 fields.detach(),  # type: ignore[missing-argument]
             )
-            if self._promote_1d:
-                detached_fields = _promote_1d_leaves(detached_fields)
             wire_fields = detached_fields
             field_names = [str(key) for key in detached_fields.keys()]
 
+        self._mark_data_operation_started()
         # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_batch_put(
             keys=list(sample_ids),
@@ -939,6 +1061,7 @@ class TQDataPlaneClient(DataPlaneClient):
     ) -> TensorDict:
         if not sample_ids:
             return TensorDict({}, batch_size=(0,))
+        self._mark_data_operation_started()
         td = tq.kv_batch_get(
             keys=list(sample_ids),
             partition_id=partition_id,
@@ -946,9 +1069,16 @@ class TQDataPlaneClient(DataPlaneClient):
         )
         return _from_wire(td)
 
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        """List TQ keys in ``partition_id`` without fetching tensor payloads."""
+        self._mark_data_operation_started()
+        listing = tq.kv_list(partition_id=partition_id)
+        return sorted(listing.get(partition_id, {}).keys())
+
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         cleared_via_none = sample_ids is None
         if sample_ids is None:
+            self._mark_data_operation_started()
             # No local state — ask TQ's controller for the current key
             # set in this partition. ``kv_list`` errors propagate; we
             # don't want a network blip to silently turn into "cleared
@@ -968,10 +1098,46 @@ class TQDataPlaneClient(DataPlaneClient):
                     stacklevel=2,
                 )
             return
+        self._mark_data_operation_started()
         # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Save TQ controller metadata and storage data."""
+        self._require_checkpointing_support()
+        _connect_existing()
+        tq.save_checkpoint(checkpoint_dir, metadata=metadata)
+
+    def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Restore TQ state after initialization and before data operations.
+
+        The local lifecycle guard cannot observe operations issued by another
+        TQ client, so the recovery coordinator must also guarantee globally
+        clean setup ordering.
+        """
+        self._require_checkpointing_support()
+        self._require_clean_for_load()
+        # Validate the adapter-owned metadata before starting TQ's
+        # non-transactional storage/controller restore.
+        metadata_path = Path(checkpoint_dir) / "metadata.json"
+        with metadata_path.open() as metadata_file:
+            checkpoint_metadata = json.load(metadata_file)
+        user_metadata = checkpoint_metadata.get("user_metadata", {})
+        if not isinstance(user_metadata, dict):
+            raise ValueError("TQ checkpoint user_metadata must be a dictionary")
+        _connect_existing()
+        # A failed TQ load may have partially modified distributed storage, so
+        # this client is no longer safe for a retry even when an error escapes.
+        self._mark_data_operation_started()
+        tq.load_checkpoint(checkpoint_dir)
+        return dict(user_metadata)
 
     def close(self) -> None:
         if self._closed:

@@ -32,6 +32,7 @@ reward models), so those parallelism modes are not exercised here.
 import os
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -165,6 +166,29 @@ def _create_value_test_config(
             "kwargs": {"factor": 1.0, "total_iters": 1_000_000},
         },
     }
+
+
+def test_value_worker_init_rejects_cp_scoring_before_setup(monkeypatch):
+    from nemo_rl.models.value.workers import dtensor_value_worker_v2
+
+    config = _create_value_test_config(model_name="unused", cp=2)
+    apply_transformer_engine_patch = MagicMock()
+    monkeypatch.setattr(
+        dtensor_value_worker_v2,
+        "apply_transformer_engine_patch",
+        apply_transformer_engine_patch,
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"get_values\(\) scoring path does not support context parallelism",
+    ):
+        dtensor_value_worker_v2.DTensorValueWorkerV2Impl(
+            config=config,
+            tokenizer=MagicMock(),
+        )
+
+    apply_transformer_engine_patch.assert_not_called()
 
 
 def _make_checkpointing_cfg(checkpoint_dir) -> dict:
