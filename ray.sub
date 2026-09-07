@@ -567,6 +567,31 @@ else
   echo "WARNING: Could not generate NUMA affinity map (nvidia-smi topo unavailable)"
 fi
 
+# Diagnose NCCL HCA selection before Ray starts so every daemon and actor sees
+# the same effective environment. The default auto mode only repairs when the
+# cluster provides an authoritative device list; otherwise it warns or skips.
+NCCL_TOPOLOGY_DIR="$LOG_DIR/nccl-topology"
+mkdir -p "\$NCCL_TOPOLOGY_DIR"
+NCCL_TOPOLOGY_NODE_RANK="\${TOPO_RANK:-unknown}"
+NCCL_TOPOLOGY_NODE_ID=\$(printf '%s' "\${SLURMD_NODENAME:-\$(hostname)}" | tr -c 'A-Za-z0-9_.-' '_')
+if [[ -z "\$NCCL_TOPOLOGY_NODE_ID" ]]; then
+  NCCL_TOPOLOGY_NODE_ID="\$NCCL_TOPOLOGY_NODE_RANK"
+fi
+NCCL_TOPOLOGY_REPORT="\$NCCL_TOPOLOGY_DIR/node-\$NCCL_TOPOLOGY_NODE_ID.json"
+NCCL_TOPOLOGY_ENV_FILE="\$NCCL_TOPOLOGY_DIR/node-\$NCCL_TOPOLOGY_NODE_ID.env"
+if ! python -m nemo_rl.utils.nccl_topology \
+  --node-rank "\$NCCL_TOPOLOGY_NODE_RANK" \
+  --report "\$NCCL_TOPOLOGY_REPORT" \
+  --env-file "\$NCCL_TOPOLOGY_ENV_FILE"; then
+  echo "[ERROR] NCCL topology validation failed; see \$NCCL_TOPOLOGY_REPORT" >&2
+  touch "$LOG_DIR/ENDED" 2>/dev/null || true
+  exit 1
+fi
+if [[ -s "\$NCCL_TOPOLOGY_ENV_FILE" ]]; then
+  source "\$NCCL_TOPOLOGY_ENV_FILE"
+  echo "[INFO] Applied validated NCCL HCA repair on topology rank \$NCCL_TOPOLOGY_NODE_RANK"
+fi
+
 # Use \\\" so that when --resources="\$RAY_RESOURCES" expands, we pass valid JSON to ray
 # IMPORTANT: The key names "nvlink_domain_" and "topo_rank" below must stay in sync
 # with the constants NVLINK_DOMAIN_PREFIX and TOPO_RANK_KEY defined in
