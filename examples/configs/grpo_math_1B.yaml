@@ -415,6 +415,7 @@ policy:
       enable_prefix_caching: false  # Reuse KV blocks across requests sharing a prompt prefix.
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload", "recompute".
+      async_sched_mode: "async"  # Dynamic-batching scheduler mode. Options: "legacy", "async". "async" hides scheduler CPU time behind GPU compute.
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
       logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
