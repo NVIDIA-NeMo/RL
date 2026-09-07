@@ -20,7 +20,6 @@ policy:
     _v2: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-    context_parallel_size: 1
     expert_parallel_size: 8
     # Recompute activations to fit 30B-A3B on 1n8g: avoids the full-vocab
     # log_softmax OOM in DPO loss-input prep (~step 8) on 80 GiB GPUs.
@@ -43,10 +42,10 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.v2
+    name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
   tensorboard:
-    log_dir: tb_logs-dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.v2
+    log_dir: tb_logs-dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
   mlflow:
-    run_name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.v2
+    run_name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
 cluster:
   gpus_per_node: 8
