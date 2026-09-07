@@ -644,30 +644,6 @@ class TestCollectiveWeightSynchronizer:
         assert call_kwargs.kwargs["kv_scales"] == kv_scales
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
-    def test_sync_weights_forwards_fixed_buffer_size(self, mock_ray):
-        mock_ray.get.return_value = [True]
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = CollectiveWeightSynchronizer(
-            policy,
-            gen,
-            _mock_cluster(),
-            _mock_cluster(),
-            refit_buffer_size_gb=1.5,
-        )
-
-        sync.sync_weights()
-
-        expected_bytes = int(1.5 * 1024**3)
-        policy.broadcast_weights_for_collective.assert_called_once_with(
-            kv_scales=None,
-            buffer_size_bytes=expected_bytes,
-        )
-        gen.update_weights_from_collective.assert_called_once_with(
-            buffer_size_bytes=expected_bytes
-        )
-
-    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_sync_weights_raises_on_failure(self, mock_ray):
         mock_ray.get.side_effect = [
             None,  # futures_train
@@ -1014,10 +990,8 @@ class TestFactory:
             colocated=False,
             train_cluster=_mock_cluster(),
             inference_cluster=_mock_cluster(),
-            refit_buffer_size_gb=1.5,
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
-        assert sync._buffer_size_bytes == int(1.5 * 1024**3)
 
     def test_non_colocated_dynamo_returns_collective(self):
         sync = create_weight_synchronizer(
