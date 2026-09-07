@@ -318,6 +318,7 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_weights_from_refit: bool = True
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    hf_to_local_param_map: HFToLocalParamMap
     _nrl_layerwise_reload_active: bool = False
     # Initialization detaches parameters, so any later failure leaves this
     # worker unsafe to reuse. Keep the original failure for the worker lifetime.
@@ -546,10 +547,7 @@ class VllmInternalWorkerExtension:
             )
 
         refit_info = getattr(self, "nccl_reshard_refit_info", None)
-        if (
-            refit_info is not None
-            and self._uses_unquantized_flashinfer_trtllm()
-        ):
+        if refit_info is not None and self._uses_unquantized_flashinfer_trtllm():
             # TRTLLM expert destinations depend on this worker's rank in each
             # per-PP-stage group, so they cannot be mapped during prepare.
             self.hf_to_local_param_map = self.build_hf_to_local_param_map(refit_info)
@@ -1317,10 +1315,7 @@ class VllmInternalWorkerExtension:
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
-        if (
-            self._uses_unquantized_flashinfer_trtllm()
-            and not self.pp_comm_groups
-        ):
+        if self._uses_unquantized_flashinfer_trtllm() and not self.pp_comm_groups:
             # The TRTLLM expert map needs the per-PP-stage communicator ranks,
             # which init_nccl_reshard_comm_group establishes after prepare.
             self.hf_to_local_param_map = HFToLocalParamMap()

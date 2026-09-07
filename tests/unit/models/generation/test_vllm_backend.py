@@ -555,9 +555,7 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(monkeypatch):
         ("model.weight_scale", torch.ones(1)),
     ]
 
-    def get_quantized_weight_iterator(
-        weights, model_runner, *, refit_with_reload_api
-    ):
+    def get_quantized_weight_iterator(weights, model_runner, *, refit_with_reload_api):
         assert weights is source_weights
         assert model_runner is ext.model_runner
         assert refit_with_reload_api is False
