@@ -37,7 +37,7 @@ by wall time is normalized by a tiny spread and its advantages explode.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -84,7 +84,7 @@ class TimeEfficiencyConfig(BaseModel, extra="allow"):
     enabled: bool = False
     lambda_time: float = 1.0 / 60.0
     apply_to: Literal["all", "correct"] = "all"
-    lambda_call_bonus: float = Field(default=0.0, ge=0.0)
+    lambda_call_bonus: Annotated[float, Field(ge=0.0)] = 0.0
     call_bonus_ref: float | None = None
     floor: float | None = None
 
