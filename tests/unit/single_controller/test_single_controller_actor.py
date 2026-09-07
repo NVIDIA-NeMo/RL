@@ -1101,13 +1101,14 @@ def test_gdpo_advantage_stage_reconstructs_named_reward_columns() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._gdpo_enabled = True
-    ctrl._algo_cfg = SimpleNamespace(
+    ctrl._algo_cfg = GRPOConfig(
         seq_logprob_error_threshold=None,
         overlong_filtering=False,
     )
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
     }
