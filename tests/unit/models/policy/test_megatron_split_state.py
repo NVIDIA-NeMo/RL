@@ -157,24 +157,22 @@ def _make_worker(loss_type):
     w.dtype = torch.float32
     w._is_reward_model = False
     w._router_replay_enabled = False
+    w.media_placeholder_token_id = None
+    # Model-capability flags __init__ derives from self.model, which
+    # object.__new__ skips. train_microbatch passes all three straight through
+    # to get_microbatch_iterator, so the plain-model defaults (NeMo-RL owns
+    # packing and CP sharding) have to be spelled out here.
     w.delegate_pack_to_model = False
     w.delegate_mtp_loss_mask_to_model = False
     w.model_slices_context_parallel_inputs = False
+    w._first_train_step_forward_pre_hook_disabled = False
+    w._first_train_step_param_sync_func = None
     # Normally set from get_rank_safe() in __init__, which object.__new__ skips.
     # The step summary in finish_train_step reads it eagerly to decide whether
     # this rank prints.
     w.rank = 0
     # Also set in __init__: the finish path reads them to put the DDP forward
     # pre-hook back after the first optimizer step.
-    w._first_train_step_forward_pre_hook_disabled = False
-    w._first_train_step_param_sync_func = None
-    # Also set in __init__, from the loaded model. train_microbatch reads both
-    # to reject a multimodal model, so they must exist before the first call.
-    # These values are the text-only case, which is what this mock fabric is.
-    w.media_placeholder_token_id = None
-    w.model_slices_context_parallel_inputs = False
-    # Pure telemetry, and it resets the CUDA peak counters — keep it out of the
-    # way so these tests stay hermetic on GPU shards.
     w._log_gpu_mem = MagicMock()
 
     # Stash a loss_fn with the requested loss_type for tests that need one.
@@ -585,6 +583,43 @@ class TestFinish:
         w.model.scale_gradients.assert_called_once()
         arg = w.model.scale_gradients.call_args.args[0]
         assert 0 < arg <= 1.0
+
+    def test_restores_first_step_param_sync_after_success(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        saved_param_sync = MagicMock(name="saved_param_sync")
+        w._first_train_step_forward_pre_hook_disabled = True
+        w._first_train_step_param_sync_func = saved_param_sync
+        w.model.config.param_sync_func = None
+        w.enable_forward_pre_hook = MagicMock()
+
+        w.finish_train_step()
+
+        w.enable_forward_pre_hook.assert_called_once_with()
+        assert w.model.config.param_sync_func is saved_param_sync
+        assert w._first_train_step_param_sync_func is None
+        assert w._first_train_step_forward_pre_hook_disabled is False
+
+    def test_keeps_first_step_param_sync_disabled_after_failed_update(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        saved_param_sync = MagicMock(name="saved_param_sync")
+        w._first_train_step_forward_pre_hook_disabled = True
+        w._first_train_step_param_sync_func = saved_param_sync
+        w.model.config.param_sync_func = None
+        w.enable_forward_pre_hook = MagicMock()
+        w.optimizer.step.return_value = (False, 0.5, 0)
+
+        w.finish_train_step()
+
+        w.enable_forward_pre_hook.assert_not_called()
+        assert w.model.config.param_sync_func is None
+        assert w._first_train_step_param_sync_func is saved_param_sync
+        assert w._first_train_step_forward_pre_hook_disabled is True
 
     @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
     def test_grad_sync_call_order_after_rescale(

@@ -858,10 +858,22 @@ class AsyncNemoGymRolloutImpl:
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
 
+        resolved_agent_ref = rollout_inputs[0].get("agent_ref")
+        if not isinstance(resolved_agent_ref, dict):
+            raise ValueError("NeMo-Gym did not return a resolved agent_ref")
+        if any(
+            row.get("agent_ref") != resolved_agent_ref for row in rollout_inputs[1:]
+        ):
+            raise ValueError(
+                "NeMo-Gym resolved one prompt group to inconsistent agent_ref values"
+            )
+        record_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
+        record_extra_env_info["agent_ref"] = copy.deepcopy(resolved_agent_ref)
+
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
             prompt=prompt_message_log,
-            extra_env_info=input_sample["extra_env_info"],
+            extra_env_info=record_extra_env_info,
             metadata={"task_name": "nemo_gym"},
             completions=completions,
             rollout_metrics=rollout_metrics,
@@ -954,13 +966,14 @@ class AsyncNemoGymRolloutImpl:
             The environment's timing metrics, or None if the stream ended without them.
         """
         dispatched = {row["_rowidx"] for row in pending}
+        pending_by_rowidx = {row["_rowidx"]: row for row in pending}
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
         async for result_ref in nemo_gym_env.run_rollouts.options(
             num_returns="streaming"
         ).remote(pending, timer_prefix):
-            rowidx, result, timing_metrics = await result_ref
+            rowidx, resolved_agent_ref, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.
             if not isinstance(rowidx, int) or not 0 <= rowidx < total_rows:
@@ -976,6 +989,7 @@ class AsyncNemoGymRolloutImpl:
             if rowidx in received:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
+            pending_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
             results[rowidx] = result
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics

@@ -1600,7 +1600,8 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
 
         assert postprocess_calls == [(nemo_gym_row, nemo_gym_result, tokenizer, True)]
         assert streamed_results[0][0] == 7
-        assert streamed_results[0][1] == {"message_log": []}
+        assert streamed_results[0][1] == nemo_gym_row["agent_ref"]
+        assert streamed_results[0][2] == {"message_log": []}
 
     asyncio.run(_run())
 
@@ -1697,8 +1698,9 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
         ):
             streamed.append(item)
 
-        row_index, result, _metrics = streamed[0]
+        row_index, agent_ref, result, _metrics = streamed[0]
         assert row_index == 3
+        assert agent_ref == row["agent_ref"]
         assert [message["role"] for message in result["message_log"]] == [
             "user",
             "assistant",
@@ -1804,7 +1806,7 @@ def test_nemo_gym_sanity(
     for result_ref in nemo_gym.run_rollouts.options(num_returns="streaming").remote(
         nemo_gym_sanity_test_data["input"], ""
     ):
-        rowidx, result, _ = ray.get(result_ref)
+        rowidx, _agent_ref, result, _ = ray.get(result_ref)
         actual_result[rowidx] = result
     expected_result = nemo_gym_sanity_test_data["expected_output"]
 
@@ -1835,8 +1837,13 @@ def test_nemo_gym_sanity(
                 message["prompt_str"] = "dummy prompt_str"
             if "generation_str" in message:
                 message["generation_str"] = "dummy generation_str"
-            message.setdefault("is_invalid_tool_call", False)
-            message.setdefault("has_malformed_thinking", False)
+            for generation_flag in (
+                "is_invalid_tool_call",
+                "has_malformed_thinking",
+            ):
+                if generation_flag in message:
+                    assert isinstance(message[generation_flag], bool)
+                    message.pop(generation_flag)
 
         return d
 
