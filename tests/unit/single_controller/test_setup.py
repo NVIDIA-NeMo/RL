@@ -1235,9 +1235,7 @@ class TestSetup:
                 return_value=fake_actors,
             ) as mock_create_finalizer_actors,
         ):
-            actor_args, _ = setup_single_controller(
-                mc, tokenizer, processor=processor
-            )
+            actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
 
         (actor_dp_config, actor_config), actor_kwargs = (
             mock_create_finalizer_actors.call_args
@@ -1251,9 +1249,7 @@ class TestSetup:
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
         partition_calls = actor_args.dp_client.register_partition.call_args_list
         assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
-        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(
-            partition_calls[1].kwargs["fields"]
-        )
+        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(partition_calls[1].kwargs["fields"])
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""

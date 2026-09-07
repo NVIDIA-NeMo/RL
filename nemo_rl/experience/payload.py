@@ -163,9 +163,7 @@ def record_to_train_batch(
     )
     mask_sample = _mask_sample_flags(c.env_extras for c in completions)
     truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
-    sample_mask = torch.full(
-        (n,), float(record.loss_multiplier), dtype=torch.float32
-    )
+    sample_mask = torch.full((n,), float(record.loss_multiplier), dtype=torch.float32)
 
     train_data: dict[str, Any] = {
         "input_ids": flat["token_ids"],

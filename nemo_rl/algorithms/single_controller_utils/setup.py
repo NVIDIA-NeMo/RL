@@ -1476,8 +1476,7 @@ def setup_single_controller(
         num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
         partition_fields = fields_with_optional_routed_experts(
             DP_TRAIN_FIELDS,
-            enabled=r3_enabled
-            and not token_capture_cfg.defer_routed_experts_to_policy,
+            enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
         if processor is not None:
             partition_fields.extend(
