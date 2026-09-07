@@ -1,0 +1,132 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  batch_multiplier: 4
+  max_num_epochs: 100
+  max_num_steps: 1000
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  adv_estimator:
+    normalize_rewards: false
+    use_leave_one_out_baseline: false
+  max_val_samples: 960
+  val_batch_size: 960
+  use_dynamic_sampling: true
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 1024
+    max_response_length: 2048
+loss_fn:
+  token_level_loss: false
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128
+  keep_top_k: 1
+  save_period: 2
+  checkpoint_must_save_by: 00:03:45:00
+  model_save_format: null
+policy:
+  model_name: deepseek-ai/DeepSeek-V4-Flash-0731
+  refit_buffer_size_gb: 1
+  tokenizer:
+    chat_template: deepseek_v4
+    chat_template_kwargs:
+      enable_thinking: false
+  dequantize_base_checkpoint: true
+  hf_config_overrides:
+    num_nextn_predict_layers: 0
+    expert_dtype: fp8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 3072
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: true
+  make_sequence_length_divisible_by: 64
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.01
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+  dtensor_cfg:
+    env_vars:
+      NRL_OFFLOAD_OPTIMIZER_FOR_TRAIN: '0'
+      NRL_OPTIMIZER_OFFLOAD_DEBUG: '0'
+    context_parallel_size: 8
+    expert_parallel_size: 128
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+      reshard_after_forward: false
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: tilelang
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: deepep
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    max_new_tokens: 2048
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8_ds_mla
+      env_vars:
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: '0'
+        VLLM_USE_DEEP_GEMM_E8M0: '1'
+      use_deep_gemm: true
+      pow2_weight_scaling_factors: true
+      tensor_parallel_size: 8
+      enable_expert_parallel: true
+      enforce_eager: true
+    vllm_kwargs:
+      tokenizer_mode: deepseek_v4
+data:
+  max_input_seq_length: 1024
+  filter_overlong_prompts: true
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  num_val_samples_to_print: 2
+  num_train_samples_to_print: 2
+  wandb:
+    project: nemo-rl
+    name: grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16

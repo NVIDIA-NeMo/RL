@@ -14,7 +14,7 @@
 
 import math
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -33,6 +33,7 @@ from nemo_rl.algorithms.utils import (
     print_performance_metrics,
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.deepseek_v4_tokenizer import get_deepseek_v4_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -183,6 +184,60 @@ def test_get_processor_forwards_tokenizer_kwargs():
         "model_max_length": 123,
         "use_fast": False,
     }
+
+
+@patch("nemo_rl.algorithms.utils.AutoTokenizer")
+@patch("nemo_rl.algorithms.utils.get_deepseek_v4_tokenizer")
+def test_get_tokenizer_uses_vllm_deepseek_v4_renderer(
+    mock_get_deepseek_v4_tokenizer, mock_auto_tokenizer, capsys
+):
+    base_tokenizer = MagicMock()
+    base_tokenizer.pad_token = "<pad>"
+    tokenizer = MagicMock()
+    mock_auto_tokenizer.from_pretrained.return_value = base_tokenizer
+    mock_get_deepseek_v4_tokenizer.return_value = tokenizer
+
+    result = get_tokenizer(
+        {
+            "name": "deepseek-ai/DeepSeek-V4-Flash-Base",
+            "chat_template": "deepseek_v4",
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
+    )
+
+    assert result is tokenizer
+    mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+        "deepseek-ai/DeepSeek-V4-Flash-Base", trust_remote_code=True
+    )
+    mock_get_deepseek_v4_tokenizer.assert_called_once_with(
+        base_tokenizer, {"enable_thinking": True}
+    )
+    assert "Using vLLM 0.25.1's DeepSeek V4 chat renderer" in capsys.readouterr().out
+
+
+class DummyDeepSeekV4Tokenizer:
+    vocab_size = 10
+
+    def get_added_vocab(self):
+        return {}
+
+    def encode(self, text, add_special_tokens=False, **kwargs):
+        assert add_special_tokens is False
+        return [ord(character) % 256 for character in text]
+
+
+def test_deepseek_v4_renderer_matches_single_turn_chat_format():
+    tokenizer = get_deepseek_v4_tokenizer(DummyDeepSeekV4Tokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Solve 1+1."}],
+        tokenize=False,
+        enable_thinking=False,
+    )
+
+    assert (
+        prompt == "<｜begin▁of▁sentence｜><｜User｜>Solve 1+1.<｜Assistant｜></think>"
+    )
 
 
 def test_maybe_pad_last_batch():

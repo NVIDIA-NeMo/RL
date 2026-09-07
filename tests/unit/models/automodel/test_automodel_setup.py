@@ -1928,6 +1928,36 @@ class TestGetTokenizer:
         assert mock_tokenizer.pad_token == "<eos>"
 
     @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    @patch("nemo_rl.models.automodel.setup.get_deepseek_v4_tokenizer")
+    def test_uses_vllm_deepseek_v4_renderer(
+        self, mock_get_deepseek_v4_tokenizer, mock_nemo_auto_tokenizer, capsys
+    ):
+        base_tokenizer = MagicMock()
+        base_tokenizer.pad_token = "<pad>"
+        tokenizer = MagicMock()
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = base_tokenizer
+        mock_get_deepseek_v4_tokenizer.return_value = tokenizer
+
+        result = get_tokenizer(
+            {
+                "name": "deepseek-ai/DeepSeek-V4-Flash-Base",
+                "chat_template": "deepseek_v4",
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+        )
+
+        assert result is tokenizer
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "deepseek-ai/DeepSeek-V4-Flash-Base", trust_remote_code=True
+        )
+        mock_get_deepseek_v4_tokenizer.assert_called_once_with(
+            base_tokenizer, {"enable_thinking": True}
+        )
+        assert (
+            "Using vLLM 0.25.1's DeepSeek V4 chat renderer" in capsys.readouterr().out
+        )
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
     def test_does_not_override_existing_pad_token(self, mock_nemo_auto_tokenizer):
         """Test that existing pad_token is not overridden."""
         mock_tokenizer = MagicMock()

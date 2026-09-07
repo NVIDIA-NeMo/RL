@@ -47,6 +47,42 @@ def _make_collective_update_extension(backend):
     return ext, state_info
 
 
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected"),
+    [("fp8", True), ("fp8_e4m3", True), ("fp8_ds_mla", False), ("auto", False)],
+)
+def test_uses_fp8_kv_cache_excludes_deepseek_mla(cache_dtype, expected):
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            cache_config=SimpleNamespace(cache_dtype=cache_dtype)
+        )
+    )
+
+    assert ext._uses_fp8_kv_cache() is expected
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected"),
+    [("fp8", True), ("fp8_e4m3", True), ("fp8_ds_mla", False), ("auto", False)],
+)
+def test_generation_kv_scale_sync_excludes_deepseek_mla(cache_dtype, expected):
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"kv_cache_dtype": cache_dtype}}
+    generation.weight_synchronizer = None
+    generation.worker_group = SimpleNamespace(shutdown=lambda **_kwargs: True)
+
+    assert generation.requires_kv_scale_sync is expected
+
+
 def _write_sharded_checkpoint(model_dir, shards):
     """Write safetensors shards plus a model.safetensors.index.json.
 
@@ -487,6 +523,31 @@ def test_layerwise_reload_propagates_detach_error_after_successful_load(monkeypa
 
     assert exc_info.value is detach_error
     model.load_weights.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_fp8_layerwise_load_detaches_deferred_transport_weights(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    model = SimpleNamespace(modules=lambda: [])
+    vllm_config = object()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext._nrl_layerwise_reload_active = True
+    detach = MagicMock()
+    load = MagicMock()
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda config: config is vllm_config)
+    monkeypatch.setattr(fp8, "load_weights", load)
+    monkeypatch.setattr(vllm_backend, "_detach_pending_layerwise_weights", detach)
+    weights = [("model.weight", torch.ones(1))]
+
+    ext._load_hf_weights(weights)
+
+    load.assert_called_once_with(weights, ext.model_runner)
+    detach.assert_called_once_with(model, {weights[0][1].untyped_storage().data_ptr()})
 
 
 @pytest.mark.vllm
@@ -942,6 +1003,89 @@ def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(monkeypatch):
     )
 
     assert result == [("vision_tower.vision_model.patch_embed.w", "w")]
+
+
+@pytest.mark.vllm
+def test_weight_update_lifecycle_uses_native_reload_for_dsv4(monkeypatch):
+    from vllm.model_executor.model_loader import reload as layerwise_reload
+    from vllm.model_executor.model_loader.reload import meta
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8, fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(model_type="deepseek_v4")
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    call_order = []
+
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config",
+        lambda _config: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        layerwise_reload,
+        "initialize_layerwise_reload",
+        lambda loaded_model: call_order.append(("initialize", loaded_model)),
+    )
+    monkeypatch.setattr(
+        layerwise_reload,
+        "finalize_layerwise_reload",
+        lambda loaded_model, config: call_order.append(
+            ("finalize", loaded_model, config)
+        ),
+    )
+    monkeypatch.setattr(meta, "SKIP_TENSORS", set())
+
+    def prepare_refit(loaded_model):
+        call_order.append(("prepare_experts", loaded_model))
+        meta.SKIP_TENSORS.add("attn_sink")
+        return {"attn_sink"}
+
+    def restore_refit(added):
+        call_order.append(("restore_experts", added))
+        meta.SKIP_TENSORS.difference_update(added)
+
+    monkeypatch.setattr(deepseek_v4_fp8, "prepare_refit", prepare_refit)
+    monkeypatch.setattr(deepseek_v4_fp8, "restore_refit", restore_refit)
+    monkeypatch.setattr(
+        deepseek_v4_fp8,
+        "finalize_refit",
+        lambda loaded_model: call_order.append(("finalize_experts", loaded_model)),
+    )
+    ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append(
+        ("mtp", None)
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda loaded_model: call_order.append(("hpc", loaded_model)),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: call_order.append(("sync", None))
+    )
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        call_order.append(("stream", None))
+        finalize()
+
+    assert meta.SKIP_TENSORS == set()
+    assert call_order == [
+        ("prepare_experts", model),
+        ("initialize", model),
+        ("stream", None),
+        ("finalize", model, ext.model_config),
+        ("finalize_experts", model),
+        ("hpc", model),
+        ("mtp", None),
+        ("sync", None),
+        ("restore_experts", {"attn_sink"}),
+    ]
 
 
 @pytest.mark.vllm

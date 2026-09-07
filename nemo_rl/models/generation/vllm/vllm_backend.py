@@ -27,6 +27,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -274,8 +275,19 @@ class VllmInternalWorkerExtension:
         self, policy_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
         """Load HF weights and detach any deferred reload tensors from transport storage."""
+        self._load_with_layerwise_detach(
+            policy_weights,
+            lambda weights: self.model_runner.model.load_weights(weights=weights),
+        )
+
+    def _load_with_layerwise_detach(
+        self,
+        policy_weights: list[tuple[str, torch.Tensor]],
+        load_weights: Callable[[list[tuple[str, torch.Tensor]]], None],
+    ) -> None:
+        """Run a loader while protecting deferred weights from buffer reuse."""
         if not getattr(self, "_nrl_layerwise_reload_active", False):
-            self.model_runner.model.load_weights(weights=policy_weights)
+            load_weights(policy_weights)
             return
 
         source_storage_ptrs = {
@@ -283,7 +295,7 @@ class VllmInternalWorkerExtension:
         }
         load_error: Exception | None = None
         try:
-            self.model_runner.model.load_weights(weights=policy_weights)
+            load_weights(policy_weights)
         except Exception as error:
             load_error = error
             raise
@@ -308,7 +320,10 @@ class VllmInternalWorkerExtension:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.load_weights(policy_weights, self.model_runner)
+            self._load_with_layerwise_detach(
+                policy_weights,
+                lambda weights: fp8.load_weights(weights, self.model_runner),
+            )
             return
         self._load_full_hf_weights(policy_weights)
 
@@ -525,11 +540,14 @@ class VllmInternalWorkerExtension:
         return sorted(applier.discover_native_skips(state_dict_info))
 
     def _uses_fp8_kv_cache(self) -> bool:
-        """Return whether this worker owns an FP8 KV cache."""
+        """Return whether this worker owns separately refittable FP8 KV scales."""
         vllm_config = getattr(self.model_runner, "vllm_config", None)
         cache_config = getattr(vllm_config, "cache_config", None)
         kv_cache_dtype = getattr(cache_config, "cache_dtype", None)
-        return kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+        if kv_cache_dtype is None:
+            return False
+        kv_cache_dtype = str(kv_cache_dtype).lower()
+        return kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -840,7 +858,19 @@ class VllmInternalWorkerExtension:
         """Return whether this transport needs vLLM's layerwise lifecycle."""
         return transport in ("ipc", "collective") and (
             self._uses_unquantized_flashinfer_trtllm()
+            or self._uses_deepseek_v4_fp8_refit()
         )
+
+    def _uses_deepseek_v4_fp8_refit(self) -> bool:
+        """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
+        model = self.model_runner.model
+        config = getattr(model, "config", None)
+        if getattr(config, "model_type", None) != "deepseek_v4":
+            return False
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        return fp8.is_fp8_model(self.model_runner.vllm_config)
 
     def _validate_native_layerwise_refit(self) -> None:
         """Reject unsupported features on the native layerwise reload path."""
@@ -878,6 +908,7 @@ class VllmInternalWorkerExtension:
         """
         if self._uses_native_layerwise_refit(transport):
             self._validate_native_layerwise_refit()
+            use_deepseek_v4_fp8 = self._uses_deepseek_v4_fp8_refit()
             previous_failure = self._nrl_layerwise_reload_failure
             if previous_failure is not None:
                 raise RuntimeError(
@@ -891,10 +922,13 @@ class VllmInternalWorkerExtension:
             )
 
             model = self.model_runner.model
+            added_skip_tensors: set[str] = set()
 
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
+                    if use_deepseek_v4_fp8:
+                        deepseek_v4_fp8.finalize_refit(model)
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
@@ -902,6 +936,12 @@ class VllmInternalWorkerExtension:
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     with torch.device(self.device):
+                        if use_deepseek_v4_fp8:
+                            from nemo_rl.models.generation.vllm.quantization import (
+                                deepseek_v4_fp8,
+                            )
+
+                            added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
                         initialize_layerwise_reload(model)
                     self._nrl_layerwise_reload_active = True
                     yield finalize
@@ -910,6 +950,8 @@ class VllmInternalWorkerExtension:
                 raise
             finally:
                 self._nrl_layerwise_reload_active = False
+                if use_deepseek_v4_fp8:
+                    deepseek_v4_fp8.restore_refit(added_skip_tensors)
 
             return
 
@@ -932,7 +974,9 @@ class VllmInternalWorkerExtension:
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
-        return self._uses_unquantized_flashinfer_trtllm()
+        return self._uses_unquantized_flashinfer_trtllm() or (
+            self._nrl_layerwise_reload_failure is not None
+        )
 
     def _synchronize_before_ipc_data_ack(self) -> None:
         """Fence work consuming one IPC data batch before its acknowledgment."""

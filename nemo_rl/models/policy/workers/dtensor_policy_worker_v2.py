@@ -294,6 +294,9 @@ class DTensorPolicyWorkerV2Impl(
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
+        requires_synchronous_checkpoint = (
+            getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
+        )
         self._init_checkpoint_manager(
             config_updates={
                 "model_repo_id": config["model_name"],
@@ -301,7 +304,10 @@ class DTensorPolicyWorkerV2Impl(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
-                "is_async": True,
+                # Automodel's process-based async DCP cannot serialize the
+                # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
+                # the pre-existing async checkpoint path.
+                "is_async": not requires_synchronous_checkpoint,
             },
         )
 
@@ -1366,9 +1372,8 @@ class DTensorPolicyWorkerV2Impl(
     def finalize_async_save(self) -> None:
         """Block until this worker's in-flight async checkpoint writes complete.
 
-        Overrides the base no-op: this worker initializes the checkpoint manager
-        with ``is_async=True``, so the caller-side rename of ``tmp_step_N`` to
-        ``step_N`` must wait for the staged writes to land.
+        Overrides the base no-op so async configurations wait for staged writes
+        before the caller renames ``tmp_step_N`` to ``step_N``.
         """
         if self.checkpoint_manager is None:
             return
