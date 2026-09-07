@@ -777,7 +777,10 @@ def test_process_mxfp8_moe_refit_rejects_non_flashinfer_backend(fp8_module):
         fp8_module.process_weights_after_loading_mxfp8_moe(quant_method, object())
 
 
-def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
+@pytest.mark.parametrize("replace_runtime_scales", [False, True])
+def test_process_mxfp8_moe_initializes_kernel_once(
+    fp8_module, monkeypatch, replace_runtime_scales
+):
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
     fp8 = fp8_module
@@ -857,6 +860,13 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
 
     layer.w13_weight_scale_from_checkpoint.data.fill_(2)
     layer.w2_weight_scale_from_checkpoint.data.fill_(2)
+    if replace_runtime_scales:
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.zeros_like(layer.w13_weight_scale), requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.zeros_like(layer.w2_weight_scale), requires_grad=False
+        )
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
 
     assert quant_method.moe_kernel is kernel
@@ -870,8 +880,25 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         layer.w13_weight_scale,
         layer.w2_weight_scale,
     )
-    assert tuple(id(parameter) for parameter in refit_parameters) == parameter_ids
-    assert tuple(parameter.data_ptr() for parameter in refit_parameters) == storage_ptrs
+    if replace_runtime_scales:
+        assert (
+            tuple(id(parameter) for parameter in refit_parameters[:2])
+            == parameter_ids[:2]
+        )
+        assert (
+            tuple(parameter.data_ptr() for parameter in refit_parameters[:2])
+            == (storage_ptrs[:2])
+        )
+        assert quant_config.w1_scale is runtime_parameters[2]
+        assert quant_config.w2_scale is runtime_parameters[3]
+        assert torch.all(quant_config.w1_scale == 2)
+        assert torch.all(quant_config.w2_scale == 2)
+    else:
+        assert tuple(id(parameter) for parameter in refit_parameters) == parameter_ids
+        assert (
+            tuple(parameter.data_ptr() for parameter in refit_parameters)
+            == storage_ptrs
+        )
     assert all(torch.all(parameter == 2) for parameter in refit_parameters)
     assert kernel_calls[0] == {
         "moe_quant_config": quant_config,
