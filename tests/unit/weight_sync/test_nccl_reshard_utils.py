@@ -422,6 +422,45 @@ def test_group_expert_params_collapses_to_grouped_hf_entries():
     )
 
 
+def test_group_expert_params_canonicalizes_qwen35_grouped_slabs():
+    base = "model.language_model.layers.0.mlp.experts"
+    metadata = {
+        f"{base}.gate_up_proj": {
+            "shape": [256, 1024, 2048],
+            "dtype": "torch.bfloat16",
+        },
+        f"{base}.down_proj": {
+            "shape": [256, 2048, 512],
+            "dtype": "torch.bfloat16",
+        },
+        "model.visual.proj.weight": {
+            "shape": [2048, 2048],
+            "dtype": "torch.bfloat16",
+        },
+    }
+
+    grouped = group_expert_params_in_metadata(metadata)
+
+    assert grouped[f"{base}.gate_proj.weight"] == {
+        "shape": [256, 512, 2048],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "gate_proj",
+    }
+    assert grouped[f"{base}.up_proj.weight"] == {
+        "shape": [256, 512, 2048],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "up_proj",
+    }
+    assert grouped[f"{base}.down_proj.weight"] == {
+        "shape": [256, 2048, 512],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "down_proj",
+    }
+    assert f"{base}.gate_up_proj" not in grouped
+    assert f"{base}.down_proj" not in grouped
+    assert grouped["model.visual.proj.weight"] == metadata["model.visual.proj.weight"]
+
+
 def test_group_expert_params_no_experts_is_identity():
     md = {
         "model.layers.0.self_attn.q_proj.weight": {
