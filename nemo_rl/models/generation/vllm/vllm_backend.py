@@ -1096,6 +1096,8 @@ class VllmInternalWorkerExtension:
             )
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
             added_skip_tensors: set[str] = set()
+            if use_deepseek_v4_fp8:
+                from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 
             def finalize() -> None:
                 with torch.device(self.device):
@@ -1114,10 +1116,6 @@ class VllmInternalWorkerExtension:
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     with torch.device(self.device):
                         if use_deepseek_v4_fp8:
-                            from nemo_rl.models.generation.vllm.quantization import (
-                                deepseek_v4_fp8,
-                            )
-
                             added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
                         for reload_target in reload_targets:
                             initialize_layerwise_reload(reload_target)

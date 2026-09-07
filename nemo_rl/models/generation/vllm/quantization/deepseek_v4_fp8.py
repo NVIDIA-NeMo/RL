@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import cast
+
 import torch
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+from vllm.model_executor.models.utils import WeightsMapper
 
 _PACKED_MODULES = {
     "attn.fused_wqa_wkv": ["attn.wq_a", "attn.wkv"],
@@ -41,7 +44,8 @@ def map_checkpoint_name(model: torch.nn.Module, name: str) -> str:
     """Apply DeepSeek V4's regex and suffix-aware HF-to-vLLM mapping."""
     if not is_model(model):
         return name
-    return model.hf_to_vllm_mapper.apply_list([name])[0]
+    mapper = cast(WeightsMapper, model.hf_to_vllm_mapper)
+    return mapper.apply_list([name])[0]
 
 
 def remap_packed_module_path(

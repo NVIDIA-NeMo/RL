@@ -248,6 +248,39 @@ def test_prepare_refit_restores_raw_expert_shapes_and_dtypes(
     deepseek_v4_fp8.restore_refit(added_skip_tensors)
 
 
+@pytest.mark.parametrize(
+    "param_name",
+    ["w13_weight", "w2_weight", "w13_weight_scale_inv", "w2_weight_scale_inv"],
+)
+def test_prepare_refit_restores_expert_stride_only(
+    deepseek_v4_fp8, monkeypatch, skip_tensors, param_name
+):
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
+    layer = FakeRoutedExpertsLayer(weight_block_size=[1, 1])
+    _record_raw_expert_metadata(layer)
+    restore_params, _ = get_layerwise_info(layer).restore_metadata
+    for name, metadata in restore_params.items():
+        getattr(layer, name).data = torch.empty(metadata.shape, dtype=metadata.dtype)
+    metadata = restore_params[param_name]
+    restore_params[param_name] = metadata.transpose(1, 2).contiguous().transpose(1, 2)
+    param = getattr(layer, param_name)
+    assert param.shape == restore_params[param_name].shape
+    assert param.dtype == restore_params[param_name].dtype
+    assert param.stride() != restore_params[param_name].stride()
+
+    added_skip_tensors = deepseek_v4_fp8.prepare_refit(torch.nn.Sequential(layer))
+    try:
+        for name, metadata in restore_params.items():
+            restored = getattr(layer, name)
+            assert restored.shape == metadata.shape
+            assert restored.dtype == metadata.dtype
+            assert restored.stride() == metadata.stride()
+    finally:
+        deepseek_v4_fp8.restore_refit(added_skip_tensors)
+
+
 def test_prepare_refit_marks_expert_and_sink_tensors_for_immediate_load(
     deepseek_v4_fp8, monkeypatch, skip_tensors
 ):
@@ -299,7 +332,8 @@ def test_refit_ignores_unquantized_routed_experts(
     deepseek_v4_fp8, monkeypatch, skip_tensors
 ):
     monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
-    layer = FakeRoutedExpertsLayer(weight_block_size=None)
+    process_calls = []
+    layer = FakeRoutedExpertsLayer(weight_block_size=None, process_calls=process_calls)
     model = torch.nn.Sequential(layer)
 
     added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
@@ -307,4 +341,5 @@ def test_refit_ignores_unquantized_routed_experts(
     assert added_skip_tensors == {"attn_sink"}
     assert "w13_weight" not in skip_tensors
     deepseek_v4_fp8.finalize_refit(model)
+    assert process_calls == []
     deepseek_v4_fp8.restore_refit(added_skip_tensors)

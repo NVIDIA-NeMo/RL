@@ -175,10 +175,35 @@ def test_get_added_vocab_returns_a_defensive_copy():
     assert "<|mutated|>" not in tokenizer.get_added_vocab()
 
 
-def test_num_special_tokens_to_add_is_zero_for_raw_encoding():
-    tokenizer = get_deepseek_v4_tokenizer(DummyTokenizer())
+@pytest.mark.parametrize("add_bos", [False, True])
+def test_special_token_count_matches_hf_encoding(add_bos):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.processors import TemplateProcessing
+    from transformers import PreTrainedTokenizerFast
 
-    assert tokenizer.num_special_tokens_to_add() == 0
+    bos_token = "<｜begin▁of▁sentence｜>"
+    backend = Tokenizer(WordLevel({"<unk>": 0, bos_token: 1}, unk_token="<unk>"))
+    if add_bos:
+        backend.post_processor = TemplateProcessing(
+            single=f"{bos_token} $A", special_tokens=[(bos_token, 1)]
+        )
+    base_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="<unk>", bos_token=bos_token
+    )
+    tokenizer = get_deepseek_v4_tokenizer(base_tokenizer)
+    messages = [{"role": "user", "content": "Solve 1+1."}]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False)
+
+    assert base_tokenizer.num_special_tokens_to_add() == int(add_bos)
+    assert (
+        tokenizer.num_special_tokens_to_add()
+        == base_tokenizer.num_special_tokens_to_add()
+    )
+    assert tokenizer.encode("") == base_tokenizer.encode("")
+    assert tokenizer.apply_chat_template(messages) == base_tokenizer.encode(
+        prompt, add_special_tokens=False
+    )
 
 
 def test_wrapper_survives_pickling_for_ray_and_vllm_workers():

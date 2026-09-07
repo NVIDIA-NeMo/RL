@@ -1840,6 +1840,66 @@ def test_mxfp8_reload_iterator_emits_upstream_checkpoint_names(fp8_module, monke
     assert quantized[1][1].dtype == torch.uint8
 
 
+@pytest.mark.parametrize("change_layout", [False, True])
+def test_process_fp8_moe_preserves_storage_and_loaders(
+    fp8_module, monkeypatch, change_layout
+):
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    def weight_loader(*_args, **_kwargs):
+        pass
+
+    shapes = {
+        "w13_weight": (2, 4, 4),
+        "w2_weight": (2, 4, 2),
+        "w13_weight_scale_inv": (2, 2, 2),
+        "w2_weight_scale_inv": (2, 2, 1),
+    }
+    layer = torch.nn.Module()
+    converted = {}
+    for name, shape in shapes.items():
+        param = torch.nn.Parameter(torch.zeros(shape), requires_grad=False)
+        param.weight_loader = weight_loader
+        layer.register_parameter(name, param)
+        target_shape = (shape[0], shape[2], shape[1]) if change_layout else shape
+        target_dtype = torch.bfloat16 if change_layout else torch.float32
+        converted[name] = torch.ones(target_shape, dtype=target_dtype)
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    monkeypatch.setattr(
+        vllm_fp8,
+        "convert_to_fp8_moe_kernel_format",
+        lambda **_kwargs: tuple(value.clone() for value in converted.values()),
+    )
+    kernel = object()
+    quant_config = object()
+    method = types.SimpleNamespace(
+        weight_scale_name="weight_scale_inv",
+        fp8_backend=object(),
+        moe_kernel=kernel,
+        get_fused_moe_quant_config=lambda _layer: quant_config,
+    )
+    params = {name: getattr(layer, name) for name in shapes}
+    pointers = {name: param.data_ptr() for name, param in params.items()}
+
+    fp8_module.process_weights_after_loading_moe(method, layer)
+    if change_layout:
+        for name, param in params.items():
+            assert getattr(layer, name) is not param
+        params = {name: getattr(layer, name) for name in shapes}
+        pointers = {name: param.data_ptr() for name, param in params.items()}
+    for _ in range(2):
+        fp8_module.process_weights_after_loading_moe(method, layer)
+        for name, expected in converted.items():
+            param = getattr(layer, name)
+            assert param is params[name]
+            assert param.data_ptr() == pointers[name]
+            assert param.weight_loader is weight_loader
+            torch.testing.assert_close(param, expected)
+    assert method.moe_kernel is kernel
+    assert method.moe_quant_config is quant_config
+
+
 def _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model=False):
     """Fake model mirroring vLLM's MoERunner -> RoutedExperts layout at
     ``layers.0.mlp.experts``, with expert weights in ``experts_dtype``.

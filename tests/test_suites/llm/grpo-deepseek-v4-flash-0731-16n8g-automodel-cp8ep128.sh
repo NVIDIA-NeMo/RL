@@ -29,3 +29,8 @@ uv run examples/run_grpo.py \
     2>&1 | tee $RUN_LOG
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+uv run tests/check_metrics.py "$JSON_METRICS" \
+    "len(data['train/loss']) >= $MAX_STEPS" \
+    'all_finite(data["train/loss"])' \
+    'all_finite(data["train/token_mult_prob_error"])' \
+    'all_finite(data["train/gen_kl_error"])'

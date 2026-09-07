@@ -146,6 +146,58 @@ def test_deepseek_v4_layerwise_failure_restores_global_state(monkeypatch):
     assert restored == [{"attn_sink"}]
 
 
+@pytest.mark.parametrize("context_name", ["config", "device"])
+def test_deepseek_v4_context_entry_failure_preserves_original_error(
+    monkeypatch, context_name
+):
+    import vllm.config
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.device = "cpu"
+    ext._uses_native_layerwise_refit = lambda _transport: True
+    ext._validate_native_layerwise_refit = lambda: None
+    ext._uses_deepseek_v4_fp8_refit = lambda: True
+    failure = RuntimeError("context entry failed")
+    restored = []
+
+    class FailingContext:
+        def __enter__(self):
+            raise failure
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        vllm.config,
+        "set_current_vllm_config",
+        lambda _config: FailingContext()
+        if context_name == "config"
+        else contextlib.nullcontext(),
+    )
+    if context_name == "device":
+        monkeypatch.setattr(
+            vllm_backend.torch, "device", lambda _device: FailingContext()
+        )
+    monkeypatch.setattr(
+        deepseek_v4_fp8, "restore_refit", lambda added: restored.append(added)
+    )
+
+    with pytest.raises(RuntimeError, match="context entry failed") as exc_info:
+        with ext._weight_update_lifecycle("ipc"):
+            pytest.fail("The refit stream must not start after context entry fails")
+
+    assert exc_info.value is failure
+    assert ext._nrl_layerwise_reload_failure is failure
+    assert ext._nrl_layerwise_reload_active is False
+    assert restored == [set()]
+
+
 def test_weight_update_lifecycle_keeps_full_post_load_for_non_deepseek_models(
     monkeypatch,
 ):
