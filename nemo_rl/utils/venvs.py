@@ -17,7 +17,7 @@ import shlex
 import shutil
 import subprocess
 import time
-from functools import lru_cache
+from hashlib import sha256
 from pathlib import Path
 
 import ray
@@ -26,6 +26,8 @@ from ray.util import placement_group
 dir_path = os.path.dirname(os.path.abspath(__file__))
 git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
+_VENV_SPEC_FILE = ".nemo_rl_venv_spec"
+_VENV_BUILD_LOCK_SUFFIX = ".STARTED_ENV_BUILDER"
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +51,40 @@ def add_hf_modules_cache_to_pythonpath(env_vars: dict[str, str]) -> dict[str, st
     return result
 
 
-@lru_cache(maxsize=None)
+def _venv_fingerprint(py_executable: str) -> str:
+    """Fingerprint the requested uv tier and its resolved project dependencies."""
+    digest = sha256()
+    digest.update(py_executable.encode("utf-8"))
+    for filename in ("pyproject.toml", "uv.lock"):
+        path = Path(git_root) / filename
+        digest.update(filename.encode("utf-8"))
+        try:
+            digest.update(path.read_bytes())
+        except FileNotFoundError:
+            digest.update(b"<missing>")
+    return digest.hexdigest()
+
+
+def _venv_matches_spec(venv_path: Path, py_executable: str) -> bool:
+    """Return whether a cached venv matches the uv tier and dependency lock."""
+    python_path = venv_path / "bin" / "python"
+    spec_path = venv_path / _VENV_SPEC_FILE
+    if not python_path.exists() or not spec_path.is_file():
+        return False
+    try:
+        return spec_path.read_text(encoding="utf-8") == _venv_fingerprint(py_executable)
+    except OSError:
+        return False
+
+
+def _write_venv_spec(venv_path: Path, py_executable: str) -> None:
+    """Atomically mark a venv valid after all of its sync commands succeed."""
+    spec_path = venv_path / _VENV_SPEC_FILE
+    temporary_path = venv_path / f"{_VENV_SPEC_FILE}.{os.getpid()}.tmp"
+    temporary_path.write_text(_venv_fingerprint(py_executable), encoding="utf-8")
+    os.replace(temporary_path, spec_path)
+
+
 def create_local_venv(
     py_executable: str, venv_name: str, force_rebuild: bool = False
 ) -> str:
@@ -58,8 +93,10 @@ def create_local_venv(
     The output can be used as a py_executable for a Ray worker assuming the worker
     nodes also have access to the same file system as the head node.
 
-    This function is cached to avoid multiple calls to uv to create the same venv,
-    which avoids duplicate logging.
+    A fingerprint of the requested uv invocation, ``pyproject.toml``, and
+    ``uv.lock`` is persisted inside the venv. Reusing an actor name after its
+    extras or resolved dependencies change automatically resyncs the environment
+    instead of trusting an incompatible cached interpreter.
 
     Args:
         py_executable (str): Command to run with the virtual environment (e.g., "uv.sh run --locked")
@@ -77,26 +114,40 @@ def create_local_venv(
     #
     # You can override this location by setting the NEMO_RL_VENV_DIR environment variable
 
-    NEMO_RL_VENV_DIR = os.path.normpath(
+    nemo_rl_venv_dir = os.path.normpath(
         os.environ.get("NEMO_RL_VENV_DIR", DEFAULT_VENV_DIR)
     )
-    logger.info(f"NEMO_RL_VENV_DIR is set to {NEMO_RL_VENV_DIR}.")
+    logger.info(f"NEMO_RL_VENV_DIR is set to {nemo_rl_venv_dir}.")
 
     # Create the venv directory if it doesn't exist
-    os.makedirs(NEMO_RL_VENV_DIR, exist_ok=True)
+    os.makedirs(nemo_rl_venv_dir, exist_ok=True)
 
     # Full path to the virtual environment
-    venv_path = os.path.join(NEMO_RL_VENV_DIR, venv_name)
+    venv_path = Path(nemo_rl_venv_dir) / venv_name
+    python_path = venv_path / "bin" / "python"
 
-    # Force rebuild if requested
-    if force_rebuild and os.path.exists(venv_path):
+    # Build or retrieve the venv.
+    if force_rebuild and venv_path.exists():
+        # Force rebuild if requested.
         logger.info(f"Force rebuilding venv at {venv_path}")
         shutil.rmtree(venv_path)
+    elif _venv_matches_spec(venv_path, py_executable):
+        # If the cached venv spec matches the current requirements
+        # computed from pyproject.toml, uv.lock, etc. then use the
+        # cached venv.
+        logger.info(f"Using compatible cached venv at {venv_path}")
+        return str(python_path)
+    elif venv_path.exists():
+        # Rebuild / update the venv.
+        logger.info(
+            "Refreshing venv at %s because its cached uv specification changed",
+            venv_path,
+        )
 
     logger.info(f"Creating new venv at {venv_path}")
 
     # Create the virtual environment
-    uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
+    uv_venv_cmd = ["uv", "venv", "--allow-existing", str(venv_path)]
     subprocess.run(uv_venv_cmd, check=True)
 
     # Execute the command with the virtual environment
@@ -105,7 +156,7 @@ def create_local_venv(
     #  one call to this in the driver. It is not safe to use this in a multi-process
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
-    env["UV_PROJECT_ENVIRONMENT"] = venv_path
+    env["UV_PROJECT_ENVIRONMENT"] = str(venv_path)
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)
@@ -116,9 +167,12 @@ def create_local_venv(
     subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
     subprocess.run(exec_cmd, env=env, check=True)
 
+    if not python_path.exists():
+        raise RuntimeError(f"uv completed without creating {python_path}")
+    _write_venv_spec(venv_path, py_executable)
+
     # Return the path to the python executable in the virtual environment
-    python_path = os.path.join(venv_path, "bin", "python")
-    return python_path
+    return str(python_path)
 
 
 # Ray-based helper to create a virtual environment on each Ray node
@@ -127,37 +181,43 @@ def _env_builder(
     py_executable: str, venv_name: str, node_idx: int, force_rebuild: bool = False
 ):
     # Check if another node is already building
-    NEMO_RL_VENV_DIR = os.path.normpath(
+    nemo_rl_venv_dir = os.path.normpath(
         os.environ.get("NEMO_RL_VENV_DIR", DEFAULT_VENV_DIR)
     )
-    venv_path = Path(NEMO_RL_VENV_DIR) / venv_name
+    venv_path = Path(nemo_rl_venv_dir) / venv_name
     python_path = venv_path / "bin" / "python"
-    started_file = venv_path / "STARTED_ENV_BUILDER"
+    started_file = Path(f"{venv_path}{_VENV_BUILD_LOCK_SUFFIX}")
 
     # Skip early return if force_rebuild is True
-    if not force_rebuild and python_path.exists():
+    if not force_rebuild and _venv_matches_spec(venv_path, py_executable):
         logger.info(f"Using existing venv at {venv_path}")
         return str(python_path)
 
     # Sleep to stagger node startup
     time.sleep(1 * node_idx)
 
-    if started_file.exists():
+    try:
+        started_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(started_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(lock_fd)
+        owns_build_lock = True
+    except FileExistsError:
+        owns_build_lock = False
+
+    if not owns_build_lock:
         # Another node is already building, wait for completion
         logger.info(
             f"Node {node_idx}: Another node is building {venv_name}, skipping..."
         )
-        # Wait for the venv to be ready (check for python executable)
-        python_path = venv_path / "bin" / "python"
-        while not python_path.exists():
+        while started_file.exists():
             time.sleep(1)
-        return str(python_path)
+        if _venv_matches_spec(venv_path, py_executable):
+            return str(python_path)
+        raise RuntimeError(
+            f"Venv builder for {venv_name} finished without producing a "
+            f"compatible environment at {venv_path}"
+        )
 
-    # Create the venv directory if needed
-    venv_path.mkdir(parents=True, exist_ok=True)
-
-    # Touch the started file to signal we're building
-    started_file.touch()
     try:
         # Create the virtual environment on this node
         return create_local_venv(py_executable, venv_name, force_rebuild=force_rebuild)
