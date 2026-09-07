@@ -374,7 +374,7 @@ def test_unquantized_nccl_reshard_keeps_existing_refit_lifecycle(monkeypatch):
 
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
-    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
 @pytest.mark.vllm
@@ -526,7 +526,7 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
 
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
-    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
 @pytest.mark.vllm
@@ -752,6 +752,114 @@ def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
         ext.prepare_sparse_delta_refit_info({})
     with pytest.raises(RuntimeError, match="sparse-delta refit does not support"):
         ext.update_weights_from_decoded_sparse_payload(b"")
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prepare_refit_info_reports_only_fp8_weights(monkeypatch, enabled):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    model = torch.nn.Module()
+    config = object()
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=config)
+    state_dict_info = {
+        "model.linear.weight": ((2, 2), torch.bfloat16),
+        "model.norm.weight": ((2,), torch.bfloat16),
+    }
+    is_fp8_model = MagicMock(return_value=True)
+    checked_names = []
+
+    def is_fp8_weight(name, candidate_model):
+        assert candidate_model is model
+        checked_names.append(name)
+        return name == "model.linear.weight"
+
+    source_config = fp8.FP8Config(
+        is_mx=True,
+        refit_prequantize=enabled,
+        use_fp8_weights=True,
+    )
+    monkeypatch.setattr(fp8, "global_fp8_config", source_config)
+    serialized_config = fp8.serialize_fp8_config()
+    monkeypatch.setattr(fp8, "global_fp8_config", None)
+    monkeypatch.setattr(fp8, "is_fp8_model", is_fp8_model)
+    monkeypatch.setattr(fp8, "_is_fp8_weight", is_fp8_weight)
+
+    result = ext.prepare_refit_info(state_dict_info, serialized_config)
+
+    assert ext.state_dict_info is state_dict_info
+    assert fp8.global_fp8_config == source_config
+    if enabled:
+        assert result == ["model.linear.weight"]
+        is_fp8_model.assert_called_once_with(config)
+        assert checked_names == list(state_dict_info)
+    else:
+        assert result is None
+        is_fp8_model.assert_not_called()
+        assert checked_names == []
+
+
+@pytest.mark.vllm
+def test_sync_prepare_refit_info_unions_worker_names(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_worker import (
+        VllmGenerationWorkerImpl,
+    )
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+    serialized_config = {"is_mx": True, "refit_prequantize": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
+    worker.llm = SimpleNamespace(
+        collective_rpc=MagicMock(
+            return_value=[
+                None,
+                ["model.b.weight", "model.a.weight"],
+                ["model.a.weight"],
+            ]
+        )
+    )
+
+    assert worker.prepare_refit_info(state_dict_info) == [
+        "model.a.weight",
+        "model.b.weight",
+    ]
+    worker.llm.collective_rpc.assert_called_once_with(
+        "prepare_refit_info",
+        args=(state_dict_info, serialized_config),
+    )
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_prepare_refit_info_unions_worker_names(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+    serialized_config = {"is_mx": True, "refit_prequantize": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(
+            return_value=[None, ["model.b.weight"], ["model.a.weight"]]
+        )
+    )
+
+    assert await worker.prepare_refit_info_async(state_dict_info) == [
+        "model.a.weight",
+        "model.b.weight",
+    ]
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "prepare_refit_info",
+        args=(state_dict_info, serialized_config),
+    )
 
 
 @pytest.mark.vllm
@@ -995,7 +1103,6 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
         post_unpack_func([("model.weight", "weight-value")])
 
     ext._load_weights = load_weights
-    ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
     monkeypatch.setattr(
         vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
     )
@@ -1018,7 +1125,6 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
         "config_enter",
         "process_mtp",
         "config_exit",
-        "kv",
         "gc",
         "empty_cache",
     ]
@@ -1147,17 +1253,20 @@ async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
 
 
 @pytest.mark.vllm
-def test_worker_prepare_refit_info_forwards_state_dict_info():
+def test_worker_prepare_refit_info_forwards_state_dict_info(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     worker.llm = SimpleNamespace(collective_rpc=MagicMock())
     state_dict_info = {"model.weight": object()}
+    serialized_config = {"is_mx": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
 
     worker.prepare_refit_info(state_dict_info)
 
     assert worker.llm.collective_rpc.call_args_list == [
-        call("prepare_refit_info", args=(state_dict_info,)),
+        call("prepare_refit_info", args=(state_dict_info, serialized_config)),
     ]
 
 
@@ -1192,8 +1301,38 @@ def test_generation_prepare_refit_info_rejects_mxfp8_grouped_moe(
 
 
 @pytest.mark.vllm
+def test_generation_prepare_refit_info_allows_prequantized_mxfp8_grouped_moe(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import vllm_generation
+
+    generation = vllm_generation.VllmGeneration.__new__(vllm_generation.VllmGeneration)
+    generation.cfg = {
+        "vllm_cfg": {
+            "async_engine": False,
+            "precision": "fp8",
+            "is_mx": True,
+            "refit_prequantize": True,
+        }
+    }
+    generation.worker_group = SimpleNamespace(
+        run_all_workers_single_data=MagicMock(return_value=["future"])
+    )
+    monkeypatch.setattr(vllm_generation.ray, "get", MagicMock(return_value=[None]))
+    state_dict_info = {"model.layers.0.mlp.experts.gate_up_proj": object()}
+
+    assert generation.prepare_refit_info(state_dict_info) is None
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "prepare_refit_info",
+        state_dict_info=state_dict_info,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
+@pytest.mark.vllm
 @pytest.mark.asyncio
-async def test_async_worker_prepare_refit_info_forwards_state_dict_info():
+async def test_async_worker_prepare_refit_info_forwards_state_dict_info(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
         VllmAsyncGenerationWorkerImpl,
     )
@@ -1201,11 +1340,13 @@ async def test_async_worker_prepare_refit_info_forwards_state_dict_info():
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.llm = SimpleNamespace(collective_rpc=AsyncMock())
     state_dict_info = {"model.weight": object()}
+    serialized_config = {"is_mx": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
 
     await worker.prepare_refit_info_async(state_dict_info)
 
     assert worker.llm.collective_rpc.await_args_list == [
-        call("prepare_refit_info", args=(state_dict_info,)),
+        call("prepare_refit_info", args=(state_dict_info, serialized_config)),
     ]
 
 

@@ -12,6 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
+from typing import Any
+
+_REFIT_CACHE_LOADER_ROUTES_KEY = "nemo_rl_refit_cache_loader_routes"
+
+
+def configure_refit_runtime(
+    vllm_cfg: Mapping[str, Any], vllm_kwargs: dict[str, Any]
+) -> None:
+    """Forward NeMo-RL refit options through vLLM's worker config."""
+    additional_config = dict(vllm_kwargs.get("additional_config") or {})
+    additional_config[_REFIT_CACHE_LOADER_ROUTES_KEY] = vllm_cfg.get(
+        "refit_cache_loader_routes", False
+    )
+    vllm_kwargs["additional_config"] = additional_config
+
+
+def refit_cache_loader_routes_enabled(vllm_config: Any) -> bool:
+    """Return the configured loader-route cache setting in a vLLM worker."""
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    if _REFIT_CACHE_LOADER_ROUTES_KEY not in additional_config:
+        return False
+    value = additional_config[_REFIT_CACHE_LOADER_ROUTES_KEY]
+    if not isinstance(value, bool):
+        raise TypeError(f"{_REFIT_CACHE_LOADER_ROUTES_KEY} must be a boolean")
+    return value
+
 
 def resolve_distributed_executor_backend(
     tensor_parallel_size: int,

@@ -77,6 +77,7 @@ basic_vllm_test_config: VllmConfig = {
     "stop_strings": None,
     "vllm_cfg": {
         "precision": "bfloat16",
+        "refit_cache_loader_routes": False,
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,
@@ -144,6 +145,15 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_skips_missing_metadata():
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.worker_group = MagicMock()
+
+    assert generation.prepare_refit_info(None) is None
+    generation.worker_group.run_all_workers_single_data.assert_not_called()
 
 
 def test_context_capped_max_new_tokens():

@@ -259,6 +259,7 @@ policy:
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
+      refit_cache_loader_routes: false # Replay stable vLLM loader routes across refits.
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
