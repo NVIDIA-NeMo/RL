@@ -4,7 +4,6 @@ set -euo pipefail
 # ---- Required vars ----
 : "${EXP_NAME:?EXP_NAME is required}"
 : "${TRAIN_PATH:?TRAIN_PATH is required}"
-: "${VAL_PATH:?VAL_PATH is required}"
 : "${CONFIG_PATH:?CONFIG_PATH is required}"
 : "${MODEL_PATH:?MODEL_PATH is required}"
 : "${CONTAINER:?CONTAINER is required}"
@@ -23,6 +22,7 @@ done
 WANDB_PROJ="${WANDB_PROJ:-nemotron-3-super-posttraining}"
 SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
 DRY_RUN="${DRY_RUN:-false}"
+VAL_PATH="${VAL_PATH:-}"
 # Existing code snapshots are reused by tools/code_snapshot.sh. Refresh tracked
 # files so restarts pick up dependency/code changes without deleting old logs.
 REFRESH_CODE_SNAPSHOT="${REFRESH_CODE_SNAPSHOT:-true}"
@@ -104,7 +104,7 @@ echo " Experiment : ${EXP_NAME}"
 echo " Config     : ${CONFIG_PATH}"
 echo " Model      : ${MODEL_PATH}"
 echo " Train data : ${TRAIN_PATH}"
-echo " Val data   : ${VAL_PATH}"
+echo " Val data   : ${VAL_PATH:-<disabled>}"
 echo " Ckpt dir   : ${CHECKPOINT_DIR}"
 echo " Log dir    : ${LOG_DIR}"
 echo " Wandb      : ${WANDB_PROJ} / ${WANDB_NAME}"
@@ -186,8 +186,11 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     logger.wandb_enabled=True \
     logger.wandb.name=${WANDB_NAME} \
     logger.wandb.project=${WANDB_PROJ} \
-    data.train.data_path=${TRAIN_PATH} \
-    data.validation.data_path=${VAL_PATH}"
+    data.train.data_path=${TRAIN_PATH}"
+
+if [[ -n "${VAL_PATH}" ]]; then
+    COMMAND="$COMMAND data.validation.data_path=${VAL_PATH}"
+fi
 
 if [[ -n "$SIF_DIR" ]]; then
     COMMAND="$COMMAND sif_dir=${SIF_DIR}"
@@ -244,6 +247,9 @@ if [[ -n "${SLURM_QOS:-}" ]]; then
 fi
 if [[ -n "${SLURM_COMMENT:-}" ]]; then
     SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --comment="${SLURM_COMMENT}" "${SBATCH_CMD[@]:1}")
+fi
+if [[ -n "${EXCLUDE_NODES:-}" ]]; then
+    SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --exclude="${EXCLUDE_NODES}" "${SBATCH_CMD[@]:1}")
 fi
 if [[ -n "${SLURM_LOG_DIR}" ]]; then
     SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --output="${SLURM_LOG_DIR}/%j.out" --error="${SLURM_LOG_DIR}/%j.err" "${SBATCH_CMD[@]:1}")

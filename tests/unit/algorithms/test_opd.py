@@ -711,19 +711,28 @@ def test_create_advantage_estimator_opd_branch():
         OPDAdvantageEstimator,
     )
     from nemo_rl.algorithms.grpo import GRPOConfig, _create_advantage_estimator
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 
     # loss_fn not MOPD-configured -> the 3 recommendation warnings fire.
     loss_fn = SimpleNamespace(
         disable_ppo_ratio=False,
+        force_on_policy_ratio=False,
         use_importance_sampling_correction=False,
         truncated_importance_sampling_type="none",
     )
     master_config = SimpleNamespace(
         grpo=GRPOConfig(adv_estimator=AdvEstimatorConfig(name="opd")),
         loss_fn=loss_fn,
+        on_policy_distillation=OnPolicyDistillationConfig(
+            enabled=True,
+            proximal_teacher_alpha=0.2,
+            subtract_global_baseline=True,
+        ),
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         estimator = _create_advantage_estimator(master_config)
     assert isinstance(estimator, OPDAdvantageEstimator)
+    assert estimator.proximal_teacher_alpha == 0.2
+    assert estimator.subtract_global_baseline is True
     assert len(caught) == 3
