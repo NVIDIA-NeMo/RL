@@ -2183,6 +2183,11 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            # Must precede the step_finished=True log below. That log commits
+            # the wandb step, and wandb silently discards anything logged
+            # against a step it has already committed -- no exception, no
+            # failed return, just an empty chart. grpo_sync had the same bug.
+            self._log_data_plane_metrics(total_time)
             # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(
                 timing_metrics,
@@ -2190,7 +2195,6 @@ class SingleControllerActor:
                 prefix="timing/train",
                 step_finished=True,
             )
-            self._log_data_plane_metrics(total_time)
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
