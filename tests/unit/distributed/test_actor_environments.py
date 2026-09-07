@@ -90,6 +90,7 @@ def test_registry_matches_py_executables():
     """The generated py_executable is the string the worker actually needs."""
     expected = {
         ("vllm",): PY_EXECUTABLES.VLLM,
+        ("vllm", "nemo_gym"): PY_EXECUTABLES.VLLM_GYM,
         ("sglang",): PY_EXECUTABLES.SGLANG,
         ("fsdp",): PY_EXECUTABLES.FSDP,
         ("automodel",): PY_EXECUTABLES.AUTOMODEL,
@@ -105,6 +106,37 @@ def test_registry_matches_py_executables():
             assert got == expected.get(tuple(extras), uv_py_executable(extras)), (
                 actor_fqn
             )
+
+
+def test_every_extras_py_executable_is_wired_to_an_actor():
+    """A PY_EXECUTABLES constant naming extras must be used by some actor.
+
+    This branch builds ACTOR_ENVIRONMENT_REGISTRY from ACTOR_ENVIRONMENTS instead of
+    the literal dict main keeps in ray_actor_environment_registry.py. When main changes
+    which extras an actor needs -- as #4009 did, moving the vLLM workers onto
+    PY_EXECUTABLES.VLLM_GYM so token capture can import nemo_gym -- a rebase drops the
+    literal dict and the change is silently lost. A new constant that no actor uses is
+    the signature of exactly that miss.
+
+    PY_EXECUTABLES.BASE is excluded: it names no extra and is not an actor environment.
+    """
+    unused = []
+    for name in sorted(n for n in dir(PY_EXECUTABLES) if n.isupper()):
+        value = getattr(PY_EXECUTABLES, name)
+        if "--extra" not in value:
+            continue
+        if not any(
+            uv_py_executable(extras) == value
+            for extras in ACTOR_ENVIRONMENTS.values()
+            if extras is not None
+        ):
+            unused.append(name)
+    assert not unused, (
+        f"PY_EXECUTABLES {unused} name extras but no actor in ACTOR_ENVIRONMENTS uses "
+        "them. Either an actor's extras were not carried over from "
+        "nemo_rl/distributed/ray_actor_environment_registry.py on main, or the "
+        "constant is dead and should be deleted."
+    )
 
 
 def test_actor_environments_module_is_stdlib_only():

@@ -39,9 +39,17 @@ import sys
 # ``None`` means the actor runs on the driver's interpreter and gets no venv.
 # Every extra must exist in ``[project.optional-dependencies]`` of pyproject.toml.
 ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
-    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": ["vllm"],
+    # vLLM workers always get vllm + nemo_gym. Token capture (token_capture.enabled)
+    # imports nemo_gym inside the worker, and worker venvs are cached by actor class
+    # name -- a venv prebuilt with plain "vllm" is reused as-is, so the extras have to
+    # be fixed here rather than swapped in at runtime.
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": [
+        "vllm",
+        "nemo_gym",
+    ],
     "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": [
-        "vllm"
+        "vllm",
+        "nemo_gym",
     ],
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": ["sglang"],
     "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": None,
