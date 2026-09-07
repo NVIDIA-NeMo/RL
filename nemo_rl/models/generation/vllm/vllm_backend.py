@@ -263,11 +263,15 @@ def _record_loader_calls(
     try:
         for param_name, param in model.named_parameters():
             loader = getattr(param, "weight_loader", None)
-            # Leave default_weight_loader params unwrapped: model
-            # load_weights implementations dispatch on
-            # `weight_loader == default_weight_loader` with a different
-            # argument list.
-            if loader is None or loader is default_weight_loader:
+            # Leave loaders owned by vLLM's loading lifecycle unwrapped.
+            # The default loader may use a different argument list, while the
+            # online loader must remain installed so vLLM can finalize each
+            # layer without replaying through this cache recorder.
+            if (
+                loader is None
+                or loader is default_weight_loader
+                or getattr(loader, "__name__", None) == "online_process_loader"
+            ):
                 continue
             cache.snapshot[param_name] = param
             originals.append((param, loader))
