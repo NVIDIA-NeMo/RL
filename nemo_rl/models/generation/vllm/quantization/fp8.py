@@ -16,6 +16,7 @@ import inspect
 import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from copy import copy
 from dataclasses import asdict, dataclass, field
 from typing import Any
 from unittest.mock import patch
@@ -34,6 +35,7 @@ from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
+    flashinfer_mxfp8_moe_padding_plan,
     pad_flashinfer_scale_k,
 )
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
@@ -1631,6 +1633,7 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
 
     layer.weight_block_size = self.weight_block_size
     epilogue_tile_m = 128
+    e8m0_unit_scale = 127
     is_gated = self.moe.is_act_and_mul
     intermediate_size_factor = 2 if is_gated else 1
 
@@ -1639,13 +1642,13 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
     # below, while these params keep their original shapes across refits.
     original_intermediate_size = layer.w2_weight.shape[2]
     original_hidden_size = layer.w13_weight.shape[2]
-    padded_intermediate_size = _round_up(original_intermediate_size, 128)
-    padded_hidden_size = _round_up(original_hidden_size, 512)
+    padded_hidden_size, padded_intermediate_size = flashinfer_mxfp8_moe_padding_plan(
+        original_hidden_size, original_intermediate_size
+    )
     needs_padding = (
         padded_intermediate_size != original_intermediate_size
         or padded_hidden_size != original_hidden_size
     )
-
     first_load = not hasattr(layer, "w13_weight_scale_from_checkpoint")
     w13_weight = layer.w13_weight.data
     if first_load:
@@ -1662,16 +1665,27 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
         )
         w13_weight = _pad_tensor_dim(w13_weight, 2, padded_hidden_size)
         w13_scale = _pad_w13_shards(
-            w13_scale, intermediate_size_factor, padded_intermediate_size, pad_value=1
+            w13_scale,
+            intermediate_size_factor,
+            padded_intermediate_size,
+            pad_value=e8m0_unit_scale,
         )
         w13_scale = _pad_tensor_dim(
-            w13_scale, 2, padded_hidden_size // MXFP8_BLOCK_SIZE, pad_value=1
+            w13_scale,
+            2,
+            padded_hidden_size // MXFP8_BLOCK_SIZE,
+            pad_value=e8m0_unit_scale,
         )
         w2_weight = _pad_tensor_dim(w2_weight, 1, padded_hidden_size)
         w2_weight = _pad_tensor_dim(w2_weight, 2, padded_intermediate_size)
-        w2_scale = _pad_tensor_dim(w2_scale, 1, padded_hidden_size, pad_value=1)
         w2_scale = _pad_tensor_dim(
-            w2_scale, 2, padded_intermediate_size // MXFP8_BLOCK_SIZE, pad_value=1
+            w2_scale, 1, padded_hidden_size, pad_value=e8m0_unit_scale
+        )
+        w2_scale = _pad_tensor_dim(
+            w2_scale,
+            2,
+            padded_intermediate_size // MXFP8_BLOCK_SIZE,
+            pad_value=e8m0_unit_scale,
         )
         # Zero E8M0 scale bytes destabilize the TRTLLM kernel; clamp to byte 1.
         w13_scale = _clamp_mxfp8_scale(w13_scale)
@@ -1689,7 +1703,13 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
         w13_scale_shuffled,
         w2_scale_shuffled,
     ) = _shuffle_mxfp8_moe_batched(
-        layer, w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
+        layer,
+        w13_weight,
+        w2_weight,
+        w13_scale,
+        w2_scale,
+        is_gated,
+        epilogue_tile_m,
     )
 
     if first_load:
@@ -1737,12 +1757,6 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
             original_intermediate_size
         )
         layer.mxfp8_padded_intermediate_size_per_partition = padded_intermediate_size
-        # vLLM 0.25 stores this size on both RoutedExperts and its FusedMoEConfig.
-        # Keep them aligned so routing/kernel setup sees the padded value.
-        # Hidden size stays original: apply pads x and narrows the output back.
-        layer.intermediate_size_per_partition = padded_intermediate_size
-        layer.moe_config.intermediate_size_per_partition = padded_intermediate_size
-        self.moe.intermediate_size_per_partition = padded_intermediate_size
         _set_mxfp8_apply_tensor(layer, "w13_weight_for_apply", w13_weight_shuffled)
         _set_mxfp8_apply_tensor(layer, "w2_weight_for_apply", w2_weight_shuffled)
         _set_mxfp8_apply_tensor(layer, "w13_scale_for_apply", w13_scale_shuffled)
@@ -1771,6 +1785,19 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
             make_fp8_moe_quant_config,
         )
 
+        kernel_moe_config = self.moe
+        if needs_padding:
+            kernel_moe_config = copy(self.moe)
+            kernel_moe_config.hidden_dim = padded_hidden_size
+            kernel_moe_config.hidden_dim_unpadded = original_hidden_size
+            kernel_moe_config.intermediate_size_per_partition = padded_intermediate_size
+            kernel_moe_config.intermediate_size_per_partition_unpadded = (
+                original_intermediate_size
+            )
+            kernel_moe_config.intermediate_size = (
+                padded_intermediate_size
+                * kernel_moe_config.moe_parallel_config.tp_size
+            )
         self.moe_quant_config = make_fp8_moe_quant_config(
             fp8_backend=self.mxfp8_backend,
             w1_scale=runtime_w13_scale,
@@ -1788,7 +1815,7 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
             make_fp8_moe_kernel,
             layer,
             moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
+            moe_config=kernel_moe_config,
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
@@ -1824,15 +1851,20 @@ def apply_monolithic_mxfp8_moe(
     hidden dim to mxfp8_padded_hidden_size before the kernel, and narrows the
     output back.
     """
+    del input_ids
     assert self.is_monolithic
     assert self.moe_kernel is not None
-    unpadded_hidden_size = x.shape[-1]
+    unpadded_hidden_size = getattr(layer, "mxfp8_unpadded_hidden_size", x.shape[-1])
+    if x.shape[-1] != unpadded_hidden_size:
+        raise ValueError(
+            f"Expected MXFP8 MoE hidden size {unpadded_hidden_size}, got {x.shape[-1]}."
+        )
     padded_hidden_size = getattr(
         layer, "mxfp8_padded_hidden_size", unpadded_hidden_size
     )
-    if unpadded_hidden_size < padded_hidden_size:
+    if x.shape[-1] < padded_hidden_size:
         x = torch.nn.functional.pad(
-            x, (0, padded_hidden_size - unpadded_hidden_size), value=0.0
+            x, (0, padded_hidden_size - x.shape[-1]), value=0.0
         )
 
     output = self.moe_kernel.apply_monolithic(

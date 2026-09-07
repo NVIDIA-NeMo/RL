@@ -20,7 +20,7 @@ import pytest
 
 def _load_mxfp8_utils():
     module_path = (
-        Path(__file__).parents[1]
+        Path(__file__).parents[4]
         / "nemo_rl/models/generation/vllm/quantization/mxfp8_utils.py"
     )
     spec = importlib.util.spec_from_file_location("mxfp8_utils", module_path)
@@ -52,3 +52,43 @@ def test_flashinfer_scale_k_pad_width_rejects_negative_k() -> None:
     flashinfer_scale_k_pad_width = _load_mxfp8_utils().flashinfer_scale_k_pad_width
     with pytest.raises(ValueError, match="non-negative"):
         flashinfer_scale_k_pad_width(-1)
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "intermediate_size", "expected"),
+    [
+        (2688, 1856, (3072, 1920)),
+        (2688, 928, (3072, 1024)),
+        (96, 128, (512, 128)),
+        (4096, 2048, (4096, 2048)),
+    ],
+)
+def test_flashinfer_mxfp8_moe_padding_plan(
+    hidden_size: int,
+    intermediate_size: int,
+    expected: tuple[int, int],
+) -> None:
+    padding_plan = _load_mxfp8_utils().flashinfer_mxfp8_moe_padding_plan
+
+    padded_hidden_size, padded_intermediate_size = padding_plan(
+        hidden_size, intermediate_size
+    )
+
+    assert (padded_hidden_size, padded_intermediate_size) == expected
+    assert padded_hidden_size % 512 == 0
+    assert padded_hidden_size // 32 % 4 == 0
+    assert padded_intermediate_size % 128 == 0
+    assert padded_intermediate_size // 32 % 4 == 0
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "intermediate_size"),
+    [(0, 128), (128, 0), (127, 128), (128, 127)],
+)
+def test_flashinfer_mxfp8_moe_padding_plan_rejects_invalid_sizes(
+    hidden_size: int, intermediate_size: int
+) -> None:
+    padding_plan = _load_mxfp8_utils().flashinfer_mxfp8_moe_padding_plan
+
+    with pytest.raises(ValueError):
+        padding_plan(hidden_size, intermediate_size)
