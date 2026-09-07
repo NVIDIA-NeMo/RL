@@ -1731,8 +1731,19 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
         )
     else:
         assert self.moe_quant_config is not None
-        assert self.moe_quant_config.w1_scale is runtime_w13_scale
-        assert self.moe_quant_config.w2_scale is runtime_w2_scale
+        for kernel_scale, runtime_scale, scale_name in (
+            (self.moe_quant_config.w1_scale, runtime_w13_scale, "w13"),
+            (self.moe_quant_config.w2_scale, runtime_w2_scale, "w2"),
+        ):
+            if kernel_scale is runtime_scale:
+                continue
+            if kernel_scale.shape != runtime_scale.shape:
+                raise RuntimeError(
+                    f"MXFP8 MoE {scale_name} runtime scale shape changed from "
+                    f"{tuple(kernel_scale.shape)} to {tuple(runtime_scale.shape)}"
+                )
+            # Keep the storage already captured by the kernel and CUDA Graph.
+            kernel_scale.copy_(runtime_scale)
 
 
 def apply_monolithic_mxfp8_moe(
