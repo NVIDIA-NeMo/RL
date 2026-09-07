@@ -1544,10 +1544,6 @@ class MegatronPolicyWorkerImpl(
         # call carries one DP slice; the iterator subdivides into pipeline
         # microbatches.
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
-<<<<<<< HEAD
-=======
-
->>>>>>> f1369705e (Fix rebase errors to reenable V2 multimodal with MCore.)
         (
             data_iterator,
             num_microbatches,
