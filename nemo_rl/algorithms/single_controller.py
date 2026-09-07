@@ -58,7 +58,16 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Literal,
+    Optional,
+    Union,
+    cast,
+)
 
 import ray
 import torch
@@ -138,7 +147,6 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
-    PromptGroupRecoveryRecord,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -174,6 +182,25 @@ log = logging.getLogger(__name__)
 
 _MAX_CONSECUTIVE_ROLLOUT_CHECKPOINT_FAILURES = 3
 
+RolloutCheckpointAttemptReason = Literal[
+    "completed",
+    "invariant_error",
+    "io_error",
+    "missing_trainer_anchor",
+    "no_data_plane_mutations",
+    "optimizer_commit_in_progress",
+    "timeout",
+    "trainer_state_changed",
+]
+
+
+@dataclass(frozen=True)
+class _RolloutCheckpointSaveResult:
+    """Outcome returned by one rollout checkpoint save attempt."""
+
+    saved: bool
+    reason: RolloutCheckpointAttemptReason
+
 
 @dataclass(frozen=True)
 class _RolloutCheckpointCut:
@@ -185,13 +212,17 @@ class _RolloutCheckpointCut:
     replay_metadata: Optional[TQReplayMetadataState]
     rollout_recovery_payload: Optional[bytes]
     rollout_recovery_group_count: Optional[int]
+    replay_row_count: int
+    staging_row_count: int
     rolled_back_train_group_count: int
     mutation_version: int
     tq_save_seconds: float
 
 
-def _latest_vllm_values(metrics: dict[str, Any], metric_name: str) -> dict[int, float]:
-    """Return the latest value keyed by vLLM data-parallel worker."""
+def _latest_generation_values(
+    metrics: dict[str, Any], metric_name: str
+) -> dict[int, float]:
+    """Return the latest value keyed by generation data-parallel worker."""
     per_worker = metrics.get(metric_name)
     if not isinstance(per_worker, dict):
         return {}
@@ -610,16 +641,11 @@ class SingleControllerActor:
         )
         await self._maybe_restore_replacement_reserve()
         recovery_prepare_seconds = time.monotonic() - recovery_prepare_started
-        if self._rollout_checkpoint_load_metrics is not None:
-            load_metrics = dict(self._rollout_checkpoint_load_metrics)
-            load_metrics["replay_metadata_load_seconds"] = replay_restore_seconds
-            load_metrics["recovery_prepare_seconds"] = recovery_prepare_seconds
-            load_metrics["total_load_seconds"] = sum(load_metrics.values())
-            self._log_telemetry_metrics(
-                load_metrics,
-                step=self._train_steps,
-                prefix="timing/rollout_checkpoint",
-            )
+        self._log_rollout_restore_metrics(
+            replay_metadata_load_seconds=replay_restore_seconds,
+            recovery_prepare_seconds=recovery_prepare_seconds,
+            restored_replay_groups=restored_replay_groups,
+        )
 
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
@@ -767,6 +793,37 @@ class SingleControllerActor:
         """Record one committed group's queue and execution durations."""
         self._rollout_queue_wait_durations_s.append(dispatch_started - work_started)
         self._rollout_completion_durations_s.append(time.monotonic() - dispatch_started)
+
+    def _log_rollout_restore_metrics(
+        self,
+        *,
+        replay_metadata_load_seconds: float,
+        recovery_prepare_seconds: float,
+        restored_replay_groups: int,
+    ) -> None:
+        """Log rollout restore phases after the controller is ready to dispatch."""
+        if self._rollout_checkpoint_load_metrics is None:
+            return
+        load_metrics = dict(self._rollout_checkpoint_load_metrics)
+        load_metrics["replay_metadata_load_seconds"] = replay_metadata_load_seconds
+        load_metrics["recovery_prepare_seconds"] = recovery_prepare_seconds
+        load_metrics["total_load_seconds"] = sum(
+            load_metrics[key]
+            for key in (
+                "snapshot_resolution_seconds",
+                "dataloader_load_seconds",
+                "tq_load_seconds",
+                "replay_metadata_load_seconds",
+                "recovery_prepare_seconds",
+            )
+            if key in load_metrics
+        )
+        load_metrics["groups_reused"] = float(restored_replay_groups)
+        self._log_telemetry_metrics(
+            load_metrics,
+            step=self._train_steps,
+            prefix="timing/rollout_recovery",
+        )
 
     # ── internal helpers ───────────────────────────────────────────────────
 
@@ -1265,7 +1322,7 @@ class SingleControllerActor:
         *,
         replay_metadata: Optional[TQReplayMetadataState],
         clear_unreferenced: bool,
-    ) -> None:
+    ) -> int:
         """Validate staging ownership while the caller holds a stable cut."""
         cut.require_live()
         expected_staging_keys = self._rollout_recovery_ledger.expected_staging_keys()
@@ -1309,6 +1366,7 @@ class SingleControllerActor:
             f"referenced={len(expected_staging_keys)}",
             flush=True,
         )
+        return len(expected_staging_keys)
 
     async def _maybe_restore_replacement_reserve(self) -> None:
         """Restore spare prompts diverted before the previous run's checkpoint.
@@ -3612,6 +3670,9 @@ class SingleControllerActor:
             additional_groups=training_owned_groups,
         )
         await self._validate_replay_inventory(replay_metadata)
+        replay_row_count = sum(
+            len(group["meta"].sample_ids) for group in replay_metadata["groups"]
+        )
 
         recovery_state = self._rollout_manager.recovery_ledger.state_dict()
         recovery_state["batch_shortfall"] = self._batch_shortfall.copy()
@@ -3629,8 +3690,9 @@ class SingleControllerActor:
         recovery_payload = payload_buffer.getvalue()
         recovery_digest = hashlib.sha256(recovery_payload).hexdigest()
 
+        staging_row_count = 0
         if self._master_config.token_capture.enabled:
-            await self._validate_rollout_recovery_inventory(
+            staging_row_count = await self._validate_rollout_recovery_inventory(
                 cut,
                 replay_metadata=replay_metadata,
                 clear_unreferenced=False,
@@ -3653,6 +3715,8 @@ class SingleControllerActor:
             replay_metadata=replay_metadata,
             rollout_recovery_payload=recovery_payload,
             rollout_recovery_group_count=len(recovery_state["groups"]),
+            replay_row_count=replay_row_count,
+            staging_row_count=staging_row_count,
             rolled_back_train_group_count=len(training_owned_groups),
             mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
             tq_save_seconds=tq_save_seconds,
@@ -3662,51 +3726,74 @@ class SingleControllerActor:
         self,
         checkpoint_path: Path,
         cut: _RolloutCheckpointCut,
-    ) -> None:
-        """Write metadata-only controller state beside a native TQ snapshot."""
+    ) -> int:
+        """Write controller state beside TQ and return its on-disk byte size."""
+        written_paths: list[Path] = []
+        dataloader_path = checkpoint_path / "train_dataloader.pt"
         await asyncio.to_thread(
             torch.save,
             cut.dataloader_state,
-            checkpoint_path / "train_dataloader.pt",
+            dataloader_path,
         )
+        written_paths.append(dataloader_path)
         if cut.replacement_reserve:
+            replacement_reserve_path = checkpoint_path / REPLACEMENT_RESERVE_FILENAME
             await asyncio.to_thread(
                 torch.save,
                 cut.replacement_reserve,
-                checkpoint_path / "replacement_reserve.pt",
+                replacement_reserve_path,
             )
+            written_paths.append(replacement_reserve_path)
         if cut.replay_metadata is not None:
+            replay_metadata_path = checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME
             await asyncio.to_thread(
                 torch.save,
                 cut.replay_metadata,
-                checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME,
+                replay_metadata_path,
             )
+            written_paths.append(replay_metadata_path)
         if cut.rollout_recovery_payload is not None:
+            rollout_recovery_path = checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME
             await asyncio.to_thread(
-                (checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME).write_bytes,
+                rollout_recovery_path.write_bytes,
                 cut.rollout_recovery_payload,
             )
+            written_paths.append(rollout_recovery_path)
+
+        config_path = checkpoint_path / "config.yaml"
 
         def _write_config() -> None:
             import yaml
 
             dumped = self._master_config.model_dump(mode="json")
-            with (checkpoint_path / "config.yaml").open("w") as config_file:
+            with config_path.open("w") as config_file:
                 yaml.safe_dump(dumped, config_file)
 
         await asyncio.to_thread(_write_config)
+        written_paths.append(config_path)
+        return await asyncio.to_thread(
+            lambda: sum(path.stat().st_size for path in written_paths)
+        )
 
-    async def _save_rollout_checkpoint(self, *, force: bool = False) -> bool:
+    async def _save_rollout_checkpoint(
+        self, *, force: bool = False
+    ) -> _RolloutCheckpointSaveResult:
         """Publish one rollout-only snapshot anchored to durable trainer state."""
         async with self._checkpoint_save_lock:
             if self._optimizer_commit_in_progress:
-                return False
+                return _RolloutCheckpointSaveResult(
+                    saved=False,
+                    reason="optimizer_commit_in_progress",
+                )
             if (
                 not force
                 and self._last_rollout_snapshot_mutation_version
                 == self._data_plane_checkpoint_barrier.mutation_version
             ):
-                return False
+                return _RolloutCheckpointSaveResult(
+                    saved=False,
+                    reason="no_data_plane_mutations",
+                )
 
             save_started = time.monotonic()
             await asyncio.to_thread(self._checkpointer.finalize_pending)
@@ -3742,7 +3829,10 @@ class SingleControllerActor:
                             flush=True,
                         )
                     self._last_missing_rollout_snapshot_anchor = skip_key
-                    return False
+                    return _RolloutCheckpointSaveResult(
+                        saved=False,
+                        reason="missing_trainer_anchor",
+                    )
                 try:
                     await asyncio.to_thread(
                         prune_bootstrap_snapshots,
@@ -3772,14 +3862,23 @@ class SingleControllerActor:
                         or self._trainer_version != expected_trainer_version
                     ):
                         await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
-                        return False
+                        return _RolloutCheckpointSaveResult(
+                            saved=False,
+                            reason="trainer_state_changed",
+                        )
                     snapshot_epoch = self._current_epoch
                     snapshot_cut = await self._capture_rollout_checkpoint_cut(
                         cut, tmp_path
                     )
                 barrier_released = time.monotonic()
 
-                await self._write_rollout_checkpoint_sidecars(tmp_path, snapshot_cut)
+                sidecar_save_started = time.monotonic()
+                controller_sidecar_bytes = (
+                    await self._write_rollout_checkpoint_sidecars(
+                        tmp_path,
+                        snapshot_cut,
+                    )
+                )
                 manifest = RolloutSnapshotManifest(
                     schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
                     base_train_step=expected_train_step,
@@ -3792,10 +3891,16 @@ class SingleControllerActor:
                     ),
                     bootstrap_fingerprint=snapshot_fingerprint,
                 )
+                manifest_text = (
+                    json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n"
+                )
                 await asyncio.to_thread(
                     (tmp_path / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text,
-                    json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n",
+                    manifest_text,
                 )
+                controller_sidecar_bytes += len(manifest_text.encode())
+                sidecar_save_seconds = time.monotonic() - sidecar_save_started
+                snapshot_commit_started = time.monotonic()
                 await asyncio.to_thread(
                     commit_snapshot,
                     tmp_path,
@@ -3804,6 +3909,7 @@ class SingleControllerActor:
                         self._master_config.rollout_checkpointing.keep_latest_k
                     ),
                 )
+                snapshot_commit_seconds = time.monotonic() - snapshot_commit_started
             except BaseException:
                 if tmp_path.exists():
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
@@ -3818,12 +3924,20 @@ class SingleControllerActor:
                 "tq_save_seconds": snapshot_cut.tq_save_seconds,
                 "barrier_wait_seconds": barrier_acquired - barrier_requested,
                 "exclusive_hold_seconds": barrier_released - barrier_acquired,
+                "sidecar_save_seconds": sidecar_save_seconds,
+                "snapshot_commit_seconds": snapshot_commit_seconds,
                 "replay_groups": float(
                     len(snapshot_cut.replay_metadata["groups"])
                     if snapshot_cut.replay_metadata is not None
                     else 0
                 ),
                 "ledger_groups": float(snapshot_cut.rollout_recovery_group_count or 0),
+                "replay_rows": float(snapshot_cut.replay_row_count),
+                "staging_rows": float(snapshot_cut.staging_row_count),
+                "snapshot_rows": float(
+                    snapshot_cut.replay_row_count + snapshot_cut.staging_row_count
+                ),
+                "controller_sidecar_bytes": float(controller_sidecar_bytes),
             }
             self._log_telemetry_metrics(
                 checkpoint_metrics,
@@ -3840,10 +3954,14 @@ class SingleControllerActor:
                 f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
                 flush=True,
             )
-            return True
+            return _RolloutCheckpointSaveResult(saved=True, reason="completed")
 
     def _log_rollout_checkpoint_outcome(
-        self, *, outcome: str, attempt_duration_seconds: float
+        self,
+        *,
+        outcome: Literal["completed", "failed", "skipped"],
+        reason: RolloutCheckpointAttemptReason,
+        attempt_duration_seconds: float,
     ) -> None:
         """Record every scheduled checkpoint attempt, including no-op cuts."""
         metrics = {
@@ -3856,14 +3974,19 @@ class SingleControllerActor:
                 self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
                 or 0.0
             ),
+            f"reason_{reason}": 1.0,
         }
+        completed_at = time.monotonic()
         if outcome == "completed":
-            completed_at = time.monotonic()
             if self._last_successful_rollout_checkpoint_time is not None:
                 metrics["seconds_since_previous_success"] = (
                     completed_at - self._last_successful_rollout_checkpoint_time
                 )
             self._last_successful_rollout_checkpoint_time = completed_at
+        elif self._last_successful_rollout_checkpoint_time is not None:
+            metrics["seconds_since_last_success"] = (
+                completed_at - self._last_successful_rollout_checkpoint_time
+            )
         self._log_telemetry_metrics(
             metrics,
             step=self._train_steps,
@@ -3883,12 +4006,21 @@ class SingleControllerActor:
             attempt_started = time.monotonic()
             deadline_due = self._train_steps == 0 and self._timeout.would_save()
             try:
-                saved = await self._save_rollout_checkpoint(force=deadline_due)
-            except (OSError, TimeoutError) as error:
+                result = await self._save_rollout_checkpoint(force=deadline_due)
+            except Exception as error:
+                if isinstance(error, TimeoutError):
+                    failure_reason: RolloutCheckpointAttemptReason = "timeout"
+                elif isinstance(error, OSError):
+                    failure_reason = "io_error"
+                else:
+                    failure_reason = "invariant_error"
                 self._log_rollout_checkpoint_outcome(
                     outcome="failed",
+                    reason=failure_reason,
                     attempt_duration_seconds=time.monotonic() - attempt_started,
                 )
+                if not isinstance(error, (OSError, TimeoutError)):
+                    raise
                 if deadline_due:
                     raise RuntimeError(
                         "failed to save the required pre-step rollout checkpoint"
@@ -3909,10 +4041,11 @@ class SingleControllerActor:
                 continue
             consecutive_failures = 0
             self._log_rollout_checkpoint_outcome(
-                outcome="completed" if saved else "skipped",
+                outcome="completed" if result.saved else "skipped",
+                reason=result.reason,
                 attempt_duration_seconds=time.monotonic() - attempt_started,
             )
-            if deadline_due and saved and self._timeout.check_save():
+            if deadline_due and result.saved and self._timeout.check_save():
                 print(
                     "Checkpoint deadline reached before the first train step; "
                     "stopping after a durable rollout snapshot",
@@ -3954,7 +4087,9 @@ class SingleControllerActor:
                 stacklevel=2,
             )
 
-        generated_values = _latest_vllm_values(generation_metrics, "generation_tokens")
+        generated_values = _latest_generation_values(
+            generation_metrics, "generation_tokens"
+        )
         generated_by_worker = (
             {worker_id: int(value) for worker_id, value in generated_values.items()}
             if generated_values
@@ -4007,9 +4142,9 @@ class SingleControllerActor:
             )
             metrics["checkpoint_mutation_wait_seconds_max"] = max(mutation_waits)
 
-        running = _latest_vllm_values(generation_metrics, "inflight_batch_sizes")
-        waiting = _latest_vllm_values(generation_metrics, "num_pending_samples")
-        kv_usage = _latest_vllm_values(generation_metrics, "kv_cache_usage_perc")
+        running = _latest_generation_values(generation_metrics, "inflight_batch_sizes")
+        waiting = _latest_generation_values(generation_metrics, "num_pending_samples")
+        kv_usage = _latest_generation_values(generation_metrics, "kv_cache_usage_perc")
         if running:
             metrics["vllm_requests_running"] = sum(running.values())
         if waiting:
@@ -4017,7 +4152,7 @@ class SingleControllerActor:
         if kv_usage:
             metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage.values()) / len(kv_usage)
         if generated_tokens is not None:
-            metrics["vllm_output_tokens"] = float(generated_tokens)
+            metrics["generation_output_tokens"] = float(generated_tokens)
 
         completion_durations = list(self._rollout_completion_durations_s)
         queue_wait_durations = list(self._rollout_queue_wait_durations_s)
@@ -4070,11 +4205,11 @@ class SingleControllerActor:
                             - previous_generated[worker_id]
                             for worker_id in current_workers
                         )
-                        metrics["vllm_output_tokens_per_second"] = (
+                        metrics["generation_output_tokens_per_second"] = (
                             generated_delta / elapsed
                         )
                     else:
-                        metrics["vllm_counter_discontinuity"] = 1.0
+                        metrics["generation_counter_discontinuity"] = 1.0
 
         self._throughput_sample_time = now
         self._throughput_generation_tokens_by_worker = generated_by_worker

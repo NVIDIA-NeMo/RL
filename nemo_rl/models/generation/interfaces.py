@@ -658,6 +658,9 @@ class GenerationInterface(ABC):
 
         Implementations may clear or compact their accumulated metric histories.
         Callers must not assume that a later ``get_logger_metrics`` includes values
-        observed before this drain.
+        observed before this drain. Backends supporting raw rollout throughput
+        should return cumulative sampled-token counters under ``generation_tokens``
+        as ``data_parallel_worker_id -> list[counter]``. The controller computes
+        per-worker deltas before summing them, so counter resets are detectable.
         """
         return self.get_logger_metrics()

@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -1164,7 +1165,9 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         try:
             actor._sampler.restore_dispatch_index(5)
-            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+            result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+            assert result.saved
+            assert result.reason == "completed"
         finally:
             actor._checkpointer.shutdown()
 
@@ -1195,7 +1198,8 @@ class TestPeriodicRolloutCheckpoint:
                 "nemo_rl.algorithms.single_controller.time.monotonic",
                 new=_SteppingClock(),
             ):
-                assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+                result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+                assert result.saved
         finally:
             actor._checkpointer.shutdown()
 
@@ -1204,11 +1208,72 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["total_save_seconds"] > 0
         assert 0 <= logged["barrier_wait_seconds"] <= logged["total_save_seconds"]
         assert 0 <= logged["tq_save_seconds"] <= logged["exclusive_hold_seconds"]
+        assert 0 <= logged["sidecar_save_seconds"] <= logged["total_save_seconds"]
+        assert 0 <= logged["snapshot_commit_seconds"] <= logged["total_save_seconds"]
+        assert logged["controller_sidecar_bytes"] > 0
+        assert logged["snapshot_rows"] == (
+            logged["replay_rows"] + logged["staging_rows"]
+        )
         assert actor._logger.log_metrics.call_args.kwargs == {
             "step": 1,
             "prefix": "timing/rollout_checkpoint",
             "step_metric": "telemetry/wall_time_seconds",
         }
+
+    def test_logs_checkpoint_outcome_reason_and_effective_cadence(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._telemetry_started_at = 0.0
+        try:
+            with patch(
+                "nemo_rl.algorithms.single_controller.time.monotonic",
+                new=_SteppingClock(start=10.0),
+            ):
+                actor._log_rollout_checkpoint_outcome(
+                    outcome="completed",
+                    reason="completed",
+                    attempt_duration_seconds=2.0,
+                )
+                actor._log_rollout_checkpoint_outcome(
+                    outcome="skipped",
+                    reason="no_data_plane_mutations",
+                    attempt_duration_seconds=0.1,
+                )
+        finally:
+            actor._checkpointer.shutdown()
+
+        first, second = actor._logger.log_metrics.call_args_list
+        assert first.args[0]["reason_completed"] == 1.0
+        assert "seconds_since_last_success" not in first.args[0]
+        assert second.args[0]["reason_no_data_plane_mutations"] == 1.0
+        assert second.args[0]["seconds_since_last_success"] == pytest.approx(2.0)
+
+    def test_logs_restore_phase_total_and_reused_groups(self, tmp_path: Path) -> None:
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._telemetry_started_at = time.monotonic()
+        actor._rollout_checkpoint_load_metrics = {
+            "snapshot_resolution_seconds": 0.5,
+            "dataloader_load_seconds": 1.0,
+            "tq_load_seconds": 2.0,
+        }
+        try:
+            actor._log_rollout_restore_metrics(
+                replay_metadata_load_seconds=3.0,
+                recovery_prepare_seconds=4.0,
+                restored_replay_groups=5,
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["total_load_seconds"] == 10.5
+        assert logged["groups_reused"] == 5.0
+        assert actor._logger.log_metrics.call_args.kwargs["prefix"] == (
+            "timing/rollout_recovery"
+        )
 
     def test_logs_raw_and_canonical_rollout_throughput(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
@@ -1262,7 +1327,7 @@ class TestPeriodicRolloutCheckpoint:
             actor._checkpointer.shutdown()
 
         logged = actor._logger.log_metrics.call_args.args[0]
-        assert logged["vllm_output_tokens_per_second"] == pytest.approx(20.0)
+        assert logged["generation_output_tokens_per_second"] == pytest.approx(20.0)
         assert logged["canonical_output_tokens_per_second"] == pytest.approx(4.0)
         assert logged["canonical_groups_per_second"] == pytest.approx(0.2)
         assert logged["vllm_requests_running"] == 3
@@ -1276,6 +1341,8 @@ class TestPeriodicRolloutCheckpoint:
         self, tmp_path: Path
     ):
         actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._telemetry_started_at = time.monotonic()
         claimed_meta = KVBatchMeta(
             partition_id=_PARTITION_ID,
             task_name=None,
@@ -1295,7 +1362,8 @@ class TestPeriodicRolloutCheckpoint:
         actor._dp_client.sample_ids = list(claimed_meta.sample_ids)
 
         try:
-            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+            result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+            assert result.saved
         finally:
             actor._checkpointer.shutdown()
 
@@ -1317,15 +1385,34 @@ class TestPeriodicRolloutCheckpoint:
         assert [group["group_id"] for group in replay_state["groups"]] == [
             "claimed-group"
         ]
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["replay_rows"] == 1.0
+        assert logged["snapshot_rows"] == 1.0
 
     def test_snapshot_skips_optimizer_commit_window(self, tmp_path: Path):
         actor = self._actor(tmp_path)
         actor._optimizer_commit_in_progress = True
         try:
-            assert not asyncio.run(actor._save_rollout_checkpoint(force=True))
+            result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+            assert not result.saved
+            assert result.reason == "optimizer_commit_in_progress"
             assert actor._dp_client.save_calls == []
         finally:
             actor._checkpointer.shutdown()
+
+    def test_snapshot_reports_no_new_mutations(self, tmp_path: Path) -> None:
+        actor = self._actor(tmp_path)
+        actor._last_rollout_snapshot_mutation_version = (
+            actor._data_plane_checkpoint_barrier.mutation_version
+        )
+        try:
+            result = asyncio.run(actor._save_rollout_checkpoint())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert not result.saved
+        assert result.reason == "no_data_plane_mutations"
+        assert actor._dp_client.save_calls == []
 
     def test_periodic_pump_reports_each_consecutive_failure(
         self,
@@ -1398,6 +1485,8 @@ class TestPeriodicRolloutCheckpoint:
 
     def test_periodic_pump_does_not_retry_invariant_failure(self, tmp_path: Path):
         actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._telemetry_started_at = time.monotonic()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         calls = 0
 
@@ -1421,6 +1510,9 @@ class TestPeriodicRolloutCheckpoint:
             actor._checkpointer.shutdown()
 
         assert calls == 1
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["failed"] == 1.0
+        assert logged["reason_invariant_error"] == 1.0
 
 
 class TestDataPlaneCheckpoint:
@@ -1656,15 +1748,15 @@ class TestDataPlaneCheckpoint:
         )
         actor._dp_client = dp_client
 
-        async def validate_inventory() -> None:
+        async def validate_inventory() -> int:
             async with DataPlaneCheckpointBarrier().mutation() as cut:
-                await actor._validate_rollout_recovery_inventory(
+                return await actor._validate_rollout_recovery_inventory(
                     cut,
                     replay_metadata=replay_metadata,  # type: ignore[arg-type]
                     clear_unreferenced=True,
                 )
 
-        asyncio.run(validate_inventory())
+        assert asyncio.run(validate_inventory()) == 2
 
         assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
         assert sorted(dp_client.sample_ids) == [route_key, "sealed-key"]
@@ -2264,6 +2356,12 @@ class TestSetupResumeWiring:
         assert actor_args.save_state.current_epoch == 4
         assert actor_args.save_state.sampler_dispatch_index == 6
         assert actor_args.last_checkpoint_path == str(final_snapshot)
+        assert actor_args.rollout_checkpoint_load_metrics is not None
+        assert {
+            "snapshot_resolution_seconds",
+            "dataloader_load_seconds",
+            "tq_load_seconds",
+        } <= actor_args.rollout_checkpoint_load_metrics.keys()
 
     def test_disabled_periodic_checkpointing_uses_trainer_anchor(
         self,

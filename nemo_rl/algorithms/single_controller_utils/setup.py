@@ -1164,6 +1164,7 @@ def setup_single_controller(
         if save_state.trainer_version is not None
         else save_state.current_step
     )
+    snapshot_resolution_started = time.monotonic()
     if (
         trainer_checkpoint_path is not None
         and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
@@ -1203,6 +1204,7 @@ def setup_single_controller(
                 expected_trainer_version=0,
                 expected_bootstrap_fingerprint=bootstrap_digest,
             )
+    snapshot_resolution_seconds = time.monotonic() - snapshot_resolution_started
     if resolved_snapshot is not None:
         recovery_checkpoint_path = str(resolved_snapshot.path)
         save_state.current_epoch = resolved_snapshot.manifest.current_epoch
@@ -1227,7 +1229,9 @@ def setup_single_controller(
         or (recovery_path / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
     )
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = (
-        {} if has_rollout_checkpoint_payload else None
+        {"snapshot_resolution_seconds": snapshot_resolution_seconds}
+        if has_rollout_checkpoint_payload
+        else None
     )
 
     # ==========================
