@@ -19,9 +19,9 @@ Charges each rollout for the time its agent loop ran::
     reward_i = reward_i - lambda_time * (openhands_run_time_i / 60)
 
 ``openhands_run_time`` (seconds) is emitted by the Gym ``swe_agents`` server
-for every rollout. It covers the agent loop only and excludes container
-spin-up, final evaluation and Ray queueing, so it is the part of wall time the
-policy can actually influence. With the default ``lambda_time = 1/60`` a
+for every rollout. It spans the agent container from launch to exit, so it
+excludes final evaluation and Ray queueing but *includes* apptainer spin-up,
+which the policy cannot influence. With the default ``lambda_time = 1/60`` a
 60-minute rollout costs exactly 1.0: one hour of compute is priced at one
 solved task.
 
@@ -49,7 +49,8 @@ class TimeEfficiencyConfig(BaseModel, extra="allow"):
         apply_to: ``"all"`` deducts from every rollout, including failures, so
             failed rollouts also receive a gradient from their wall time; a
             slow correct rollout can then score below a fast incorrect one.
-            ``"correct"`` deducts from resolved rollouts only.
+            ``"correct"`` deducts only from rollouts that are resolved and
+            still carry a positive reward after the reward-zeroing penalties.
         floor: Lower clamp on the post-deduction reward so one pathologically
             slow rollout cannot dominate its group. ``None`` disables.
     """
@@ -79,17 +80,21 @@ def apply_time_efficiency_reward(
 ) -> dict[str, float]:
     """Deduct the wall-time price from each ``result["full_result"]["reward"]`` in place.
 
-    Runs before the reward-zeroing penalties in the NeMo-Gym postprocess so
-    those can still zero a rollout after the deduction.
+    Runs last in the NeMo-Gym postprocess, after effort shaping, the
+    reward-zeroing penalties and the length penalties: those assume a binary
+    env reward, so the continuous deduction only composes with them when it is
+    applied after them.
 
     Args:
-        results: One prompt group of NeMo-Gym rollout results.
+        results: The NeMo-Gym rollout results to adjust: one prompt group on
+            the async collector path, the whole batch in
+            ``run_nemo_gym_rollout_sync``.
         config: The ``grpo.time_efficiency`` block. ``None`` or
             ``enabled=False`` leaves ``results`` untouched.
 
     Returns:
-        Group-level metrics under the ``time_efficiency/`` prefix, or an empty
-        dict when the feature is disabled or ``results`` is empty.
+        Metrics under the ``time_efficiency/`` prefix computed over ``results``,
+        or an empty dict when the feature is disabled or ``results`` is empty.
     """
     if config is None or not config.enabled or not results:
         return {}
@@ -98,7 +103,9 @@ def apply_time_efficiency_reward(
     deductions: list[float] = []
     for result, rollout_min in zip(results, minutes):
         full_result = result["full_result"]
-        if config.apply_to == "correct" and not full_result.get("resolved"):
+        if config.apply_to == "correct" and not (
+            full_result.get("resolved") and full_result.get("reward")
+        ):
             deductions.append(0.0)
             continue
         base = float(full_result.get("reward") or 0.0)
@@ -108,12 +115,17 @@ def apply_time_efficiency_reward(
         deductions.append(base - new)
         full_result["reward"] = new
 
+    # ``<name>/<stat>`` keys so aggregate_rollout_metrics maxes the ``/max``
+    # entries across prompt groups instead of averaging them.
     return {
-        "time_efficiency/minutes_mean": sum(minutes) / len(minutes),
-        "time_efficiency/minutes_max": max(minutes),
-        "time_efficiency/deduction_mean": sum(deductions) / len(deductions),
-        "time_efficiency/deduction_max": max(deductions),
-        # 1.0 when wall times differ within the group, i.e. the term can still
-        # produce a gradient after group normalization.
-        "time_efficiency/group_has_signal": float(max(minutes) > min(minutes)),
+        "time_efficiency/minutes/mean": sum(minutes) / len(minutes),
+        "time_efficiency/minutes/max": max(minutes),
+        "time_efficiency/deduction/mean": sum(deductions) / len(deductions),
+        "time_efficiency/deduction/max": max(deductions),
+        # 1.0 when the deduction differs within the group (skipped rollouts
+        # count as 0), i.e. the term can still produce a gradient after group
+        # normalization. 1e-6 absorbs float noise from ``base - new``.
+        "time_efficiency/group_has_signal": float(
+            max(deductions) - min(deductions) > 1e-6
+        ),
     }

@@ -2566,6 +2566,7 @@ def run_nemo_gym_rollout_sync(
         greedy: Must be ``False`` because this path does not support greedy mode.
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
+        length_penalty_config: Optional GRPO config block for length adjustments.
         time_efficiency_config: Optional ``grpo.time_efficiency`` block; deducts
             a price for each rollout's agent wall time from its reward.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
@@ -2639,12 +2640,6 @@ def _postprocess_single_nemo_gym_group(
     mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
-    # Wall-clock time-efficiency reward. Runs first so the reward-zeroing
-    # penalties below can still zero a rollout after the deduction.
-    time_efficiency_stats = apply_time_efficiency_reward(
-        results, time_efficiency_config
-    )
-
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
     length_rewards_low = shaping.length_rewards_low
@@ -2677,6 +2672,14 @@ def _postprocess_single_nemo_gym_group(
             apply_group_length_penalties(
                 results, {"grpo": grpo_config}, tokenizer=tokenizer
             )
+
+    # Wall-clock time-efficiency reward. Runs LAST: the shapers above assume a
+    # binary env reward (effort shaping multiplies it, the length penalties gate
+    # on a 0/1 reward, the reward penalties reset it to 0), so the continuous
+    # deduction only composes with them when applied after them.
+    time_efficiency_stats = apply_time_efficiency_reward(
+        results, time_efficiency_config
+    )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):

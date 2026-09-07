@@ -50,8 +50,9 @@ grpo:
   # Wall-clock time-efficiency reward for NeMo-Gym agentic rollouts (training only):
   #   reward = reward - lambda_time * (openhands_run_time / 60)
   # lambda_time 1/60 makes a 60-minute rollout cost exactly 1.0. apply_to "all"
-  # deducts from every rollout, including failures; "correct" deducts from
-  # resolved rollouts only. floor clamps the post-deduction reward; null disables.
+  # deducts from every rollout, including failures; "correct" deducts only from
+  # resolved rollouts whose reward survived the reward-zeroing penalties. floor
+  # clamps the post-deduction reward; null disables. Requires the NeMo-Gym path.
   # Pair with a tight advantage_clip_low/high (e.g. -3/3) when normalize_rewards
   # is true, otherwise a narrow group reward spread amplifies this small term.
   time_efficiency:

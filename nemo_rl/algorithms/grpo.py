@@ -354,9 +354,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     # Wall-clock time-efficiency reward for NeMo-Gym agentic rollouts:
-    # reward -= lambda_time * openhands_run_time / 60. Applied to training
-    # rollouts only; validation reports the raw env reward.
-    # See nemo_rl/utils/time_efficiency.py.
+    # reward -= lambda_time * openhands_run_time / 60, applied after the other
+    # reward shapers. Training rollouts only; validation reports the raw env
+    # reward. See nemo_rl/utils/time_efficiency.py.
     time_efficiency: TimeEfficiencyConfig = Field(default_factory=TimeEfficiencyConfig)
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: bool = False
@@ -805,6 +805,9 @@ def setup(
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
     _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=enable_nemo_gym
+    )
+    _raise_if_time_efficiency_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
@@ -2054,6 +2057,22 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
         "reward_penalties require the NeMo-Gym path "
         "(env.should_use_nemo_gym=true); they are not supported with the native "
         "generation path."
+    )
+
+
+def _raise_if_time_efficiency_enabled_without_nemo_gym(
+    master_config: MasterConfig,
+    *,
+    enable_nemo_gym: bool,
+) -> None:
+    """Validate the time-efficiency reward is only used with NeMo-Gym."""
+    if enable_nemo_gym or not master_config.grpo.time_efficiency.enabled:
+        return
+
+    raise ValueError(
+        "grpo.time_efficiency requires the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); openhands_run_time is only emitted by "
+        "Gym agents, so the deduction would be a silent no-op elsewhere."
     )
 
 
