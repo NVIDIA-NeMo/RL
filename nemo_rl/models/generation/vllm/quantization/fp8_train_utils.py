@@ -125,7 +125,8 @@ def iter_mxfp8_prequantized_params(
         selected_names: Parameter names selected for MXFP8 prequantization.
         quantize_fn: MXFP8 quantization function.
         scratch_cache: Reusable stacking buffers keyed by device, dtype, and
-            CUDA stream.
+            CUDA stream. When omitted, reuse is limited to this export pass so
+            the stacking storage is released before training resumes.
         max_experts_per_batch: Maximum number of experts per quantization call.
 
     Yields:
@@ -243,6 +244,8 @@ def iter_mxfp8_prequantized_params(
                         if source_stream is not None and source_stream != stack_stream:
                             stack_stream.wait_stream(source_stream)
                         tensor.record_stream(stack_stream)
+                # Stream objects must outlive this export pass; their raw CUDA
+                # handles form part of the scratch-storage identity.
                 stream_id = (
                     int(stack_stream.cuda_stream) if stack_stream is not None else None
                 )
@@ -265,6 +268,8 @@ def iter_mxfp8_prequantized_params(
                 scale_shape = (*first.shape[:-1], scale_columns)
                 scale = scale.view(len(chunk), *scale_shape)
                 for offset, index in enumerate(chunk_indices):
+                    # These views avoid per-expert copies. Refit consumers must
+                    # copy them before advancing past the current export batch.
                     results[index] = value[offset], scale[offset], stack_stream
 
         for index, (_id, _proj, name, _tensor, _stream) in enumerate(pending):
@@ -300,6 +305,8 @@ def iter_mxfp8_prequantized_params(
             and len(pending_expert_ids) == max_experts_per_batch
         ):
             yield from flush_pending()
+        # Bridge export must hand off any private producer stream before yield;
+        # the ambient stream observed here defines tensor readiness.
         source_stream = (
             torch.cuda.current_stream(tensor.device) if tensor.is_cuda else None
         )

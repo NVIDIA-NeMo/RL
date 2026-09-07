@@ -2398,6 +2398,7 @@ class MegatronPolicyWorkerImpl(
     def _maybe_prequantize_param(
         self, name: str, tensor: torch.Tensor
     ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Single-tensor fallback; normal trainer export uses the batched iterator."""
         if name not in self._refit_prequant_names:
             yield name, tensor
             return
