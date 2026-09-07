@@ -14,7 +14,6 @@
 
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).parents[3]
 DOCKERFILES = (
     REPO_ROOT / "docker/Dockerfile",
