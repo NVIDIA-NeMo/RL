@@ -221,10 +221,21 @@ class _FakeBuffer:
 
 
 class _FakeImpl:
-    """Stand-in for AsyncRolloutImpl that returns a sentinel record."""
+    """Stand-in for AsyncRolloutImpl that returns a typed sentinel record."""
 
     def __init__(self, record="sentinel-record", on_run=None) -> None:
-        self._record = record
+        self._record = (
+            record
+            if isinstance(record, PromptGroupRecord)
+            else PromptGroupRecord(
+                prompt_idx=0,
+                prompt=[],
+                extra_env_info=None,
+                metadata={"sentinel": record},
+                completions=[],
+                rollout_metrics={},
+            )
+        )
         self._on_run = on_run
 
     async def run_rollout(self, input_sample):
@@ -257,6 +268,10 @@ def _make_manager(
         else RolloutRetryPolicy.single_attempt()
     )
     mgr._stats = RolloutStats()
+    mgr._canonical_groups_finalized = 0
+    mgr._canonical_output_tokens = 0
+    mgr._recovery_siblings_reused = 0
+    mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
     return mgr
@@ -441,7 +456,8 @@ class TestGenerateAndPushFlow:
         assert len(buf.commit_calls) == 1
         gid, record, start_v, end_v = buf.commit_calls[0]
         assert gid in buf._slots
-        assert record == "r0"
+        assert isinstance(record, PromptGroupRecord)
+        assert record.metadata["sentinel"] == "r0"
         assert start_v == 0
         assert end_v == 0
         assert len(mgr.recovery_ledger) == 0
@@ -1735,6 +1751,10 @@ def _make_capture_manager(
         else RolloutRetryPolicy.single_attempt()
     )
     mgr._stats = RolloutStats()
+    mgr._canonical_groups_finalized = 0
+    mgr._canonical_output_tokens = 0
+    mgr._recovery_siblings_reused = 0
+    mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
     mgr._recovery_ledger = RolloutRecoveryLedger()
