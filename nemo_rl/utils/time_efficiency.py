@@ -33,6 +33,7 @@ by wall time is normalized by a tiny spread and its advantages explode.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -49,6 +50,13 @@ class TimeEfficiencyConfig(BaseModel, extra="allow"):
         apply_to: ``"all"`` deducts from every rollout, including failures, so
             failed rollouts also receive a gradient from their wall time; a
             slow correct rollout can then score below a fast incorrect one.
+            Rollouts the env flags with ``mask_sample`` (``swe_agents`` flags
+            timeouts, i.e. the group's longest rollouts) are exempt while
+            ``env.should_mask_flagged_samples`` is on: they are dropped from
+            the loss, so charging them could only drag their siblings' group
+            baseline down. They still enter the baseline at their raw 0.0,
+            which tilts it slightly the other way. With the flag off those
+            rows train and are charged.
             ``"correct"`` deducts only from rollouts that are resolved and
             still carry a positive reward after the reward-zeroing penalties.
         floor: Lower clamp on the post-deduction reward so one pathologically
@@ -77,6 +85,8 @@ def rollout_minutes(result: dict[str, Any]) -> float:
 def apply_time_efficiency_reward(
     results: list[dict[str, Any]],
     config: TimeEfficiencyConfig | None,
+    *,
+    mask_sample: Sequence[bool] | None = None,
 ) -> dict[str, float]:
     """Deduct the wall-time price from each ``result["full_result"]["reward"]`` in place.
 
@@ -91,20 +101,39 @@ def apply_time_efficiency_reward(
             ``run_nemo_gym_rollout_sync``.
         config: The ``grpo.time_efficiency`` block. ``None`` or
             ``enabled=False`` leaves ``results`` untouched.
+        mask_sample: Per-row env ``mask_sample`` flags, one per result, as
+            produced by the caller's loss-mask extraction. Flagged rows are not
+            charged (their deduction is 0). ``None`` charges every row; pass it
+            when ``env.should_mask_flagged_samples`` is off, since those rows
+            then train.
 
     Returns:
         Metrics under the ``time_efficiency/`` prefix computed over ``results``,
         or an empty dict when the feature is disabled or ``results`` is empty.
+        Skipped rows count toward the means with a 0 deduction;
+        ``group_has_signal`` is computed over the rows that train.
+
+    Raises:
+        ValueError: If ``mask_sample`` is given with a length other than
+            ``len(results)``.
     """
     if config is None or not config.enabled or not results:
         return {}
+    if mask_sample is not None and len(mask_sample) != len(results):
+        raise ValueError(
+            f"mask_sample has {len(mask_sample)} entries for {len(results)} results"
+        )
+    masked = (
+        [bool(flag) for flag in mask_sample] if mask_sample else [False] * len(results)
+    )
 
     minutes = [rollout_minutes(result) for result in results]
     deductions: list[float] = []
-    for result, rollout_min in zip(results, minutes):
+    for result, rollout_min, is_masked in zip(results, minutes, masked):
         full_result = result["full_result"]
-        if config.apply_to == "correct" and not (
-            full_result.get("resolved") and full_result.get("reward")
+        if is_masked or (
+            config.apply_to == "correct"
+            and not (full_result.get("resolved") and full_result.get("reward"))
         ):
             deductions.append(0.0)
             continue
@@ -115,6 +144,12 @@ def apply_time_efficiency_reward(
         deductions.append(base - new)
         full_result["reward"] = new
 
+    # Loss-masked rows cannot learn from the term, so the signal metric only
+    # looks at the rows that train.
+    trainable_deductions = [
+        d for d, is_masked in zip(deductions, masked) if not is_masked
+    ]
+
     # ``<name>/<stat>`` keys so aggregate_rollout_metrics maxes the ``/max``
     # entries across prompt groups instead of averaging them.
     return {
@@ -122,10 +157,11 @@ def apply_time_efficiency_reward(
         "time_efficiency/minutes/max": max(minutes),
         "time_efficiency/deduction/mean": sum(deductions) / len(deductions),
         "time_efficiency/deduction/max": max(deductions),
-        # 1.0 when the deduction differs within the group (skipped rollouts
-        # count as 0), i.e. the term can still produce a gradient after group
-        # normalization. 1e-6 absorbs float noise from ``base - new``.
+        # 1.0 when the deduction differs among the trainable rows ("correct"
+        # skips count as 0), i.e. the term can still produce a gradient after
+        # group normalization. 1e-6 absorbs float noise from ``base - new``.
         "time_efficiency/group_has_signal": float(
-            max(deductions) - min(deductions) > 1e-6
+            len(trainable_deductions) > 1
+            and max(trainable_deductions) - min(trainable_deductions) > 1e-6
         ),
     }

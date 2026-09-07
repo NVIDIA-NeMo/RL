@@ -2673,12 +2673,23 @@ def _postprocess_single_nemo_gym_group(
                 results, {"grpo": grpo_config}, tokenizer=tokenizer
             )
 
+    # Env/agent mask flag: flagged samples are dropped from the loss but still
+    # count for advantages. env.should_mask_flagged_samples=false skips this.
+    mask_sample_flags = (
+        _extract_mask_sample_flags(results) if mask_env_flagged_samples else None
+    )
+
     # Wall-clock time-efficiency reward. Runs LAST: the shapers above assume a
     # binary env reward (effort shaping multiplies it, the length penalties gate
     # on a 0/1 reward, the reward penalties reset it to 0), so the continuous
-    # deduction only composes with them when applied after them.
+    # deduction only composes with them when applied after them. Rows the
+    # trainer drops from the loss are not charged (same flags as final_batch).
     time_efficiency_stats = apply_time_efficiency_reward(
-        results, time_efficiency_config
+        results,
+        time_efficiency_config,
+        mask_sample=(
+            mask_sample_flags.tolist() if mask_sample_flags is not None else None
+        ),
     )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
@@ -2883,10 +2894,8 @@ def _postprocess_single_nemo_gym_group(
             final_batch[identity_key] = torch.tensor(
                 [int(value) for value in identity_values], dtype=torch.long
             )
-    # Env/agent mask flag: flagged samples are dropped from the loss but still
-    # count for advantages. env.should_mask_flagged_samples=false skips this.
-    if mask_env_flagged_samples:
-        final_batch["mask_sample"] = _extract_mask_sample_flags(results)
+    if mask_sample_flags is not None:
+        final_batch["mask_sample"] = mask_sample_flags
 
     if length_rewards_low:
         rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(

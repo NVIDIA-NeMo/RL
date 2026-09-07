@@ -169,6 +169,46 @@ class TestApplyTimeEfficiencyReward:
         )
         assert stats["time_efficiency/group_has_signal"] == 0.0
 
+    def test_masked_rows_are_not_charged_when_the_loss_mask_is_on(self):
+        # Three trainable failures at equal wall time plus a loss-masked 60-min
+        # timeout (the group's longest rollout by construction).
+        def group():
+            return [
+                make_result(0.0, 600.0, resolved=False),
+                make_result(0.0, 600.0, resolved=False),
+                make_result(0.0, 600.0, resolved=False),
+                make_result(0.0, 3600.0, resolved=False),
+            ]
+
+        results = group()
+        stats = apply_time_efficiency_reward(
+            results,
+            TimeEfficiencyConfig(enabled=True),
+            mask_sample=[False, False, False, True],
+        )
+        # Masked row keeps its raw reward; trainable rows are charged as usual.
+        assert rewards(results) == pytest.approx([-1 / 6, -1 / 6, -1 / 6, 0.0])
+        assert stats["time_efficiency/deduction/max"] == pytest.approx(1 / 6)
+        # The trainable rows have identical deductions, so there is no signal
+        # even though the masked row's 0 deduction differs from theirs.
+        assert stats["time_efficiency/group_has_signal"] == 0.0
+
+        # With the loss mask off those rows train, so they are charged.
+        results = group()
+        stats = apply_time_efficiency_reward(
+            results, TimeEfficiencyConfig(enabled=True), mask_sample=None
+        )
+        assert rewards(results) == pytest.approx([-1 / 6, -1 / 6, -1 / 6, -1.0])
+        assert stats["time_efficiency/deduction/max"] == pytest.approx(1.0)
+        assert stats["time_efficiency/group_has_signal"] == 1.0
+
+    def test_mask_sample_length_mismatch_raises(self):
+        results = [make_result(1.0, 600.0), make_result(1.0, 600.0)]
+        with pytest.raises(ValueError, match="mask_sample has 1 entries"):
+            apply_time_efficiency_reward(
+                results, TimeEfficiencyConfig(enabled=True), mask_sample=[True]
+            )
+
     def test_group_has_signal_follows_deductions_not_wall_times(self):
         # "correct" on an all-failed group: wall times differ, nothing deducted.
         results = [
