@@ -14,9 +14,12 @@
 
 """Wall-clock time-efficiency reward for NeMo-Gym agentic rollouts.
 
-Charges each rollout for the time its agent loop ran::
+Charges each rollout for the time its agent loop ran, optionally paying a
+saturating bonus for the tool calls it made::
 
-    reward_i = reward_i - lambda_time * (openhands_run_time_i / 60)
+    reward_i = reward_i
+               + lambda_call_bonus * min(calls_i / call_bonus_ref, 1)   # 0 by default
+               - lambda_time * (openhands_run_time_i / 60)
 
 ``openhands_run_time`` (seconds) is emitted by the Gym ``swe_agents`` server
 for every rollout. It spans the agent container from launch to exit, so it
@@ -36,7 +39,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 
 class TimeEfficiencyConfig(BaseModel, extra="allow"):
@@ -59,14 +62,42 @@ class TimeEfficiencyConfig(BaseModel, extra="allow"):
             rows train and are charged.
             ``"correct"`` deducts only from rollouts that are resolved and
             still carry a positive reward after the reward-zeroing penalties.
-        floor: Lower clamp on the post-deduction reward so one pathologically
-            slow rollout cannot dominate its group. ``None`` disables.
+        lambda_call_bonus: Bonus paid for tool calls, saturating at
+            ``call_bonus_ref`` calls: ``lambda_call_bonus * min(calls /
+            call_bonus_ref, 1)``. Only well-formed ``function_call`` items
+            count, so a malformed call earns nothing. ``0`` (default) disables
+            the bonus and reduces this block to the plain time deduction. The
+            bonus follows the same ``apply_to`` gate as the deduction; paying
+            it on failures (``"all"``) rewards junk calls, so use ``"correct"``
+            with it.
+        call_bonus_ref: Number of calls at which the bonus saturates. Model
+            and task specific: calibrate it to the untrained checkpoint's
+            average calls per solved task (read ``time_efficiency/calls/mean``
+            off step 1). Required when ``lambda_call_bonus > 0``.
+        floor: Lower clamp on the adjusted reward so one pathologically slow
+            rollout cannot dominate its group. ``None`` disables. With the
+            bonus, a correct rollout that runs a 60-minute timeout without
+            earning the bonus lands on exactly 0.0 and ties with the
+            failures; a small positive floor keeps it above them.
     """
 
     enabled: bool = False
     lambda_time: float = 1.0 / 60.0
     apply_to: Literal["all", "correct"] = "all"
+    lambda_call_bonus: float = Field(default=0.0, ge=0.0)
+    call_bonus_ref: float | None = None
     floor: float | None = None
+
+    @model_validator(mode="after")
+    def _check_call_bonus_ref(self) -> "TimeEfficiencyConfig":
+        if self.lambda_call_bonus > 0 and not (
+            self.call_bonus_ref is not None and self.call_bonus_ref > 0
+        ):
+            raise ValueError(
+                "grpo.time_efficiency.call_bonus_ref must be a positive number of "
+                "tool calls when lambda_call_bonus > 0"
+            )
+        return self
 
 
 def rollout_minutes(result: dict[str, Any]) -> float:
@@ -82,13 +113,30 @@ def rollout_minutes(result: dict[str, Any]) -> float:
         return 0.0
 
 
+def rollout_calls(result: dict[str, Any]) -> int:
+    """Return the number of well-formed tool calls the model emitted.
+
+    Counts ``function_call`` items in the Responses output. Calls the
+    environment rejected as malformed never become ``function_call`` items,
+    so they earn no bonus.
+    """
+    output = (result["full_result"].get("response") or {}).get("output")
+    if not isinstance(output, list):
+        return 0
+    return sum(
+        1
+        for item in output
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    )
+
+
 def apply_time_efficiency_reward(
     results: list[dict[str, Any]],
     config: TimeEfficiencyConfig | None,
     *,
     mask_sample: Sequence[bool] | None = None,
 ) -> dict[str, float]:
-    """Deduct the wall-time price from each ``result["full_result"]["reward"]`` in place.
+    """Adjust each ``result["full_result"]["reward"]`` in place for wall time and tool calls.
 
     Runs last in the NeMo-Gym postprocess, after effort shaping, the
     reward-zeroing penalties and the length penalties: those assume a binary
@@ -110,7 +158,13 @@ def apply_time_efficiency_reward(
     Returns:
         Metrics under the ``time_efficiency/`` prefix computed over ``results``,
         or an empty dict when the feature is disabled or ``results`` is empty.
-        Skipped rows count toward the means with a 0 deduction;
+        ``deduction`` is the realized decrease of the reward (net of the call
+        bonus and the floor; negative when the bonus wins), ``bonus`` the raw
+        call bonus, ``calls`` the tool-call count, ``seconds_per_call`` the
+        quantity a call bonus can be gamed on (a collapse alongside rising
+        ``calls/mean`` means cheap-call spam), ``bonus_saturated_frac`` and
+        ``floored_frac`` the calibration signals for ``call_bonus_ref`` and
+        ``floor``. Skipped rows count toward the means with 0;
         ``group_has_signal`` is computed over the rows that train.
 
     Raises:
@@ -128,20 +182,31 @@ def apply_time_efficiency_reward(
     )
 
     minutes = [rollout_minutes(result) for result in results]
+    calls = [rollout_calls(result) for result in results]
     deductions: list[float] = []
-    for result, rollout_min, is_masked in zip(results, minutes, masked):
+    bonuses: list[float] = []
+    floored = 0
+    for result, rollout_min, n_calls, is_masked in zip(results, minutes, calls, masked):
         full_result = result["full_result"]
         if is_masked or (
             config.apply_to == "correct"
             and not (full_result.get("resolved") and full_result.get("reward"))
         ):
             deductions.append(0.0)
+            bonuses.append(0.0)
             continue
         base = float(full_result.get("reward") or 0.0)
-        new = base - config.lambda_time * rollout_min
-        if config.floor is not None:
-            new = max(new, config.floor)
+        bonus = 0.0
+        if config.lambda_call_bonus > 0:
+            # call_bonus_ref is validated to be positive when the bonus is on.
+            assert config.call_bonus_ref is not None
+            bonus = config.lambda_call_bonus * min(n_calls / config.call_bonus_ref, 1.0)
+        new = base + bonus - config.lambda_time * rollout_min
+        if config.floor is not None and new < config.floor:
+            new = config.floor
+            floored += 1
         deductions.append(base - new)
+        bonuses.append(bonus)
         full_result["reward"] = new
 
     # Loss-masked rows cannot learn from the term, so the signal metric only
@@ -152,11 +217,21 @@ def apply_time_efficiency_reward(
 
     # ``<name>/<stat>`` keys so aggregate_rollout_metrics maxes the ``/max``
     # entries across prompt groups instead of averaging them.
+    n = len(results)
     return {
-        "time_efficiency/minutes/mean": sum(minutes) / len(minutes),
+        "time_efficiency/minutes/mean": sum(minutes) / n,
         "time_efficiency/minutes/max": max(minutes),
-        "time_efficiency/deduction/mean": sum(deductions) / len(deductions),
+        "time_efficiency/deduction/mean": sum(deductions) / n,
         "time_efficiency/deduction/max": max(deductions),
+        "time_efficiency/calls/mean": sum(calls) / n,
+        "time_efficiency/bonus/mean": sum(bonuses) / n,
+        "time_efficiency/seconds_per_call": sum(minutes) * 60.0 / max(sum(calls), 1),
+        "time_efficiency/bonus_saturated_frac": (
+            sum(1 for c in calls if c >= config.call_bonus_ref) / n
+            if config.lambda_call_bonus > 0 and config.call_bonus_ref
+            else 0.0
+        ),
+        "time_efficiency/floored_frac": floored / n,
         # 1.0 when the deduction differs among the trainable rows ("correct"
         # skips count as 0), i.e. the term can still produce a gradient after
         # group normalization. 1e-6 absorbs float noise from ``base - new``.
