@@ -17,7 +17,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneConfig
+from nemo_rl.data_plane.interfaces import (
+    DataPlaneClient,
+    DataPlaneConfig,
+    DataPlaneRuntimeConfig,
+    LocalDataPlaneConfig,
+)
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import MasterConfig
@@ -113,13 +118,13 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
 
 
 def build_data_plane_client(
-    cfg: DataPlaneConfig | None, *, bootstrap: bool = True
+    cfg: DataPlaneRuntimeConfig | None, *, bootstrap: bool = True
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 
-    Dispatches on ``cfg["impl"]``. Only ``"transfer_queue"`` ships today;
-    other adapters can be added behind this factory without touching
-    call sites. Raises if data_plane is disabled — the legacy trainer
+    Dispatches on the configured implementation. TransferQueue supports
+    cross-process transfer; the local adapter keeps colocated SFT batches in
+    one process. Raises if data_plane is disabled — the legacy trainer
     (``nemo_rl.algorithms.grpo.grpo_train``) should be used in that case
     rather than a NoOp fallback here.
 
@@ -133,22 +138,46 @@ def build_data_plane_client(
         A configured ``DataPlaneClient``; wrapped in
         :class:`MetricsDataPlaneClient` when observability is enabled.
     """
-    if cfg is None or not cfg["enabled"]:
+    if cfg is None:
+        raise ValueError(
+            "build_data_plane_client called with data_plane disabled. "
+            "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer "
+            "(which never engages the data plane) for that case."
+        )
+    if isinstance(cfg, LocalDataPlaneConfig):
+        enabled = cfg.enabled
+    else:
+        enabled = cfg["enabled"]
+    if not enabled:
         raise ValueError(
             "build_data_plane_client called with data_plane disabled. "
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer "
             "(which never engages the data plane) for that case."
         )
 
-    impl = cfg["impl"]
+    impl = cfg.impl if isinstance(cfg, LocalDataPlaneConfig) else cfg["impl"]
     if impl == "transfer_queue":
         from nemo_rl.data_plane.adapters.transfer_queue import TQDataPlaneClient
 
+        assert not isinstance(cfg, LocalDataPlaneConfig)
         client: DataPlaneClient = TQDataPlaneClient(cfg, bootstrap=bootstrap)
+    elif impl == "local":
+        from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient
+
+        local_cfg = (
+            cfg
+            if isinstance(cfg, LocalDataPlaneConfig)
+            else LocalDataPlaneConfig.model_validate(cfg)
+        )
+        client = LocalDataPlaneClient(local_cfg)
     else:
         raise ValueError(f"unknown data_plane impl: {impl!r}")
 
-    obs = cfg.get("observability") or {}
+    obs = (
+        cfg.observability
+        if isinstance(cfg, LocalDataPlaneConfig)
+        else cfg.get("observability")
+    ) or {}
     if obs.get("enabled", False):
         from nemo_rl.data_plane.observability import (
             MetricsDataPlaneClient,
