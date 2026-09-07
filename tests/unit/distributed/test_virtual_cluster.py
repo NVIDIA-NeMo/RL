@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 import re
 import socket
 import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -759,29 +761,47 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
 
 
-@pytest.mark.parametrize("use_system_executable", [False, True])
-def test_py_executables_honor_system_flag(monkeypatch, use_system_executable):
-    original_values = {
-        name: value for name, value in vars(PY_EXECUTABLES).items() if name.isupper()
-    }
+_REGISTRY_PROBE = """
+import json
 
-    try:
-        monkeypatch.setenv(
-            "NEMO_RL_PY_EXECUTABLES_SYSTEM", "1" if use_system_executable else "0"
-        )
-        # The flag is resolved once at import, so re-run it after changing the env.
-        PY_EXECUTABLES._resolve_system_overrides()
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+    get_actor_python_env,
+)
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
-        current = {
-            name: value
-            for name, value in vars(PY_EXECUTABLES).items()
-            if name.isupper()
+envs = {fqn: get_actor_python_env(fqn) for fqn in ACTOR_ENVIRONMENT_REGISTRY}
+print(
+    json.dumps(
+        {
+            "all_system": set(envs.values()) == {PY_EXECUTABLES.SYSTEM},
+            "envs": envs,
         }
-        if use_system_executable:
-            assert set(current.values()) == {PY_EXECUTABLES.SYSTEM}
-        else:
-            assert current == original_values
-    finally:
-        # _resolve_system_overrides only ever overwrites, so put the uv commands back here.
-        for name, value in original_values.items():
-            setattr(PY_EXECUTABLES, name, value)
+    )
+)
+"""
+
+
+@pytest.mark.parametrize("use_system_executable", [False, True])
+def test_actor_registry_honors_system_flag(use_system_executable):
+    # The registry freezes its executable strings at import, so the flag can
+    # only be exercised in a fresh interpreter.
+    env = dict(os.environ)
+    env["NEMO_RL_PY_EXECUTABLES_SYSTEM"] = "1" if use_system_executable else "0"
+    result = subprocess.run(
+        [sys.executable, "-c", _REGISTRY_PROBE],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+
+    if use_system_executable:
+        assert payload["all_system"], payload["envs"]
+    else:
+        envs = payload["envs"]
+        assert envs[
+            "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+        ].startswith("uv run")
+        assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")

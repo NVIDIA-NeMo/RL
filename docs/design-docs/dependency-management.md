@@ -94,7 +94,7 @@ Within the driver script, NeMo RL starts multiple [`RayWorkerGroup`](https://git
 - **Generation workers** (e.g., vLLM): Require `vllm` dependencies  
 - **Environment workers** (e.g., math evaluation): Use system/base dependencies
 
-Each worker type is mapped to a specific Python executable configuration in the [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py#L18-L55). This registry defines which virtual environment should be used for each actor type:
+Each worker type is mapped to a specific Python executable configuration in the [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py#L17-L55). This registry defines which virtual environment should be used for each actor type:
 
 ```python
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
