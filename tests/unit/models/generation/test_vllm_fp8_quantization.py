@@ -1150,7 +1150,7 @@ def test_load_weights_accepts_prequantized_mxfp8_split_across_batches(
     fp8.load_weights([("model.weight_scale_from_checkpoint", scale)], model_runner)
 
     assert loaded == [
-        ["model.weight", weight],
+        ("model.weight", weight),
         ("model.weight_scale_from_checkpoint", scale),
     ]
 
