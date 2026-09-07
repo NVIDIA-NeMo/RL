@@ -242,6 +242,51 @@ def test_refit_loader_cache_records_replays_and_falls_back(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_refit_loader_cache_does_not_wrap_vllm_online_process_loader():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        load_weights_maybe_cached,
+    )
+
+    loader_calls = []
+
+    def online_process_loader(param, loaded_weight):
+        loader_calls.append(loaded_weight)
+        with torch.no_grad():
+            param.copy_(loaded_weight)
+
+    class Model:
+        def __init__(self):
+            self.param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            self.param.weight_loader = online_process_loader
+            self.load_calls = 0
+
+        def named_parameters(self):
+            return [("param", self.param)]
+
+        def load_weights(self, *, weights):
+            self.load_calls += 1
+            assert self.param.weight_loader is online_process_loader
+            for name, weight in weights:
+                self.param.weight_loader(self.param, weight)
+            return {name for name, _weight in weights}
+
+    model = Model()
+
+    assert load_weights_maybe_cached(
+        model, [("param", torch.tensor([1.0]))], cache_loader_routes=True
+    ) == {"param"}
+    assert load_weights_maybe_cached(
+        model, [("param", torch.tensor([2.0]))], cache_loader_routes=True
+    ) == {"param"}
+
+    assert model.load_calls == 2
+    assert len(loader_calls) == 2
+    assert model._nrl_refit_loader_cache.calls == {}
+    assert model._nrl_refit_loader_cache.uncached == {"param"}
+    torch.testing.assert_close(model.param, torch.tensor([2.0]))
+
+
+@pytest.mark.vllm
 def test_refit_loader_cache_invalidates_replaced_parameter(monkeypatch):
     from nemo_rl.models.generation.vllm.vllm_backend import (
         load_weights_maybe_cached,
