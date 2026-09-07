@@ -151,6 +151,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.time_efficiency import TimeEfficiencyConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -352,6 +353,11 @@ class GRPOConfig(BaseModel, extra="allow"):
     batch_multiplier: float = 1.0
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
+    # Wall-clock time-efficiency reward for NeMo-Gym agentic rollouts:
+    # reward -= lambda_time * openhands_run_time / 60, applied after the other
+    # reward shapers. Training rollouts only; validation reports the raw env
+    # reward. See nemo_rl/utils/time_efficiency.py.
+    time_efficiency: TimeEfficiencyConfig = Field(default_factory=TimeEfficiencyConfig)
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: bool = False
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
@@ -799,6 +805,9 @@ def setup(
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
     _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=enable_nemo_gym
+    )
+    _raise_if_time_efficiency_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
@@ -2051,6 +2060,22 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
     )
 
 
+def _raise_if_time_efficiency_enabled_without_nemo_gym(
+    master_config: MasterConfig,
+    *,
+    enable_nemo_gym: bool,
+) -> None:
+    """Validate the time-efficiency reward is only used with NeMo-Gym."""
+    if enable_nemo_gym or not master_config.grpo.time_efficiency.enabled:
+        return
+
+    raise ValueError(
+        "grpo.time_efficiency requires the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); openhands_run_time is only emitted by "
+        "Gym agents, so the deduction would be a silent no-op elsewhere."
+    )
+
+
 def _batch_row_value(batch: BatchedDataDict, key: str, row_index: int) -> Any:
     """Read one row-aligned diagnostic value without affecting training."""
     values = batch.get(key)
@@ -3141,6 +3166,7 @@ def grpo_train(
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
                             length_penalty_config=master_config.grpo.model_dump(),
+                            time_efficiency_config=master_config.grpo.time_efficiency,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
@@ -4065,11 +4091,11 @@ def validate(
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
                     reward_penalty_config=master_config.reward_penalties,
-                    # No length_penalty_config here: validation metrics
-                    # (accuracy/pass_k) must reflect the raw env reward, and the
-                    # adjustment code groups by the TRAINING stride
-                    # (num_generations_per_prompt), which does not match
-                    # val_num_generations_per_prompt.
+                    # No length_penalty_config or time_efficiency_config here:
+                    # validation metrics (accuracy/pass_k) must reflect the raw
+                    # env reward, and the length adjustment code groups by the
+                    # TRAINING stride (num_generations_per_prompt), which does
+                    # not match val_num_generations_per_prompt.
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(
                         master_config.env
