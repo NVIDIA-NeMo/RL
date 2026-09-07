@@ -30,7 +30,7 @@ Both share the same checkpoint, model code, and reward pipeline; they differ onl
 
 ### Recipe 1 — CLEVR-CoGenT (single-node)
 
-The CLEVR-CoGenT recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml). It expects 8 GPUs on a single node, EP=8 across the experts, and TP=8 in vLLM.
+The CLEVR-CoGenT recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml). It expects 8 GPUs on a single node, EP=8 across the experts, and TP=8 in vLLM.
 
 Key knobs in the config:
 
@@ -53,7 +53,7 @@ From inside the container on an 8-GPU node:
 ```bash
 export NRL_MAMBA_PREFILL_DECODE_SYNC="${NRL_MAMBA_PREFILL_DECODE_SYNC:-1}"
 
-uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml \
+uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml \
     cluster.gpus_per_node=8 \
     cluster.num_nodes=1
 ```
@@ -61,7 +61,7 @@ uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-n
 To override the model path or any other YAML field, append Hydra-style overrides:
 
 ```bash
-uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml \
+uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml \
     policy.model_name=/path/to/your/checkpoint \
     cluster.gpus_per_node=8 cluster.num_nodes=1
 ```
