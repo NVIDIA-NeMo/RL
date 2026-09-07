@@ -129,6 +129,13 @@ def _make_mtp_refit_extension(
     return ext, drafter_model
 
 
+def test_native_refit_accepts_disk_loaded_mtp_regardless_of_policy_probe():
+    ext, _ = _make_mtp_refit_extension(from_disk=True)
+    ext._mtp_drafter_refit_enabled = lambda: True
+
+    ext._validate_native_speculative_refit()
+
+
 class _RecordingGroup:
     """Stands in for StatelessProcessGroup so no port is bound and no CUDA is touched."""
 

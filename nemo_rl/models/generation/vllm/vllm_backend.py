@@ -1334,14 +1334,15 @@ class VllmInternalWorkerExtension:
 
     def _validate_native_speculative_refit(self) -> None:
         """Reject drafter updates that lack a native layerwise reload lifecycle."""
+        if self._mtp_drafter_from_disk:
+            return
+
         if self._mtp_drafter_refit_enabled():
             raise ValueError(
                 "native MXFP8 refit does not yet support a co-trained MTP drafter; "
                 "load static MTP weights from the generation checkpoint instead"
             )
 
-        if self._mtp_drafter_from_disk:
-            return
         spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
         draft_model_config = getattr(spec_config, "draft_model_config", None)
         draft_quantization = getattr(draft_model_config, "quantization", None)
