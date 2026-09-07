@@ -97,6 +97,9 @@ ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 # Ensure DeepEP is built for H100 and B200
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
+# Build HybridEP with inter-node transport support.
+ENV HYBRID_EP_MULTINODE=1
+
 # Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
 ENV CUDA_HOME=/usr/local/cuda
 
@@ -115,6 +118,7 @@ sed -i 's/= \[{ requirement = "torch", match-runtime = true }\]/= []/g' pyprojec
 uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
 uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
 # Ensure nvshmem is installed before building DeepEP
+uv cache clean deep-ep
 uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
