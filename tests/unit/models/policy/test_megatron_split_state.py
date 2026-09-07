@@ -1537,7 +1537,7 @@ class TestReplicatedLogprobResult:
                 side_effect=lambda tensors: tensors,
             ) as broadcast,
             patch(f"{WORKER_MOD}.torch.empty_like") as empty_like,
-            patch(f"{WORKER_MOD}.torch.cuda.synchronize") as synchronize,
+            patch(f"{WORKER_MOD}.torch.cuda.current_stream") as current_stream,
         ):
             cpu_logprobs = MagicMock()
             empty_like.return_value = cpu_logprobs
@@ -1555,12 +1555,13 @@ class TestReplicatedLogprobResult:
             cpu_logprobs.copy_.assert_called_once_with(
                 source_logprobs, non_blocking=True
             )
-            synchronize.assert_called_once_with(source_logprobs.device)
+            current_stream.assert_called_once_with(source_logprobs.device)
+            current_stream.return_value.synchronize.assert_called_once_with()
             assert result["logprobs"] is cpu_logprobs
         else:
             assert not result
             empty_like.assert_not_called()
-            synchronize.assert_not_called()
+            current_stream.assert_not_called()
 
     @pytest.mark.parametrize("has_inner_result", [False, True])
     def test_reference_logprobs_accept_empty_nonleader_result(self, has_inner_result):

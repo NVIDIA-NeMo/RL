@@ -2061,8 +2061,9 @@ class MegatronPolicyWorkerImpl(
         # long logprob forwards. Ray must not serialize the destination until
         # the asynchronous copy has completed.
         cpu_logprobs = torch.empty_like(logprobs, device="cpu", pin_memory=True)
+        copy_stream = torch.cuda.current_stream(logprobs.device)
         cpu_logprobs.copy_(logprobs, non_blocking=True)
-        torch.cuda.synchronize(logprobs.device)
+        copy_stream.synchronize()
         return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
 
     def _apply_state_dict_to_model(
