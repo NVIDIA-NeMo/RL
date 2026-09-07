@@ -22,6 +22,10 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
+from nemo_rl.data.multimodal_utils import (
+    encode_multimodal_for_wire,
+    multimodal_row_tags,
+)
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import (
@@ -105,10 +109,12 @@ def record_to_train_batch(
             flags for configured advantage penalties.
 
     Returns:
-        BatchedDataDict with input_ids, input_lengths, generation_logprobs,
-        token_mask, an all-ones sample_mask, the raw mask_sample and truncated
-        flags, prompt_ids_for_adv, total_reward, violation counts, and optional
-        routed experts and message-violation masks.
+        BatchedDataDict with input IDs and lengths, generation log probabilities,
+        token and prompt-level sample masks, raw ``mask_sample`` and ``truncated``
+        flags, prompt IDs for advantage computation, rewards, and violation
+        counts. Optional fields include routed experts, message-violation masks,
+        and any packed or per-token multimodal model inputs carried by the
+        completions.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
@@ -157,7 +163,7 @@ def record_to_train_batch(
     )
     mask_sample = _mask_sample_flags(c.env_extras for c in completions)
     truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
-    sample_mask = torch.ones(n, dtype=torch.float32)
+    sample_mask = torch.full((n,), float(record.loss_multiplier), dtype=torch.float32)
 
     train_data: dict[str, Any] = {
         "input_ids": flat["token_ids"],
@@ -176,6 +182,7 @@ def record_to_train_batch(
     if include_message_violation_fields:
         train_data[INVALID_TOOL_CALL_MASK] = flat[INVALID_TOOL_CALL_MASK]
         train_data[MALFORMED_THINKING_MASK] = flat[MALFORMED_THINKING_MASK]
+    train_data.update(flat.get_multimodal_dict(as_tensors=False))
     return BatchedDataDict[Any](train_data)
 
 
@@ -195,8 +202,11 @@ def pack_payload(
         prompt_idx: Stable dataset prompt index stamped on every row's tag.
 
     Returns:
-        sample_ids of the form {group_id}_g{i}, a jagged-packed TensorDict, and per-row
-        tags carrying weight_version plus any per-row violation counts.
+        Sample IDs of the form ``{group_id}_g{i}``, a jagged-packed TensorDict
+        containing tensor fields and encoded multimodal wire fields, and
+        per-row tags. Tags carry the weight version, prompt index, violation
+        counts, and ``<field>__row_shapes`` metadata required to reconstruct
+        packed multimodal rows.
     """
     lengths = train_batch["input_lengths"]
     n = int(lengths.shape[0])
@@ -206,16 +216,23 @@ def pack_payload(
         if isinstance(v, torch.Tensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
+    multimodal = BatchedDataDict[Any](train_batch).get_multimodal_dict(as_tensors=False)
+    for key, value in multimodal.items():
+        wire_value = encode_multimodal_for_wire(key, value)
+        if wire_value is not None:
+            tensor_fields[key] = wire_value
     fields_td = pack_jagged_fields(
         tensor_fields, lengths=lengths, token_aligned_fields=TOKEN_ALIGNED_FIELDS
     )
     sample_ids = [f"{group_id}_g{i}" for i in range(n)]
     violations = train_batch.get(_VIOLATION_COUNTS_KEY, [{}] * n)
+    multimodal_tags = multimodal_row_tags(multimodal, n) or [{} for _ in range(n)]
     tags = [
         {
             "weight_version": weight_version,
             "prompt_idx": prompt_idx,
             **violations[i],
+            **multimodal_tags[i],
         }
         for i in range(n)
     ]

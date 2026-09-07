@@ -13,7 +13,7 @@ fi
 
 GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
 if (( GPU_COUNT < 2 )); then
-    echo "SKIP: Omni Gym-video Megatron smoke requires at least two GPUs"
+    echo "SKIP: Omni CLEVR SingleController smoke requires at least two visible GPUs"
     exit 0
 fi
 DETECTED_CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0)
@@ -38,11 +38,8 @@ EXP_NAME=$(basename "$0" .sh)
 EXP_DIR="${SCRIPT_DIR}/${EXP_NAME}"
 LOG_DIR="${EXP_DIR}/logs"
 DATA_ROOT="${EXP_DIR}/data"
-VIDEO_PATH="${DATA_ROOT}/red.mp4"
-RAW_TRAIN_PATH="${DATA_ROOT}/train-raw.jsonl"
-RAW_VAL_PATH="${DATA_ROOT}/val-raw.jsonl"
-TRAIN_PATH="${DATA_ROOT}/train-gym.jsonl"
-VAL_PATH="${DATA_ROOT}/val-gym.jsonl"
+TRAIN_PATH="${DATA_ROOT}/train.jsonl"
+VAL_PATH="${DATA_ROOT}/val.jsonl"
 JSON_METRICS="${EXP_DIR}/metrics.json"
 RUN_LOG="${EXP_DIR}/run.log"
 rm -rf "${EXP_DIR}"
@@ -50,51 +47,61 @@ mkdir -p "${LOG_DIR}" "${DATA_ROOT}"
 
 cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-export NRL_VIDEO_BACKEND=torchcodec
-export NRL_VIDEO_SAMPLING_STYLE=nemotron_vl
-export NRL_VIDEO_TEMPORAL_PATCH_SIZE=2
 
-bash tools/install_audio_deps.sh
-ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i color=c=red:s=224x224:r=8:d=2 \
-    -c:v libx264 -pix_fmt yuv420p "${VIDEO_PATH}"
+# Match the non-SingleController L1 fixture.
+TRAIN_PATH="${TRAIN_PATH}" VAL_PATH="${VAL_PATH}" uv run --no-sync python - <<'PY'
+import base64
+import io
+import json
+import os
 
-for sample_id in $(seq 1 64); do
-    jq -nc \
-        --arg prompt "Sample ${sample_id}: What color fills the video? A. Red B. Blue" \
-        --arg video "${VIDEO_PATH}" \
-        '{prompt: $prompt, video: $video, answer: "A", verifier: "mcqa"}'
-done > "${RAW_TRAIN_PATH}"
-for sample_id in $(seq 1 2); do
-    jq -nc \
-        --arg prompt "Validation ${sample_id}: What color fills the video? A. Red B. Blue" \
-        --arg video "${VIDEO_PATH}" \
-        '{prompt: $prompt, video: $video, answer: "A", verifier: "mcqa"}'
-done > "${RAW_VAL_PATH}"
+from PIL import Image
 
-uv run --no-sync examples/nemo_gym/prepare_video_dataset.py convert \
-    --input "${RAW_TRAIN_PATH}" \
-    --output "${TRAIN_PATH}"
-uv run --no-sync examples/nemo_gym/prepare_video_dataset.py convert \
-    --input "${RAW_VAL_PATH}" \
-    --output "${VAL_PATH}"
+buffer = io.BytesIO()
+Image.new("RGB", (224, 224), color="red").save(buffer, format="PNG")
+image_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
-# TODO(@cspades): Replace Omni 30B with a smaller pretrained model.
-# For now, just use this as a partially-trainable functional test
-# (frozen decoder trunk) for inference and multimodal RL.
-uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
-    --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml \
+
+def sample(index: int) -> dict:
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image_url},
+                    {
+                        "type": "text",
+                        "text": f"Sample {index}: What color is the image?",
+                    },
+                ],
+            },
+            {"role": "assistant", "content": "<answer>red</answer>"},
+        ]
+    }
+
+
+for path, count in ((os.environ["TRAIN_PATH"], 64), (os.environ["VAL_PATH"], 2)):
+    with open(path, "w") as output:
+        for index in range(count):
+            output.write(json.dumps(sample(index)) + "\n")
+PY
+
+# SingleController requires disaggregated generation. One frozen-decoder model
+# fits on each GB200, so split the two visible GPUs 1 trainer + 1 generator.
+uv run --no-sync python examples/run_grpo_single_controller.py \
+    --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron_generation.v1.yaml \
     cluster.num_nodes=1 \
     cluster.gpus_per_node=2 \
+    ++cluster.segment_size=1 \
     policy.megatron_cfg.env_vars.TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
-    policy.megatron_cfg.tensor_model_parallel_size=2 \
-    policy.megatron_cfg.pipeline_model_parallel_size=1 \
-    policy.megatron_cfg.expert_model_parallel_size=2 \
+    policy.megatron_cfg.tensor_model_parallel_size=1 \
+    policy.megatron_cfg.expert_model_parallel_size=1 \
     policy.megatron_cfg.expert_tensor_parallel_size=1 \
     policy.megatron_cfg.context_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=true \
     policy.megatron_cfg.activation_checkpointing=true \
     ++policy.megatron_cfg.freeze_config.freeze_language_model=true \
+    +policy.megatron_cfg.bias_dropout_fusion=false \
     policy.megatron_cfg.optimizer.optimizer_cpu_offload=false \
     policy.megatron_cfg.optimizer.optimizer_offload_fraction=0.0 \
     ++policy.megatron_cfg.optimizer.params_dtype=bfloat16 \
@@ -104,14 +111,12 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++policy.megatron_cfg.optimizer.exp_avg_sq_dtype=bfloat16 \
     ++policy.megatron_cfg.optimizer.store_param_remainders=false \
     policy.generation.backend=megatron \
-    ++policy.generation.bad_words=null \
-    policy.generation.colocated.enabled=true \
+    policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
-    policy.generation.colocated.resources.gpus_per_node=2 \
+    policy.generation.colocated.resources.gpus_per_node=1 \
     policy.generation.max_new_tokens=128 \
-    policy.generation.mcore_generation_config.expose_http_server=true \
-    policy.generation.mcore_generation_config.tensor_model_parallel_size=2 \
-    policy.generation.mcore_generation_config.expert_model_parallel_size=2 \
+    policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
+    policy.generation.mcore_generation_config.expert_model_parallel_size=1 \
     policy.generation.mcore_generation_config.expert_tensor_parallel_size=1 \
     ++policy.generation.mcore_generation_config.context_parallel_size=1 \
     ++policy.generation.mcore_generation_config.moe_router_dtype=fp32 \
@@ -123,27 +128,20 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     policy.generation.mcore_generation_config.inference_cuda_graph_scope="${INFERENCE_CUDA_GRAPH_SCOPE}" \
     policy.generation.mcore_generation_config.num_cuda_graphs="${NUM_CUDA_GRAPHS}" \
     policy.generation.mcore_generation_config.use_cuda_graphs_for_non_decode_steps=false \
-    ++policy.generation.mcore_generation_config.moe_pad_experts_for_cuda_graph_inference="${MOE_PAD_EXPERTS_FOR_CG}" \
+    policy.generation.mcore_generation_config.moe_pad_experts_for_cuda_graph_inference="${MOE_PAD_EXPERTS_FOR_CG}" \
     policy.generation.mcore_generation_config.enable_chunked_prefill=true \
     ++policy.generation.mcore_generation_config.async_sched_mode=async \
-    policy.generation.mcore_generation_config.enable_prefix_caching=true \
     policy.generation.mcore_generation_config.max_model_len=1024 \
     policy.generation.mcore_generation_config.max_tokens=1024 \
-    ++policy.generation.mcore_generation_config.video_num_frames=8 \
-    ++policy.generation.mcore_generation_config.video_temporal_patch_size=2 \
-    ++policy.generation.mcore_generation_config.video_target_num_patches=256 \
     policy.max_total_sequence_length=1024 \
-    data.default.num_frames=8 \
-    data.default.video_sampling_style=nemotron_vl \
-    data.default.video_temporal_patch_size=2 \
-    +data.default.min_generation_tokens=128 \
-    data.default.video_target_num_patches=256 \
-    data.train.data_path="${TRAIN_PATH}" \
-    data.validation.data_path="${VAL_PATH}" \
-    grpo.deduplicate_multimodal_data=false \
-    grpo.async_grpo.enabled=true \
-    grpo.async_grpo.max_trajectory_age_steps=2 \
-    grpo.async_grpo.in_flight_weight_updates=true \
+    data.train.dataset_name=ResponseDataset \
+    ++data.train.data_path="${TRAIN_PATH}" \
+    data.train.split=train \
+    data.validation.dataset_name=ResponseDataset \
+    ++data.validation.data_path="${VAL_PATH}" \
+    data.validation.split=train \
+    data.num_workers=0 \
+    grpo.async_grpo=null \
     grpo.num_prompts_per_step=1 \
     grpo.num_generations_per_prompt=2 \
     grpo.max_num_steps=1 \
@@ -152,6 +150,17 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     grpo.val_at_end=false \
     policy.train_global_batch_size=2 \
     policy.train_micro_batch_size=1 \
+    ++data_plane.enabled=true \
+    ++data_plane.impl=transfer_queue \
+    ++data_plane.backend=simple \
+    ++data_plane.claim_meta_poll_interval_s=0.5 \
+    ++data_plane.simple.num_storage_units=2 \
+    ++async_rl.sampler.name=in_order \
+    ++async_rl.sampler.max_lookahead_versions=1 \
+    ++async_rl.recompute_kv_cache_after_weight_updates=false \
+    ++async_rl.min_groups_for_streaming_train=1 \
+    ++async_rl.max_inflight_prompts=2 \
+    ++async_rl.max_buffered_rollouts=2 \
     logger.tensorboard_enabled=true \
     logger.log_dir="${LOG_DIR}" \
     logger.wandb_enabled=false \

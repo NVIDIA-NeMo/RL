@@ -33,7 +33,6 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     extract_input_media_sources_from_responses_messages,
     extract_multimodal_model_inputs,
-    get_dim_to_pack_along,
     get_responses_content_part_url,
     image_to_data_url,
     media_sources_equal,
@@ -824,11 +823,6 @@ def nemo_gym_example_to_video_datum_spec(
     if "imgs_sizes" in processed and "num_frames" not in processed:
         processed["num_frames"] = torch.tensor([len(frame_items)], dtype=torch.int32)
     user_message.update(extract_multimodal_model_inputs(processor, processed))
-    if "num_frames" in processed:
-        user_message["num_frames"] = PackedTensor(
-            processed["num_frames"].to(dtype=torch.int32),
-            dim_to_pack=get_dim_to_pack_along(processor, "num_frames"),
-        )
 
     length = len(user_message["token_ids"])
     loss_multiplier = 1.0
