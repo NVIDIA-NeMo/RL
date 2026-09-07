@@ -17,11 +17,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import threading
 from typing import Any
 
 import pytest
 import torch
+from wandb import Table
 
 import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -33,8 +35,16 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     replay_manifest_digest,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
+from nemo_rl.experience.route_plan import (
+    ROUTE_PLAN_SCHEMA_VERSION,
+    RouteAssemblyPlan,
+    RouteSpan,
+    encode_route_plan,
+)
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
@@ -164,7 +174,11 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _make_record(*, prompt_idx: int = 0) -> PromptGroupRecord:
+def _make_record(
+    rollout_metrics: dict[str, Any] | None = None,
+    *,
+    prompt_idx: int = 0,
+) -> PromptGroupRecord:
     """Opaque PromptGroupRecord — converter is stubbed, so contents are unused."""
     return PromptGroupRecord(
         prompt_idx=prompt_idx,
@@ -172,7 +186,7 @@ def _make_record(*, prompt_idx: int = 0) -> PromptGroupRecord:
         extra_env_info=None,
         metadata={},
         completions=[],
-        rollout_metrics={},
+        rollout_metrics=dict(rollout_metrics or {}),
     )
 
 
@@ -200,6 +214,7 @@ def _add_group(
     weight: int,
     end_weight: int | None = None,
     target_step: int | None = None,
+    rollout_metrics: dict[str, Any] | None = None,
 ) -> KVBatchMeta:
     if end_weight is None:
         end_weight = weight
@@ -207,7 +222,7 @@ def _add_group(
     return _run(
         buf.commit(
             group_id,
-            _make_record(),
+            _make_record(rollout_metrics),
             start_weight_version=weight,
             end_weight_version=end_weight,
         )
@@ -381,6 +396,26 @@ class TestTQReplayBufferReserveCommit:
         assert dp.depth() == 0
         assert buf.ready_list == [False]
         assert buf.meta_list == [None]
+
+    def test_commit_retains_group_rollout_metrics(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        record = _make_record({"gen_tokens/min": 3, "total_turns": 2})
+        group_id = buf.reserve(weight_version=3)
+
+        meta = _run(
+            buf.commit(
+                group_id,
+                record,
+                start_weight_version=3,
+                end_weight_version=4,
+            )
+        )
+        record.rollout_metrics["gen_tokens/min"] = 99
+
+        assert meta.extra_info[ROLLOUT_METRICS] == [
+            {"gen_tokens/min": 3, "total_turns": 2}
+        ]
 
     def test_commit_clears_rows_when_put_raises_after_writing(self):
         dp = FailAfterPutDataPlaneClient()
@@ -681,6 +716,25 @@ class TestTQReplayBufferRemove:
         assert dp.depth() == 2 * _N_GENS
         assert dp.clear_calls == []
 
+    def test_remove_deletes_by_identity_when_a_slot_is_aborted_mid_clear(self):
+        class AbortDuringClearClient(FakeDataPlaneClient):
+            async def clear_samples(self, sample_ids, partition_id):
+                super().clear_samples(sample_ids, partition_id)
+                buf.abort(unready_id)  # renumbers slots above it while remove awaits
+
+        dp = AbortDuringClearClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0)  # index 0, ready
+        unready_id = buf.reserve(weight_version=0)  # index 1, unready
+        target = _add_group(buf, weight=0)  # index 2, ready; the eviction target
+
+        removed = _run(buf.remove([2], remove_in_dp=True))
+
+        assert removed == 1
+        assert buf._group_ids == [buf._group_ids[0]]
+        assert buf.meta_list[0] is not target
+        assert dp.clear_calls == [target.sample_ids]
+
 
 class TestTQReplayBufferSize:
     def test_size_and_len(self):
@@ -886,6 +940,17 @@ class TestReplayManifestDigest:
 
         assert replay_manifest_digest([first]) == replay_manifest_digest([second])
 
+    def test_ignores_rollout_metrics_logging_sidecar(self):
+        first = _make_group_entry("group-1", weight=1)
+        second = _make_group_entry("group-1", weight=1)
+        first["meta"].extra_info = {
+            "packing": [1, 2],
+            ROLLOUT_METRICS: [{"per_worker_token_counts": {0: 7}}],
+        }
+        second["meta"].extra_info = {"packing": [1, 2]}
+
+        assert replay_manifest_digest([first]) == replay_manifest_digest([second])
+
 
 class TestTQReplayBufferStateDict:
     def test_metadata_state_dict_omits_tensors_and_data_plane_reads(self):
@@ -909,7 +974,18 @@ class TestTQReplayBufferStateDict:
     def test_native_tq_round_trip_restores_index_without_reputting_rows(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
-        metas = [_add_group(buf, weight=w) for w in (1, 2)]
+        metas = [
+            _add_group(
+                buf,
+                weight=1,
+                rollout_metrics={
+                    "gen_tokens/min": 3,
+                    "total_turns": 2,
+                    "per_worker_token_counts": {0: 7},
+                },
+            ),
+            _add_group(buf, weight=2),
+        ]
         state = buf.metadata_state_dict(saved_capacity=8)
 
         restored_dp = FakeDataPlaneClient()
@@ -926,7 +1002,62 @@ class TestTQReplayBufferStateDict:
         assert [meta.sample_ids for meta in restored_buf.meta_list] == [
             list(meta.sample_ids) for meta in metas
         ]
+        assert restored_buf.meta_list[0].extra_info[ROLLOUT_METRICS] == [
+            {
+                "gen_tokens/min": 3,
+                "total_turns": 2,
+                "per_worker_token_counts": {0: 7},
+            }
+        ]
         assert restored_dp.put_calls == []
+
+    def test_checkpoint_serialization_preserves_full_result_table(self):
+        """Opt-in NeMo Gym tables remain usable after the torch checkpoint round trip."""
+        gym_impl = AsyncNemoGymRolloutImpl(
+            tokenizer=None,
+            task_to_env={},
+            num_generations_per_prompt=1,
+            max_seq_len=16,
+            max_rollout_turns=1,
+            generation_config={
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+            },
+            log_full_result_tables=True,
+        )
+        rollout_metrics = gym_impl._compute_rollout_metrics(
+            [
+                Completion(
+                    message_log=[
+                        {"role": "user", "token_ids": [1]},
+                        {"role": "assistant", "token_ids": [2]},
+                    ],
+                    env_extras={"reward": 1.0, "status": "completed"},
+                    truncated=False,
+                    reward=1.0,
+                )
+            ],
+            "agent",
+        )
+        assert isinstance(rollout_metrics["agent/full_result"], Table)
+
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=1, rollout_metrics=rollout_metrics)
+
+        payload = io.BytesIO()
+        torch.save(buf.metadata_state_dict(saved_capacity=8), payload)
+        payload.seek(0)
+        restored_state = torch.load(payload, weights_only=False)
+
+        restored_buf = _make_buffer(FakeDataPlaneClient())
+        assert _load(restored_buf, restored_state) == 1
+        restored_table = restored_buf.meta_list[0].extra_info[ROLLOUT_METRICS][0][
+            "agent/full_result"
+        ]
+        assert isinstance(restored_table, Table)
+        assert restored_table.columns == ["Full result"]
+        assert restored_table.data == [['{"reward":1.0,"status":"completed"}']]
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
         # start != end and a non-None target_step must survive the round-trip:
@@ -1074,3 +1205,311 @@ class TestTQReplayBufferLoadPreflight:
         assert "dataloader has already moved past them" in message
         assert dp.put_calls == []
         assert buf.size() == 0
+
+    def test_over_capacity_with_target_stamps_is_still_rejected(self):
+        # A capacity change alone is tolerated, but more groups than the new
+        # capacity never are -- target_step stamps do not bypass that guard.
+        state = _make_metadata_envelope(
+            [
+                _make_group_entry("g1", weight=1),
+                _make_group_entry("g2", weight=2),
+                _make_group_entry("g3", weight=3, target_step=3),
+            ],
+            saved_capacity=8,
+        )
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        with pytest.raises(ValueError, match="more replay groups than the current"):
+            _load(buf, state, max_groups=2)
+
+    def test_target_stamped_groups_within_capacity_load_fine(self):
+        # The guard is scoped to the over-capacity case only.
+        state = _make_metadata_envelope(
+            [_make_group_entry(f"g{w}", weight=w, target_step=w) for w in (1, 2)],
+            saved_capacity=8,
+        )
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        assert _load(buf, state, max_groups=2) == 2
+        assert buf.target_step_list == [1, 2]
+
+
+class MultiPartitionFakeDataPlaneClient(FakeDataPlaneClient):
+    """Fake DP client that tracks rows per partition (token-capture mode)."""
+
+    def __init__(self) -> None:
+        super().__init__(partition_id="rollout_data")
+        self.rows_by_partition: dict[str, dict[str, Any]] = {}
+        self.clear_calls_by_partition: list[tuple[str, list[str]]] = []
+
+    def put_samples(self, sample_ids, partition_id, fields=None, tags=None):
+        bucket = self.rows_by_partition.setdefault(partition_id, {})
+        for i, sid in enumerate(sample_ids):
+            bucket[sid] = {"tag": dict(tags[i]) if tags is not None else {}}
+        return KVBatchMeta(
+            partition_id=partition_id,
+            task_name=None,
+            sample_ids=list(sample_ids),
+            fields=None,
+            tags=[dict(t) for t in tags] if tags is not None else None,
+        )
+
+    def clear_samples(self, sample_ids, partition_id):
+        ids = list(sample_ids) if sample_ids is not None else []
+        self.clear_calls_by_partition.append((partition_id, ids))
+        bucket = self.rows_by_partition.setdefault(partition_id, {})
+        for sid in ids:
+            bucket.pop(sid, None)
+
+
+class TestTQReplayBufferTokenCaptureMode:
+    """commit_finalized / abort / rollout_ids / staging-aware remove.
+
+    All of these are uncalled on the legacy (token_capture.enabled=false)
+    path; the existing test classes above are the legacy-invariance guard.
+    """
+
+    def _make_capture_buffer(self, dp) -> TQReplayBuffer:
+        buf = TQReplayBuffer(
+            dp,
+            partition_id="rollout_data",
+            pad_value_dict={"token_ids": 0},
+            include_message_violation_fields=False,
+            staging_partition_id="rollout_staging",
+        )
+        # Destructive ops (commit_finalized/remove) refuse to run unbound.
+        buf.set_data_plane_checkpoint_barrier(DataPlaneCheckpointBarrier())
+        return buf
+
+    def test_reserve_records_rollout_ids(self):
+        buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
+        buf.reserve(weight_version=1, rollout_ids=["g0_g0", "g0_g1"])
+        assert buf._rollout_ids_list == [["g0_g0", "g0_g1"]]
+        # Legacy reserve records None.
+        buf.reserve(weight_version=1)
+        assert buf._rollout_ids_list[1] is None
+
+    def test_commit_finalized_fills_slot_with_group_min_wv(self):
+        dp = MultiPartitionFakeDataPlaneClient()
+        buf = self._make_capture_buffer(dp)
+        group_id = buf.reserve(weight_version=4, rollout_ids=["r0", "r1"])
+        # The finalizer published its own rows; commit_finalized only fills the slot.
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name=None,
+            sample_ids=[f"{group_id}_g0", f"{group_id}_g1"],
+            fields=None,
+        )
+        _run(
+            buf.commit_finalized(
+                group_id,
+                meta,
+                group_min_wv=3,
+                group_max_wv=5,
+                staging_keys=["r0/c1", "r0/c2", "r1/c1"],
+            )
+        )
+        assert buf.ready_list == [True]
+        assert buf.start_weight_list == [3]  # oldest call version, not reserve-time 4
+        assert buf.end_weight_list == [5]
+        assert buf.meta_list[0] is meta
+        assert buf._staging_keys_list == [["r0/c1", "r0/c2", "r1/c1"]]
+        # No tensorize/put happened here.
+        assert dp.rows_by_partition.get("rollout_data") is None
+
+    def test_commit_finalized_raises_for_evicted_slot(self):
+        buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
+        meta = KVBatchMeta(
+            partition_id="rollout_data", task_name=None, sample_ids=[], fields=None
+        )
+        with pytest.raises(ValueError, match="no live slot"):
+            _run(buf.commit_finalized("ghost", meta, group_min_wv=0, group_max_wv=0))
+
+    def test_commit_finalized_verifies_full_plan_manifest_ownership(self):
+        dp = MultiPartitionFakeDataPlaneClient()
+        buf = self._make_capture_buffer(dp)
+        group_id = buf.reserve(weight_version=1, rollout_ids=["r0"])
+        plan = encode_route_plan(
+            RouteAssemblyPlan(
+                schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                staging_partition="rollout_staging",
+                spans=(RouteSpan("r0/on_chain", 0, 2, 2, 1, "0" * 64),),
+                cleanup_staging_keys=("r0/on_chain", "r0/off_chain"),
+                expected_token_length=2,
+            )
+        )
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["r0"],
+            fields=["input_ids"],
+            tags=[{ROUTE_PLAN_TAG: plan}],
+        )
+
+        with pytest.raises(ValueError, match="ownership does not match"):
+            _run(
+                buf.commit_finalized(
+                    group_id,
+                    meta,
+                    group_min_wv=1,
+                    group_max_wv=1,
+                    staging_keys=["r0/on_chain"],
+                )
+            )
+
+        assert buf.size() == 1
+        assert buf.ready_list == [False]
+
+    def test_abort_drops_unready_slot_only(self):
+        dp = MultiPartitionFakeDataPlaneClient()
+        buf = self._make_capture_buffer(dp)
+        gid_unready = buf.reserve(weight_version=1)
+        gid_ready = buf.reserve(weight_version=1)
+        _run(
+            buf.commit(
+                gid_ready,
+                _make_record(),
+                start_weight_version=1,
+                end_weight_version=1,
+            )
+        )
+        assert buf.abort(gid_unready) is True
+        assert buf.size() == 1
+        # Ready slots and unknown ids are not abortable.
+        assert buf.abort(gid_ready) is False
+        assert buf.abort("ghost") is False
+        assert buf.size() == 1
+
+    def test_remove_clears_staging_rows_alongside_canonical(self):
+        dp = MultiPartitionFakeDataPlaneClient()
+        buf = self._make_capture_buffer(dp)
+        group_id = buf.reserve(weight_version=1, rollout_ids=["r0"])
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name=None,
+            sample_ids=[f"{group_id}_g0"],
+            fields=None,
+        )
+        _run(
+            buf.commit_finalized(
+                group_id,
+                meta,
+                group_min_wv=1,
+                group_max_wv=1,
+                staging_keys=["r0/c1", "r0/c2"],
+            )
+        )
+        n = _run(buf.remove([0], remove_in_dp=True))
+        assert n == 1
+        assert ("rollout_data", [f"{group_id}_g0"]) in dp.clear_calls_by_partition
+        assert ("rollout_staging", ["r0/c1", "r0/c2"]) in dp.clear_calls_by_partition
+
+    def test_remove_without_staging_partition_skips_staging_clear(self):
+        dp = MultiPartitionFakeDataPlaneClient()
+        buf = TQReplayBuffer(
+            dp,
+            partition_id="rollout_data",
+            pad_value_dict={"token_ids": 0},
+            include_message_violation_fields=False,
+        )
+        buf.set_data_plane_checkpoint_barrier(DataPlaneCheckpointBarrier())
+        group_id = buf.reserve(weight_version=1)
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name=None,
+            sample_ids=[f"{group_id}_g0"],
+            fields=None,
+        )
+        _run(buf.commit_finalized(group_id, meta, group_min_wv=1, group_max_wv=1))
+        _run(buf.remove([0], remove_in_dp=True))
+        partitions_cleared = {p for p, _ in dp.clear_calls_by_partition}
+        assert partitions_cleared == {"rollout_data"}
+
+    def test_cleanup_failure_retains_buffer_ownership(self):
+        class FailingStagingCleanupClient(MultiPartitionFakeDataPlaneClient):
+            def clear_samples(self, sample_ids, partition_id):
+                if partition_id == "rollout_staging":
+                    raise RuntimeError("injected staging cleanup failure")
+                return super().clear_samples(sample_ids, partition_id)
+
+        dp = FailingStagingCleanupClient()
+        buf = self._make_capture_buffer(dp)
+        group_id = buf.reserve(weight_version=1, rollout_ids=["r0"])
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["r0"],
+            fields=None,
+        )
+        _run(
+            buf.commit_finalized(
+                group_id,
+                meta,
+                group_min_wv=1,
+                group_max_wv=1,
+                staging_keys=["r0/c1"],
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="retained replay-buffer ownership"):
+            _run(buf.remove([0], remove_in_dp=True))
+
+        assert buf.size() == 1
+        assert buf._staging_keys_list == [["r0/c1"]]
+
+
+class TestTQReplayBufferEvictedCommit:
+    def test_commit_on_evicted_slot_writes_nothing(self):
+        """The pre-write check: an evicted group must not orphan rows."""
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=1)
+        _run(buf.remove([0], remove_in_dp=False))
+
+        with pytest.raises(ValueError, match="no live slot"):
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=1,
+                    end_weight_version=1,
+                )
+            )
+        assert dp.put_calls == []
+        assert dp.depth() == 0
+
+    def test_commit_evicted_during_write_unwrites_rows(self):
+        """Eviction interleaving with the awaited put must clear the rows."""
+
+        class EvictDuringPut(FakeDataPlaneClient):
+            def __init__(self):
+                super().__init__()
+                self.buf: TQReplayBuffer | None = None
+
+            async def put_samples(
+                self, sample_ids, partition_id, fields=None, tags=None
+            ):
+                result = FakeDataPlaneClient.put_samples(
+                    self, sample_ids, partition_id, fields=fields, tags=tags
+                )
+                # Simulate the sampler evicting the slot mid-write.
+                await self.buf.remove([0], remove_in_dp=False)
+                return result
+
+        dp = EvictDuringPut()
+        buf = _make_buffer(dp)
+        dp.buf = buf
+        group_id = buf.reserve(weight_version=1)
+
+        with pytest.raises(ValueError, match="evicted during"):
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=1,
+                    end_weight_version=1,
+                )
+            )
+        # The written rows were un-written.
+        assert dp.depth() == 0
+        assert len(dp.clear_calls) == 1

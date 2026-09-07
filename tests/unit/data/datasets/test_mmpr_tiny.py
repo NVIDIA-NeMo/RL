@@ -160,7 +160,10 @@ def _make_stub_nemotron_processor(*, include_imgs_sizes=True, num_tiles=1):
                     for item in content:
                         if isinstance(item, dict) and "text" in item:
                             parts.append(item["text"])
-            return " ".join(parts)
+            formatted_text = " ".join(parts)
+            if kwargs.get("tokenize"):
+                return {"input_ids": fake_input_ids}
+            return formatted_text
 
         def __call__(self, text=None, images=None, **kwargs):
             self.captured_call_text = text
@@ -241,6 +244,31 @@ class TestVLMProcessorMMPRTiny:
         assert user_message["pixel_values"].pad_to_max_shape is True
         assert user_message["pixel_values"].as_tensor().dtype == torch.float32
 
+    def test_text_only_row_preserves_formatted_vllm_content(self):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        processor = _make_stub_nemotron_processor()
+        task_data_spec = TaskDataSpec(task_name="text-only")
+        task_data_spec.prompt = "Answer: {}"
+
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "messages": [
+                    {"role": "user", "content": "What is 2 + 2?"},
+                    {"role": "assistant", "content": "4"},
+                ],
+                "task_name": "text-only",
+            },
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        assert result["vllm_content"] == "Answer: What is 2 + 2?"
+        assert result["vllm_images"] == []
+
     def test_conversation_preprocessor_is_preserved(self, tiny_image_path):
         processor = _make_stub_nemotron_processor()
         processor.conversation_preprocessor = MagicMock(
@@ -250,7 +278,7 @@ class TestVLMProcessorMMPRTiny:
         result, _ = _run_processor(tiny_image_path, processor=processor)
 
         processor.conversation_preprocessor.assert_called_once()
-        assert result["vllm_content"] == "preprocessed"
+        assert result["vllm_content"] is None
         assert processor.captured_call_text == "preprocessed"
 
     def test_historical_tiled_processor_gets_media_metadata(self, tiny_image_path):
@@ -285,14 +313,14 @@ class TestVLMProcessorMMPRTiny:
     def test_prompted_text_contains_boxed_literal_and_no_raw_dataset_string(
         self, tiny_image_path
     ):
-        result, _ = _run_processor(tiny_image_path)
-        vllm_content = result["vllm_content"]
+        result, processor = _run_processor(tiny_image_path)
+        processed_text = processor.captured_call_text
 
         # Positive: literal \boxed{} must survive prompt formatting
-        assert "\\boxed{}" in vllm_content
+        assert "\\boxed{}" in processed_text
 
         # Negative: the raw dataset string (with <image> prefix) must NOT leak through
-        assert _RAW_QUESTION not in vllm_content
+        assert _RAW_QUESTION not in processed_text
 
     def test_placeholder_conversion_exact_string(self, tiny_image_path):
         """Verify the exact tokenizer input for the placeholder-style processor path.
@@ -310,15 +338,15 @@ class TestVLMProcessorMMPRTiny:
 
         # The stub's apply_chat_template joins message parts with spaces,
         # so the captured text passed to __call__ is the chat-templated string.
-        # Verify the vllm_content (which is apply_chat_template output) matches.
-        vllm_content = result["vllm_content"]
-        assert vllm_content == expected_tokenizer_input
+        # Verify the apply_chat_template output through captured_call_text below;
+        # placeholder-style processors send expanded token IDs to vLLM.
+        assert result["vllm_content"] is None
 
         # Verify exactly one <image> token in the final output
-        assert vllm_content.count("<image>") == 1
+        assert processor.captured_call_text.count("<image>") == 1
 
         # Verify the question text is present
-        assert _CLEAN_QUESTION in vllm_content
+        assert _CLEAN_QUESTION in processor.captured_call_text
 
         # Verify the captured __call__ text also matches
         # (processor.__call__ receives the apply_chat_template output)

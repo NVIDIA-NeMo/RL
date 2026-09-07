@@ -42,6 +42,8 @@ def _completion(
     *,
     env_token_ids: tuple[int, ...] = (30,),
     with_routes: bool = True,
+    mask_sample: bool | None = None,
+    truncated: bool = False,
 ) -> Completion:
     message_log = [
         {
@@ -67,10 +69,15 @@ def _completion(
     if not with_routes:
         for message in message_log:
             message.pop("routed_experts")
+    env_extras = (
+        None
+        if mask_sample is None
+        else {"instance_config": {"mask_sample": mask_sample}}
+    )
     return Completion(
         message_log=message_log,
-        env_extras=None,
-        truncated=False,
+        env_extras=env_extras,
+        truncated=truncated,
         reward=reward,
     )
 
@@ -142,6 +149,7 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
         "num_invalid_tool_calls": 0,
         "num_malformed_thinking": 0,
         "num_assistant_messages": 1,
+        "num_routed_experts_backfilled": 0,
     }
     assert tags == [
         {"weight_version": 3, "prompt_idx": 17, **no_violations},
@@ -235,6 +243,50 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
     assert "routed_experts" not in fields
 
 
+def test_record_to_train_batch_carries_raw_masks_without_applying_them() -> None:
+    record = _record(
+        [
+            _completion(
+                route_start=10,
+                reward=1.0,
+                mask_sample=True,
+            ),
+            _completion(
+                route_start=30,
+                reward=2.0,
+                mask_sample=False,
+                truncated=True,
+            ),
+            _completion(route_start=50, reward=3.0),
+        ]
+    )
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+
+    assert torch.equal(train_batch["sample_mask"], torch.ones(3))
+    assert torch.equal(
+        train_batch["mask_sample"],
+        torch.tensor([True, False, False]),
+    )
+    assert torch.equal(
+        train_batch["truncated"],
+        torch.tensor([False, True, False]),
+    )
+
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+    assert torch.equal(fields["mask_sample"], train_batch["mask_sample"])
+    assert torch.equal(fields["truncated"], train_batch["truncated"])
+
+
 def _failed_completion() -> Completion:
     """A trajectory whose first generation raised: prompt only, no routes."""
     return Completion(
@@ -311,6 +363,7 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_invalid_tool_calls": 1,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 1,
+            "num_routed_experts_backfilled": 0,
         },
         {
             "weight_version": 7,
@@ -318,6 +371,7 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 1,
             "num_assistant_messages": 1,
+            "num_routed_experts_backfilled": 0,
         },
         {
             "weight_version": 7,
@@ -325,5 +379,9 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 0,
+            # _failed_completion() has one message missing routed_experts; the
+            # other two completions in this group carry real routes, so
+            # backfill_missing_routed_experts finds a template and fills it.
+            "num_routed_experts_backfilled": 1,
         },
     ]
