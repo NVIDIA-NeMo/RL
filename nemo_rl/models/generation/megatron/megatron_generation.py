@@ -238,7 +238,7 @@ class MegatronGeneration(GenerationInterface):
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
         # Populated after the first prepare_for_generation (which starts the HTTP server).
-        self.dp_openai_server_base_urls: list[Optional[str]] = []
+        self.dp_openai_server_base_urls: list[str] = []
         # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional["WeightSynchronizer"] = None
 
