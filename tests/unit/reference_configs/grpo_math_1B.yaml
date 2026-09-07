@@ -50,6 +50,8 @@ grpo:
     enabled: false
     lambda_time: 0.016666666666666666
     apply_to: "all"
+    lambda_call_bonus: 0.0
+    call_bonus_ref: null
     floor: null
   skip_reference_policy_logprobs_calculation: false
   calculate_advantages_on_gpu: false

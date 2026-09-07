@@ -21,17 +21,22 @@ from pydantic import ValidationError
 from nemo_rl.utils.time_efficiency import (
     TimeEfficiencyConfig,
     apply_time_efficiency_reward,
+    rollout_calls,
     rollout_minutes,
 )
 
 
-def make_result(reward, run_time_s, resolved=True):
+def make_result(reward, run_time_s, resolved=True, calls=0, malformed=0):
     """Minimal NeMo-Gym rollout result in the shape the module consumes."""
+    output = [{"type": "function_call", "name": "bash"} for _ in range(calls)]
+    # Rejected calls surface as plain messages, never as function_call items.
+    output += [{"type": "message", "content": "<tool_call>"} for _ in range(malformed)]
     return {
         "full_result": {
             "reward": reward,
             "openhands_run_time": run_time_s,
             "resolved": resolved,
+            "response": {"output": output},
         }
     }
 
@@ -46,11 +51,42 @@ class TestTimeEfficiencyConfig:
         assert cfg.enabled is False
         assert cfg.lambda_time == pytest.approx(1.0 / 60.0)
         assert cfg.apply_to == "all"
+        assert cfg.lambda_call_bonus == 0.0
+        assert cfg.call_bonus_ref is None
         assert cfg.floor is None
 
     def test_rejects_unknown_apply_to(self):
         with pytest.raises(ValidationError):
             TimeEfficiencyConfig(apply_to="solved")
+
+    def test_rejects_negative_call_bonus(self):
+        with pytest.raises(ValidationError):
+            TimeEfficiencyConfig(lambda_call_bonus=-0.1, call_bonus_ref=56.0)
+
+    @pytest.mark.parametrize("call_bonus_ref", [None, 0.0, -5.0])
+    def test_call_bonus_requires_positive_ref(self, call_bonus_ref):
+        with pytest.raises(ValidationError, match="call_bonus_ref must be a positive"):
+            TimeEfficiencyConfig(lambda_call_bonus=0.1, call_bonus_ref=call_bonus_ref)
+
+    def test_ref_without_bonus_is_allowed(self):
+        TimeEfficiencyConfig(call_bonus_ref=56.0)
+
+
+class TestRolloutCalls:
+    def test_counts_only_function_call_items(self):
+        assert rollout_calls(make_result(1.0, 60.0, calls=3, malformed=2)) == 3
+
+    @pytest.mark.parametrize(
+        "full_result",
+        [
+            {"reward": 1.0},
+            {"reward": 1.0, "response": None},
+            {"reward": 1.0, "response": {"output": None}},
+            {"reward": 1.0, "response": {"output": ["not-a-dict"]}},
+        ],
+    )
+    def test_missing_or_malformed_output_counts_as_zero(self, full_result):
+        assert rollout_calls({"full_result": full_result}) == 0
 
 
 class TestRolloutMinutes:
@@ -100,6 +136,12 @@ class TestApplyTimeEfficiencyReward:
                 "time_efficiency/minutes/max": 60.0,
                 "time_efficiency/deduction/mean": 0.75,
                 "time_efficiency/deduction/max": 1.0,
+                "time_efficiency/calls/mean": 0.0,
+                "time_efficiency/bonus/mean": 0.0,
+                # 90 min of wall time and no calls: max(sum(calls), 1) guards the division.
+                "time_efficiency/seconds_per_call": 5400.0,
+                "time_efficiency/bonus_saturated_frac": 0.0,
+                "time_efficiency/floored_frac": 0.0,
                 "time_efficiency/group_has_signal": 1.0,
             }
         )
@@ -168,6 +210,79 @@ class TestApplyTimeEfficiencyReward:
             results, TimeEfficiencyConfig(enabled=True)
         )
         assert stats["time_efficiency/group_has_signal"] == 0.0
+
+    def test_call_bonus_saturates_at_the_reference(self):
+        # lambda_call_bonus 0.10, ref 50: 25 calls -> +0.05, 50 -> +0.10, 80 -> +0.10.
+        results = [
+            make_result(1.0, 1200.0, calls=25),  # 20 min
+            make_result(1.0, 1200.0, calls=50),
+            make_result(1.0, 1200.0, calls=80),
+        ]
+        cfg = TimeEfficiencyConfig(
+            enabled=True, lambda_call_bonus=0.10, call_bonus_ref=50.0
+        )
+        stats = apply_time_efficiency_reward(results, cfg)
+
+        penalty = 20.0 / 60.0
+        assert rewards(results) == pytest.approx(
+            [1.0 + 0.05 - penalty, 1.0 + 0.10 - penalty, 1.0 + 0.10 - penalty]
+        )
+        assert stats["time_efficiency/calls/mean"] == pytest.approx(155 / 3)
+        assert stats["time_efficiency/bonus/mean"] == pytest.approx(0.25 / 3)
+        assert stats["time_efficiency/bonus_saturated_frac"] == pytest.approx(2 / 3)
+        assert stats["time_efficiency/seconds_per_call"] == pytest.approx(
+            3 * 1200.0 / 155
+        )
+        # deduction is the realized decrease, net of the bonus.
+        assert stats["time_efficiency/deduction/max"] == pytest.approx(penalty - 0.05)
+
+    def test_call_bonus_follows_the_correct_gate(self):
+        # Under "correct" a failure earns neither the bonus nor the deduction,
+        # so junk calls on a failed rollout cannot be rewarded.
+        results = [
+            make_result(0.0, 600.0, resolved=False, calls=200),
+            make_result(1.0, 600.0, resolved=True, calls=10),
+        ]
+        cfg = TimeEfficiencyConfig(
+            enabled=True,
+            apply_to="correct",
+            lambda_call_bonus=0.10,
+            call_bonus_ref=50.0,
+        )
+        apply_time_efficiency_reward(results, cfg)
+        assert rewards(results) == pytest.approx([0.0, 1.0 + 0.02 - 10.0 / 60.0])
+
+    def test_floor_counts_floored_rows_and_lifts_the_full_timeout(self):
+        # A correct 60-min rollout with no calls lands on exactly 0.0 and would
+        # tie with the failures; the floor keeps it above them.
+        results = [
+            make_result(1.0, 3600.0, resolved=True, calls=0),
+            make_result(1.0, 600.0, resolved=True, calls=50),
+            make_result(0.0, 600.0, resolved=False),
+        ]
+        cfg = TimeEfficiencyConfig(
+            enabled=True,
+            apply_to="correct",
+            lambda_call_bonus=0.10,
+            call_bonus_ref=50.0,
+            floor=0.05,
+        )
+        stats = apply_time_efficiency_reward(results, cfg)
+        assert rewards(results) == pytest.approx([0.05, 1.0 + 0.10 - 10.0 / 60.0, 0.0])
+        assert stats["time_efficiency/floored_frac"] == pytest.approx(1 / 3)
+
+    def test_zero_call_bonus_is_the_plain_deduction(self):
+        results = [
+            make_result(1.0, 1800.0, calls=40),
+            make_result(0.0, 3600.0, calls=5),
+        ]
+        stats = apply_time_efficiency_reward(
+            results, TimeEfficiencyConfig(enabled=True)
+        )
+        assert rewards(results) == pytest.approx([0.5, -1.0])
+        assert stats["time_efficiency/bonus/mean"] == 0.0
+        assert stats["time_efficiency/bonus_saturated_frac"] == 0.0
+        assert stats["time_efficiency/calls/mean"] == pytest.approx(22.5)
 
     def test_masked_rows_are_not_charged_when_the_loss_mask_is_on(self):
         # Three trainable failures at equal wall time plus a loss-masked 60-min
