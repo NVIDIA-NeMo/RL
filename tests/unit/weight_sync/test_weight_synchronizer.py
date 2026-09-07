@@ -688,7 +688,9 @@ class TestCollectiveWeightSynchronizer:
         def get(ref):
             if ref is generation_ref:
                 raise generation_error
-            raise AssertionError("trainer future was observed before generation failure")
+            raise AssertionError(
+                "trainer future was observed before generation failure"
+            )
 
         mock_ray.wait.side_effect = wait
         mock_ray.get.side_effect = get
@@ -896,7 +898,9 @@ class TestNcclReshardWeightSynchronizer:
         def get(ref):
             if ref is generation_ref:
                 raise generation_error
-            raise AssertionError("trainer future was observed before generation failure")
+            raise AssertionError(
+                "trainer future was observed before generation failure"
+            )
 
         mock_ray.wait.side_effect = wait
         mock_ray.get.side_effect = get

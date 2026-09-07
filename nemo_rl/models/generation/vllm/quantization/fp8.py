@@ -1814,8 +1814,7 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
                 original_intermediate_size
             )
             kernel_moe_config.intermediate_size = (
-                padded_intermediate_size
-                * kernel_moe_config.moe_parallel_config.tp_size
+                padded_intermediate_size * kernel_moe_config.moe_parallel_config.tp_size
             )
         self.moe_quant_config = make_fp8_moe_quant_config(
             fp8_backend=self.mxfp8_backend,
@@ -1882,9 +1881,7 @@ def apply_monolithic_mxfp8_moe(
         layer, "mxfp8_padded_hidden_size", unpadded_hidden_size
     )
     if x.shape[-1] < padded_hidden_size:
-        x = torch.nn.functional.pad(
-            x, (0, padded_hidden_size - x.shape[-1]), value=0.0
-        )
+        x = torch.nn.functional.pad(x, (0, padded_hidden_size - x.shape[-1]), value=0.0)
 
     output = self.moe_kernel.apply_monolithic(
         x,
