@@ -22,8 +22,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.algorithms.metric_utils import normalize_filter_aware_mb_metrics
-
+from nemo_rl.algorithms.utils import finalize_actor_token_metrics
 from nemo_rl.data_plane import KVBatchMeta
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
@@ -76,7 +75,7 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         mb.update({f"moe/{k}": v for k, v in train_result["moe_metrics"].items()})
     if "mtp_metrics" in train_result:
         mb.update({f"mtp/{k}": v for k, v in train_result["mtp_metrics"].items()})
-    mb.update(normalize_filter_aware_mb_metrics(train_result.get("all_mb_metrics", {})))
+    mb.update(train_result.get("all_mb_metrics", {}))
 
     for k, v in mb.items():
         if k in _MB_METRIC_MIN:
@@ -89,7 +88,6 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
             metrics[k] = float(np.mean(v))
         else:
             metrics[k] = float(np.sum(v))
-
     # Deferred-mode counterpart to rollout_reassembler's direct-mode
     # routed_experts_row_coverage/routed_experts_sentinel_token_fraction:
     # this step's per-reason count of rows whose route fragments failed to
@@ -98,6 +96,7 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
     for reason, count in train_result.get("route_fallback_counts", {}).items():
         metrics[f"routed_experts_deferred_fallback/{reason}"] = float(count)
 
+    finalize_actor_token_metrics(metrics)
     return metrics
 
 

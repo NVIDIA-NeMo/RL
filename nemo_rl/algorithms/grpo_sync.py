@@ -46,8 +46,6 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.metric_utils import normalize_filter_aware_mb_metrics
-
 # Re-imports from grpo so this file is a thin trainer-only fork.
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
@@ -72,6 +70,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    finalize_actor_token_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
@@ -1118,9 +1117,7 @@ def grpo_train_sync(
                     metrics["filtered_reward"] = rewards.numpy()
                     metrics["reward"] = unfiltered_rewards.numpy()
 
-                metrics.update(
-                    normalize_filter_aware_mb_metrics(train_results["all_mb_metrics"])
-                )
+                metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
@@ -1147,6 +1144,7 @@ def grpo_train_sync(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
+                finalize_actor_token_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics

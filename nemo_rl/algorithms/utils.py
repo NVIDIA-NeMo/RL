@@ -34,6 +34,58 @@ from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
 
+ACTOR_TOKEN_COUNT_METRIC = "num_valid_actor_tokens"
+ACTOR_TOKEN_MEAN_METRICS = frozenset(
+    {"probs_ratio", "probs_ratio_clamped", "approx_entropy"}
+)
+PREV_TOKEN_COUNT_METRIC = "num_valid_prev_tokens"
+PREV_TOKEN_MEAN_METRICS = frozenset(
+    {
+        "token_mult_prob_error",
+        "gen_kl_error",
+        "policy_kl_error",
+        "js_divergence_error",
+    }
+)
+SAMPLING_RATIO_TOKEN_COUNT_METRIC = "num_valid_sampling_importance_ratio_tokens"
+IS_OOB_TOKEN_COUNT_METRIC = "num_valid_is_oob_tokens"
+
+_FILTER_AWARE_TOKEN_METRIC_GROUPS = (
+    (ACTOR_TOKEN_COUNT_METRIC, ACTOR_TOKEN_MEAN_METRICS),
+    (PREV_TOKEN_COUNT_METRIC, PREV_TOKEN_MEAN_METRICS),
+    (SAMPLING_RATIO_TOKEN_COUNT_METRIC, frozenset({"sampling_importance_ratio"})),
+    (IS_OOB_TOKEN_COUNT_METRIC, frozenset({"is_oob_ratio"})),
+)
+
+
+def finalize_actor_token_metrics(metrics: dict[str, Any]) -> None:
+    """Normalize filter-aware token metric numerators after aggregation.
+
+    ``ClippedPGLossFn`` emits raw numerator fragments for metrics whose mask can
+    narrow after the original global token count was computed, together with a
+    matching retained-token count. Callers first sum both across every
+    microbatch and data-parallel rank, then call this helper exactly once.
+    Normalizing fragments locally would weight sparse shards and packed
+    sequences equally instead of by their retained-token counts.
+
+    Args:
+        metrics: Step metrics whose loss fragments have already been summed.
+            The mapping is updated in place.
+    """
+    for count_metric, mean_metrics in _FILTER_AWARE_TOKEN_METRIC_GROUPS:
+        if count_metric not in metrics:
+            continue
+        count = float(metrics[count_metric])
+        if count < 0:
+            raise ValueError(f"{count_metric} must be non-negative, got {count}")
+        for metric_name in mean_metrics:
+            if metric_name not in metrics:
+                continue
+            metrics[metric_name] = (
+                float(metrics[metric_name]) / count if count > 0 else 0.0
+            )
+
+
 def get_gdpo_reward_component_keys(batch) -> list[str]:
     """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
     return sorted(

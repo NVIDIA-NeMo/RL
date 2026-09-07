@@ -49,7 +49,6 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
-    normalize_filter_aware_mb_metrics,
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
@@ -60,6 +59,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    finalize_actor_token_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -3723,9 +3723,7 @@ def grpo_train(
                     metrics["filtered_reward"] = rewards.numpy()
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
 
-                metrics.update(
-                    normalize_filter_aware_mb_metrics(train_results["all_mb_metrics"])
-                )
+                metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():
@@ -3753,6 +3751,7 @@ def grpo_train(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
+                finalize_actor_token_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -5590,9 +5589,7 @@ def async_grpo_train(
                     metrics["draft_grad_norm"] = train_results[
                         "draft_grad_norm"
                     ].numpy()
-                metrics.update(
-                    normalize_filter_aware_mb_metrics(train_results["all_mb_metrics"])
-                )
+                metrics.update(train_results["all_mb_metrics"])
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
@@ -5616,6 +5613,7 @@ def async_grpo_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                finalize_actor_token_metrics(metrics)
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics

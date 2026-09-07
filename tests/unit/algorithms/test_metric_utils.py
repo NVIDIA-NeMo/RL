@@ -20,51 +20,8 @@ import pytest
 
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
-    normalize_filter_aware_mb_metrics,
     print_setup_timing_summary,
 )
-
-
-class TestNormalizeFilterAwareMbMetrics:
-    def test_uses_actual_counts_across_uneven_microbatches(self):
-        metrics = {
-            "global_valid_toks": [5.0, 5.0],
-            "probs_ratio": [4.0 / 5.0, 3.0 / 5.0],
-            "token_mult_prob_error": [6.0 / 5.0, 4.0 / 5.0],
-            "sampling_importance_ratio": [9.0 / 5.0, 3.0 / 5.0],
-            "is_oob_ratio": [1.0 / 5.0, 1.0 / 5.0],
-            "_actor_valid_toks": [2.0, 1.0],
-            "_prev_valid_toks": [3.0, 2.0],
-            "_sampling_importance_ratio_valid_toks": [3.0, 2.0],
-            "_is_oob_valid_toks": [3.0, 2.0],
-            "unrelated": [1.0, 2.0],
-        }
-
-        out = normalize_filter_aware_mb_metrics(metrics)
-
-        assert out["probs_ratio"] == pytest.approx([7.0 / 3.0])
-        assert out["token_mult_prob_error"] == pytest.approx([2.0])
-        assert out["sampling_importance_ratio"] == pytest.approx([12.0 / 5.0])
-        assert out["is_oob_ratio"] == pytest.approx([2.0 / 5.0])
-        assert out["unrelated"] == [1.0, 2.0]
-        assert not any(key.startswith("_") for key in out)
-        assert metrics["_actor_valid_toks"] == [2.0, 1.0]
-
-    def test_zero_actual_tokens_returns_zero(self):
-        out = normalize_filter_aware_mb_metrics(
-            {
-                "global_valid_toks": [4.0],
-                "probs_ratio": [0.0],
-                "_actor_valid_toks": [0.0],
-            }
-        )
-        assert out["probs_ratio"] == [0.0]
-
-    def test_requires_original_denominator(self):
-        with pytest.raises(ValueError, match="global_valid_toks"):
-            normalize_filter_aware_mb_metrics(
-                {"probs_ratio": [0.5], "_actor_valid_toks": [1.0]}
-            )
 
 
 class TestPrintSetupTimingSummary:

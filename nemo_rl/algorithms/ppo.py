@@ -46,12 +46,12 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
-from nemo_rl.algorithms.metric_utils import normalize_filter_aware_mb_metrics
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    finalize_actor_token_metrics,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -1838,11 +1838,7 @@ def ppo_train(
                         "loss": train_results["loss"].numpy(),
                         "grad_norm": train_results["grad_norm"].numpy(),
                     }
-                    metrics.update(
-                        normalize_filter_aware_mb_metrics(
-                            train_results["all_mb_metrics"]
-                        )
-                    )
+                    metrics.update(train_results["all_mb_metrics"])
                     if "moe_metrics" in train_results:
                         metrics.update(
                             {
@@ -1900,6 +1896,7 @@ def ppo_train(
                         metrics[k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
+                finalize_actor_token_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -2865,11 +2862,7 @@ def async_ppo_train(
                                 for k, v in train_results["moe_metrics"].items()
                             }
                         )
-                    metrics.update(
-                        normalize_filter_aware_mb_metrics(
-                            train_results["all_mb_metrics"]
-                        )
-                    )
+                    metrics.update(train_results["all_mb_metrics"])
                 if value_results is not None:
                     metrics.update(_compute_critic_metrics(value_results))
 
@@ -2895,6 +2888,7 @@ def async_ppo_train(
                         metrics[k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
+                finalize_actor_token_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
