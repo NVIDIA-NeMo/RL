@@ -144,7 +144,13 @@ def test_check_nccl_reshard_refit_support_accepts_native_mxfp8_pair() -> None:
     check_nccl_reshard_refit_support(config)
 
 
-@pytest.mark.parametrize("fp8_recipe", ["tensorwise", None])
+@pytest.mark.parametrize(
+    ("fp8_recipe", "match"),
+    [
+        ("tensorwise", "fp8_recipe must be 'blockwise'"),
+        (None, "fp8_recipe must be 'blockwise'"),
+    ],
+)
 def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
     fp8_recipe: str | None,
     match: str,
