@@ -1174,6 +1174,22 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
+        if megatron_cfg["mtp_num_layers"] == 0:
+            # mtp_num_layers=0 means "do not build MTP at all". For checkpoints
+            # trained with a repeated MTP layer, HybridProvider.finalize() still
+            # appends one MTP section to the layer pattern (max(1, 0) copies)
+            # whenever mtp_use_repeated_layer/mtp_hybrid_override_pattern are
+            # set, and HybridModel.forward then hits
+            # ``assert self.config.mtp_num_layers > 0``. Strip every MTP source
+            # so the pattern stays main-decoder only.
+            if getattr(model_cfg, "mtp_hybrid_override_pattern", None):
+                model_cfg.mtp_hybrid_override_pattern = None
+            if getattr(model_cfg, "mtp_use_repeated_layer", False):
+                model_cfg.mtp_use_repeated_layer = False
+            for pattern_attr in ("hybrid_layer_pattern", "hybrid_override_pattern"):
+                pattern = getattr(model_cfg, pattern_attr, None)
+                if isinstance(pattern, str) and "/" in pattern:
+                    setattr(model_cfg, pattern_attr, pattern.split("/")[0])
     if "mtp_loss_scaling_factor" in megatron_cfg:
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
     if "mtp_use_repeated_layer" in megatron_cfg:
