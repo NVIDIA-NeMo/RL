@@ -212,6 +212,7 @@ policy:
       fp8_param: false
 
 data:
+  backend: hf
   max_input_seq_length: ${policy.max_total_sequence_length}
   add_bos: true
   add_eos: true
