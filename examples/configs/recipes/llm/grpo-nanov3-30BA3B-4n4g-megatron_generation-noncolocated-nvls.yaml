@@ -1,0 +1,29 @@
+defaults: ./grpo-nanov3-30BA3B-2n8g-megatron_generation.yaml
+# This base model solves well under 1% of prompts, so the inherited 16 samples
+# per step leave a ~29% chance of a run scoring no reward at all and tripping the
+# reward assertion. 64 samples per step brings that under 1%.
+grpo:
+  num_prompts_per_step: 8
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-nvls
+policy:
+  train_global_batch_size: 64
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    sequence_parallel: false
+  generation:
+    mcore_generation_config:
+      tensor_model_parallel_size: 1
+      sequence_parallel: false
+      inference_moe_token_dispatcher_type: nvls
+    colocated:
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2
+logger:
+  wandb:
+    name: grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-nvls
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 2
