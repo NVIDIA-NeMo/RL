@@ -479,6 +479,12 @@ def _patch_scalar_field_schema() -> None:
     _md._nrl_scalar_schema_patched = True
 
 
+# Installed at import, not from the constructor: a process can unpickle a client
+# without ever running __init__, so import is the earliest point that covers
+# every user of this module.
+_patch_scalar_field_schema()
+
+
 def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     """Reuse RDMA-registered host buffers for mooncake tensor GETs and PUTs.
 
@@ -778,15 +784,12 @@ class TQDataPlaneClient(DataPlaneClient):
         """
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
-        # env vars and they can't be changed. Two per-process knobs are
+        # env vars and they can't be changed. MC_TCP_BIND_ADDRESS is
         # needed in EVERY process that builds a TQ client (driver,
-        # SyncRolloutActor, every MegatronPolicyWorker rank):
-        #   1. MC_TCP_BIND_ADDRESS — Mooncake engine.so writes this into
-        #      desc.ip_or_host_name, the address peers receive from the
-        #      metadata service. Without it, getifaddrs()[0] picks usb0
-        #      (169.254.x APIPA) and peers fail to connect.
-        #   2. KV-path 1D promotion — works around TQ's
-        #      extract_field_schema schema/data mismatch for 1D fields.
+        # SyncRolloutActor, every MegatronPolicyWorker rank): Mooncake
+        # engine.so writes it into desc.ip_or_host_name, the address peers
+        # receive from the metadata service. Without it, getifaddrs()[0]
+        # picks usb0 (169.254.x APIPA) and peers fail to connect.
         # The cluster-wide MC_* knobs are NOT among them; they are set
         # once on the driver, before this module is importable — see
         # nemo_rl.data_plane.adapters.transfer_queue_env.
@@ -814,14 +817,6 @@ class TQDataPlaneClient(DataPlaneClient):
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
-        # Fix TQ's 1-D field schema at the source rather than reshaping the
-        # payload around it: the schema now reports the ``()`` sample shape
-        # the stored rows actually have. Applied on every backend and in
-        # every process that builds a client, before ``_init_tq`` /
-        # ``_connect_existing``, so no put can land under the old schema.
-        # Self-verifying — see :func:`_assert_tq_stores_scalar_rows_0d`.
-        _patch_scalar_field_schema()
-
         if bootstrap:
             _init_tq(cfg)
         else:
