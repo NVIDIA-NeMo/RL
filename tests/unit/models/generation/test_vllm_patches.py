@@ -49,7 +49,7 @@ _PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
 _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
-_RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
+_RADIO_MARKER = 'initializer_factor = getattr(self.config, "initializer_factor", 1.0)'
 _NANO_VL_SOURCE = "model_executor/models/nano_nemotron_vl.py"
 _NANO_VL_PATCH_FN = "_patch_vllm_radio_final_layernorm"
 _NANO_VL_MARKER = "self.vision_final_layernorm = nn.LayerNorm("
@@ -174,9 +174,9 @@ def test_radio_layerscale_patch_loads_explicit_and_initializes_folded_weights(
 ):
     content = patched_radio_source.read_text()
     assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
-    assert 'name.endswith((".ls1", ".ls2"))' in content
-    assert "param.data.fill_(initializer_factor)" in content
-    assert "loaded_params.add(name)" in content
+    assert 'ls_name.endswith((".ls1", ".ls2"))' in content
+    assert "ls_param.data.fill_(initializer_factor)" in content
+    assert "loaded_params.add(ls_name)" in content
 
 
 @pytest.mark.vllm
@@ -208,9 +208,7 @@ def test_radio_final_layernorm_patch_covers_model_forward_and_loader(
 
 
 @pytest.mark.vllm
-def test_radio_final_layernorm_patch_is_idempotent(
-    patched_nano_vl_source, monkeypatch
-):
+def test_radio_final_layernorm_patch_is_idempotent(patched_nano_vl_source, monkeypatch):
     before = patched_nano_vl_source.read_text()
     monkeypatch.setattr(
         patches, "_get_vllm_file", lambda _relative: str(patched_nano_vl_source)
@@ -230,7 +228,7 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
         patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
-    assert "vLLM 0.25.1 source shape was not found" in caplog.text
+    assert "load_weights tail anchor was not found" in caplog.text
 
 
 @pytest.mark.parametrize(

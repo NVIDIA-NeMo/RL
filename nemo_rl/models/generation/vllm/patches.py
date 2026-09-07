@@ -615,8 +615,7 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
         file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
     except RuntimeError:
         logger.warning(
-            "Could not locate nano_nemotron_vl.py for the RADIO final "
-            "LayerNorm patch."
+            "Could not locate nano_nemotron_vl.py for the RADIO final LayerNorm patch."
         )
         return
 

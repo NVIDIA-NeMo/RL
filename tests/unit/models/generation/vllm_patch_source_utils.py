@@ -47,26 +47,37 @@ def patch_replacements(patch_fn_name: str) -> tuple[tuple[str, str], ...]:
         ) from None
 
     snippets = {}
+    named_pairs: dict[str, dict[str, str]] = {}
     replacements = None
     for node in ast.walk(func):
-        if (
+        if not (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in ("old_snippet", "new_snippet")
         ):
-            snippets[node.targets[0].id] = ast.literal_eval(node.value)
+            continue
 
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "replacements"
-        ):
+        target_name = node.targets[0].id
+        if target_name in ("old_snippet", "new_snippet"):
+            snippets[target_name] = ast.literal_eval(node.value)
+        elif target_name == "replacements":
             replacements = ast.literal_eval(node.value)
+        elif target_name.endswith(("_old", "_new")):
+            pair_name, side = target_name.rsplit("_", 1)
+            named_pairs.setdefault(pair_name, {})[side] = ast.literal_eval(node.value)
 
     if replacements is not None:
         return tuple(replacements)
+
+    if named_pairs:
+        incomplete = [
+            name for name, pair in named_pairs.items() if pair.keys() != {"old", "new"}
+        ]
+        if incomplete:
+            raise AssertionError(
+                f"{patch_fn_name} defines incomplete replacement pairs: {incomplete}"
+            )
+        return tuple((pair["old"], pair["new"]) for pair in named_pairs.values())
 
     missing = {"old_snippet", "new_snippet"} - snippets.keys()
     if missing:
@@ -107,6 +118,11 @@ def write_unpatched_copy(
     content = Path(patches._get_vllm_file(relative_source)).read_text()
 
     for old_snippet, new_snippet in reversed(replacements):
+        # A deletion-only optional edit cannot be reconstructed from the
+        # patched source. Leaving it deleted is sufficient to restore and
+        # exercise every required anchor in the patch.
+        if not new_snippet:
+            continue
         if new_snippet in content:
             content = content.replace(new_snippet, old_snippet, 1)
         assert new_snippet not in content, (
