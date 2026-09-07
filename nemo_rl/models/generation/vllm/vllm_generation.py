@@ -47,6 +47,8 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
+    assert_refit_unsupported_grouped_moe_params,
+    assert_reload_refit_config_supported,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
@@ -216,6 +218,8 @@ class VllmGeneration(GenerationInterface):
             f"Provided keys: {', '.join(self.cfg.keys())}\n"
             f"Please update your configuration to include all required VLLM parameters."
         )
+
+        assert_reload_refit_config_supported(self.cfg)
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
@@ -594,6 +598,36 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         results = ray.get(futures)
         return results
+
+    def setup_token_capture(
+        self, dp_cfg: dict[str, Any], staging_partition: str
+    ) -> None:
+        """Install ledger-authoritative token capture in every DP-leader worker.
+
+        Called once at setup when ``token_capture.enabled``; each async worker
+        builds its in-worker data-plane client + TQTokenSink and makes the
+        single Gym ``install_capture`` call.
+        """
+        assert self.cfg["vllm_cfg"]["async_engine"], (
+            "token capture requires the async vLLM engine (the capture host "
+            "is the worker's in-process HTTP server)"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            "setup_token_capture",
+            dp_cfg=dp_cfg,
+            staging_partition=staging_partition,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the weight version workers stamp on captured model calls."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "set_rollout_weight_version",
+            version=version,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
 
     def _get_raw_spec_counters(self) -> dict[str | tuple[str, int], float]:
         """Collect raw spec decode counters from workers."""
@@ -1187,6 +1221,7 @@ class VllmGeneration(GenerationInterface):
         """
         if state_dict_info is None:
             return None
+        assert_refit_unsupported_grouped_moe_params(self.cfg, state_dict_info)
 
         # Choose the appropriate method based on async_engine setting
         method_name = (

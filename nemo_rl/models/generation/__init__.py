@@ -123,6 +123,7 @@ def configure_generation_config(
         # MTP draft weights arrive via refit if the trainer trains the MTP layer.
         # If the trainer does not train the MTP layer, the weights need to be
         # loaded from the checkpoint.
+        config["_draft_weights_from_refit"] = has_refit_draft_weights
         config["_mtp_weights_from_refit"] = trains_mtp
 
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.

@@ -136,6 +136,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        logger={"wandb_enabled": False, "wandb": {}},
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
         cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
