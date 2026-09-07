@@ -807,16 +807,13 @@ class SingleControllerActor:
         load_metrics = dict(self._rollout_checkpoint_load_metrics)
         load_metrics["replay_metadata_load_seconds"] = replay_metadata_load_seconds
         load_metrics["recovery_prepare_seconds"] = recovery_prepare_seconds
+        # At this point, load_metrics contains restore-phase timers only. Sum by
+        # the metric contract instead of maintaining a second hard-coded phase
+        # inventory that can silently omit a newly added restore timer.
         load_metrics["total_load_seconds"] = sum(
-            load_metrics[key]
-            for key in (
-                "snapshot_resolution_seconds",
-                "dataloader_load_seconds",
-                "tq_load_seconds",
-                "replay_metadata_load_seconds",
-                "recovery_prepare_seconds",
-            )
-            if key in load_metrics
+            value
+            for key, value in load_metrics.items()
+            if key.endswith("_seconds") and key != "total_load_seconds"
         )
         load_metrics["groups_reused"] = float(restored_replay_groups)
         self._log_telemetry_metrics(

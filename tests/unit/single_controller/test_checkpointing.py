@@ -53,6 +53,7 @@ from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
@@ -110,6 +111,7 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
 from tests.unit.single_controller.test_setup import (
+    _native_tq_metadata,
     patched_factories,  # noqa: F401
 )
 
@@ -1258,6 +1260,7 @@ class TestPeriodicRolloutCheckpoint:
             "snapshot_resolution_seconds": 0.5,
             "dataloader_load_seconds": 1.0,
             "tq_load_seconds": 2.0,
+            "future_restore_phase_seconds": 5.0,
         }
         try:
             actor._log_rollout_restore_metrics(
@@ -1269,7 +1272,7 @@ class TestPeriodicRolloutCheckpoint:
             actor._checkpointer.shutdown()
 
         logged = actor._logger.log_metrics.call_args.args[0]
-        assert logged["total_load_seconds"] == 10.5
+        assert logged["total_load_seconds"] == 15.5
         assert logged["groups_reused"] == 5.0
         assert actor._logger.log_metrics.call_args.kwargs["prefix"] == (
             "timing/rollout_recovery"
@@ -2170,6 +2173,7 @@ def _write_periodic_snapshot(step_dir: Path) -> Path:
     # dataloader and manifest. Keep this fixture representative so setup
     # exercises rollout-payload restore timing as well as cursor restoration.
     torch.save({"groups": []}, tmp_snapshot / REPLAY_BUFFER_METADATA_FILENAME)
+    (tmp_snapshot / DATA_PLANE_CHECKPOINT_DIR).mkdir()
     manifest = RolloutSnapshotManifest(
         schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
         base_train_step=3,
@@ -2335,6 +2339,11 @@ class TestSetupResumeWiring:
             list(range(8)),
             None,
         )
+        tq_metadata = _native_tq_metadata(step=3, trainer_version=3, epoch=4)
+        tq_metadata["replay_group_count"] = 0
+        patched_factories[
+            "fake_policy"
+        ].load_data_plane_checkpoint.return_value = tq_metadata
 
         with (
             patch(

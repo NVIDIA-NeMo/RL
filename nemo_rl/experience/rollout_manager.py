@@ -1912,7 +1912,9 @@ class RolloutManager:
             mean_output_tokens = rollout_metrics.get("mean_gen_tokens_per_sample", 0)
             output_tokens = 0
             if isinstance(mean_output_tokens, (int, float)):
-                total_output_tokens = float(mean_output_tokens) * len(record.completions)
+                total_output_tokens = float(mean_output_tokens) * len(
+                    record.completions
+                )
                 if math.isfinite(total_output_tokens):
                     output_tokens = max(0, round(total_output_tokens))
             self.record_canonical_publication(output_tokens)
