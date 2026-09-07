@@ -892,7 +892,6 @@ def _load_opd_full_teacher_lm_heads(
             "on_policy_distillation.full currently supports exactly one teacher "
             f"checkpoint, got {sorted(teacher_checkpoints)}."
         )
-    from nemo_rl.models.megatron.setup import validate_model_paths
 
     teacher = next(iter(teacher_worker_groups.values()))
     # TeacherWorkerGroup deep-copies the student policy config and overrides only
@@ -900,18 +899,20 @@ def _load_opd_full_teacher_lm_heads(
     # validate_model_paths would ignore `model_name` entirely and hand back the
     # *student's* checkpoint, silently distilling the student into itself. Clear
     # it so resolution keys off the teacher's own model name.
+    #
+    # Path resolution happens on the student workers, not here: validate_model_paths
+    # lives in nemo_rl.models.megatron.setup, which imports megatron.bridge at module
+    # scope, and the driver process is never provisioned with the mcore extra -- only
+    # the Megatron worker actors are.
     teacher_path_config = {**teacher.cfg, "pretrained_checkpoint": None}
-    _, teacher_pretrained_path, _ = validate_model_paths(
-        cast(PolicyConfig, teacher_path_config)
-    )
-    ray.get(
+    results = ray.get(
         trainer.worker_group.run_all_workers_single_data(
             "load_opd_full_teacher_lm_head",
-            teacher_pretrained_path=teacher_pretrained_path,
+            teacher_path_config=cast(PolicyConfig, teacher_path_config),
         )
     )
     print(
-        f"  ✓ Loaded opd_full teacher LM head from {teacher_pretrained_path}",
+        f"  ✓ Loaded opd_full teacher LM head from {results[0]}",
         flush=True,
     )
 

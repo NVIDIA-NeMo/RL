@@ -1,0 +1,28 @@
+defaults: ./mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab.yaml
+
+# GB200 variant of the H100 3n8g recipe. GB200 nodes expose 4 GPUs each, so
+# every gpus_per_node knob that was sized to the H100 node (student/generation
+# split and the non-colocated teacher) is halved; tensor_model_parallel_size=2
+# throughout still divides evenly into 4.
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 4
+
+checkpointing:
+  checkpoint_dir: results/mopd-qwen3-1.7b-3n4g-megatron-pack-single-controller-fullvocab
+
+logger:
+  wandb:
+    name: mopd-qwen3-1.7b-3n4g-megatron-pack-single-controller-fullvocab
+  mlflow:
+    run_name: mopd-qwen3-1.7b-3n4g-megatron-pack-single-controller-fullvocab
+
+cluster:
+  gpus_per_node: 4
+
+on_policy_distillation:
+  non_colocated_teachers:
+    default_teacher_cfg:
+      gpus_per_node: 4

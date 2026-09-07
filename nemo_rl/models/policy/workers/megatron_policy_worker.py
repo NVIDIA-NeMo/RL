@@ -2092,15 +2092,30 @@ class MegatronPolicyWorkerImpl(
             "on_policy_distillation.full.teacher_payload='logits'."
         )
 
-    def load_opd_full_teacher_lm_head(self, teacher_pretrained_path: str) -> None:
-        """Load this rank's shard of the teacher LM head for full-vocabulary MOPD.
+    def load_opd_full_teacher_lm_head(self, teacher_path_config: PolicyConfig) -> str:
+        """Resolve and load the teacher LM head for full-vocabulary MOPD.
 
         Called after the teacher worker groups exist, because the teacher's
-        Megatron checkpoint is only materialized by their HF conversion.
+        Megatron checkpoint is only materialized by their HF conversion. Path
+        resolution happens here rather than on the driver: the driver process
+        is never provisioned with the mcore extra that validate_model_paths'
+        module needs.
 
         Args:
-            teacher_pretrained_path: Megatron checkpoint root of the teacher.
+            teacher_path_config: Teacher policy config with `pretrained_checkpoint`
+                cleared, so resolution keys off the teacher's own model name.
+
+        Returns:
+            The resolved Megatron checkpoint root of the teacher.
         """
+        _, teacher_pretrained_path, _ = validate_model_paths(teacher_path_config)
+        self._load_opd_full_teacher_lm_head_from_path(teacher_pretrained_path)
+        return teacher_pretrained_path
+
+    def _load_opd_full_teacher_lm_head_from_path(
+        self, teacher_pretrained_path: str
+    ) -> None:
+        """Load this rank's shard of the teacher LM head from an already-resolved path."""
         owner = self._resolve_output_layer_owner()
         output_layer = owner.output_layer
         output_weight = output_layer.weight
@@ -2147,7 +2162,9 @@ class MegatronPolicyWorkerImpl(
             and self._opd_full_lm_head_lifecycle == "evict"
             and self._opd_full_teacher_checkpoint_path is not None
         ):
-            self.load_opd_full_teacher_lm_head(self._opd_full_teacher_checkpoint_path)
+            self._load_opd_full_teacher_lm_head_from_path(
+                self._opd_full_teacher_checkpoint_path
+            )
         self._move_opd_full_teacher_lm_head("cuda")
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs_with_full_payload")
