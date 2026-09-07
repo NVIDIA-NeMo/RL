@@ -513,6 +513,12 @@ def test_megatron_policy_generation(
             f"tp={tensor_parallel_size} pp={pipeline_parallel_size}"
         )
 
+    if pipeline_parallel_size > 1:
+        pytest.xfail(
+            "FIXME(@cspades/@tdene): MCore async-scheduled generation segfaults with PP>1 "
+            "in dynamic_context.calculate_log_probs_tensors when slicing log_probs."
+        )
+
     config = deepcopy(basic_megatron_test_config)
     config["megatron_cfg"]["tensor_model_parallel_size"] = tensor_parallel_size
     config["megatron_cfg"]["pipeline_model_parallel_size"] = pipeline_parallel_size

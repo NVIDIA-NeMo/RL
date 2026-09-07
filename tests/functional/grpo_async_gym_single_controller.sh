@@ -107,7 +107,14 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
+EXTRA_CHECKS=()
+if [[ "$*" == *token_capture.enabled=true* ]]; then
+    # Nonzero only when a finalizer actor ran, i.e. capture really was on.
+    EXTRA_CHECKS+=('max(data["train/finalize/total_ms"]) > 0')
+fi
+
 # Observed to be between 0.8-1.3
 uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/gen_kl_error"]) < 1.3' \
-    'max(data["train/reward"]) > 0'
+    'max(data["train/reward"]) > 0' \
+    "${EXTRA_CHECKS[@]}"

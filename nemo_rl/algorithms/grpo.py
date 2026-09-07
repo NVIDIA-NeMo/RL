@@ -111,7 +111,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
     GenerationSamplingParams,
-    resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -461,10 +460,24 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
             "grpo.deduplicate_multimodal_data=true is currently qualified "
             "only with policy.generation.backend=vllm."
         )
-    if (master_config.data_plane or {}).get("enabled", False):
+    # The data plane accepts deduplicated payloads, so the wire format is not
+    # the constraint -- but note what dedup buys there. ``to_wire`` emits one
+    # row per *logical* row, so a shared segment is concatenated once per
+    # generation: the saving is in driver RAM (the deepcopy memo), not in wire
+    # or TQ-storage bytes, which stay O(G x images). The one gap is NeMo-Gym:
+    # ``grpo_train_sync`` does not call
+    # ``attach_initial_nemo_gym_image_payloads``, which supplies the initial
+    # image tensors a Gym dataset omits from ``extra_env_info``. That helper is
+    # itself gated on ``should_use_nemo_gym``, so non-Gym recipes never needed
+    # it and are unaffected.
+    if (master_config.data_plane or {}).get("enabled", False) and (
+        should_use_nemo_gym(master_config)
+    ):
         raise NotImplementedError(
-            "grpo.deduplicate_multimodal_data=true is currently supported "
-            "only when data_plane.enabled=false."
+            "grpo.deduplicate_multimodal_data=true with data_plane.enabled=true "
+            "is not supported for NeMo-Gym runs: the TransferQueue trainer does "
+            "not attach the initial Gym image payloads. Non-Gym recipes are "
+            "supported."
         )
 
 
@@ -816,19 +829,12 @@ def setup(
     def _spinup_nemo_gym(base_urls, model_name):
         """Spin up the NeMo Gym actor against the given generation server URLs."""
         t0 = time.perf_counter()
-        enable_router_replay = router_replay_enabled(policy_config)
-        routed_experts_dtype = (
-            resolve_routed_experts_dtype_name_for_model(model_name)
-            if enable_router_replay
-            else "int16"
-        )
         actor = spinup_nemo_gym_actor(
-            env_configs=env_configs,
+            env_configs,
             base_urls=base_urls,
             model_name=model_name,
             tokenizer=tokenizer,
-            enable_router_replay=enable_router_replay,
-            routed_experts_dtype=routed_experts_dtype,
+            enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
         return actor, time.perf_counter() - t0

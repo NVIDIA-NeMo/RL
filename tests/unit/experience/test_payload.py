@@ -149,6 +149,7 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
         "num_invalid_tool_calls": 0,
         "num_malformed_thinking": 0,
         "num_assistant_messages": 1,
+        "num_routed_experts_backfilled": 0,
     }
     assert tags == [
         {"weight_version": 3, "prompt_idx": 17, **no_violations},
@@ -362,6 +363,7 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_invalid_tool_calls": 1,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 1,
+            "num_routed_experts_backfilled": 0,
         },
         {
             "weight_version": 7,
@@ -369,6 +371,7 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 1,
             "num_assistant_messages": 1,
+            "num_routed_experts_backfilled": 0,
         },
         {
             "weight_version": 7,
@@ -376,5 +379,9 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 0,
+            # _failed_completion() has one message missing routed_experts; the
+            # other two completions in this group carry real routes, so
+            # backfill_missing_routed_experts finds a template and fills it.
+            "num_routed_experts_backfilled": 1,
         },
     ]

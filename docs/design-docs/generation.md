@@ -247,9 +247,8 @@ policy:
       max_tokens: 16384
 ```
 
-For a complete example, see:
-- **Configuration**: `examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml`
-- **Test Script**: `tests/functional/grpo_megatron_generation.sh`
+For a complete example, see
+`examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml`.
 
 ## Extend with New Backends
 
