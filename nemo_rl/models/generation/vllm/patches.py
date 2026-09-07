@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import os
+from collections.abc import Callable
 from contextlib import contextmanager
 from functools import wraps
 from importlib.util import find_spec
-from typing import Any
+from typing import Any, cast
 
 from nemo_rl.utils.quantization_logging import (
     LAYER_QUANTIZATION_LOG_ENV,
@@ -193,12 +194,15 @@ def _patch_vllm_modelopt_layer_quantization_logging(
             return False
 
         original_get_quant_method = getattr(cls, "get_quant_method", None)
-        if original_get_quant_method is None:
+        if not callable(original_get_quant_method):
             return False
+        typed_get_quant_method = cast(
+            Callable[[Any, Any, str], Any], original_get_quant_method
+        )
 
-        @wraps(original_get_quant_method)
+        @wraps(typed_get_quant_method)
         def wrapped_get_quant_method(self: Any, layer: Any, prefix: str) -> Any:
-            quant_method = original_get_quant_method(self, layer, prefix)
+            quant_method = typed_get_quant_method(self, layer, prefix)
             if isinstance(layer, logged_layer_types):
                 if (
                     quant_method is None
@@ -221,7 +225,7 @@ def _patch_vllm_modelopt_layer_quantization_logging(
                     )
             return quant_method
 
-        setattr(cls, "_nrl_original_get_quant_method", original_get_quant_method)
+        setattr(cls, "_nrl_original_get_quant_method", typed_get_quant_method)
         cls.get_quant_method = wrapped_get_quant_method
         setattr(cls, G_MODELOPT_LAYER_QUANTIZATION_PATCH_ATTR, True)
         return True
