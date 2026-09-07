@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
@@ -1111,6 +1112,11 @@ class DistillationLossConfig(BaseModel, extra="allow"):
     kl_type: str = "mixed"
     mixed_kl_weight: float = 0.5
     zero_outside_topk: bool = False
+    # Interpolation coefficient for kl_type="jsd" (generalized Jensen-Shannon
+    # divergence, see Eq. 1 of https://huggingface.co/papers/2306.13649):
+    # beta=0 reduces to forward KL, beta=1 to reverse KL, beta=0.5 (default)
+    # gives the symmetric JSD. Unused for other kl_type values.
+    jsd_beta: float = 0.5
 
 
 class DistillationLossDataDict(TypedDict):
@@ -1132,12 +1138,14 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg.kl_type
         self.mixed_kl_weight = cfg.mixed_kl_weight
         self.zero_outside_topk = cfg.zero_outside_topk
+        self.jsd_beta = cfg.jsd_beta
         self.log_infinitesimal = -100
 
-        assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
+        assert self.kl_type in ["forward", "reverse", "mixed", "jsd"], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+        assert self.jsd_beta >= 0 and self.jsd_beta <= 1, "Invalid JSD beta"
 
     def __call__(
         self,
@@ -1152,8 +1160,14 @@ class DistillationLossFn(LossFunction):
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
+        # jsd is forward KL at beta=0 and reverse KL at beta=1, so the topk
+        # correction below is skipped/unscaled the same way forward/reverse are.
+        is_forward_like = self.kl_type == "forward" or (
+            self.kl_type == "jsd" and self.jsd_beta <= 0.0
+        )
+
         loss_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
-        if self.zero_outside_topk and self.kl_type != "forward":
+        if self.zero_outside_topk and not is_forward_like:
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
             P_rest = 1 - (student_probs.sum(-1))
             # The entropy and prob of the rest of the tokens [B, S-1]
@@ -1162,6 +1176,8 @@ class DistillationLossFn(LossFunction):
                 loss_correction_term = loss_correction_term * (
                     1.0 - self.mixed_kl_weight
                 )
+            elif self.kl_type == "jsd" and self.jsd_beta < 1.0:
+                loss_correction_term = loss_correction_term * (1.0 - self.jsd_beta)
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
@@ -1171,14 +1187,42 @@ class DistillationLossFn(LossFunction):
             per_token_kl = student_probs * (
                 student_topk_logprobs - teacher_topk_logprobs
             )
-        else:
-            # mixed KL
+        elif self.kl_type == "mixed":
             kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
             kl_reverse = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
             per_token_kl = (
                 self.mixed_kl_weight * kl_forward
                 + (1.0 - self.mixed_kl_weight) * kl_reverse
             )
+        else:
+            # Generalized Jensen-Shannon divergence (Eq. 1 of
+            # https://huggingface.co/papers/2306.13649): beta * KL(teacher || M)
+            # + (1 - beta) * KL(student || M), M = beta * teacher + (1 - beta) * student.
+            # beta=0/1 degenerate to plain forward/reverse KL, since M collapses
+            # onto student/teacher and the mixture-weighted term above vanishes.
+            beta = self.jsd_beta
+            if beta <= 0.0:
+                per_token_kl = teacher_probs * (
+                    teacher_topk_logprobs - student_topk_logprobs
+                )
+            elif beta >= 1.0:
+                per_token_kl = student_probs * (
+                    student_topk_logprobs - teacher_topk_logprobs
+                )
+            else:
+                mixture_topk_logprobs = torch.logaddexp(
+                    student_topk_logprobs + math.log1p(-beta),
+                    teacher_topk_logprobs + math.log(beta),
+                )
+                kl_teacher_to_mixture = teacher_probs * (
+                    teacher_topk_logprobs - mixture_topk_logprobs
+                )
+                kl_student_to_mixture = student_probs * (
+                    student_topk_logprobs - mixture_topk_logprobs
+                )
+                per_token_kl = (
+                    beta * kl_teacher_to_mixture + (1.0 - beta) * kl_student_to_mixture
+                )
 
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
