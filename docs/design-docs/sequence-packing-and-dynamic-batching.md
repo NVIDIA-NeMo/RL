@@ -255,7 +255,8 @@ interleave with expert-parameter collectives and hang.
 The option is not enabled by default because this NeMo-RL-owned pre-padding
 path does not currently support pipeline parallelism or MTP. NeMo-RL rejects
 unsupported combinations during setup. When the option is omitted or `false`,
-uneven-input padding is delegated to Megatron-Core instead.
+no uneven-input alignment is applied, so HybridEP with packed sequences requires
+this option.
 
 ## Dynamic Batching
 

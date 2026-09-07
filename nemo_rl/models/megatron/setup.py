@@ -633,10 +633,13 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
 
 def validate_megatron_config(megatron_cfg: Any, config: Mapping[str, Any]) -> None:
-    """Validate Bridge config while preserving NeMo-owned HybridEP prepadding."""
+    """Validate Bridge config, then preserve explicit NeMo-RL prepadding."""
     megatron_cfg.validate()
 
     if config["megatron_cfg"].get("moe_hybridep_prepad_packed_inputs"):
+        # Bridge 5ed9799 does not auto-enable per-layer padding because NeMo-RL
+        # supplies no Bridge dataset. Keep the opt-in authoritative if that gate
+        # changes or another config provider enables the field.
         megatron_cfg.model.moe_hybridep_pad_uneven_dispatch_inputs = False
 
 

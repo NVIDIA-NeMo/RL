@@ -841,14 +841,10 @@ class TestApplyMoeConfig:
         from nemo_rl.models.megatron.setup import validate_megatron_config
 
         model_cfg = SimpleNamespace(
-            moe_hybridep_pad_uneven_dispatch_inputs=False,
+            moe_hybridep_pad_uneven_dispatch_inputs=True,
         )
         megatron_cfg = SimpleNamespace(model=model_cfg)
-
-        def bridge_validate():
-            model_cfg.moe_hybridep_pad_uneven_dispatch_inputs = True
-
-        megatron_cfg.validate = MagicMock(side_effect=bridge_validate)
+        megatron_cfg.validate = MagicMock()
         config = self._base_moe_cfg(
             expert_model_parallel_size=8,
             moe_flex_dispatcher_backend="hybridep",
