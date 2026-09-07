@@ -17,7 +17,6 @@ import logging
 import math
 import os
 import re
-import socket
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -59,7 +58,6 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.held_port import receive_held_socket
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -80,7 +78,10 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
-from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.models.megatron.router_replay import (
+    router_replay_dimensions,
+    router_replay_enabled,
+)
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
     finalize_megatron_setup,
@@ -349,6 +350,10 @@ class MegatronPolicyWorkerImpl(
             "pipeline_parallel": parallel_state.get_pipeline_model_parallel_rank(),
         }
 
+    def _routed_experts_dimensions(self) -> tuple[int, int]:
+        """Return route dimensions from the initialized Megatron model config."""
+        return router_replay_dimensions(self._get_model_config())
+
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
 
@@ -438,6 +443,7 @@ class MegatronPolicyWorkerImpl(
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
         init_reference_model: bool = True,
+        processor: Optional[Any] = None,
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
@@ -481,14 +487,12 @@ class MegatronPolicyWorkerImpl(
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
-        # Adopt the driver-reserved OpenAI server socket before any heavy init.
-        # The port holder has kept it bound and listening since reservation, so
-        # there was no window in which the pre-published URL could be stolen.
-        self._reserved_http_server_socket: Optional[socket.socket] = None
-        if reserved_http_server_port is not None and self.rank == 0:
-            self._reserved_http_server_socket = receive_held_socket(
-                reserved_http_server_port
-            )
+        # Store the reserved HTTP server port for inference server initialization.
+        # Megatron-LLM's inference server lives on Rank 0 only.
+        # TODO: Multiple inference servers for each MP coordinator.
+        self._reserved_http_server_port = (
+            reserved_http_server_port if self.rank == 0 else None
+        )
 
         # Step 1: Setup distributed
         setup_distributed(config)
@@ -531,6 +535,7 @@ class MegatronPolicyWorkerImpl(
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.processor = processor
 
         # Step 3: Setup model configuration
         runtime_config = validate_and_set_config(
@@ -738,6 +743,20 @@ class MegatronPolicyWorkerImpl(
         self._first_train_step_param_sync_func = model_config.param_sync_func
         model_config.param_sync_func = None
         self._first_train_step_forward_pre_hook_disabled = True
+
+    def _restore_first_train_step_param_sync(self, update_successful: bool) -> None:
+        if (
+            not self._first_train_step_forward_pre_hook_disabled
+            or not update_successful
+        ):
+            return
+
+        self.enable_forward_pre_hook()
+        get_model_config(
+            self.model
+        ).param_sync_func = self._first_train_step_param_sync_func
+        self._first_train_step_param_sync_func = None
+        self._first_train_step_forward_pre_hook_disabled = False
 
     def _copy_main_params_to_param_buffer(self, zero_grad_buffer: bool = False) -> None:
         if not isinstance(self.model, DistributedDataParallel):
@@ -1033,17 +1052,8 @@ class MegatronPolicyWorkerImpl(
                 draft_grad_norm = reduce_max_stat_across_model_parallel_group(
                     draft_grad_norm, mp_group=pg_collection.mp
                 )
-                if (
-                    not eval_mode
-                    and self._first_train_step_forward_pre_hook_disabled
-                    and update_successful
-                ):
-                    self.enable_forward_pre_hook()
-                    get_model_config(
-                        self.model
-                    ).param_sync_func = self._first_train_step_param_sync_func
-                    self._first_train_step_param_sync_func = None
-                    self._first_train_step_forward_pre_hook_disabled = False
+                if not eval_mode:
+                    self._restore_first_train_step_param_sync(update_successful)
 
                 warn_if_inf_grad_norm(grad_norm)
 
@@ -1261,10 +1271,40 @@ class MegatronPolicyWorkerImpl(
         if not isinstance(metric_normalizations, dict):
             metric_normalizations = {}
 
+        model_config = self._get_model_config()
+        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+        mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+        mtp_detach_heads = bool(getattr(model_config, "mtp_detach_heads", False))
+        mtp_loss_scaling_factor = getattr(model_config, "mtp_loss_scaling_factor", 0.1)
+        loss_type = getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL)
+
+        # MTP is a token-summed auxiliary loss and therefore always needs the
+        # valid-token denominator. Under a sequence-level main loss, the split
+        # path can apply that distinct denominator only when mcore has isolated
+        # and tagged the detached MTP parameters. Attached-head gradients are
+        # already mixed into the backbone and cannot be corrected after the
+        # global counts become available at finish.
+        if (
+            mtp_enabled
+            and mtp_loss_scaling_factor != 0
+            and loss_type != LossType.TOKEN_LEVEL
+            and not mtp_detach_heads
+        ):
+            raise ValueError(
+                "MTP with a nonzero loss weight and sequence-level loss requires "
+                "policy.megatron_cfg.mtp_detach_heads=True on the SingleController "
+                "split training path because the MTP auxiliary gradient must be "
+                "normalized by valid tokens independently of the main loss. "
+                f"Got loss_type={loss_type}, mtp_num_layers={mtp_num_layers}, "
+                f"mtp_loss_scaling_factor={mtp_loss_scaling_factor}."
+            )
+
         return {
             "loss_fn": loss_fn,
-            "loss_type": getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL),
+            "loss_type": loss_type,
             "metric_normalizations": metric_normalizations,
+            "mtp_enabled": mtp_enabled,
+            "mtp_detach_heads": mtp_detach_heads,
             "gbs": gbs or self.cfg["train_global_batch_size"],
             "mbs": mbs or self.cfg["train_micro_batch_size"],
             "local_valid_seqs": torch.zeros((), dtype=torch.float64, device="cuda"),
@@ -1371,6 +1411,12 @@ class MegatronPolicyWorkerImpl(
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
 
+        # Leave this unset so mcore falls back to config.grad_scale_func and
+        # inherits the optimizer's dynamic loss scale (especially for fp16).
+        # Also clear any transient callable left by an interrupted older step.
+        if state["mtp_enabled"]:
+            self._set_mtp_grad_scale_func(None)
+
         # Null the three mcore hooks that would fire a mid-step DP reduce:
         #   grad_sync_func — PP scheduler's direct call on last-MB boundaries
         #                    (PP>1 path).
@@ -1443,6 +1489,12 @@ class MegatronPolicyWorkerImpl(
             # expected to invoke abort_train_step (idempotent on the saved
             # values) to drop ``_train_step_state``.
             try:
+                self._set_mtp_grad_scale_func(None)
+            except Exception:
+                log.exception(
+                    "failed to clear MTP gradient scaling after train_microbatch error"
+                )
+            try:
                 self._restore_saved_mcore_hooks(state)
             except Exception:
                 log.exception(
@@ -1477,6 +1529,15 @@ class MegatronPolicyWorkerImpl(
         state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
         state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
 
+        # Match the synchronous Megatron path: derive the mask on the worker
+        # immediately before microbatch processing so sequence packing applies
+        # the same layout transformation to tokens and the MTP loss mask. The
+        # mask is worker-local derived data; it does not need a TQ schema field.
+        if state["mtp_enabled"] and "token_mask" in data and "sample_mask" in data:
+            data["mtp_loss_mask"] = data["token_mask"] * data["sample_mask"].unsqueeze(
+                -1
+            )
+
         # The number of chunks per optimizer step is a first-class property of
         # this path — it decides how many times gradients are accumulated before
         # a single reduce — but it was previously only recoverable by calibrating
@@ -1501,6 +1562,7 @@ class MegatronPolicyWorkerImpl(
         # Build the per-call iterator. Each ``train_microbatches_from_meta``
         # call carries one DP slice; the iterator subdivides into pipeline
         # microbatches.
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
         (
             data_iterator,
             num_microbatches,
@@ -1512,6 +1574,9 @@ class MegatronPolicyWorkerImpl(
             self.cfg,
             state["mbs"],
             straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
         state["total_num_microbatches"] += int(num_microbatches)
 
@@ -1604,6 +1669,12 @@ class MegatronPolicyWorkerImpl(
             # the right config. Leave ``_train_step_state`` for the caller's
             # abort_train_step to clear.
             try:
+                self._set_mtp_grad_scale_func(None)
+            except Exception:
+                log.exception(
+                    "failed to clear MTP gradient scaling after finish_train_step error"
+                )
+            try:
                 self._restore_saved_mcore_hooks(state)
             except Exception:
                 log.exception(
@@ -1636,6 +1707,17 @@ class MegatronPolicyWorkerImpl(
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
         self.model.scale_gradients(inv_n)
+        # The uniform rescale gives MTP the main loss's denominator. Correct
+        # detached, MTP-tagged parameters back to the valid-token denominator
+        # used by the synchronous path. For token-level loss the factor is 1.
+        # This runs before gradient reduction; scaling and reduction are linear.
+        if state["mtp_enabled"] and state["mtp_detach_heads"]:
+            self._scale_mtp_param_grads(
+                float((n_safe / global_valid_toks.clamp(min=1)).item())
+            )
+        # No more forward/backward calls remain in this step. Clear the
+        # callable before optimizer/scheduler/checkpoint state can serialize it.
+        self._set_mtp_grad_scale_func(None)
 
         # End-of-step gradient finalization, exactly once per optimizer step.
         # ``begin_train_step`` nulled ``finalize_model_grads_func`` so mcore's
@@ -1690,6 +1772,11 @@ class MegatronPolicyWorkerImpl(
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        mtp_grad_norm = (
+            self.optimizer.grad_norms_by_group.get("mtp")
+            if state["mtp_enabled"]
+            else None
+        )
 
         pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
@@ -1701,16 +1788,17 @@ class MegatronPolicyWorkerImpl(
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, mp_group=pg_collection.mp
         )
+        if state["mtp_enabled"]:
+            # MTP parameters live on the last PP stage. Make their independently
+            # clipped grad norm visible to every model-parallel rank before the
+            # driver selects a replica leader's result.
+            mtp_grad_norm = reduce_max_stat_across_model_parallel_group(
+                mtp_grad_norm, mp_group=pg_collection.mp
+            )
 
         # Mirrors train(): without re-enabling the pre-hook __init__ removed, the
         # param all-gather never runs and each forward sees only its own shard.
-        if self._first_train_step_forward_pre_hook_disabled and update_successful:
-            self.enable_forward_pre_hook()
-            get_model_config(
-                self.model
-            ).param_sync_func = self._first_train_step_param_sync_func
-            self._first_train_step_param_sync_func = None
-            self._first_train_step_forward_pre_hook_disabled = False
+        self._restore_first_train_step_param_sync(update_successful)
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
@@ -1853,6 +1941,12 @@ class MegatronPolicyWorkerImpl(
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
 
+        self._collect_mtp_metrics(
+            metrics,
+            state["total_num_microbatches"],
+            mtp_grad_norm,
+        )
+
         self._train_step_state = None
         return metrics
 
@@ -1861,12 +1955,15 @@ class MegatronPolicyWorkerImpl(
         state = getattr(self, "_train_step_state", None)
         if state is None:
             return
-        # Restore the mcore hooks first so the model is back to a normal
-        # state before zero_grad_buffer touches anything.
-        self._restore_saved_mcore_hooks(state)
-        self.model.zero_grad_buffer()
-        self.optimizer.zero_grad()
-        self._train_step_state = None
+        # Drop the step-local MTP scaler and restore the mcore hooks before
+        # zero_grad_buffer touches anything.
+        try:
+            self._set_mtp_grad_scale_func(None)
+        finally:
+            self._restore_saved_mcore_hooks(state)
+            self.model.zero_grad_buffer()
+            self.optimizer.zero_grad()
+            self._train_step_state = None
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
@@ -2247,6 +2344,26 @@ class MegatronPolicyWorkerImpl(
         config = self._get_model_config()
         if config is not None:
             config.mtp_grad_scale_func = func
+
+    def _scale_mtp_param_grads(self, factor: float) -> None:
+        """Scale detached MTP parameters' gradients by ``factor``.
+
+        MCore tags every MTP parameter ``grad_norm_group='mtp'`` when
+        ``mtp_detach_heads`` is enabled. In that configuration the auxiliary
+        loss reaches no shared parameters, so its denominator can be corrected
+        independently. ``main_grad`` is a view into the DDP gradient buffer.
+
+        Args:
+            factor: Multiplier for MTP gradients. ``1.0`` is a no-op.
+        """
+        if factor == 1.0:
+            return
+        for param in self.model.parameters():
+            if getattr(param, "grad_norm_group", None) != "mtp":
+                continue
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is not None:
+                main_grad.mul_(factor)
 
     def _get_model_config(self):
         """Get the underlying model config (handle Float16Module wrapper)."""
@@ -4093,10 +4210,13 @@ class MegatronPolicyWorkerImpl(
 
     def finish_inference(self) -> None:
         """Offload model params to CPU after inference. Only used in PPO."""
+        # MambaMixer.eval() recomputes and caches a state transition decay,
+        # -torch.exp(self.A_log.float()). Set the model in inference mode
+        # before offloading the model parameters (including self.A_log).
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
-        self.model.eval()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -4242,10 +4362,13 @@ class MegatronPolicyWorkerImpl(
             and self.inference_model is None
             and self._colocated_reshard_plan is None
         )
+        # MambaMixer.eval() recomputes and caches a state transition decay,
+        # -torch.exp(self.A_log.float()). Set the model in inference mode
+        # before offloading the model parameters (including self.A_log).
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=not keep_params_for_generation
         )
-        self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 

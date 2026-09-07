@@ -38,12 +38,12 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_gym_single_controller.sh
-# Full mode only (~10 min): SIGKILLs a generation worker and asserts the job fails fast
+# Fast mode too (~10 min): SIGKILLs a generation worker and asserts the job fails fast
 # and attributably instead of wedging. This is the ONLY end-to-end check of the
 # containment behaviour -- without it, a regression that restores the silent wedge is
 # caught by nothing, because a wedged job produces no exception and no failing assertion
 # anywhere else.
-run_test      uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
 # Full mode only: the same Gym run, but with NeMo-Gym pointed at the NeMo-RL-owned router.
 # Without this the router has no functional coverage at all -- the default Gym run above
 # leaves it disabled, so a regression in the proxy would ship silently.
@@ -178,6 +178,10 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 # Deterministic process restart with an admitted group held before canonical TQ
 # commit, followed by exact-once redispatch at its stable group ID.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_unfinished_recovery.sh
+
+# Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
+# custodying token lineage and the finalizer publishing training rows.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

@@ -168,6 +168,83 @@ self.val_dataset = None
 self.split_train_validation(split_validation_size, seed)
 ```
 
+### Energon Multimodal Datasets
+
+The optional Energon SFT backend reads prepared WebDataset shards while the existing Hugging Face backend remains the default. `megatron-energon` ships in the `mcore` extra, and the Megatron policy workers pick that environment up from `ACTOR_ENVIRONMENT_REGISTRY`, so the driver runs under a plain `uv run`:
+
+```bash
+uv run examples/run_sft_v2.py \
+  --config examples/configs/recipes/vlm/vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-energon.v1.yaml
+```
+
+Each shard sample contains a JSON payload and its media members. The JSON payload uses one complete conversation as the sampling unit:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": [
+      {"type": "image", "media_index": 0},
+      {"type": "text", "text": "Compare with the next image."},
+      {"type": "image", "media_index": 1}
+    ]},
+    {"role": "assistant", "content": "The second image is brighter."}
+  ],
+  "media": [
+    {"type": "image", "member": "000001.first.jpg"},
+    {"type": "image", "member": "000001.second.jpg"}
+  ],
+  "tools": null
+}
+```
+
+Media references must appear exactly once and in manifest order. Multi-turn conversations, assistant tool calls, matching tool results, and the final assistant response remain in the same sample. Tool results must reference an earlier tool-call ID.
+
+Configure the prepared dataset path and split as follows:
+
+```yaml
+sft:
+  # SFTv2 has no validation loop; the exemplar defaults (val_period: 10,
+  # val_at_start: true) are rejected at startup.
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+data:
+  _override_: true              # replace the exemplar's HF data block wholesale
+  backend: energon
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  energon:
+    model_family: qwen          # required, no default: "qwen" or "nemotron"
+    num_workers: 8
+    shuffle_buffer_size: 1000
+    processor_adapter: hf_multimodal
+    packing_buffer_size: null
+  train:
+    path: /path/to/prepared/energon/dataset
+    split: train
+    virtual_epoch_length: 1000  # batches per virtual epoch
+  validation: null              # SFTv2 builds a train loader only
+data_plane:                     # required by run_sft_v2.py
+  enabled: true
+  impl: local
+  max_partitions: 2
+```
+
+`model_family` and the top-level `data_plane` block have no defaults and are not
+supplied by any exemplar config, so both must be set explicitly. The `sft`
+overrides are needed for a different reason: SFTv2 runs no validation pass, so it
+rejects `val_period`, `val_at_start` or `val_at_end` left at their exemplar
+values, and `data.validation` must be null — the loader is always built with
+`split_role="train"`.
+
+The processor runs inside Energon loader workers and returns the same tokenized `message_log` representation as the Hugging Face path, including model inputs such as Qwen3-VL grid metadata or Nano Omni image sizes and frame counts. `prepare_sft_batch` creates the assistant loss mask, flattens the messages, and pads the batch without checking which loader produced it.
+
+The v1 `SFTProcessorAdapter` and `HFMultimodalSFTProcessorAdapter` are narrow integration interfaces. They are planned to be replaced by a more comprehensive modular processor implementation; dataset loading and the policy-facing batch shape should remain stable through that change.
+
+Sequence packing is unavailable in this path, on both sides: `packing_buffer_size` and `max_samples_per_sequence` are typed null-only, and `policy.sequence_packing` (like `policy.dynamic_batching`) is rejected at startup with `SFTv2 requires fixed NeMo-RL batching.` Packing is deferred to a later stage of the Energon integration. Energon does not provide a separate offline sequence-packing pipeline either; offline preparation may store length and media-cost metadata, but should not pre-concatenate multimodal conversations.
+
+Training dataloader checkpoints include the Energon worker state plus a fingerprint of the source, loader, and processor settings. Restore must occur before the first iteration, and a changed fingerprint fails instead of silently continuing with a different stream. SFTv2 accepts a single train source; use an Energon metadataset to blend prepared sources.
+
 ### OpenAI Format Datasets (with Tool Calling Support)
 
 NeMo RL also supports datasets in the OpenAI conversation format, which is commonly used for chat models and function calling. This format is particularly useful for training models with tool-use capabilities.

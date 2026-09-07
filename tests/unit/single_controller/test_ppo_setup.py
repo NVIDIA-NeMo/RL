@@ -136,6 +136,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        logger={"wandb_enabled": False, "wandb": {}},
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
         cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
@@ -328,13 +329,11 @@ class TestPPOValidation:
     @pytest.mark.parametrize(
         "enable",
         [
-            lambda cfg: setattr(cfg, "overlong_filtering", True),
             lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
             lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
             lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
         ],
         ids=[
-            "overlong_filtering",
             "use_dynamic_sampling",
             "reward_scaling",
             "reward_shaping",
@@ -349,14 +348,12 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
-    def test_rejects_shaping_on_a_grpo_run_too(self):
-        mc = _make_master_config()
-        mc.grpo.overlong_filtering = True
+    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+    def test_accepts_overlong_filtering(self, algorithm: str):
+        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
+        getattr(mc, algorithm).overlong_filtering = True
 
-        with pytest.raises(
-            NotImplementedError, match="overlong_filtering not supported"
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_a_dtensor_critic(self):
         """Only the Megatron value worker carries TQWorkerMixin."""

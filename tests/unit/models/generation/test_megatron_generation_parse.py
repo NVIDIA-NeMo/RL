@@ -38,10 +38,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
 )
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.held_port import (
-    HeldPortReservation,
-    receive_held_socket,
-)
+from nemo_rl.distributed.held_port import HeldPortReservation
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
 )
@@ -196,45 +193,59 @@ def test_http_server_port_reservation(monkeypatch):
     with socket.create_connection(("127.0.0.1", port), timeout=5):
         pass
 
-    # Worker-side adoption: the same live socket, duplicated across the
-    # process boundary; still the same port, still accepting.
-    reserved = receive_held_socket(port)
-    try:
-        assert reserved.getsockname()[1] == port
-        with socket.create_connection(("127.0.0.1", port), timeout=5):
-            pass
+    # Server start with the network and MLM server stubbed out.
+    started = {}
+    monkeypatch.setattr(
+        mlm_text_gen_server,
+        "start_text_gen_server",
+        lambda **kwargs: started.update(kwargs),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_free_port_local",
+        lambda: 12345,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    requests_mock = MagicMock()
+    health_get = requests_mock.Session.return_value.__enter__.return_value.get
+    health_get.return_value.status_code = 200
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.requests",
+        requests_mock,
+    )
 
-        # Server start with the network and MLM server stubbed out.
-        started = {}
-        monkeypatch.setattr(
-            mlm_text_gen_server,
-            "start_text_gen_server",
-            lambda **kwargs: started.update(kwargs),
+    for reserved_port, expected_port in ((port, port), (None, 12345)):
+        worker = SimpleNamespace(
+            coordinator_addr="tcp://127.0.0.1:5555",
+            megatron_tokenizer=object(),
+            rank=0,
+            cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
+            _reserved_http_server_port=reserved_port,
+            inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
         )
-        monkeypatch.setattr(
-            "nemo_rl.distributed.virtual_cluster._get_free_port_local",
-            lambda: 12345,
-        )
-        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-        requests_mock = MagicMock()
-        health_get = requests_mock.Session.return_value.__enter__.return_value.get
-        health_get.return_value.status_code = 200
-        monkeypatch.setattr(
-            "nemo_rl.models.generation.megatron.megatron_worker.requests",
-            requests_mock,
-        )
-
-        for reserved_socket, expected_port in ((reserved, port), (None, 12345)):
-            worker = SimpleNamespace(
-                coordinator_addr="tcp://127.0.0.1:5555",
-                megatron_tokenizer=object(),
-                rank=0,
-                cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
-                _reserved_http_server_socket=reserved_socket,
-            )
-            base_url = MegatronGenerationMixin._setup_openai_api_server(worker)
-            assert started["sock"] is reserved_socket
+        base_url = MegatronGenerationMixin._setup_openai_api_server(worker)
+        reserved_socket = started["sock"]
+        try:
             assert started["server_port"] == expected_port
             assert base_url == f"http://10.0.0.5:{expected_port}/v1"
-    finally:
-        reserved.close()
+            if reserved_port is None:
+                assert reserved_socket is None
+                continue
+
+            # Adoption occurs only at HTTP startup, after model initialization
+            # can no longer leak the listener into long-lived child processes.
+            assert holder._sock.fileno() == -1
+            assert reserved_socket.getsockname()[1] == port
+
+            # MCore closes the handed-off fd and gives every frontend replica
+            # its own SO_REUSEPORT listener. Such a listener can join the reuse
+            # group while this test stub still holds the adopted duplicate.
+            replica = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                replica.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                replica.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                replica.bind(("0.0.0.0", port))
+            finally:
+                replica.close()
+        finally:
+            if reserved_socket is not None:
+                reserved_socket.close()

@@ -98,6 +98,10 @@ class VllmSpecificArgs(TypedDict):
     # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
     # affecting other test cases.
     env_vars: NotRequired[dict[str, str]]
+    # Opt into vLLM's native reload_weights API for refit. The default stays
+    # False so existing IPC/NCCL refit behavior keeps using NeMo-RL's legacy
+    # loader path.
+    refit_with_reload_api: NotRequired[bool]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
 
@@ -289,7 +293,7 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         raise ValueError(
             "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
             f"with refit_transport={transport!r}: this transport's refit path "
-            "does not reset the multimodal encoder cache, so stale vision "
+            "does not reset the multimodal encoder cache, so stale multimodal "
             "embeddings would silently survive weight updates. Supported "
             "transports: null (collective/IPC) and 'nccl_reshard'."
         )

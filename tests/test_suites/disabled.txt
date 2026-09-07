@@ -27,6 +27,10 @@ tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-vid
 # budget has room.
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g-megatron-tp2ep8.v1.sh
 
+# TODO(@cspades): Run and validate this multimodal Megatron generation
+# functional test before moving it to a recurring suite.
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-count-1n4g-megatron_generation.v1.sh
+
 # Nemotron Super Omni: 16-node topology, and the checkpoint and multimodal Gym
 # blend are too large to ship with the repo, so these are invoked manually via
 # examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh rather than run
@@ -43,3 +47,29 @@ tests/test_suites/vlm/mopd-nemotron-super-omni-120ba12b-4n8g-smoke.v1.sh
 # nightly budget is at 3922 of its 3928 GPU-hour cap and this run's ~27
 # GPU-hours would exceed it. Move to nightly.txt when the budget has room.
 tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-ready-first-single-controller.sh
+
+# The Energon SFTv2 smoke test is a 1n2g recipe, but the nightly tiers pin GPUs
+# per node: nightly.txt requires 8 and nightly_gb200.txt requires 4, so there is
+# no tier it can join (test_nightly_suites_match_gpus_per_node enforces this).
+# Covered by tests/functional/sft_v2_energon.sh in the L1 SFT suite.
+tests/test_suites/vlm/vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-energon.v1.sh
+
+# The Nemotron-Omni 30B-A3B Energon SFTv2 run is self-contained, but its 1x8-GPU
+# 90-minute allocation adds 12 GPU-hours and the nightly suite is already at
+# ~4176 of its 4181 GPU-hour cap (test_nightly_compute_stays_below_4181_hours).
+# Run it manually until the nightly suite has room.
+tests/test_suites/vlm/vlm_sft-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8-energon.v1.sh
+# OOMs on H100 2n8g during the colocated reshard: the colocated training state
+# offload is currently too slow to use; tracked by issue #3976.
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym.sh
+
+# Disabled until NVIDIA/Megatron-LM#6993 is live in this codebase.
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym.sh
+
+# Megatron-Core/Bridge bump-lane smoke legs. Not disabled: they run in the
+# bump-validation lanes via nightly_mcore{,_gb200}.txt rather than in the
+# recurring suites above, and are listed here to keep the accounting 1:1.
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym-quick.sh

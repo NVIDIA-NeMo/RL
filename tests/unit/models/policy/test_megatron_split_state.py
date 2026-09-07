@@ -41,11 +41,14 @@ The bugs these catch:
   - ``prepare_for_lp_inference`` offloading grad buffers mid-step, which frees
     (not copies) every earlier chunk's gradients while the 1/N normalizer still
     counts them.
+  - MTP masks, auxiliary-gradient scaling, grad norms, and tracker metrics being
+    present only in the synchronous Megatron path.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -85,6 +88,15 @@ def _make_mock_model():
     # hook need to be able to clear it to a real None.
     model.config.finalize_model_grads_func = MagicMock(name="ORIGINAL_FINALIZE")
     model.config.num_moe_experts = None  # disable MoE branch
+    model.config.mtp_num_layers = None  # disable MTP unless a test opts in
+    model.config.mtp_grad_scale_func = None
+    # Explicit values prevent MagicMock's auto-created attributes from making
+    # every test look like it uses detached heads with an arbitrary loss weight.
+    model.config.mtp_detach_heads = False
+    model.config.mtp_loss_scaling_factor = 0.1
+    # Prevent MagicMock's dynamic attributes from making _get_model_config
+    # mistake this bare model for a Float16Module wrapper.
+    model.module = None
     # no_sync() is a context manager — return a MagicMock that supports
     # __enter__/__exit__ so the `with self.model.no_sync():` block works.
     model.no_sync = MagicMock(
@@ -115,6 +127,7 @@ def _make_worker(loss_type):
     w.optimizer = MagicMock()
     # MegatronOptimizer.step returns (success, grad_norm, num_zeros)
     w.optimizer.step.return_value = (True, 0.5, 0)
+    w.optimizer.grad_norms_by_group = {}
     w.optimizer.param_groups = [{"lr": 1e-4, "weight_decay": 0.01}]
     w.scheduler = MagicMock()
     w.scheduler.get_lr.return_value = 1e-4
@@ -144,16 +157,22 @@ def _make_worker(loss_type):
     w.dtype = torch.float32
     w._is_reward_model = False
     w._router_replay_enabled = False
+    w.media_placeholder_token_id = None
+    # Model-capability flags __init__ derives from self.model, which
+    # object.__new__ skips. train_microbatch passes all three straight through
+    # to get_microbatch_iterator, so the plain-model defaults (NeMo-RL owns
+    # packing and CP sharding) have to be spelled out here.
+    w.delegate_pack_to_model = False
+    w.delegate_mtp_loss_mask_to_model = False
+    w.model_slices_context_parallel_inputs = False
+    w._first_train_step_forward_pre_hook_disabled = False
+    w._first_train_step_param_sync_func = None
     # Normally set from get_rank_safe() in __init__, which object.__new__ skips.
     # The step summary in finish_train_step reads it eagerly to decide whether
     # this rank prints.
     w.rank = 0
     # Also set in __init__: the finish path reads them to put the DDP forward
     # pre-hook back after the first optimizer step.
-    w._first_train_step_forward_pre_hook_disabled = False
-    w._first_train_step_param_sync_func = None
-    # Pure telemetry, and it resets the CUDA peak counters — keep it out of the
-    # way so these tests stay hermetic on GPU shards.
     w._log_gpu_mem = MagicMock()
 
     # Stash a loss_fn with the requested loss_type for tests that need one.
@@ -315,6 +334,51 @@ class TestBegin:
         assert w._train_step_state["gbs"] == w.cfg["train_global_batch_size"]
         assert w._train_step_state["mbs"] == w.cfg["train_micro_batch_size"]
 
+    def test_records_mtp_enabled_from_model_config(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert w._train_step_state["mtp_enabled"] is True
+
+    def test_rejects_sequence_level_mtp_with_attached_heads(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.SEQUENCE_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        with pytest.raises(ValueError, match="mtp_detach_heads"):
+            w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert getattr(w, "_train_step_state", None) is None
+
+    def test_allows_sequence_level_mtp_with_detached_heads(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.SEQUENCE_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.model.config.mtp_detach_heads = True
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert w._train_step_state["mtp_detach_heads"] is True
+
+    def test_allows_token_level_mtp_with_attached_heads(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert w._train_step_state["mtp_detach_heads"] is False
+
+    def test_allows_zero_weight_sequence_level_mtp_with_attached_heads(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.SEQUENCE_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.model.config.mtp_loss_scaling_factor = 0.0
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert w._train_step_state["mtp_detach_heads"] is False
+
 
 # ── _assert_step_open ────────────────────────────────────────────────────
 
@@ -368,6 +432,45 @@ class TestTrainMicrobatch:
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
         assert mock_module_symbols["mfb"].call_count == 1
+
+    @pytest.mark.parametrize(
+        (
+            "delegate_pack_to_model",
+            "delegate_mtp_loss_mask_to_model",
+            "model_slices_context_parallel_inputs",
+        ),
+        [
+            pytest.param(True, True, False, id="model-owned-packing"),
+            pytest.param(False, False, True, id="model-owned-cp-slicing"),
+        ],
+    )
+    def test_forwards_model_owned_packing_flags(
+        self,
+        mock_module_symbols: dict[str, MagicMock],
+        delegate_pack_to_model: bool,
+        delegate_mtp_loss_mask_to_model: bool,
+        model_slices_context_parallel_inputs: bool,
+    ) -> None:
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 1
+        w.delegate_pack_to_model = delegate_pack_to_model
+        w.delegate_mtp_loss_mask_to_model = delegate_mtp_loss_mask_to_model
+        w.model_slices_context_parallel_inputs = model_slices_context_parallel_inputs
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+
+        kwargs = mock_module_symbols["gmi"].call_args.kwargs
+        assert kwargs["delegate_pack_to_model"] is delegate_pack_to_model
+        assert (
+            kwargs["delegate_mtp_loss_mask_to_model"] is delegate_mtp_loss_mask_to_model
+        )
+        assert (
+            kwargs["model_slices_context_parallel_inputs"]
+            is model_slices_context_parallel_inputs
+        )
 
     def test_passes_placeholder_n_one_to_loss(self, mock_module_symbols):
         """The N=1 trick: loss must be called with global_valid_*=1 so it
@@ -427,6 +530,37 @@ class TestTrainMicrobatch:
         w.train_microbatch(_fake_batch())
         w.optimizer.step.assert_not_called()
 
+    def test_builds_mtp_mask_and_uses_main_loss_scale_fallback(
+        self, mock_module_symbols
+    ):
+        """The mask combines both inputs and MTP inherits the main loss scale."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        batch = _fake_batch()
+        batch["token_mask"][0, 5] = 0
+        batch["sample_mask"][3] = 0
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(batch)
+
+        mask = batch["mtp_loss_mask"]
+        assert mask.shape == (8, 257)
+        assert mask[3].sum().item() == pytest.approx(0.0)
+        assert mask[0].sum().item() == pytest.approx(256.0)
+        assert mask[1].sum().item() == pytest.approx(257.0)
+        assert w.model.config.mtp_grad_scale_func is None
+
+    def test_skips_mtp_mask_and_scale_when_disabled(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        batch = _fake_batch()
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(batch)
+        assert "mtp_loss_mask" not in batch
+        assert w.model.config.mtp_grad_scale_func is None
+
 
 # ── finish_train_step ────────────────────────────────────────────────────
 
@@ -449,6 +583,43 @@ class TestFinish:
         w.model.scale_gradients.assert_called_once()
         arg = w.model.scale_gradients.call_args.args[0]
         assert 0 < arg <= 1.0
+
+    def test_restores_first_step_param_sync_after_success(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        saved_param_sync = MagicMock(name="saved_param_sync")
+        w._first_train_step_forward_pre_hook_disabled = True
+        w._first_train_step_param_sync_func = saved_param_sync
+        w.model.config.param_sync_func = None
+        w.enable_forward_pre_hook = MagicMock()
+
+        w.finish_train_step()
+
+        w.enable_forward_pre_hook.assert_called_once_with()
+        assert w.model.config.param_sync_func is saved_param_sync
+        assert w._first_train_step_param_sync_func is None
+        assert w._first_train_step_forward_pre_hook_disabled is False
+
+    def test_keeps_first_step_param_sync_disabled_after_failed_update(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        saved_param_sync = MagicMock(name="saved_param_sync")
+        w._first_train_step_forward_pre_hook_disabled = True
+        w._first_train_step_param_sync_func = saved_param_sync
+        w.model.config.param_sync_func = None
+        w.enable_forward_pre_hook = MagicMock()
+        w.optimizer.step.return_value = (False, 0.5, 0)
+
+        w.finish_train_step()
+
+        w.enable_forward_pre_hook.assert_not_called()
+        assert w.model.config.param_sync_func is None
+        assert w._first_train_step_param_sync_func is saved_param_sync
+        assert w._first_train_step_forward_pre_hook_disabled is True
 
     @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
     def test_grad_sync_call_order_after_rescale(
@@ -531,6 +702,60 @@ class TestFinish:
         # local_valid_seqs = 8 → inv_n = 1/8
         arg = w.model.scale_gradients.call_args.args[0]
         assert arg == pytest.approx(1.0 / 8.0, rel=1e-4)
+
+    @staticmethod
+    def _mtp_params() -> tuple[MagicMock, MagicMock]:
+        """Create one MTP-tagged parameter and one untagged parameter."""
+        mtp_param = MagicMock()
+        mtp_param.grad_norm_group = "mtp"
+        mtp_param.main_grad = torch.ones(4)
+        other_param = MagicMock()
+        other_param.grad_norm_group = None
+        other_param.main_grad = torch.ones(4)
+        return mtp_param, other_param
+
+    def test_mtp_grads_use_token_denominator_under_sequence_level_loss(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.SEQUENCE_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.model.config.mtp_detach_heads = True
+        mtp_param, other_param = self._mtp_params()
+        w.model.parameters = MagicMock(return_value=[mtp_param, other_param])
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        grad_seen_by_finalize: list[torch.Tensor] = []
+        w._train_step_state["saved_finalize_model_grads_func"] = (
+            lambda models, num_tokens: grad_seen_by_finalize.append(
+                mtp_param.main_grad.clone()
+            )
+        )
+        w.finish_train_step()
+
+        # The main loss gets 1/8; MTP additionally gets 8/2048, for net 1/2048.
+        assert w.model.scale_gradients.call_args.args[0] == pytest.approx(1.0 / 8.0)
+        expected_mtp_grad = torch.full((4,), 8.0 / 2048.0)
+        torch.testing.assert_close(mtp_param.main_grad, expected_mtp_grad)
+        torch.testing.assert_close(grad_seen_by_finalize[0], expected_mtp_grad)
+        torch.testing.assert_close(other_param.main_grad, torch.ones(4))
+
+    def test_mtp_grads_need_no_correction_under_token_level_loss(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.model.config.mtp_detach_heads = True
+        mtp_param, _ = self._mtp_params()
+        w.model.parameters = MagicMock(return_value=[mtp_param])
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.finish_train_step()
+
+        torch.testing.assert_close(mtp_param.main_grad, torch.ones(4))
 
     def test_restores_grad_sync_func(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -623,6 +848,37 @@ class TestFinish:
         # get_moe_metrics receives loss_scale=1/6
         kwargs = mock_module_symbols["moe"].call_args.kwargs
         assert kwargs["loss_scale"] == pytest.approx(1.0 / 6.0, rel=1e-6)
+
+    def test_collects_mtp_metrics_and_reduced_grad_norm(self, mock_module_symbols):
+        """Finish surfaces the same post-#3194 MTP payload as sync train()."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.optimizer.grad_norms_by_group = {"mtp": 1.25}
+
+        def _collect(
+            metrics: dict[str, Any],
+            total_num_microbatches: int,
+            mtp_grad_norm: float | None,
+        ) -> None:
+            assert total_num_microbatches == 2
+            metrics["mtp_metrics"] = {
+                "mtp_1_loss": 0.5,
+                "grad_norm": mtp_grad_norm,
+            }
+
+        w._collect_mtp_metrics = MagicMock(side_effect=_collect)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        metrics = w.finish_train_step()
+
+        args = w._collect_mtp_metrics.call_args.args
+        assert args[1] == 2  # fixture: two pipeline microbatches per chunk
+        assert args[2] == pytest.approx(1.25)
+        assert metrics["mtp_metrics"]["mtp_1_loss"] == pytest.approx(0.5)
+        assert metrics["mtp_metrics"]["grad_norm"] == pytest.approx(1.25)
+        assert w.model.config.mtp_grad_scale_func is None
 
     def test_loss_advertised_normalizers_applied(self, mock_module_symbols):
         """finish scales each metric by the denominator the loss advertised:
@@ -774,6 +1030,21 @@ class TestAbort:
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state is not None
         assert float(w._train_step_state["local_valid_seqs"].item()) == 0.0
+
+    def test_clears_stale_mtp_gradient_scale_at_step_boundaries(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 1
+        w.model.config.mtp_grad_scale_func = lambda: torch.tensor(7.0)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert w.model.config.mtp_grad_scale_func is None
+        w.train_microbatch(_fake_batch())
+        assert w.model.config.mtp_grad_scale_func is None
+        w.abort_train_step()
+        assert w.model.config.mtp_grad_scale_func is None
 
 
 # ── grad_sync_func full lifecycle (integration of begin → finish/abort) ─

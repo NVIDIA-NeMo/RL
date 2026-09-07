@@ -114,6 +114,10 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(VALUE_SEED_FIELDS),
             task_name="value_fwd",
+            # A value model consumes tokens only; unioning the rollout's
+            # multimodal columns in would fetch and broadcast pixels this
+            # forward discards.
+            include_multimodal=False,
         )
         with timer.time("get_values/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
@@ -165,6 +169,8 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
+            # See get_values: token-only inputs, so no multimodal union.
+            include_multimodal=False,
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
