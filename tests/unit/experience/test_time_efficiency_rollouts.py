@@ -35,13 +35,14 @@ class _FakeTokenizer:
         return {"<think>": [12], "</think>": [13]}[text]
 
 
-def _result(reward, run_time_s, resolved):
+def _result(reward, run_time_s, resolved, mask_sample=False):
     return {
         "full_result": {
             "reward": reward,
             "openhands_run_time": run_time_s,
             "resolved": resolved,
             "response": {"output": []},
+            "instance_config": {"mask_sample": mask_sample},
         },
         "message_log": [
             {"role": "user", "token_ids": torch.tensor([3, 4])},
@@ -51,7 +52,12 @@ def _result(reward, run_time_s, resolved):
     }
 
 
-def _postprocess(results, time_efficiency_config, reward_penalty_config=None):
+def _postprocess(
+    results,
+    time_efficiency_config,
+    reward_penalty_config=None,
+    mask_env_flagged_samples=True,
+):
     return _postprocess_single_nemo_gym_group(
         nemo_gym_rows=[{"agent_ref": {"name": "swe_agents"}} for _ in results],
         results=results,
@@ -63,6 +69,7 @@ def _postprocess(results, time_efficiency_config, reward_penalty_config=None):
         log_full_result_tables=False,
         reward_penalty_config=reward_penalty_config,
         time_efficiency_config=time_efficiency_config,
+        mask_env_flagged_samples=mask_env_flagged_samples,
     )
 
 
@@ -102,6 +109,41 @@ def test_deduction_runs_after_reward_zeroing_penalties(
     assert out.rollout_metrics["time_efficiency/deduction/max"] == pytest.approx(
         expected_deduction_max
     )
+
+
+def test_loss_masked_timeout_is_not_charged_when_flag_on():
+    # A swe_agents timeout: unresolved, longest in the group, flagged mask_sample.
+    results = [
+        _result(0.0, 600.0, False),
+        _result(0.0, 600.0, False),
+        _result(0.0, 3600.0, False, mask_sample=True),
+    ]
+    out = _postprocess(results, TimeEfficiencyConfig(enabled=True))
+
+    assert torch.allclose(
+        out.final_batch["total_reward"], torch.tensor([-1 / 6, -1 / 6, 0.0])
+    )
+    assert torch.equal(
+        out.final_batch["mask_sample"], torch.tensor([False, False, True])
+    )
+    assert out.rollout_metrics["time_efficiency/group_has_signal"] == 0.0
+
+
+def test_loss_masked_timeout_is_charged_when_flag_off():
+    results = [
+        _result(0.0, 600.0, False),
+        _result(0.0, 600.0, False),
+        _result(0.0, 3600.0, False, mask_sample=True),
+    ]
+    out = _postprocess(
+        results, TimeEfficiencyConfig(enabled=True), mask_env_flagged_samples=False
+    )
+
+    assert torch.allclose(
+        out.final_batch["total_reward"], torch.tensor([-1 / 6, -1 / 6, -1.0])
+    )
+    assert "mask_sample" not in out.final_batch
+    assert out.rollout_metrics["time_efficiency/group_has_signal"] == 1.0
 
 
 def test_disabled_leaves_rewards_and_metrics_untouched():
