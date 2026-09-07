@@ -174,6 +174,41 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
     assert not modelopt_config.is_layer_excluded("model.layers.0.mlp.gate_up_proj")
 
 
+def test_make_fp8_moe_kernel_compat_matches_vllm_signature(fp8_module):
+    fp8 = fp8_module
+    layer = object()
+    kernel = object()
+    calls = []
+
+    def vllm_025_style(
+        moe_quant_config, moe_config, experts_cls, fp8_backend, routing_tables, layer
+    ):
+        calls.append(("0.25", layer))
+        return kernel
+
+    def vllm_028_style(
+        moe_quant_config, moe_config, experts_cls, fp8_backend, routing_tables
+    ):
+        calls.append(("0.28", None))
+        return kernel
+
+    def var_kwargs_style(**kwargs):
+        calls.append(("kwargs", kwargs["layer"]))
+        return kernel
+
+    common = {
+        "moe_quant_config": object(),
+        "moe_config": object(),
+        "experts_cls": object(),
+        "fp8_backend": object(),
+        "routing_tables": (None, None, None),
+    }
+    assert fp8._make_fp8_moe_kernel_compat(vllm_025_style, layer, **common) is kernel
+    assert fp8._make_fp8_moe_kernel_compat(vllm_028_style, layer, **common) is kernel
+    assert fp8._make_fp8_moe_kernel_compat(var_kwargs_style, layer, **common) is kernel
+    assert calls == [("0.25", layer), ("0.28", None), ("kwargs", layer)]
+
+
 @pytest.mark.parametrize(
     "config",
     [
@@ -1366,6 +1401,8 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
             assert weight.shape == shape
             assert scale.shape == (shape[0] // 128, shape[1] // 128)
             _assert_dequant_close(weight, scale, source[eid])
+
+
 @GROUPED_EXPERT_KEY_SHAPES
 @pytest.mark.parametrize(
     "refit_with_reload_api,scale_suffix",
