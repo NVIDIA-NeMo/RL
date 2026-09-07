@@ -1372,8 +1372,9 @@ class DTensorPolicyWorkerV2Impl(
     def finalize_async_save(self) -> None:
         """Block until this worker's in-flight async checkpoint writes complete.
 
-        Overrides the base no-op so async configurations wait for staged writes
-        before the caller renames ``tmp_step_N`` to ``step_N``.
+        Overrides the base no-op: this worker initializes the checkpoint manager
+        with ``is_async=True``, so the caller-side rename of ``tmp_step_N`` to
+        ``step_N`` must wait for the staged writes to land.
         """
         if self.checkpoint_manager is None:
             return
