@@ -238,6 +238,8 @@ fi
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
+apt-get update
+apt-get install -y --no-install-recommends libnvidia-ml-dev
 uv cache clean deep-ep
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
@@ -250,6 +252,8 @@ uv sync --link-mode symlink --frozen --extra mcore --no-install-project
 uv sync --link-mode symlink --frozen --extra automodel --no-install-project
 uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
 uv sync --link-mode symlink --frozen --all-groups --no-install-project
+apt-get purge -y libnvidia-ml-dev
+rm -rf /var/lib/apt/lists/*
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache

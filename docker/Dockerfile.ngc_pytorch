@@ -118,6 +118,8 @@ sed -i 's/= \[{ requirement = "torch", match-runtime = true }\]/= []/g' pyprojec
 uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
 uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
 # Ensure nvshmem is installed before building DeepEP
+apt-get update
+apt-get install -y --no-install-recommends libnvidia-ml-dev
 uv cache clean deep-ep
 uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
@@ -125,6 +127,8 @@ uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-projec
 uv sync --link-mode symlink --locked --inexact --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
+apt-get purge -y libnvidia-ml-dev
+rm -rf /var/lib/apt/lists/*
 EOF
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
