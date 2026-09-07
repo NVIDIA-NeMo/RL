@@ -2055,7 +2055,15 @@ class MegatronPolicyWorkerImpl(
         # axes is consumed. Avoid copying the discarded replicas to host.
         if not self._is_replica_leader():
             return BatchedDataDict[LogprobOutputSpec]()
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+        # Copy through pinned memory explicitly. A blocking copy to newly
+        # allocated pageable memory can stall inside cuMemcpyDtoHAsync after
+        # long logprob forwards. Ray must not serialize the destination until
+        # the asynchronous copy has completed.
+        cpu_logprobs = torch.empty_like(logprobs, device="cpu", pin_memory=True)
+        cpu_logprobs.copy_(logprobs, non_blocking=True)
+        torch.cuda.synchronize(logprobs.device)
+        return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
 
     def _apply_state_dict_to_model(
         self,

@@ -1512,8 +1512,6 @@ class TestReplicatedLogprobResult:
 
     @pytest.mark.parametrize("is_leader", [False, True])
     def test_only_replica_leader_copies_logprobs_to_cpu(self, is_leader):
-        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
         w = self._worker()
         w._is_replica_leader = MagicMock(return_value=is_leader)
         worker_logprobs = torch.tensor([[1.0, 2.0, 3.0]])
@@ -1538,24 +1536,31 @@ class TestReplicatedLogprobResult:
                 f"{WORKER_MOD}.broadcast_tensors_from_last_stage",
                 side_effect=lambda tensors: tensors,
             ) as broadcast,
-            patch.object(
-                BatchedDataDict,
-                "to",
-                autospec=True,
-                side_effect=lambda batch, _device: batch,
-            ) as to_device,
+            patch(f"{WORKER_MOD}.torch.empty_like") as empty_like,
+            patch(f"{WORKER_MOD}.torch.cuda.synchronize") as synchronize,
         ):
+            cpu_logprobs = MagicMock()
+            empty_like.return_value = cpu_logprobs
             result = w.get_logprobs(data=MagicMock())
 
         broadcast.assert_called_once()
         if is_leader:
+            source_logprobs = empty_like.call_args.args[0]
             torch.testing.assert_close(
-                result["logprobs"], torch.tensor([[1.0, 2.0, 3.0, 0.0]])
+                source_logprobs, torch.tensor([[1.0, 2.0, 3.0, 0.0]])
             )
-            to_device.assert_called_once()
+            empty_like.assert_called_once_with(
+                source_logprobs, device="cpu", pin_memory=True
+            )
+            cpu_logprobs.copy_.assert_called_once_with(
+                source_logprobs, non_blocking=True
+            )
+            synchronize.assert_called_once_with(source_logprobs.device)
+            assert result["logprobs"] is cpu_logprobs
         else:
             assert not result
-            to_device.assert_not_called()
+            empty_like.assert_not_called()
+            synchronize.assert_not_called()
 
     @pytest.mark.parametrize("has_inner_result", [False, True])
     def test_reference_logprobs_accept_empty_nonleader_result(self, has_inner_result):
