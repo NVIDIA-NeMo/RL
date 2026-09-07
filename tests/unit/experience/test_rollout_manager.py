@@ -131,12 +131,22 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
             "token_ids": torch.tensor([1, 2, 3]),
             "pixel_values": pixel_values,
             "imgs_sizes": imgs_sizes,
-        }
+        },
+        {
+            "role": "assistant",
+            "content": "follow-up",
+            "token_ids": torch.tensor([4, 5]),
+        },
     ]
 
-    _run(manager._generate_response(message_log, None))
+    assistant_message, input_lengths, _ = _run(
+        manager._generate_response(message_log, ["<stop>"])
+    )
 
     generation_data = captured["data"]
+    assert generation_data["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
+    assert generation_data["input_lengths"].tolist() == [5]
+    assert generation_data["stop_strings"] == [["<stop>"]]
     assert isinstance(generation_data["pixel_values"], PackedTensor)
     assert isinstance(generation_data["imgs_sizes"], PackedTensor)
     assert torch.equal(
@@ -145,6 +155,9 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     assert torch.equal(
         generation_data["imgs_sizes"].as_tensor(), imgs_sizes.as_tensor()
     )
+    assert input_lengths.tolist() == [5]
+    assert assistant_message["content"] == "answer"
+    assert assistant_message["token_ids"].tolist() == [42]
 
 
 class _FakeBuffer:

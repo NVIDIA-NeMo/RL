@@ -281,6 +281,30 @@ def test_multimodal_packed_tensor_round_trips_through_tq_payload() -> None:
     assert torch.equal(restored_media.as_tensor(), media)
 
 
+def test_per_token_multimodal_field_is_packed_with_sequence_lengths() -> None:
+    train_batch = {
+        "input_lengths": torch.tensor([3, 2], dtype=torch.int32),
+        "input_ids": torch.tensor([[10, 11, 12], [20, 21, 0]]),
+        "token_type_ids": torch.tensor([[0, 1, 1], [0, 1, 0]]),
+    }
+
+    _, fields, tags = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+
+    assert [row.tolist() for row in fields["token_type_ids"].unbind()] == [
+        [0, 1, 1],
+        [0, 1],
+    ]
+    assert tags == [
+        {"weight_version": 3, "prompt_idx": 17},
+        {"weight_version": 3, "prompt_idx": 17},
+    ]
+
+
 def test_record_to_train_batch_carries_raw_masks_without_applying_them() -> None:
     record = _record(
         [
@@ -331,7 +355,7 @@ def test_record_to_train_batch_broadcasts_prompt_loss_multiplier() -> None:
             _completion(route_start=10, reward=1.0),
             _completion(route_start=30, reward=2.0),
         ],
-        loss_multiplier=0.0,
+        loss_multiplier=0.25,
     )
 
     train_batch = record_to_train_batch(
@@ -340,7 +364,16 @@ def test_record_to_train_batch_broadcasts_prompt_loss_multiplier() -> None:
         include_message_violation_fields=False,
     )
 
-    assert torch.equal(train_batch["sample_mask"], torch.zeros(2))
+    expected = torch.full((2,), 0.25)
+    assert torch.equal(train_batch["sample_mask"], expected)
+
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+    assert torch.equal(fields["sample_mask"], expected)
 
 
 def _failed_completion() -> Completion:
