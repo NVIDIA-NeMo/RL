@@ -63,6 +63,8 @@ class ReassemblyRequest:
     # train pump reads the same ``mask_sample`` field as the native path
     # (SingleController reads it unconditionally).
     mask_sample: tuple[bool, ...]
+    # Dataset-level loss weight shared by every completion in this prompt group.
+    loss_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -152,6 +154,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             mask_sample=list(request.mask_sample),
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
+            loss_multiplier=request.loss_multiplier,
         )
         assert_metadata_only(result)
         return result
