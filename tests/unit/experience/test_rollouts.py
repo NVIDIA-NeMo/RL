@@ -2129,7 +2129,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
 
 
-def test_postprocess_nemo_gym_group_reports_per_agent_truncation_rate():
+def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
     is_truncated = [True, False, True, True]
     rows = [{"agent_ref": {"name": name}} for name in agent_names]
@@ -2181,6 +2181,30 @@ def test_postprocess_nemo_gym_group_reports_per_agent_truncation_rate():
     assert rollout_result.rollout_metrics["agent-b/truncation_rate"] == pytest.approx(
         1.0
     )
+    assert rollout_result.rollout_metrics[
+        "agent-a/total_tokens_per_sample/mean"
+    ] == pytest.approx(2.5)
+    assert rollout_result.rollout_metrics[
+        "agent-a/total_tokens_per_sample/histogram"
+    ] == [3, 2]
+    assert rollout_result.rollout_metrics[
+        "agent-a/gen_tokens_per_sample/mean"
+    ] == pytest.approx(1.5)
+    assert rollout_result.rollout_metrics[
+        "agent-a/gen_tokens_per_sample/histogram"
+    ] == [2, 1]
+    assert rollout_result.rollout_metrics[
+        "agent-b/total_tokens_per_sample/mean"
+    ] == pytest.approx(3.0)
+    assert rollout_result.rollout_metrics[
+        "agent-b/total_tokens_per_sample/histogram"
+    ] == [3, 3]
+    assert rollout_result.rollout_metrics[
+        "agent-b/gen_tokens_per_sample/mean"
+    ] == pytest.approx(2.0)
+    assert rollout_result.rollout_metrics[
+        "agent-b/gen_tokens_per_sample/histogram"
+    ] == [2, 2]
     assert rollout_result.final_batch["truncated"].tolist() == is_truncated
     assert not rollout_result.final_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY].any()
 
@@ -2487,6 +2511,18 @@ def test_run_async_nemo_gym_rollout(
             "truncation_rate": None,
             # per agent metrics
             "example_multi_step_simple_agent/full_result": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/mean": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/max": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/min": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/median": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/stddev": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/histogram": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/mean": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/max": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/min": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/median": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/stddev": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/histogram": None,
             "example_multi_step_simple_agent/accuracy/histogram": None,
             "example_multi_step_simple_agent/accuracy/max": 0.0,
             "example_multi_step_simple_agent/accuracy/mean": 0.0,

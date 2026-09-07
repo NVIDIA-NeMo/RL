@@ -2756,19 +2756,20 @@ def _postprocess_single_nemo_gym_group(
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        agent_to_truncations: dict[str, list[bool]] = defaultdict(list)
+        agent_to_sample_metrics: dict[str, list[dict]] = defaultdict(list)
         for nemo_gym_row, result, sample_metrics in zip(
             nemo_gym_rows, results, all_sample_metrics
         ):
             agent_ref = nemo_gym_row["agent_ref"]
             agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
-            agent_to_truncations[agent_name].append(sample_metrics["hit_max_tokens"])
+            agent_to_sample_metrics[agent_name].append(sample_metrics)
             result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
-            agent_truncations = agent_to_truncations[agent_name]
+            agent_sample_metrics = agent_to_sample_metrics[agent_name]
+            agent_truncations = [m["hit_max_tokens"] for m in agent_sample_metrics]
             per_agent_metrics[f"{agent_name}/truncation_rate"] = sum(
                 agent_truncations
             ) / len(agent_truncations)
@@ -2786,6 +2787,23 @@ def _postprocess_single_nemo_gym_group(
                             values, len(agent_results), f"{agent_name}/{key}"
                         )
                     )
+
+            # Emit authoritative live token metrics after full-result metrics so
+            # similarly named environment metadata cannot overwrite them.
+            per_agent_metrics.update(
+                calculate_single_metric(
+                    [m["total_tokens"] for m in agent_sample_metrics],
+                    len(agent_sample_metrics),
+                    f"{agent_name}/total_tokens_per_sample",
+                )
+            )
+            per_agent_metrics.update(
+                calculate_single_metric(
+                    [m["assistant_tokens"] for m in agent_sample_metrics],
+                    len(agent_sample_metrics),
+                    f"{agent_name}/gen_tokens_per_sample",
+                )
+            )
 
             if log_full_result_tables:
                 to_log = [
