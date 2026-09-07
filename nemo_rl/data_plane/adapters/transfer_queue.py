@@ -658,10 +658,10 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         _existing_path = os.environ.get("PATH", "")
         if _moon_pkg not in _existing_path.split(os.pathsep):
             os.environ["PATH"] = _moon_pkg + os.pathsep + _existing_path
-        # Per-process MC_TCP_BIND_ADDRESS / KV-path promotion already
-        # set by TQDataPlaneClient.__init__ (runs on every process,
-        # including this driver). _init_tq only needs local_ip below
-        # for the metadata/master server URLs (driver-bound).
+        # Per-process MC_TCP_BIND_ADDRESS already set by
+        # TQDataPlaneClient.__init__; the scalar schema patch is installed
+        # at module import. _init_tq only needs local_ip below for the
+        # metadata/master server URLs (driver-bound).
         local_ip = _get_local_node_ip()
         if not local_ip:
             raise RuntimeError(
