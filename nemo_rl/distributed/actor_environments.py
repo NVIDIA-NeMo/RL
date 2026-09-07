@@ -56,6 +56,7 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
         "mcore"
     ],
     "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": ["mcore"],
+    "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker": ["mcore"],
     "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": [
         "trtllm"
     ],
