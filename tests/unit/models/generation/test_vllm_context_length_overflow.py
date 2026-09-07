@@ -46,7 +46,6 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
     is_context_length_error,
 )
 
-
 GYM_PROXY_SOURCE = (
     Path(nemo_rl.__file__).resolve().parents[1]
     / "3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
@@ -85,7 +84,11 @@ def gym_recovers(status_code: int, body: str) -> bool:
         "result_content_str": body,
     }
     return all(
-        bool(eval(compile(ast.Expression(predicate), "<gym-proxy>", "eval"), {}, namespace))
+        bool(
+            eval(
+                compile(ast.Expression(predicate), "<gym-proxy>", "eval"), {}, namespace
+            )
+        )
         for predicate in _gym_overflow_predicates()
     )
 

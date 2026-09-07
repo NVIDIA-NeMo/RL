@@ -2873,7 +2873,8 @@ def _postprocess_single_nemo_gym_group(
         identity_values = [row.get(identity_key) for row in nemo_gym_rows]
         if identity_values and all(value is not None for value in identity_values):
             final_batch[identity_key] = torch.tensor(
-                [int(value) for value in identity_values], dtype=torch.long
+                [int(value) for value in identity_values if value is not None],
+                dtype=torch.long,
             )
     # Env/agent mask flag: flagged samples are dropped from the loss but still
     # count for advantages. env.should_mask_flagged_samples=false skips this.
