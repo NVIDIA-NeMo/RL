@@ -998,9 +998,10 @@ def setup_single_controller(
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     # Token capture: validate the supported combination loudly at setup
-    # (NeMo-Gym rollout path, vLLM backend, async_engine=true) and give
-    # capture-enabled vLLM workers a venv that carries nemo_gym (the
-    # worker hosts Gym's capture core + adapter in-process).
+    # (NeMo-Gym rollout path, vLLM backend, async_engine=true). The vLLM
+    # worker venv always carries nemo_gym (see VLLM_EXECUTABLE in
+    # ray_actor_environment_registry.py), so nothing here needs to change the
+    # worker's environment.
     token_capture_cfg = master_config.token_capture
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
@@ -1021,14 +1022,6 @@ def setup_single_controller(
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
                 "host is the worker's in-process HTTP server)"
             )
-        from nemo_rl.distributed.ray_actor_environment_registry import (
-            ACTOR_ENVIRONMENT_REGISTRY,
-        )
-        from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
-
-        ACTOR_ENVIRONMENT_REGISTRY[
-            "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
-        ] = PY_EXECUTABLES.VLLM_GYM
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token and the process-shared capture
@@ -1501,23 +1494,7 @@ def setup_single_controller(
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.
-        try:
-            generation.setup_token_capture(
-                dp_config, token_capture_cfg.staging_partition
-            )
-        except Exception as error:
-            if "No module named 'nemo_gym'" in str(error):
-                # Worker venvs are cached by actor class name
-                # (nemo_rl/utils/venvs.py), so a venv prebuilt before token
-                # capture predates the nemo_gym extra and is reused as-is.
-                raise RuntimeError(
-                    "token_capture.enabled requires nemo_gym inside the vLLM "
-                    "worker venv, but the cached worker venv predates it. "
-                    "Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
-                    "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
-                    "vllm_worker_async.VllmAsyncGenerationWorker and rerun."
-                ) from error
-            raise
+        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
