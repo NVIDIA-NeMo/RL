@@ -232,6 +232,8 @@ class GenerationConfig(TypedDict):
     use_async_rollouts: NotRequired[bool]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
+    # Eagle draft weights arrive via refit when policy.draft.enabled=true.
+    _draft_weights_from_refit: NotRequired[bool]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
     # Internal debug-only measurement of exact Ray generation arguments.
@@ -632,5 +634,21 @@ class GenerationInterface(ABC):
 
         Returns:
             Dictionary of metrics. Format may vary by backend.
+        """
+        return {}
+
+    def snapshot_step_metrics(self) -> None:
+        """Begin a per-training-step generation metric window.
+
+        Backends without per-step generation metrics may use this default no-op.
+        """
+
+    def get_step_metrics(self) -> dict[str, float]:
+        """Finish the current metric window and return generation metrics.
+
+        Returns:
+            Metrics accumulated since the matching ``snapshot_step_metrics``
+            call, not running totals. Backends without per-step generation
+            metrics return an empty dictionary.
         """
         return {}

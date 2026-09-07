@@ -48,12 +48,33 @@ class MCoreGenerationSpecificArgs(TypedDict):
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
+    async_sched_mode: NotRequired[Literal["legacy", "async"]]
+    vision_embedding_cache_max_bytes: NotRequired[int]
+    allow_stale_multimodal_embeddings: NotRequired[bool]
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
+
+    # Raw media preprocessing corresponding with Megatron's
+    # ImageProcessingConfig / VideoProcessingConfig.
+    # `video_num_frames` is required for video.
+    vision_model_type: NotRequired[str]
+    image_dynamic_resolution: NotRequired[bool]
+    video_num_frames: NotRequired[int]  # Frames sampled per video.
+    video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.
+    video_target_num_patches: NotRequired[int]  # Overrides the image max-patch budget.
+    video_maintain_aspect_ratio: NotRequired[bool]
+
+    # Fully-qualified class path of the MCore inference wrapper, e.g.
+    # "megatron.core.inference.model_inference_wrappers.multimodal.
+    # nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper".
+    # Resolved by `_get_megatron_inference_wrapper_cls`; its `supports_*`
+    # attributes gate which modalities are preprocessed. Not media preprocessing
+    # itself, and used on the direct generate path as well as the HTTP endpoint.
+    megatron_inference_wrapper: NotRequired[str]
 
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)
@@ -70,6 +91,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
+    # Merged into megatron_cfg for gen workers; required for EP>1 + local CUDA graphs.
+    moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
 
 
 class MCoreGenerationConfig(GenerationConfig):

@@ -256,7 +256,7 @@ def convert(args: argparse.Namespace) -> None:
         row["responses_create_params"] = {
             "input": input_messages,
             "metadata": {
-                "chat_template_kwargs": {"enable_thinking": True},
+                "chat_template_kwargs": json.dumps({"enable_thinking": True}),
             },
         }
         raw_answer = source_row.get("answer")
