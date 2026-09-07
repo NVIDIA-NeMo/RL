@@ -409,6 +409,11 @@ class VllmAsyncGenerationWorkerImpl(
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
+        if self._mtp_speculative_enabled:
+            await self.llm.collective_rpc(
+                "configure_mtp_drafter_weight_source",
+                args=(self._mtp_weights_from_refit,),
+            )
         if self._mtp_load_from_disk:
             await self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
