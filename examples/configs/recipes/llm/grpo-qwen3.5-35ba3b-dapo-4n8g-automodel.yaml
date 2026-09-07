@@ -63,7 +63,7 @@ policy:
         linear: torch
         rms_norm: torch
         experts: gmm
-        dispatcher: deepep
+        dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true

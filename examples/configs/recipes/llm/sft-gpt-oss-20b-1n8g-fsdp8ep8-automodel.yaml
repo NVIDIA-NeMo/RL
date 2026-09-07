@@ -23,7 +23,7 @@ policy:
         linear: te
         rms_norm: te
         experts: torch_mm
-        enable_deepep: true
+        dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true

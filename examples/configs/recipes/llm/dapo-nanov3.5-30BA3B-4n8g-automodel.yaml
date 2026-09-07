@@ -73,7 +73,7 @@ policy:
         linear: te
         rms_norm: torch_fp32
         experts: gmm
-        dispatcher: deepep
+        dispatcher: hybridep
         rope_fusion: false
         enable_hf_state_dict_adapter: true
   sequence_packing:
