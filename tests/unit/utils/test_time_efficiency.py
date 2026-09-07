@@ -96,10 +96,10 @@ class TestApplyTimeEfficiencyReward:
         assert rewards(results) == pytest.approx([0.5, -1.0])
         assert stats == pytest.approx(
             {
-                "time_efficiency/minutes_mean": 45.0,
-                "time_efficiency/minutes_max": 60.0,
-                "time_efficiency/deduction_mean": 0.75,
-                "time_efficiency/deduction_max": 1.0,
+                "time_efficiency/minutes/mean": 45.0,
+                "time_efficiency/minutes/max": 60.0,
+                "time_efficiency/deduction/mean": 0.75,
+                "time_efficiency/deduction/max": 1.0,
                 "time_efficiency/group_has_signal": 1.0,
             }
         )
@@ -115,8 +115,22 @@ class TestApplyTimeEfficiencyReward:
 
         assert rewards(results) == pytest.approx([0.5, 0.0])
         # Skipped rollouts still count toward the group means with a 0 deduction.
-        assert stats["time_efficiency/deduction_mean"] == pytest.approx(0.25)
-        assert stats["time_efficiency/minutes_mean"] == pytest.approx(45.0)
+        assert stats["time_efficiency/deduction/mean"] == pytest.approx(0.25)
+        assert stats["time_efficiency/minutes/mean"] == pytest.approx(45.0)
+
+    def test_correct_skips_resolved_rollouts_zeroed_by_a_penalty(self):
+        # A reward-zeroing penalty ran before us: resolved but reward == 0.0 is
+        # treated as a failure and not charged.
+        results = [
+            make_result(0.0, 1800.0, resolved=True),
+            make_result(1.0, 1800.0, resolved=True),
+        ]
+        stats = apply_time_efficiency_reward(
+            results, TimeEfficiencyConfig(enabled=True, apply_to="correct")
+        )
+
+        assert rewards(results) == pytest.approx([0.0, 0.5])
+        assert stats["time_efficiency/deduction/max"] == pytest.approx(0.5)
 
     def test_floor_clamps_the_post_deduction_reward(self):
         results = [make_result(1.0, 5400.0), make_result(0.0, 3600.0)]  # 90 / 60 min
@@ -125,8 +139,8 @@ class TestApplyTimeEfficiencyReward:
         )
 
         assert rewards(results) == pytest.approx([0.0, 0.0])
-        assert stats["time_efficiency/deduction_max"] == pytest.approx(1.0)
-        assert stats["time_efficiency/deduction_mean"] == pytest.approx(0.5)
+        assert stats["time_efficiency/deduction/max"] == pytest.approx(1.0)
+        assert stats["time_efficiency/deduction/mean"] == pytest.approx(0.5)
 
     def test_custom_lambda(self):
         results = [make_result(1.0, 600.0)]  # 10 min
@@ -141,7 +155,7 @@ class TestApplyTimeEfficiencyReward:
             results, TimeEfficiencyConfig(enabled=True)
         )
         assert rewards(results) == [1.0]
-        assert stats["time_efficiency/deduction_max"] == 0.0
+        assert stats["time_efficiency/deduction/max"] == 0.0
 
     def test_none_reward_is_treated_as_zero(self):
         results = [make_result(None, 1800.0)]
@@ -154,3 +168,29 @@ class TestApplyTimeEfficiencyReward:
             results, TimeEfficiencyConfig(enabled=True)
         )
         assert stats["time_efficiency/group_has_signal"] == 0.0
+
+    def test_group_has_signal_follows_deductions_not_wall_times(self):
+        # "correct" on an all-failed group: wall times differ, nothing deducted.
+        results = [
+            make_result(0.0, 600.0, resolved=False),
+            make_result(0.0, 3600.0, resolved=False),
+        ]
+        stats = apply_time_efficiency_reward(
+            results, TimeEfficiencyConfig(enabled=True, apply_to="correct")
+        )
+        assert stats["time_efficiency/group_has_signal"] == 0.0
+
+        # floor clamps both rewards to the same value: equal deductions, no signal.
+        results = [make_result(1.0, 5400.0), make_result(1.0, 7200.0)]  # 90 / 120 min
+        stats = apply_time_efficiency_reward(
+            results, TimeEfficiencyConfig(enabled=True, floor=0.0)
+        )
+        assert rewards(results) == pytest.approx([0.0, 0.0])
+        assert stats["time_efficiency/group_has_signal"] == 0.0
+
+        # one second of difference is a signal.
+        results = [make_result(1.0, 600.0), make_result(1.0, 601.0)]
+        stats = apply_time_efficiency_reward(
+            results, TimeEfficiencyConfig(enabled=True)
+        )
+        assert stats["time_efficiency/group_has_signal"] == 1.0

@@ -51,7 +51,7 @@ def _result(reward, run_time_s, resolved):
     }
 
 
-def _postprocess(results, time_efficiency_config):
+def _postprocess(results, time_efficiency_config, reward_penalty_config=None):
     return _postprocess_single_nemo_gym_group(
         nemo_gym_rows=[{"agent_ref": {"name": "swe_agents"}} for _ in results],
         results=results,
@@ -61,6 +61,7 @@ def _postprocess(results, time_efficiency_config):
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(len(results))}),
         tokenizer=_FakeTokenizer(),
         log_full_result_tables=False,
+        reward_penalty_config=reward_penalty_config,
         time_efficiency_config=time_efficiency_config,
     )
 
@@ -72,8 +73,35 @@ def test_deduction_reaches_total_reward_and_metrics():
     # 1.0 - 30/60 = 0.5 and 0.0 - 60/60 = -1.0 -> mean -0.25
     assert out.rollout_metrics["total_reward/mean"] == pytest.approx(-0.25)
     assert torch.allclose(out.final_batch["total_reward"], torch.tensor([0.5, -1.0]))
-    assert out.rollout_metrics["time_efficiency/minutes_mean"] == pytest.approx(45.0)
-    assert out.rollout_metrics["time_efficiency/deduction_max"] == pytest.approx(1.0)
+    assert out.rollout_metrics["time_efficiency/minutes/mean"] == pytest.approx(45.0)
+    assert out.rollout_metrics["time_efficiency/deduction/max"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "apply_to, expected_rewards, expected_deduction_max",
+    [("all", [-0.5, -1.0], 1.0), ("correct", [0.0, 0.0], 0.0)],
+)
+def test_deduction_runs_after_reward_zeroing_penalties(
+    apply_to, expected_rewards, expected_deduction_max
+):
+    # Both rollouts have an empty response.output, so penalize_empty_final_answer
+    # zeroes them before the deduction runs. Under "all" the zeroed rollouts are
+    # still charged for their wall time; under "correct" a zeroed rollout counts
+    # as a failure and is not charged.
+    results = [_result(1.0, 1800.0, True), _result(0.0, 3600.0, False)]
+    out = _postprocess(
+        results,
+        TimeEfficiencyConfig(enabled=True, apply_to=apply_to),
+        reward_penalty_config={"penalize_empty_final_answer": True},
+    )
+
+    assert out.rollout_metrics["empty_final_answer_rate"] == pytest.approx(1.0)
+    assert torch.allclose(
+        out.final_batch["total_reward"], torch.tensor(expected_rewards)
+    )
+    assert out.rollout_metrics["time_efficiency/deduction/max"] == pytest.approx(
+        expected_deduction_max
+    )
 
 
 def test_disabled_leaves_rewards_and_metrics_untouched():
