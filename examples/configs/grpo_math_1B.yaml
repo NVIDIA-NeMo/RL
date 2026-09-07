@@ -323,6 +323,8 @@ policy:
     env_vars: null
 
   draft:
+    # Draft co-training speculator. Currently only eagle3 is supported.
+    speculator_type: eagle3
     enabled: false
     model_name: null
     loss_weight: 0.1
