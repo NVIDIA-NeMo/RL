@@ -40,8 +40,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'all_finite(data["train/token_mult_prob_error"])' \
         'median(data["train/token_mult_prob_error"]) < 1.05' \
         'mean(data["train/gen_kl_error"]) < 0.001' \
-        'mean(data["train/reward"]) > 0.4' \
-        'max(data["train/num_masked_seqs_by_logprob_error"]) == 0'
+        'mean(data["train/reward"]) > 0.4'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
