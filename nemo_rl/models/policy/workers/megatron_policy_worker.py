@@ -89,6 +89,7 @@ from nemo_rl.models.megatron.setup import (
     setup_model_and_optimizer,
     setup_reference_model_state,
     validate_and_set_config,
+    validate_megatron_config,
     validate_model_paths,
 )
 from nemo_rl.models.megatron.train import (
@@ -567,7 +568,7 @@ class MegatronPolicyWorkerImpl(
             self.megatron_cfg.rerun_state_machine.check_for_nan_in_loss = False
 
         # Validate configuration
-        self.megatron_cfg.validate()
+        validate_megatron_config(self.megatron_cfg, self.cfg)
 
         # Step 4: Setup Megatron model and components
         assert not (skip_weight_load and (init_optimizer or init_reference_model)), (

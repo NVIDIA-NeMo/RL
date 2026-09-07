@@ -632,6 +632,16 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
 
+def validate_megatron_config(
+    megatron_cfg: Any, config: Mapping[str, Any]
+) -> None:
+    """Validate Bridge config while preserving NeMo-owned HybridEP prepadding."""
+    megatron_cfg.validate()
+
+    if config["megatron_cfg"].get("moe_hybridep_prepad_packed_inputs"):
+        megatron_cfg.model.moe_hybridep_pad_uneven_dispatch_inputs = False
+
+
 def setup_model_config(
     config: PolicyConfig,
     rank,

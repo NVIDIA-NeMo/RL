@@ -62,12 +62,6 @@ def configure_hybridep_packed_input_padding(
                 "HybridEP input prepadding currently requires MTP disabled."
             )
 
-    # Packed inputs are aligned once in NeMo-RL before forward. Repeating the
-    # scalar MAX collective inside each MoE layer can interleave with expert
-    # parameter all-gathers on the same EP communicator.
-    model_cfg.moe_hybridep_pad_uneven_dispatch_inputs = not prepad_packed_inputs
-
-
 def _get_hybridep_aligned_seq_len(
     local_seq_len: int,
     multiple: int,
