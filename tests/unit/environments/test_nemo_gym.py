@@ -41,7 +41,6 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
-    _rollout_progress_identity,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -76,27 +75,6 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
-
-
-@pytest.mark.parametrize(
-    ("row", "expected"),
-    [
-        (
-            {
-                "task_source": "math_resources_server",
-                "agent_ref": {"name": "routed_agent"},
-            },
-            "agent:routed_agent",
-        ),
-        ({"task_source": "math_resources_server"}, "task-source:math_resources_server"),
-        ({"agent_ref": {"name": "legacy_agent"}}, "agent:legacy_agent"),
-        ({}, "<unknown>"),
-    ],
-)
-def test_rollout_progress_identity_matches_gym_routing_precedence(
-    row: dict, expected: str
-) -> None:
-    assert _rollout_progress_identity(row) == expected
 
 
 def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
@@ -155,7 +133,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
     asyncio.run(_run())
 
     captured = capsys.readouterr()
-    assert "1. agent:resolved_agent: 1" in captured.err
+    assert "1. resolved_agent: 1" in captured.err
     assert "task-source:test_resources_server" not in captured.err
 
 
