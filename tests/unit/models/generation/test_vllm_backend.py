@@ -1253,17 +1253,20 @@ async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
 
 
 @pytest.mark.vllm
-def test_worker_prepare_refit_info_forwards_state_dict_info():
+def test_worker_prepare_refit_info_forwards_state_dict_info(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     worker.llm = SimpleNamespace(collective_rpc=MagicMock())
     state_dict_info = {"model.weight": object()}
+    serialized_config = {"is_mx": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
 
     worker.prepare_refit_info(state_dict_info)
 
     assert worker.llm.collective_rpc.call_args_list == [
-        call("prepare_refit_info", args=(state_dict_info,)),
+        call("prepare_refit_info", args=(state_dict_info, serialized_config)),
     ]
 
 
@@ -1328,7 +1331,8 @@ def test_generation_prepare_refit_info_allows_prequantized_mxfp8_grouped_moe(
 
 @pytest.mark.vllm
 @pytest.mark.asyncio
-async def test_async_worker_prepare_refit_info_forwards_state_dict_info():
+async def test_async_worker_prepare_refit_info_forwards_state_dict_info(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
         VllmAsyncGenerationWorkerImpl,
     )
@@ -1336,11 +1340,13 @@ async def test_async_worker_prepare_refit_info_forwards_state_dict_info():
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.llm = SimpleNamespace(collective_rpc=AsyncMock())
     state_dict_info = {"model.weight": object()}
+    serialized_config = {"is_mx": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
 
     await worker.prepare_refit_info_async(state_dict_info)
 
     assert worker.llm.collective_rpc.await_args_list == [
-        call("prepare_refit_info", args=(state_dict_info,)),
+        call("prepare_refit_info", args=(state_dict_info, serialized_config)),
     ]
 
 
