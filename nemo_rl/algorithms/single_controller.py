@@ -1143,12 +1143,6 @@ class SingleControllerActor:
         reused_siblings = 0
         redispatched_siblings = 0
 
-        def _record_sibling_work(group: PromptGroupRecoveryRecord) -> None:
-            nonlocal reused_siblings, redispatched_siblings
-            reused = len(group.sealed_generation_indices)
-            reused_siblings += reused
-            redispatched_siblings += group.expected_generations - reused
-
         recognized_phases = (
             PromptGroupPhase.ADMITTED,
             PromptGroupPhase.RESERVED,
@@ -1174,7 +1168,9 @@ class SingleControllerActor:
                     group.target_step,
                     group.group_id,
                 )
-                _record_sibling_work(group)
+                reused = len(group.sealed_generation_indices)
+                reused_siblings += reused
+                redispatched_siblings += group.expected_generations - reused
                 redispatched += 1
 
         # A checkpoint may land after dataloader ownership is recorded but before
@@ -1197,7 +1193,9 @@ class SingleControllerActor:
                     group.target_step,
                     group.group_id,
                 )
-                _record_sibling_work(group)
+                reused = len(group.sealed_generation_indices)
+                reused_siblings += reused
+                redispatched_siblings += group.expected_generations - reused
                 redispatched += 1
 
         self._rollout_manager.record_recovery_siblings(
@@ -2495,12 +2493,12 @@ class SingleControllerActor:
                         await asyncio.sleep(0)
 
                         # Evict stale groups
-                        async with self._data_plane_checkpoint_barrier.mutation(
-                            "group_removals"
-                        ):
-                            evicted = await self._sampler.evict(
-                                current_train_weight=self._trainer_version,
-                            )
+                        # TQReplayBuffer.remove() owns the group-removal mutation
+                        # cut. Acquiring another cut here would nest the same
+                        # non-reentrant barrier section in this task.
+                        evicted = await self._sampler.evict(
+                            current_train_weight=self._trainer_version,
+                        )
                         evicted_stale_prompt_groups += evicted
                         if evicted:
                             print(

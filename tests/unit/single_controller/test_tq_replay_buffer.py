@@ -447,6 +447,8 @@ class TestDataPlaneCheckpointBarrier:
             async with barrier.mutation() as cut:
                 cut.require_live()
 
+        asyncio.run(exercise())
+
     def test_reports_mutations_blocked_by_checkpoint(self):
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()

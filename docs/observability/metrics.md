@@ -6,6 +6,21 @@ Metrics are emitted **only when telemetry is exporting** — the driver always e
 
 Training scalars — reward, loss, KL, grad norm, learning rate, throughput — are **not** mirrored to OTel. nemo-lens declares `record_rl_metrics` gauges for most of them, plus `rl.generation.duration_ms` and `rl.rollout.duration_ms` histograms, but NeMo-RL emits none of them: mapping its logger keys onto lens's fixed fields is still being settled with the lens owners. Read those scalars from W&B / TensorBoard, and phase durations from the spans.
 
+## W&B history step axes
+
+W&B's internal `_step` is a monotonically increasing history-row number, not a
+NeMo-RL trainer step. Trainer-correlated metrics are buffered into one history
+row and carry the explicit `nemo_rl/step` field. Use `nemo_rl/step` when plotting
+or joining training metrics by optimizer step; relying on `_step` also counts
+independently committed telemetry rows and can misalign the series.
+
+Independent event streams use their own custom axes and do not carry
+`nemo_rl/step`. In particular, Single-Controller rollout benchmark series under
+`rollout/throughput/*`, `timing/rollout_checkpoint/*`,
+`timing/rollout_recovery/*`, and `rollout/checkpoint_outcome/*` use
+`telemetry/wall_time_seconds`. This lets those series continue through a long
+or paused trainer step without changing the meaning of the trainer-step axis.
+
 ## Async efficiency metrics (`rl.efficiency.*`)
 
 Async GRPO measures where wall time goes with a `Timer` and logs the result as `efficiency/*` scalars (`print_efficiency_summary` in `nemo_rl/algorithms/utils.py`). Those same values are teed to OTel as one **dimensioned** gauge rather than one instrument per category, so adding a category needs no instrument change.

@@ -1006,7 +1006,7 @@ def setup_single_controller(
                 stacklevel=2,
             )
         else:
-            vllm_cfg = generation_config["vllm_cfg"]
+            vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
             if not vllm_cfg.get("enable_vllm_metrics_logger"):
                 warnings.warn(
                     "rollout_checkpointing.telemetry_interval_s is enabled, but "

@@ -28,6 +28,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     DataPlaneMutationCut,
     TQReplayBuffer,
@@ -108,6 +109,8 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._rollout_slot_waiters = 0
     ctrl._rollout_permitted_waiters = 0
     ctrl._buffer_capacity_waiters = 0
+    ctrl._rollout_completion_durations_s = deque(maxlen=10_000)
+    ctrl._rollout_queue_wait_durations_s = deque(maxlen=10_000)
 
 
 class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
@@ -119,8 +122,10 @@ class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
         self.release_mutation = asyncio.Event()
 
     @asynccontextmanager
-    async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
-        async with super().mutation() as cut:
+    async def mutation(
+        self, kind: CheckpointMutationKind = "other"
+    ) -> AsyncIterator[DataPlaneMutationCut]:
+        async with super().mutation(kind) as cut:
             yield cut
             self.mutation_applied.set()
             await self.release_mutation.wait()

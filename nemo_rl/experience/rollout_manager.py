@@ -1592,33 +1592,21 @@ class RolloutManager:
     def telemetry_snapshot(self) -> dict[str, int]:
         """Return cumulative canonical-publication and recovery counters."""
         return {
-            "canonical_groups_finalized": getattr(
-                self, "_canonical_groups_finalized", 0
-            ),
-            "canonical_output_tokens": getattr(self, "_canonical_output_tokens", 0),
-            "recovery_siblings_reused": getattr(self, "_recovery_siblings_reused", 0),
-            "recovery_siblings_redispatched": getattr(
-                self, "_recovery_siblings_redispatched", 0
-            ),
+            "canonical_groups_finalized": self._canonical_groups_finalized,
+            "canonical_output_tokens": self._canonical_output_tokens,
+            "recovery_siblings_reused": self._recovery_siblings_reused,
+            "recovery_siblings_redispatched": self._recovery_siblings_redispatched,
         }
 
     def record_canonical_publication(self, output_tokens: int) -> None:
         """Count one prompt group after its canonical TQ commit succeeds."""
-        self._canonical_groups_finalized = (
-            getattr(self, "_canonical_groups_finalized", 0) + 1
-        )
-        self._canonical_output_tokens = getattr(
-            self, "_canonical_output_tokens", 0
-        ) + max(0, int(output_tokens))
+        self._canonical_groups_finalized += 1
+        self._canonical_output_tokens += max(0, int(output_tokens))
 
     def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
         """Count sibling work avoided and repeated after a process restart."""
-        self._recovery_siblings_reused = getattr(
-            self, "_recovery_siblings_reused", 0
-        ) + max(0, int(reused))
-        self._recovery_siblings_redispatched = getattr(
-            self, "_recovery_siblings_redispatched", 0
-        ) + max(0, int(redispatched))
+        self._recovery_siblings_reused += max(0, int(reused))
+        self._recovery_siblings_redispatched += max(0, int(redispatched))
 
     def reserve_prompt_group(
         self,
@@ -1920,13 +1908,11 @@ class RolloutManager:
                 raise
 
             self._stats.committed += 1
-            rollout_metrics = getattr(record, "rollout_metrics", {})
+            rollout_metrics = record.rollout_metrics
             mean_output_tokens = rollout_metrics.get("mean_gen_tokens_per_sample", 0)
             output_tokens = 0
             if isinstance(mean_output_tokens, (int, float)):
-                total_output_tokens = float(mean_output_tokens) * len(
-                    getattr(record, "completions", ())
-                )
+                total_output_tokens = float(mean_output_tokens) * len(record.completions)
                 if math.isfinite(total_output_tokens):
                     output_tokens = max(0, round(total_output_tokens))
             self.record_canonical_publication(output_tokens)

@@ -179,6 +179,10 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
         else RolloutRetryPolicy.single_attempt()
     )
     manager._stats = RolloutStats()
+    manager._canonical_groups_finalized = 0
+    manager._canonical_output_tokens = 0
+    manager._recovery_siblings_reused = 0
+    manager._recovery_siblings_redispatched = 0
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
     return manager
