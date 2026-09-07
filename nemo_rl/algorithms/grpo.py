@@ -4751,6 +4751,45 @@ def async_grpo_train(
         except Exception as e:
             print(f"Error flushing trajectory collector telemetry: {e}")
 
+    def _cleanup_async_grpo() -> None:
+        """Stop async GRPO resources without masking the triggering exception."""
+        try:
+            checkpointer.shutdown()
+        except Exception as e:
+            print(f"Error finalizing pending checkpoint: {e}")
+
+        print("🛑 Stopping trajectory collection...")
+        _flush_collector_telemetry()
+        try:
+            ray.kill(trajectory_collector)
+        except Exception as e:
+            print(f"Error stopping trajectory collector: {e}")
+
+        try:
+            ray.kill(replay_buffer)
+        except Exception as e:
+            print(f"Error stopping replay buffer: {e}")
+
+        try:
+            shutdown_environments(task_to_env, val_task_to_env)
+        except Exception as e:
+            print(f"Error shutting down environments: {e}")
+
+        print("🛑 Shutting down generation workers...")
+        try:
+            policy_generation.shutdown()
+        except Exception as e:
+            print(f"Error shutting down generation workers: {e}")
+
+        if policy is not policy_generation:
+            print("🛑 Shutting down policy workers...")
+            try:
+                policy.shutdown()
+            except Exception as e:
+                print(f"Error shutting down policy workers: {e}")
+
+        print("Async GRPO training complete!")
+
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, "
         f"max_age={max_trajectory_age_steps} steps, "
@@ -4773,8 +4812,8 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            _flush_collector_telemetry()
-            return
+            _cleanup_async_grpo()
+            raise
     else:
         print("🔄 Preparing policy generation for inference...")
         try:
@@ -4785,8 +4824,8 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            _flush_collector_telemetry()
-            return
+            _cleanup_async_grpo()
+            raise
 
     # Generation must hold the policy's real weights before any backend starts
     # collecting. In particular, vLLM and Dynamo start with dummy weights when
@@ -5956,38 +5995,4 @@ def async_grpo_train(
         raise
 
     finally:
-        # Finalize any pending async checkpoint before tearing down workers.
-        try:
-            checkpointer.shutdown()
-        except Exception as e:
-            print(f"Error finalizing pending checkpoint: {e}")
-
-        print("🛑 Stopping trajectory collection...")
-        _flush_collector_telemetry()
-        try:
-            ray.kill(trajectory_collector)
-        except Exception as e:
-            print(f"Error stopping trajectory collector: {e}")
-
-        try:
-            ray.kill(replay_buffer)
-        except Exception as e:
-            print(f"Error stopping replay buffer: {e}")
-
-        # Environments can have in-flight HTTP requests to generation workers.
-        shutdown_environments(task_to_env, val_task_to_env)
-
-        print("🛑 Shutting down generation workers...")
-        try:
-            policy_generation.shutdown()
-        except Exception as e:
-            print(f"Error shutting down generation workers: {e}")
-
-        if policy is not policy_generation:
-            print("🛑 Shutting down policy workers...")
-            try:
-                policy.shutdown()
-            except Exception as e:
-                print(f"Error shutting down policy workers: {e}")
-
-        print("Async GRPO training complete!")
+        _cleanup_async_grpo()

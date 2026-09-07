@@ -1879,11 +1879,7 @@ class VllmAsyncGenerationWorkerImpl(
             # the run still wedged at step 4 because this handler did not match.
             if is_refit_abort(e):
                 raise RefitAborted(str(e)) from e
-            print(f"Exception during collective_rpc for weight update: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
+            raise
 
     async def init_nccl_reshard_comm_group_async(
         self,
@@ -1954,11 +1950,7 @@ class VllmAsyncGenerationWorkerImpl(
             # the run still wedged at step 4 because this handler did not match.
             if is_refit_abort(e):
                 raise RefitAborted(str(e)) from e
-            print(f"Exception during nccl_reshard_refit: {e}", flush=True)
-            import traceback
-
-            traceback.print_exc()
-            return False
+            raise
 
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""
