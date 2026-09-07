@@ -94,6 +94,12 @@ def _mock_cluster(world_size=4, ip="127.0.0.1", port=29500):
     return cluster
 
 
+def _wait_in_input_order(refs, *, num_returns, timeout=None):
+    del timeout
+    refs = list(refs)
+    return refs[:num_returns], refs[num_returns:]
+
+
 # ---------------------------------------------------------------------------
 # WeightSynchronizer ABC contract
 # ---------------------------------------------------------------------------
@@ -515,7 +521,8 @@ class TestSGLangDisaggregatedWeightSynchronizer:
 class TestCollectiveWeightSynchronizer:
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_sync_weights_calls_broadcast_and_receive(self, mock_ray):
-        mock_ray.get.return_value = [True]
+        mock_ray.wait.side_effect = _wait_in_input_order
+        mock_ray.get.return_value = True
         policy = _mock_policy()
         gen = _mock_generation()
         train_cluster = _mock_cluster(world_size=4)
@@ -538,7 +545,8 @@ class TestCollectiveWeightSynchronizer:
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_sync_weights_passes_kv_scales(self, mock_ray):
-        mock_ray.get.return_value = [True]
+        mock_ray.wait.side_effect = _wait_in_input_order
+        mock_ray.get.return_value = True
         policy = _mock_policy()
         gen = _mock_generation()
         sync = CollectiveWeightSynchronizer(
@@ -552,9 +560,10 @@ class TestCollectiveWeightSynchronizer:
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_sync_weights_raises_on_failure(self, mock_ray):
+        mock_ray.wait.side_effect = _wait_in_input_order
         mock_ray.get.side_effect = [
-            None,  # futures_train
-            [False],  # futures_inference -- update failed
+            None,  # train future
+            False,  # generation future -- update failed
         ]
         policy = _mock_policy()
         gen = _mock_generation()
@@ -564,6 +573,40 @@ class TestCollectiveWeightSynchronizer:
 
         with pytest.raises(RuntimeError, match="Weight transfer failed"):
             sync.sync_weights()
+
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_generation_error_is_observed_before_hanging_train_future(self, mock_ray):
+        train_ref = object()
+        generation_ref = object()
+        generation_error = RuntimeError("generation refit failed")
+        policy = _mock_policy()
+        policy.broadcast_weights_for_collective.return_value = [train_ref]
+        gen = _mock_generation()
+        gen.update_weights_from_collective.return_value = [generation_ref]
+        wait_calls = []
+
+        def wait(refs, *, num_returns, timeout=None):
+            wait_calls.append((list(refs), num_returns, timeout))
+            if timeout is not None:
+                return list(refs), []
+            return [generation_ref], [train_ref]
+
+        def get(ref):
+            if ref is generation_ref:
+                raise generation_error
+            raise AssertionError("trainer future was observed before generation failure")
+
+        mock_ray.wait.side_effect = wait
+        mock_ray.get.side_effect = get
+        sync = CollectiveWeightSynchronizer(
+            policy, gen, _mock_cluster(), _mock_cluster()
+        )
+
+        with pytest.raises(RuntimeError, match="generation refit failed") as caught:
+            sync.sync_weights()
+
+        assert caught.value is generation_error
+        assert wait_calls[0] == ([train_ref, generation_ref], 1, None)
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_init_communicator_sets_up_collective(self, mock_ray):
@@ -589,7 +632,8 @@ class TestCollectiveWeightSynchronizer:
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_backend_sender_contract_controls_geometry_and_world_size(self, mock_ray):
-        mock_ray.get.return_value = [True]
+        mock_ray.wait.side_effect = _wait_in_input_order
+        mock_ray.get.return_value = True
         policy = _mock_policy()
         gen = _mock_generation()
         gen.get_collective_sender_spec.return_value = CollectiveSenderSpec(
@@ -628,6 +672,40 @@ class TestCollectiveWeightSynchronizer:
 
 
 class TestNcclReshardWeightSynchronizer:
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_generation_error_is_observed_before_hanging_train_future(self, mock_ray):
+        train_ref = object()
+        generation_ref = object()
+        generation_error = RuntimeError("generation reshard failed")
+        policy = _mock_policy()
+        policy.nccl_reshard_refit.return_value = [train_ref]
+        gen = _mock_generation()
+        gen.nccl_reshard_refit.return_value = [generation_ref]
+        wait_calls = []
+
+        def wait(refs, *, num_returns, timeout=None):
+            wait_calls.append((list(refs), num_returns, timeout))
+            if timeout is not None:
+                return list(refs), []
+            return [generation_ref], [train_ref]
+
+        def get(ref):
+            if ref is generation_ref:
+                raise generation_error
+            raise AssertionError("trainer future was observed before generation failure")
+
+        mock_ray.wait.side_effect = wait
+        mock_ray.get.side_effect = get
+        sync = NcclReshardWeightSynchronizer(
+            policy, gen, _mock_cluster(), _mock_cluster()
+        )
+
+        with pytest.raises(RuntimeError, match="generation reshard failed") as caught:
+            sync.sync_weights()
+
+        assert caught.value is generation_error
+        assert wait_calls[0] == ([train_ref, generation_ref], 1, None)
+
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
     def test_init_communicator_ships_wire_safe_refit_info(self, mock_ray):
         # The train-side refit info carries MeshInfo rank tensors; the copy
@@ -947,4 +1025,40 @@ class TestFactory:
                 generation_backend=VLLM_BACKEND,
                 colocated=True,
                 refit_buffer_size_gb=0,
+            )
+
+    def test_generation_config_refit_timeout_reaches_nccl_reshard(self):
+        gen = _mock_generation()
+        gen.cfg = {
+            "refit_transport": "nccl_reshard",
+            "refit_timeout_s": 300.0,
+        }
+
+        sync = create_weight_synchronizer(
+            policy=_mock_policy(),
+            generation=gen,
+            generation_backend=VLLM_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert isinstance(sync, NcclReshardWeightSynchronizer)
+        assert sync._refit_timeout_s == 300.0
+
+    @pytest.mark.parametrize("timeout", [0, -1.0])
+    def test_generation_config_rejects_nonpositive_refit_timeout(
+        self, timeout: float
+    ) -> None:
+        gen = _mock_generation()
+        gen.cfg = {"refit_timeout_s": timeout}
+
+        with pytest.raises(ValueError, match="refit_timeout_s must be > 0"):
+            create_weight_synchronizer(
+                policy=_mock_policy(),
+                generation=gen,
+                generation_backend=VLLM_BACKEND,
+                colocated=False,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
             )

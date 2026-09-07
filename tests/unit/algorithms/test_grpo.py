@@ -203,6 +203,7 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     # weight_synchronizer and refit_policy_generation would delegate to it instead
     # of taking the colocated IPC path under test.
     policy_generation.weight_synchronizer = None
+    policy_generation.cfg = {}
     kv_scales = {"layer.0": 0.5}
 
     refit_policy_generation(
@@ -217,6 +218,31 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
     )
+
+
+@patch("nemo_rl.algorithms.grpo.time.monotonic", side_effect=[100.0, 101.0, 120.0])
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_refit_policy_generation_shares_one_deadline_across_legacy_ipc_waits(
+    mock_ray: MagicMock,
+    _mock_monotonic: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    policy_generation = MagicMock()
+    policy_generation.weight_synchronizer = None
+    policy_generation.cfg = {"refit_timeout_s": 300.0}
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=True,
+        _refit_buffer_size_gb=1.0,
+    )
+
+    assert [call.kwargs["timeout"] for call in mock_ray.get.call_args_list] == [
+        299.0,
+        280.0,
+    ]
 
 
 class TestMaskSampleFilter:
@@ -1940,6 +1966,58 @@ def test_initial_refit_completes_before_async_collection_starts(
         )
 
     assert events[:3] == ["refit", "set_weight_version", "start_collection"]
+
+
+def test_async_grpo_initial_refit_failure_cleans_up_and_reraises(
+    mock_grpo_components,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["backend"] = "vllm"
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    policy = mock_grpo_components["policy"]
+    policy_generation = _mock_policy_generation()
+    checkpointer = mock_grpo_components["checkpointer"]
+    refit_error = RuntimeError("initial refit failed")
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            {"mean_gen_tokens_per_sample": 2.0},
+            refit_side_effect=refit_error,
+        ),
+        patch("nemo_rl.algorithms.grpo.ray.kill") as ray_kill,
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown_envs,
+        pytest.raises(RuntimeError, match="initial refit failed") as caught,
+    ):
+        async_grpo_train(
+            policy,
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert caught.value is refit_error
+    checkpointer.shutdown.assert_called_once_with()
+    assert ray_kill.call_count == 2
+    shutdown_envs.assert_called_once_with(
+        mock_grpo_components["task_to_env"],
+        mock_grpo_components["val_task_to_env"],
+    )
+    policy_generation.shutdown.assert_called_once_with()
+    policy.shutdown.assert_called_once_with()
 
 
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:

@@ -75,6 +75,33 @@ def _settle_before_propagating(futures, budget_s, what: str) -> None:
         pass
 
 
+def _wait_for_refit_completion(
+    train_futures: Sequence[Any],
+    generation_futures: Sequence[Any],
+    *,
+    settle_budget_s: float,
+) -> None:
+    """Observe both refit sides in completion order and propagate the first failure."""
+    generation_refs = set(generation_futures)
+    pending = list(train_futures) + list(generation_futures)
+
+    try:
+        while pending:
+            ready, pending = ray.wait(pending, num_returns=1)
+            future = ready[0]
+            result = ray.get(future)
+            if future in generation_refs and result is not None and not result:
+                raise RuntimeError(
+                    "Weight transfer failed during NCCL collective sync. "
+                    "This often indicates an issue with the NCCL process group "
+                    "or the generation backend worker."
+                )
+    except BaseException:
+        _settle_before_propagating(train_futures, settle_budget_s, "train")
+        _settle_before_propagating(generation_futures, settle_budget_s, "generation")
+        raise
+
+
 class CollectiveWeightSynchronizer(WeightSynchronizer):
     """Weight synchronizer using NCCL collectives for non-colocated deployments.
 
@@ -145,31 +172,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 refit_timeout_s=self._refit_timeout_s
             )
 
-            try:
-                ray.get(futures_train)
-            except BaseException:
-                # Every rank must be out of the old refit before the caller can rebuild
-                # over the survivors; see _settle_before_propagating. BOTH sides: the
-                # rebuild dispatches init_collective to the generation ranks too, and
-                # ray.get(futures_train) raising leaves futures_inference running. Settling
-                # only the train half is the same half-applied fix as the widened
-                # signatures in design_vllm_fault_tolerance.md section 8.5.5.
-                _settle_before_propagating(
-                    futures_train, self._settle_budget_s(), "train"
-                )
-                _settle_before_propagating(
-                    futures_inference, self._settle_budget_s(), "generation"
-                )
-                raise
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-
-            if not update_success:
-                raise RuntimeError(
-                    "Weight transfer failed during NCCL collective sync. "
-                    "This often indicates an issue with the NCCL process group "
-                    "or the generation backend worker."
-                )
+            _wait_for_refit_completion(
+                futures_train,
+                futures_inference,
+                settle_budget_s=self._settle_budget_s(),
+            )
 
         self._stale = False
 

@@ -147,6 +147,13 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
 @pytest.fixture(autouse=True)
 def _no_ray(monkeypatch):
     monkeypatch.setattr("ray.get", lambda futures: futures)
+    monkeypatch.setattr(
+        "ray.wait",
+        lambda futures, *, num_returns=1, timeout=None: (
+            list(futures[:num_returns]),
+            list(futures[num_returns:]),
+        ),
+    )
 
 
 class TestPlanRegeneration:

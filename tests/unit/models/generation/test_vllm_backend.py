@@ -1138,12 +1138,70 @@ async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
             "reset_encoder_cache_after_weight_update": True,
         }
     }
+    reset_error = RuntimeError("reset failed")
     worker.llm = SimpleNamespace(
         collective_rpc=AsyncMock(return_value=[True]),
-        reset_encoder_cache=AsyncMock(side_effect=RuntimeError("reset failed")),
+        reset_encoder_cache=AsyncMock(side_effect=reset_error),
     )
 
-    assert await worker.update_weights_from_collective_async() is False
+    with pytest.raises(RuntimeError, match="reset failed") as caught:
+        await worker.update_weights_from_collective_async()
+
+    assert caught.value is reset_error
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method_name",
+    ["update_weights_from_collective_async", "nccl_reshard_refit_async"],
+)
+async def test_async_refit_propagates_non_abort_rpc_failures(method_name):
+    """A layout or loader error must reach the driver with its original traceback."""
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    rpc_error = RuntimeError("packed expert layout mismatch")
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(side_effect=rpc_error),
+        reset_encoder_cache=AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="packed expert layout mismatch") as caught:
+        await getattr(worker, method_name)()
+
+    assert caught.value is rpc_error
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method_name",
+    ["update_weights_from_collective_async", "nccl_reshard_refit_async"],
+)
+async def test_async_refit_preserves_refit_aborted_translation(method_name):
+    """EngineCore's stringified abort remains the controller's recovery signal."""
+    from nemo_rl.distributed.refit_watchdog import RefitAborted
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(
+            side_effect=Exception(
+                f"Call to refit failed: {RefitAborted('deadline exceeded')}"
+            )
+        ),
+        reset_encoder_cache=AsyncMock(),
+    )
+
+    with pytest.raises(RefitAborted, match="deadline exceeded"):
+        await getattr(worker, method_name)()
 
 
 @pytest.mark.vllm
