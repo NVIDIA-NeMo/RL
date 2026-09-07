@@ -88,6 +88,8 @@ class _TokenizedText:
 
 
 class _FakeTokenizer:
+    pad_token_id = 0
+
     def decode(self, ids, skip_special_tokens=True):
         del skip_special_tokens
         return f"<{len(ids)} tokens>"

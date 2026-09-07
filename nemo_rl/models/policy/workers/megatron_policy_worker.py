@@ -1455,6 +1455,9 @@ class MegatronPolicyWorkerImpl(
         explicitly in ``finish_train_step``. Returns nothing: gradients
         land in ``param.main_grad`` and per-microbatch metrics accumulate
         in the open-step state until ``finish_train_step`` surfaces them.
+
+        Multimodal validity-mask and model-owned packing/CP behavior match the
+        regular ``train`` path.
         """
         state = self._assert_step_open()
         try:
