@@ -8,6 +8,7 @@ replace-imports-with-any = [
   "transformers.*",
   "tensorrt_llm.*",
   "vllm.*",
+  "flashinfer.*",
   "dynamo.*",
   "math_verify.*",
   "nemo_gym.*",

@@ -40,9 +40,38 @@ at the synchronizer level.
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from nemo_rl.utils.timer import Timer
+
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.interfaces import GenerationInterface
+    from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+
+
+def initialize_refit_metadata(
+    policy: "ColocatablePolicyInterface", generation: "GenerationInterface"
+) -> None:
+    """Negotiate the wire-format metadata used by policy-to-generation refit."""
+    state_dict_info = policy.prepare_refit_info()
+    prequant_names = generation.prepare_refit_info(state_dict_info)
+    if not prequant_names:
+        return
+
+    megatron_cfg = policy.cfg.get("megatron_cfg")
+    if megatron_cfg is None or not megatron_cfg["enabled"]:
+        raise ValueError(
+            "vllm_cfg.refit_prequantize requires the Megatron policy backend "
+            "(policy.megatron_cfg.enabled=true); the DTensor workers do not "
+            "implement trainer-side pre-quantized refit."
+        )
+
+    updated_info = policy.enable_refit_prequantize(prequant_names)
+    if updated_info is None:
+        raise RuntimeError(
+            "Trainer-side refit prequantization did not return updated metadata."
+        )
+    generation.prepare_refit_info(updated_info)
 
 
 class WeightSynchronizer(ABC):

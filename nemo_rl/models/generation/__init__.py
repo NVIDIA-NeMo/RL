@@ -19,7 +19,10 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.models.generation.trtllm import TrtllmConfig
 from nemo_rl.models.generation.vllm import VllmConfig
-from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    validate_vllm_quantization_config,
+)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -82,6 +85,7 @@ def configure_generation_config(
 
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
+        validate_vllm_quantization_config(config)
         if config.get("real_quant"):
             export_cpu_offload = config.get("real_quant_export_cpu_offload")
             if not isinstance(export_cpu_offload, bool):
