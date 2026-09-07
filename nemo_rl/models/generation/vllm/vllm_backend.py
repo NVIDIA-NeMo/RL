@@ -863,11 +863,14 @@ class VllmInternalWorkerExtension:
 
     def _uses_deepseek_v4_fp8_refit(self) -> bool:
         """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
-        from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8, fp8
+        model = self.model_runner.model
+        config = getattr(model, "config", None)
+        if getattr(config, "model_type", None) != "deepseek_v4":
+            return False
 
-        return fp8.is_fp8_model(
-            self.model_runner.vllm_config
-        ) and deepseek_v4_fp8.is_model(self.model_runner.model)
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        return fp8.is_fp8_model(self.model_runner.vllm_config)
 
     def _validate_native_layerwise_refit(self) -> None:
         """Reject unsupported features on the native layerwise reload path."""
