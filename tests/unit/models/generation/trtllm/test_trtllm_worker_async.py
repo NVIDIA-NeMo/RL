@@ -91,13 +91,20 @@ async def test_generate_async_converts_padded_batch_and_logprobs():
 
     responses = {
         (11, 12): SimpleNamespace(
-            outputs=[SimpleNamespace(token_ids=[21, 22], logprobs=[-0.1, -0.2])]
+            outputs=[
+                SimpleNamespace(
+                    token_ids=[21, 22],
+                    logprobs=[-0.1, -0.2],
+                    finish_reason="stop",
+                )
+            ]
         ),
         (13,): SimpleNamespace(
             outputs=[
                 SimpleNamespace(
                     token_ids=[23],
                     logprobs=[{23: SimpleNamespace(logprob=-0.3)}],
+                    finish_reason="length",
                 )
             ]
         ),
@@ -125,6 +132,7 @@ async def test_generate_async_converts_padded_batch_and_logprobs():
         output["output_ids"], torch.tensor([[11, 12, 21, 22], [13, 23, 0, 0]])
     )
     assert torch.equal(output["generation_lengths"], torch.tensor([2, 1]))
+    assert torch.equal(output["truncated"], torch.tensor([False, True]))
     assert torch.equal(output["unpadded_sequence_lengths"], torch.tensor([4, 2]))
     assert torch.allclose(
         output["logprobs"],
@@ -197,6 +205,66 @@ def test_merge_stop_strings_returns_none_when_nothing_configured():
 
     assert worker._merge_stop_strings(None) is None
     assert worker._merge_stop_strings([[], None]) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_async_reports_truncation_from_finish_reason():
+    """``truncated`` must reach the batch, or overlong filtering silently no-ops.
+
+    TRT-LLM reports hitting max_tokens without a stop token as
+    ``finish_reason == "length"`` -- the same signal the vLLM worker reads. The
+    backend returned no ``truncated`` column at all, so the rollout default of
+    all-False stood, and ``grpo.overlong_filtering`` kept the loss for samples
+    that had run out of budget.
+    """
+    worker = _worker()
+    worker._build_sampling_params = MagicMock(return_value=object())
+
+    responses = {
+        (11,): SimpleNamespace(
+            outputs=[
+                SimpleNamespace(token_ids=[21], logprobs=[-0.1], finish_reason="stop")
+            ]
+        ),
+        (12,): SimpleNamespace(
+            outputs=[
+                SimpleNamespace(token_ids=[22], logprobs=[-0.2], finish_reason="length")
+            ]
+        ),
+    }
+
+    async def generate_async(*, inputs, sampling_params):
+        return responses[tuple(inputs["prompt_token_ids"])]
+
+    worker.llm.generate_async.side_effect = generate_async
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[11], [12]]),
+            "input_lengths": torch.tensor([1, 1]),
+        }
+    )
+
+    output = await worker.generate_async(data)
+
+    assert torch.equal(output["truncated"], torch.tensor([False, True]))
+
+
+@pytest.mark.asyncio
+async def test_generate_async_empty_batch_returns_empty_truncated():
+    """The empty-batch shortcut must carry the same columns as a real batch."""
+    worker = _worker()
+
+    output = await worker.generate_async(
+        BatchedDataDict(
+            {
+                "input_ids": torch.zeros((0, 0), dtype=torch.long),
+                "input_lengths": torch.zeros(0, dtype=torch.long),
+            }
+        )
+    )
+
+    assert output["truncated"].dtype == torch.bool
+    assert output["truncated"].numel() == 0
 
 
 def test_build_sampling_params_null_top_k_maps_to_zero():

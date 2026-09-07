@@ -484,6 +484,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                     "logprobs": torch.zeros((0, 0), dtype=torch.float),
                     "generation_lengths": torch.zeros(0, dtype=torch.long),
                     "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
+                    "truncated": torch.zeros(0, dtype=torch.bool),
                 }
             )
 
@@ -518,6 +519,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         logprobs_list = []
         generation_lengths = []
         unpadded_sequence_lengths = []
+        truncated_list = []
 
         max_gen_len = max(len(o.outputs[0].token_ids) for o in outputs)
 
@@ -553,6 +555,13 @@ class TrtllmAsyncGenerationWorkerImpl:
             generation_lengths.append(len(gen_tokens))
             unpadded_sequence_lengths.append(resp_len)
 
+            # "length" is how TRT-LLM reports hitting max_tokens without a stop
+            # token, the same condition the vLLM worker reads off finish_reason.
+            # Rollouts fold this into the batch's ``truncated`` column, which
+            # ``grpo.overlong_filtering`` uses to zero the loss for samples that
+            # ran out of budget; without it those samples train as if complete.
+            truncated_list.append(gen.finish_reason == "length")
+
         return BatchedDataDict[GenerationOutputSpec](
             {
                 "output_ids": torch.stack(output_ids_list),
@@ -560,6 +569,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "generation_lengths": torch.tensor(
                     generation_lengths, dtype=torch.long
                 ),
+                "truncated": torch.tensor(truncated_list, dtype=torch.bool),
                 "unpadded_sequence_lengths": torch.tensor(
                     unpadded_sequence_lengths, dtype=torch.long
                 ),
