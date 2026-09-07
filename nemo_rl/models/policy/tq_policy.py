@@ -349,6 +349,38 @@ class TQPolicy(TQDriverMixin, Policy):
             common_kwargs={"micro_batch_size": micro_batch_size},
         )
 
+    def get_topk_logits_from_meta(
+        self,
+        meta: KVBatchMeta,
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> None:
+        """1-hop counterpart to get_topk_logits, for a distillation teacher.
+
+        Returns nothing: the two tensors land in TQ under
+        ``teacher_topk_logits`` / ``teacher_topk_indices`` via the worker-side
+        write-back, so the loss reads them from there rather than through Ray.
+
+        Reuses ``LP_SEED_FIELDS`` because a teacher forward needs exactly what a
+        logprob forward needs -- the student's tokens and their masks. The
+        teacher contributes only its own scoring of them.
+
+        Args:
+            meta: Full-step batch metadata consumed by all DP ranks.
+            k: Number of top logits to keep per position.
+            micro_batch_size: Inference micro batch size; None uses the config default.
+            timer: Optional timer for nested measurements.
+        """
+        self._logprob_dispatch(
+            meta,
+            task_name="teacher_topk",
+            worker_method="get_topk_logits_presharded",
+            timer_prefix="get_topk_logits",
+            timer=timer,
+            common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+        )
+
     def train_from_meta(
         self,
         meta: KVBatchMeta,
@@ -517,7 +549,8 @@ class TQPolicy(TQDriverMixin, Policy):
         Args:
             meta: Data-plane metadata for the samples in this chunk.
             timer: Optional timer for nested policy-training measurements.
-            train_fields: Columns produced for this step and fetched by workers.
+            train_fields: Columns produced for this step and fetched by workers;
+                distillation supplies its narrower loss-input schema here.
         """
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._with_route_fields(

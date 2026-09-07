@@ -21,6 +21,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutFailureConfig,
     WatchdogConfig,
     algo_config,
+    is_distillation_run,
     is_ppo_run,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
@@ -36,6 +37,7 @@ __all__ = [
     "SingleControllerActorArgs",
     "WatchdogConfig",
     "algo_config",
+    "is_distillation_run",
     "is_ppo_run",
     "setup_single_controller",
 ]
