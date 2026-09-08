@@ -292,6 +292,14 @@ jobs:
       run_id: ${{ github.run_id }}
       run_attempt: ${{ github.run_attempt }}
 
+  dynamo-runner-routing:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    with:
+      lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
+      legacy_label: nemo-ci-aws-gpu-x8-ephemeral
+      run_id: ${{ github.run_id }}
+      run_attempt: ${{ github.run_attempt }}
+
   org-member-pre-flight:
     needs: [ephemeral-runner-routing]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
@@ -869,8 +877,8 @@ jobs:
       max-parallel: 16
       matrix:
         script: ${{ fromJSON(needs.pre-flight.outputs.h100_functional_test_scripts) }}
-    needs: [pre-flight, prepare-megatron-lock, build-container, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
-    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+    needs: [pre-flight, prepare-megatron-lock, build-container, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, dynamo-runner-routing, cicd-wait-in-queue]
+    runs-on: ${{ matrix.script == 'L1_Functional_Tests_Dynamo' && needs.dynamo-runner-routing.outputs.runner_label || needs.org-member-pre-flight.outputs.runner_prefix }}
     if: >-
       ${{
         always() &&
@@ -879,6 +887,7 @@ jobs:
         needs.pre-flight.outputs.h100_functional_test_count != '0' &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
+        needs.dynamo-runner-routing.result == 'success' &&
         (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
@@ -904,7 +913,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          runner: ${{ matrix.script == 'L1_Functional_Tests_Dynamo' && needs.dynamo-runner-routing.outputs.runner_label || needs.org-member-pre-flight.outputs.runner_prefix }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
@@ -971,7 +980,7 @@ jobs:
       fail-fast: false
       matrix:
         script: ${{ fromJSON(needs.pre-flight.outputs.h100_functional_test_scripts) }}
-    needs: [pre-flight, prepare-megatron-lock, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, functional-test-script-check, org-member-pre-flight, dynamo-runner-routing, cicd-wait-in-queue]
     if: >-
       ${{
         always() &&
@@ -980,6 +989,7 @@ jobs:
         needs.pre-flight.outputs.h100_functional_test_count != '0' &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
+        needs.dynamo-runner-routing.result == 'success' &&
         (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
@@ -988,7 +998,7 @@ jobs:
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
       }}
-    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+    runs-on: ${{ matrix.script == 'L1_Functional_Tests_Dynamo' && needs.dynamo-runner-routing.outputs.runner_label || needs.org-member-pre-flight.outputs.runner_prefix }}
     name: fast_${{ matrix.script }}
     steps:
       - name: Checkout
@@ -998,7 +1008,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          runner: ${{ matrix.script == 'L1_Functional_Tests_Dynamo' && needs.dynamo-runner-routing.outputs.runner_label || needs.org-member-pre-flight.outputs.runner_prefix }}
           script: ${{ matrix.script }}
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}

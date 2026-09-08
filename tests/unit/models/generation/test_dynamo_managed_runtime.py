@@ -33,12 +33,18 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 from nemo_rl.models.generation.dynamo.venv import get_dynamo_venv_dir
 from nemo_rl.models.generation.dynamo.worker_pool import (
     FixedDynamoWorkerPool,
+    _kv_event_port_for_node_slot,
+    _nixl_port_for_node_slot,
     _vllm_port_for_node_slot,
 )
 
 
 class _Cluster:
     num_gpus_per_node = 4
+
+    @staticmethod
+    def world_size() -> int:
+        return 4
 
 
 def test_dynamo_package_directory_does_not_shadow_stdlib_http() -> None:
@@ -177,6 +183,26 @@ def test_runtime_rejects_multinode_engine_group_before_spawning() -> None:
         ManagedDynamoRuntime(cluster=_Cluster(), config=_config(tp=8))
 
 
+def test_runtime_builds_stable_disaggregated_roles_and_rejects_wrong_gpu_count() -> (
+    None
+):
+    config = _config(tp=2)
+    config["colocated"]["resources"] = {"gpus_per_node": 4, "num_nodes": 1}
+    config["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+    }
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=config)
+    assert runtime._worker_roles == ["decode", "prefill"]
+    assert runtime._expected_components == {"backend": 1, "prefill": 1}
+
+    config["vllm_cfg"]["tensor_parallel_size"] = 1
+    config["vllm_cfg"]["expert_parallel_size"] = 1
+    config["colocated"]["resources"]["gpus_per_node"] = 2
+    with pytest.raises(ValueError, match="allocated=4, expected=2"):
+        ManagedDynamoRuntime(cluster=_Cluster(), config=config)
+
+
 def test_managed_service_and_frontend_environments_are_runtime_owned(
     monkeypatch,
 ) -> None:
@@ -231,6 +257,12 @@ def test_dynamo_venv_uses_explicit_env_or_repository_fallback(monkeypatch) -> No
 
 def test_vllm_node_local_port_bands_are_deterministic() -> None:
     assert [_vllm_port_for_node_slot(slot) for slot in range(3)] == [7000, 7100, 7200]
+    assert [_nixl_port_for_node_slot(slot) for slot in range(3)] == [4100, 4101, 4102]
+    assert [_kv_event_port_for_node_slot(slot) for slot in range(3)] == [
+        4200,
+        4201,
+        4202,
+    ]
 
 
 def test_startup_failure_cleans_up_partial_worker_pool(monkeypatch, tmp_path) -> None:
@@ -419,6 +451,7 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
 
     process = SimpleNamespace(pid=4321)
     reservation = _FakeReservation()
+    launch = {}
     worker_cls = DynamoVllmWorker.__ray_metadata__.modified_class
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.dynamo_worker._get_node_ip_local",
@@ -436,9 +469,14 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
         "nemo_rl.models.generation.dynamo.dynamo_worker.get_dynamo_venv_dir",
         lambda: Path("/opt/dynamo_venv"),
     )
+
+    def fake_popen(command, **kwargs):
+        launch["command"] = command
+        launch["env"] = kwargs["env"]
+        return process
+
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.dynamo_worker.subprocess.Popen",
-        lambda *args, **kwargs: process,
+        "nemo_rl.models.generation.dynamo.dynamo_worker.subprocess.Popen", fake_popen
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.dynamo_worker.ray.get", lambda ref: ref
@@ -453,6 +491,9 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
         cuda_devices=[0],
         system_port=4000,
         vllm_port=7000,
+        nixl_port=4100,
+        kv_event_port=4200,
+        worker_role="prefill",
         manager_env={},
         startup_timeout_s=5,
         seed=0,
@@ -460,6 +501,15 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
     )
 
     assert reservation.register_process_group.calls == [((4321,), {})]
+    assert launch["env"]["VLLM_NIXL_SIDE_CHANNEL_HOST"] == "10.0.0.1"
+    assert launch["env"]["VLLM_NIXL_SIDE_CHANNEL_PORT"] == "4100"
+    assert launch["command"][launch["command"].index("--disaggregation-mode") + 1] == (
+        "prefill"
+    )
+    kv_event_config = json.loads(
+        launch["command"][launch["command"].index("--kv-events-config") + 1]
+    )
+    assert kv_event_config["endpoint"] == "tcp://*:4200"
 
 
 def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:
@@ -577,6 +627,7 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
         config=_config(),
         namespace="nemo-rl-test",
         engine_world_size=1,
+        worker_roles=["aggregated"],
         manager_env={},
         startup_timeout_s=5,
     )
@@ -633,6 +684,7 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     ]
     workers_to_launch = iter(workers)
     launch_kwargs = []
+    actor_names = []
 
     class RemoteFactory:
         def __init__(self, actor):
@@ -649,6 +701,7 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     class WorkerFactory:
         @staticmethod
         def options(**kwargs):
+            actor_names.append(kwargs["name"])
             worker = next(workers_to_launch)
 
             class CapturingRemoteFactory(RemoteFactory):
@@ -668,6 +721,7 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
         config=_config(),
         namespace="nemo-rl-test",
         engine_world_size=1,
+        worker_roles=["decode", "prefill"],
         manager_env={},
         startup_timeout_s=5,
     )
@@ -708,6 +762,16 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     ]
     assert [kwargs["system_port"] for kwargs in launch_kwargs] == [4001, 4002]
     assert [kwargs["vllm_port"] for kwargs in launch_kwargs] == [7000, 7100]
+    assert [kwargs["nixl_port"] for kwargs in launch_kwargs] == [4100, 4101]
+    assert [kwargs["kv_event_port"] for kwargs in launch_kwargs] == [None, 4201]
+    assert [kwargs["worker_role"] for kwargs in launch_kwargs] == [
+        "decode",
+        "prefill",
+    ]
+    assert actor_names == [
+        "nemo-rl-test-dynamo-vllm-decode-0",
+        "nemo-rl-test-dynamo-vllm-prefill-0",
+    ]
     assert [kwargs["cleanup_reservation"] for kwargs in launch_kwargs] == (
         reservation_objects
     )
@@ -824,7 +888,7 @@ def test_frontend_waits_for_model_after_endpoint_registration(monkeypatch) -> No
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep", lambda _: None
     )
-    runtime._wait_for_frontend(expected_workers=1)
+    runtime._wait_for_frontend(expected_components={"backend": 1})
     assert urls == [
         "http://127.0.0.1:3000/health",
         "http://127.0.0.1:3000/v1/models",
@@ -840,7 +904,7 @@ def test_frontend_wait_fails_immediately_when_worker_exits(monkeypatch) -> None:
     runtime._pool = SimpleNamespace(is_alive=lambda: False)
 
     with pytest.raises(RuntimeError, match="worker exited while the frontend"):
-        runtime._wait_for_frontend(expected_workers=1)
+        runtime._wait_for_frontend(expected_components={"backend": 1})
 
 
 def test_frontend_logs_resolved_tokenizer_environment(monkeypatch, capsys) -> None:
@@ -865,3 +929,109 @@ def test_frontend_logs_resolved_tokenizer_environment(monkeypatch, capsys) -> No
     output = capsys.readouterr().out
     assert "DYN_TOKENIZER': 'fastokens" in output
     assert "<redacted>" not in output
+
+
+def test_frontend_accepts_a_fully_registered_disaggregated_fleet(
+    monkeypatch,
+) -> None:
+    config = _config(tp=2)
+    config["colocated"]["resources"] = {"gpus_per_node": 4, "num_nodes": 1}
+    config["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+    }
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=config)
+    runtime._frontend_port = 3000
+    runtime._frontend_process = _FakeProcess()
+    runtime._pool = SimpleNamespace(is_alive=lambda: True)
+    runtime._namespace = "nemo-rl-test"
+    health = {
+        "instances": [
+            {
+                "namespace": "nemo-rl-test",
+                "component": component,
+                "endpoint": endpoint,
+                "instance_id": worker,
+            }
+            for component, worker in (
+                ("backend", "decode-0"),
+                ("prefill", "prefill-0"),
+            )
+            for endpoint in ("generate", "rl")
+        ]
+    }
+    responses = iter([health, {"data": [{"id": "model"}]}])
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.urllib.request.urlopen",
+        lambda url, timeout: _FakeHttpResponse(next(responses)),
+    )
+
+    runtime._wait_for_frontend(expected_components={"backend": 1, "prefill": 1})
+
+
+@pytest.mark.parametrize(
+    "instances",
+    [
+        [
+            {
+                "namespace": "nemo-rl-test",
+                "component": "backend",
+                "endpoint": endpoint,
+                "instance_id": "decode-0",
+            }
+            for endpoint in ("generate", "rl")
+        ],
+        [
+            {
+                "namespace": "nemo-rl-test",
+                "component": component,
+                "endpoint": endpoint,
+                "instance_id": instance_id,
+            }
+            for component, endpoint, instance_id in (
+                ("backend", "generate", "decode-0"),
+                ("backend", "rl", "decode-0"),
+                ("prefill", "generate", "prefill-0"),
+                ("prefill", "rl", "prefill-1"),
+            )
+        ],
+    ],
+    ids=["missing-prefill", "mismatched-prefill-instance-ids"],
+)
+def test_frontend_rejects_incomplete_disaggregated_registration(
+    monkeypatch, instances
+) -> None:
+    config = _config(tp=2)
+    config["colocated"]["resources"] = {"gpus_per_node": 4, "num_nodes": 1}
+    config["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+    }
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=config)
+    runtime._frontend_port = 3000
+    runtime._frontend_process = _FakeProcess()
+    runtime._pool = SimpleNamespace(is_alive=lambda: True)
+    runtime._namespace = "nemo-rl-test"
+    urls = []
+
+    def fake_urlopen(url, timeout):
+        urls.append(url)
+        return _FakeHttpResponse({"instances": instances})
+
+    monotonic = iter([0.0, 1.0, 100.0])
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.time.monotonic",
+        lambda: next(monotonic),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep", lambda _: None
+    )
+
+    with pytest.raises(RuntimeError, match="did not observe the fixed worker fleet"):
+        runtime._wait_for_frontend(expected_components={"backend": 1, "prefill": 1})
+
+    assert urls == ["http://127.0.0.1:3000/health"]
