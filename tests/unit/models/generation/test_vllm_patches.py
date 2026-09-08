@@ -29,10 +29,12 @@ The two port patches ship their own suites. These cover the remaining two:
 """
 
 import ast
+import hashlib
 import logging
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -48,6 +50,7 @@ _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
+_ROUTED_EXPERTS_MARKER = "def get_routed_experts_layer_indices"
 
 
 def test_external_vllm_patch_allowlist(monkeypatch):
@@ -185,6 +188,104 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+@pytest.fixture
+def compact_routed_experts_source(tmp_path, monkeypatch):
+    """Copy and compact one of the two supported vLLM capturer sources."""
+    installed_source = Path(
+        patches._get_vllm_file(patches._ROUTED_EXPERTS_CAPTURER_SOURCE)
+    )
+    copied_source = tmp_path / "routed_experts_capturer.py"
+    copied_source.write_text(installed_source.read_text())
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied_source))
+
+    before_sha256 = hashlib.sha256(copied_source.read_bytes()).hexdigest()
+    assert before_sha256 in {
+        patches._ROUTED_EXPERTS_CAPTURER_V0251_SHA256,
+        patches._ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256,
+    }
+    assert patches._patch_vllm_routed_experts_compact_layers(
+        logging.getLogger(__name__)
+    )
+    return copied_source
+
+
+@pytest.mark.vllm
+def test_routed_experts_compact_source_patch_matches_pinned_result(
+    compact_routed_experts_source,
+):
+    content = compact_routed_experts_source.read_text()
+    assert hashlib.sha256(content.encode()).hexdigest() == (
+        patches._ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256
+    )
+    assert _ROUTED_EXPERTS_MARKER in content
+    assert "routed_layers=%d" in content
+    assert "self.layer_id_to_capture_index" in content
+    ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_routed_experts_compact_source_patch_is_idempotent(
+    compact_routed_experts_source, monkeypatch
+):
+    before = compact_routed_experts_source.read_text()
+    monkeypatch.setattr(
+        patches,
+        "_get_vllm_file",
+        lambda _relative: str(compact_routed_experts_source),
+    )
+
+    assert patches._patch_vllm_routed_experts_compact_layers(
+        logging.getLogger(__name__)
+    )
+    assert compact_routed_experts_source.read_text() == before
+
+
+@pytest.mark.vllm
+def test_routed_experts_compact_source_selects_only_hybrid_moe_layers(
+    compact_routed_experts_source,
+):
+    tree = ast.parse(compact_routed_experts_source.read_text())
+    resolver = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "get_routed_experts_layer_indices"
+    )
+    namespace = {}
+    exec(
+        compile(ast.Module(body=[resolver], type_ignores=[]), "<resolver>", "exec"),
+        namespace,
+    )
+    resolve = namespace["get_routed_experts_layer_indices"]
+
+    hybrid = types.SimpleNamespace(
+        num_hidden_layers=6,
+        layers_block_type=["mamba", "moe", "attention", "moe", "mamba", "moe"],
+        mtp_layers_block_type=["moe"],
+    )
+    fallback = types.SimpleNamespace(num_hidden_layers=4)
+    assert resolve(hybrid) == (1, 3, 5)
+    assert resolve(fallback) == (0, 1, 2, 3)
+
+
+def test_routed_experts_compact_source_patch_rejects_unknown_source(
+    monkeypatch, tmp_path, caplog
+):
+    unknown_source = tmp_path / "routed_experts_capturer.py"
+    unknown_source.write_text("class RoutedExpertsCapturer:\n    pass\n")
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(unknown_source)
+    )
+
+    with caplog.at_level(logging.ERROR):
+        assert not patches._patch_vllm_routed_experts_compact_layers(
+            logging.getLogger(__name__)
+        )
+
+    assert unknown_source.read_text() == "class RoutedExpertsCapturer:\n    pass\n"
+    assert "Refusing to patch unknown vLLM routed-experts capturer" in caplog.text
 
 
 @pytest.mark.parametrize(

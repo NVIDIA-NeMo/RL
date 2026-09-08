@@ -332,6 +332,11 @@ class BaseVllmGenerationWorker:
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
+            require_compact_routed_experts=bool(
+                self.cfg.get("vllm_kwargs", {}).get(
+                    "enable_return_routed_experts", False
+                )
+            ),
         )
 
         # Skip model loading if we're not the model owner
