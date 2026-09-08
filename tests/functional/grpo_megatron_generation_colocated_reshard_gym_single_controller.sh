@@ -119,7 +119,7 @@ fi
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Observed to be between 0.8-1.3
 uv run tests/check_metrics.py $JSON_METRICS \
+    'max(data["train/token_mult_prob_error"]) < 1.05' \
     'median(data["train/gen_kl_error"]) < 1.3' \
     'max(data["train/reward"]) > 0'

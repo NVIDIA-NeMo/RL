@@ -697,6 +697,23 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
     assert manager._impl._reward_penalty_config is reward_penalty_config
 
 
+@pytest.mark.parametrize("use_nemo_gym", [False, True], ids=["native", "nemo_gym"])
+def test_rollout_manager_hands_its_deadline_registry_to_the_impl(use_nemo_gym):
+    """The controller suspends deadlines through the manager, so the impl must arm
+    its request deadlines on the manager's own registry rather than a private one."""
+    manager = RolloutManager(
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=1,
+        policy_generation=object(),
+        generation_config={"stop_strings": None, "stop_token_ids": None, "top_k": None},
+        use_nemo_gym=use_nemo_gym,
+    )
+
+    assert manager._impl._deadline_registry is manager._request_deadlines
+
+
 def test_rollout_manager_forwards_log_full_result_tables():
     common = {
         "tokenizer": None,
