@@ -24,7 +24,6 @@ import importlib.util
 import os
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 import pytest
@@ -45,23 +44,23 @@ MODULE_PATH = Path(git_root) / "nemo_rl" / "distributed" / "actor_environments.p
 # PY_EXECUTABLES and uv_py_executable, so there is no module constant to import.
 USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
 
-with open(Path(git_root) / "pyproject.toml", "rb") as _f:
-    DECLARED_EXTRAS = set(tomllib.load(_f)["project"]["optional-dependencies"])
-
 
 @pytest.mark.parametrize("actor_fqn", sorted(ACTOR_ENVIRONMENTS))
-def test_actor_extras_are_declared(actor_fqn):
-    """Every extra names a real [project.optional-dependencies] entry."""
+def test_actor_extras_is_none_or_a_list_of_str(actor_fqn):
+    """Each value is None or a list of strings.
+
+    This deliberately does NOT re-check that the extras are declared in
+    pyproject.toml. Importing this module imports the registry, which runs
+    _reject_undeclared_extras() at import time, so an undeclared extra raises
+    during collection and no assertion here is ever reached. A type error is
+    different: ("mcore",) is a tuple of a real extra, so the import-time check --
+    which only does set arithmetic -- passes it, and this is what catches it.
+    """
     extras = ACTOR_ENVIRONMENTS[actor_fqn]
     if extras is None:
         return
     assert isinstance(extras, list) and all(isinstance(e, str) for e in extras), (
         f"{actor_fqn}: value must be None or a list of extras, got {extras!r}"
-    )
-    undeclared = set(extras) - DECLARED_EXTRAS
-    assert not undeclared, (
-        f"{actor_fqn} names extras {sorted(undeclared)} that are not in "
-        "[project.optional-dependencies] of pyproject.toml"
     )
 
 
