@@ -516,11 +516,23 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
     """Load explicit RADIO LayerScale weights and initialize folded weights.
 
-    vLLM 0.25.1 uses ``ls1`` and ``ls2`` in ``RadioVisionEncoderLayer`` but
-    skips them in ``RadioModel.load_weights``. Explicit checkpoint values are
-    therefore ignored, while folded checkpoints leave the parameters at dummy
-    initialization. Patch the loader so explicit values are loaded and absent
-    values are initialized to RADIO's configured identity factor.
+    ``RadioVisionEncoderLayer`` scales each residual branch by ``ls1``/``ls2``
+    (``... + self.attn(...) * self.ls1``), but ``RadioModel.load_weights``
+    discards those entries for legacy ``radio_model.*`` checkpoints, and folded
+    checkpoints ship no LayerScale tensors at all. NeMo-RL forces
+    ``load_format=dummy`` because weights arrive by refit, so anything the
+    loader does not populate keeps its random initialization: the vision tower
+    then multiplies every residual branch by noise. The failure is silent --
+    unchanged step time, a collapsed reward, and a large
+    train/token_mult_prob_error.
+
+    Applied as two INDEPENDENT edits rather than one block replacement. The
+    surrounding loader body differs between stock vLLM 0.25.1 and the
+    super_vl_rl_v0.25.1 fork that the CI images ship: the fork gates the legacy
+    branch on ``is_legacy``, inserts an ``elif not is_legacy:`` native-mapping
+    branch (which maps ``layer_scale{1,2}.lambda1`` -> ``ls{1,2}``), and makes
+    the ``weight_loader`` call shard-aware. Matching that whole body against a
+    single snippet is what made this patch no-op silently on the fork.
     """
     try:
         file_to_patch = _get_vllm_file("model_executor/models/radio.py")
@@ -528,64 +540,66 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         logger.warning("Could not locate radio.py for the LayerScale loader patch.")
         return
 
-    old_snippet = """            elif sub.startswith("model.blocks."):
-                # Encoder blocks: HF 'model.blocks.{i}.' ->
-                # vLLM 'model.encoder.layers.{i}.'
-                parts = sub.split(".")
-                if len(parts) >= 4:
-                    layer_idx = parts[2]
-                    suffix = ".".join(parts[3:])
-                    # Skip layer-scale entries that vLLM doesn't use
+    # Edit 1 (optional): stop discarding explicit LayerScale weights from legacy
+    # checkpoints. Identical text in stock 0.25.1 and the fork. Native-format
+    # checkpoints do not need it -- the fork's native_layer_mapping already
+    # routes layer_scale{1,2}.lambda1 to ls{1,2}.
+    skip_old = """                    # Skip layer-scale entries that vLLM doesn't use
                     if suffix in {"ls1", "ls2"} or suffix.startswith(("ls1.", "ls2.")):
                         continue
-                    vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
+"""
+    skip_new = ""
 
-            if vllm_key and vllm_key in params_dict:
-                param = params_dict[vllm_key]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
-                loaded_params.add(vllm_key)
+    # Edit 2 (required): give every LayerScale parameter the checkpoint did not
+    # supply the configured identity factor instead of dummy-init noise.
+    # RadioConfig defaults initializer_factor=1.0, and getattr keeps this safe
+    # for configs that omit it. This is the edit that matters for the folded
+    # checkpoints we train on, which contain no ls1/ls2 tensors whatsoever.
+    tail_old = """                loaded_params.add(vllm_key)
 
         return loaded_params
 """
-    new_snippet = """            elif sub.startswith("model.blocks."):
-                # Encoder blocks: HF 'model.blocks.{i}.' ->
-                # vLLM 'model.encoder.layers.{i}.'
-                parts = sub.split(".")
-                if len(parts) >= 4:
-                    layer_idx = parts[2]
-                    suffix = ".".join(parts[3:])
-                    vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
+    tail_new = """                loaded_params.add(vllm_key)
 
-            if vllm_key and vllm_key in params_dict:
-                param = params_dict[vllm_key]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
-                loaded_params.add(vllm_key)
-
-        initializer_factor = self.config.initializer_factor
-        for name, param in params_dict.items():
-            if name.endswith((".ls1", ".ls2")) and name not in loaded_params:
-                param.data.fill_(initializer_factor)
-                loaded_params.add(name)
+        initializer_factor = getattr(self.config, "initializer_factor", 1.0)
+        for ls_name, ls_param in params_dict.items():
+            if ls_name.endswith((".ls1", ".ls2")) and ls_name not in loaded_params:
+                ls_param.data.fill_(initializer_factor)
+                loaded_params.add(ls_name)
 
         return loaded_params
 """
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if new_snippet in content:
+        if "ls_param.data.fill_(initializer_factor)" in content:
             logger.info("vLLM RADIO LayerScale loader patch already applied.")
             return
-        if old_snippet not in content:
+
+        updated = content
+        skip_removed = skip_old in updated
+        if skip_removed:
+            updated = updated.replace(skip_old, skip_new, 1)
+
+        if tail_old not in updated:
+            # Without the fill loop the parameters stay at dummy init, so refuse
+            # to write a half-applied patch and make the reason loud.
             logger.warning(
-                "Could not apply vLLM RADIO LayerScale loader patch: expected "
-                "vLLM 0.25.1 source shape was not found in %s.",
+                "Could not apply vLLM RADIO LayerScale loader patch: the "
+                "load_weights tail anchor was not found in %s. LayerScale "
+                "parameters would keep their dummy initialization; expect a "
+                "degraded vision tower and inflated token_mult_prob_error.",
                 file_to_patch,
             )
             return
-        write_back(content.replace(old_snippet, new_snippet, 1))
+        updated = updated.replace(tail_old, tail_new, 1)
 
-    logger.info("Successfully patched vLLM RADIO LayerScale loading.")
+        write_back(updated)
+
+    logger.info(
+        "Successfully patched vLLM RADIO LayerScale loading "
+        "(explicit legacy-skip removed: %s).",
+        skip_removed,
+    )
 
 
 def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:

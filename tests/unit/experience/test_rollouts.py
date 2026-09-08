@@ -45,6 +45,12 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
@@ -1847,6 +1853,8 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             timer_prefix,
             deduplicate_multimodal_data,
         ):
+            assert all(NEMO_GYM_TASK_INDEX_KEY in row for row in rows)
+            assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
             del rows, timer_prefix
             assert deduplicate_multimodal_data is True
             # Both groups complete out of order internally and group 1 completes first.
@@ -1946,10 +1954,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     monkeypatch.setattr(
         rollouts_mod,
         "collect_multimodal_payload_metrics",
-        lambda payload, boundary, enabled: payload_calls.append(
-            (payload, boundary, enabled)
-        )
-        or {},
+        lambda payload, boundary, enabled: (
+            payload_calls.append((payload, boundary, enabled)) or {}
+        ),
     )
     monkeypatch.setattr(
         rollouts_mod, "print_multimodal_payload_metrics", lambda metrics: None
@@ -2060,11 +2067,16 @@ def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     rows = [
-        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
-        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
+        {
+            "agent_ref": {"name": "agent"},
+            NEMO_GYM_TASK_INDEX_KEY: 42,
+            NEMO_GYM_ROLLOUT_INDEX_KEY: rollout_index,
+            NEMO_GYM_ATTEMPT_INDEX_KEY: 1,
+        }
+        for rollout_index in range(2)
     ]
     results = []
-    for reward in (1.0, 2.0):
+    for result_index, reward in enumerate((1.0, 2.0)):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -2083,6 +2095,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                     },
                 ],
                 "full_result": {"reward": reward},
+                NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY: result_index == 1,
             }
         )
 
@@ -2103,13 +2116,20 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
 
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert rollout_result.final_batch[NEMO_GYM_TASK_INDEX_KEY].tolist() == [42, 42]
+    assert rollout_result.final_batch[NEMO_GYM_ROLLOUT_INDEX_KEY].tolist() == [0, 1]
+    assert rollout_result.final_batch[NEMO_GYM_ATTEMPT_INDEX_KEY].tolist() == [1, 1]
+    assert rollout_result.final_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY].tolist() == [
+        False,
+        True,
+    ]
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
     assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
 
 
-def test_postprocess_nemo_gym_group_reports_per_agent_truncation_rate():
+def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
     is_truncated = [True, False, True, True]
     rows = [{"agent_ref": {"name": name}} for name in agent_names]
@@ -2161,7 +2181,32 @@ def test_postprocess_nemo_gym_group_reports_per_agent_truncation_rate():
     assert rollout_result.rollout_metrics["agent-b/truncation_rate"] == pytest.approx(
         1.0
     )
+    assert rollout_result.rollout_metrics[
+        "agent-a/total_tokens_per_sample/mean"
+    ] == pytest.approx(2.5)
+    assert rollout_result.rollout_metrics[
+        "agent-a/total_tokens_per_sample/histogram"
+    ] == [3, 2]
+    assert rollout_result.rollout_metrics[
+        "agent-a/gen_tokens_per_sample/mean"
+    ] == pytest.approx(1.5)
+    assert rollout_result.rollout_metrics[
+        "agent-a/gen_tokens_per_sample/histogram"
+    ] == [2, 1]
+    assert rollout_result.rollout_metrics[
+        "agent-b/total_tokens_per_sample/mean"
+    ] == pytest.approx(3.0)
+    assert rollout_result.rollout_metrics[
+        "agent-b/total_tokens_per_sample/histogram"
+    ] == [3, 3]
+    assert rollout_result.rollout_metrics[
+        "agent-b/gen_tokens_per_sample/mean"
+    ] == pytest.approx(2.0)
+    assert rollout_result.rollout_metrics[
+        "agent-b/gen_tokens_per_sample/histogram"
+    ] == [2, 2]
     assert rollout_result.final_batch["truncated"].tolist() == is_truncated
+    assert not rollout_result.final_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY].any()
 
 
 def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
@@ -2466,6 +2511,18 @@ def test_run_async_nemo_gym_rollout(
             "truncation_rate": None,
             # per agent metrics
             "example_multi_step_simple_agent/full_result": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/mean": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/max": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/min": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/median": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/stddev": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/histogram": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/mean": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/max": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/min": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/median": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/stddev": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/histogram": None,
             "example_multi_step_simple_agent/accuracy/histogram": None,
             "example_multi_step_simple_agent/accuracy/max": 0.0,
             "example_multi_step_simple_agent/accuracy/mean": 0.0,

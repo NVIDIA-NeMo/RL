@@ -1098,6 +1098,19 @@ class AsyncNemoGymRolloutImpl:
                 rollout_metrics.update(
                     calculate_single_metric(values, n, f"{agent_name}/{key}")
                 )
+
+        # Emit authoritative live token metrics after full-result metrics so
+        # similarly named environment metadata cannot overwrite them.
+        rollout_metrics.update(
+            calculate_single_metric(
+                total_tokens, n, f"{agent_name}/total_tokens_per_sample"
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+            )
+        )
         rollout_metrics[f"{agent_name}/full_result"] = Table(
             data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
             columns=["Full result"],
