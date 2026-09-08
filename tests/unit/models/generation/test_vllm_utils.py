@@ -1061,3 +1061,59 @@ def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
             device=torch.device("cpu"),
             routed_experts_dtype=torch.int8,
         )
+
+
+def test_attach_routed_experts_uses_ref_factory_once():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        prompt_routed_experts=torch.tensor(
+            [[[10]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+        ),
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[200],
+                routed_experts=torch.tensor(
+                    [[[20]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+    stored = []
+
+    def make_ref(routed_experts):
+        stored.append(routed_experts.clone())
+        return {"schema": "test-ref"}
+
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.int16,
+        routed_experts_ref_factory=make_ref,
+    )
+
+    assert response.choices[0].message.routed_experts == {"schema": "test-ref"}
+    assert len(stored) == 1
+    assert stored[0].dtype == torch.int16
+    assert stored[0].tolist() == [[[10]], [[20]], [[0]]]
+
+
+def test_attach_routed_experts_ref_rejects_multiple_choices():
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="exactly one chat choice"):
+        attach_routed_experts_to_chat_response_choices(
+            response,
+            SimpleNamespace(outputs=[]),
+            device=torch.device("cpu"),
+            routed_experts_ref_factory=lambda routed_experts: {},
+        )

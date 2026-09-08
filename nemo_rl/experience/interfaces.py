@@ -22,6 +22,8 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 # This is distinct from the private _rowidx ordering key even though both are
 # assigned the same value when a single prompt's K rollout rows are expanded.
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# Opaque async-RL target version forwarded through Gym to the generation backend.
+NEMO_GYM_TARGET_WEIGHT_VERSION_KEY = "_ng_target_weight_version"
 # Zero-based retry attempt for a NeMo-Gym row. The initial attempt is 0.
 NEMO_GYM_ATTEMPT_INDEX_KEY = "_ng_attempt_index"
 # RL-local marker for a successful Gym response with no output items. Such rows
