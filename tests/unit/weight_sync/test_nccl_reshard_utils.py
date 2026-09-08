@@ -153,7 +153,6 @@ def test_check_nccl_reshard_refit_support_accepts_native_mxfp8_pair() -> None:
 )
 def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
     fp8_recipe: str | None,
-    match: str,
 ) -> None:
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
@@ -163,7 +162,7 @@ def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
         "fp8_recipe": fp8_recipe,
     }
 
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match="fp8_recipe must be 'blockwise'"):
         check_nccl_reshard_refit_support(config)
 
 
