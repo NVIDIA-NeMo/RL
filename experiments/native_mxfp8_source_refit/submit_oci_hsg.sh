@@ -13,6 +13,7 @@ NATIVE_REFIT_AUDIT="${NATIVE_REFIT_AUDIT:-0}"
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
 PARTITION=${PARTITION:-batch}
+SLURM_QOS=${SLURM_QOS:-}
 USE_GRES=${USE_GRES:-1}
 LOCAL_SCRATCH=${LOCAL_SCRATCH:-/raid/scratch/${USER}}
 SLURM_HELPER_CANDIDATE_DIRS=${SLURM_HELPER_CANDIDATE_DIRS:-/usr/local/bin:/usr/bin:/bin}
@@ -372,9 +373,15 @@ if [[ "${USE_GRES}" == 1 ]]; then
   SBATCH_GPU_ARGS=(--gres=gpu:4)
 fi
 
+SBATCH_QOS_ARGS=()
+if [[ -n "${SLURM_QOS}" ]]; then
+  SBATCH_QOS_ARGS=(--qos="${SLURM_QOS}")
+fi
+
 SBATCH_ARGS=(
   --nodes="${NUM_NODES}"
   "${SBATCH_GPU_ARGS[@]}"
+  "${SBATCH_QOS_ARGS[@]}"
   --exclusive
   --account="${SLURM_ACCOUNT}"
   --partition="${PARTITION}"
