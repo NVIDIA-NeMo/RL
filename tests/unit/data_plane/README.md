@@ -107,10 +107,11 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_local_node_ip_returns_empty_on_exception` — DNS exception → returns empty string (no crash).
 - `test_mc_tcp_bind_address_overwrites_existing` — TQDataPlaneClient `__init__` uses direct assignment (not `setdefault`).
 
-## `test_mooncake_gdr.py` (3 tests)
+## `test_mooncake_gdr.py` (4 tests)
 
 - `test_init_tq_forwards_nested_gdr_config_and_keeps_rdma` — Nested GDR settings reach TransferQueue without changing #2935's RDMA/all-rail transport.
 - `test_cpu_only_client_may_attach_with_gdr_config` — A CPU-only producer may attach because GDR eligibility is client-local.
+- `test_gdr_tensor_put_is_confirmed_once_and_never_falls_back` — A CUDA client's tensor PUT raises rather than downgrading to CPU RDMA, and logs the GDR confirmation exactly once.
 - `test_gdr_receiver_requires_cuda_initialized` — A policy receiver must initialize CUDA before attaching its GDR client.
 
 ## `test_message_log_decompose.py` (11 tests)
