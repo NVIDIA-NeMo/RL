@@ -23,7 +23,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
 from functools import wraps
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar, cast
 
 import torch
 from megatron.bridge import AutoBridge
@@ -321,6 +321,64 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
         )
 
 
+def _force_sync_model_from_optimizer_fp32(optimizer):
+    """Restore BF16 compute weights from loaded HybridDeviceOptimizer masters.
+
+    On a full checkpoint resume, ``HybridDeviceOptimizer.load_state_dict`` restores
+    its FP32 master parameters, but the BF16 parameter shards used by the first
+    forward can still contain the pre-load values. The first optimizer step copies
+    the masters back and masks the problem from subsequent steps, producing a
+    one-step loss/reward discontinuity exactly at the resume boundary.
+
+    Copy each loaded FP32 working parameter back to its BF16 shard and then force a
+    synchronous DP parameter all-gather before any reference-policy or training
+    forward. This is the inverse of ``_force_sync_optimizer_fp32_from_model`` and
+    is only called for a genuine optimizer-state resume.
+    """
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    def _sync_distrib_opt(distrib_opt):
+        try:
+            from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+                HybridDeviceOptimizer,
+            )
+        except ImportError:
+            return False
+        if not isinstance(
+            getattr(distrib_opt, "optimizer", None), HybridDeviceOptimizer
+        ):
+            return False
+
+        hdo = distrib_opt.optimizer
+        param_to_fp32_param = getattr(hdo, "param_to_fp32_param", None)
+        if not param_to_fp32_param:
+            return False
+
+        # HybridDeviceOptimizer's post-load hook has already populated these
+        # FP32 working parameters from the checkpoint's master_param entries.
+        for model_param, fp32_param in param_to_fp32_param.items():
+            model_param.data.copy_(fp32_param.data)
+
+        # The copied parameters are local distributed-optimizer shards. Rebuild
+        # full BF16 compute parameters before the first forward after resume.
+        for model_chunk in getattr(distrib_opt, "model_chunks", []):
+            model_chunk.start_param_sync(force_sync=True)
+        return True
+
+    applied = False
+    if hasattr(optimizer, "chained_optimizers"):
+        for sub_opt in optimizer.chained_optimizers:
+            applied |= _sync_distrib_opt(sub_opt)
+    else:
+        applied = _sync_distrib_opt(optimizer)
+
+    if applied and rank == 0:
+        print(
+            "WORKAROUND: force-synced BF16 model params from loaded optimizer "
+            "FP32 masters (HybridDeviceOptimizer)"
+        )
+
+
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
@@ -341,6 +399,9 @@ from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
+from nemo_rl.models.megatron.hybridep import (
+    configure_hybridep_packed_input_padding,
+)
 from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
@@ -355,6 +416,42 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+_OPTIMIZER_DTYPE_KEYS = (
+    "params_dtype",
+    "main_grads_dtype",
+    "main_params_dtype",
+    "exp_avg_dtype",
+    "exp_avg_sq_dtype",
+)
+
+
+def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Resolve optimizer dtype strings, including TE's uint8-backed FP8 moments."""
+    resolved = dict(optimizer_cfg)
+    dtype_aliases = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp8": torch.uint8,
+        "uint8": torch.uint8,
+    }
+    for key in _OPTIMIZER_DTYPE_KEYS:
+        value = resolved.get(key)
+        if isinstance(value, str):
+            normalized = value.lower().removeprefix("torch.")
+            try:
+                resolved[key] = dtype_aliases[normalized]
+            except KeyError as e:
+                raise ValueError(
+                    f"Unsupported optimizer dtype {value!r} for {key}. "
+                    "Supported Transformer Engine FusedAdam dtype aliases: "
+                    f"{', '.join(dtype_aliases)}"
+                ) from e
+    return resolved
 
 
 def destroy_parallel_state():
@@ -689,6 +786,17 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
 
+def validate_megatron_config(megatron_cfg: Any, config: Mapping[str, Any]) -> None:
+    """Validate Bridge config, then preserve explicit NeMo-RL prepadding."""
+    megatron_cfg.validate()
+
+    if config["megatron_cfg"].get("moe_hybridep_prepad_packed_inputs"):
+        # Bridge 5ed9799 does not auto-enable per-layer padding because NeMo-RL
+        # supplies no Bridge dataset. Keep the opt-in authoritative if that gate
+        # changes or another config provider enables the field.
+        megatron_cfg.model.moe_hybridep_pad_uneven_dispatch_inputs = False
+
+
 def setup_model_config(
     config: PolicyConfig,
     rank,
@@ -793,6 +901,9 @@ def setup_model_config(
 
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
+
+    # Apply optional multimodal provider settings
+    _apply_multimodal_config(model_cfg, config)
 
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
@@ -1010,6 +1121,27 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         )
 
 
+def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
+    """Map legacy Omni freeze controls onto canonical provider attributes."""
+    field_mapping = {
+        "freeze_vision_encoder": "freeze_vision_model",
+        "freeze_vision_projector": "freeze_vision_projection",
+        "freeze_audio_encoder": "freeze_sound_encoder",
+        "freeze_audio_projector": "freeze_sound_projection",
+        "radio_force_cpe_eval_mode": "radio_force_cpe_eval_mode",
+    }
+    megatron_cfg = cast(dict[str, Any], config["megatron_cfg"])
+    for config_key, provider_attr in field_mapping.items():
+        if config_key not in megatron_cfg:
+            continue
+        if not hasattr(model_cfg, provider_attr):
+            raise ValueError(
+                f"policy.megatron_cfg.{config_key} is only supported by a "
+                f"multimodal provider exposing {provider_attr!r}."
+            )
+        setattr(model_cfg, provider_attr, megatron_cfg[config_key])
+
+
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
     model_cfg.expert_tensor_parallel_size = config["megatron_cfg"][
@@ -1100,6 +1232,8 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.moe_flex_dispatcher_backend = config["megatron_cfg"][
             "moe_flex_dispatcher_backend"
         ]
+    configure_hybridep_packed_input_padding(model_cfg, config)
+
     if "moe_hybridep_num_sms" in config["megatron_cfg"]:
         num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
         if hasattr(TransformerConfig, "moe_flex_dispatcher_num_sms"):
@@ -1390,6 +1524,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.fp8 = fp8_cfg["fp8"]
             model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
             model_cfg.fp8_param = fp8_cfg["fp8_param"]
+            model_cfg.fp8_quantizer_factory = fp8_cfg.get("fp8_quantizer_factory")
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
@@ -1597,7 +1732,7 @@ def _create_megatron_config(
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
-        **config["megatron_cfg"]["optimizer"],
+        **_resolve_optimizer_dtype_kwargs(config["megatron_cfg"]["optimizer"]),
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
@@ -2172,8 +2307,11 @@ def setup_model_and_optimizer(
         # through BF16 and lose precision, so we must skip the sync there.
         # state.cfg is megatron_cfg (set above), so this reads the value the
         # bridge may have just mutated during load_checkpoint.
-        if optimizer is not None and megatron_cfg.checkpoint.finetune:
-            _force_sync_optimizer_fp32_from_model(optimizer, model)
+        if optimizer is not None:
+            if megatron_cfg.checkpoint.finetune:
+                _force_sync_optimizer_fp32_from_model(optimizer, model)
+            elif resume_checkpoint_exists:
+                _force_sync_model_from_optimizer_fp32(optimizer)
     torch.distributed.barrier()
 
     draft_model = get_attached_draft_model(model)

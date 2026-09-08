@@ -244,6 +244,9 @@ policy:
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
+    # For HybridEP sequence packing with PP=1 and MTP disabled, set true to align
+    # uneven rank-local inputs before forward and avoid collective-order hangs.
+    moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
@@ -426,6 +429,8 @@ policy:
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+      refit_with_reload_api: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP

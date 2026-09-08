@@ -27,6 +27,8 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,12 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
+    """Command each Ray actor launches under, one entry per uv extra combination.
+
+    Every uv command below is rewritten to SYSTEM when NEMO_RL_PY_EXECUTABLES_SYSTEM
+    is set to 1, so callers never apply that check themselves.
+    """
+
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
@@ -73,11 +81,41 @@ class PY_EXECUTABLES:
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
+    # Default env for the vLLM generation workers (see
+    # ray_actor_environment_registry.py). It carries nemo_gym so the worker can
+    # host Gym's token capture (token_capture.enabled) without swapping the
+    # worker's env at runtime: worker venvs are cached by actor class name, so
+    # a venv prebuilt with plain `--extra vllm` would be reused as-is and the
+    # nemo_gym import would fail.
+    VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
+
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and TRT-LLM.
     TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and ModelOpt.
+    MODELOPT_VLLM = (
+        f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+    )
+    MODELOPT_AUTOMODEL = (
+        f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+    )
+    MODELOPT_MCORE = (
+        f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+    )
+
+    @classmethod
+    def _resolve_system_overrides(cls) -> None:
+        """Rewrite every uv command constant to the system executable when the flag is set."""
+        if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") != "1":
+            return
+        for name in [n for n in vars(cls) if n.isupper()]:
+            setattr(cls, name, cls.SYSTEM)
+
+
+PY_EXECUTABLES._resolve_system_overrides()
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
@@ -314,7 +352,11 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
             os.environ.pop(_k, None)
 
-    env_vars = dict(os.environ)
+    # Ray actors deserialize constructor arguments before importing NeMo-RL.
+    # Put Hugging Face's generated ``transformers_modules`` package on the
+    # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
+    # that boundary. This covers both V1 worker groups and direct V2/SC actors.
+    env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
 
     runtime_env = {

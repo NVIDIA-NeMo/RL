@@ -174,6 +174,12 @@ logger:
 data_plane:
   enabled: true
 
+# Ledger-authoritative token capture via NeMo-Gym. Off by default; the
+# single-controller recovery options require it.
+token_capture:
+  enabled: false
+  staging_partition: rollout_staging
+
 cluster:
   # Master ports inherit the shared 1400-1999 band from grpo_math_1B.yaml.
   gpus_per_node: 2
