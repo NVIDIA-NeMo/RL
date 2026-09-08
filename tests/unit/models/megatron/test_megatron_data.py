@@ -82,6 +82,7 @@ class TestProcessedMicrobatchDataclass:
         assert microbatch.packed_sequence_metadata is None
 
 
+@pytest.mark.mcore
 def test_build_packed_sequence_metadata_preserves_cpu_boundaries():
     """Packed CPU metadata mirrors individual and bin-level padding."""
     from nemo_rl.models.megatron.data import _build_packed_sequence_metadata
@@ -97,6 +98,7 @@ def test_build_packed_sequence_metadata_preserves_cpu_boundaries():
     assert metadata.cu_seqlens_padded == (0, 8, 24, 32)
 
 
+@pytest.mark.mcore
 def test_build_vlm_packed_sequence_metadata_uses_padded_boundaries():
     """Self-packing VLM metadata matches its padded PackedSeqParams layout."""
     from nemo_rl.models.megatron.data import _build_packed_sequence_metadata
