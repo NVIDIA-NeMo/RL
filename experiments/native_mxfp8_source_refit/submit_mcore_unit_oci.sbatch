@@ -22,11 +22,16 @@ test "$(git -C "${MCORE_DIR}" rev-parse HEAD)" = "${MCORE_FIX_SHA}"
 
 "${SRUN_BIN}" --ntasks=1 \
   --container-image="${CONTAINER}" \
+  --container-remap-root \
+  --no-container-mount-home \
   --container-mounts="/home:/home,/lustre:/lustre,/raid/scratch:/raid/scratch" \
   bash -lc "
     set -euo pipefail
     cd ${MCORE_DIR}
-    export PYTHONPATH=${MCORE_DIR}
+    UNIT_DEPS=/raid/scratch/${USER}/mcore-unit-deps/${MCORE_FIX_SHA}
+    mkdir -p \"\${UNIT_DEPS}\"
+    uv pip install --target \"\${UNIT_DEPS}\" typing_extensions pytest
+    export PYTHONPATH=\${UNIT_DEPS}:${MCORE_DIR}
     /opt/nemo_rl_venv/bin/python - <<'PY'
 import torch
 
