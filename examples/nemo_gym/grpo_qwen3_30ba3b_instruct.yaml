@@ -79,7 +79,7 @@ policy:
       num_speculative_tokens: 0
       logprobs_mode: processed_logprobs
       refit_backend: "nccl"
-      offload_policy_before_refit: true
+      offload_policy_before_refit: false
       parsers: []
       expose_http_server: false
 

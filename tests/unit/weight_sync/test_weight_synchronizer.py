@@ -703,7 +703,7 @@ class TestNcclReshardWeightSynchronizer:
 
 def _mock_megatron_generation(
     refit_backend: str = "nccl",
-    offload_policy_before_refit: bool = True,
+    offload_policy_before_refit: bool = False,
     **overrides,
 ):
     gen = _mock_generation(**overrides)
@@ -771,7 +771,7 @@ class TestMegatronWeightSynchronizer:
 
         assert sync.sync_weights() == {}
         gen.suspend_for_refit.assert_called_once()
-        policy.offload_before_refit.assert_called_once()
+        policy.offload_before_refit.assert_not_called()
         policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
         gen.update_weights_from_collective.assert_called_once()
         gen.resume_after_refit.assert_called_once()

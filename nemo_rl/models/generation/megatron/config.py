@@ -58,7 +58,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     # Move training gradients and optimizer state to CPU around a non-colocated
     # refit when extra GPU headroom is needed for transfer staging. The
-    # recommended default is True.
+    # recommended default is False.
     offload_policy_before_refit: bool
     num_speculative_tokens: int
 

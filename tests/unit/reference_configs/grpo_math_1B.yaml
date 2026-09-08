@@ -404,7 +404,7 @@ policy:
       num_speculative_tokens: 0
       logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
       refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl"
-      offload_policy_before_refit: true  # Move training gradients and optimizer state to CPU around a non-colocated Megatron refit. Disable only when there is sufficient GPU memory for refit staging.
+      offload_policy_before_refit: false  # Keep policy state on GPU by default. Enable when a non-colocated Megatron refit needs additional GPU headroom for transfer staging.
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
     vllm_cfg:
