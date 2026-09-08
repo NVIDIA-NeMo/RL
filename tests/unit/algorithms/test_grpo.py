@@ -131,8 +131,18 @@ def test_setup_rejects_fused_linear_logprobs_with_unsupported_sampling(
     }
     master_config.policy["sequence_packing"] = {"enabled": False}
     master_config.policy["generation"].update(sampling_config)
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.data.update({"shuffle": False, "num_workers": 0})
 
-    with pytest.raises(AssertionError, match=error):
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger"),
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as checkpointer_cls,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        pytest.raises(AssertionError, match=error),
+    ):
+        checkpointer_cls.return_value.get_latest_checkpoint_path.return_value = None
+        checkpointer_cls.return_value.load_training_info.return_value = {}
         setup(master_config, MagicMock(), MagicMock(), None)
 
 

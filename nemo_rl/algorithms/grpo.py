@@ -591,38 +591,6 @@ def setup(
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
 
-    # Fused linear logprobs compute next-token logprobs directly from hidden states
-    # and therefore cannot apply sampling transforms to materialized logits.
-    megatron_cfg = policy_config.get("megatron_cfg", {})
-    use_fused_linear_logprobs = bool(
-        megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
-    )
-    if use_fused_linear_logprobs:
-        assert not policy_config["sequence_packing"]["enabled"], (
-            "Linear CE fusion loss is not supported with sequence packing for GRPO. "
-            "The fused path has not been validated with cu_seqlens-based logprob "
-            "aggregation. Set policy.megatron_cfg.use_fused_linear_logprobs=false "
-            "or policy.sequence_packing.enabled=false."
-        )
-        sampling_params = TrainingSamplingParams(
-            top_k=generation_config["top_k"],
-            top_p=generation_config["top_p"],
-            temperature=generation_config["temperature"],
-        )
-        assert sampling_params.temperature == 1.0, (
-            "Linear CE fusion loss is not supported with non-unit training-time "
-            "temperature for GRPO. The fused path computes logprobs before "
-            "temperature scaling. Set policy.megatron_cfg.use_fused_linear_logprobs=false, "
-            "or set policy.generation.temperature to 1.0 (or 0.0 for greedy generation)."
-        )
-        assert not need_top_k_or_top_p_filtering(sampling_params), (
-            "Linear CE fusion loss is not supported with top-k/top-p training-time "
-            "filtering for GRPO. The fused path computes logprobs from unfiltered "
-            "logits. Set policy.megatron_cfg.use_fused_linear_logprobs=false, or "
-            "disable filtering (policy.generation.top_k=null, "
-            "policy.generation.top_p=1.0)."
-        )
-
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
     val_sampling_overridden = (
@@ -776,6 +744,50 @@ def setup(
     # ==========================
     #        Loss Function
     # ==========================
+    # Fused linear logprobs compute next-token logprobs directly from hidden states
+    # (chunked over the sequence) and never materialize the full
+    # [batch, seq_len, vocab_size] logit tensor, which significantly reduces peak
+    # memory. It is only available on the Megatron backend.
+    # Both megatron_cfg and use_fused_linear_logprobs are NotRequired, and many
+    # configs (e.g. nemo_gym, modelopt, non-megatron) omit them -- use .get() with
+    # a {} fallback to avoid a KeyError.
+    megatron_cfg = policy_config.get("megatron_cfg", {})
+    use_fused_linear_logprobs = bool(
+        megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
+    )
+    if use_fused_linear_logprobs:
+        # Sequence packing is not yet validated with the fused path: the fused
+        # forward rolls labels over the whole (packed) sequence and would mix
+        # tokens across packed-sequence boundaries.
+        assert not policy_config["sequence_packing"]["enabled"], (
+            "Linear CE fusion loss is not supported with sequence packing for GRPO. "
+            "The fused path has not been validated with cu_seqlens-based logprob "
+            "aggregation. Set policy.megatron_cfg.use_fused_linear_logprobs=false "
+            "or policy.sequence_packing.enabled=false."
+        )
+        sampling_params = TrainingSamplingParams(
+            top_k=generation_config["top_k"],
+            top_p=generation_config["top_p"],
+            temperature=generation_config["temperature"],
+        )
+        assert sampling_params.temperature == 1.0, (
+            "Linear CE fusion loss is not supported with non-unit training-time "
+            "temperature for GRPO. The fused path computes logprobs before "
+            "temperature scaling. Set policy.megatron_cfg.use_fused_linear_logprobs=false, "
+            "or set policy.generation.temperature to 1.0 (or 0.0 for greedy generation)."
+        )
+        # The fused forward gathers the logprob of the realized token from the raw
+        # (unfiltered) logits, so top-k/top-p training-time filtering cannot be
+        # applied. This also keeps prev/reference logprobs (computed via the fused
+        # get_logprobs path) consistent with the actor logprobs.
+        assert not need_top_k_or_top_p_filtering(sampling_params), (
+            "Linear CE fusion loss is not supported with top-k/top-p training-time "
+            "filtering for GRPO. The fused path computes logprobs from unfiltered "
+            "logits. Set policy.megatron_cfg.use_fused_linear_logprobs=false, or "
+            "disable filtering (policy.generation.top_k=null, "
+            "policy.generation.top_p=1.0)."
+        )
+
     loss_fn = ClippedPGLossFn(
         loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
     )
