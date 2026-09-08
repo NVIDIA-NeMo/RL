@@ -286,6 +286,10 @@ NeMo RL containers enforce environment reproducibility by automatically checking
 
 - The **md5sum of `pyproject.toml`**
 - The **md5sum of `uv.lock`**
+- The **md5sum of `nemo_rl/distributed/actor_environments.py`** (the actor → uv extras
+  table). Worker virtual environments are reused rather than rebuilt, and nothing prunes
+  them, so changing an actor's extras has to invalidate the fingerprint the same way a
+  dependency change does.
 - The **commit hashes of relevant submodules**
 
 If any of these values differ between your code and the container image, NeMo RL will alert you and show exactly what has changed:
@@ -304,6 +308,9 @@ Differences found:
   - uv.lock:
       Container: 0987f6543210
       Current:   1234abcd5678
+  - nemo_rl/distributed/actor_environments.py:
+      Container: 2b3c4d5e6f70
+      Current:   9a8b7c6d5e4f
   - submodules/3rdparty/ExampleSubmodule:
       Container: a1b2c3d4e5f6
       Current:   f6e5d4c3b2a1
