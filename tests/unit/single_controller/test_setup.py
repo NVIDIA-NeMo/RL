@@ -56,6 +56,10 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.algorithms.single_controller_utils.config import (
+    validate_single_controller_config,
+)
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollouts import EffortLevelsConfig
@@ -158,6 +162,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        logger={"wandb_enabled": False, "wandb": {}},
         cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
@@ -396,8 +401,11 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     assert teacher_topology is None
 
 
-def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
+def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch):
     """The inherited recipe resolves exactly as the SC entrypoint consumes it."""
+    # The parent recipe locates its fixture data below HF_HOME. This test only
+    # validates config resolution, so it needs a stable path, not real data.
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
     register_omegaconf_resolvers()
     repo_root = Path(__file__).resolve().parents[3]
     recipe = repo_root / (
@@ -408,6 +416,7 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
 
     assert isinstance(resolved, dict)
     config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
     assert config.grpo.async_grpo is None
     assert config.grpo.adv_estimator.name == "opd"
     assert config.grpo.skip_reference_policy_logprobs_calculation is True
@@ -426,6 +435,24 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
         config.on_policy_distillation.teacher_model_by_agent_name["default_teacher"]
         == config.policy["model_name"]
     )
+
+
+def test_single_controller_ppo_recipe_inherits_overlong_filtering():
+    """The SC nightly exercises the overlong filtering inherited from its parent."""
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-"
+        "noncolocated-async-single-controller.yaml"
+    )
+    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
+    assert config.ppo is not None
+    assert config.ppo.overlong_filtering is True
 
 
 @pytest.mark.parametrize(
@@ -485,6 +512,21 @@ class TestSetup:
         )
 
         with pytest.raises(ValueError, match="reward_penalties.token_ids.unwanted"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_token_capture_rejects_message_level_advantage_penalties(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.grpo.invalid_tool_call_advantage = -5.0
+
+        with pytest.raises(
+            NotImplementedError, match="token-capture finalizer does not emit"
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         patched_factories["setup_response_data"].assert_not_called()
@@ -764,6 +806,11 @@ class TestSetup:
             ),
             ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
+            (
+                "deferred_routes_without_capture",
+                ValueError,
+                "defer_routed_experts_to_policy requires",
+            ),
         ],
     )
     def test_invalid_config_fails_before_setup_factories(
@@ -783,6 +830,9 @@ class TestSetup:
         elif invalid_case == "buffer_capacity":
             mc = _make_master_config()
             mc.async_rl.max_buffered_rollouts = 7
+        elif invalid_case == "deferred_routes_without_capture":
+            mc = _make_master_config()
+            mc.token_capture.defer_routed_experts_to_policy = True
         elif invalid_case == "megatron_dtensor_trainer":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
@@ -899,6 +949,7 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
+        assert actor_args.finalizer_actors == []
         actor_args.dp_client.register_partition.assert_called_once()
         warmup = actor_args.dp_client.register_partition.call_args.kwargs
         assert warmup["partition_id"] == "rollout_data"
@@ -963,6 +1014,29 @@ class TestSetup:
         )
 
     @pytest.mark.parametrize(
+        ("wandb_enabled", "table_flag", "expected"),
+        [(False, True, False), (True, False, False), (True, True, True)],
+    )
+    def test_full_result_table_gate_reaches_the_rollout_manager(
+        self,
+        wandb_enabled: bool,
+        table_flag: bool,
+        expected: bool,
+        patched_factories,
+    ):
+        mc = _make_master_config()
+        mc.logger = {
+            "wandb_enabled": wandb_enabled,
+            "wandb": {"log_nemo_gym_full_result_tables": table_flag},
+        }
+
+        with patch.object(sc_setup_mod, "RolloutManager") as mock_rollout_manager:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        _, call_kwargs = mock_rollout_manager.call_args
+        assert call_kwargs["log_full_result_tables"] is expected
+
+    @pytest.mark.parametrize(
         "env",
         [
             pytest.param({}, id="no_nemo_gym_section"),
@@ -993,16 +1067,37 @@ class TestSetup:
         """setup_response_data receives master_config.env and supplies env handles."""
         math_env_cfg = {"some": "value"}
         mc = _make_master_config(env={"math": math_env_cfg})
+        tokenizer = MagicMock(pad_token_id=0)
 
-        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        actor_args, _ = setup_single_controller(mc, tokenizer)
 
-        _, call_kwargs = patched_factories["setup_response_data"].call_args
+        call_args, call_kwargs = patched_factories["setup_response_data"].call_args
+        assert call_args[0] is tokenizer
         assert call_kwargs["env_configs"] == {"math": math_env_cfg}
+        assert call_kwargs["is_vlm"] is False
         assert actor_args.env_handles is patched_factories["env_handles"]
+
+    def test_vlm_processor_used_for_data_and_environment_setup(self, patched_factories):
+        mc = _make_master_config(env={"clevr-cogent": {"some": "value"}})
+        tokenizer = MagicMock(pad_token_id=0)
+        processor = MagicMock(tokenizer=tokenizer)
+        processor.model_input_names = ["input_ids", "pixel_values", "image_grid_thw"]
+
+        actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
+
+        call_args, call_kwargs = patched_factories["setup_response_data"].call_args
+        assert call_args[0] is processor
+        assert call_kwargs["env_configs"] == {"clevr-cogent": {"some": "value"}}
+        assert call_kwargs["is_vlm"] is True
+        warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
+            "fields"
+        ]
+        assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
     def test_weight_sync_factory_args(self, patched_factories):
         """create_weight_synchronizer receives policy / generation / topology."""
         mc = _make_master_config(colocated=False, backend="vllm")
+        mc.async_rl.generation_fleet_health.refit_timeout_s = 42.0
         tokenizer = MagicMock(pad_token_id=0)
 
         setup_single_controller(mc, tokenizer)
@@ -1012,6 +1107,11 @@ class TestSetup:
         assert factory_kwargs["generation"] is patched_factories["fake_gen"]
         assert factory_kwargs["generation_backend"] == "vllm"
         assert factory_kwargs["colocated"] is False
+        assert factory_kwargs["refit_timeout_s"] == 42.0
+        assert (
+            patched_factories["fake_gen"].weight_synchronizer
+            is patched_factories["create_weight_synchronizer"].return_value
+        )
 
     def test_custom_partition_id(self, patched_factories):
         mc = _make_master_config()
@@ -1115,8 +1215,13 @@ class TestSetup:
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
             tokenizer = MagicMock(pad_token_id=0)
-            actor_args, _ = setup_single_controller(mc, tokenizer)
+            processor = MagicMock(tokenizer=tokenizer)
+            actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
 
+        data_args, data_kwargs = patched_factories["setup_response_data"].call_args
+        assert data_args[0] is processor
+        assert data_kwargs["env_configs"] is None
+        assert data_kwargs["is_vlm"] is True
         mock_spinup.assert_called_once_with(
             env_configs=mc.env,
             base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
@@ -1125,10 +1230,65 @@ class TestSetup:
             # run_rollouts call.
             tokenizer=tokenizer,
             enable_router_replay=False,
-            routed_experts_dtype="int16",
             use_fastokens=False,
+            token_capture=None,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+        warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
+            "fields"
+        ]
+        assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
+
+    def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        # Extend, don't replace: setup_single_controller also indexes the
+        # wandb keys that _make_master_config populates.
+        mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
+        mc.token_capture.enabled = True
+        mc.token_capture.num_reassembler_workers = 3
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+        fake_actors = [MagicMock(name=f"finalizer_{index}") for index in range(3)]
+        tokenizer = MagicMock(pad_token_id=9)
+        processor = MagicMock(tokenizer=tokenizer)
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=fake_actors,
+            ) as mock_create_finalizer_actors,
+        ):
+            actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
+
+        (actor_dp_config, actor_config), actor_kwargs = (
+            mock_create_finalizer_actors.call_args
+        )
+        assert actor_dp_config == mc.data_plane
+        assert actor_config.partition_id == "rollout_data"
+        assert actor_config.staging_partition == mc.token_capture.staging_partition
+        assert actor_config.pad_token_id == 9
+        assert actor_kwargs == {"num_workers": 3}
+        assert actor_args.finalizer_actors == fake_actors
+        assert not hasattr(actor_args.rollout_manager, "_finalizer")
+        partition_calls = actor_args.dp_client.register_partition.call_args_list
+        assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
+        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(partition_calls[1].kwargs["fields"])
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""
@@ -1461,13 +1621,15 @@ class TestSetup:
         mock_megatron.return_value.finish_generation.assert_called_once_with()
         if gym:
             # Gym spins up on the reserved URL, before the served-address
-            # cross-check — so the mismatch leg sees it too.
+            # cross-check — so the mismatch leg sees it too. The initial refit
+            # must happen during that wait because it starts Megatron's server.
             _, spinup_kwargs = mock_spinup.call_args
             assert spinup_kwargs["base_urls"] == [reserved_url]
             # The initial refit ran in setup, against the collective brought up
             # there; the served-address check reads the URLs it populated.
             weight_sync.init_communicator.assert_called_once_with()
             weight_sync.sync_weights.assert_called_once_with()
+            assert mock_megatron.return_value.weight_synchronizer is weight_sync
         else:
             mock_spinup.assert_not_called()
             # Native: the actor's startup sync performs the initial refit.

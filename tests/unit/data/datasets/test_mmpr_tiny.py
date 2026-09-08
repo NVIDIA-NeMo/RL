@@ -307,7 +307,7 @@ class TestVLMProcessorMMPRTiny:
             torch.tensor([[224, 224], [224, 224], [224, 224]]),
         )
         assert torch.equal(
-            user_message["num_frames"].as_tensor(), torch.ones(3, dtype=torch.long)
+            user_message["num_frames"].as_tensor(), torch.ones(3, dtype=torch.int32)
         )
 
     def test_prompted_text_contains_boxed_literal_and_no_raw_dataset_string(
