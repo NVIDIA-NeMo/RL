@@ -74,6 +74,7 @@ def make_sglang_cfg(
 ):
     return {
         "sglang_cfg": {
+            "use_fault_tolerance": False,
             "model_path": model_path,
             "random_seed": 42,
             "tp_size": tp_size,

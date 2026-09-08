@@ -37,12 +37,15 @@ policy:
         num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
       sglang_router_config:
         use_external_router: false
-      # Fault tolerance (RolloutHealthMonitor). Off by default; when enabled,
-      # a daemon thread health-checks each engine and restarts hung/dead actors.
+      # Fault tolerance: probe serving health during generation and check engine
+      # liveness before refit, restarting hung/dead engines at that refit.
       use_fault_tolerance: false
       rollout_health_check_interval: 60
       rollout_health_check_timeout: 60
       rollout_health_check_first_wait: 60
+      # Nonnegative restart limit per logical engine over the run's lifetime.
+      # Abort when exhausted; 0 disables restarts.
+      rollout_max_restart_attempts: 3
     colocated:
       enabled: true
 
