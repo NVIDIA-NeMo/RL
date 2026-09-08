@@ -92,10 +92,17 @@ def build_config(
     return config
 
 
-# Request fields NeMo-Gym sends for vLLM that TRT-LLM's ChatCompletionRequest
+# Request fields clients send for vLLM that TRT-LLM's ChatCompletionRequest
 # does not declare. Its models are extra="forbid", so leaving them in means a
-# 422 on every request.
-_GYM_ONLY_REQUEST_FIELDS = ("return_tokens_as_token_ids", "return_token_ids")
+# 422/400 on every request. `required_prefix_token_ids` is the vLLM server's
+# prefix-override extension (used by the MLPerf warmup); the TRT-LLM engine
+# adapter derives the on-policy prefix from the assistant messages instead and
+# ignores the top-level field, so dropping it here keeps both paths identical.
+_GYM_ONLY_REQUEST_FIELDS = (
+    "return_tokens_as_token_ids",
+    "return_token_ids",
+    "required_prefix_token_ids",
+)
 
 # Prefix vLLM uses when asked to report tokens as ids, which NeMo-Gym parses.
 _TOKEN_ID_PREFIX = "token_id:"
