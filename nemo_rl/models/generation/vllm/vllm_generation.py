@@ -619,7 +619,17 @@ class VllmGeneration(GenerationInterface):
                 "Previous snapshot will be overwritten.",
                 RuntimeWarning,
             )
-        self._step_metrics_snapshot = self._get_raw_spec_counters()
+        # Guarded for the same reason get_step_metrics is, against the same
+        # input: this reads the engine's whole Prometheus snapshot, whose series
+        # names and shapes move between vLLM releases, and the callers invoke it
+        # bare in the step loop. Left as None on failure so the paired
+        # get_step_metrics returns {} rather than delta-ing against a stale
+        # baseline and reporting a step's worth of counters as one step's work.
+        try:
+            self._step_metrics_snapshot = self._get_raw_spec_counters()
+        except Exception:
+            warn_once("vllm_step_metrics", "failed to snapshot vLLM step metrics")
+            self._step_metrics_snapshot = None
 
     def get_step_metrics(self) -> dict[str, float]:
         """Get the vLLM engine metrics delta since snapshot_step_metrics().

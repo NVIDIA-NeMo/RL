@@ -237,7 +237,17 @@ class SingleControllerActor:
         # this actor, so this is the process that has to open the job span. It is
         # rank 0 of 1 in its own right, which is what it reports rather than
         # inheriting a stray RANK from the driver's environment.
-        init_telemetry_worker(rank=0, world_size=1)
+        #
+        # Named explicitly for the same reason NemoGym is: this actor is built
+        # directly rather than by RayWorkerGroup, so nothing sets
+        # NRL_WORKER_GROUP for it. Without the name it reports rank 0 of 1 with
+        # no rl.worker_group, which is exactly what the launcher driver reports
+        # -- leaving every rl.sc.* span indistinguishable from the driver's.
+        init_telemetry_worker(
+            rank=0,
+            world_size=1,
+            resource_attributes={"rl.worker_group": "single_controller"},
+        )
         _telemetry = get_telemetry_handle()
         self._tracer = _telemetry.tracer if _telemetry is not None else None
 
@@ -1854,14 +1864,7 @@ class SingleControllerActor:
                     version_during_step
                 ):
                     # ---- 1. Select the rollouts to train on ----
-                    # Generation time this step failed to hide behind training,
-                    # so the training fleet is stalled on the buffer: the same
-                    # phase async GRPO reports as idle/buffer_starvation, named
-                    # identically here so a goodput rollup can span both paths.
-                    with (
-                        self._timer.time("exposed_generation"),
-                        efficiency_span("idle/buffer_starvation", tracer=self._tracer),
-                    ):
+                    with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
 
                         # Evict stale groups
@@ -1922,7 +1925,18 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
-                            await asyncio.sleep(0.005)
+                            # The wait only, not the selection above it. That
+                            # selection evicts stale groups, which clears their
+                            # rows through the data plane and so opens an
+                            # overhead-bucketed span; a bucketed parent over
+                            # bucketed children is counted twice by a rollup
+                            # that sums durations by bucket. Async GRPO reports
+                            # this phase under the same category name, and
+                            # wraps a bare sleep there too.
+                            with efficiency_span(
+                                "idle/buffer_starvation", tracer=self._tracer
+                            ):
+                                await asyncio.sleep(0.005)
                             continue
 
                         # Release buffer capacity
