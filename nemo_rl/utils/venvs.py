@@ -69,6 +69,17 @@ def create_local_venv(
     Returns:
         str: Path to the python executable in the created virtual environment
     """
+    # A single token that is an executable file is already an interpreter, not a
+    # command line to run under uv -- there is nothing to build.
+    parts = shlex.split(py_executable)
+    if len(parts) == 1 and os.path.isfile(parts[0]) and os.access(parts[0], os.X_OK):
+        logger.warning(
+            f"{py_executable} is an interpreter, not a uv command, so no venv was built "
+            f"for {venv_name}; using it as-is (NEMO_RL_PY_EXECUTABLES_SYSTEM=1 sets every "
+            "PY_EXECUTABLES entry to sys.executable)."
+        )
+        return py_executable
+
     # This directory is where virtual environments will be installed
     # It is local to the driver process but should be visible to all worker nodes
     # If this directory is not accessible from worker nodes (e.g., on a distributed
