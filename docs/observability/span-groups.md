@@ -500,9 +500,12 @@ transfer-queue span; it is that their count scales with the prompt count. A
 from every phase group. That is why they are reachable only from `all` or an
 explicit `per_step,per_prompt`.
 
-If 20k per rollout is more than you want but you still need the rollout view,
-enable `per_prompt` and drop `data_plane`: transfer-queue time inside a rollout
-also shows up as a gap between the `rl.sc.*` phase spans.
+If 20k per rollout is more than you want, the only lever is `per_prompt` itself
+— the two go together. Dropping `data_plane` does not thin them out: inside a
+rollout the put is gated on `per_prompt` rather than `data_plane` (see below),
+so `data_plane` governs only the batch-shaped data-plane spans. With
+`per_prompt` off, transfer-queue time inside a rollout still shows up as a gap
+between the `rl.sc.*` phase spans.
 
 ### Why the group has to come from the caller
 

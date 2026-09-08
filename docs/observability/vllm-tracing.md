@@ -42,7 +42,7 @@ vLLM traces at **request** granularity: every prompt it serves produces a span. 
 
 Treat Layer 2 as a **debugging tool you switch on for a few steps**, not as something to leave on for a training run. There is no sampling knob: vLLM builds its own `TracerProvider` and the only lever is the process-global `OTEL_TRACES_SAMPLER`, which would also thin out the `rl.*` spans in the same process.
 
-If what you want is engine behaviour in aggregate — token throughput, queue time, sequence lengths, preemptions, finish reasons — the `vllm/*` metrics are teed to OTel by default and cost one RPC per step, with no per-request spans. See [Metrics](metrics.md). Reach for Layer 2 only when an aggregate number has already told you *something* is wrong and you need per-request detail to find out what.
+If what you want is engine behaviour in aggregate — token throughput, sequence lengths, finish reasons — the `vllm/*` metrics are teed to OTel by default and cost one RPC per step, with no per-request spans. Queue time and preemptions are *not* among them: the engine exposes both, but `_KEPT_COUNTER_NAMES` does not keep them, so Layer 2 is the only way to see either today. See [Metrics](metrics.md). Reach for Layer 2 only when an aggregate number has already told you *something* is wrong and you need per-request detail to find out what.
 
 `collect_detailed_traces` is deliberately **not** set. vLLM documents it as "possibly costly and or blocking", and it adds per-request timing inside the engine, so it slows generation rather than just adding spans. Pass it through `vllm_kwargs` if you specifically want it.
 
@@ -65,5 +65,6 @@ If the installed vLLM does not support `otlp_traces_endpoint` (older versions), 
 ## Which layer do I want?
 
 - **Just want to see generation cost per rollout?** Layer 1 — enable the `generation` group. Works over any transport, including a direct-to-backend `http/protobuf` path.
-- **Want engine behaviour over a whole run (throughput, queue time, preemptions, finish reasons)?** The `vllm/*` metrics, on by default — no per-request spans, no collector needed. See [Metrics](metrics.md).
+- **Want engine behaviour over a whole run (token throughput, sequence lengths, finish reasons)?** The `vllm/*` metrics, on by default — no per-request spans, no collector needed. See [Metrics](metrics.md).
+- **Want queue time or preemptions?** Layer 2 — neither is teed as a metric today.
 - **Debugging vLLM engine internals (scheduling, batching, prefill/decode) on a specific step?** Add Layer 2 — but stand up a gRPC OTLP collector first, correlate by `nemo.run.id`, and turn it off again: it emits one span per request (see Caveat 1).
