@@ -1,0 +1,161 @@
+defaults: ../../grpo_math_1B.yaml
+# Nemotron 3.5 Super VL (NemotronH_Omni_Reasoning_V3: "Nemotron Super" hybrid
+# Mamba+Attention MoE backbone, 512 routed / 22 active experts, + RADIO vision
+# tower) DAPO-512 on the automodel (DTensor v2) backend, text-only math task.
+# Same task/algorithm settings as dapo-nanov3.5-30BA3B-4n8g-automodel.yaml;
+# parallelism follows grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.yaml.
+#
+# Requirements (see pyproject.toml):
+#   - Automodel pinned at huiyingl/nemotron-super-3.5-vision (992a9b64+), which
+#     registers NemotronH_Omni_Reasoning_V3 and the transformers-native RADIO
+#     checkpoint layout this checkpoint ships.
+#   - vLLM from the super_vl_rl_v0.25.1 fork: stock 0.25.1 does not know this
+#     architecture name.
+#
+# Notes:
+#   - The tokenizer path (no processor) is used, so the DTensor worker runs the
+#     model text-only (is_vlm=false) and vLLM never receives images. The vision
+#     tower is still constructed on both sides; skip_mm_profiling keeps vLLM from
+#     reserving encoder-cache memory for images that never arrive.
+#   - hf_config_overrides.num_nextn_predict_layers=0 drops the checkpoint's MTP
+#     head (num_nextn_predict_layers=1, mtp.* tensors) on the training side;
+#     generation speculative_config must stay unset for the same reason.
+#   - dtensor_cfg.automodel_kwargs.force_hf must NOT be set (the custom
+#     NemotronOmni implementation + state-dict adapter are required for EP and
+#     per-tensor refit).
+#   - moe_parallelizer.ignore_router_for_ac is required with activation
+#     checkpointing: bf16 router top-k is nondeterministic, and recomputed expert
+#     permutation buffers can change shape and crash backward (CheckpointError).
+#   - dtensor_cfg.expert_parallel_size must not exceed gpus_per_node: DeepEP
+#     assumes EP groups of <= 8 ranks are intranode (CUDA IPC) and fails with
+#     "invalid resource handle" when the group spans nodes (e.g. EP8 on 4-GPU
+#     GB200 nodes). On 4-GPU nodes use expert_parallel_size=4 and vLLM TP/EP=4.
+#   - Do not set dtensor_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#     here (see the dtensor_cfg comment): it breaks the IPC refit on this cluster.
+#   - Untested at scale as of 2026-09-07: only environment bring-up was
+#     validated on a single node; 8 nodes may also fit on GB200-class GPUs.
+grpo:
+  max_num_epochs: 2
+  val_at_start: true
+  use_dynamic_sampling: true
+  batch_multiplier: 3
+  overlong_filtering: true
+  use_leave_one_out_baseline: false
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: ${policy.generation.max_new_tokens}
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel
+  # 4h partition limit; steps take 15-18 min (~30 min on validation steps), so
+  # leave >= 40 min so the timeout save + exit never straddles the wall clock.
+  checkpoint_must_save_by: 00:03:20:00
+  keep_top_k: 2
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  hf_config_overrides:
+    num_nextn_predict_layers: 0
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 9216
+  make_sequence_length_divisible_by: 8
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  dtensor_cfg:
+    expert_parallel_size: 8
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+    # Deliberately NOT setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # (unlike the nanov3.5 recipe): with expandable segments PyTorch exports CUDA
+    # IPC handles as file descriptors fetched via pidfd_getfd, which fails on the
+    # oci-hsg GB200 nodes ("pidfd_getfd: Bad file descriptor") and breaks the
+    # colocated trainer -> vLLM IPC refit (all 42k keys missing). The default
+    # allocator uses legacy cudaIpcMemHandle sharing, which works there.
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: torch_fp32
+        experts: gmm
+        dispatcher: deepep
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      tensor_parallel_size: 8
+      expert_parallel_size: 8
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      # vLLM's multimodal encoder budget (NemotronH_Nano_VL_V2 processor info)
+      # needs the tokenizer at engine init even for text-only prompts; the
+      # text-only default (true) fails with "You cannot pass text prompts when
+      # skip_tokenizer_init=True".
+      skip_tokenizer_init: false
+    vllm_kwargs:
+      moe_backend: triton
+      mamba_ssm_cache_dtype: float32
+      skip_mm_profiling: true
+      mm_processor_cache_gb: 0
+      limit_mm_per_prompt:
+        image: 1
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-super-3.5
+    name: dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16

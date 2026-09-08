@@ -6,7 +6,7 @@
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
 	url = https://github.com/NVIDIA-NeMo/Automodel.git
-	branch = r0.6.0
+	branch = huiyingl/nemotron-super-3.5-vision
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
