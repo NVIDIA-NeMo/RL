@@ -38,7 +38,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
+from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
 from pydantic import BaseModel, Field
 from tensordict import TensorDict

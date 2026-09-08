@@ -460,6 +460,9 @@ Backend choice:
 
 ### Experimental Mooncake storage checkpoints
 
+The distributed format uses manifest version 3. Earlier centralized Mooncake
+checkpoint formats are not accepted by this loader; use fresh checkpoints.
+
 `mooncake_cpu.checkpoint.enabled=true` adds storage save/load support to TQ's
 existing explicit checkpoint API. It does not change the normal data path:
 ordinary PUTs remain in Mooncake memory and perform no checkpoint-related

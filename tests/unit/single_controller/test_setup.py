@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
@@ -2083,6 +2084,100 @@ class TestNativeTQRecoverySetup:
         dp_client.register_partition.assert_not_called()
         assert actor_args.last_checkpoint_path == str(checkpoint_path)
         assert actor_args.data_plane_checkpoint_metadata is None
+
+    def test_mooncake_periodic_snapshot_path_waits_for_finalizer_clients(
+        self, tmp_path, patched_factories
+    ):
+        trainer_checkpoint = tmp_path / "checkpoints" / "step_3"
+        snapshot_path = trainer_checkpoint / "rollout_snapshots" / "snapshot_000007"
+        save_state = _save_state()
+        checkpointer = MagicMock()
+        checkpointer.checkpoint_dir = tmp_path / "checkpoints"
+        checkpointer.get_latest_checkpoint_path.return_value = str(trainer_checkpoint)
+        checkpointer.load_training_info.return_value = vars(save_state)
+        checkpointer.get_resume_paths.return_value = (None, None)
+        resolved_snapshot = SimpleNamespace(
+            path=snapshot_path,
+            manifest=SimpleNamespace(current_epoch=2, sampler_dispatch_index=7),
+        )
+
+        mc = _make_master_config(colocated=False, backend="vllm")
+        mc.data_plane["backend"] = "mooncake_cpu"
+        mc.data_plane["mooncake_cpu"] = {"checkpoint": {"enabled": True}}
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 1,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.logger["log_dir"] = str(tmp_path / "logs")
+        mc.token_capture.enabled = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            restore_mode="latest",
+        )
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+
+        ready_ref = object()
+        ready_remote = MagicMock(return_value=ready_ref)
+        finalizer = SimpleNamespace(__ray_ready__=SimpleNamespace(remote=ready_remote))
+        with (
+            patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer),
+            patch.object(
+                sc_setup_mod,
+                "resolve_latest_snapshot",
+                return_value=resolved_snapshot,
+            ) as resolve_latest,
+            patch.object(sc_setup_mod, "load_dataloader_state") as load_dataloader,
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                return_value=[finalizer],
+            ),
+            patch.object(sc_setup_mod.ray, "get", return_value=[True]) as ray_get,
+        ):
+            actor_args, _ = setup_single_controller(
+                mc,
+                MagicMock(pad_token_id=0),
+            )
+
+        resolve_latest.assert_called_once_with(
+            trainer_checkpoint,
+            expected_train_step=3,
+            expected_trainer_version=3,
+            expected_bootstrap_fingerprint=None,
+        )
+        load_dataloader.assert_called_once_with(
+            patched_factories["dataloader"],
+            str(snapshot_path),
+            mc.data,
+        )
+        ready_remote.assert_called_once_with()
+        ray_get.assert_called_once_with([ready_ref])
+        patched_factories["fake_policy"].load_data_plane_checkpoint.assert_not_called()
+        actor_args.dp_client.register_partition.assert_not_called()
+        assert actor_args.last_checkpoint_path == str(snapshot_path)
+        assert actor_args.data_plane_checkpoint_metadata is None
+        assert actor_args.save_state.current_epoch == 2
+        assert actor_args.save_state.sampler_dispatch_index == 7
 
     def test_loads_authoritative_tq_checkpoint_when_metadata_file_exists(
         self, tmp_path

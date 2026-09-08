@@ -302,6 +302,7 @@ def _unregister_or_quarantine(
 
     buffer.quarantined = True
     _QUARANTINED_BUFFERS.append(buffer.payload)
+    assert last_error is not None
     raise RuntimeError(
         f"Mooncake buffer cleanup failed for {label} after "
         f"{_UNREGISTER_ATTEMPTS} attempts; the mapped buffer was retained"
@@ -378,9 +379,9 @@ def _save_object(store: Any, obj: _StoredObject, output: Any) -> str:
 
         digest = hashlib.sha256(buffer.payload).hexdigest()
         _write_buffer(output, buffer.payload, obj.size, label=obj.key)
-        return digest
     finally:
         buffer.close()
+    return digest
 
 
 def _restore_object(
@@ -587,7 +588,8 @@ def _manifest_object_from_mapping(value: Mapping[str, Any]) -> _ManifestObject:
 
 
 def _local_replica_config(manager: Any, segment_name: str) -> Any:
-    from mooncake.store import ReplicateConfig
+    # Optional native extension; it ships without Python type stubs.
+    from mooncake.store import ReplicateConfig  # type: ignore[import-not-found]
 
     source = manager.storage_client.replica_config
     config = ReplicateConfig()
@@ -733,7 +735,8 @@ class _CheckpointParticipant:
                 except zmq.ZMQError:
                     # A coordinator can time out and disconnect while the local
                     # participant is still completing checkpoint I/O. Keep the
-                    # endpoint alive so a later checkpoint can still use it.
+                    # thread alive for orderly shutdown; the coordinator treats
+                    # the uncertain checkpoint as a fatal failure, not a retry.
                     continue
         except Exception as error:
             self._error = error
@@ -896,10 +899,10 @@ def _request_participant(
                 f"{request.participant.participant_id} failed: "
                 f"{response.get('error', 'unknown error')}"
             )
-        return response
     finally:
         socket.close(linger=0)
         context.term()
+    return response
 
 
 def _fanout_requests(
@@ -1273,7 +1276,11 @@ def _validate_restore_response(
     values = request.body.get("objects")
     if not isinstance(values, list):
         raise RuntimeError("Malformed Mooncake restore request")
-    expected = [value.get("key") for value in values if isinstance(value, Mapping)]
+    expected: list[str] = []
+    for value in values:
+        if not isinstance(value, Mapping) or not isinstance(value.get("key"), str):
+            raise RuntimeError("Malformed Mooncake restore request key")
+        expected.append(value["key"])
     restored = response.get("restored_keys")
     if restored != expected:
         raise RuntimeError(

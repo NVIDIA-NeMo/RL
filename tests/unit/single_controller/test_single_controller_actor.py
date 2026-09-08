@@ -47,7 +47,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
 )
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROLLOUT_METRICS
+from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -154,6 +156,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         last_checkpoint_path=None,
         finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
+        partition_includes_multimodal_fields=False,
         bootstrap_identity=None,
     )
     args.update(overrides)
@@ -217,6 +220,32 @@ def test_fresh_mooncake_init_registers_partition(monkeypatch, tmp_path) -> None:
     dp_client.load_checkpoint.assert_not_called()
     dp_client.register_partition.assert_called_once()
     assert controller._data_plane_checkpoint_metadata is None
+
+
+def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    dp_client = MagicMock(name="dp_client")
+    master_config = _grpo_master_config(tmp_path)
+    master_config.data_plane = _data_plane_config("mooncake_cpu")
+    master_config.token_capture.enabled = True
+    actor_args = _actor_args_for_init(
+        dp_client=dp_client,
+        partition_includes_multimodal_fields=True,
+    )
+
+    _init_controller(master_config, actor_args)
+
+    assert dp_client.register_partition.call_count == 2
+    canonical_call, staging_call = dp_client.register_partition.call_args_list
+    assert canonical_call.kwargs["partition_id"] == "rollout_data"
+    assert set(DP_TRAIN_FIELDS).issubset(canonical_call.kwargs["fields"])
+    assert set(WIRE_MULTIMODAL_FIELDS).issubset(canonical_call.kwargs["fields"])
+    assert staging_call.kwargs["partition_id"] == (
+        master_config.token_capture.staging_partition
+    )
+    assert staging_call.kwargs["fields"] == list(STAGING_FIELDS)
 
 
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:

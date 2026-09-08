@@ -168,7 +168,8 @@ def test_mooncake_checkpoint_placement_settings_reach_tq(monkeypatch) -> None:
     conf = OmegaConf.to_container(captured["conf"], resolve=True)
     mooncake = conf["backend"]["MooncakeStore"]
     assert mooncake["hard_pin"] is True
-    assert mooncake["offload"] == {"enabled": False}
+    # TQ merges its own offload defaults into the resolved backend config.
+    assert mooncake["offload"]["enabled"] is False
     assert mooncake["checkpoint"] == {"enabled": True}
 
 

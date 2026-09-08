@@ -311,10 +311,8 @@ class SingleControllerActor:
                     self._dp_client,
                     master_config=master_config,
                     partition_id=self._partition_id,
-                    include_multimodal_fields=getattr(
-                        actor_args,
-                        "partition_includes_multimodal_fields",
-                        False,
+                    include_multimodal_fields=(
+                        actor_args.partition_includes_multimodal_fields
                     ),
                 )
         else:

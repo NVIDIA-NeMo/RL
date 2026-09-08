@@ -19,6 +19,7 @@ import ctypes
 import hashlib
 import json
 import pickle
+import threading
 from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
@@ -383,6 +384,99 @@ def test_physical_keys_include_all_produced_fields_and_gdr_chunks() -> None:
         "1@metadata",
         "1@tokens",
     ]
+
+
+def test_distributed_checkpoint_round_trip_over_real_control_sockets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise real ZMQ fanout with owner-local stores and no coordinator I/O."""
+    payloads = _payloads()
+    identities = [("owner-a", "127.0.0.1:12301"), ("owner-b", "127.0.0.1:12302")]
+    owners = {
+        key: (identities[index % len(identities)][1],)
+        for index, key in enumerate(sorted(payloads))
+    }
+    cluster = _FakeCluster(payloads, owners)
+    managers = _managers(cluster, identities)
+    participants = [
+        checkpoint_plugin._CheckpointParticipant(manager) for manager in managers
+    ]
+    coordinator = _manager(_FakeStore(cluster, "127.0.0.1:12303"), "coordinator")
+
+    def unexpected_payload_io(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("checkpoint coordinator performed payload I/O")
+
+    monkeypatch.setattr(
+        coordinator.storage_client._store, "get_into", unexpected_payload_io
+    )
+    monkeypatch.setattr(
+        coordinator.storage_client._store, "upsert_from", unexpected_payload_io
+    )
+    monkeypatch.setattr(
+        checkpoint_plugin,
+        "_live_participants",
+        lambda _manager: [participant.info for participant in participants],
+    )
+    monkeypatch.setattr(
+        checkpoint_plugin,
+        "_local_replica_config",
+        lambda _manager, segment_name: SimpleNamespace(preferred_segment=segment_name),
+    )
+    try:
+        for participant in participants:
+            participant._thread = threading.Thread(target=participant._run, daemon=True)
+            participant._thread.start()
+            assert participant._ready.wait(timeout=5.0)
+            assert participant._error is None
+
+        checkpoint_dir = _checkpoint_dir(tmp_path)
+        _save_storage_checkpoint(coordinator, str(checkpoint_dir))
+
+        assert _saved_payloads(checkpoint_dir) == payloads
+        shard_owners: dict[str, set[str]] = {}
+        for entry in _manifest(checkpoint_dir)["objects"]:
+            assert entry["saved_owner"] == owners[entry["key"]][0]
+            shard_owners.setdefault(entry["shard"], set()).add(entry["saved_owner"])
+        assert len(shard_owners) == 2
+        assert all(len(endpoints) == 1 for endpoints in shard_owners.values())
+        assert sorted(cluster.get_calls) == sorted(
+            (endpoints[0], key) for key, endpoints in owners.items()
+        )
+
+        cluster.objects.clear()
+        cluster.owners.clear()
+        _load_storage_checkpoint(coordinator, str(checkpoint_dir))
+
+        assert cluster.objects == payloads
+        assert {endpoint for endpoint, _, _ in cluster.upsert_calls} == {
+            endpoint for _, endpoint in identities
+        }
+        assert all(
+            manager.storage_client._store.registered == {} for manager in managers
+        )
+    finally:
+        for participant in participants:
+            participant.close()
+
+
+def test_participant_timeout_is_fatal_to_the_checkpoint_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SC must not treat uncertain participant writes as a retryable local timeout."""
+    manager = _manager(_FakeStore(_FakeCluster({}, {}), "127.0.0.1:12301"))
+    participant = _participant(manager)
+    request = checkpoint_plugin._ParticipantRequest(
+        participant.info, checkpoint_plugin._request_body(manager, "save")
+    )
+
+    def timeout(*_args: Any, **_kwargs: Any) -> Any:
+        raise TimeoutError("participant still writing")
+
+    monkeypatch.setattr(checkpoint_plugin, "_request_participant", timeout)
+    with pytest.raises(RuntimeError, match="checkpoint fanout failed") as error:
+        checkpoint_plugin._fanout_requests([request], timeout_s=0.1)
+    assert isinstance(error.value.__cause__, TimeoutError)
 
 
 def test_live_participants_prunes_a_stale_owner_before_endpoint_deduplication(
@@ -997,6 +1091,9 @@ def test_installed_manager_dispatches_explicit_storage_save_and_load(
     manager_type = StorageManagerFactory._registry["MooncakeStore"]
     manager = object.__new__(manager_type)
     manager.config = {"checkpoint": {"enabled": True}}
+    manager.storage_manager_id = "test-manager"
+    manager.controller_handshake_socket = None
+    manager.zmq_context = SimpleNamespace(term=lambda: None)
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(
         checkpoint_plugin,
