@@ -3178,7 +3178,27 @@ class SingleControllerActor:
                     "needed to attribute the failure)."
                 ) from failure
 
-    def _promote_refit_shards(self) -> None:
+    def _refit_participants(self) -> set[int]:
+        """Shards eligible to receive this refit's weights, as of right now.
+
+        Captured at the moment membership settles rather than read at promotion time,
+        because a restart finishing mid-transfer turns its shard STALE -- which is not
+        absent -- and the communicator was already built without it.
+
+        Derived from the fleet rather than from the transport's membership so it holds for
+        backends that own no membership at all: a shard that is absent when the transfer
+        starts receives nothing either way.
+        """
+        if self._gen_fleet is None:
+            return set()
+        absent = set(self._gen_fleet.absent_shards())
+        return {
+            health.dp_shard_idx
+            for health in self._gen_fleet.snapshot()
+            if health.dp_shard_idx not in absent
+        }
+
+    def _promote_refit_shards(self, participants: set[int]) -> None:
         """Return shards holding current weights to the serving set.
 
         The exit from STALE, and the reason marking partial weights is safe rather than
@@ -3191,11 +3211,24 @@ class SingleControllerActor:
         Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but
         it is failing probes for its own reasons and promoting it here would reset the
         failure count that is supposed to condemn it.
+
+        And only STALE shards that were IN the refit. Asking "is this shard STALE?" alone
+        was correct until restart existed, because nothing could turn a shard STALE while a
+        refit was in flight. A restart can: it takes minutes, nothing blocks it, and
+        mark_loaded moves the shard DEAD -> STALE at whatever moment the reload lands. A
+        shard absent when membership settled received no weights from this transfer, so
+        promoting it would return it to service holding the checkpoint it read off disk --
+        the outcome this module's docstring exists to prevent. It stays STALE, is not
+        absent, and the next refit picks it up.
+
+        Args:
+            participants: shards eligible for this refit, from :meth:`_refit_participants`
+                at the point membership settled.
         """
         if self._gen_fleet is None:
             return
         for health in self._gen_fleet.snapshot():
-            if health.state is ShardState.STALE:
+            if health.state is ShardState.STALE and health.dp_shard_idx in participants:
                 self._gen_fleet.report_refit(
                     health.dp_shard_idx, weight_version=self._trainer_version
                 )
@@ -3639,6 +3672,11 @@ class SingleControllerActor:
         # set comparison in the common case -- it used to be a full rebuild on every call
         # once a shard was gone, because absent_shards() never empties again.
         await self._reconcile_refit_membership()
+        # Read once, here, because the answer changes underneath a refit. A restart takes
+        # minutes and nothing blocks it, so mark_loaded can turn a shard STALE mid-transfer
+        # -- and STALE is not absent, so asking again at promotion time would include a
+        # shard the communicator was deliberately built without.
+        participants = self._refit_participants()
 
         try:
             await self._sync_weights_within(kv_scales, "first")
@@ -3668,19 +3706,24 @@ class SingleControllerActor:
                 raise
             with self._recovery_window():
                 await self._recover_from_failed_refit(failure)
+                # Re-read: the recovery condemns the silent participant and rebuilds over
+                # the survivors, so the retry's membership is not the first attempt's. This
+                # is the likelier of the two windows -- the shard is restarting precisely
+                # because this refit just failed.
+                participants = self._refit_participants()
                 # Once only: a second failure is a real fault, not a membership problem,
                 # and retrying forever would recreate the wedge this exists to remove.
                 await self._sync_weights_within(kv_scales, "retry")
                 # Inside the window: this is what refills the serving set, so releasing
                 # the flag before it runs would reopen the gap it exists to close.
-                self._promote_refit_shards()
+                self._promote_refit_shards(participants)
         else:
             # A completed refit is what makes an engine's weights current, so this is
             # where a shard pulled out of service for holding partial ones earns its way
             # back. else, not a trailing statement: the recovery path above already
             # promoted inside its window, and everything below this must still run on
             # both paths.
-            self._promote_refit_shards()
+            self._promote_refit_shards(participants)
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would

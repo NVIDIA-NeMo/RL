@@ -282,7 +282,8 @@ class TestPromotionIsWiredUp:
         asyncio.run(_tick_and_settle(supervisor))
         assert monitor.state_of(1) is ShardState.STALE
 
-        self._controller(monitor)._promote_refit_shards()
+        ctrl = self._controller(monitor)
+        ctrl._promote_refit_shards(ctrl._refit_participants())
 
         assert monitor.state_of(1) is ShardState.HEALTHY
         assert 1 in monitor.serving_shards()
@@ -293,7 +294,8 @@ class TestPromotionIsWiredUp:
         supervisor = EngineSupervisor(generation=gen, monitor=monitor)
         asyncio.run(_tick_and_settle(supervisor))
 
-        self._controller(monitor, trainer_version=11)._promote_refit_shards()
+        ctrl = self._controller(monitor, trainer_version=11)
+        ctrl._promote_refit_shards(ctrl._refit_participants())
 
         assert monitor.snapshot()[0].weight_version == 11
 
@@ -304,13 +306,83 @@ class TestPromotionIsWiredUp:
         monitor.record_probe(2, ok=False, error="timeout")
         assert monitor.state_of(2) is ShardState.SUSPECT
 
-        self._controller(monitor)._promote_refit_shards()
+        ctrl = self._controller(monitor)
+        ctrl._promote_refit_shards(ctrl._refit_participants())
 
         assert monitor.state_of(2) is ShardState.SUSPECT
 
     def test_promotion_is_inert_without_fleet_health(self):
         ctrl = self._controller(None)
-        ctrl._promote_refit_shards()  # must not raise
+        ctrl._promote_refit_shards(set())  # must not raise
+
+
+class TestOnlyTheShardsThatWereRefitArePromoted:
+    """A refit may only return to service the shards it actually wrote weights to.
+
+    A restart takes minutes and nothing blocks it, so ``mark_loaded`` can turn a shard
+    STALE *during* a refit whose membership was settled while that shard was still
+    RESTARTING -- absent, and correctly left out of the communicator. Promoting on "is
+    STALE" alone then returns a shard to service holding the checkpoint it read off disk.
+
+    Before restart existed, nothing could turn a shard STALE mid-refit, so "is STALE" and
+    "was in the refit group" described the same set and no check was needed.
+    """
+
+    @staticmethod
+    def _controller(monitor, trainer_version=5):
+        from nemo_rl.algorithms.single_controller import SingleControllerActor
+
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._gen_fleet = monitor
+        ctrl._trainer_version = trainer_version
+        return ctrl
+
+    def test_a_shard_that_finished_restarting_mid_refit_stays_stale(self):
+        monitor, gen = _monitor(), _Generation()
+        _condemn(monitor, 2)
+        monitor.mark_restarting(2)
+        # Membership is settled here: shard 2 is RESTARTING, so it is absent and the
+        # communicator is built without it.
+        participants = self._controller(monitor)._refit_participants()
+        assert 2 not in participants
+
+        # The reload lands mid-transfer. Nothing blocks it.
+        supervisor = EngineSupervisor(generation=gen, monitor=monitor)
+        monitor.mark_loaded(2, base_url="http://replacement:9000/v1")
+        assert monitor.state_of(2) is ShardState.STALE
+        del supervisor
+
+        self._controller(monitor)._promote_refit_shards(participants)
+
+        assert monitor.state_of(2) is ShardState.STALE, (
+            "shard 2 received no weights from this refit and must not serve"
+        )
+        assert 2 not in monitor.serving_shards()
+
+    def test_and_the_next_refit_picks_it_up(self):
+        """STALE is not absent, so the following refit includes it and promotes it."""
+        monitor, gen = _monitor(), _Generation()
+        _condemn(monitor, 2)
+        monitor.mark_restarting(2)
+        monitor.mark_loaded(2, base_url="http://replacement:9000/v1")
+
+        participants = self._controller(monitor)._refit_participants()
+        assert 2 in participants
+        self._controller(monitor, trainer_version=9)._promote_refit_shards(participants)
+
+        assert monitor.state_of(2) is ShardState.HEALTHY
+        assert monitor.snapshot()[2].weight_version == 9
+
+    def test_the_shards_that_were_refit_are_still_promoted(self):
+        """The filter must not strand a survivor that legitimately holds partial weights."""
+        monitor, gen = _monitor(), _Generation()
+        monitor.mark_weights_partial(0)
+        assert monitor.state_of(0) is ShardState.STALE
+
+        participants = self._controller(monitor)._refit_participants()
+        self._controller(monitor)._promote_refit_shards(participants)
+
+        assert monitor.state_of(0) is ShardState.HEALTHY
 
 
 def test_every_supervised_backend_can_restart_a_shard():
@@ -329,7 +401,7 @@ def test_every_supervised_backend_can_restart_a_shard():
     import ast
     from pathlib import Path
 
-    repo_root = Path(__file__).resolve().parents[4]
+    repo_root = Path(__file__).resolve().parents[3]
     called = "restart_shard"
 
     supervisor = ast.parse(

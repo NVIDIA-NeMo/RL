@@ -28,7 +28,7 @@ import pytest
 
 from nemo_rl.models.generation import maybe_configure_engine_reaping_env
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 FLAG = "RAY_process_group_cleanup_enabled"
 
 

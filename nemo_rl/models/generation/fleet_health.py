@@ -424,6 +424,13 @@ class GenerationFleetHealth:
         # immediately, burning a restart attempt for nothing.
         shard.consecutive_probe_failures = 0
         shard.consecutive_probe_successes = 0
+        # Both belong to the engine that died. The reported streak counts requests that
+        # process failed, and state_before_partial is a verdict about how it was behaving
+        # before an abort pulled it out of service. Neither is evidence about the fresh
+        # process taking its place, and report_refit reads both -- so leaving them set
+        # brings a clean replacement back SUSPECT, one failure from being condemned again.
+        shard.consecutive_reported_failures = 0
+        shard.state_before_partial = None
         self._transition(shard, ShardState.STALE)
 
     def mark_weights_partial(self, shard_idx: int) -> None:

@@ -208,6 +208,61 @@ class TestFailedRestart:
         assert monitor.state_of(0) is ShardState.RETIRED, "retirement is terminal"
 
 
+class TestARestartedEngineHasNoHistory:
+    """A replacement process must not inherit the dead engine's record.
+
+    ``mark_loaded`` already clears the probe counters, and says why: carrying them into a
+    fresh engine would let one unlucky probe re-condemn it. The same argument covers
+    ``consecutive_reported_failures`` and ``state_before_partial``, which ``report_refit``
+    reads -- so leaving them set makes a brand-new engine come back SUSPECT at 2 of 3 on
+    the counter that condemns it.
+
+    Deterministic on the condemn-silent-participant path rather than a race:
+    ``suspected_shards()`` selects on ``state_before_partial`` being SUSPECT, so every
+    shard condemned that way carries it into DEAD.
+    """
+
+    def test_a_replacement_comes_back_healthy_with_a_clean_streak(self):
+        monitor = _monitor(shard_count=4, unhealthy_threshold=3)
+        # Two failed generations, then an aborted refit pulls it out of service, then it
+        # is condemned as the silent participant -- the exact sequence that sets both
+        # fields and then restarts the shard.
+        monitor.report_failure(1, error="generation failed")
+        monitor.report_failure(1, error="generation failed")
+        assert monitor.state_of(1) is ShardState.SUSPECT
+        monitor.mark_weights_partial(1)
+        assert 1 in monitor.suspected_shards()
+        monitor.condemn_silent_participant(1, reason="silent in refit")
+        assert monitor.state_of(1) is ShardState.DEAD
+
+        monitor.mark_restarting(1)
+        monitor.mark_loaded(1, base_url="http://replacement:9000/v1")
+        assert monitor.state_of(1) is ShardState.STALE
+
+        # The next completed refit must return a fresh engine to service outright.
+        monitor.report_refit(1, weight_version=7)
+
+        assert monitor.state_of(1) is ShardState.HEALTHY
+        snapshot = {h.dp_shard_idx: h for h in monitor.snapshot()}
+        assert snapshot[1].consecutive_reported_failures == 0
+        assert snapshot[1].state_before_partial is None
+
+    def test_one_later_failure_only_reaches_suspect(self):
+        """Where an engine with a single failure belongs -- not one step from DEAD."""
+        monitor = _monitor(shard_count=4, unhealthy_threshold=3)
+        monitor.report_failure(1, error="generation failed")
+        monitor.report_failure(1, error="generation failed")
+        monitor.mark_weights_partial(1)
+        monitor.condemn_silent_participant(1, reason="silent in refit")
+        monitor.mark_restarting(1)
+        monitor.mark_loaded(1, base_url="http://replacement:9000/v1")
+        monitor.report_refit(1, weight_version=7)
+
+        monitor.report_failure(1, error="one unrelated failure")
+
+        assert monitor.state_of(1) is ShardState.SUSPECT
+
+
 class TestRetirement:
     def test_restarts_are_bounded_then_the_shard_retires(self):
         monitor = _monitor(unhealthy_threshold=1, max_restart_attempts_per_shard=2)
