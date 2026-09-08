@@ -37,13 +37,16 @@ import torch
 
 from megatron.core.extensions.transformer_engine import Fp8Padding
 
-padding = Fp8Padding(2, align_size=4)
-row_indices = torch.arange(1, 4, dtype=torch.int64, device='cuda').unsqueeze(-1)
-padded, counts = padding(row_indices, [2, 1])
-expected = torch.tensor([[1], [2], [0], [0], [3], [0], [0], [0]], device='cuda')
-torch.testing.assert_close(padded, expected)
-assert counts == [4, 4]
-print('TE INT64 padding probe passed')
+if Fp8Padding is None:
+    print('TE INT64 padding probe skipped: TE is installed in the policy worker venv')
+else:
+    padding = Fp8Padding(2, align_size=4)
+    row_indices = torch.arange(1, 4, dtype=torch.int64, device='cuda').unsqueeze(-1)
+    padded, counts = padding(row_indices, [2, 1])
+    expected = torch.tensor([[1], [2], [0], [0], [3], [0], [0], [0]], device='cuda')
+    torch.testing.assert_close(padded, expected)
+    assert counts == [4, 4]
+    print('TE INT64 padding probe passed')
 PY
     /opt/nemo_rl_venv/bin/python -m pytest -q \
       tests/unit_tests/transformer/moe/test_grouped_mlp.py \
