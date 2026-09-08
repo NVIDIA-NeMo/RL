@@ -50,5 +50,5 @@ else:
 PY
     /opt/nemo_rl_venv/bin/python -m pytest -q \
       tests/unit_tests/transformer/moe/test_grouped_mlp.py \
-      -k 'router_probability_padding'
+      -k 'router_probability_padding or fused_impl_supported_rejects_fp64'
   " 2>&1 | tee "${LOG_DIR}/${SLURM_JOB_ID}.log"
