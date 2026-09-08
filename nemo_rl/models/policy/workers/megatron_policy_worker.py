@@ -3744,6 +3744,12 @@ class MegatronPolicyWorkerImpl(
         inference_mcfg = plan.inference_megatron_cfg
         inference_config = {**config, "megatron_cfg": inference_mcfg}
 
+        if inference_mcfg.get("transformer_impl") == "inference_optimized":
+            # The provider snapshot was taken from the training model, whose
+            # generic GPT spec uses Transformer Engine. Select MCore inference
+            # linears before constructing the dedicated generation model.
+            _configure_inference_optimized_layer_spec(plan.initial_model_provider)
+
         print(
             "[colocated-reshard] building dedicated inference model "
             f"(inference TP={inference_mcfg['tensor_model_parallel_size']} "
