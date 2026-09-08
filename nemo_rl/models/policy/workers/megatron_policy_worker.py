@@ -484,8 +484,11 @@ class MegatronPolicyWorkerImpl(
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
         # Store the reserved HTTP server port for inference server initialization.
-        # Megatron-LLM's inference servers live on MP coordinator ranks, one per DP rank.
-        self._reserved_http_server_port = (reserved_http_server_ports or {}).get(self.rank)
+        # Megatron-LLM's hosts an inference server on every MP coordinator rank,
+        # effectively one per DP rank.
+        self._reserved_http_server_port: Optional[int] = (
+            reserved_http_server_ports or {}
+        ).get(self.rank)
 
         # Step 1: Setup distributed
         setup_distributed(config)

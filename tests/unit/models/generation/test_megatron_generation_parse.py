@@ -173,6 +173,11 @@ def test_http_server_port_reservation(monkeypatch):
     probes queue instead of being refused), the worker adopts that same socket
     through the fd handoff — the port is never released in between — and the
     server falls back to a fresh port only when nothing was reserved.
+
+    Adoption is deferred to server startup rather than worker init, so that a
+    listening fd is never live across model initialization, where a long-lived
+    child process could inherit it and absorb SO_REUSEPORT traffic it never
+    serves.
     """
     # The holder resolves the node IP via held_port; the server resolves it via
     # virtual_cluster (megatron_worker imports it at call time). Patch both.
