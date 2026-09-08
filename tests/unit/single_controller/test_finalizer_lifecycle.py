@@ -105,6 +105,7 @@ def _controller(actor: object) -> Any:
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._rollout_manager = MagicMock()
+    ctrl._gym_participant_checkpointing_enabled = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
@@ -157,6 +158,45 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         staging_keys=["group_g0/call"],
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+
+
+def test_finalization_does_not_duplicate_seal_time_gym_acknowledgements() -> None:
+    events: list[str] = []
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    ctrl = _controller(actor)
+    ctrl._gym_participant_checkpointing_enabled = True
+
+    async def commit_finalized(*_args: Any, **_kwargs: Any) -> None:
+        events.append("canonical_commit")
+
+    ctrl._buffer.commit_finalized = AsyncMock(side_effect=commit_finalized)
+    ctrl._rollout_recovery_ledger.discard_group.side_effect = (
+        lambda *_args: events.append("discard_recovery_group")
+    )
+
+    asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    assert events == [
+        "canonical_commit",
+        "discard_recovery_group",
+    ]
+    ctrl._rollout_recovery_ledger.record_sealed_sibling_acknowledgement.assert_not_called()
+    ctrl._rollout_recovery_ledger.record_sealed_group_acknowledgements.assert_not_called()
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:

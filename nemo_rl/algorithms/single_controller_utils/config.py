@@ -718,11 +718,28 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
     """NeMo-Gym checkpoint control-plane discovery.
 
     This is opt-in while the Gym control protocol is experimental. Discovery
-    validates and fingerprints every participant before training starts. It
-    does not by itself add Gym participant state to periodic snapshots.
+    validates and fingerprints every participant before training starts.
+    ``participant_checkpointing_enabled`` adds Gym participant state to each
+    periodic snapshot and enables completed-result acknowledgement. It requires
+    discovery so SC can validate the participant topology and acknowledgement
+    feature before training starts.
     """
 
     capability_discovery_enabled: bool = False
+    participant_checkpointing_enabled: bool = False
+    prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
+
+    @model_validator(mode="after")
+    def validate_participant_checkpointing(self) -> "GymRolloutCheckpointConfig":
+        if (
+            self.participant_checkpointing_enabled
+            and not self.capability_discovery_enabled
+        ):
+            raise ValueError(
+                "participant_checkpointing_enabled=true requires "
+                "capability_discovery_enabled=true"
+            )
+        return self
 
 
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
