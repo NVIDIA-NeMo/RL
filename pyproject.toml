@@ -84,8 +84,11 @@ dependencies = [
   # Without it, qwen3.5 / nano-v3 / moonlight Megatron recipes crash at first
   # gated-chunk backward with a RuntimeError pointing at this exact pip install.
   # Keep the base range broad for both supported Linux architectures; backend
-  # extras tighten the version as required.
-  "tilelang>=0.1.9,<0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # extras tighten the version as required. Upper bound includes 0.1.14 so the
+  # mcore extra can select TileLang that is compatible with apache-tvm-ffi 0.1.12
+  # (TileLang 0.1.12 caps apache-tvm-ffi at <=0.1.11). Other extras keep their
+  # exact pins.
+  "tilelang>=0.1.9,<0.1.15; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
   # automatically include them. Removes the need for a `[data-plane]`
@@ -126,6 +129,9 @@ fsdp = [
   "mamba-ssm",
   "causal-conv1d",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # Block apache-tvm-ffi 0.1.12+ (breaks TileLang 0.1.9) without forcing 0.1.11:
+  # fsdp does not conflict with nemo-gym[vllm], which needs apache-tvm-ffi==0.1.9.
+  "apache-tvm-ffi>=0.1.9,<0.1.12",
 ]
 automodel = [
   "nemo-automodel[moe]",
@@ -146,6 +152,9 @@ automodel = [
   "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  # TileLang 0.1.11 requires the 0.1.11 TVM FFI ABI. Pin here (not in
+  # override-dependencies) so the mcore extra can take apache-tvm-ffi 0.1.12.
+  "apache-tvm-ffi==0.1.11",
 ]
 vllm = [
   "transformers==5.12.1",
@@ -182,6 +191,9 @@ sglang = [
   "flashinfer-jit-cache==0.6.14",
   "transformers==5.12.1",
   "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # TileLang 0.1.11 requires the 0.1.11 TVM FFI ABI. Pin here (not in
+  # override-dependencies) so the mcore extra can take apache-tvm-ffi 0.1.12.
+  "apache-tvm-ffi==0.1.11",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -201,7 +213,9 @@ mcore = [
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
   "transformers==5.12.1",
-  "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # 0.1.12 caps apache-tvm-ffi at <=0.1.11, which is incompatible with
+  # flash-attn-4==4.0.0b20 (>=0.1.12). 0.1.13/0.1.14 allow 0.1.12.
+  "tilelang>=0.1.13,<0.1.15; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -210,12 +224,7 @@ mcore = [
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   # TE v2.15 Megatron attention_backend=flash requires flash_attn.cute (FA4).
   # flash-attn-4 pulls nvidia-cutlass-dsl==4.6.0.dev0; [cu13] installs libs-cu13 (the `cutlass` module).
-  "flash-attn-4>=4.0.0b20 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  # uv mcore extra fork omits flash-attn-4 transitive deps; pin explicitly for worker venvs.
-  # Bare nvidia-cutlass-dsl is a stub wheel; libs-base is excluded project-wide (see exclude-dependencies).
-  "nvidia-cutlass-dsl[cu13]==4.6.0.dev0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  # flash-attn-4 4.0.0b25 needs >=0.1.12 for map_dataclass_to_tuple in cute.compile.
-  "apache-tvm-ffi>=0.1.12,<0.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "flash-attn-4==4.0.0b20 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
@@ -227,7 +236,14 @@ mcore = [
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cutlass-dsl[cu13]==4.6.0.dev0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # Transitive pre-release of nvidia-cutlass-dsl[cu13]==4.6.0.dev0. uv 0.11 does
+  # not admit transitive pre-releases unless they are a first-party requirement
+  # with a pre-release specifier.
+  "nvidia-cutlass-dsl-libs-cu13==4.6.0.dev0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # flash-attn-4 needs apache-tvm-ffi>=0.1.12 (map_dataclass_to_tuple). Scoped to
+  # this extra so fsdp/vllm/automodel/sglang/trtllm can keep the 0.1.11 TileLang ABI.
+  "apache-tvm-ffi>=0.1.12,<0.1.13",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -240,6 +256,9 @@ trtllm = [
   "tensorrt-llm==1.3.0rc21",
   "transformers==5.5.4",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # TileLang 0.1.9 vendors a TVM ABI incompatible with apache-tvm-ffi 0.1.12+.
+  # tensorrt-llm's pin is rewritten in 3rdparty/TensorRT-LLM-workspace.
+  "apache-tvm-ffi==0.1.11",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
@@ -427,10 +446,6 @@ override-dependencies = [
   # xgrammar.normalize_tool_choice (vLLM requires xgrammar>=0.2.1,<1.0.0; the
   # override would otherwise force an incompatible downgrade).
   "xgrammar>=0.2.1,<1.0.0",
-  # tensorrt-llm 1.3.0rc21 pins apache-tvm-ffi==0.1.6, but the xgrammar the
-  # line above selects needs >=0.1.9, and flash-attn-4 needs >=0.1.12 for
-  # map_dataclass_to_tuple. Take the newer one; trtllm extra unsatisfiable on cp313 otherwise.
-  "apache-tvm-ffi>=0.1.12,<0.2",
   # Override dependencies to address CVEs
   "mlflow>=3.13.0",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
@@ -535,6 +550,10 @@ conflicts = [
   ],
   [
     { extra = "automodel" },
+    { extra = "fsdp" },
+  ],
+  [
+    { extra = "mcore" },
     { extra = "fsdp" },
   ],
   [
