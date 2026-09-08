@@ -363,6 +363,8 @@ export GPUS_PER_NODE=4
 export CPUS_PER_WORKER=${CPUS_PER_WORKER:-144}
 export BASE_LOG_DIR="${RUN_ROOT}"
 
+BATCH_PATH="${SLURM_HELPER_PATH}:/usr/local/bin:/usr/bin:/bin"
+
 SBATCH_ACTION=()
 if [[ "${ACTION}" == test-only ]]; then
   SBATCH_ACTION=(--test-only)
@@ -389,7 +391,7 @@ SBATCH_ARGS=(
   --segment="${SEGMENT_SIZE}"
   --job-name="${SLURM_ACCOUNT}.${RUN_NAME}"
   --output="${RUN_ROOT}/slurm-%j.out"
-  --export="ALL,SLURM_HELPER_PATH=${SLURM_HELPER_PATH}"
+  --export="ALL,SLURM_HELPER_PATH=${SLURM_HELPER_PATH},PATH=${BATCH_PATH}"
   --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","reason":"model_loading","description":"native MXFP8 source refit"}}'
 )
 
