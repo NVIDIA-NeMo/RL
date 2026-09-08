@@ -4014,6 +4014,9 @@ class MegatronPolicyWorkerImpl(
             and not self.optimizer_cpu_offload
             and self.offload_optimizer_for_logprob
         ):
+            # Drain any in-flight async save first: moving the optimizer frees
+            # the storage the writer is still reading from.
+            self.finalize_async_save()
             self.move_optimizer("cpu")
 
         # No teacher projection happens during logprob inference, so the head can
@@ -4242,6 +4245,11 @@ class MegatronPolicyWorkerImpl(
             and not self.optimizer_cpu_offload
             and self.offload_optimizer_for_refit
         ):
+            # The Megatron weight synchronizer calls offload_before_refit
+            # directly on every refit, so this path -- not just the
+            # offload_after_refit wrapper -- must drain the async save before
+            # freeing the optimizer storage the writer still points at.
+            self.finalize_async_save()
             self.move_optimizer("cpu")
 
         gc.collect()
@@ -4472,23 +4480,58 @@ class MegatronPolicyWorkerImpl(
         ckpt_cfg = self.mcore_state.cfg.checkpoint
         generation_cfg = self.cfg.get("generation") or {}
         colocated_cfg = generation_cfg.get("colocated") or {}
-        return bool(
+        # Caching tensor handles is only safe while the storage behind them stays
+        # put. Colocated generation is not the only thing that moves it: a
+        # non-colocated Megatron rollout offloads the optimizer for refit or for
+        # logprob, which reallocates the Adam state and leaves the persistent
+        # writer holding handles to freed storage. Every later "save" then
+        # rewrites whatever those stale handles point at, so the optimizer state
+        # in each checkpoint is frozen at the first post-startup update and a
+        # resume silently restores stale moments.
+        storage_can_move = bool(
+            colocated_cfg.get("enabled", False)
+            or (
+                getattr(self, "optimizer", None) is not None
+                and not self.optimizer_cpu_offload
+                and (
+                    self.offload_optimizer_for_refit
+                    or self.offload_optimizer_for_logprob
+                )
+            )
+        )
+        result = bool(
             ckpt_cfg.async_save
             and getattr(ckpt_cfg, "async_strategy", "nvrx") == "nvrx"
             and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
             and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
             and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
-            and colocated_cfg.get("enabled", False)
+            and storage_can_move
         )
+        # Log once so a run records which branch it took; a non-colocated
+        # Megatron rollout that reports False here is the stale-optimizer bug.
+        if self.rank == 0 and not getattr(self, "_nvrx_release_announced", False):
+            self._nvrx_release_announced = True
+            logging.info(
+                "nvrx_cuda_cache_release=%s (colocated=%s, storage_can_move=%s, "
+                "offload_optimizer_for_refit=%s, offload_optimizer_for_logprob=%s)",
+                result,
+                colocated_cfg.get("enabled", False),
+                storage_can_move,
+                getattr(self, "offload_optimizer_for_refit", None),
+                getattr(self, "offload_optimizer_for_logprob", None),
+            )
+        return result
 
     def finalize_async_save(self):
-        """Finalize an async write and release unsafe colocated CUDA IPC caches.
+        """Finalize an async write and release CUDA IPC caches that may be stale.
 
         NVRx constant-structure saves cache CUDA tensor handles in the persistent
-        writer. That is safe while model/optimizer storage stays fixed, but a
-        colocated policy replaces that storage during CPU offload. In that case,
-        close the completed writer and invalidate its training-side cache; NVRx
-        starts a fresh persistent writer lazily for the next checkpoint.
+        writer. That is safe while model/optimizer storage stays fixed, but any
+        CPU offload replaces that storage -- colocated generation offloads the
+        policy, and a non-colocated Megatron rollout offloads the optimizer for
+        refit/logprob. In those cases, close the completed writer and invalidate
+        its training-side cache; NVRx starts a fresh persistent writer lazily for
+        the next checkpoint.
         """
         release_cuda_cache = bool(
             self._async_checkpoint_cuda_cache_active
