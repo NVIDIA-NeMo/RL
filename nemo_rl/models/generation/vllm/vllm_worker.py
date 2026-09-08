@@ -565,10 +565,13 @@ class BaseVllmGenerationWorker:
         # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
         spec_cfg = vllm_kwargs.get("speculative_config")
         mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        self._mtp_speculative_enabled = spec_cfg is not None and spec_cfg.get(
+            "method"
+        ) in ("deepseek_mtp", "mtp")
+        self._mtp_weights_from_refit = mtp_weights_from_refit
         self._mtp_load_from_disk: bool = (
             load_format == "dummy"
-            and spec_cfg is not None
-            and spec_cfg.get("method") in ("deepseek_mtp", "mtp")
+            and self._mtp_speculative_enabled
             and not mtp_weights_from_refit
         )
 
@@ -937,6 +940,11 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         if self.llm is not None:
             self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
+        if self._mtp_speculative_enabled:
+            self.llm.collective_rpc(
+                "configure_mtp_drafter_weight_source",
+                args=(self._mtp_weights_from_refit,),
+            )
         if self._mtp_load_from_disk:
             self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)

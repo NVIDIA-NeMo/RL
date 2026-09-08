@@ -179,7 +179,7 @@ def _make_native_speculative_extension(
     from_disk: bool = False,
 ) -> tuple[VllmInternalWorkerExtension, MagicMock]:
     extension = _make_ext({})
-    extension._mtp_drafter_from_disk = from_disk
+    extension._mtp_drafter_weights_from_refit = not from_disk
     extension.model_runner.drafter = SimpleNamespace(
         model=SimpleNamespace(load_weights=MagicMock())
     )

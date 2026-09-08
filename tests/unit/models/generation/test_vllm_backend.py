@@ -114,7 +114,7 @@ def _make_mtp_refit_extension(
 
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
     ext.device = torch.device("cpu")
-    ext._mtp_drafter_from_disk = from_disk
+    ext._mtp_drafter_weights_from_refit = not from_disk
 
     spec_config = (
         None
@@ -1350,7 +1350,7 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
         process_weights_after_loading,
     )
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
-    ext._mtp_drafter_from_disk = False
+    ext._mtp_drafter_weights_from_refit = True
     ext.model_runner.drafter = SimpleNamespace(model=draft_model)
     ext.model_runner.vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -1906,6 +1906,18 @@ def test_mtp_drafter_refit_enabled(method, from_disk, has_drafter, expected):
         method=method, from_disk=from_disk, has_drafter=has_drafter
     )
     assert ext._mtp_drafter_refit_enabled() is expected
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("weights_from_refit", [False, True])
+def test_configure_mtp_drafter_weight_source(weights_from_refit):
+    """Checkpoint-loaded MTP stays static for both dummy and auto model loads."""
+    ext, _ = _make_mtp_refit_extension(method="mtp", from_disk=False)
+
+    ext.configure_mtp_drafter_weight_source(weights_from_refit)
+
+    assert ext._mtp_drafter_weights_from_refit is weights_from_refit
+    assert ext._mtp_drafter_refit_enabled() is weights_from_refit
 
 
 @pytest.mark.vllm
