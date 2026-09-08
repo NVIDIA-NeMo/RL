@@ -96,6 +96,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
     prepare_segment_topology,
 )
+from nemo_rl.environments.gym_checkpoint import GymCheckpointTopology
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
@@ -174,6 +175,9 @@ class SingleControllerActorArgs:
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
+    # Discovered only when Gym capability discovery is enabled. Dynamic phases,
+    # addresses, and credentials are excluded from this identity.
+    gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -1082,6 +1086,19 @@ def setup_single_controller(
         )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
+    if rollout_checkpoint_cfg.gym.capability_discovery_enabled:
+        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is None:
+            raise ValueError(
+                "rollout_checkpointing.gym.capability_discovery_enabled=true "
+                "requires "
+                "rollout_checkpointing.snapshot_attempt_interval_s"
+            )
+        if not should_use_nemo_gym(master_config):
+            raise ValueError(
+                "rollout_checkpointing.gym.capability_discovery_enabled=true "
+                "requires the NeMo-Gym rollout path "
+                "(env.should_use_nemo_gym=true)"
+            )
     if (
         master_config.checkpointing.get("save_data_plane")
         or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
@@ -1784,6 +1801,24 @@ def setup_single_controller(
 
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
 
+    gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
+    if rollout_checkpoint_cfg.gym.capability_discovery_enabled:
+        gym_actor = env_handles["nemo_gym"]
+        discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
+        gym_checkpoint_topology = GymCheckpointTopology.model_validate(discovered)
+        if resolved_snapshot is not None:
+            saved_topology_fingerprint = (
+                resolved_snapshot.manifest.gym_topology_fingerprint
+            )
+            current_topology_fingerprint = gym_checkpoint_topology.fingerprint()
+            if saved_topology_fingerprint != current_topology_fingerprint:
+                raise ValueError(
+                    "Gym checkpoint participant topology does not match the "
+                    "selected rollout snapshot: "
+                    f"checkpoint={saved_topology_fingerprint!r}, "
+                    f"current={current_topology_fingerprint!r}"
+                )
+
     setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     if "value_time" in time_metrics:
         setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
@@ -2014,6 +2049,7 @@ def setup_single_controller(
         partition_includes_multimodal_fields=processor is not None,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
+        gym_checkpoint_topology=gym_checkpoint_topology,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

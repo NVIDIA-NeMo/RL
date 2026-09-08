@@ -19,7 +19,9 @@ from pydantic import ValidationError
 
 from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
+    GymCheckpointTopology,
     GymControlCapabilities,
+    GymDiscoveredParticipant,
     GymExecutionIdentity,
     gym_capture_key,
 )
@@ -90,3 +92,34 @@ def test_capability_contract_binds_routing_and_participant_identity() -> None:
         "component": "responses_api_models",
         "participant_name": "policy_model",
     }
+
+
+def test_topology_fingerprint_excludes_dynamic_checkpoint_phase() -> None:
+    first = GymControlCapabilities.model_validate(_capabilities())
+    second = GymControlCapabilities.model_validate(
+        _capabilities(
+            admission_states=["paused", "accepting", "draining"],
+            phase="preparing",
+            active_checkpoint_id="snapshot-7",
+            deadline_ts=123.0,
+        )
+    )
+
+    first_topology = GymCheckpointTopology.from_discovered(
+        [
+            GymDiscoveredParticipant(
+                participant=first.participant("policy-route"),
+                capabilities=first,
+            )
+        ]
+    )
+    second_topology = GymCheckpointTopology.from_discovered(
+        [
+            GymDiscoveredParticipant(
+                participant=second.participant("policy-route"),
+                capabilities=second,
+            )
+        ]
+    )
+
+    assert first_topology.fingerprint() == second_topology.fingerprint()

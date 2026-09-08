@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -49,6 +50,7 @@ def _checkpoint_env():
     env = object.__new__(env_cls)
     env.rh = object()
     env._gym_checkpoint_participants = ()
+    env._control_timeout_s = 60.0
     return env
 
 
@@ -99,7 +101,9 @@ def test_checkpoint_capability_discovery_validates_and_caches_participants() -> 
         env.discover_checkpoint_capabilities(["tools", "policy", "agent"])
     )
 
-    assert [item["participant"]["server_name"] for item in discovered] == [
+    assert [
+        item["participant"]["server_name"] for item in discovered["participants"]
+    ] == [
         "agent",
         "policy",
         "tools",
@@ -193,6 +197,151 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
         "agent",
         "tools",
     }
+
+
+def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent": _capability("responses_api_agents", "agent"),
+        "tools": _capability("resources_servers", "tools"),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    calls = []
+
+    async def prepare_control(method, path, *, server_name, **_kwargs):
+        calls.append((method, path, server_name))
+        if server_name == "policy" and path.endswith("/pause"):
+            return {
+                "state": "draining",
+                "workers": {"acknowledged": 1, "expected": 1},
+                "inflight_total": 1,
+                "waiters_total": 0,
+            }
+        if server_name == "policy" and path.endswith("/status"):
+            return {
+                "checkpoint_id": "snapshot-8",
+                "state": "paused",
+                "per_worker": {"0": {"state": "paused", "inflight": 0}},
+                "inflight_total": 0,
+                "waiters_total": 0,
+                "inflight": [],
+                "tombstones": [],
+            }
+        if server_name == "agent":
+            return {
+                "state": "preparing",
+                "ready_to_commit": True,
+                "running": 0,
+                "parked": 0,
+                "parked_with_boundary": 0,
+                "parked_without_boundary": 0,
+                "completed_unacknowledged": 0,
+                "active": 0,
+                "blocking_attempts": [],
+                "completed_unacknowledged_attempts": [],
+                "executions": [],
+            }
+        return {"sessions": 0, "state": "prepared"}
+
+    env._control = AsyncMock(side_effect=prepare_control)
+
+    result = asyncio.run(env.prepare_checkpoint("snapshot-8", time.time() + 10.0))
+
+    assert result["ready"] is True
+    assert any(path.endswith("/status") for _method, path, _server in calls)
+
+
+def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent": _capability("responses_api_agents", "agent"),
+        "tools": _capability("resources_servers", "tools"),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    resume_order = []
+
+    async def prepare_control(_method, path, *, server_name, **_kwargs):
+        if path.endswith("/pause"):
+            return {
+                "state": "draining",
+                "workers": {"acknowledged": 1, "expected": 1},
+                "inflight_total": 1,
+                "waiters_total": 0,
+            }
+        if path.endswith("/status"):
+            return {
+                "checkpoint_id": "snapshot-9",
+                "state": "draining",
+                "per_worker": {"0": {"state": "draining", "inflight": 1}},
+                "inflight_total": 1,
+                "waiters_total": 0,
+                "inflight": [
+                    {
+                        "rollout_id": "rollout-1",
+                        "attempt_index": 0,
+                        "plane": "policy",
+                        "age_seconds": 1.0,
+                    }
+                ],
+                "tombstones": [],
+            }
+        if path.endswith("/prepare") and server_name == "agent":
+            return {
+                "state": "preparing",
+                "ready_to_commit": True,
+                "running": 0,
+                "parked": 0,
+                "parked_with_boundary": 0,
+                "parked_without_boundary": 0,
+                "completed_unacknowledged": 0,
+                "active": 0,
+                "blocking_attempts": [],
+                "completed_unacknowledged_attempts": [],
+                "executions": [],
+            }
+        if path.endswith("/prepare"):
+            return {"sessions": 0, "state": "prepared"}
+        resume_order.append(server_name)
+        if server_name == "policy":
+            return {
+                "state": "accepting",
+                "workers": {"acknowledged": 1, "expected": 1},
+                "released_waiters": 0,
+            }
+        if server_name == "agent":
+            return {"state": "accepting", "released": 0}
+        return {"state": "accepting"}
+
+    env._control = AsyncMock(side_effect=prepare_control)
+
+    with pytest.raises(TimeoutError, match="remained 'draining'"):
+        asyncio.run(env.prepare_checkpoint("snapshot-9", time.time() + 10.0))
+
+    assert resume_order == ["tools", "agent", "policy"]
 
 
 def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
