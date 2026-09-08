@@ -21,6 +21,7 @@ imports the same dict. These tests keep the two readers honest.
 import ast
 import hashlib
 import importlib.util
+import os
 import subprocess
 import sys
 import tomllib
@@ -31,7 +32,6 @@ import pytest
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS, _build_stage
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
-    USE_SYSTEM_EXECUTABLE,
 )
 from nemo_rl.distributed.virtual_cluster import (
     PY_EXECUTABLES,
@@ -40,6 +40,10 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 
 MODULE_PATH = Path(git_root) / "nemo_rl" / "distributed" / "actor_environments.py"
+
+# Read straight from the environment: since #4020 the flag is applied inside
+# PY_EXECUTABLES and uv_py_executable, so there is no module constant to import.
+USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
 
 with open(Path(git_root) / "pyproject.toml", "rb") as _f:
     DECLARED_EXTRAS = set(tomllib.load(_f)["project"]["optional-dependencies"])

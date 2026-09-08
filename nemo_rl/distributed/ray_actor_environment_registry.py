@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import tomllib
 from pathlib import Path
 
@@ -23,17 +22,15 @@ from nemo_rl.distributed.virtual_cluster import (
     uv_py_executable,
 )
 
-# NEMO_RL_PY_EXECUTABLES_SYSTEM=1 (single-environment images such as Dockerfile.ngc_pytorch)
-# runs every actor on the driver's interpreter instead of a per-actor uv venv.
-USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
-
 # Actor FQN -> the py_executable its workers launch under. The extras come from
 # nemo_rl.distributed.actor_environments, which docker/Dockerfile also reads to
 # pre-build one venv per actor into the image.
+#
+# NEMO_RL_PY_EXECUTABLES_SYSTEM=1 is not checked here. PY_EXECUTABLES and
+# uv_py_executable both already return the driver's interpreter when it is set,
+# so there is one place that knows about the flag rather than two.
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
-    actor_fqn: PY_EXECUTABLES.SYSTEM
-    if extras is None or USE_SYSTEM_EXECUTABLE
-    else uv_py_executable(extras)
+    actor_fqn: PY_EXECUTABLES.SYSTEM if extras is None else uv_py_executable(extras)
     for actor_fqn, extras in ACTOR_ENVIRONMENTS.items()
 }
 
