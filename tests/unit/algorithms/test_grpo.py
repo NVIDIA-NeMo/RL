@@ -17,7 +17,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -51,7 +51,6 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
     _startup_pipeline_ready,
-    _validate_fused_linear_logprobs_sampling,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -92,10 +91,7 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
-from nemo_rl.models.generation.interfaces import (
-    GenerationConfig,
-    should_use_async_rollouts,
-)
+from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
@@ -117,26 +113,27 @@ def _mock_policy_generation() -> MagicMock:
     return policy_generation
 
 
-def test_fused_linear_logprobs_allows_greedy_sampling() -> None:
-    generation_config = cast(
-        GenerationConfig,
-        {"top_k": 5, "top_p": 0.8, "temperature": 0.0},
-    )
-
-    _validate_fused_linear_logprobs_sampling(generation_config)
-
-
-@pytest.mark.parametrize("temperature", [0.5, 1e-2])
-def test_fused_linear_logprobs_reject_non_unit_temperature(
-    temperature: float,
+@pytest.mark.parametrize(
+    ("sampling_config", "error"),
+    [
+        ({"temperature": 0.5}, "non-unit training-time temperature"),
+        ({"top_k": 5}, "top-k/top-p training-time filtering"),
+        ({"top_p": 0.9}, "top-k/top-p training-time filtering"),
+    ],
+)
+def test_setup_rejects_fused_linear_logprobs_with_unsupported_sampling(
+    mock_grpo_components, sampling_config: dict[str, float | int], error: str
 ) -> None:
-    generation_config = cast(
-        GenerationConfig,
-        {"top_k": None, "top_p": 1.0, "temperature": temperature},
-    )
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["megatron_cfg"] = {
+        "enabled": True,
+        "use_fused_linear_logprobs": True,
+    }
+    master_config.policy["sequence_packing"] = {"enabled": False}
+    master_config.policy["generation"].update(sampling_config)
 
-    with pytest.raises(AssertionError, match="non-unit training-time temperature"):
-        _validate_fused_linear_logprobs_sampling(generation_config)
+    with pytest.raises(AssertionError, match=error):
+        setup(master_config, MagicMock(), MagicMock(), None)
 
 
 def test_save_async_replay_buffer_checkpoint(tmp_path):
