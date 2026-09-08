@@ -27,9 +27,9 @@ case "${ACTION}" in
 esac
 
 case "${MODEL}" in
-  qwen30|qwen235|nano) ;;
+  qwen30|qwen235|qwen235smoke|nano) ;;
   *)
-    echo "MODEL must be qwen30, qwen235, or nano" >&2
+    echo "MODEL must be qwen30, qwen235, qwen235smoke, or nano" >&2
     exit 2
     ;;
 esac
@@ -77,6 +77,7 @@ if ! [[ "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+CHECKPOINT_MODEL_KEY=${MODEL}
 case "${MODEL}:${PRECISION_MODE}:${FP8_PARAM}" in
   qwen30:bf16:false)
     CONFIG=experiments/native_mxfp8_source_refit/qwen30-bf16.yaml
@@ -100,6 +101,13 @@ case "${MODEL}:${PRECISION_MODE}:${FP8_PARAM}" in
     CONFIG=experiments/native_mxfp8_source_refit/qwen235-fp8param-true.yaml
     NUM_NODES=32
     SEGMENT_SIZE=16
+    MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-235B-A22B'
+    ;;
+  qwen235smoke:mxfp8:true)
+    CONFIG=experiments/native_mxfp8_source_refit/qwen235-fp8param-true-smoke.yaml
+    NUM_NODES=20
+    SEGMENT_SIZE=4
+    CHECKPOINT_MODEL_KEY=qwen235
     MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-235B-A22B'
     ;;
   nano:mxfp8:false)
@@ -261,7 +269,7 @@ RUN_NAME="native-mxfp8-${MODEL}-${CACHE_ARM}-${RUN_GROUP}"
 RUN_ROOT="${RESULT_ROOT}/${RUN_NAME}"
 if [[ "${ACTION}" == submit ]]; then
   mkdir -p "${RUN_ROOT}/logs"
-  mkdir -p "${MEGATRON_CHECKPOINT_ROOT}/${MODEL}"
+  mkdir -p "${MEGATRON_CHECKPOINT_ROOT}/${CHECKPOINT_MODEL_KEY}"
   mkdir -p "${DATASET_ROOT}"
 fi
 
@@ -295,7 +303,7 @@ export HF_HOME_SOURCE=${HF_HOME}
 export HF_HOME=${LOCAL_SCRATCH}/hf-cache/${MODEL}
 export HF_DATASETS_CACHE=${DATASET_ROOT}
 export HUGGINGFACE_HUB_CACHE=\${HF_HOME}/hub
-export NRL_MEGATRON_CHECKPOINT_DIR=${MEGATRON_CHECKPOINT_ROOT}/${MODEL}
+export NRL_MEGATRON_CHECKPOINT_DIR=${MEGATRON_CHECKPOINT_ROOT}/${CHECKPOINT_MODEL_KEY}
 export NEMO_RL_VENV_DIR=${LOCAL_SCRATCH}/nemo-rl-worker-cache/${SOURCE_SHA}-${MCORE_FIX_SHA}
 export VLLM_CACHE_ROOT=${LOCAL_SCRATCH}/vllm-cache/${SOURCE_SHA}/${CACHE_ARM}
 export TORCHINDUCTOR_CACHE_DIR=${LOCAL_SCRATCH}/inductor-cache/${SOURCE_SHA}/${CACHE_ARM}
