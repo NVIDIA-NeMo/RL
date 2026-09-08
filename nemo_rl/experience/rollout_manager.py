@@ -91,6 +91,8 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
+GymAcknowledgementsReadyCallback = Callable[[], None]
+_NG_RESOLVED_AGENT_REF_KEY = "_ng_resolved_agent_ref"
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
@@ -1120,6 +1122,14 @@ class AsyncNemoGymRolloutImpl:
                 # Completion callbacks are token-capture receipt-only, making this
                 # conversion lightweight and safe to repeat during group metrics.
                 row_completions, _ = self._results_to_completions([result])
+                callback_extras = row_completions[0].env_extras
+                if callback_extras is None:
+                    raise RuntimeError(
+                        "NeMo-Gym completion callback requires environment extras"
+                    )
+                callback_extras[_NG_RESOLVED_AGENT_REF_KEY] = copy.deepcopy(
+                    resolved_agent_ref
+                )
                 await on_completion(rowidx, row_completions[0])
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
@@ -2003,6 +2013,9 @@ class RolloutManager:
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
         lineage_group_id: Optional[str] = None,
+        on_gym_acknowledgements_ready: Optional[
+            GymAcknowledgementsReadyCallback
+        ] = None,
     ) -> Optional["ReassemblyRequest"]:
         """Capture siblings with stable lineage and configured retry granularity.
 
@@ -2044,6 +2057,7 @@ class RolloutManager:
                     input_sample,
                     recovery_group_id=recovery_group_id,
                     inflight_registry=inflight_registry,
+                    on_gym_acknowledgements_ready=on_gym_acknowledgements_ready,
                 )
             except Exception as error:
                 reason = type(error).__name__
@@ -2102,6 +2116,7 @@ class RolloutManager:
         *,
         recovery_group_id: str,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
+        on_gym_acknowledgements_ready: Optional[GymAcknowledgementsReadyCallback],
     ) -> "ReassemblyRequest":
         """Dispatch the current sibling cohort and leave one slot unready."""
         from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
@@ -2183,6 +2198,17 @@ class RolloutManager:
                     )
                 )
             )
+            resolved_agent_ref = env_extras.get(_NG_RESOLVED_AGENT_REF_KEY)
+            if not isinstance(resolved_agent_ref, dict):
+                raise ValueError(
+                    "token-capture completion must contain its resolved agent_ref"
+                )
+            resolved_agent_name = resolved_agent_ref.get("name")
+            if not isinstance(resolved_agent_name, str) or not resolved_agent_name:
+                raise ValueError(
+                    "token-capture completion resolved agent_ref.name must be a "
+                    "non-empty string"
+                )
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
@@ -2190,6 +2216,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    resolved_agent_name=resolved_agent_name,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2208,6 +2235,15 @@ class RolloutManager:
                         group_id,
                         pending_group_results,
                     )
+                    if on_gym_acknowledgements_ready is not None:
+                        self._recovery_ledger.record_sealed_group_acknowledgements(
+                            cut,
+                            group_id,
+                        )
+                if on_gym_acknowledgements_ready is not None:
+                    # Only schedule transport after releasing the seal cut. The
+                    # checkpointable obligation itself was recorded inside the cut.
+                    on_gym_acknowledgements_ready()
                 return
 
             async with self._recovery_mutation("sibling_seals") as cut:
@@ -2219,7 +2255,17 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    resolved_agent_name=resolved_agent_name,
                 )
+                if on_gym_acknowledgements_ready is not None:
+                    self._recovery_ledger.record_sealed_sibling_acknowledgement(
+                        cut,
+                        group_id,
+                        generation_index,
+                    )
+            if on_gym_acknowledgements_ready is not None:
+                # Network delivery must never extend the data-plane mutation cut.
+                on_gym_acknowledgements_ready()
 
         try:
             if inflight_registry is not None:

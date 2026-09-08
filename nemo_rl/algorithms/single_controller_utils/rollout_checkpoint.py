@@ -27,8 +27,9 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.environments.gym_checkpoint import GymCheckpointCommitResult
 
-ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 3
+ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 4
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
 BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
@@ -229,6 +230,7 @@ class RolloutSnapshotManifest:
     rolled_back_train_group_count: int
     bootstrap_fingerprint: Optional[str]
     gym_topology_fingerprint: Optional[str] = None
+    gym_checkpoint: Optional[GymCheckpointCommitResult] = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> RolloutSnapshotManifest:
@@ -262,6 +264,12 @@ class RolloutSnapshotManifest:
                 "rollout snapshot gym_topology_fingerprint must be a SHA-256 "
                 "digest or null"
             )
+        raw_gym_checkpoint = raw.get("gym_checkpoint")
+        gym_checkpoint = (
+            None
+            if raw_gym_checkpoint is None
+            else GymCheckpointCommitResult.model_validate(raw_gym_checkpoint)
+        )
         manifest = cls(
             schema_version=raw["schema_version"],
             base_train_step=raw["base_train_step"],
@@ -272,6 +280,7 @@ class RolloutSnapshotManifest:
             rolled_back_train_group_count=raw["rolled_back_train_group_count"],
             bootstrap_fingerprint=fingerprint,
             gym_topology_fingerprint=gym_topology_fingerprint,
+            gym_checkpoint=gym_checkpoint,
         )
         if manifest.schema_version != ROLLOUT_SNAPSHOT_SCHEMA_VERSION:
             raise ValueError(
@@ -293,10 +302,24 @@ class RolloutSnapshotManifest:
             raise ValueError(
                 "rollout snapshot sampler_dispatch_index must be at least -1"
             )
+        if (
+            manifest.gym_checkpoint is not None
+            and manifest.gym_topology_fingerprint is None
+        ):
+            raise ValueError(
+                "rollout snapshot with Gym participant state requires a Gym "
+                "topology fingerprint"
+            )
         return manifest
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["gym_checkpoint"] = (
+            self.gym_checkpoint.model_dump(mode="json")
+            if self.gym_checkpoint is not None
+            else None
+        )
+        return payload
 
 
 @dataclass(frozen=True)

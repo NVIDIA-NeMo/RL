@@ -67,6 +67,7 @@ REPLAY_BUFFER_METADATA_STORAGE: Literal["tq_checkpoint"] = "tq_checkpoint"
 
 CheckpointMutationKind = Literal[
     "advantage_writeback",
+    "gym_acknowledgements",
     "group_commits",
     "group_removals",
     "other",
@@ -78,6 +79,7 @@ CheckpointMutationKind = Literal[
 ]
 CHECKPOINT_MUTATION_KINDS: tuple[CheckpointMutationKind, ...] = (
     "advantage_writeback",
+    "gym_acknowledgements",
     "group_commits",
     "group_removals",
     "prompt_reservations",

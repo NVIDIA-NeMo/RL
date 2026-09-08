@@ -14,16 +14,20 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from pydantic import ValidationError
 
 from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
+    GymCheckpointCommitResult,
     GymCheckpointTopology,
     GymControlCapabilities,
     GymDiscoveredParticipant,
     GymExecutionIdentity,
     gym_capture_key,
+    validate_gym_checkpoint_manifests,
 )
 
 
@@ -123,3 +127,112 @@ def test_topology_fingerprint_excludes_dynamic_checkpoint_phase() -> None:
     )
 
     assert first_topology.fingerprint() == second_topology.fingerprint()
+
+
+def test_participant_manifest_digest_is_verified_before_publication(tmp_path) -> None:
+    manifest_path = tmp_path / "agent" / "manifest.json"
+    manifest_path.parent.mkdir()
+    manifest_path.write_text("{}")
+    digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    checkpoint = GymCheckpointCommitResult.model_validate(
+        {
+            "checkpoint_id": "snapshot-7",
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "agent-route",
+                        "component": "responses_api_agents",
+                        "participant_name": "agent",
+                    },
+                    "payload": {"records": 1, "manifest_digest": digest},
+                    "manifest": {
+                        "participant": {
+                            "server_name": "agent-route",
+                            "component": "responses_api_agents",
+                            "participant_name": "agent",
+                        },
+                        "relative_path": "agent/manifest.json",
+                        "manifest_digest": digest,
+                    },
+                }
+            ],
+        }
+    )
+
+    validate_gym_checkpoint_manifests(tmp_path, checkpoint)
+    manifest_path.write_text('{"corrupt": true}')
+
+    with pytest.raises(ValueError, match="manifest digest mismatch"):
+        validate_gym_checkpoint_manifests(tmp_path, checkpoint)
+
+
+def test_checkpoint_commit_rejects_mismatched_manifest_identity() -> None:
+    with pytest.raises(ValidationError, match="manifest identity does not match"):
+        GymCheckpointCommitResult.model_validate(
+            {
+                "checkpoint_id": "snapshot-7",
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "agent-route",
+                            "component": "responses_api_agents",
+                            "participant_name": "agent-a",
+                        },
+                        "payload": {
+                            "records": 1,
+                            "manifest_digest": "a" * 64,
+                        },
+                        "manifest": {
+                            "participant": {
+                                "server_name": "agent-route",
+                                "component": "responses_api_agents",
+                                "participant_name": "agent-b",
+                            },
+                            "relative_path": "agent/manifest.json",
+                            "manifest_digest": "a" * 64,
+                        },
+                    }
+                ],
+            }
+        )
+
+
+def test_topology_requires_every_stateful_checkpoint_participant() -> None:
+    topology = GymCheckpointTopology.model_validate(
+        {
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "policy-route",
+                        "component": "responses_api_models",
+                        "participant_name": "policy",
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting", "draining", "paused"],
+                    "checkpoint_mode": "export_restore",
+                    "concurrency_contract": "stateless",
+                    "multi_process": {"mode": "single_worker", "num_workers": 1},
+                    "instance_role": "policy",
+                },
+                {
+                    "participant": {
+                        "server_name": "judge-route",
+                        "component": "responses_api_models",
+                        "participant_name": "judge",
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting"],
+                    "checkpoint_mode": "stateless",
+                    "concurrency_contract": "stateless",
+                    "multi_process": {"mode": "single_worker", "num_workers": 1},
+                    "instance_role": "auxiliary",
+                },
+            ]
+        }
+    )
+    checkpoint = GymCheckpointCommitResult.model_validate(
+        {"checkpoint_id": "checkpoint-7", "participants": []}
+    )
+
+    with pytest.raises(ValueError, match="missing=.*policy-route"):
+        topology.validate_checkpoint_participants(checkpoint)

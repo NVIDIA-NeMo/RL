@@ -758,6 +758,58 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_gym_participant_checkpointing_requires_discovery(self):
+        with pytest.raises(
+            ValueError,
+            match=(
+                "participant_checkpointing_enabled=true requires "
+                "capability_discovery_enabled=true"
+            ),
+        ):
+            RolloutCheckpointConfig(
+                snapshot_attempt_interval_s=1.0,
+                gym={"participant_checkpointing_enabled": True},
+            )
+
+    def test_gym_participant_checkpointing_requires_token_capture(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={
+                "capability_discovery_enabled": True,
+                "participant_checkpointing_enabled": True,
+            },
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="participant_checkpointing_enabled=true requires "
+            "token_capture.enabled=true",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_gym_participant_checkpointing_requires_latest_restore_mode(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = True
+        mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            restore_mode="trainer_checkpoint",
+            gym={
+                "capability_discovery_enabled": True,
+                "participant_checkpointing_enabled": True,
+            },
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Gym participant checkpointing requires.*restore_mode='latest'",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_gym_checkpointing_discovers_topology_during_setup(
         self,
         tmp_path: Path,
@@ -785,7 +837,10 @@ class TestSetup:
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
-            gym={"capability_discovery_enabled": True},
+            gym={
+                "capability_discovery_enabled": True,
+                "participant_checkpointing_enabled": True,
+            },
         )
         topology = {
             "schema_version": 1,
@@ -805,6 +860,23 @@ class TestSetup:
                         "num_workers": 1,
                     },
                     "instance_role": "policy",
+                },
+                {
+                    "participant": {
+                        "server_name": "agent-route",
+                        "component": "responses_api_agents",
+                        "participant_name": "test-agent",
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting"],
+                    "checkpoint_mode": "export_restore",
+                    "concurrency_contract": "serialized_per_session",
+                    "multi_process": {
+                        "mode": "single_worker",
+                        "num_workers": 1,
+                    },
+                    "instance_role": None,
+                    "features": ["completed_result_acknowledgement"],
                 }
             ],
         }

@@ -379,6 +379,7 @@ async def _round_trip(
                     },
                     reward=float(generation_index),
                     mask_sample=False,
+                    resolved_agent_name="test-agent",
                 )
     sealed_before = {
         group.group_id: tuple(group.sealed_generation_indices)

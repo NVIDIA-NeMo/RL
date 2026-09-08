@@ -167,6 +167,11 @@ rollout_checkpointing:
   # Requires a Gym revision exposing the /ng-control/v1 checkpoint protocol.
   gym:
     capability_discovery_enabled: false
+    # Adds prepared Gym model, agent, and resources state to each rollout
+    # snapshot. Requires token capture and completed-result acknowledgement in
+    # the Gym agent participant.
+    participant_checkpointing_enabled: false
+    prepare_timeout_s: 300
 
 policy:
   dtensor_cfg:

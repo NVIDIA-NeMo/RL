@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import hashlib
+import json
 import math
 import os
 import subprocess
@@ -40,8 +41,8 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.gym_checkpoint import (
+    GYM_AGENT_COMPLETION_ACK_PATH,
     GYM_AGENT_CHECKPOINT_PREFIX,
     GYM_CHECKPOINT_CAPABILITIES_PATH,
     GYM_CHECKPOINT_CONTROL_PREFIX,
@@ -59,6 +60,9 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointResumeResult,
     GymCheckpointRestoreResult,
     GymCheckpointTopology,
+    GymCompletedExecution,
+    GymCompletedExecutionAcknowledgementRequest,
+    GymCompletedExecutionAcknowledgementResponse,
     GymCoordinatorModelStatusResponse,
     GymControlCapabilities,
     GymDiscoveredParticipant,
@@ -80,6 +84,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymSingleWorkerModelStatusResponse,
     gym_capture_key,
 )
+from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
     _index_per_turn_images,
     _is_trainable_output_item,
@@ -284,6 +289,21 @@ _CHECKPOINT_CONTROL_ENV = "NEMO_GYM_CHECKPOINT_CONTROL_TOKEN"
 _GYM_COMPONENT_KEYS = frozenset(
     {"responses_api_models", "responses_api_agents", "resources_servers"}
 )
+
+
+class GymControlRequestError(RuntimeError):
+    """Typed non-success response from one Gym checkpoint control route."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        error_code: Optional[str],
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.error_code = error_code
 
 
 def _checkpoint_server_names(global_config: Mapping[str, Any]) -> list[str]:
@@ -690,9 +710,22 @@ Depending on your data shape, you may want to change these values."""
                 f"{request_timeout_s}s (control plane unreachable or stalled)"
             ) from None
         if response.status != 200:
-            raise RuntimeError(
+            response_text = await response.text()
+            error_code: Optional[str] = None
+            try:
+                error_payload = json.loads(response_text)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(error_payload, dict):
+                    error = error_payload.get("error")
+                    if isinstance(error, dict) and isinstance(error.get("code"), str):
+                        error_code = error["code"]
+            raise GymControlRequestError(
                 f"Gym control call to {server_name!r} {method} {path} failed: "
-                f"HTTP {response.status} {await response.text()}"
+                f"HTTP {response.status} {response_text}",
+                status=response.status,
+                error_code=error_code,
             )
         payload = await response.json()
         if not isinstance(payload, dict):
@@ -783,6 +816,86 @@ Depending on your data shape, you may want to change these values."""
                 "checkpoint control calls"
             )
         return self._gym_checkpoint_participants
+
+    def _agent_checkpoint_participant(
+        self,
+        agent_name: str,
+    ) -> GymDiscoveredParticipant:
+        matches = [
+            item
+            for item in self._checkpoint_participants()
+            if item.participant.component == "responses_api_agents"
+            and item.participant.participant_name == agent_name
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "resolved Gym agent must match exactly one checkpoint "
+                f"participant: agent={agent_name!r}, matches={len(matches)}"
+            )
+        participant = matches[0]
+        if "completed_result_acknowledgement" not in participant.capabilities.features:
+            raise RuntimeError(
+                f"Gym agent {agent_name!r} does not advertise completed-result "
+                "acknowledgement"
+            )
+        return participant
+
+    async def acknowledge_completed_executions(
+        self,
+        executions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Release terminal results after RL records checkpointable ownership."""
+        validated = [
+            GymCompletedExecution.model_validate(execution) for execution in executions
+        ]
+        if not validated:
+            return {"acknowledged": []}
+        keys = [
+            (
+                item.agent_name,
+                item.execution.rollout_id,
+                item.execution.attempt_index,
+            )
+            for item in validated
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("completed Gym execution acknowledgements must be unique")
+
+        by_agent: dict[str, list[GymExecutionIdentity]] = {}
+        for item in validated:
+            by_agent.setdefault(item.agent_name, []).append(item.execution)
+
+        acknowledged: list[GymCompletedExecution] = []
+        for agent_name, identities in sorted(by_agent.items()):
+            discovered = self._agent_checkpoint_participant(agent_name)
+            request = GymCompletedExecutionAcknowledgementRequest(executions=identities)
+            response = GymCompletedExecutionAcknowledgementResponse.model_validate(
+                await self._control(
+                    "POST",
+                    GYM_AGENT_COMPLETION_ACK_PATH,
+                    server_name=discovered.participant.server_name,
+                    json=request.model_dump(mode="json"),
+                )
+            )
+            requested_keys = {
+                (identity.rollout_id, identity.attempt_index) for identity in identities
+            }
+            response_keys = {
+                (identity.rollout_id, identity.attempt_index)
+                for identity in response.acknowledged
+            }
+            if response_keys != requested_keys:
+                raise RuntimeError(
+                    "Gym completed-result acknowledgement did not cover the "
+                    f"requested executions for agent {agent_name!r}: "
+                    f"requested={sorted(requested_keys)!r}, "
+                    f"acknowledged={sorted(response_keys)!r}"
+                )
+            acknowledged.extend(
+                GymCompletedExecution(execution=identity, agent_name=agent_name)
+                for identity in response.acknowledged
+            )
+        return {"acknowledged": [item.model_dump(mode="json") for item in acknowledged]}
 
     def _ordered_checkpoint_participants(
         self,
@@ -877,14 +990,10 @@ Depending on your data shape, you may want to change these values."""
                     if capabilities.checkpoint_mode != "export_restore":
                         continue
                     touched.append(discovered)
-                    payload = GymAgentPrepareResponse.model_validate(
-                        await self._control(
-                            "POST",
-                            f"{GYM_AGENT_CHECKPOINT_PREFIX}/prepare",
-                            server_name=participant.server_name,
-                            timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                            json=request,
-                        )
+                    payload = await self._prepare_agent_checkpoint(
+                        discovered,
+                        request=request,
+                        deadline_ts=deadline_ts,
                     )
                     ready = payload.ready_to_commit
                 else:
@@ -963,6 +1072,45 @@ Depending on your data shape, you may want to change these values."""
             ready=True,
             participants=results,
         ).model_dump(mode="json")
+
+    async def _prepare_agent_checkpoint(
+        self,
+        discovered: GymDiscoveredParticipant,
+        *,
+        request: dict[str, Any],
+        deadline_ts: float,
+    ) -> GymAgentPrepareResponse:
+        """Retry Gym's non-ready 409 until terminal results are acknowledged."""
+        participant = discovered.participant
+        while True:
+            remaining = deadline_ts - time.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Gym agent {participant.server_name!r} missed the prepare deadline"
+                )
+            try:
+                raw = await self._control(
+                    "POST",
+                    f"{GYM_AGENT_CHECKPOINT_PREFIX}/prepare",
+                    server_name=participant.server_name,
+                    timeout_s=remaining,
+                    json=request,
+                )
+            except GymControlRequestError as error:
+                if not (
+                    error.status == 409
+                    and error.error_code == "agent_prepare_incomplete"
+                ):
+                    raise
+                await asyncio.sleep(min(0.1, max(0.0, deadline_ts - time.time())))
+                continue
+            payload = GymAgentPrepareResponse.model_validate(raw)
+            if not payload.ready_to_commit:
+                raise RuntimeError(
+                    f"Gym agent {participant.server_name!r} returned HTTP 200 "
+                    "without a complete checkpoint boundary"
+                )
+            return payload
 
     async def _wait_for_policy_model_pause(
         self,
@@ -1099,6 +1247,7 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_id: str,
         deadline_ts: float,
         checkpoint_dir: str,
+        source_checkpoint_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Restore every stateful participant but leave admission paused."""
         request = GymCheckpointDirectoryRequest(
@@ -1155,6 +1304,19 @@ Depending on your data shape, you may want to change these values."""
                     payload=payload,
                 )
             )
+            if source_checkpoint_id is not None:
+                actual_source_checkpoint_id = (
+                    payload.checkpoint_id
+                    if isinstance(payload, GymModelRestoreResponse)
+                    else payload.source_checkpoint_id
+                )
+                if actual_source_checkpoint_id != source_checkpoint_id:
+                    raise RuntimeError(
+                        "Gym participant restored the wrong source checkpoint: "
+                        f"participant={participant.participant_name!r}, "
+                        f"expected={source_checkpoint_id!r}, "
+                        f"actual={actual_source_checkpoint_id!r}"
+                    )
         return GymCheckpointRestoreResult(
             checkpoint_id=checkpoint_id,
             participants=results,

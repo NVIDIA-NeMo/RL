@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -96,7 +97,10 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
     prepare_segment_topology,
 )
-from nemo_rl.environments.gym_checkpoint import GymCheckpointTopology
+from nemo_rl.environments.gym_checkpoint import (
+    GymCheckpointTopology,
+    validate_gym_checkpoint_manifests,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import (
@@ -170,6 +174,7 @@ class SingleControllerActorArgs:
     # Discovered only when Gym capability discovery is enabled. Dynamic phases,
     # addresses, and credentials are excluded from this identity.
     gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
+    gym_checkpoint_restore_operation_id: Optional[str] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -970,6 +975,19 @@ def setup_single_controller(
                 "requires the NeMo-Gym rollout path "
                 "(env.should_use_nemo_gym=true)"
             )
+    if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
+        if not master_config.token_capture.enabled:
+            raise ValueError(
+                "rollout_checkpointing.gym.participant_checkpointing_enabled=true "
+                "requires token_capture.enabled=true so RL can durably own a "
+                "completed Gym result before acknowledging it"
+            )
+        if rollout_checkpoint_cfg.restore_mode != "latest":
+            raise ValueError(
+                "Gym participant checkpointing requires "
+                "rollout_checkpointing.restore_mode='latest'; full trainer "
+                "checkpoints do not yet contain Gym participant state"
+            )
     if (
         master_config.checkpointing.get("save_data_plane")
         or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
@@ -1231,6 +1249,17 @@ def setup_single_controller(
         print(
             f"📦 Selected rollout recovery snapshot: {recovery_checkpoint_path}",
             flush=True,
+        )
+    elif (
+        trainer_checkpoint_path is not None
+        and rollout_checkpoint_cfg.gym.participant_checkpointing_enabled
+    ):
+        raise ValueError(
+            "Gym participant checkpointing is enabled, but the selected trainer "
+            "checkpoint has no committed rollout snapshot containing Gym state. "
+            "Use an earlier compatible checkpoint directory or disable Gym "
+            "participant recovery explicitly. Existing checkpoint state was not "
+            "modified."
         )
     elif restore_mode == "trainer_checkpoint" and trainer_checkpoint_path:
         print(
@@ -1559,6 +1588,19 @@ def setup_single_controller(
         gym_actor = env_handles["nemo_gym"]
         discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
         gym_checkpoint_topology = GymCheckpointTopology.model_validate(discovered)
+        if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
+            unsupported_agents = [
+                contract.participant.participant_name
+                for contract in gym_checkpoint_topology.participants
+                if contract.participant.component == "responses_api_agents"
+                and "completed_result_acknowledgement" not in contract.features
+            ]
+            if unsupported_agents:
+                raise RuntimeError(
+                    "Gym participant checkpointing requires completed-result "
+                    "acknowledgement support from every agent participant; "
+                    f"missing={unsupported_agents!r}"
+                )
         if resolved_snapshot is not None:
             saved_topology_fingerprint = (
                 resolved_snapshot.manifest.gym_topology_fingerprint
@@ -1572,9 +1614,47 @@ def setup_single_controller(
                     f"current={current_topology_fingerprint!r}"
                 )
 
+    gym_checkpoint_restore_operation_id: Optional[str] = None
+    saved_gym_checkpoint = (
+        resolved_snapshot.manifest.gym_checkpoint
+        if resolved_snapshot is not None
+        else None
+    )
+    if saved_gym_checkpoint is not None and not (
+        rollout_checkpoint_cfg.gym.participant_checkpointing_enabled
+    ):
+        raise ValueError(
+            "the selected rollout snapshot contains Gym participant state; "
+            "enable rollout_checkpointing.gym.participant_checkpointing_enabled "
+            "to restore it"
+        )
+    if (
+        resolved_snapshot is not None
+        and rollout_checkpoint_cfg.gym.participant_checkpointing_enabled
+        and saved_gym_checkpoint is None
+    ):
+        raise ValueError(
+            "Gym participant checkpointing is enabled, but the selected rollout "
+            "snapshot contains no Gym participant state"
+        )
+
     setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     if "value_time" in time_metrics:
         setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
+
+    if saved_gym_checkpoint is not None:
+        assert resolved_snapshot is not None
+        assert gym_checkpoint_topology is not None
+        # Reject a corrupt or incomplete participant export before mutating the
+        # live data plane. Each Gym participant validates its own manifest again
+        # while restoring.
+        gym_checkpoint_topology.validate_checkpoint_participants(
+            saved_gym_checkpoint
+        )
+        validate_gym_checkpoint_manifests(
+            resolved_snapshot.path,
+            saved_gym_checkpoint,
+        )
 
     # Native TQ restore must run through the trainer's bootstrap client before
     # the normal SC data-plane client is created or any rollout/train data-plane
@@ -1590,6 +1670,22 @@ def setup_single_controller(
     if rollout_checkpoint_load_metrics is not None:
         rollout_checkpoint_load_metrics["tq_load_seconds"] = (
             time.monotonic() - data_plane_load_started
+        )
+
+    if saved_gym_checkpoint is not None:
+        assert resolved_snapshot is not None
+        awaitable_gym_actor = env_handles["nemo_gym"]
+        gym_checkpoint_restore_operation_id = f"restore-{uuid.uuid4().hex}"
+        restore_deadline_ts = (
+            time.time() + rollout_checkpoint_cfg.gym.prepare_timeout_s
+        )
+        ray.get(
+            awaitable_gym_actor.restore_checkpoint.remote(
+                gym_checkpoint_restore_operation_id,
+                restore_deadline_ts,
+                str(resolved_snapshot.path),
+                saved_gym_checkpoint.checkpoint_id,
+            )
         )
 
     if use_nemo_gym:
@@ -1828,6 +1924,7 @@ def setup_single_controller(
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         gym_checkpoint_topology=gym_checkpoint_topology,
+        gym_checkpoint_restore_operation_id=gym_checkpoint_restore_operation_id,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

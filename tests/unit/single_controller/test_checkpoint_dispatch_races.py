@@ -191,6 +191,7 @@ class _PendingLedger:
     def state_dict(self) -> dict[str, Any]:
         return {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "pending_completed_execution_acknowledgements": [],
             "groups": [
                 {
                     "group_id": group.group_id,

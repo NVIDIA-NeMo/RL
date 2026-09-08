@@ -126,6 +126,36 @@ token_capture:
   enabled: true
 ```
 
+To include NeMo-Gym's model lineage, parked agent boundaries, and resource
+snapshots in the same outer snapshot, enable the experimental participant
+protocol:
+
+```yaml
+rollout_checkpointing:
+  snapshot_attempt_interval_s: 120
+  gym:
+    capability_discovery_enabled: true
+    participant_checkpointing_enabled: true
+    prepare_timeout_s: 300
+```
+
+Single Controller first closes new rollout admission, acknowledges completed
+Gym executions that are already owned by canonical TQ rows, and asks Gym to
+park the remaining work. Gym writes its participant manifests into the
+unpublished snapshot directory. Only then does Single Controller take the
+short data-plane barrier and save TQ plus replay and recovery metadata. The
+outer snapshot publishes atomically after all participant manifest digests
+validate. On failure, Gym is resumed and the previous committed snapshot stays
+authoritative.
+
+This mode requires a Gym revision that advertises the checkpoint protocol and
+completed-result acknowledgement feature. It also requires
+`token_capture.enabled: true`; NeMo-RL never tells Gym to release a completed
+terminal result until the canonical TQ and replay-buffer commit has succeeded.
+Use `restore_mode: latest`: full trainer checkpoints do not yet contain Gym
+participant state, so startup fails safely if no compatible periodic rollout
+snapshot exists for the selected trainer anchor.
+
 `snapshot_attempt_interval_s` is the cadence at which Single-Controller attempts
 a rollout snapshot. It is not a guarantee that a snapshot is written at every
 interval. An attempt after step N succeeds only when the immutable trainer
