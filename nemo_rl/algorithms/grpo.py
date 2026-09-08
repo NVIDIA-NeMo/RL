@@ -521,23 +521,14 @@ def shutdown_environments(
                     print(f"Error stopping environment {task_name}: {kill_error}")
 
 
-def _training_sampling_params_from_generation_config(
-    generation_config: GenerationConfig,
-) -> TrainingSamplingParams:
-    """Build the effective policy-logprob sampling configuration."""
-    return TrainingSamplingParams(
-        top_k=generation_config["top_k"],
-        top_p=generation_config["top_p"],
-        temperature=generation_config["temperature"],
-    )
-
-
 def _validate_fused_linear_logprobs_sampling(
     generation_config: GenerationConfig,
 ) -> None:
     """Reject sampling transforms unsupported by fused Megatron logprobs."""
-    sampling_params = _training_sampling_params_from_generation_config(
-        generation_config
+    sampling_params = TrainingSamplingParams(
+        top_k=generation_config["top_k"],
+        top_p=generation_config["top_p"],
+        temperature=generation_config["temperature"],
     )
     assert sampling_params.temperature == 1.0, (
         "Linear CE fusion loss is not supported with non-unit training-time "

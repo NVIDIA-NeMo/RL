@@ -51,7 +51,6 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
     _startup_pipeline_ready,
-    _training_sampling_params_from_generation_config,
     _validate_fused_linear_logprobs_sampling,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
@@ -118,17 +117,12 @@ def _mock_policy_generation() -> MagicMock:
     return policy_generation
 
 
-def test_training_sampling_params_from_generation_config_normalizes_greedy() -> None:
+def test_fused_linear_logprobs_allows_greedy_sampling() -> None:
     generation_config = cast(
         GenerationConfig,
         {"top_k": 5, "top_p": 0.8, "temperature": 0.0},
     )
 
-    params = _training_sampling_params_from_generation_config(generation_config)
-
-    assert params.temperature == 1.0
-    assert params.top_k is None
-    assert params.top_p == 1.0
     _validate_fused_linear_logprobs_sampling(generation_config)
 
 
