@@ -507,6 +507,7 @@ def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
     assert datum is not None
     user_message = datum["message_log"][0]
     assert user_message["num_frames"].as_tensor().tolist() == [4]
+    assert user_message["num_frames"].as_tensor().dtype == torch.int32
     assert user_message["imgs_sizes"].as_tensor().dtype == torch.int32
     extra_env_info = datum["extra_env_info"]
     outbound_content = extra_env_info["responses_create_params"]["input"][0]["content"]
@@ -1837,8 +1838,13 @@ def test_nemo_gym_sanity(
                 message["prompt_str"] = "dummy prompt_str"
             if "generation_str" in message:
                 message["generation_str"] = "dummy generation_str"
-            message.setdefault("is_invalid_tool_call", False)
-            message.setdefault("has_malformed_thinking", False)
+            for generation_flag in (
+                "is_invalid_tool_call",
+                "has_malformed_thinking",
+            ):
+                if generation_flag in message:
+                    assert isinstance(message[generation_flag], bool)
+                    message.pop(generation_flag)
 
         return d
 

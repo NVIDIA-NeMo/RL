@@ -89,7 +89,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(
         run_grpo_single_controller,
         "setup_single_controller",
-        lambda *_args: (actor_args, SetupTimingMetrics()),
+        lambda *_args, **_kwargs: (actor_args, SetupTimingMetrics()),
     )
     monkeypatch.setattr(
         run_grpo_single_controller.SingleControllerActor,
@@ -169,4 +169,31 @@ def test_main_configures_generation_for_trained_mtp(
     )
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
+    )
+
+
+def test_main_passes_processor_for_vlm(
+    main_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = SimpleNamespace(tokenizer="vlm-tokenizer")
+    get_tokenizer = MagicMock(return_value=processor)
+    setup_single_controller = MagicMock(
+        return_value=(main_context.actor_args, SetupTimingMetrics())
+    )
+    main_context.config.policy["is_vlm"] = True
+    monkeypatch.setattr(run_grpo_single_controller, "get_tokenizer", get_tokenizer)
+    monkeypatch.setattr(
+        run_grpo_single_controller,
+        "setup_single_controller",
+        setup_single_controller,
+    )
+
+    run_grpo_single_controller.main()
+
+    get_tokenizer.assert_called_once_with(
+        main_context.config.policy["tokenizer"], get_processor=True
+    )
+    setup_single_controller.assert_called_once_with(
+        main_context.config, "vlm-tokenizer", processor=processor
     )

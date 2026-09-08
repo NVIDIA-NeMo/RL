@@ -215,6 +215,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         mask_sample=[True, False],
         fallback_weight_version=9,
         prompt_idx=0,
+        loss_multiplier=0.25,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
@@ -229,7 +230,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
 
     rows = _fetch_rows(tq_client, rollout_ids)
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()
-    assert sample_mask.tolist() == [1.0, 0.0]
+    assert sample_mask.tolist() == [0.25, 0.0]
     input_ids = torch.as_tensor(rows["input_ids"][0]).flatten()
     assert input_ids[:valid_len].tolist() == expected.token_ids
     # Placeholder borrows the valid sibling's prompt for baseline grouping.
