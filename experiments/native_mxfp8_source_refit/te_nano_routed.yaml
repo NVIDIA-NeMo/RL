@@ -1,0 +1,27 @@
+configs:
+  bf16:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      override_quantized_autocast: true
+  mxfp8:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      fp8_quantization_recipe: mxfp8
+      override_quantized_autocast: true
+
+matchers:
+  routed_experts_fc1_mxfp8:
+    config: mxfp8
+    type: glob
+    pattern: "*mlp.experts.linear_fc1"
+    enabled: true
+  routed_experts_fc2_mxfp8:
+    config: mxfp8
+    type: glob
+    pattern: "*mlp.experts.linear_fc2"
+    enabled: true
+  all_other_modules_bf16:
+    config: bf16
+    type: glob
+    pattern: "*"
+    enabled: true
