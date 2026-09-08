@@ -117,6 +117,8 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     p = object.__new__(TQPolicy)
     p.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
     p._router_replay_enabled = False
+    # opd_full off, as __init__ leaves it when the config block is absent.
+    p._opd_full_field = None
     p.flops_tracker = None
     wg = MagicMock()
     wg.run_all_workers_single_data.return_value = ["f0", "f1"]

@@ -127,6 +127,7 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
+from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
@@ -892,6 +893,54 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
     )
 
 
+def _load_opd_full_teacher_lm_heads(
+    trainer: Any,
+    teacher_worker_groups: dict[str, Any],
+) -> None:
+    """Load the teacher LM head onto every student worker for full-vocabulary MOPD.
+
+    Callers gate this on the ``hidden_states`` payload; the ``logits`` payload
+    ships the projected distribution and needs no teacher LM head.
+
+    Args:
+        trainer: The driver-side policy whose workers hold the student model.
+        teacher_worker_groups: Deduplicated teacher groups, keyed by primary alias.
+
+    Raises:
+        ValueError: If the run does not resolve to exactly one teacher checkpoint.
+    """
+    teacher_checkpoints = {
+        teacher.model_name for teacher in teacher_worker_groups.values()
+    }
+    if len(teacher_checkpoints) != 1:
+        raise ValueError(
+            "on_policy_distillation.full currently supports exactly one teacher "
+            f"checkpoint, got {sorted(teacher_checkpoints)}."
+        )
+
+    teacher = next(iter(teacher_worker_groups.values()))
+    # TeacherWorkerGroup deep-copies the student policy config and overrides only
+    # `model_name`, so a student `pretrained_checkpoint` rides along. Left in,
+    # validate_model_paths would hand back the *student's* checkpoint, silently
+    # distilling the student into itself. Clear it so resolution keys off the
+    # teacher's model name.
+    #
+    # Resolution happens on the student workers, not here: validate_model_paths
+    # imports megatron.bridge at module scope, and only the Megatron worker
+    # actors get the mcore extra.
+    teacher_path_config = {**teacher.cfg, "pretrained_checkpoint": None}
+    results = ray.get(
+        trainer.worker_group.run_all_workers_single_data(
+            "load_opd_full_teacher_lm_head",
+            teacher_path_config=cast(PolicyConfig, teacher_path_config),
+        )
+    )
+    print(
+        f"  ✓ Loaded opd_full teacher LM head from {results[0]}",
+        flush=True,
+    )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1086,6 +1135,23 @@ def setup_single_controller(
                     "gym_token_capture",
                 )
             )
+
+    # Resolved once here so the student workers and the teacher worker group
+    # (which deep-copies this config) read the same settings. Absent means the
+    # feature is off; workers must not re-derive a default.
+    opd_full_config = opd_module.get_opd_full_config(master_config)
+    if opd_full_config is not None:
+        # model_dump() is typed dict[str, Any], so the envelope is assembled here
+        # and cast: OnPolicyDistillationFullConfig stays the single source of the
+        # keys and their defaults, and OnPolicyDistillationFullTransport mirrors
+        # it for the workers that read it.
+        policy_config["on_policy_distillation_full"] = cast(
+            OnPolicyDistillationFullTransport,
+            {
+                **opd_full_config.model_dump(),
+                "payload_field": opd_module.opd_full_payload_field(opd_full_config),
+            },
+        )
 
     set_seed(algo_cfg.seed)
 
@@ -1578,6 +1644,13 @@ def setup_single_controller(
         )
         for teacher in teacher_worker_groups.values():
             teacher.setup_data_plane(dp_config)
+        # Only reachable now: create_teacher_worker_groups above materializes the
+        # teacher's Megatron checkpoint, so the LM head cannot be read earlier.
+        if (
+            opd_full_config is not None
+            and opd_full_config.teacher_payload == "hidden_states"
+        ):
+            _load_opd_full_teacher_lm_heads(trainer, teacher_worker_groups)
         setup_timing_metrics.teacher_model_init_time_s = time.perf_counter() - t0
         setup_timing_metrics.teacher_init_time_s = (
             setup_timing_metrics.teacher_reservation_time_s or 0.0
@@ -1694,7 +1767,10 @@ def setup_single_controller(
     # Setup Algorithm + Rollout Wiring
     # ==========================
     advantage_estimator = _build_advantage_estimator(master_config)
-    loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
+    loss_fn: LossFunction = ClippedPGLossFn(
+        master_config.loss_fn,
+        opd_full=opd_module.get_opd_full_config(master_config),
+    )
     value_loss_fn: Optional[LossFunction] = (
         MseValueLossFn(master_config.value_loss_fn)  # type: ignore
         if is_ppo_run(master_config)

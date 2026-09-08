@@ -46,6 +46,18 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+def _disable_opd_full(worker) -> None:
+    """Set the opd_full attributes to the state __init__ gives them when off.
+
+    These doubles are built with ``object.__new__``, so every attribute the
+    paths under test read has to be set here by hand.
+    """
+    worker._opd_full_enabled = False
+    worker._opd_full_lm_head_lifecycle = "offload"
+    worker._opd_full_teacher_lm_head = None
+    worker._opd_full_teacher_checkpoint_path = None
+
+
 def test_model_owned_packing_capability_is_detected():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,
@@ -164,6 +176,7 @@ def test_model_cp_slicing_accepts_data_plane_setup():
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     worker.model_slices_context_parallel_inputs = True
     worker._dp_client = None
 
@@ -188,6 +201,7 @@ def test_model_cp_slicing_accepts_transfer_queue_setup(monkeypatch):
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     worker.model_slices_context_parallel_inputs = True
     worker._dp_client = None
 
@@ -270,6 +284,7 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
 
     events = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     worker.model = object()
     worker.optimizer = None
     worker.optimizer_cpu_offload = False
@@ -314,6 +329,7 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
 
     moved = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     worker.model = object()
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
@@ -364,6 +380,7 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     worker.model = _FakeTrainableModel()
     worker.model.eval = lambda: events.append("eval")
     worker.cfg = (
@@ -411,6 +428,7 @@ def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     worker.model = _FakeTrainableModel()
     worker.model.eval = lambda: events.append("eval")
     worker.move_model = lambda model, device, **kwargs: (
@@ -434,6 +452,7 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
 
     events = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     worker.model = _FakeTrainableModel()
     worker.model.training = False
     worker.optimizer = object()
@@ -548,6 +567,7 @@ def test_megatron_move_model_does_not_serialize_extra_state():
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     model = _ModelWithNonSerializableExtraState()
 
     moved_model = MegatronPolicyWorkerImpl.move_model(worker, model, "cpu")
@@ -563,6 +583,7 @@ def test_megatron_prepare_for_training_restores_optimizer():
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     model = _FakeTrainableModel()
     restored_devices = []
 
@@ -586,6 +607,7 @@ def test_megatron_prepare_for_training_leaves_native_cpu_optimizer_placement():
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     model = _FakeTrainableModel()
 
     worker.model = model
@@ -609,6 +631,7 @@ def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     model_config = SimpleNamespace()
     worker.model = SimpleNamespace(config=model_config)
 
@@ -630,6 +653,7 @@ def test_set_moe_grad_scale_func_handles_float16module_wrapper():
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     inner_config = SimpleNamespace()
     worker.model = SimpleNamespace(module=SimpleNamespace(config=inner_config))
 
@@ -647,6 +671,7 @@ def test_set_moe_grad_scale_func_noop_when_no_config():
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     worker.model = SimpleNamespace()  # no .config and no .module
 
     # Should not raise even though there is no config to set the func on.
@@ -660,6 +685,7 @@ def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
 
     scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
         worker, torch.tensor(4.0)
@@ -674,6 +700,7 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
 
     scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
         worker, torch.tensor(0.0)

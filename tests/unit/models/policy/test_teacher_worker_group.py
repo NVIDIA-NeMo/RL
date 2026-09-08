@@ -150,6 +150,17 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     assert policy_config["router_replay"]["enabled"] is True
 
 
+def _disable_opd_full(teacher) -> None:
+    """Set the opd_full attributes to the state __init__ gives them when off.
+
+    These doubles are built with ``object.__new__``, so every attribute the
+    dispatch path reads has to be set here by hand.
+    """
+    teacher._opd_full_payload = None
+    teacher._opd_full_payload_dtype = "bfloat16"
+    teacher._opd_full_payload_field = None
+
+
 def test_get_logprobs_from_meta_dispatches_tq_shards_to_teacher_workers():
     """TeacherWorkerGroup sends metadata, not token tensors, to each DP rank."""
     from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
@@ -162,6 +173,7 @@ def test_get_logprobs_from_meta_dispatches_tq_shards_to_teacher_workers():
     worker_group = MagicMock()
     worker_group.run_all_workers_sharded_data.return_value = "futures"
     teacher = object.__new__(TeacherWorkerGroup)
+    _disable_opd_full(teacher)
     teacher.alias = "teacher"
     teacher.use_sequence_packing = False
     teacher.use_dynamic_batches = False
@@ -211,6 +223,7 @@ def test_get_logprobs_from_meta_builds_global_dynamic_batch_plan(monkeypatch):
     monkeypatch.setattr(teacher_module, "shard_meta_for_dp", capture_plan)
     worker_group = MagicMock()
     teacher = object.__new__(TeacherWorkerGroup)
+    _disable_opd_full(teacher)
     teacher.alias = "teacher"
     teacher.use_sequence_packing = False
     teacher.use_dynamic_batches = True
@@ -291,6 +304,7 @@ def test_get_logprobs_from_meta_builds_global_sequence_packing_plan(monkeypatch)
     monkeypatch.setattr(teacher_module, "shard_meta_for_dp", capture_plan)
     worker_group = MagicMock()
     teacher = object.__new__(TeacherWorkerGroup)
+    _disable_opd_full(teacher)
     teacher.alias = "teacher"
     teacher.use_sequence_packing = True
     teacher.use_dynamic_batches = False
