@@ -184,6 +184,7 @@ def calculate_baseline_and_std_per_prompt(
     rewards: torch.Tensor,
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
+    leave_one_out_std: bool = False,
     std_rewards: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
@@ -196,6 +197,10 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
                                   the baseline is for (from RLOO https://arxiv.org/abs/2402.14740)
+    leave_one_out_std: bool       Reproduce the legacy text-RL normalization by also leaving the
+                                  current sample out of the standard deviation. This is disabled
+                                  by default because a sole reward outlier then receives a near-zero
+                                  denominator. It is retained only for controlled comparisons.
     std_rewards: tensor (b,)      Optional separate reward tensor used only for the std
                                   calculation. Defaults to `rewards`. Useful for DAPO,
                                   which needs std on the raw task metric for dynamic
@@ -205,6 +210,9 @@ def calculate_baseline_and_std_per_prompt(
     Returns:
     tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
     """
+    if leave_one_out_std and not leave_one_out_baseline:
+        raise ValueError("leave_one_out_std requires leave_one_out_baseline=True")
+
     if std_rewards is None:
         std_rewards = rewards
     unique_prompts = torch.unique(prompts, dim=0)
@@ -245,15 +253,48 @@ def calculate_baseline_and_std_per_prompt(
                 / num_valid
             )
             baseline[prompt_idx] = prompt_baseline
-            # Leave-one-out applies only to the baseline. GRPO normalization
-            # uses one full-group denominator for every response. Reusing the
-            # LOO mask for variance can exclude a group's sole reward outlier
-            # from its own denominator and create an extreme advantage.
-            valid_std_rewards = std_rewards[prompt_idx][valid_mask[prompt_idx].bool()]
-            # torch.std is also stable for tightly clustered rewards, unlike
-            # the cancellation-prone E[x^2] - E[x]^2 expression.
-            prompt_std = valid_std_rewards.std(correction=1).nan_to_num(0)
-            std[prompt_idx] = prompt_std
+            if leave_one_out_std:
+                # Compatibility path for the historical text-RL estimator:
+                # every response is normalized by the sample std of the other
+                # valid responses. Keep this opt-in because it can amplify a
+                # sole outlier when the remaining rewards have low variance.
+                std_prompt_baseline = (
+                    prompt_baseline
+                    if std_rewards is rewards
+                    else torch.matmul(
+                        baseline_mask_matrix,
+                        std_rewards[prompt_idx] * valid_mask[prompt_idx],
+                    )
+                    / num_valid
+                )
+                std_prompt_baseline_square = (
+                    torch.matmul(
+                        baseline_mask_matrix,
+                        torch.pow(std_rewards[prompt_idx], 2)
+                        * valid_mask[prompt_idx],
+                    )
+                    / num_valid
+                )
+                std[prompt_idx] = (
+                    (
+                        (std_prompt_baseline_square - std_prompt_baseline.square())
+                        * (num_valid / (num_valid - 1))
+                    )
+                    .sqrt()
+                    .nan_to_num(0)
+                )
+            else:
+                # Leave-one-out applies only to the baseline. GRPO normalization
+                # uses one full-group denominator for every response. Reusing the
+                # LOO mask for variance can exclude a group's sole reward outlier
+                # from its own denominator and create an extreme advantage.
+                valid_std_rewards = std_rewards[prompt_idx][
+                    valid_mask[prompt_idx].bool()
+                ]
+                # torch.std is stable for tightly clustered rewards, unlike the
+                # cancellation-prone E[x^2] - E[x]^2 expression.
+                prompt_std = valid_std_rewards.std(correction=1).nan_to_num(0)
+                std[prompt_idx] = prompt_std
 
     return baseline, std
 

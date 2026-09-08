@@ -70,6 +70,7 @@ router_replay_enabled="${ROUTER_REPLAY_ENABLED:-false}"
 router_replay_transport="${ROUTER_REPLAY_TRANSPORT:-}"
 load_replay_buffer="${LOAD_REPLAY_BUFFER:-}"
 use_leave_one_out_baseline="${USE_LEAVE_ONE_OUT_BASELINE:-false}"
+use_leave_one_out_std="${USE_LEAVE_ONE_OUT_STD:-false}"
 async_grpo_enabled="${ASYNC_GRPO_ENABLED:-true}"
 max_trajectory_age_steps="${MAX_TRAJECTORY_AGE_STEPS:-1}"
 freeze_moe_router="${FREEZE_MOE_ROUTER:-true}"
@@ -278,6 +279,7 @@ export NEMO_RL_VIDEO_MEDIA_ROOT=/
   grpo.length_penalty.profile_band.enabled="${profile_band_enabled}" \
   grpo.use_leave_one_out_baseline="${use_leave_one_out_baseline}" \
   ++grpo.adv_estimator.use_leave_one_out_baseline="${use_leave_one_out_baseline}" \
+  ++grpo.adv_estimator.use_leave_one_out_std="${use_leave_one_out_std}" \
   policy.megatron_cfg.freeze_moe_router="${freeze_moe_router}" \
   policy.megatron_cfg.moe_router_load_balancing_type="${moe_router_load_balancing_type}" \
   policy.megatron_cfg.moe_router_bias_update_rate="${moe_router_bias_update_rate}" \
@@ -310,7 +312,7 @@ submit_args=(
 )
 
 echo "candidate=${candidate_name}"
-echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} training_nodes=${num_train_nodes} generation_nodes=${num_gen_nodes} policy_dp=${policy_dp_size} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} async=${async_grpo_enabled} age=${max_trajectory_age_steps} length_penalty=${length_penalty_enabled} profile_band=${profile_band_enabled} router_replay=${router_replay_enabled} router_transport=${router_replay_transport} load_replay_buffer=${load_replay_buffer} leave_one_out=${use_leave_one_out_baseline} freeze_moe_router=${freeze_moe_router} moe_load_balancing=${moe_router_load_balancing_type} moe_bias_rate=${moe_router_bias_update_rate} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template}"
+echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} training_nodes=${num_train_nodes} generation_nodes=${num_gen_nodes} policy_dp=${policy_dp_size} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} async=${async_grpo_enabled} age=${max_trajectory_age_steps} length_penalty=${length_penalty_enabled} profile_band=${profile_band_enabled} router_replay=${router_replay_enabled} router_transport=${router_replay_transport} load_replay_buffer=${load_replay_buffer} leave_one_out=${use_leave_one_out_baseline} leave_one_out_std=${use_leave_one_out_std} freeze_moe_router=${freeze_moe_router} moe_load_balancing=${moe_router_load_balancing_type} moe_bias_rate=${moe_router_bias_update_rate} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template}"
 echo "container=${container}"
 echo "results=${results_dir}"
 echo "run_cache=${run_cache_dir}"

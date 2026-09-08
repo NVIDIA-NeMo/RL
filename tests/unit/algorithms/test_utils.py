@@ -795,6 +795,37 @@ def test_full_group_std_is_stable_for_tightly_clustered_rewards():
     assert torch.allclose(std, expected_std)
 
 
+def test_legacy_leave_one_out_std_reproduces_text_rl_normalization():
+    """The compatibility switch computes a response-specific others-only std."""
+    rewards = torch.tensor([0.0, 0.0, 0.0, 1.0])
+    prompts = torch.zeros((4, 1), dtype=torch.long)
+    valid_mask = torch.ones_like(rewards)
+
+    baseline, std = calculate_baseline_and_std_per_prompt(
+        prompts,
+        rewards,
+        valid_mask,
+        leave_one_out_baseline=True,
+        leave_one_out_std=True,
+    )
+
+    expected_baseline = torch.tensor([1 / 3, 1 / 3, 1 / 3, 0.0])
+    expected_std = torch.tensor([1 / 3**0.5, 1 / 3**0.5, 1 / 3**0.5, 0.0])
+    assert torch.allclose(baseline, expected_baseline)
+    assert torch.allclose(std, expected_std)
+
+
+def test_legacy_leave_one_out_std_requires_loo_baseline():
+    with pytest.raises(ValueError, match="requires leave_one_out_baseline=True"):
+        calculate_baseline_and_std_per_prompt(
+            torch.zeros((2, 1), dtype=torch.long),
+            torch.tensor([0.0, 1.0]),
+            torch.ones(2),
+            leave_one_out_baseline=False,
+            leave_one_out_std=True,
+        )
+
+
 def test_calculate_baseline_and_std_per_prompt_cuda_compatibility():
     """Test calculate_baseline_and_std_per_prompt works with CUDA tensors if available."""
     if not torch.cuda.is_available():

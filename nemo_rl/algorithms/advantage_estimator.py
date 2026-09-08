@@ -48,6 +48,9 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     # GRPO specific
     normalize_rewards: bool = True
     use_leave_one_out_baseline: bool = True
+    # Compatibility option for reproducing legacy text-RL LOO normalization.
+    # When false, LOO affects only the baseline and std uses the full group.
+    use_leave_one_out_std: bool = False
     # GDPO specific: optional per-component weights w_n for the aggregation.
     reward_weights: list[float] | None = None
     # Reinforce++ specific
@@ -64,6 +67,7 @@ class GRPOAdvantageEstimator:
         self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
     ):
         self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+        self.use_leave_one_out_std = estimator_config.use_leave_one_out_std
         self.normalize_rewards = estimator_config.normalize_rewards
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
@@ -84,6 +88,7 @@ class GRPOAdvantageEstimator:
             rewards,
             torch.ones_like(rewards),
             leave_one_out_baseline=self.use_leave_one_out_baseline,
+            leave_one_out_std=self.use_leave_one_out_std,
         )
         advantages = (rewards - baseline).unsqueeze(-1)
 
