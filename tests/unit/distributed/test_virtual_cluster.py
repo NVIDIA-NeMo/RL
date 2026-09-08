@@ -11,9 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
+import re
 import socket
 import subprocess
+import sys
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
@@ -21,8 +25,11 @@ import pytest
 import ray
 
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_PORT_RANGE_LOW,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
     DEFAULT_MASTER_PORT_RANGE_HIGH,
@@ -43,6 +50,27 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
+
+
+def _ray_sub_default(name: str) -> int:
+    ray_sub = (Path(__file__).resolve().parents[3] / "ray.sub").read_text()
+    match = re.search(
+        rf'^{re.escape(name)}="?\$\{{[A-Z0-9_]+:-(\d+)\}}"?',
+        ray_sub,
+        re.MULTILINE,
+    )
+    assert match is not None, f"{name} default not found in ray.sub"
+    return int(match.group(1))
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    (("SANDBOX_PORT", 6000), ("SANDBOX_BASE_PORT", 6001)),
+)
+def test_ray_sub_default_handles_quoted_and_aliased_variables(
+    name: str, expected: int
+) -> None:
+    assert _ray_sub_default(name) == expected
 
 
 def test_get_node_ip_and_free_port_does_not_start_with_zero():
@@ -257,6 +285,31 @@ def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
         assert env_vars["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
 
 
+def test_init_ray_adds_hf_modules_cache_to_cluster_pythonpath():
+    """Direct actors must import trust_remote_code classes while unpickling."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "HF_MODULES_CACHE": "/hf/modules",
+            "PYTHONPATH": "/project",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            init_ray()
+
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert env_vars["HF_MODULES_CACHE"] == "/hf/modules"
+        assert env_vars["PYTHONPATH"].split(os.pathsep) == [
+            "/hf/modules",
+            "/project",
+        ]
+
+
 def test_init_ray_alone_has_no_data_plane_awareness():
     """Every non-data-plane launcher's call (bare init_ray(), no preceding
     maybe_configure_data_plane_env) must not touch mooncake env vars --
@@ -277,6 +330,10 @@ def test_init_ray_alone_has_no_data_plane_awareness():
         assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in env_vars
 
 
+@pytest.mark.skipif(
+    os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1",
+    reason="No venv is built when every PY_EXECUTABLES entry is sys.executable",
+)
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project
@@ -634,9 +691,46 @@ class TestVllmPortAssignment:
         assert "VLLM_PORT" not in env_vars
 
 
+def test_router_band_does_not_collide_with_ray_sub_ports():
+    reserved = {
+        _ray_sub_default("PORT"),
+        _ray_sub_default("RAY_CLIENT_SERVER_PORT"),
+        _ray_sub_default("DASHBOARD_PORT"),
+    }
+    # ray.sub gives the head node these ports + 1; workers get the odd values.
+    for name in (
+        "NODE_MANAGER_PORT",
+        "OBJECT_MANAGER_PORT",
+        "RUNTIME_ENV_AGENT_PORT",
+        "DASHBOARD_AGENT_GRPC_PORT",
+        "METRICS_EXPORT_PORT",
+        "DASHBOARD_AGENT_LISTEN_PORT",
+    ):
+        reserved |= {_ray_sub_default(name), _ray_sub_default(name) + 1}
+    reserved |= set(
+        range(
+            _ray_sub_default("MIN_WORKER_PORT"),
+            _ray_sub_default("MAX_WORKER_PORT") + 1,
+        )
+    )
+
+    router_band = set(
+        range(
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+        )
+    )
+    assert not router_band & reserved, sorted(router_band & reserved)
+
+
 def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     # Lowest observed ephemeral floor on some GB200 nodes; stock Linux is 32768.
     EPHEMERAL_FLOOR = 9000
+    assert (
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        < DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+        <= DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW
+    )
     assert DEFAULT_MASTER_PORT_RANGE_LOW < DEFAULT_MASTER_PORT_RANGE_HIGH
     assert DEFAULT_GENERATION_PORT_RANGE_LOW < DEFAULT_GENERATION_PORT_RANGE_HIGH
     assert DEFAULT_GYM_PORT_RANGE_LOW < DEFAULT_GYM_PORT_RANGE_HIGH
@@ -651,12 +745,12 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     )
     # SGLang router / Prometheus carve-outs live inside the vLLM band (only one
     # rollout backend runs at a time), stay above the 8-engine vLLM high-water
-    # mark and the Ray dashboard (8265), and sit below the ephemeral floor.
+    # mark and the Ray dashboard, and sit below the ephemeral floor.
     assert (
         DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
         < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
     )
-    assert 8265 < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    assert _ray_sub_default("DASHBOARD_PORT") < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
     assert DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW < DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH
     assert (
         DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
@@ -667,4 +761,56 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     )
     assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
     # Avoid privileged ports (<1024).
+    assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
+
+
+_REGISTRY_PROBE = """
+import json
+
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+    get_actor_python_env,
+)
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+envs = {fqn: get_actor_python_env(fqn) for fqn in ACTOR_ENVIRONMENT_REGISTRY}
+# Also assert on PY_EXECUTABLES directly: a constant with no registry entry
+# is invisible to envs, so the class-level promise needs its own check.
+constants = {n: getattr(PY_EXECUTABLES, n) for n in vars(PY_EXECUTABLES) if n.isupper()}
+print(
+    json.dumps(
+        {
+            "all_system": set(envs.values()) | set(constants.values())
+            == {PY_EXECUTABLES.SYSTEM},
+            "envs": envs,
+            "constants": constants,
+        }
+    )
+)
+"""
+
+
+@pytest.mark.parametrize("use_system_executable", [False, True])
+def test_actor_registry_honors_system_flag(use_system_executable):
+    # The registry freezes its executable strings at import, so the flag can
+    # only be exercised in a fresh interpreter.
+    env = dict(os.environ)
+    env["NEMO_RL_PY_EXECUTABLES_SYSTEM"] = "1" if use_system_executable else "0"
+    result = subprocess.run(
+        [sys.executable, "-c", _REGISTRY_PROBE],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+
+    if use_system_executable:
+        assert payload["all_system"], (payload["envs"], payload["constants"])
+    else:
+        envs = payload["envs"]
+        assert envs[
+            "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+        ].startswith("uv run")
+        assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")

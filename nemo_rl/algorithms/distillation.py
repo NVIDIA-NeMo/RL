@@ -21,7 +21,6 @@ import numpy as np
 import ray
 import torch
 from pydantic import BaseModel
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -50,11 +49,8 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
-    NemoGym,
-    NemoGymConfig,
-    get_nemo_gym_uv_cache_dir,
-    get_nemo_gym_venv_dir,
     should_use_nemo_gym,
+    spinup_nemo_gym_actor,
 )
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -86,7 +82,6 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
@@ -341,12 +336,6 @@ def setup(
     colocated_inference = generation_config["colocated"]["enabled"]
     enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
     nemo_gym_actor: Optional[EnvironmentInterface] = None
-    if enable_nemo_gym:
-        nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
-        ray_cur_node_id = ray.get_runtime_context().get_node_id()
-    else:
-        nemo_gym_num_nodes = 0
-        ray_cur_node_id = None
     segment_size = cluster_config.get("segment_size")
 
     if colocated_inference:
@@ -529,45 +518,15 @@ def setup(
                 return deferred_vllm
 
             def init_nemo_gym():
-                nemo_gym_dict = dict(env_configs["nemo_gym"])
-                # These are NeMo-RL-side fields consumed by NemoGymConfig, not
-                # NeMo-Gym global config entries.
-                invalid_tool_call_patterns = nemo_gym_dict.pop(
-                    "invalid_tool_call_patterns", None
-                )
-                thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
-                # Pass prebuilt cache + venv dirs through the global config so the
-                # gym reuses image-baked venvs instead of rebuilding them.
-                uv_cache_dir = get_nemo_gym_uv_cache_dir()
-                if uv_cache_dir is not None:
-                    nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
-                uv_venv_dir = get_nemo_gym_venv_dir()
-                if uv_venv_dir is not None:
-                    nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
-                nemo_gym_cfg = NemoGymConfig(
+                return spinup_nemo_gym_actor(
+                    env_configs,
+                    base_urls=cast(list[str], deferred_vllm.dp_openai_server_base_urls),
                     model_name=generation_config["model_name"],
-                    base_urls=deferred_vllm.dp_openai_server_base_urls,
-                    invalid_tool_call_patterns=invalid_tool_call_patterns,
-                    thinking_tags=thinking_tags,
+                    tokenizer=tokenizer,
+                    # Distillation does not configure vLLM for router replay.
+                    enable_router_replay=False,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
-                    initial_global_config_dict=nemo_gym_dict,
                 )
-                nemo_gym_opts = {
-                    "runtime_env": make_actor_runtime_env(
-                        "nemo_rl.environments.nemo_gym.NemoGym"
-                    )
-                }
-                if nemo_gym_num_nodes:
-                    nemo_gym_opts["scheduling_strategy"] = (
-                        NodeAffinitySchedulingStrategy(
-                            node_id=ray_cur_node_id,
-                            soft=True,
-                        )
-                    )
-                actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-                ray.get(actor._spinup.remote())
-                ray.get(actor.set_tokenizer.remote(tokenizer))
-                return actor
 
             init_tasks = {
                 "vllm": init_vllm_deferred,

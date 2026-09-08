@@ -34,6 +34,8 @@ from typing_extensions import Self
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
     NATIVE_MULTIMODAL_KEYS,
+    PACKED_MULTIMODAL_FIELDS,
+    PER_TOKEN_MULTIMODAL_FIELDS,
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
@@ -104,6 +106,8 @@ class SequencePackingArgs(TypedDict):
     sequence_length_pad_multiple: (
         int  # pad each sequence to a multiple of this value (for CP/TP alignment)
     )
+    pair_grouping_key: NotRequired[str]
+    max_sequences_per_bin: NotRequired[int]
 
 
 class DynamicBatchingArgs(TypedDict):
@@ -125,12 +129,6 @@ class DynamicBatchingArgs(TypedDict):
 class BatchedDataDict(UserDict, Generic[DictT]):
     _PIXEL_DTYPE_CAST_KEYS = frozenset({"pixel_values", "pixel_values_videos"})
 
-    # keys that are model specific, but not part of the PackedTensor
-    ADDITIONAL_OPTIONAL_KEY_TENSORS = [
-        "token_type_ids",  # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
-        "mm_token_type_ids",  # specific to qwen2.5-vl (transformers>=5.3): tells model which tokens are text(0)/image(1)/video(2) for 3D RoPE position encoding
-    ]
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -144,7 +142,16 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         device: Optional[torch.device] = None,
         pixel_dtype: Optional[torch.dtype] = None,
     ) -> dict[str, Any]:
-        """Return a regular dict of tensors or packed multimodal data items.
+        """Return the multimodal fields as a dict.
+
+        Four cases per (k, v):
+          * ``PackedTensor`` — in-memory form, keep as-is.
+          * ``k`` in ``PACKED_MULTIMODAL_FIELDS`` — data-plane wire form,
+            which cannot be rebuilt here: raises. ``codec.materialize``
+            reassembles it earlier via ``reassemble_packed_multimodal``.
+          * ``k`` in ``PER_TOKEN_MULTIMODAL_FIELDS`` — plain per-token
+            tensor, keep as-is.
+          * anything else — not multimodal, skip.
 
         ``pixel_dtype`` converts pixel tensors without materializing repeated
         logical segments. This is used to reduce policy-bound Ray payloads.
@@ -176,16 +183,36 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                         f"{metadata_counts}."
                     )
 
-        multimodal_dict = {}
+        result: dict[str, Any] = {}
         for k, v in self.data.items():
             if isinstance(v, PackedTensor):
+                # In-memory PackedTensor (or a per-token field a caller
+                # happened to wrap; matches the pre-refactor behavior of
+                # unwrapping via as_tensor).
                 if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
                     v = v.to_dtype(pixel_dtype)
-                multimodal_dict[k] = v.as_tensor(device=device) if as_tensors else v
-            elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
-                multimodal_dict[k] = v
-
-        return multimodal_dict
+                result[k] = v.as_tensor(device=device) if as_tensors else v
+            elif k in PER_TOKEN_MULTIMODAL_FIELDS:
+                # Plain per-token tensor: emit as-is.
+                result[k] = v
+            elif k in PACKED_MULTIMODAL_FIELDS:
+                # Data-plane wire form: a value that reached here without
+                # ``codec.materialize`` reassembling it. Purely a fail-loud
+                # guard -- never a reconstruction path, because neither case is
+                # recoverable from here. A *nested* value still needs the
+                # per-segment shapes, which live only on ``KVBatchMeta.tags``;
+                # taking its flat rows as-is would emit 1-D pixels and train
+                # image-blind. A *dense* value means the field was padded and
+                # the row boundaries are already gone.
+                raise ValueError(
+                    f"{k!r} is still in data-plane wire form "
+                    f"({'nested' if getattr(v, 'is_nested', False) else 'dense'}). "
+                    "Packed multimodal fields must be rebuilt by "
+                    "multimodal_utils.reassemble_packed_multimodal (which "
+                    "codec.materialize calls) before get_multimodal_dict."
+                )
+            # else: not a multimodal field, silently skip.
+        return result
 
     @classmethod
     def from_batches(
@@ -601,6 +628,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 collect_metrics=False,  # TODO(ahmadki): make configurable
                 min_bin_count=shards,
                 bin_count_multiple=shards,
+                max_sequences_per_bin=sequence_packing_args.get(
+                    "max_sequences_per_bin"
+                ),
             )
 
             input_lengths_key = sequence_packing_args["input_lengths_key"]
@@ -612,6 +642,18 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
             def _get_padded_seqlen(seqlen: int) -> int:
                 return (seqlen + pad_multiple - 1) // pad_multiple * pad_multiple
+
+            grouping_key = sequence_packing_args.get("pair_grouping_key")
+            grouping_values = None
+            if grouping_key is not None:
+                if grouping_key not in self.data:
+                    raise KeyError(
+                        f"sequence_packing pair_grouping_key={grouping_key!r} "
+                        "is not present in the batch"
+                    )
+                grouping_values = self.data[grouping_key]
+                if not isinstance(grouping_values, torch.Tensor):
+                    grouping_values = torch.as_tensor(grouping_values)
 
             # Store bin assignments for each chunk to reuse later
             all_chunk_bin_assignments = []
@@ -628,10 +670,45 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     _get_padded_seqlen(seq_len.item()) for seq_len in chunk_seqlens
                 ]
 
-                # Pack sequences in this chunk into bins
-                chunk_bin_assignments = bin_packer.pack(
-                    sequence_lengths=chunk_padded_seqlens_list,
-                )
+                if grouping_values is None:
+                    chunk_bin_assignments = bin_packer.pack(
+                        sequence_lengths=chunk_padded_seqlens_list,
+                    )
+                else:
+                    # Treat every preference pair as one atomic virtual item.
+                    # The packer sees the pair's combined padded length and the
+                    # resulting bins are expanded back to sequence-row indices.
+                    chunk_groups = grouping_values[chunk_start:chunk_end]
+                    group_to_members: dict[int, list[int]] = {}
+                    for local_idx, group_id in enumerate(chunk_groups.tolist()):
+                        group_to_members.setdefault(int(group_id), []).append(local_idx)
+                    sorted_group_ids = sorted(group_to_members)
+                    group_lengths = [
+                        sum(
+                            chunk_padded_seqlens_list[member]
+                            for member in group_to_members[group_id]
+                        )
+                        for group_id in sorted_group_ids
+                    ]
+                    bin_capacity = sequence_packing_args["max_tokens_per_microbatch"]
+                    for group_id, group_length in zip(sorted_group_ids, group_lengths):
+                        if group_length > bin_capacity:
+                            raise ValueError(
+                                f"sequence_packing pair group {group_id} requires "
+                                f"{group_length} tokens but "
+                                f"max_tokens_per_microbatch={bin_capacity}"
+                            )
+                    group_bins = bin_packer.pack(sequence_lengths=group_lengths)
+                    chunk_bin_assignments = [
+                        [
+                            member
+                            for group_position in group_bin
+                            for member in group_to_members[
+                                sorted_group_ids[group_position]
+                            ]
+                        ]
+                        for group_bin in group_bins
+                    ]
                 all_chunk_bin_assignments.append(chunk_bin_assignments)
                 all_chunk_padded_seqlens.append(chunk_padded_seqlens_list)
 
@@ -951,6 +1028,15 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     def truncate_tensors(self, dim: int, truncated_len: int):
         """Truncates tensors in this dict of a given dim to a given length."""
         for k, v in self.items():
+            # Packed multimodal fields are not sequence-aligned — their
+            # dim 1 is patch/image count — so narrowing them to the token
+            # seqlen silently corrupts images (or raises when the patch
+            # count is smaller than the seqlen). The in-memory
+            # ``PackedTensor`` form is skipped by ``torch.is_tensor``
+            # below, but the data-plane wire form is a nested tensor, so
+            # name it here.
+            if k in PACKED_MULTIMODAL_FIELDS:
+                continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
                 self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
 

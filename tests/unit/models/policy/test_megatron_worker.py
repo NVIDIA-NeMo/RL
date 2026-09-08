@@ -149,18 +149,55 @@ def test_model_cp_slicing_capability_is_detected():
     assert not _model_slices_context_parallel_inputs(object())
 
 
-def test_model_cp_slicing_rejects_transfer_queue_setup():
+def test_model_cp_slicing_accepts_data_plane_setup():
+    """Models that slice CP inputs themselves are no longer fenced off here.
+
+    ``setup_data_plane`` used to reject them outright. The train path now
+    forwards ``model_slices_context_parallel_inputs`` into
+    ``get_microbatch_iterator``, so such a worker builds a client like any
+    other. The second call pins the documented idempotence.
+    """
+    from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient
+    from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model_slices_context_parallel_inputs = True
+    worker._dp_client = None
 
-    with pytest.raises(
-        NotImplementedError, match="TransferQueue/SingleController does not yet support"
-    ):
-        worker.setup_data_plane(MagicMock())
+    worker.setup_data_plane(LocalDataPlaneConfig())
+    client = worker._dp_client
+    assert isinstance(client, LocalDataPlaneClient)
+
+    worker.setup_data_plane(LocalDataPlaneConfig())
+    assert worker._dp_client is client
+
+
+def test_model_cp_slicing_accepts_transfer_queue_setup(monkeypatch):
+    """Media-before-CP models are served by the leader-broadcast fetch.
+
+    ``_fetch`` broadcasts one DP slice across the replica group (TP x CP x PP
+    siblings of a DP rank), so every CP sibling gets identical full THD rows and
+    the model applies its own post-embedding slice. Setup used to reject these
+    models outright, so setup must now accept them.
+    """
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model_slices_context_parallel_inputs = True
+    worker._dp_client = None
+
+    client = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client", lambda cfg, bootstrap: client
+    )
+    worker.setup_data_plane(MagicMock())
+
+    assert worker._dp_client is client
 
 
 def test_refit_size_estimate_preserves_integral_buffer_dtype():
@@ -328,6 +365,7 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model = _FakeTrainableModel()
+    worker.model.eval = lambda: events.append("eval")
     worker.cfg = (
         {"generation": {"backend": generation_backend}} if generation_backend else {}
     )
@@ -360,7 +398,31 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
 
     assert events[0] == "finalize_async_save"
     assert events.index("finalize_async_save") < events.index("move_model")
+    assert events.index("eval") < events.index("move_model")
     assert move_kwargs[0]["move_params"] is expect_move_params
+
+
+def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
+    """Mamba decode caches must refresh before CUDA parameter storage is released."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    move_kwargs = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = _FakeTrainableModel()
+    worker.model.eval = lambda: events.append("eval")
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_model") or move_kwargs.append(kwargs) or model
+    )
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronPolicyWorkerImpl.finish_inference(worker)
+
+    assert events == ["eval", "move_model"]
+    assert move_kwargs == [{"move_params": True, "move_grads": False}]
 
 
 def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
@@ -681,6 +743,40 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
     assert worker._first_train_step_param_sync_func == "sync"
     assert model_config.param_sync_func is None
     assert worker._first_train_step_forward_pre_hook_disabled is True
+
+
+@pytest.mark.parametrize("update_successful", [False, True])
+def test_restore_first_train_step_param_sync(
+    monkeypatch: pytest.MonkeyPatch, update_successful: bool
+) -> None:
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.enable_forward_pre_hook = MagicMock()
+    saved_param_sync = MagicMock(name="saved_param_sync")
+    worker._first_train_step_forward_pre_hook_disabled = True
+    worker._first_train_step_param_sync_func = saved_param_sync
+    model_config = SimpleNamespace(param_sync_func=None)
+    monkeypatch.setattr(
+        megatron_policy_worker, "get_model_config", lambda _: model_config
+    )
+
+    worker._restore_first_train_step_param_sync(update_successful)
+
+    if update_successful:
+        worker.enable_forward_pre_hook.assert_called_once_with()
+        assert model_config.param_sync_func is saved_param_sync
+        assert worker._first_train_step_param_sync_func is None
+        assert worker._first_train_step_forward_pre_hook_disabled is False
+
+        worker._restore_first_train_step_param_sync(True)
+        worker.enable_forward_pre_hook.assert_called_once_with()
+    else:
+        worker.enable_forward_pre_hook.assert_not_called()
+        assert model_config.param_sync_func is None
+        assert worker._first_train_step_param_sync_func is saved_param_sync
+        assert worker._first_train_step_forward_pre_hook_disabled is True
 
 
 def test_prepare_for_generation_disables_param_gather_hook_before_wake(

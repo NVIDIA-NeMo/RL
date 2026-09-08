@@ -21,6 +21,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -69,6 +70,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -108,9 +110,6 @@ from nemo_rl.models.generation.generation_router import (
     GenerationRouterActor,
     GenerationRouterImpl,
 )
-from nemo_rl.models.generation.interfaces import (
-    resolve_routed_experts_dtype_name_for_model,
-)
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -126,6 +125,7 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     validate_warm_start_checkpoint,
 )
+from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -152,8 +152,11 @@ class SingleControllerActorArgs:
     partition_id: str
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
+    finalizer_actors: list[Any]
+    # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
-    # None when async_rl.generation_fleet_health is disabled.
+    # None when async_rl.generation_fleet_health is disabled; the SingleController drives the
+    # probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
     # None unless async_rl.generation_router is enabled.
     generation_router: Optional[ray.actor.ActorHandle[GenerationRouterImpl]] = None
@@ -662,19 +665,19 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
-    routed_experts_dtype = (
-        resolve_routed_experts_dtype_name_for_model(generation_config["model_name"])
-        if enable_router_replay
-        else "int16"
-    )
     actor = spinup_nemo_gym_actor(
         env_configs=master_config.env,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
-        routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        # Ledger config rides into Gym's policy model server.
+        token_capture=(
+            master_config.token_capture.model_dump()
+            if master_config.token_capture.enabled
+            else None
+        ),
     )
     return actor, time.perf_counter() - t0
 
@@ -712,23 +715,33 @@ def _clamp_max_num_steps(
 def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     """Set train_iters from max_num_steps after its dataloader clamp."""
     algo_cfg = algo_config(master_config)
-    is_ppo = is_ppo_run(master_config)
-    # train_iters is a scheduler-tick budget, and each PPO epoch steps both
-    # optimizers once, so the configured warmup/decay horizon has to be scaled.
-    ppo_epochs = algo_cfg.ppo_epochs if is_ppo else 1
-    train_iters = algo_cfg.max_num_steps * ppo_epochs
+    ppo_config = master_config.ppo if is_ppo_run(master_config) else None
+    # train_iters is a scheduler-tick budget. Policy and value need separate
+    # budgets when their epoch counts or training start steps differ.
+    policy_epochs = ppo_config.ppo_epochs if ppo_config is not None else 1
+    policy_training_steps = algo_cfg.max_num_steps
+    if ppo_config is not None:
+        policy_training_steps = max(
+            policy_training_steps - ppo_config.policy_training_start_step,
+            0,
+        )
+    # Megatron-Bridge requires a positive scheduler horizon at setup. A PPO
+    # policy scheduler is never advanced when critic warmup spans the whole run.
+    policy_train_iters = max(policy_training_steps * policy_epochs, 1)
 
     # policy
     policy_config = master_config.policy
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = train_iters
+        policy_config["megatron_cfg"]["train_iters"] = policy_train_iters
 
     # value
-    if not is_ppo:
+    if ppo_config is None:
         return
     value_config = master_config.value
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = train_iters  # type: ignore[index]
+        value_config["megatron_cfg"]["train_iters"] = (  # type: ignore[index]
+            algo_cfg.max_num_steps * ppo_config.critic_ppo_epochs
+        )
 
 
 def _maybe_attach_fleet_health(
@@ -984,6 +997,48 @@ def setup_single_controller(
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
+    # Token capture: validate the supported combination loudly at setup
+    # (NeMo-Gym rollout path, vLLM backend, async_engine=true). The vLLM
+    # worker venv always carries nemo_gym (see VLLM_EXECUTABLE in
+    # ray_actor_environment_registry.py), so nothing here needs to change the
+    # worker's environment.
+    token_capture_cfg = master_config.token_capture
+    if token_capture_cfg.enabled:
+        if not should_use_nemo_gym(master_config):
+            raise ValueError(
+                "token_capture.enabled requires the NeMo-Gym rollout path "
+                "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
+                "policy model server"
+            )
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "token_capture.enabled supports the vllm backend only; got "
+                f"{generation_config['backend']!r}"
+            )
+        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
+        if not vllm_cfg["async_engine"]:
+            raise ValueError(
+                "token_capture.enabled requires "
+                "policy.generation.vllm_cfg.async_engine=true (the capture "
+                "host is the worker's in-process HTTP server)"
+            )
+
+        # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
+        # per-run control-plane bearer token and the process-shared capture
+        # directory used by every Gym worker.
+        if token_capture_cfg.control_auth_token is None:
+            # Deferred import: only needed on the capture path.
+            import secrets
+
+            token_capture_cfg.control_auth_token = secrets.token_hex(32)
+        if token_capture_cfg.capture_dir is None:
+            token_capture_cfg.capture_dir = os.path.abspath(
+                os.path.join(
+                    master_config.logger.get("log_dir") or "logs",
+                    "gym_token_capture",
+                )
+            )
+
     set_seed(algo_cfg.seed)
 
     # ==========================
@@ -1013,6 +1068,8 @@ def setup_single_controller(
     # ==========================
     # TODO: add validate dataset wiring.
     use_nemo_gym = should_use_nemo_gym(master_config)
+    data_tokenizer = processor if processor is not None else tokenizer
+    is_vlm = processor is not None
     if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
         raise NotImplementedError(
             "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
@@ -1023,13 +1080,18 @@ def setup_single_controller(
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
-        response_data = setup_response_data(tokenizer, data_config, env_configs=None)
+        response_data = setup_response_data(
+            data_tokenizer, data_config, env_configs=None, is_vlm=is_vlm
+        )
         assert len(response_data) == 2
         dataset, _val_dataset = response_data
         env_handles: dict[str, EnvironmentInterface] = {}
     else:
         response_data = setup_response_data(
-            tokenizer, data_config, env_configs=master_config.env
+            data_tokenizer,
+            data_config,
+            env_configs=master_config.env,
+            is_vlm=is_vlm,
         )
         assert len(response_data) == 4
         dataset, _val_dataset, env_handles, _val_env_handles = response_data
@@ -1093,6 +1155,7 @@ def setup_single_controller(
     megatron_reserved_url = None
     megatron_port_holder = None
     reserved_http_server_port = None
+    weight_synchronizer: Optional[WeightSynchronizer] = None
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
 
@@ -1222,7 +1285,7 @@ def setup_single_controller(
         build_tasks["nemo_gym"] = partial(
             _spinup_gym,
             master_config=master_config,
-            base_urls=gym_spinup_base_urls,
+            base_urls=cast(list[str], gym_spinup_base_urls),
             tokenizer=tokenizer,
         )
 
@@ -1252,7 +1315,6 @@ def setup_single_controller(
         build_tasks["trainer"] = _build_trainer_and_value
 
     # Submit build tasks and get results
-    weight_synchronizer: Optional[WeightSynchronizer] = None
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
             submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
@@ -1279,7 +1341,9 @@ def setup_single_controller(
                     train_cluster=train_cluster,
                     inference_cluster=inference_cluster,
                     refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+                    refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
                 )
+                generation.weight_synchronizer = weight_synchronizer
                 weight_synchronizer.init_communicator()
                 setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
                 t0 = time.perf_counter()
@@ -1354,22 +1418,84 @@ def setup_single_controller(
     # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
-    # SingleController reuses one partition for the run. Warm every known
-    # tensor field before rollout, policy, and teacher writers become
-    # concurrent; TransferQueue otherwise registers field names lazily.
-    dp_client.register_partition(
-        partition_id=partition_id,
-        fields=fields_with_optional_routed_experts(
+
+    # Token-capture mode: pre-register both rollout partitions from this
+    # single driver thread before any producer is live. TQ's controller
+    # registers unseen field names lazily inside update_production_status
+    # without a lock, so the first concurrent puts into an unregistered
+    # partition can race kv_retrieve_meta and kill the controller thread
+    # (see TQDataPlaneClient.register_partition).
+    token_capture_cfg = master_config.token_capture
+    if not token_capture_cfg.enabled:
+        # SingleController reuses one partition for the run. Warm every known
+        # tensor field before rollout, policy, and teacher writers become
+        # concurrent; TransferQueue otherwise registers field names lazily.
+        partition_fields = fields_with_optional_routed_experts(
             SC_ROLLOUT_SCHEMA_FIELDS,
             enabled=router_replay_enabled(policy_config),
-        ),
-        num_samples=(
-            master_config.async_rl.max_buffered_rollouts
-            * algo_cfg.num_generations_per_prompt
-        ),
-        consumer_tasks=["prev_lp", "ref_lp", "train"],
-        grpo_group_size=algo_cfg.num_generations_per_prompt,
-    )
+        )
+        if processor is not None:
+            partition_fields.extend(
+                field
+                for field in sorted(WIRE_MULTIMODAL_FIELDS)
+                if field not in partition_fields
+            )
+        dp_client.register_partition(
+            partition_id=partition_id,
+            fields=partition_fields,
+            num_samples=(
+                master_config.async_rl.max_buffered_rollouts
+                * algo_cfg.num_generations_per_prompt
+            ),
+            consumer_tasks=["prev_lp", "ref_lp", "train"],
+            grpo_group_size=algo_cfg.num_generations_per_prompt,
+        )
+    else:
+        from nemo_rl.data_plane.schema import (
+            DP_TRAIN_FIELDS,
+        )
+        from nemo_rl.data_plane.schema import (
+            ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
+        )
+        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+
+        r3_enabled = router_replay_enabled(master_config.policy)
+        if token_capture_cfg.defer_routed_experts_to_policy and not r3_enabled:
+            raise ValueError(
+                "token_capture.defer_routed_experts_to_policy requires "
+                "policy.router_replay.enabled=true"
+            )
+        group_size = algo_cfg.num_generations_per_prompt
+        num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
+        partition_fields = fields_with_optional_routed_experts(
+            DP_TRAIN_FIELDS,
+            enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
+        )
+        if processor is not None:
+            partition_fields.extend(
+                field
+                for field in sorted(WIRE_MULTIMODAL_FIELDS)
+                if field not in partition_fields
+            )
+        dp_client.register_partition(
+            partition_id=partition_id,
+            fields=partition_fields,
+            num_samples=num_rollout_samples,
+            consumer_tasks=["prev_lp", "ref_lp", "train"],
+            grpo_group_size=group_size,
+        )
+        dp_client.register_partition(
+            partition_id=token_capture_cfg.staging_partition,
+            fields=list(STAGING_FIELDS)
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            num_samples=num_rollout_samples,
+            consumer_tasks=["finalize", "prev_lp", "train"],
+        )
+        # Host Gym's capture core in every vLLM DP leader (in-worker DP
+        # client + TQTokenSink + the single install_capture call), and give
+        # workers the initial weight version to stamp on captured calls.
+        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
         t0 = time.perf_counter()
@@ -1383,6 +1509,7 @@ def setup_single_controller(
             refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
             refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
         )
+        generation.weight_synchronizer = weight_synchronizer
         weight_synchronizer.init_communicator()
         setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
 
@@ -1402,18 +1529,49 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
+        include_message_violation_fields=(
+            algo_cfg.invalid_tool_call_advantage is not None
+            or algo_cfg.malformed_thinking_advantage is not None
+        ),
         require_routed_experts=router_replay_enabled(policy_config),
+        staging_partition_id=(
+            token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
+        ),
     )
+    finalizer_actors: list[Any] = []
+    if token_capture_cfg.enabled:
+        from nemo_rl.experience.rollout_reassembler_actor import (
+            RolloutReassemblerActorConfig,
+            create_rollout_reassembler_actors,
+        )
+
+        finalizer_actors = create_rollout_reassembler_actors(
+            dp_config,
+            RolloutReassemblerActorConfig(
+                partition_id=partition_id,
+                staging_partition=token_capture_cfg.staging_partition,
+                pad_token_id=pad_id,
+                router_replay_enabled=router_replay_enabled(policy_config),
+                defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
+                max_seq_len=_generation_max_seq_len(generation_config),
+            ),
+            num_workers=token_capture_cfg.num_reassembler_workers,
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
         num_generations_per_prompt=algo_cfg.num_generations_per_prompt,
         max_seq_len=_generation_max_seq_len(generation_config),
+        rollout_recovery_config=master_config.rollout_recovery,
         max_rollout_turns=algo_cfg.max_rollout_turns,
         policy_generation=generation,
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        log_full_result_tables=should_log_nemo_gym_full_result_tables(
+            wandb_enabled=master_config.logger["wandb_enabled"],
+            wandb_config=master_config.logger["wandb"],
+        ),
         reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
@@ -1448,6 +1606,7 @@ def setup_single_controller(
         partition_id=partition_id,
         save_state=save_state,
         last_checkpoint_path=last_checkpoint_path,
+        finalizer_actors=finalizer_actors,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

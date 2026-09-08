@@ -59,7 +59,7 @@ When only one node remains for policy and generation after other resources are r
 
 ### Asynchronous PPO
 
-Set `ppo.async_ppo.enabled: true` to overlap rollout generation with training. A background collector fills a replay buffer on the non-colocated vLLM GPUs while the policy and value model train on their shared cluster. Values and policy/reference log probabilities are recomputed when a trajectory is sampled, then PPO runs GAE and its normal `ppo_epochs` updates before publishing one new policy version to vLLM.
+Set `ppo.async_ppo.enabled: true` to overlap rollout generation with training. A background collector fills a replay buffer on the non-colocated vLLM GPUs while the policy and value model train on their shared cluster. Values and policy/reference log probabilities are recomputed when a trajectory is sampled, then PPO runs GAE, all `critic_ppo_epochs` critic updates, and all `ppo_epochs` policy updates before publishing one new policy version to vLLM.
 
 Async PPO reuses the trajectory collector, replay buffer, and weight-versioning infrastructure described in the [Async GRPO guide](async-grpo.md); this section focuses on PPO-specific behavior and constraints.
 
@@ -175,10 +175,10 @@ The PPO training loop, [ppo_train](../../nemo_rl/algorithms/ppo.py), follows thi
 3. **Value inference**: the value model predicts per-token state values
 4. **Logprob computation**: the policy computes log probabilities for advantage estimation
 5. **Advantage estimation**: GAE computes advantages using value predictions and rewards
-6. **Value training**: the critic is updated first (critic-before-actor, following [veRL](https://arxiv.org/abs/2412.09613))
-7. **Policy training**: the actor is updated with the clipped surrogate objective
+6. **Value training**: the critic completes all of its updates first
+7. **Policy training**: the actor completes all of its updates with the clipped surrogate objective
 
-Steps 6–7 repeat `ppo_epochs` times per rollout before generating new responses.
+The critic stays resident for all `critic_ppo_epochs` updates, then the policy stays resident for all `ppo_epochs` updates. This avoids moving the colocated models between CPU and GPU after every epoch.
 
 ### Multiple Training Steps per Rollout
 
@@ -186,10 +186,14 @@ Unlike GRPO, which performs one training update per rollout, PPO can perform mul
 
 ```yaml
 ppo:
-  ppo_epochs: 4   # Train 4 times on each rollout batch
+  ppo_epochs: 4          # actor passes over each rollout batch
+  critic_ppo_epochs: ${ppo.ppo_epochs}  # critic passes; follows actor by default
 ```
 
-Each step trains both the critic and the actor on the same advantage estimates computed from the initial rollout.
+Each pass uses the same returns and advantage estimates computed from the initial
+rollout. Both epoch counts must be at least 1 and can be configured independently;
+the exemplar uses interpolation so the critic follows the actor unless explicitly
+overridden.
 
 ### Critic Warmup
 
@@ -221,7 +225,7 @@ The path is a `step_<n>` directory holding a `value/` subtree — the layout a P
 - `value.megatron_cfg.optimizer.lr` and `.min_lr` — they feed `max_lr`/`min_lr` and are the *first* two fields checked. They live in the optimizer block, not the scheduler block.
 - `value.megatron_cfg.scheduler`.
 - `value.train_global_batch_size` — it multiplies `lr_decay_steps`, `wd_incr_steps` and `lr_warmup_steps`.
-- the tick budget `train_iters`. A synchronous run sets it to `min(max_num_steps, max_num_epochs × len(dataloader)) × ppo_epochs`; an async run sets it to `max_num_steps × ppo_epochs`, since async requires `max_num_epochs: -1`. `len(dataloader)` is prompt batches per epoch, so on a synchronous run the dataset size and `num_prompts_per_step` are part of the budget whenever the epoch term is the smaller one — as it is for the shipped recipes that set `max_num_epochs: 15`. Matching `max_num_steps` and `ppo_epochs` alone is not enough there.
+- the tick budget `train_iters`. A synchronous run sets it to `min(max_num_steps, max_num_epochs × len(dataloader)) × critic_ppo_epochs`; an async run sets it to `max_num_steps × critic_ppo_epochs`, since async requires `max_num_epochs: -1`. `len(dataloader)` is prompt batches per epoch, so on a synchronous run the dataset size and `num_prompts_per_step` are part of the budget whenever the epoch term is the smaller one — as it is for the shipped recipes that set `max_num_epochs: 15`. Matching `max_num_steps` and `critic_ppo_epochs` alone is not enough there.
 
 A mismatch fails during critic init. Which field is named depends on which input differs: a batch-size difference reports `warmup iterations`, a learning-rate difference reports `learning rate`.
 
@@ -270,6 +274,7 @@ ppo:
   max_num_epochs: 100000
   max_num_steps: 100000
   ppo_epochs: 4
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0
   warm_start_value_checkpoint: null
   val_period: 20
@@ -326,7 +331,8 @@ value_loss_fn:
 ```
 
 **PPO-specific parameters:**
-- **`ppo.ppo_epochs`**: Number of training updates per rollout batch
+- **`ppo.ppo_epochs`**: Number of actor training updates per rollout batch
+- **`ppo.critic_ppo_epochs`**: Number of critic training updates per rollout batch. It can differ from `ppo_epochs`; the exemplar defaults it to `${ppo.ppo_epochs}`.
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.warm_start_value_checkpoint`**: Checkpoint step directory whose `value/` seeds the critic on a fresh run. See [Warm-Starting the Critic](#warm-starting-the-critic)
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.

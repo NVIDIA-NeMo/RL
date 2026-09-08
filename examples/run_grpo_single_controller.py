@@ -130,7 +130,12 @@ def main() -> None:
     maybe_configure_engine_reaping_env(config.async_rl.generation_fleet_health)
     init_ray()
 
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    processor = None
+    if config.policy.get("is_vlm"):
+        processor = get_tokenizer(config.policy["tokenizer"], get_processor=True)
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = get_tokenizer(config.policy["tokenizer"])
     assert config.policy["generation"] is not None, (
         "A generation config is required for SC-driven async GRPO"
     )
@@ -148,7 +153,9 @@ def main() -> None:
     if bool(config.env.get("should_use_nemo_gym")):
         setup_nemo_gym_config(config, tokenizer)
 
-    actor_args, setup_timing_metrics = setup_single_controller(config, tokenizer)
+    actor_args, setup_timing_metrics = setup_single_controller(
+        config, tokenizer, processor=processor
+    )
 
     print("🚀 Launching SingleControllerActor")
     sc = SingleControllerActor.remote(

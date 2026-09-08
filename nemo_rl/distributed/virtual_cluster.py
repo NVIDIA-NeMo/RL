@@ -27,6 +27,8 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,12 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
+    """Command each Ray actor launches under, one entry per uv extra combination.
+
+    Every uv command below is rewritten to SYSTEM when NEMO_RL_PY_EXECUTABLES_SYSTEM
+    is set to 1, so callers never apply that check themselves.
+    """
+
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
@@ -73,11 +81,41 @@ class PY_EXECUTABLES:
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
+    # Default env for the vLLM generation workers (see
+    # ray_actor_environment_registry.py). It carries nemo_gym so the worker can
+    # host Gym's token capture (token_capture.enabled) without swapping the
+    # worker's env at runtime: worker venvs are cached by actor class name, so
+    # a venv prebuilt with plain `--extra vllm` would be reused as-is and the
+    # nemo_gym import would fail.
+    VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
+
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and TRT-LLM.
     TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and ModelOpt.
+    MODELOPT_VLLM = (
+        f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+    )
+    MODELOPT_AUTOMODEL = (
+        f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+    )
+    MODELOPT_MCORE = (
+        f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+    )
+
+    @classmethod
+    def _resolve_system_overrides(cls) -> None:
+        """Rewrite every uv command constant to the system executable when the flag is set."""
+        if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") != "1":
+            return
+        for name in [n for n in vars(cls) if n.isupper()]:
+            setattr(cls, name, cls.SYSTEM)
+
+
+PY_EXECUTABLES._resolve_system_overrides()
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
@@ -87,20 +125,23 @@ class PY_EXECUTABLES:
 #
 # Python port-range bounds below are half-open: [low, high).
 #
+#   [1202, 1300) SingleController gen. router    (driver-local allocation)
 #   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
 #   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
 #     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
 #     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
-#   6000-6099    SingleController gen. router    (async_rl.generation_router.port_range_low/high;
-#                                                 one fixed port per run — NeMo-Gym holds the
-#                                                 URL for the whole run and never re-resolves)
+#   6000         NeMo-Skills sandbox Nginx       (NEMO_SKILLS_SANDBOX_PORT; ray.sub starts one
+#                                                 sidecar per allocated node, driver included)
+#   6001-6999    NeMo-Skills sandbox uWSGI       (SANDBOX_BASE_PORT)
 #   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
 #   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
 #                                                 carved out of the vLLM band — only one rollout
 #                                                 backend runs at a time)
 #   8800-8999    SGLang Prometheus metrics       (DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_*, hard-coded)
+DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW = 1202
+DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH = 1300
 DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
 DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW = 1313
@@ -311,7 +352,11 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
             os.environ.pop(_k, None)
 
-    env_vars = dict(os.environ)
+    # Ray actors deserialize constructor arguments before importing NeMo-RL.
+    # Put Hugging Face's generated ``transformers_modules`` package on the
+    # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
+    # that boundary. This covers both V1 worker groups and direct V2/SC actors.
+    env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
 
     runtime_env = {
