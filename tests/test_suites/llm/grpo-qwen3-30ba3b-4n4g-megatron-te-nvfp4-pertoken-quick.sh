@@ -40,6 +40,7 @@ grep -F -q \
 grep -q "\[fp4_cfg\] TE per-module precision recipe loaded" "$RUN_LOG"
 grep -q "\[fp4_cfg\] verified routed-expert NVFP4 coverage" "$RUN_LOG"
 grep -q "\[nvfp4_pertoken\] inventory: selected [1-9]" "$RUN_LOG"
+grep -F -q "Using 'FLASHINFER_TRTLLM' NvFp4 MoE backend" "$RUN_LOG"
 grep -q "ordinary linears remain BF16" "$RUN_LOG"
 grep -q "\[nvfp4_pertoken\] per-token NVFP4 activation scaling active" "$RUN_LOG"
 REFIT_COUNT=$(grep -F -c "[nvfp4_pertoken] refit: quantized" "$RUN_LOG" || true)
@@ -66,11 +67,12 @@ fi
 
 uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     'min(data["train/num_valid_samples"]) > 0' \
-    'mean(data["train/gen_kl_error"]) < 0.1' \
-    'median(data["train/token_mult_prob_error"]) < 4.0' \
-    'max(data["train/reward"]) > -1.1' \
-    'mean(data["train/grad_norm"], 2, 0) > 0.0' \
-    "abs(float(data[\"train/loss\"][\"$MAX_RECORDED_STEP\"])) < 1000000"
+    'mean(data["train/gen_kl_error"]) < 0.02' \
+    'median(data["train/token_mult_prob_error"]) < 1.5' \
+    'max(data["train/reward"]) > 0.0' \
+    'all_finite(data["train/loss"])' \
+    'all_finite(data["train/grad_norm"])' \
+    'mean(data["train/grad_norm"], 2, 0) > 0.0'
 
 mapfile -t TRAIN_DATA_FILES < <(
     find "$LOG_DIR" -type f -name 'train_data_step*.jsonl' -print | sort -V
