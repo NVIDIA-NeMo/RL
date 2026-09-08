@@ -21,11 +21,13 @@ Two readers:
   pre-build, so the image ships one venv per actor.
 
 DO NOT IMPORT ANYTHING FROM ``nemo_rl`` HERE, AND KEEP IT STDLIB-ONLY.
-The Dockerfile runs this from the dependency layer, where only this file and
-``pyproject.toml``/``uv.lock`` exist -- the rest of the source tree has not been
-copied in yet. Running it as a script (rather than importing it) is also what
-keeps ``nemo_rl/__init__.py`` from executing there. An import added here breaks
-the image build in its most expensive layer.
+The Dockerfile runs this from the dependency layer, where ``pyproject.toml``,
+``uv.lock`` and a handful of standalone files exist, but the rest of the
+``nemo_rl`` package does not (see the ``COPY`` directives in
+``docker/Dockerfile``). Running it as a script rather than importing it is what
+keeps ``nemo_rl/__init__.py`` -- which is copied in, and does real work at import
+-- from executing there. An import added here breaks the image build in its most
+expensive layer.
 ``tests/unit/distributed/test_actor_environments.py`` enforces this.
 """
 
