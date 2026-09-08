@@ -44,7 +44,11 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
+from nemo_rl.weight_sync.membership import (
+    RefitMembership,
+    desired_membership,
+    should_rebuild,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
 )
@@ -366,13 +370,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             total_gen_workers=len(self._generation.worker_group.workers),
             train_world_size=self._train_cluster.world_size(),
         )
-        # Compared against what was built, not against "is anything absent". Keyed off
-        # the absent set alone this would return False the moment a restarted shard came
-        # back, leaving it permanently excluded from a communicator it should rejoin.
-        #
-        # An unrecorded membership means the full fleet: init_communicator builds over
-        # everything, so "not recorded" is not "unknown", and treating it as a difference
-        # would rebuild pointlessly on the very first refit of every run.
+        # An unrecorded membership means the full fleet -- see should_rebuild's docstring,
+        # which owns the rest of this rule for both hardened transports.
         if self._built_membership is None:
             self._built_membership = desired_membership(
                 absent_shards=[],
@@ -380,18 +379,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=membership.train_world_size,
             )
-        # `force` is how the recovery path says the communicator is GONE rather than
-        # merely unchanged: after an abort the membership is identical and the
-        # communicator is dead, so skipping would retry over nothing.
-        #
-        # It only overrides the skip when something IS absent. Forcing a rebuild with
-        # an empty absent set would produce a communicator that still contains the
-        # rank that just went silent, and the retry would hang on it exactly as the
-        # first attempt did. That case -- a frozen-but-alive rank, which never becomes
-        # absent -- must fall through to False so the caller reports "no generation
-        # shard could be identified as absent" and stops.
-        unchanged = membership.shard_prefixes == self._built_membership.shard_prefixes
-        if unchanged and not (force and absent_shards):
+        if not should_rebuild(
+            desired=membership,
+            built=self._built_membership,
+            absent_shards=absent_shards,
+            force=force,
+        ):
             return False
         print(
             f"  refit: rebuilding nccl_reshard communicators over shards "

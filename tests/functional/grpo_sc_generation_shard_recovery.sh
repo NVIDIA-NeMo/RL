@@ -97,6 +97,10 @@ fi
 # those handoffs is a chance to pass on a GPU that is still being reclaimed.
 GPU_WAIT_S=${GPU_WAIT_S:-120}
 GPU_SETTLE_S=${GPU_SETTLE_S:-60}
+# Separate from GPU_SETTLE_S: this one is how long to wait after the kill before reading
+# the victim's GPU, which is a much shorter question than how long to wait for a whole
+# lane's GPUs to come free.
+REAP_SETTLE_S=${REAP_SETTLE_S:-5}
 
 # GPUs whose used memory is low enough to place a worker on.
 free_gpu_count() {
@@ -485,16 +489,21 @@ KILLED_AT=$(date +%s)
 #
 # The worker is a Ray actor, but the thing holding the CUDA context is its EngineCore --
 # a plain multiprocessing child that SIGKILL orphans, because every cleanup path vLLM and
-# Ray provide runs inside the dying process. Job 6720618 measured the consequence: cuda:0
-# stuck at 69.36/184.31 GiB free for 370s across five restart attempts, so the replacement
-# engine could not fit and re-admission failed while the survivors carried on.
+# Ray provide runs inside the dying process. The consequence, measured: the victim's GPU
+# stayed pinned at a fraction of its memory free for minutes across every restart attempt,
+# so the replacement engine could not fit and re-admission failed while the survivors
+# carried on.
 #
 # Printed rather than asserted, deliberately. Only the restart variant needs the memory
 # back, so a leak is invisible to every other variant here -- but it is a leak in all of
 # them, and this line is what makes it visible instead of inferred from a pass/fail.
 if command -v nvidia-smi >/dev/null 2>&1; then
-    sleep 5   # give the raylet's process-group cleanup a moment to land
-    echo "[recovery] GPU free memory ${GPU_SETTLE_S:-5}s after the kill (MiB):"
+    # Its own name, not GPU_SETTLE_S: that one is already set above for the free-GPU
+    # wait, so `${GPU_SETTLE_S:-5}` never fell back and this line reported a number it
+    # had not slept. This is the one instrument pointed at the EngineCore leak; a wrong
+    # figure here defeats it.
+    sleep "$REAP_SETTLE_S"   # give the raylet's process-group cleanup a moment to land
+    echo "[recovery] GPU free memory ${REAP_SETTLE_S}s after the kill (MiB):"
     nvidia-smi --query-gpu=index,memory.free,memory.total --format=csv,noheader \
         | sed 's/^/[recovery]   gpu /'
 fi

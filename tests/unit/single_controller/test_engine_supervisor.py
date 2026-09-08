@@ -25,8 +25,6 @@ it out of the refit that is supposed to fix it.
 
 import asyncio
 
-import pytest
-
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
@@ -182,6 +180,20 @@ class TestStateHandover:
 
         assert monitor.state_of(0) is not ShardState.DEAD
 
+    def test_a_replacement_that_dies_again_is_restarted_again(self):
+        """One restart per shard would make the second failure permanent."""
+        monitor, gen = _monitor(), _Generation()
+        _condemn(monitor, 1)
+        supervisor = EngineSupervisor(generation=gen, monitor=monitor)
+        asyncio.run(_tick_and_settle(supervisor))
+        assert monitor.state_of(1) is ShardState.STALE
+
+        monitor.record_actor_death(1, error="replacement died")
+        asyncio.run(_tick_and_settle(supervisor))
+
+        assert gen.restarted == [1, 1]
+        assert monitor.state_of(1) is ShardState.STALE
+
 
 class TestFailedRestarts:
     def test_a_failed_restart_returns_the_shard_to_dead(self):
@@ -193,7 +205,7 @@ class TestFailedRestarts:
         asyncio.run(_tick_and_settle(supervisor))
 
         assert monitor.state_of(0) is ShardState.DEAD
-        assert supervisor.metrics()["supervisor/restarts_failed"] == 1.0
+        assert supervisor.as_metrics()["gen_fleet/restarts_failed"] == 1.0
 
     def test_a_failed_restart_does_not_propagate(self):
         """A restart is best-effort; the run continues on the surviving shards."""
@@ -227,7 +239,9 @@ class TestFailedRestarts:
         asyncio.run(_main())
 
         assert monitor.state_of(0) is ShardState.RETIRED
-        assert len(gen.restarted) <= policy.max_restart_attempts_per_shard
+        # Not `len(...) <=`: that also holds at zero, which is the failure this exists to
+        # catch. The fake appends before it raises, so every attempt is recorded.
+        assert gen.restarted == [0] * policy.max_restart_attempts_per_shard
 
 
 class TestARestartThatNeverReturns:
@@ -259,7 +273,7 @@ class TestARestartThatNeverReturns:
         try:
             asyncio.run(_main())
             assert monitor.state_of(0) is ShardState.DEAD
-            assert supervisor.metrics()["supervisor/restarts_failed"] == 1.0
+            assert supervisor.as_metrics()["gen_fleet/restarts_failed"] == 1.0
         finally:
             # Let the parked thread finish so it does not outlive the test.
             gate.set()
@@ -393,8 +407,7 @@ class TestItDoesNotBlockTheControlLoop:
         assert gen.restarted == [0]
 
 
-@pytest.mark.parametrize("state", [ShardState.RETIRED])
-def test_a_retired_shard_is_never_restarted(state):
+def test_a_retired_shard_is_never_restarted():
     monitor, gen = _monitor(), _Generation()
     monitor.retire(0, reason="node gone")
     supervisor = EngineSupervisor(generation=gen, monitor=monitor)
@@ -402,7 +415,7 @@ def test_a_retired_shard_is_never_restarted(state):
     asyncio.run(_tick_and_settle(supervisor))
 
     assert gen.restarted == []
-    assert monitor.state_of(0) is state
+    assert monitor.state_of(0) is ShardState.RETIRED
 
 
 class TestPromotionIsWiredUp:
@@ -727,18 +740,19 @@ class TestDrainIsActuallyWiredUp:
             gate.set()
 
 
-def test_every_supervised_backend_can_restart_a_shard():
+def test_the_supervisors_backend_contract_is_declared_and_implemented():
     """The supervisor calls restart_shard by name, so a backend missing it degrades silently.
 
-    That is not hypothetical. restart_shard was written in a47e2032e and deleted on
-    2026-08-17 by merge b18740f73, which resolved a conflict in the same region of
-    vllm_generation.py by taking one side wholesale. The call site here and the fake below
-    both survived, so nothing looked broken -- and _restart catches the AttributeError,
-    counts a failure, and retries until the attempt budget retires the shard. Restart never
-    worked and never said so.
+    That is not hypothetical: restart_shard was once lost to a merge that resolved a
+    conflict in the same region of vllm_generation.py by taking one side wholesale. The
+    call site and the test fake both survived, so nothing looked broken -- and _restart
+    catches the AttributeError, counts a failure, and retries until the attempt budget
+    retires the shard. Restart never worked and never said so.
 
     Parsed rather than imported: VllmGeneration pulls in vllm, which is not installed in the
-    default test venv, and the point is the method's existence rather than its behaviour.
+    default test venv, and the point is the methods' existence rather than their behaviour.
+    Named for what it asserts -- vLLM is the only supervised backend today, so "every
+    backend" would be claiming more than one hardcoded path can check.
     """
     import ast
     from pathlib import Path

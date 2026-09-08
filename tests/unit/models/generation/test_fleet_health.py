@@ -600,6 +600,20 @@ class TestConclusiveActorDeath:
 
         assert monitor.state_of(0) is ShardState.RETIRED
 
+    def test_a_replacement_that_dies_again_returns_to_dead(self):
+        """STALE is not absent, so a second death has to be able to condemn it --
+        otherwise a replacement that dies before the refit lands is stranded."""
+        monitor = _monitor(shard_count=2, unhealthy_threshold=1)
+        monitor.record_actor_death(0)
+        monitor.mark_restarting(0)
+        monitor.mark_loaded(0, base_url="http://h:9000/v1")
+        assert monitor.state_of(0) is ShardState.STALE
+
+        monitor.record_actor_death(0, error="ActorDiedError: replacement died")
+
+        assert monitor.state_of(0) is ShardState.DEAD
+        assert 0 in monitor.absent_shards()
+
     def test_the_error_is_recorded(self):
         monitor = _monitor(shard_count=2)
         monitor.record_actor_death(0, error="ActorDiedError: the actor died")

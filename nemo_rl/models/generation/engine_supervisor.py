@@ -43,6 +43,7 @@ from functools import partial
 from typing import Any, Optional
 
 from nemo_rl.models.generation.fleet_health import GenerationFleetHealth, ShardState
+from nemo_rl.models.generation.interfaces import GenerationInterface
 
 # Budget for one restart, and the wait between a failed attempt and the next. Defaults
 # only: the controller passes the configured values through. See
@@ -56,7 +57,7 @@ class EngineSupervisor:
 
     def __init__(
         self,
-        generation: Any,
+        generation: GenerationInterface,
         monitor: GenerationFleetHealth,
         restart_timeout_s: float = DEFAULT_RESTART_TIMEOUT_S,
         restart_backoff_s: float = DEFAULT_RESTART_BACKOFF_S,
@@ -75,13 +76,19 @@ class EngineSupervisor:
         self._restarts_failed = 0
         self._restarts_timed_out = 0
 
-    def metrics(self) -> dict[str, float]:
+    def as_metrics(self) -> dict[str, float]:
+        """Restart counters, merged into the per-step metrics dict.
+
+        ``gen_fleet/``, matching ``GenerationFleetHealth.as_metrics`` -- the two are merged
+        two lines apart and ``gen_fleet/restart_attempts`` already carries restart state, so
+        a second prefix would split one story across two namespaces.
+        """
         return {
-            "supervisor/restarts_started": float(self._restarts_started),
-            "supervisor/restarts_succeeded": float(self._restarts_succeeded),
-            "supervisor/restarts_failed": float(self._restarts_failed),
-            "supervisor/restarts_timed_out": float(self._restarts_timed_out),
-            "supervisor/restarts_in_flight": float(len(self._in_flight)),
+            "gen_fleet/restarts_started": float(self._restarts_started),
+            "gen_fleet/restarts_succeeded": float(self._restarts_succeeded),
+            "gen_fleet/restarts_failed": float(self._restarts_failed),
+            "gen_fleet/restarts_timed_out": float(self._restarts_timed_out),
+            "gen_fleet/restarts_in_flight": float(len(self._in_flight)),
         }
 
     def tick(self) -> None:

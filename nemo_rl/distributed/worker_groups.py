@@ -792,7 +792,10 @@ class RayWorkerGroup:
             try:
                 ray.kill(old, no_restart=True)
             except Exception as e:  # noqa: BLE001 - already-dead actors raise variously
-                print(f"  recreate_worker({worker_idx}): old actor not killable: {e}")
+                print(
+                    f"  recreate_worker({worker_idx}): old actor not killable: {e}",
+                    flush=True,
+                )
 
         # A fresh name each incarnation: Ray rejects a duplicate named actor, and the
         # dead one's registration can outlive the process.

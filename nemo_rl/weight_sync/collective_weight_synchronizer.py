@@ -36,7 +36,11 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
+from nemo_rl.weight_sync.membership import (
+    RefitMembership,
+    desired_membership,
+    should_rebuild,
+)
 
 
 def _settle_before_propagating(futures, budget_s, what: str) -> None:
@@ -275,29 +279,25 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # existed. See _desired_membership.
         if membership is None:
             return False
-        # Compared against what was built, not against "is anything absent". Keyed off
-        # the absent set alone this would return False the moment a restarted shard came
-        # back, leaving it permanently excluded from a communicator it should rejoin.
-        #
-        # An unrecorded membership means the full fleet: init_communicator builds over
-        # everything, so "not recorded" is not "unknown", and treating it as a difference
-        # would rebuild pointlessly on the very first refit of every run.
-        if self._built_membership is None:
-            self._built_membership = self._desired_membership(
-                [], membership.train_world_size
+        # An unrecorded membership means the full fleet -- see should_rebuild's docstring,
+        # which owns the rest of this rule for both hardened transports.
+        built = self._built_membership
+        if built is None:
+            # Not Optional in practice: _desired_membership only returns None for a
+            # backend with no worker group, and the check above already ruled that out
+            # for this same call. `or membership` rather than an assert so a future
+            # change to that invariant degrades to "assume the current membership was
+            # built", which is what an unrecorded membership already means.
+            built = (
+                self._desired_membership([], membership.train_world_size) or membership
             )
-        # `force` is how the recovery path says the communicator is GONE rather than
-        # merely unchanged: after an abort the membership is identical and the
-        # communicator is dead, so skipping would retry over nothing.
-        #
-        # It only overrides the skip when something IS absent. Forcing a rebuild with
-        # an empty absent set would produce a communicator that still contains the
-        # rank that just went silent, and the retry would hang on it exactly as the
-        # first attempt did. That case -- a frozen-but-alive rank, which never becomes
-        # absent -- must fall through to False so the caller reports "no generation
-        # shard could be identified as absent" and stops.
-        unchanged = membership.shard_prefixes == self._built_membership.shard_prefixes
-        if unchanged and not (force and absent_shards):
+            self._built_membership = built
+        if not should_rebuild(
+            desired=membership,
+            built=built,
+            absent_shards=absent_shards,
+            force=force,
+        ):
             return False
 
         # A fresh port every time: the rendezvous store for the previous world may still

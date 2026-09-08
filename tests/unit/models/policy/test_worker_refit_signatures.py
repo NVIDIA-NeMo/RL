@@ -638,12 +638,11 @@ def test_refit_fan_outs_address_surviving_leaders_only(method):
     fan-out is wrong exactly when it executes, and ray.get raises ActorDiedError out of
     reconcile_communicator, past the recovery, into the run.
 
-    Job 6718090 measured it: the rebuild had just succeeded ("rebuilding communicator over
-    shards [1]; world_size 3") and prepare_refit_info killed the run 20s later. Every
-    collective-transport recovery variant failed; every nccl_reshard one passed, because
-    its reconcile does not make that call. Three of these four had already been converted
-    to _refit_leader_workers; this is the fourth, and missing one of a set is the bug class
-    design_vllm_fault_tolerance.md section 8.5.5 exists for.
+    The recovery path is where this bites: it is reached precisely because a shard is
+    absent, so the whole-group fan-out is wrong exactly when it runs. Three of these
+    four calls were already converted to _refit_leader_workers; this is the fourth,
+    and missing one of a set is the bug class design_vllm_fault_tolerance.md section
+    8.5.5 exists for.
     """
     tree = ast.parse(
         (REPO_ROOT / "nemo_rl/models/generation/vllm/vllm_generation.py").read_text()
@@ -687,10 +686,9 @@ def test_membership_is_recorded_before_any_refit_dispatch(synchronizer, function
     set_refit_membership addresses the shard the reconcile is removing, and ray.get raises
     ActorDiedError out of the recovery.
 
-    Job 6718090 hit it via the whole-group fan-out in prepare_refit_info; job 6718736 hit
-    it again after that was converted, because set_refit_membership still sat 21 lines
-    below the call. The reshard side was correct throughout -- _build records first, which
-    is why every nccl_reshard variant passed while every collective one failed.
+    It has been hit twice: once via the whole-group fan-out in prepare_refit_info, and
+    again after that was converted, because set_refit_membership still sat below the
+    call. The reshard side was correct throughout -- _build records first.
     """
     tree = ast.parse((REPO_ROOT / "nemo_rl" / "weight_sync" / synchronizer).read_text())
     fn = next(

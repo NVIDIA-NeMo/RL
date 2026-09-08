@@ -278,21 +278,15 @@ class TestGenerationFleetProbe:
                 ]
             )
         )
-        ctrl._gen = SimpleNamespace(
-            worker_group=SimpleNamespace(
-                get_dp_leader_worker_idx=lambda shard: shard,
-                workers=[
-                    SimpleNamespace(
-                        is_alive=SimpleNamespace(
-                            remote=(lambda alive=alive: _completed())
-                            if alive
-                            else (lambda: _failed(ray.exceptions.ActorDiedError()))
-                        )
-                    )
-                    for alive in worker_alive
-                ],
-            )
-        )
+
+        # One stub, not four nested namespaces: the probe asks the backend by shard index
+        # and the shard-to-worker layout stays the backend's business.
+        def _liveness(shard_idx):
+            if worker_alive[shard_idx]:
+                return _completed()
+            return _failed(ray.exceptions.ActorDiedError())
+
+        ctrl._gen = SimpleNamespace(shard_liveness_ref=_liveness)
         return ctrl
 
     def test_a_live_fleet_stays_serving(self):
@@ -360,7 +354,9 @@ class TestGenerationFleetProbe:
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, True])
         ctrl._async_cfg.generation_fleet_health.probe_timeout_s = 0.001
-        ctrl._gen.worker_group.workers[1].is_alive.remote = lambda: asyncio.sleep(10.0)
+        ctrl._gen.shard_liveness_ref = lambda shard_idx: (
+            asyncio.sleep(10.0) if shard_idx == 1 else _completed()
+        )
         asyncio.run(_run_probe_ticks(ctrl, 2))
         assert ctrl._stood_down == [], (
             "a probe timeout is not proof of death; standing the deadline down on one "
@@ -378,11 +374,7 @@ class TestGenerationFleetProbe:
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True])
         ctrl._async_cfg.generation_fleet_health.probe_timeout_s = 0.001
-        ctrl._gen.worker_group.workers = [
-            SimpleNamespace(
-                is_alive=SimpleNamespace(remote=lambda: asyncio.sleep(10.0))
-            )
-        ]
+        ctrl._gen.shard_liveness_ref = lambda shard_idx: asyncio.sleep(10.0)
         asyncio.run(_run_probe_ticks(ctrl, 3))
         assert monitor.state_of(0) is ShardState.SUSPECT
         assert monitor.absent_shards() == []
@@ -539,10 +531,7 @@ class TestGenerationFleetProbe:
                 concurrent -= 1
 
         ctrl = self._with_fleet(monitor, worker_alive=[True] * 4)
-        ctrl._gen.worker_group.workers = [
-            SimpleNamespace(is_alive=SimpleNamespace(remote=lambda: _slow()))
-            for _ in range(4)
-        ]
+        ctrl._gen.shard_liveness_ref = lambda shard_idx: _slow()
 
         async def _main():
             task = asyncio.ensure_future(ctrl._probe_generation_fleet())

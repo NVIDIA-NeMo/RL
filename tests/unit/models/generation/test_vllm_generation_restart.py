@@ -28,9 +28,8 @@ class TestRestartShardLoadPath:
     stashes bundle_indices and seed for load_and_start(). The default False loads inside
     __init__ and leaves _deferred_seed at None, because the branch that assigns it returns
     early. Calling load_model on that worker re-enters _create_engine with seed=None, and
-    vLLM's ModelConfig requires an int -- job 6722014 failed five restarts with
-    "ValidationError: seed - Input should be a valid integer" while the recreated worker
-    already had a working engine.
+    vLLM's ModelConfig requires an int: "ValidationError: seed - Input should be a valid
+    integer", raised against a recreated worker that already had a working engine.
     """
 
     @staticmethod

@@ -2789,12 +2789,11 @@ class SingleControllerActor:
             if self._gen_fleet is not None:
                 metrics.update(self._gen_fleet.as_metrics())
             if self._engine_supervisor is not None:
-                metrics.update(self._engine_supervisor.metrics())
+                metrics.update(self._engine_supervisor.as_metrics())
             if self._generation_router is not None:
                 # router/* counters are exactly what you want when a backend starts
-                # failing; computed since P2 landed but never published until now.
-                # Best-effort like the membership push: a router being recreated must
-                # not cost a metrics tick.
+                # failing. Best-effort like the membership push: a router being
+                # recreated must not cost a metrics tick.
                 try:
                     metrics.update(
                         await self._ray_get(self._generation_router.metrics.remote())
@@ -2910,13 +2909,16 @@ class SingleControllerActor:
             return
 
         fleet_cfg = self._async_cfg.generation_fleet_health
-        worker_group = self._gen.worker_group
 
         async def probe(shard_idx: int) -> None:
-            worker_idx = worker_group.get_dp_leader_worker_idx(shard_idx)
+            # By shard index, not by reaching through to the worker group: which worker
+            # leads a shard depends on the backend's layout, and doing that arithmetic
+            # here put a second copy of it in the control loop -- one that also assumed
+            # every backend has a `worker_group`, the assumption that broke the Dynamo
+            # lane. restart_shard already asks this way.
             try:
                 await asyncio.wait_for(
-                    self._ray_get(worker_group.workers[worker_idx].is_alive.remote()),
+                    self._ray_get(self._gen.shard_liveness_ref(shard_idx)),
                     timeout=fleet_cfg.probe_timeout_s,
                 )
             except RayActorError as error:

@@ -77,6 +77,47 @@ def desired_membership(
     )
 
 
+def should_rebuild(
+    *,
+    desired: RefitMembership,
+    built: RefitMembership,
+    absent_shards: Sequence[int],
+    force: bool,
+) -> bool:
+    """Whether the refit communicator has to be rebuilt before the next transfer.
+
+    Here rather than in each synchronizer because both hardened transports need the same
+    answer and had the same ten lines, byte for byte. Same reason ``desired_membership``
+    is here: the arithmetic is what has to be exactly right, and two copies of a rule is
+    the bug class this stack keeps hitting.
+
+    Compared against what was **built**, not against "is anything absent". Keyed off the
+    absent set alone this returns False the moment a restarted shard comes back, leaving
+    it permanently excluded from a communicator it should rejoin.
+
+    ``force`` is how the recovery path says the communicator is GONE rather than merely
+    unchanged: after an abort the membership is identical and the communicator is dead, so
+    skipping would retry over nothing.
+
+    It only overrides the skip when something IS absent. Forcing a rebuild with an empty
+    absent set would produce a communicator that still contains the rank that just went
+    silent, and the retry would hang on it exactly as the first attempt did. That case --
+    a frozen-but-alive rank, which never becomes absent -- must fall through to False so
+    the caller reports "no generation shard could be identified as absent" and stops.
+
+    Args:
+        desired: what the membership should be, given who is absent now.
+        built: what the live communicator was actually built over. Callers treat an
+            unrecorded membership as the full fleet: ``init_communicator`` builds over
+            everything, so "not recorded" is not "unknown", and calling it a difference
+            would rebuild pointlessly on the first refit of every run.
+        absent_shards: shards currently absent, as the caller sees them.
+        force: the caller knows the communicator is gone rather than stale.
+    """
+    unchanged = desired.shard_prefixes == built.shard_prefixes
+    return not (unchanged and not (force and absent_shards))
+
+
 def plan_refit_membership(
     *,
     surviving_shards: Sequence[int],

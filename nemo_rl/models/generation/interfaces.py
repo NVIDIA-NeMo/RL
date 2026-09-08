@@ -507,6 +507,17 @@ class GenerationInterface(ABC):
         """
         raise NotImplementedError
 
+    def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
+        """Liveness of the worker leading one data-parallel shard.
+
+        Which Ray worker leads shard N depends on how shards are laid out across workers,
+        which is the backend's business. Asking for it by shard index keeps that here
+        rather than in the control loop, where the same arithmetic had a second copy that
+        also assumed every backend has a ``worker_group`` -- an assumption that has already
+        broken a lane once (``'DynamoGeneration' object has no attribute 'worker_group'``).
+        """
+        raise NotImplementedError
+
     def log_shard_gpu_state(
         self, shard_idx: int, *, label: str, timeout_s: float = 30.0
     ) -> None:

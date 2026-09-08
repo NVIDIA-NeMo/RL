@@ -718,14 +718,11 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
-    # RESTORED. This method was written in a47e2032e and silently deleted on 2026-08-17 by
-    # merge b18740f73, which resolved a conflict in this region -- PR3's _refit_membership
-    # declaration landed on the same lines -- by taking one side wholesale. The call site in
-    # engine_supervisor.py and the unit-test fake both survived, and the supervisor catches
-    # the resulting AttributeError, marks the shard restart-failed and retries until the
-    # attempt budget retires it. So restart never worked and never said so. See
-    # test_every_supervised_backend_can_restart_a_shard, which now fails if it goes missing
-    # again.
+    def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
+        """Liveness of the worker leading this shard. The caller need not know the layout."""
+        leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
+        return self.worker_group.workers[leader_idx].is_alive.remote()
+
     def log_shard_gpu_state(
         self, shard_idx: int, *, label: str, timeout_s: float = 30.0
     ) -> None:
