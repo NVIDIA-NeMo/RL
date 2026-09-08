@@ -128,6 +128,13 @@ Create custom reward environments and integrate them with NeMo RL training pipel
 Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
 :::
 
+:::{grid-item-card} {octicon}`rocket` Automodel Speculative Decoding
+:link: guides/automodel-speculative-decoding
+:link-type: doc
+
+Co-train DSpark, DFlash, and EAGLE3 drafters alongside the policy on the DTensor v2 (Automodel) backend.
+:::
+
 :::{grid-item-card} {octicon}`unmute` Audio GRPO on AVQA
 :link: guides/grpo-audio
 :link-type: doc
@@ -327,6 +334,7 @@ guides/async-grpo.md
 guides/single-controller.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
+guides/automodel-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
