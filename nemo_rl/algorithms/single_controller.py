@@ -2195,7 +2195,7 @@ class SingleControllerActor:
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
                         )
 
-                    if groups_dispatched == 0 and self._gen is not None:
+                    if groups_dispatched == 0:
                         try:
                             await asyncio.to_thread(self._gen.snapshot_step_metrics)
                         except RayActorError as error:
@@ -2205,7 +2205,7 @@ class SingleControllerActor:
 
                     # Safe mid-loop: colocated steps are assembled whole, so the loop closes after this.
                     # The gate reopens at the post-step _sync_weights wake, or after the save on save-bound steps.
-                    if self._gen is not None and self._gen.blocks_training():
+                    if self._gen.blocks_training():
                         self._rollout_permitted.clear()
                         # Deadline clocks measure inference service time, not wall clock:
                         # the switch to training must not tick them down.
@@ -2437,13 +2437,12 @@ class SingleControllerActor:
                 step_metrics.update(
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
-                if self._gen is not None:
-                    try:
-                        step_metrics.update(
-                            await asyncio.to_thread(self._gen.get_step_metrics)
-                        )
-                    except RayActorError as error:
-                        log.warning("Skipping generation step metrics: %s", error)
+                try:
+                    step_metrics.update(
+                        await asyncio.to_thread(self._gen.get_step_metrics)
+                    )
+                except RayActorError as error:
+                    log.warning("Skipping generation step metrics: %s", error)
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
