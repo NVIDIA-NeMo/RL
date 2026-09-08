@@ -5,6 +5,7 @@ grpo:
   num_generations_per_prompt: 4
 
 policy:
+  train_global_batch_size: 8
   generation:
     colocated:
       resources:
