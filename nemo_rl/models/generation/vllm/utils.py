@@ -106,6 +106,7 @@ def is_grouped_moe_expert_weight_name(name: str) -> bool:
     """Return whether a checkpoint key is a grouped MoE expert slab."""
     return name.endswith(_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES)
 
+
 def _as_routed_experts_tensor(
     value: Any, *, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
