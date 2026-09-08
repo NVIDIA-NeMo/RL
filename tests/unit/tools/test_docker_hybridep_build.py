@@ -16,56 +16,77 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[3]
 DOCKERFILES = (
-    REPO_ROOT / "docker/Dockerfile",
-    REPO_ROOT / "docker/Dockerfile.ngc_pytorch",
+    (REPO_ROOT / "docker/Dockerfile", True),
+    (REPO_ROOT / "docker/Dockerfile.ngc_pytorch", False),
 )
 
 
 def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
-    for dockerfile in DOCKERFILES:
+    for dockerfile, uses_uv_cache_seed in DOCKERFILES:
         lines = dockerfile.read_text().splitlines()
         setting = "ENV HYBRID_EP_MULTINODE=1"
-        nvml_stub_install = (
+        nvml_link_dependency_install = (
             "apt-get install -y --no-install-recommends libnvidia-ml-dev"
         )
-        cache_clean = "uv cache clean deep-ep"
-        nvml_stub_purge = "apt-get purge -y libnvidia-ml-dev"
-        nvml_stub_dependencies_purge = "apt-get autoremove -y"
-        nvml_stub_purge_index = lines.index(nvml_stub_purge)
-        nvml_stub_dependencies_purge_index = next(
+        nvml_link_dependency_purge = "apt-get purge -y libnvidia-ml-dev"
+        nvml_link_dependencies_purge = "apt-get autoremove -y"
+
+        assert setting in lines, f"{dockerfile} does not enable multi-node HybridEP"
+        assert nvml_link_dependency_install in lines, (
+            f"{dockerfile} does not install the NVML link dependency"
+        )
+        assert nvml_link_dependency_purge in lines, (
+            f"{dockerfile} does not remove the NVML link dependency after the build"
+        )
+
+        first_sync_index = next(
             (
                 index
-                for index, line in enumerate(
-                    lines[nvml_stub_purge_index + 1 :], nvml_stub_purge_index + 1
-                )
-                if line == nvml_stub_dependencies_purge
+                for index, line in enumerate(lines)
+                if not line.lstrip().startswith("#") and "uv sync" in line
             ),
             None,
         )
-        first_sync_index = next(
-            index
-            for index, line in enumerate(lines)
-            if not line.lstrip().startswith("#") and "uv sync" in line
+        assert first_sync_index is not None, f"{dockerfile} has no uv sync step"
+
+        nvml_link_dependency_purge_index = lines.index(nvml_link_dependency_purge)
+        nvml_link_dependencies_purge_index = next(
+            (
+                index
+                for index, line in enumerate(
+                    lines[nvml_link_dependency_purge_index + 1 :],
+                    nvml_link_dependency_purge_index + 1,
+                )
+                if line == nvml_link_dependencies_purge
+            ),
+            None,
+        )
+        assert nvml_link_dependencies_purge_index is not None, (
+            f"{dockerfile} retains the NVML link dependency's driver-side packages"
         )
 
-        assert setting in lines, f"{dockerfile} does not enable multi-node HybridEP"
-        assert nvml_stub_install in lines, (
-            f"{dockerfile} does not install the NVML link stub"
-        )
-        assert cache_clean in lines, (
-            f"{dockerfile} can reuse a single-node DeepEP wheel"
-        )
-        assert nvml_stub_purge in lines, (
-            f"{dockerfile} does not remove the NVML link stub after the build"
-        )
-        assert nvml_stub_dependencies_purge_index is not None, (
-            f"{dockerfile} retains the NVML stub's driver-side dependencies"
-        )
+        if uses_uv_cache_seed:
+            cache_key_line = next(
+                (
+                    line
+                    for line in lines
+                    if line.startswith("CACHE_KEY=")
+                    and "BASE_IMAGE" in line
+                    and "UV_VERSION" in line
+                ),
+                None,
+            )
+            assert cache_key_line is not None, (
+                f"{dockerfile} does not define the uv seed cache key"
+            )
+            assert "HYBRID_EP_MULTINODE" in cache_key_line, (
+                f"{dockerfile} can reuse a single-node DeepEP wheel"
+            )
+
         assert (
             lines.index(setting)
-            < lines.index(nvml_stub_install)
-            < lines.index(cache_clean)
+            < lines.index(nvml_link_dependency_install)
             < first_sync_index
-            < nvml_stub_purge_index
-            < nvml_stub_dependencies_purge_index
+            < nvml_link_dependency_purge_index
+            < nvml_link_dependencies_purge_index
         ), f"{dockerfile} does not prepare multi-node DeepEP before dependency sync"

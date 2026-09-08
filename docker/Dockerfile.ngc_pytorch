@@ -117,10 +117,11 @@ sed -i 's/= \[{ requirement = "torch", match-runtime = true }\]/= []/g' pyprojec
 # The venv is symlinked to avoid bloating the layer size
 uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
 uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
-# Ensure nvshmem is installed before building DeepEP
 apt-get update
+# DeepEP's multinode link needs the exact filename libnvidia-ml.so.1; the CUDA base
+# only ships stubs/libnvidia-ml.so. Purged again after the syncs below.
 apt-get install -y --no-install-recommends libnvidia-ml-dev
-uv cache clean deep-ep
+# Ensure nvshmem is installed before building DeepEP
 uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
