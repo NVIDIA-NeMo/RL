@@ -717,11 +717,11 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict.pop("effort_levels", None)
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
         # Policy information
-        initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
+        initial_global_config_dict["policy_model_name"] = os.getenv("NEMO_GYM_POLICY_MODEL_NAME") or self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
             "dummy_key"  # No key necessary for training.
         )
-        initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+        initial_global_config_dict["policy_base_url"] = json.loads(os.getenv("NEMO_GYM_POLICY_BASE_URL", "[]")) or self.cfg["base_urls"]
         # In multinode runs, Gym-managed service configs must advertise a real node IP
         # rather than falling back to localhost, or remote workers will connect to
         # their own loopback interface instead of the actor-hosted service.
