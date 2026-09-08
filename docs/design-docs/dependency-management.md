@@ -99,7 +99,9 @@ Each worker type is mapped to the uv extras its virtual environment needs in `AC
 ```python
 # nemo_rl/distributed/actor_environments.py -- None means the driver's interpreter
 ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
-    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": ["vllm"],
+    # An actor can need more than one extra: the vLLM workers also get nemo_gym
+    # because token capture imports it inside the worker.
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": ["vllm", "nemo_gym"],
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": ["mcore"],
     "nemo_rl.environments.math_environment.MathEnvironment": None,
     # ... more mappings
