@@ -38,7 +38,7 @@ import torch
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data_plane.interfaces import backend_config
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -328,8 +328,11 @@ class TQWorkerMixin:
         self._route_fallback_counts = Counter()
         from nemo_rl.data_plane import build_data_plane_client
 
+        # ``LocalDataPlaneConfig`` is the process-local plane: no TQ, no
+        # mooncake, so no GDR to order against a CUDA context.
         if (
-            cfg["backend"] == "mooncake_cpu"
+            not isinstance(cfg, LocalDataPlaneConfig)
+            and cfg["backend"] == "mooncake_cpu"
             and backend_config(cfg).use_gdr
             and not torch.cuda.is_initialized()
         ):
