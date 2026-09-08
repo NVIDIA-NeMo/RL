@@ -3,7 +3,7 @@
 set -euo pipefail
 
 export ACTION=${ACTION:-submit}
-export MODEL=qwen235
+export MODEL=${MODEL:-qwen235}
 export PRECISION_MODE=mxfp8
 export FP8_PARAM=true
 export MAX_STEPS=${MAX_STEPS:-20}
