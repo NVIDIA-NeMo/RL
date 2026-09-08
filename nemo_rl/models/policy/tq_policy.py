@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,20 +30,26 @@ no key minting). Workers fetch their slice from TQ via
 from __future__ import annotations
 
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
+from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
+from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
+from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
+    GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
+    ROUTE_PASSTHROUGH_FLAG,
+    ROUTE_PLAN_TAG,
     fields_with_optional_routed_experts,
 )
 from nemo_rl.models.policy.lm_policy import Policy
@@ -65,11 +71,22 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
+    if "mtp_metrics" in results[0]:
+        out["mtp_metrics"] = results[0]["mtp_metrics"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
             all_mb_metrics[k].extend(v)
     out["all_mb_metrics"] = dict(all_mb_metrics)
+    # Only the replica leader ever populates this (see
+    # TQWorkerMixin._maybe_assemble_routed_experts), so non-leader entries
+    # are always empty and summing every result is safe without an
+    # is_replica_leader filter; each DP replica leader covers disjoint data.
+    route_fallback_counts: Counter[str] = Counter()
+    for r in results:
+        route_fallback_counts.update(r.get("route_fallback_counts") or {})
+    if route_fallback_counts:
+        out["route_fallback_counts"] = dict(route_fallback_counts)
     return out
 
 
@@ -97,7 +114,7 @@ class TQPolicy(TQDriverMixin, Policy):
     def __init__(
         self,
         *args: Any,
-        dp_cfg: DataPlaneConfig,
+        dp_cfg: DataPlaneRuntimeConfig,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -203,6 +220,41 @@ class TQPolicy(TQDriverMixin, Policy):
 
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 
+    def _with_route_fields(
+        self,
+        meta: KVBatchMeta,
+        base_fields: tuple[str, ...],
+        *,
+        task_name: str,
+        want_routes: bool,
+    ) -> KVBatchMeta:
+        """Resolve direct versus deferred route storage for one worker request.
+
+        Delegates to :meth:`TQDriverMixin._isolated_meta` so the narrowed
+        meta also gets its per-dispatch forward-pad target minted.
+        """
+        want = self._router_replay_enabled and want_routes
+        plan_presence = [ROUTE_PLAN_TAG in tag for tag in (meta.tags or [])]
+        if want and any(plan_presence) and not all(plan_presence):
+            raise RuntimeError(
+                "router replay does not support mixed direct/deferred route "
+                "storage in one worker fetch"
+            )
+        passthrough = bool(want and plan_presence and all(plan_presence))
+        extra_info = dict(meta.extra_info or {})
+        if passthrough:
+            extra_info[ROUTE_PASSTHROUGH_FLAG] = True
+        else:
+            extra_info.pop(ROUTE_PASSTHROUGH_FLAG, None)
+        return self._isolated_meta(
+            replace(meta, extra_info=extra_info),
+            fields=fields_with_optional_routed_experts(
+                base_fields,
+                enabled=want and not passthrough,
+            ),
+            task_name=task_name,
+        )
+
     def _logprob_dispatch(
         self,
         meta: KVBatchMeta,
@@ -216,21 +268,27 @@ class TQPolicy(TQDriverMixin, Policy):
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
-        Logprob workers need only LP_SEED_FIELDS — narrow the meta's
-        field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
-        multimodal). The same shape is used for both prev_lp and ref_lp.
-        Workers compute the per-token tensor and commit it to TQ via the
-        leader-rank ``_write_back_result_field``; the Ray return is
-        always None, so this dispatcher just waits for completion.
+        Logprob workers fetch ``LP_SEED_FIELDS`` plus the multimodal
+        columns ``_isolated_meta`` unions in, so prev/ref logprobs see the
+        same model inputs as the training forward, which is narrowed through
+        the same helper. Narrowing the
+        meta's field list still keeps rollout-only payload (message-log
+        bulk, ``content``) in TQ. The same shape is used for both prev_lp
+        and ref_lp. Workers compute the per-token tensor and commit it to
+        TQ via the leader-rank ``_write_back_result_field``; the Ray
+        return is always None, so this dispatcher just waits for
+        completion.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
-        lp_meta = self._isolated_meta(
+        # Narrow the fetch to LP_SEED_FIELDS + optional routed_experts under
+        # R3 replay. ``_isolated_meta`` unions in the multimodal columns the
+        # rollout wrote, for this dispatch and the training one alike, so the
+        # prev/ref logprobs and the training forward see identical model inputs.
+        lp_meta = self._with_route_fields(
             meta,
-            fields=fields_with_optional_routed_experts(
-                LP_SEED_FIELDS,
-                enabled=self._router_replay_enabled and include_router_replay,
-            ),
+            LP_SEED_FIELDS,
             task_name=task_name,
+            want_routes=include_router_replay,
         )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
@@ -331,12 +389,14 @@ class TQPolicy(TQDriverMixin, Policy):
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
-        train_meta = self._isolated_meta(
+        # The multimodal columns are per-batch, not part of the static schema,
+        # so ``_isolated_meta`` unions them in — without them a VLM training
+        # forward would run image-blind while the logprob forwards saw images.
+        train_meta = self._with_route_fields(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
-            ),
+            train_fields,
             task_name="train",
+            want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
@@ -460,12 +520,14 @@ class TQPolicy(TQDriverMixin, Policy):
             train_fields: Columns produced for this step and fetched by workers.
         """
         spa, dba = self._packing_args("train_mb_tokens")
-        train_meta = self._isolated_meta(
+        train_meta = self._with_route_fields(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
-            ),
+            # Raw fields, not pre-wrapped in fields_with_optional_routed_experts:
+            # _with_route_fields applies that wrapper itself, gated on both
+            # router replay and route-plan passthrough.
+            train_fields,
             task_name="train",
+            want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
@@ -476,6 +538,77 @@ class TQPolicy(TQDriverMixin, Policy):
                 dynamic_batching_args=dba,
             )
 
+        self._dispatch_train_microbatches(dp_metas, timer=timer)
+
+    def train_placed_microbatches(
+        self,
+        dp_metas: list[KVBatchMeta],
+        timer: Optional[Timer] = None,
+    ) -> None:
+        """Dispatch one producer-assigned metadata batch per logical DP rank.
+
+        The input order is the logical DP-rank order. Producer field lists
+        remain unchanged because an SFT loader can provide a narrower schema
+        than the rollout training path.
+        """
+        dp_world = self.sharding_annotations.get_axis_size("data_parallel")
+        if len(dp_metas) != dp_world:
+            raise ValueError(
+                "Placed metadata must contain exactly one batch per DP rank: "
+                f"got {len(dp_metas)} batches for dp_world={dp_world}."
+            )
+        spa, dba = self._packing_args("train_mb_tokens")
+        if spa is not None or dba is not None:
+            raise ValueError(
+                "Placed metadata supports fixed batches only. Disable NeMo-RL "
+                "sequence packing and dynamic batching."
+            )
+        train_metas = [
+            replace(meta, task_name="train")
+            for meta in self._stamp_placed_pad_seqlen(dp_metas)
+        ]
+        self._dispatch_train_microbatches(train_metas, timer=timer)
+
+    def _stamp_placed_pad_seqlen(
+        self, dp_metas: list[KVBatchMeta]
+    ) -> list[KVBatchMeta]:
+        """Mint one fresh forward padding target across all placed DP batches.
+
+        Returns new metadata rather than mutating the caller's, and ignores any
+        inherited target: reusing one would let it ratchet upward across steps
+        and pad every later step to a historical maximum. This mirrors
+        ``TQDriverMixin._isolated_meta``, which pops the key for the same reason.
+        """
+        sequence_lengths = [
+            length for meta in dp_metas for length in (meta.sequence_lengths or [])
+        ]
+        if not sequence_lengths:
+            return list(dp_metas)
+        _, dynamic_args = self._packing_args("train_mb_tokens")
+        sequence_round = (
+            int(dynamic_args["sequence_length_round"])
+            if dynamic_args is not None
+            else 1
+        )
+        pad_multiple = max(
+            [int(meta.extra_info.get("pad_to_multiple", 1)) for meta in dp_metas]
+        )
+        target = round_up(max(sequence_lengths), max(pad_multiple, sequence_round))
+        return [
+            replace(
+                meta,
+                extra_info={**meta.extra_info, GLOBAL_FORWARD_PAD_SEQLEN: target},
+            )
+            for meta in dp_metas
+        ]
+
+    def _dispatch_train_microbatches(
+        self,
+        dp_metas: list[KVBatchMeta],
+        *,
+        timer: Optional[Timer],
+    ) -> None:
+        """Send prepared per-DP metadata into an open train step."""
         if self.flops_tracker is not None:
             for m in dp_metas:
                 self.flops_tracker.track_batch(list(m.sequence_lengths or []))

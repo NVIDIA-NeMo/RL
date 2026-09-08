@@ -100,6 +100,17 @@ _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
 _PARTITION_ID = "rollout_data"
 
 
+def _consumed_meta(*sample_ids: str) -> KVBatchMeta:
+    """A train-consumed canonical meta as the train pump hands to cleanup."""
+    return KVBatchMeta(
+        partition_id=_PARTITION_ID,
+        task_name="train",
+        sample_ids=list(sample_ids),
+        fields=["input_ids"],
+        tags=[{"weight_version": 0} for _ in sample_ids],
+    )
+
+
 # ── fakes ────────────────────────────────────────────────────────────────────
 
 
@@ -572,6 +583,7 @@ def _make_actor_args(
             save_state if save_state is not None else _initial_grpo_save_state()
         ),
         last_checkpoint_path=last_checkpoint_path,
+        finalizer_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
     )
 
@@ -1200,7 +1212,7 @@ class TestDataPlaneCheckpoint:
             assert started
 
             clear_task = asyncio.create_task(
-                actor._clear_data_plane_samples(["sample-0"])
+                actor._cleanup_consumed_metas([_consumed_meta("sample-0")])
             )
             await asyncio.sleep(0)
             assert dp_client.clear_calls == []
@@ -1222,7 +1234,7 @@ class TestDataPlaneCheckpoint:
                 mc, _make_actor_args(dp_client=dp_client), SetupTimingMetrics()
             )
             event_loop_thread_id = threading.get_ident()
-            await actor._clear_data_plane_samples(["sample-0"])
+            await actor._cleanup_consumed_metas([_consumed_meta("sample-0")])
             actor._checkpointer.shutdown()
             return event_loop_thread_id
 
@@ -1561,6 +1573,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             val_at_start=False,
             val_at_end=False,
         ),
+        logger={"wandb_enabled": False, "wandb": {}},
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,
