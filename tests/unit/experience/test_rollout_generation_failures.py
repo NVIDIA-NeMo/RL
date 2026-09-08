@@ -54,6 +54,7 @@ from nemo_rl.experience.rollout_manager import (
     _Deadline,
     _gather_cancelling_siblings,
 )
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.utils.timer import Timer
 
 
@@ -88,6 +89,8 @@ class _TokenizedText:
 
 
 class _FakeTokenizer:
+    pad_token_id = 0
+
     def decode(self, ids, skip_special_tokens=True):
         del skip_special_tokens
         return f"<{len(ids)} tokens>"
@@ -440,8 +443,8 @@ class TestDeadlineHelper:
 
 
 def _gym_rows(count: int) -> list[dict]:
-    """Rows shaped the way _build_inputs stamps them: each carries its own index."""
-    return [{"_rowidx": i, "agent_ref": {"name": "agent"}} for i in range(count)]
+    """Gym 0.15 rows carry task_source until the remote actor resolves an agent."""
+    return [{"_rowidx": i, "task_source": "workplace_assistant"} for i in range(count)]
 
 
 class _PartialGymMethod:
@@ -480,6 +483,7 @@ async def _row_result(rowidx: int):
     """A minimally complete NeMo-Gym result, enough to build a Completion."""
     return (
         rowidx,
+        {"name": "agent"},
         {
             "input_message_log": [{"role": "user", "token_ids": [1]}],
             "message_log": [{"role": "assistant", "token_ids": [2]}],
@@ -507,7 +511,12 @@ class _FakeGymMethod:
 
     async def _stream(self, num_inputs):
         async def _result(rowidx):
-            return rowidx, {"input_message_log": [], "message_log": []}, None
+            return (
+                rowidx,
+                {"name": "agent"},
+                {"input_message_log": [], "message_log": []},
+                None,
+            )
 
         for rowidx in range(min(self._rows_to_yield, num_inputs)):
             yield _result(rowidx)
@@ -625,6 +634,23 @@ class TestPartialGymRedispatch:
         assert len(completions) == 5
         assert sum(len(d) for d in method.dispatched) == 7
 
+    def test_prompt_group_defers_complete_retry_to_the_outer_manager(self):
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=3)
+
+        with pytest.raises(ConnectionResetError, match="gym stream died"):
+            asyncio.run(
+                impl._run_rollouts(
+                    _gym_rows(4),
+                    Timer(),
+                    "timing/rollout",
+                    recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+                )
+            )
+
+        assert method.dispatched == [[0, 1, 2, 3]]
+        assert impl._stats.gym_row_redispatches == 0
+
     def test_a_stale_echo_of_a_landed_row_is_rejected(self):
         """Re-dispatch narrows the stream; an echo of an already-landed row must not win.
 
@@ -727,12 +753,30 @@ class TestPartialGymRedispatch:
         method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
         impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
 
-        with pytest.raises(ValueError, match="must be stamped with their own position"):
+        with pytest.raises(ValueError, match="carries invalid _rowidx"):
             asyncio.run(
                 impl._run_rollouts(
                     [{"agent_ref": {"name": "a"}}], Timer(), "timing/rollout"
                 )
             )
+
+    def test_row_indices_must_fit_within_the_prompt_group(self):
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+        rows = _gym_rows(2)
+        rows[1]["_rowidx"] = 2
+
+        with pytest.raises(ValueError, match="carries invalid _rowidx=2"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+    def test_row_indices_must_be_unique(self):
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+        rows = _gym_rows(2)
+        rows[1]["_rowidx"] = 0
+
+        with pytest.raises(ValueError, match="duplicate _rowidx values"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
 
     def test_the_group_deadline_spans_re_dispatches(self):
         """The budget belongs to the prompt group, not to each attempt.

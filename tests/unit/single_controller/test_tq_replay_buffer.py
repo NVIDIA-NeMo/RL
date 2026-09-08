@@ -170,8 +170,48 @@ class FailAfterPutAndClearDataPlaneClient(FailAfterPutDataPlaneClient):
         raise OSError("injected rollback failure")
 
 
+class BlockFirstClearDataPlaneClient(FakeDataPlaneClient):
+    """Pause one clear so another structural mutation can shift list indices."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.clear_started = threading.Event()
+        self.release_clear = threading.Event()
+        self._blocked = False
+
+    def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
+        if not self._blocked:
+            self._blocked = True
+            self.clear_started.set()
+            if not self.release_clear.wait(timeout=5):
+                raise TimeoutError("timed out waiting to release the first clear")
+        super().clear_samples(sample_ids, partition_id)
+
+
 def _run(coro):
     return asyncio.run(coro)
+
+
+async def _commit_finalized(
+    buffer: TQReplayBuffer,
+    group_id: str,
+    meta: KVBatchMeta,
+    group_min_wv: int,
+    group_max_wv: int,
+    *,
+    staging_keys: list[str] | None = None,
+) -> KVBatchMeta:
+    barrier = buffer._data_plane_checkpoint_barrier
+    assert barrier is not None
+    async with barrier.mutation() as cut:
+        return await buffer.commit_finalized(
+            cut,
+            group_id,
+            meta,
+            group_min_wv,
+            group_max_wv,
+            staging_keys=staging_keys,
+        )
 
 
 def _make_record(
@@ -298,6 +338,35 @@ class TestDataPlaneCheckpointBarrier:
 
         asyncio.run(exercise())
 
+    def test_cancelled_mutation_releases_waiting_checkpoint(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            mutation_entered = asyncio.Event()
+            checkpoint_entered = asyncio.Event()
+
+            async def mutate() -> None:
+                async with barrier.mutation():
+                    mutation_entered.set()
+                    await asyncio.Event().wait()
+
+            async def checkpoint() -> None:
+                async with barrier.checkpoint():
+                    checkpoint_entered.set()
+
+            mutation_task = asyncio.create_task(mutate())
+            await mutation_entered.wait()
+            checkpoint_task = asyncio.create_task(checkpoint())
+            await asyncio.sleep(0)
+            assert not checkpoint_entered.is_set()
+
+            mutation_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await mutation_task
+            await asyncio.wait_for(checkpoint_task, timeout=5.0)
+            assert checkpoint_entered.is_set()
+
+        asyncio.run(exercise())
+
     def test_two_checkpoints_serialize_without_deadlock(self):
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()
@@ -327,8 +396,53 @@ class TestDataPlaneCheckpointBarrier:
 
         asyncio.run(exercise())
 
+    @pytest.mark.parametrize(
+        ("outer_section", "inner_section"),
+        [
+            ("mutation", "mutation"),
+            ("mutation", "checkpoint"),
+            ("checkpoint", "mutation"),
+            ("checkpoint", "checkpoint"),
+        ],
+    )
+    def test_same_task_cannot_nest_barrier_sections(
+        self, outer_section: str, inner_section: str
+    ):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            outer = (
+                barrier.mutation()
+                if outer_section == "mutation"
+                else barrier.checkpoint()
+            )
+            inner = (
+                barrier.mutation()
+                if inner_section == "mutation"
+                else barrier.checkpoint()
+            )
+
+            async with outer:
+                with pytest.raises(
+                    RuntimeError, match="already holds a data-plane barrier section"
+                ):
+                    async with inner:
+                        pytest.fail("nested barrier section unexpectedly opened")
+
+            # A rejected nested section must not poison later acquisitions.
+            async with barrier.mutation() as cut:
+                cut.require_live()
+
+        asyncio.run(exercise())
+
 
 class TestTQReplayBufferReserveCommit:
+    def test_reserve_rejects_duplicate_live_group_id(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        buf.reserve(weight_version=0, group_id="group-0")
+
+        with pytest.raises(ValueError, match="duplicate live group_id"):
+            buf.reserve(weight_version=1, group_id="group-0")
+
     def test_commit_waits_for_active_checkpoint(self):
         async def exercise() -> None:
             dp = FakeDataPlaneClient()
@@ -657,6 +771,38 @@ class TestTQReplayBufferRemove:
         assert dp.clear_thread_ids
         assert dp.clear_thread_ids[0] != event_loop_thread_id
 
+    def test_concurrent_removal_re_resolves_stable_group_ids_after_dp_await(self):
+        async def exercise() -> None:
+            dp = BlockFirstClearDataPlaneClient()
+            buf = _make_buffer(dp)
+            group_ids = [buf.reserve(weight_version=i) for i in range(3)]
+            for i, group_id in enumerate(group_ids):
+                await buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=i,
+                    end_weight_version=i,
+                )
+
+            # Removing the final slot pauses in DataPlane. Removing the first slot
+            # concurrently shifts the final slot from index 2 to index 1.
+            remove_last = asyncio.create_task(buf.remove([2], remove_in_dp=True))
+            try:
+                clear_started = await asyncio.to_thread(dp.clear_started.wait, 2)
+                assert clear_started
+                assert await buf.remove([0], remove_in_dp=True) == 1
+            finally:
+                dp.release_clear.set()
+            assert await remove_last == 1
+
+            assert buf.group_ids == (group_ids[1],)
+            assert buf.start_weight_list == [1]
+            assert buf.end_weight_list == [1]
+            assert buf.ready_list == [True]
+            assert set(dp._rows) == set(buf.meta_list[0].sample_ids)
+
+        asyncio.run(exercise())
+
     def test_remove_drops_indices_and_clears_dp_when_requested(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -701,6 +847,28 @@ class TestTQReplayBufferRemove:
             list(metas[1].sample_ids),
         ]
         assert dp.depth() == 2 * _N_GENS
+        assert dp.clear_calls == []
+
+    def test_remove_rejects_duplicate_indices_before_mutating(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0)
+
+        with pytest.raises(ValueError, match="duplicate indices"):
+            _run(buf.remove([0, 0], remove_in_dp=True))
+
+        assert buf.size() == 1
+        assert dp.clear_calls == []
+
+    def test_remove_rejects_negative_indices_before_mutating(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0)
+
+        with pytest.raises(IndexError, match="must be non-negative"):
+            _run(buf.remove([-1], remove_in_dp=True))
+
+        assert buf.size() == 1
         assert dp.clear_calls == []
 
     def test_remove_empty_is_noop(self):
@@ -1009,6 +1177,10 @@ class TestTQReplayBufferStateDict:
                 "per_worker_token_counts": {0: 7},
             }
         ]
+        assert restored_buf._rollout_ids_list == [
+            list(meta.sample_ids) for meta in metas
+        ]
+        assert restored_buf._staging_keys_list == [None, None]
         assert restored_dp.put_calls == []
 
     def test_checkpoint_serialization_preserves_full_result_table(self):
@@ -1058,6 +1230,32 @@ class TestTQReplayBufferStateDict:
         assert isinstance(restored_table, Table)
         assert restored_table.columns == ["Full result"]
         assert restored_table.data == [['{"reward":1.0,"status":"completed"}']]
+
+    def test_token_capture_round_trip_restores_staging_cleanup_ownership(self):
+        plan = encode_route_plan(
+            RouteAssemblyPlan(
+                schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                staging_partition="rollout_staging",
+                spans=(RouteSpan("r0/on_chain", 0, 2, 2, 1, "0" * 64),),
+                cleanup_staging_keys=("r0/on_chain", "r0/off_chain"),
+                expected_token_length=2,
+            )
+        )
+        group = _make_group_entry("g0", weight=1)
+        group["meta"].tags = [{ROUTE_PLAN_TAG: plan} for _ in group["meta"].sample_ids]
+        state = _make_metadata_envelope([group])
+
+        restored = TQReplayBuffer(
+            MultiPartitionFakeDataPlaneClient(),
+            partition_id="rollout_data",
+            pad_value_dict={"token_ids": 0},
+            staging_partition_id="rollout_staging",
+            include_message_violation_fields=False,
+        )
+        assert _load(restored, state) == 1
+
+        assert restored._rollout_ids_list == [list(group["meta"].sample_ids)]
+        assert restored._staging_keys_list == [["r0/on_chain", "r0/off_chain"]]
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
         # start != end and a non-None target_step must survive the round-trip:
@@ -1289,6 +1487,36 @@ class TestTQReplayBufferTokenCaptureMode:
         buf.reserve(weight_version=1)
         assert buf._rollout_ids_list[1] is None
 
+    def test_mutating_helpers_reject_expired_cut(self):
+        buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
+        group_id = buf.reserve(weight_version=1, rollout_ids=["r0"])
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name=None,
+            sample_ids=[f"{group_id}_g0"],
+            fields=None,
+        )
+
+        async def get_expired_cut():
+            barrier = buf._data_plane_checkpoint_barrier
+            assert barrier is not None
+            async with barrier.mutation() as cut:
+                return cut
+
+        cut = _run(get_expired_cut())
+        with pytest.raises(RuntimeError, match="no longer active"):
+            _run(buf.clear_staging_keys(cut, []))
+        with pytest.raises(RuntimeError, match="no longer active"):
+            _run(buf.commit_finalized(cut, group_id, meta, 1, 1))
+        with pytest.raises(RuntimeError, match="no longer active"):
+            _run(
+                buf._remove_groups_unlocked(
+                    cut,
+                    [group_id],
+                    clear_data_plane=False,
+                )
+            )
+
     def test_commit_finalized_fills_slot_with_group_min_wv(self):
         dp = MultiPartitionFakeDataPlaneClient()
         buf = self._make_capture_buffer(dp)
@@ -1301,7 +1529,8 @@ class TestTQReplayBufferTokenCaptureMode:
             fields=None,
         )
         _run(
-            buf.commit_finalized(
+            _commit_finalized(
+                buf,
                 group_id,
                 meta,
                 group_min_wv=3,
@@ -1323,7 +1552,7 @@ class TestTQReplayBufferTokenCaptureMode:
             partition_id="rollout_data", task_name=None, sample_ids=[], fields=None
         )
         with pytest.raises(ValueError, match="no live slot"):
-            _run(buf.commit_finalized("ghost", meta, group_min_wv=0, group_max_wv=0))
+            _run(_commit_finalized(buf, "ghost", meta, 0, 0))
 
     def test_commit_finalized_verifies_full_plan_manifest_ownership(self):
         dp = MultiPartitionFakeDataPlaneClient()
@@ -1348,7 +1577,8 @@ class TestTQReplayBufferTokenCaptureMode:
 
         with pytest.raises(ValueError, match="ownership does not match"):
             _run(
-                buf.commit_finalized(
+                _commit_finalized(
+                    buf,
                     group_id,
                     meta,
                     group_min_wv=1,
@@ -1391,7 +1621,8 @@ class TestTQReplayBufferTokenCaptureMode:
             fields=None,
         )
         _run(
-            buf.commit_finalized(
+            _commit_finalized(
+                buf,
                 group_id,
                 meta,
                 group_min_wv=1,
@@ -1420,7 +1651,7 @@ class TestTQReplayBufferTokenCaptureMode:
             sample_ids=[f"{group_id}_g0"],
             fields=None,
         )
-        _run(buf.commit_finalized(group_id, meta, group_min_wv=1, group_max_wv=1))
+        _run(_commit_finalized(buf, group_id, meta, 1, 1))
         _run(buf.remove([0], remove_in_dp=True))
         partitions_cleared = {p for p, _ in dp.clear_calls_by_partition}
         assert partitions_cleared == {"rollout_data"}
@@ -1442,7 +1673,8 @@ class TestTQReplayBufferTokenCaptureMode:
             fields=None,
         )
         _run(
-            buf.commit_finalized(
+            _commit_finalized(
+                buf,
                 group_id,
                 meta,
                 group_min_wv=1,
@@ -1492,8 +1724,11 @@ class TestTQReplayBufferEvictedCommit:
                 result = FakeDataPlaneClient.put_samples(
                     self, sample_ids, partition_id, fields=fields, tags=tags
                 )
-                # Simulate the sampler evicting the slot mid-write.
-                await self.buf.remove([0], remove_in_dp=False)
+                # Simulate another task evicting the slot mid-write. Barrier
+                # sections are deliberately non-reentrant within one task, but
+                # independent mutation tasks may overlap when no checkpoint is
+                # active.
+                await asyncio.create_task(self.buf.remove([0], remove_in_dp=False))
                 return result
 
         dp = EvictDuringPut()
