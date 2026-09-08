@@ -44,6 +44,7 @@ from megatron.bridge.training.config import (
     SchedulerConfig,
     TokenizerConfig,
     TrainingConfig,
+    ValidationConfig,
 )
 from megatron.bridge.training.initialize import (
     initialize_megatron,
@@ -702,6 +703,26 @@ def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
         )
 
 
+def _is_complete_hf_conversion_cache(pretrained_path: str) -> bool:
+    """Return whether an HF-to-Bridge cache reached its final save markers."""
+    iter_path = os.path.join(pretrained_path, "iter_0000000")
+    run_config = os.path.join(iter_path, "run_config.yaml")
+    tracker = os.path.join(pretrained_path, "latest_checkpointed_iteration.txt")
+    metadata_candidates = (
+        os.path.join(iter_path, "metadata.json"),
+        os.path.join(iter_path, ".metadata"),
+    )
+
+    def _nonempty_file(path: str) -> bool:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+
+    return (
+        _nonempty_file(run_config)
+        and _nonempty_file(tracker)
+        and any(_nonempty_file(path) for path in metadata_candidates)
+    )
+
+
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths.
 
@@ -801,9 +822,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
         overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
         hf_model_subdir = f"{hf_model_subdir}__hfovr_{overrides_hash}"
     pretrained_path = os.path.join(get_megatron_checkpoint_dir(), hf_model_subdir)
-    pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-        os.path.join(pretrained_path, "iter_0000000")
-    )
+    pt_checkpoint_exists = _is_complete_hf_conversion_cache(pretrained_path)
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
 
@@ -1631,16 +1650,11 @@ def _create_megatron_config(
     fp8_param_enabled: bool = False,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
-    # NeMo-RL owns microbatch scheduling for policy train/logprob calls; the
-    # TrainingConfig batch sizes below are only placeholders required while
-    # Megatron-Bridge builds and validates its ConfigContainer. Newer Bridge
-    # versions validate that placeholder as an eval batch and require it to be
-    # divisible by the policy data-parallel width. Feeding the real rollout
-    # batch here therefore rejects otherwise-valid layouts such as 48 policy
-    # ranks, TP=2, CP=1 (DP=24), and a 2,048-sequence GRPO batch.
-    #
-    # Use one placeholder microbatch per DP replica. The actual GRPO batch
-    # remains in ``config`` and is consumed directly by MegatronPolicyWorker.
+    # NeMo-RL owns the policy microbatch schedule. Bridge still validates an
+    # eval batch while finalizing ConfigContainer, so give only validation a
+    # one-microbatch-per-DP-replica placeholder. TrainingConfig must retain the
+    # real rollout GBS: Bridge converts lr_*_iters to sample counts with it and
+    # MegatronPolicyWorker advances the scheduler by that same real GBS.
     world_size = (
         torch.distributed.get_world_size()
         if torch.distributed.is_initialized()
@@ -1656,9 +1670,9 @@ def _create_megatron_config(
             f"Policy world size ({world_size}) must be divisible by model-parallel "
             f"size ({model_parallel_size})"
         )
-    bridge_placeholder_global_batch_size = (
-        config.get("train_micro_batch_size", 1)
-        * (world_size // model_parallel_size)
+    bridge_eval_micro_batch_size = config.get("train_micro_batch_size", 1)
+    bridge_eval_global_batch_size = bridge_eval_micro_batch_size * (
+        world_size // model_parallel_size
     )
 
     # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
@@ -1707,8 +1721,14 @@ def _create_megatron_config(
         dist=dist_cfg,
         train=TrainingConfig(
             micro_batch_size=1,  # ignored
-            global_batch_size=bridge_placeholder_global_batch_size,  # ignored
+            # Keep Bridge's iteration-to-sample LR schedule conversion aligned
+            # with the real optimizer-step batch size.
+            global_batch_size=config["train_global_batch_size"],
             train_iters=config["megatron_cfg"]["train_iters"],
+        ),
+        validation=ValidationConfig(
+            eval_micro_batch_size=bridge_eval_micro_batch_size,
+            eval_global_batch_size=bridge_eval_global_batch_size,
         ),
         optimizer=OptimizerConfig(**optimizer_kwargs),
         ddp=DistributedDataParallelConfig(

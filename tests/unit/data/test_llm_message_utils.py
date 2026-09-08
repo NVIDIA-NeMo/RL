@@ -33,6 +33,11 @@ from nemo_rl.data.llm_message_utils import (
     message_log_to_flat_messages,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.utils.routed_experts_ref import (
+    ROUTED_EXPERTS_REF_DTYPE,
+    ROUTED_EXPERTS_REF_KEY,
+    ROUTED_EXPERTS_REF_SCHEMA,
+)
 
 
 @pytest.fixture
@@ -61,6 +66,57 @@ def multiple_messages_log() -> LLMMessageLogType:
             "attention_mask": torch.tensor([1, 1]),
             "text": "second",
         },
+    ]
+
+
+def test_batched_flatten_preserves_segmented_routed_experts_refs():
+    full_ref = {
+        "schema": ROUTED_EXPERTS_REF_SCHEMA,
+        "store": "store-a",
+        "store_instance_id": "instance-a",
+        "request_id": "request-a",
+        "key": ROUTED_EXPERTS_REF_KEY,
+        "task_index": 11,
+        "rollout_index": 2,
+        "target_weight_version": 3,
+        "offset": 0,
+        "length": 3,
+        "shape": [3, 2, 2],
+        "dtype": ROUTED_EXPERTS_REF_DTYPE,
+    }
+    replacement_ref = full_ref | {
+        "request_id": "request-b",
+        "offset": 2,
+        "length": 1,
+        "shape": [4, 2, 2],
+    }
+    message_logs = [
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([1]),
+                "routed_experts": full_ref | {"length": 1},
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([2, 3]),
+                "routed_experts": [
+                    full_ref | {"offset": 1, "length": 1},
+                    replacement_ref,
+                ],
+            },
+        ]
+    ]
+
+    flat, lengths = batched_message_log_to_flat_message(message_logs)
+
+    assert lengths.tolist() == [3]
+    assert flat["routed_experts"] == [
+        [
+            full_ref | {"length": 1},
+            full_ref | {"offset": 1, "length": 1},
+            replacement_ref,
+        ]
     ]
 
 

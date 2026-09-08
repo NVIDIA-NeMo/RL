@@ -26,22 +26,31 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
 fi
 
 container="${CONTAINER:-/scratch/fsw/portfolios/nemotron/projects/nemotron_omni_vision/users/pulkitk/tracking/images/nemo-rl:super35_20260901_prefetched_venvs_arm64.squashfs}"
-config_in_container="examples/configs/recipes/vlm/vlm_grpo_videoqa_super_profile_band.yaml"
+config_in_container="${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo_videoqa_super_profile_band.yaml}"
 model_path="${MODEL_PATH:-/scratch/fsw/portfolios/nemotron/projects/nemotron_omni_vision/users/pulkitk/tracking/weights/full_generalist_12500_stage2_0828_iter3159}"
 data_path="${DATA_PATH:-/lustre/fsw/portfolios/nemotron/users/arushig/nemo_gym_rl_video_0803/nemo_rl/results/combined_sav_caprl_20260822/train_sav_all_tracks_plus_caprl_exclude6215_cluster_paths.jsonl}"
 tokenizer_chat_template="${TOKENIZER_CHAT_TEMPLATE:-default}"
 vllm_chat_template="${VLLM_CHAT_TEMPLATE:-null}"
 persistent_cache="${PERSISTENT_CACHE:-/scratch/fsw/portfolios/nemotron/projects/nemotron_omni_vision/users/ehosseiniasl/nemo_rl_cache}"
+require_complete_megatron_cache="${REQUIRE_COMPLETE_MEGATRON_CACHE:-false}"
 slurm_time_limit="${SLURM_TIME_LIMIT:-14:00:00}"
 
 run_id="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}"
-# Reuse the pre-populated persistent Gym environments. A cold per-run directory
-# lets multiple Gym services install into separate environments concurrently,
-# which can leave partially installed Ray/Pygments modules if startup exits.
-gym_venv_dir="${GYM_VENV_DIR:-${persistent_cache}/gym_venvs_derisk}"
 base_name="${BASE_NAME:-async_grpo_super35_latest_combined_sav_caprl_${run_id}}"
 candidate_name="${base_name}_${SLURM_ACCOUNT}_${SLURM_PARTITION//,/_}"
 results_dir="${RESULTS_DIR:-${code_dir}/results/${base_name}}"
+run_cache_dir="${RUN_CACHE_DIR:-${persistent_cache}/runs/${base_name}}"
+gym_venv_dir="${GYM_VENV_DIR:-${persistent_cache}/gym_venvs_derisk}"
+hf_home="${RUN_HF_HOME:-${run_cache_dir}/huggingface}"
+hf_modules_cache="${RUN_HF_MODULES_CACHE:-${hf_home}/modules}"
+hf_config_lock_dir="${MEGATRON_CONFIG_LOCK_DIR:-${run_cache_dir}/hf_config_locks}"
+vllm_cache_dir="${VLLM_CACHE_ROOT:-${run_cache_dir}/vllm_compile}"
+flashinfer_cubin_dir="${FLASHINFER_CUBIN_DIR:-${run_cache_dir}/flashinfer_cubins}"
+flashinfer_workspace_dir="${FLASHINFER_WORKSPACE_BASE:-${run_cache_dir}/flashinfer_workspace}"
+torch_cache_dir="${TORCH_HOME:-${run_cache_dir}/torch}"
+triton_cache_dir="${TRITON_CACHE_DIR:-/tmp/nemo_rl_triton_${base_name}}"
+torchinductor_cache_dir="${TORCHINDUCTOR_CACHE_DIR:-/tmp/nemo_rl_torchinductor_${base_name}}"
+megatron_checkpoint_dir="${MEGATRON_CHECKPOINT_DIR:-${run_cache_dir}/megatron_ckpt_cache}"
 slurm_log_dir="${results_dir}/slurm"
 job_cycles="${JOB_CYCLES:-20}"
 num_nodes="${NUM_NODES:-32}"
@@ -58,7 +67,33 @@ recompute_kv_cache_after_weight_updates="${RECOMPUTE_KV_CACHE_AFTER_WEIGHT_UPDAT
 length_penalty_enabled="${LENGTH_PENALTY_ENABLED:-true}"
 profile_band_enabled="${PROFILE_BAND_ENABLED:-true}"
 router_replay_enabled="${ROUTER_REPLAY_ENABLED:-false}"
+router_replay_transport="${ROUTER_REPLAY_TRANSPORT:-}"
+load_replay_buffer="${LOAD_REPLAY_BUFFER:-}"
+use_leave_one_out_baseline="${USE_LEAVE_ONE_OUT_BASELINE:-false}"
+async_grpo_enabled="${ASYNC_GRPO_ENABLED:-true}"
+max_trajectory_age_steps="${MAX_TRAJECTORY_AGE_STEPS:-1}"
+freeze_moe_router="${FREEZE_MOE_ROUTER:-true}"
+moe_router_load_balancing_type="${MOE_ROUTER_LOAD_BALANCING_TYPE:-none}"
+moe_router_bias_update_rate="${MOE_ROUTER_BIAS_UPDATE_RATE:-0.0}"
 train_global_batch_size=$((num_prompts * num_generations))
+
+if [[ -z "${router_replay_transport}" ]]; then
+  if [[ "${router_replay_enabled}" == "true" ]]; then
+    router_replay_transport=ray
+  else
+    router_replay_transport=inline
+  fi
+fi
+if [[ -z "${load_replay_buffer}" ]]; then
+  if [[ "${router_replay_enabled}" == "true" && "${router_replay_transport}" == "ray" ]]; then
+    # A new Slurm window starts a new Ray cluster, so references saved by the
+    # previous cluster are not durable. Resume model/optimizer/dataloader state,
+    # but regenerate the async lookahead buffer.
+    load_replay_buffer=false
+  else
+    load_replay_buffer=true
+  fi
+fi
 
 if (( num_gen_nodes <= 0 || num_gen_nodes >= num_nodes )); then
   echo "ERROR: NUM_GEN_NODES must be between 1 and NUM_NODES-1" >&2
@@ -93,6 +128,24 @@ fi
   echo "ERROR: SA-V tracks verifier not in this clone's Gym" >&2
   exit 1
 }
+if [[ "${require_complete_megatron_cache}" == "true" ]]; then
+  complete_cache_found=false
+  shopt -s nullglob
+  for iter_dir in "${megatron_checkpoint_dir}"/*/iter_0000000; do
+    cache_root="${iter_dir%/iter_0000000}"
+    if [[ -s "${cache_root}/latest_checkpointed_iteration.txt" ]] \
+      && [[ -s "${iter_dir}/run_config.yaml" ]] \
+      && { [[ -s "${iter_dir}/metadata.json" ]] || [[ -s "${iter_dir}/.metadata" ]]; }; then
+      complete_cache_found=true
+      break
+    fi
+  done
+  shopt -u nullglob
+  [[ "${complete_cache_found}" == "true" ]] || {
+    echo "ERROR: no finalized Megatron conversion under ${megatron_checkpoint_dir}" >&2
+    exit 1
+  }
+fi
 if [[ "${WANDB_MODE:-online}" != "offline" ]]; then
   [[ -n "${WANDB_API_KEY:-}" ]] || { echo "ERROR: WANDB_API_KEY is not set for online logging" >&2; exit 1; }
 fi
@@ -100,12 +153,15 @@ fi
 mkdir -p \
   "${results_dir}" \
   "${slurm_log_dir}" \
-  "${persistent_cache}/huggingface" \
-  "${persistent_cache}/vllm_compile_cache_derisk" \
-  "${persistent_cache}/flashinfer_cubins" \
-  "${persistent_cache}/flashinfer_workspace" \
-  "${persistent_cache}/megatron_ckpt_cache_derisk" \
-  "${persistent_cache}/hf_config_locks" \
+  "${run_cache_dir}" \
+  "${hf_home}" \
+  "${hf_modules_cache}" \
+  "${hf_config_lock_dir}" \
+  "${vllm_cache_dir}" \
+  "${flashinfer_cubin_dir}" \
+  "${flashinfer_workspace_dir}" \
+  "${torch_cache_dir}" \
+  "${megatron_checkpoint_dir}" \
   "${gym_venv_dir}"
 
 wandb_run_id="${WANDB_RUN_ID:-$(printf '%s' "${base_name}" | sha256sum | cut -c1-16)}"
@@ -113,7 +169,7 @@ wandb_project="${WANDB_PROJECT:-Nemotron-omni-RL-debug}"
 cluster_name="${CLUSTER_NAME:-${SLURM_CLUSTER_NAME:-aws-cmh-slurm-1-v1}}"
 wandb_run_name="${WANDB_RUN_NAME:-${cluster_name}_${base_name}}"
 
-base_mounts="/lustre:/lustre,/scratch:/scratch"
+base_mounts="/lustre:/lustre,/scratch:/scratch,/home:/home"
 selective_mounts="${code_dir}/nemo_rl:/opt/nemo-rl/nemo_rl"
 selective_mounts+=",${code_dir}/examples:/opt/nemo-rl/examples"
 selective_mounts+=",${code_dir}/tools:/opt/nemo-rl/tools"
@@ -132,17 +188,21 @@ export NEMO_GYM_VENV_DIR="${gym_venv_dir}"
 export NRL_FORCE_REBUILD_VENVS=false
 export NRL_IGNORE_VERSION_MISMATCH=1
 export NRL_WG_USE_RAY_REF=1
-export NRL_MEGATRON_CHECKPOINT_DIR="${persistent_cache}/megatron_ckpt_cache_derisk"
-export MEGATRON_CONFIG_LOCK_DIR="${persistent_cache}/hf_config_locks"
-export VLLM_CACHE_ROOT="${persistent_cache}/vllm_compile_cache_derisk"
-export DG_JIT_CACHE_DIR="${persistent_cache}/vllm_compile_cache_derisk/deep_gemm"
+export NRL_MEGATRON_CHECKPOINT_DIR="${megatron_checkpoint_dir}"
+export MEGATRON_CONFIG_LOCK_DIR="${hf_config_lock_dir}"
+export VLLM_CACHE_ROOT="${vllm_cache_dir}"
+export DG_JIT_CACHE_DIR="${vllm_cache_dir}/deep_gemm"
 export VLLM_DEEP_GEMM_WARMUP=skip
-export FLASHINFER_CUBIN_DIR="${persistent_cache}/flashinfer_cubins"
-export FLASHINFER_WORKSPACE_BASE="${persistent_cache}/flashinfer_workspace"
+export FLASHINFER_CUBIN_DIR="${flashinfer_cubin_dir}"
+export FLASHINFER_WORKSPACE_BASE="${flashinfer_workspace_dir}"
+export TORCH_HOME="${torch_cache_dir}"
+export TRITON_CACHE_DIR="${triton_cache_dir}"
+export TORCHINDUCTOR_CACHE_DIR="${torchinductor_cache_dir}"
 export NEMO_RL_VIDEO_MEDIA_ROOT=/
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME="${persistent_cache}/huggingface"
-export HF_MODULES_CACHE="${persistent_cache}/huggingface/modules/${base_name}"
+export HF_HOME="${hf_home}"
+export HF_MODULES_CACHE="${hf_modules_cache}"
+export NRL_MODEL_PATH="${model_path}"
 
 read -r -d '' SETUP_COMMAND <<'SETUP_EOF' || true
 set -euo pipefail
@@ -154,10 +214,11 @@ export RAY_USAGE_STATS_ENABLED=0
 uv_bin=/root/.local/bin/uv
 test -x "${uv_bin}"
 export PYTHONPATH=/opt/nemo-rl:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${PYTHONPATH:-}
-"${uv_bin}" run --no-sync python -c 'import sys; assert sys.version_info >= (3, 13, 14); import ray, transformers, megatron.core, nemo_rl.algorithms.grpo, nemo_rl.environments.nemo_gym'
+"${uv_bin}" run --no-sync python -c 'import sys; assert sys.version_info >= (3, 13, 14); import ray, megatron.core, nemo_rl.algorithms.grpo, nemo_rl.environments.nemo_gym; from transformers import AutoConfig, AutoProcessor, AutoTokenizer'
 generation_vllm_python=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
 test -x "${generation_vllm_python}"
 "${generation_vllm_python}" -c 'import vllm; from nemo_rl.models.generation.vllm.vllm_worker_async import VllmAsyncGenerationWorker'
+"${generation_vllm_python}" -c 'import os; from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p=os.environ["NRL_MODEL_PATH"]; AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print("Prewarmed vLLM HF dynamic modules cache")'
 SETUP_EOF
 export SETUP_COMMAND
 
@@ -173,6 +234,13 @@ test -x "\${uv_bin}"
 export PYTHONPATH=/opt/nemo-rl:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:\${PYTHONPATH:-}
 export HF_HOME=${HF_HOME}
 export HF_MODULES_CACHE=${HF_MODULES_CACHE}
+export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}
+export DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR}
+export FLASHINFER_CUBIN_DIR=${FLASHINFER_CUBIN_DIR}
+export FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WORKSPACE_BASE}
+export TORCH_HOME=${TORCH_HOME}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR}
+export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR}
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export NEMO_RL_VENV_DIR=/opt/ray_venvs
 export NEMO_GYM_VENV_DIR=${gym_venv_dir}
@@ -202,11 +270,20 @@ export NEMO_RL_VIDEO_MEDIA_ROOT=/
   policy.train_global_batch_size="${train_global_batch_size}" \
   checkpointing.save_period="${save_period}" \
   checkpointing.keep_top_k="${checkpoint_keep_top_k}" \
+  grpo.async_grpo.enabled="${async_grpo_enabled}" \
+  grpo.async_grpo.max_trajectory_age_steps="${max_trajectory_age_steps}" \
   grpo.async_grpo.in_flight_weight_updates="${in_flight_weight_updates}" \
   grpo.async_grpo.recompute_kv_cache_after_weight_updates="${recompute_kv_cache_after_weight_updates}" \
   grpo.length_penalty.default.enabled="${length_penalty_enabled}" \
   grpo.length_penalty.profile_band.enabled="${profile_band_enabled}" \
+  grpo.use_leave_one_out_baseline="${use_leave_one_out_baseline}" \
+  ++grpo.adv_estimator.use_leave_one_out_baseline="${use_leave_one_out_baseline}" \
+  policy.megatron_cfg.freeze_moe_router="${freeze_moe_router}" \
+  policy.megatron_cfg.moe_router_load_balancing_type="${moe_router_load_balancing_type}" \
+  policy.megatron_cfg.moe_router_bias_update_rate="${moe_router_bias_update_rate}" \
   policy.router_replay.enabled="${router_replay_enabled}" \
+  ++policy.router_replay.transport="${router_replay_transport}" \
+  ++checkpointing.load_replay_buffer="${load_replay_buffer}" \
   cluster.num_nodes="${num_nodes}" \
   cluster.gpus_per_node="${gpus_per_node}" \
   cluster.segment_size="${segment_size}" \
@@ -233,9 +310,14 @@ submit_args=(
 )
 
 echo "candidate=${candidate_name}"
-echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} training_nodes=${num_train_nodes} generation_nodes=${num_gen_nodes} policy_dp=${policy_dp_size} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} length_penalty=${length_penalty_enabled} profile_band=${profile_band_enabled} router_replay=${router_replay_enabled} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template}"
+echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} training_nodes=${num_train_nodes} generation_nodes=${num_gen_nodes} policy_dp=${policy_dp_size} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} async=${async_grpo_enabled} age=${max_trajectory_age_steps} length_penalty=${length_penalty_enabled} profile_band=${profile_band_enabled} router_replay=${router_replay_enabled} router_transport=${router_replay_transport} load_replay_buffer=${load_replay_buffer} leave_one_out=${use_leave_one_out_baseline} freeze_moe_router=${freeze_moe_router} moe_load_balancing=${moe_router_load_balancing_type} moe_bias_rate=${moe_router_bias_update_rate} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template}"
 echo "container=${container}"
 echo "results=${results_dir}"
+echo "run_cache=${run_cache_dir}"
+echo "gym_venv_cache=${gym_venv_dir}"
+echo "hf_cache=${hf_home}"
+echo "vllm_cache=${vllm_cache_dir}"
+echo "megatron_checkpoint_cache=${megatron_checkpoint_dir} require_complete=${require_complete_megatron_cache}"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf 'sbatch '

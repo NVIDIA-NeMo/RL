@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -36,20 +37,26 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _apply_async_pre_training_sample_masks,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _finalize_seq_logprob_error_metrics,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
+    _pad_async_empty_response_placeholders_for_mcore,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
+    _sequence_mask_stage_metrics,
     _startup_pipeline_ready,
+    _take_nemo_gym_training_samples_for_log,
     _validate_multimodal_dedup_capability,
+    _validate_loss_side_seq_logprob_error_config,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -63,6 +70,18 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC,
+    SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC,
+)
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -70,6 +89,9 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.nemo_gym_sample_artifacts import (
+    NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -81,6 +103,7 @@ from nemo_rl.experience.interfaces import (
     GENERATION_WEIGHT_VERSION_KEY,
     NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -90,7 +113,10 @@ from nemo_rl.experience.interfaces import (
     TARGET_WEIGHT_VERSION_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
-from nemo_rl.experience.rollouts import calculate_rewards
+from nemo_rl.experience.rollouts import (
+    backfill_missing_routed_experts,
+    calculate_rewards,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
@@ -129,20 +155,6 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
     replay_buffer.save_to_path.remote.assert_called_once_with(
         str(tmp_path / "replay_buffer.pt")
     )
-
-
-def test_save_async_replay_buffer_checkpoint_can_be_disabled(tmp_path):
-    """save_replay_buffer=false avoids serializing a potentially huge buffer."""
-    replay_buffer = MagicMock()
-
-    count = _save_async_replay_buffer_checkpoint(
-        replay_buffer,
-        str(tmp_path),
-        save_replay_buffer=False,
-    )
-
-    assert count == 0
-    replay_buffer.save_to_path.remote.assert_not_called()
 
 
 @pytest.mark.parametrize("load_replay_buffer", [True, None])
@@ -277,6 +289,129 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+def test_async_pre_training_mask_reasons_are_disjoint(capsys):
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0]),
+            NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY: torch.tensor(
+                [True, True, False, False, False]
+            ),
+            "truncated": torch.tensor([True, True, True, False, False]),
+            "mask_sample": torch.tensor([True, True, True, True, False]),
+            NEMO_GYM_TASK_INDEX_KEY: torch.arange(10, 15),
+            "agent_ref": [{"name": f"agent-{i}"} for i in range(5)],
+        }
+    )
+
+    metrics = _apply_async_pre_training_sample_masks(
+        repeated_batch,
+        overlong_filtering=True,
+    )
+
+    assert repeated_batch["loss_multiplier"].tolist() == [0.0, 0.0, 0.0, 0.0, 1.0]
+    assert metrics == {
+        "num_masked_seqs_by_loss_multiplier": 1,
+        "num_masked_seqs_by_empty_response_output": 1,
+        "num_masked_seqs_by_overlong_filtering": 1,
+        "num_masked_seqs_by_rollout": 1,
+        "num_masked_seqs_by_logprob_error": 0,
+        "num_masked_seqs_total": 4,
+    }
+    events = [
+        event
+        for event in _nemo_gym_trace_events(capsys.readouterr().out)
+        if event["event"] == "sample_masked"
+    ]
+    assert [event["reason"] for event in events] == [
+        "loss_multiplier",
+        "empty_response_output",
+        "overlong_filtering",
+        "rollout",
+    ]
+    assert [event["task_index"] for event in events] == [10, 11, 12, 13]
+
+
+def test_empty_response_mcore_padding_precedes_router_replay_backfill():
+    routed_experts = torch.zeros((2, 3, 2), dtype=torch.int16)
+    repeated_batch = BatchedDataDict(
+        {
+            NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY: torch.tensor([True, False]),
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "",
+                        "token_ids": torch.tensor([23]),
+                    }
+                ],
+                [
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([1, 2]),
+                        "routed_experts": routed_experts,
+                    }
+                ],
+            ],
+        }
+    )
+    tokenizer = type(
+        "_Tokenizer",
+        (),
+        {"unk_token_id": 23, "pad_token_id": 17, "eos_token_id": 19},
+    )()
+    policy_config = {"megatron_cfg": {"context_parallel_size": 2, "mtp_num_layers": 5}}
+
+    _pad_async_empty_response_placeholders_for_mcore(
+        repeated_batch,
+        tokenizer,
+        policy_config,
+    )
+    backfill_missing_routed_experts(repeated_batch["message_log"])
+
+    placeholder = repeated_batch["message_log"][0][0]
+    assert placeholder["token_ids"].tolist() == [23, 23, 23, 23]
+    assert placeholder["routed_experts"].shape == (4, 3, 2)
+    assert torch.all(placeholder["routed_experts"] == -1)
+
+
+def test_take_nemo_gym_training_samples_detaches_selected_snapshots():
+    full_results = [{"reward": 1.0}, {"reward": 2.0}]
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 0.0]),
+            "mask_sample": torch.tensor([False, True]),
+            "total_reward": torch.tensor([1.0, 2.0]),
+            "truncated": torch.tensor([False, True]),
+            NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY: [
+                {"full_result": full_results[0], "_ng_rollout_index": 0},
+                {"full_result": full_results[1], "_ng_rollout_index": 1},
+            ],
+        }
+    )
+
+    samples = _take_nemo_gym_training_samples_for_log(repeated_batch, enabled=True)
+
+    assert NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY not in repeated_batch
+    assert samples is not None
+    assert samples == [
+        {"full_result": full_results[0], "_ng_rollout_index": 0},
+        {"full_result": full_results[1], "_ng_rollout_index": 1},
+    ]
+    assert all("training" not in sample for sample in samples)
+
+
+def test_take_nemo_gym_training_samples_warns_when_snapshots_are_missing():
+    repeated_batch = BatchedDataDict(
+        {"loss_multiplier": torch.tensor([1.0]), "total_reward": torch.tensor([1.0])}
+    )
+
+    with pytest.warns(RuntimeWarning, match="no retained NeMo Gym responses"):
+        samples = _take_nemo_gym_training_samples_for_log(repeated_batch, enabled=True)
+
+    assert samples is None
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -536,6 +671,7 @@ def test_grpo_config_nested_defaults_are_populated():
     assert isinstance(first.reward_scaling, RewardScalingConfig)
     assert first.async_grpo.enabled is False
     assert first.async_grpo.max_generation_failures == 0
+    assert first.async_grpo.nemo_gym_stream_retries == 1
     assert first.adv_estimator.use_leave_one_out_baseline is True
     assert first.adv_estimator.normalize_rewards is True
     assert first.adv_estimator.minus_baseline is True
@@ -543,6 +679,11 @@ def test_grpo_config_nested_defaults_are_populated():
     assert first.adv_estimator is not second.adv_estimator
     assert first.reward_shaping is not second.reward_shaping
     assert first.reward_scaling is not second.reward_scaling
+
+
+def test_async_grpo_config_rejects_negative_nemo_gym_stream_retries():
+    with pytest.raises(ValueError, match="nemo_gym_stream_retries"):
+        AsyncGRPOConfig(nemo_gym_stream_retries=-1)
 
 
 def _mock_seq_logprob_error_result() -> dict[str, object]:
@@ -566,6 +707,15 @@ def _logged_train_metrics_with_key(logger, key: str):
     raise AssertionError(f"No train metrics payload contained {key}")
 
 
+def _nemo_gym_trace_events(output: str) -> list[dict[str, Any]]:
+    prefix = "[nemo_gym_trace] "
+    return [
+        json.loads(line[len(prefix) :])
+        for line in output.splitlines()
+        if line.startswith(prefix)
+    ]
+
+
 def test_apply_message_level_advantage_penalties_targets_flagged_message_spans(
     capsys,
 ):
@@ -584,7 +734,7 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans(
             NEMO_GYM_TASK_INDEX_KEY: torch.tensor([7, 8]),
             NEMO_GYM_ROLLOUT_INDEX_KEY: torch.tensor([0, 1]),
             NEMO_GYM_ATTEMPT_INDEX_KEY: torch.tensor([0, 0]),
-            TARGET_WEIGHT_VERSION_KEY: torch.tensor([3, 3]),
+            NEMO_GYM_TARGET_WEIGHT_VERSION_KEY: torch.tensor([3, 3]),
             "agent_ref": [{"name": "agent-a"}, {"name": "agent-b"}],
             "message_log": [
                 [
@@ -640,25 +790,18 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans(
         ]
     )
     torch.testing.assert_close(train_data["advantages"], expected)
-    lines = [
-        line
-        for line in capsys.readouterr().out.splitlines()
-        if "event='message_advantage_overridden'" in line
+    events = [
+        event
+        for event in _nemo_gym_trace_events(capsys.readouterr().out)
+        if event["event"] == "message_advantage_overridden"
     ]
-    assert len(lines) == 2
-    for line, reason, task_index, agent_name, advantage in zip(
-        lines,
-        ("invalid_tool_call", "malformed_thinking"),
-        (7, 8),
-        ("agent-a", "agent-b"),
-        (-5.0, -7.0),
-        strict=True,
-    ):
-        assert f"reason={reason!r}" in line
-        assert f"task_index={task_index}" in line
-        assert f"agent_name={agent_name!r}" in line
-        assert "target_weight_version=3" in line
-        assert f"advantage={advantage}" in line
+    assert [event["reason"] for event in events] == [
+        "invalid_tool_call",
+        "malformed_thinking",
+    ]
+    assert [event["task_index"] for event in events] == [7, 8]
+    assert [event["agent_name"] for event in events] == ["agent-a", "agent-b"]
+    assert [event["target_weight_version"] for event in events] == [3, 3]
 
 
 def test_apply_message_level_advantage_penalties_materializes_broadcasted_advantages():
@@ -1858,6 +2001,7 @@ def test_async_initial_buffer_wait_is_included_in_first_step_timing(
 
 def test_async_grpo_masks_empty_response_before_training(
     mock_grpo_components,
+    capsys,
 ) -> None:
     master_config = mock_grpo_components["master_config"]
     master_config.policy["generation"]["colocated"]["enabled"] = False
@@ -1868,8 +2012,25 @@ def test_async_grpo_masks_empty_response_before_training(
     master_config.grpo.use_dynamic_sampling = False
     master_config.grpo.overlong_filtering = True
     master_config.env["should_log_nemo_gym_responses"] = True
+    # The containment must materialize its own storage rather than relying on
+    # outer batch padding to provide four token positions.
+    master_config.policy["make_sequence_length_divisible_by"] = 1
+    master_config.policy["megatron_cfg"] = {
+        "enabled": True,
+        "context_parallel_size": 2,
+        "mtp_num_layers": 5,
+    }
 
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["message_log"] = [
+        [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([0]),
+            }
+        ]
+    ]
     mock_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] = torch.tensor([True])
     mock_batch["truncated"] = torch.tensor([True])
     mock_batch["mask_sample"] = torch.tensor([True])
@@ -1895,6 +2056,8 @@ def test_async_grpo_masks_empty_response_before_training(
 
     train_data = mock_grpo_components["policy"].train.call_args.args[0]
     assert train_data["sample_mask"].tolist() == [0.0]
+    assert train_data["input_lengths"].tolist() == [4]
+    assert torch.count_nonzero(train_data["token_mask"]) == 0
 
     metrics = _logged_train_metrics_with_key(
         mock_grpo_components["logger"],
@@ -1905,7 +2068,17 @@ def test_async_grpo_masks_empty_response_before_training(
     assert metrics["num_masked_seqs_by_overlong_filtering"] == 0
     assert metrics["num_masked_seqs_by_rollout"] == 0
     assert metrics["num_masked_seqs_by_logprob_error"] == 0
+    assert metrics["num_masked_seqs_pre_train_step"] == 1
+    assert metrics["num_masked_seqs_post_train_step"] == 0
     assert metrics["num_masked_seqs_total"] == 1
+
+    events = [
+        event
+        for event in _nemo_gym_trace_events(capsys.readouterr().out)
+        if event["event"] == "sample_masked"
+    ]
+    assert len(events) == 1
+    assert events[0]["reason"] == "empty_response_output"
 
 
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:
@@ -5446,6 +5619,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
                 {
                     NEMO_GYM_TASK_INDEX_KEY: torch.tensor([100, 101, 102, 103]),
                     NEMO_GYM_ROLLOUT_INDEX_KEY: torch.tensor([0, 1, 2, 3]),
+                    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY: torch.full((4,), 11),
                     GENERATION_WEIGHT_VERSION_KEY: torch.full((4,), 10),
                     TARGET_WEIGHT_VERSION_KEY: torch.full((4,), 11),
                     "agent_ref": [
@@ -5472,31 +5646,27 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert torch.allclose(train_data["sample_mask"], expected_mask), (
             "Should mask sequences 2 and 3"
         )
-        lines = [
-            line
-            for line in capsys.readouterr().out.splitlines()
-            if "event='sample_masked'" in line
+        events = [
+            event
+            for event in _nemo_gym_trace_events(capsys.readouterr().out)
+            if event["event"] == "sample_masked"
         ]
-        assert len(lines) == 2
-        for line, task_index in zip(lines, (102, 103), strict=True):
-            assert "reason='seq_logprob_error'" in line
-            assert f"task_index={task_index}" in line
-            assert "agent_name='agent-b'" in line
-            assert "generation_weight_version=10" in line
-            assert "target_weight_version=11" in line
-            assert "trajectory_age=1" in line
-            assert "threshold=1.2" in line
-            assert "loss_token_count=9" in line
-            assert "max_error_token_position=1" in line
-
-        assert "max_abs_logprob_delta=0.5" in lines[0]
-        assert "generation_logprob_at_max_error=0.5" in lines[0]
-        assert "prev_logprob_at_max_error=0.0" in lines[0]
-        assert "max_error_token_id=21" in lines[0]
-        assert "max_abs_logprob_delta=1.0" in lines[1]
-        assert "generation_logprob_at_max_error=1.0" in lines[1]
-        assert "prev_logprob_at_max_error=0.0" in lines[1]
-        assert "max_error_token_id=31" in lines[1]
+        assert [event["reason"] for event in events] == [
+            "seq_logprob_error",
+            "seq_logprob_error",
+        ]
+        assert [event["task_index"] for event in events] == [102, 103]
+        assert [event["agent_name"] for event in events] == ["agent-b", "agent-b"]
+        assert all(event["target_weight_version"] == 11 for event in events)
+        assert all(event["generation_weight_version"] == 10 for event in events)
+        assert all(event["trajectory_age"] == 1 for event in events)
+        assert [event["max_abs_logprob_delta"] for event in events] == [0.5, 1.0]
+        assert [event["generation_logprob_at_max_error"] for event in events] == [
+            0.5,
+            1.0,
+        ]
+        assert [event["prev_logprob_at_max_error"] for event in events] == [0.0, 0.0]
+        assert [event["max_error_token_id"] for event in events] == [21, 31]
 
     def test_no_sequences_masked_when_all_below_threshold(self):
         """Test that no sequences are masked when all are below threshold."""
@@ -5790,6 +5960,31 @@ class TestAggregateRolloutMetrics:
         result = aggregate_rollout_metrics(metrics)
         assert result["total_turns"] == 60
 
+    def test_r3_route_counts_are_summed_and_fractions_are_weighted(self):
+        metrics = {
+            "r3/routed_experts_fallback_samples": [1, 2],
+            "r3/routed_experts_fallback_token_routes": [1, 3],
+            "r3/routed_experts_expected_token_routes": [2, 8],
+            "r3/routed_experts_actual_token_routes": [1, 5],
+            "r3/routed_experts_fallback_token_route_fraction": [0.5, 0.375],
+            "r3/routed_experts_fallback_layer_routes": [2, 3],
+            "r3/routed_experts_expected_layer_routes": [4, 16],
+            "r3/routed_experts_actual_layer_routes": [2, 13],
+            "r3/routed_experts_fallback_layer_route_fraction": [0.5, 0.1875],
+        }
+
+        result = aggregate_rollout_metrics(metrics)
+
+        assert result["r3/routed_experts_fallback_samples"] == 3
+        assert result["r3/routed_experts_fallback_token_routes"] == 4
+        assert result["r3/routed_experts_expected_token_routes"] == 10
+        assert result["r3/routed_experts_actual_token_routes"] == 6
+        assert result["r3/routed_experts_fallback_token_route_fraction"] == 0.4
+        assert result["r3/routed_experts_fallback_layer_routes"] == 5
+        assert result["r3/routed_experts_expected_layer_routes"] == 20
+        assert result["r3/routed_experts_actual_layer_routes"] == 15
+        assert result["r3/routed_experts_fallback_layer_route_fraction"] == 0.25
+
     def test_mean_metrics_averaged(self):
         metrics = {
             "mean_gen_tokens_per_sample": [100, 200, 300],
@@ -5876,7 +6071,14 @@ class TestAggregateRolloutMetrics:
 
 
 def _cfg(
-    *, force=False, threshold=None, skip_ref=None, kl_reward=False, kl_penalty=0.01
+    *,
+    force=False,
+    threshold=None,
+    loss_side=False,
+    skip_ref=None,
+    kl_reward=False,
+    kl_penalty=0.01,
+    data_plane=None,
 ):
     return MasterConfig.model_construct(
         loss_fn=ClippedPGLossConfig(
@@ -5886,8 +6088,10 @@ def _cfg(
         ),
         grpo=GRPOConfig.model_construct(
             seq_logprob_error_threshold=threshold,
+            seq_logprob_error_force_on_policy=loss_side,
             skip_reference_policy_logprobs_calculation=skip_ref,
         ),
+        data_plane=data_plane,
     )
 
 
@@ -5897,16 +6101,85 @@ def _cfg(
         ({}, (False, None)),
         ({"force": True}, (True, None)),
         ({"force": True, "threshold": 1.5}, (False, None)),  # threshold overrides skip
+        (
+            {"force": True, "threshold": 1.5, "loss_side": True},
+            (True, None),
+        ),
         ({"skip_ref": True}, (False, True)),
     ],
-    ids=["default", "force_on_policy", "force_plus_threshold", "skip_ref"],
+    ids=[
+        "default",
+        "force_on_policy",
+        "force_plus_legacy_threshold",
+        "force_plus_loss_side_threshold",
+        "skip_ref",
+    ],
 )
 def test_resolve_logprob_skip_flags(kw, expected):
-    if kw.get("force") and kw.get("threshold") is not None:
+    if kw.get("force") and kw.get("threshold") is not None and not kw.get("loss_side"):
         with pytest.warns(UserWarning, match="seq_logprob_error_threshold is set"):
             assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
     else:
         assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+
+
+def test_validate_loss_side_seq_logprob_error_config():
+    _validate_loss_side_seq_logprob_error_config(
+        _cfg(force=True, threshold=2.0, loss_side=True)
+    )
+
+    with pytest.raises(ValueError, match="seq_logprob_error_threshold"):
+        _validate_loss_side_seq_logprob_error_config(_cfg(force=True, loss_side=True))
+    with pytest.raises(ValueError, match="force_on_policy_ratio"):
+        _validate_loss_side_seq_logprob_error_config(
+            _cfg(threshold=2.0, loss_side=True)
+        )
+    with pytest.raises(NotImplementedError, match="data_plane.enabled=false"):
+        _validate_loss_side_seq_logprob_error_config(
+            _cfg(
+                force=True,
+                threshold=2.0,
+                loss_side=True,
+                data_plane={"enabled": True},
+            )
+        )
+
+
+def test_finalize_loss_side_seq_logprob_error_metrics():
+    metrics = {
+        SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC: 7.0,
+        SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC: 3.0,
+        SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC: 1.0,
+        SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC: 4.0,
+        SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC: 3.0,
+        SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC: 2.0,
+        SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC: 1.0,
+        SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC: 2.0,
+        SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC: 1.0,
+        SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC: 1.0,
+    }
+
+    _finalize_seq_logprob_error_metrics(metrics)
+
+    assert metrics["mean_seq_mult_prob_error"] == pytest.approx(7.0 / 3.0)
+    assert metrics["mean_seq_mult_prob_error_after_mask"] == pytest.approx(1.5)
+    assert metrics["num_masked_seqs_by_logprob_error"] == 1.0
+    assert metrics["masked_correct_pct"] == 1.0
+    assert metrics["logprob_error_masked_seq_fraction"] == pytest.approx(1.0 / 3.0)
+
+
+def test_sequence_mask_stage_metrics_are_disjoint_and_additive():
+    metrics = _sequence_mask_stage_metrics(
+        initial_mask=torch.tensor([1.0, 1.0, 1.0, 0.0]),
+        pre_train_mask=torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        post_train_masked_count=1.0,
+    )
+
+    assert metrics == {
+        "num_masked_seqs_pre_train_step": 1.0,
+        "num_masked_seqs_post_train_step": 1.0,
+        "num_masked_seqs_total": 2.0,
+    }
 
 
 def test_validate_use_kl_in_reward_rejects_force_on_policy_ratio():

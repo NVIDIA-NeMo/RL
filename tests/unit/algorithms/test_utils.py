@@ -625,9 +625,7 @@ def test_calculate_baseline_and_std_per_prompt_basic():
     baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
 
     expected_baseline = torch.tensor([2.5, 2.0, 1.5, 5.5, 5.0, 4.5])
-    expected_std = torch.tensor(
-        [0.707107, 1.414214, 0.707107, 0.707107, 1.414214, 0.707107]
-    )
+    expected_std = torch.ones(6)
 
     assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
     assert torch.allclose(std, expected_std, rtol=1e-5)
@@ -698,7 +696,7 @@ def test_calculate_baseline_and_std_per_prompt_mixed_prompt_sizes():
     baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
 
     expected_baseline = torch.tensor([2.0, 1.0, 5.5, 5.0, 4.5])
-    expected_std = torch.tensor([0.0, 0.0, 0.707107, 1.414214, 0.707107])
+    expected_std = torch.tensor([0.707107, 0.707107, 1.0, 1.0, 1.0])
 
     assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
     assert torch.allclose(std, expected_std, rtol=1e-5)
@@ -739,10 +737,62 @@ def test_calculate_baseline_and_std_per_prompt_nan_handling():
     baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
 
     expected_baseline = torch.tensor([3.0, 4.0, 1.0, 5.5, 5.0, 4.5])
-    expected_std = torch.tensor([0.0, 0.0, 0.0, 0.707107, 1.414214, 0.707107])
+    expected_std = torch.tensor([1.414214, 1.414214, 1.414214, 1.0, 1.0, 1.0])
 
     assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
     assert torch.allclose(std, expected_std, rtol=1e-5)
+
+
+def test_leave_one_out_baseline_uses_full_group_std_for_normalization():
+    """A reward outlier must contribute to its own GRPO normalization std."""
+    rewards = torch.tensor(
+        [
+            0.9605023,
+            0.9669372,
+            0.9455273,
+            0.9522498,
+            0.9625615,
+            0.9677927,
+            0.9646302,
+            0.9435886,
+            0.8,
+            0.9577277,
+            0.9553636,
+            0.9667388,
+            0.9511548,
+            0.9452979,
+            0.9541488,
+            0.9548762,
+        ]
+    )
+    prompts = torch.zeros((16, 1), dtype=torch.long)
+    valid_mask = torch.ones_like(rewards)
+
+    baseline, std = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask, leave_one_out_baseline=True
+    )
+
+    expected_std = rewards.std(correction=1).expand_as(rewards)
+    advantages = (rewards - baseline) / std
+    assert torch.allclose(std, expected_std)
+    expected_loo_baseline = (rewards.sum() - rewards) / (len(rewards) - 1)
+    assert torch.allclose(advantages, (rewards - expected_loo_baseline) / expected_std)
+    assert advantages[8] == pytest.approx(-3.9215, abs=1e-4)
+    assert torch.max(torch.abs(advantages)) <= len(rewards) ** 0.5
+
+
+def test_full_group_std_is_stable_for_tightly_clustered_rewards():
+    rewards = 1.0 + torch.arange(16, dtype=torch.float32) * 1e-5
+    prompts = torch.zeros((16, 1), dtype=torch.long)
+    valid_mask = torch.ones_like(rewards)
+
+    _, std = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask, leave_one_out_baseline=True
+    )
+
+    expected_std = rewards.std(correction=1).expand_as(rewards)
+    assert torch.all(expected_std > 0)
+    assert torch.allclose(std, expected_std)
 
 
 def test_calculate_baseline_and_std_per_prompt_cuda_compatibility():
@@ -768,7 +818,7 @@ def test_calculate_baseline_and_std_per_prompt_cuda_compatibility():
     assert std.device.type == "cuda"
 
     expected_baseline = torch.tensor([2.0, 1.0, 4.0, 3.0]).cuda()
-    expected_std = torch.tensor([0.0, 0.0, 0.0, 0.0]).cuda()
+    expected_std = torch.full((4,), 2**-0.5).cuda()
 
     assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
     assert torch.allclose(std, expected_std, rtol=1e-5)

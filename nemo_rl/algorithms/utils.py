@@ -210,7 +210,6 @@ def calculate_baseline_and_std_per_prompt(
     unique_prompts = torch.unique(prompts, dim=0)
 
     baseline = torch.zeros_like(rewards)
-    sq_baseline = torch.zeros_like(rewards)
     std = torch.zeros_like(rewards)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
@@ -245,33 +244,16 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
-            std_prompt_baseline = (
-                prompt_baseline
-                if std_rewards is rewards
-                else torch.matmul(
-                    baseline_mask_matrix,
-                    std_rewards[prompt_idx] * valid_mask[prompt_idx],
-                )
-                / num_valid
-            )
-            std_prompt_baseline_square = (
-                torch.matmul(
-                    baseline_mask_matrix,
-                    torch.pow(std_rewards[prompt_idx], 2) * valid_mask[prompt_idx],
-                )
-                / num_valid
-            )
-
             baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = std_prompt_baseline_square
-            std[prompt_idx] = (
-                (
-                    (std_prompt_baseline_square - std_prompt_baseline.square())
-                    * (num_valid / (num_valid - 1))
-                )
-                .sqrt()
-                .nan_to_num(0)
-            )
+            # Leave-one-out applies only to the baseline. GRPO normalization
+            # uses one full-group denominator for every response. Reusing the
+            # LOO mask for variance can exclude a group's sole reward outlier
+            # from its own denominator and create an extreme advantage.
+            valid_std_rewards = std_rewards[prompt_idx][valid_mask[prompt_idx].bool()]
+            # torch.std is also stable for tightly clustered rewards, unlike
+            # the cancellation-prone E[x^2] - E[x]^2 expression.
+            prompt_std = valid_std_rewards.std(correction=1).nan_to_num(0)
+            std[prompt_idx] = prompt_std
 
     return baseline, std
 

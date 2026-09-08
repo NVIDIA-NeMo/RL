@@ -115,12 +115,20 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
 def _skip_prev_logprobs(master_config: Any) -> bool:
     """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
 
-    Mirrors the predicate in ``grpo_train``: ``force_on_policy_ratio`` with no
-    ``seq_logprob_error_threshold`` skips the student logprob pass.
+    Force-on-policy normally skips the student logprob pass. The legacy
+    driver-side sequence-error path still needs it; the opt-in loss-side path
+    computes the error from the training forward and does not.
     """
     force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
     seq_logprob_error_threshold = master_config.grpo.seq_logprob_error_threshold
-    return bool(force_on_policy_ratio and seq_logprob_error_threshold is None)
+    loss_side_seq_logprob_error = bool(
+        getattr(master_config.grpo, "seq_logprob_error_force_on_policy", False)
+        and seq_logprob_error_threshold is not None
+    )
+    return bool(
+        force_on_policy_ratio
+        and (seq_logprob_error_threshold is None or loss_side_seq_logprob_error)
+    )
 
 
 def assert_prev_logprobs_available(master_config: Any) -> None:
@@ -132,8 +140,9 @@ def assert_prev_logprobs_available(master_config: Any) -> None:
     if is_opd_enabled(master_config) and _skip_prev_logprobs(master_config):
         raise ValueError(
             "adv_estimator='opd' requires real prev_logprobs, but the config zeros them "
-            "(loss_fn.force_on_policy_ratio=True with grpo.seq_logprob_error_threshold unset). "
-            "Set seq_logprob_error_threshold or disable force_on_policy_ratio."
+            "(loss_fn.force_on_policy_ratio=True without a driver-side logprob pass). "
+            "Disable grpo.seq_logprob_error_force_on_policy or "
+            "loss_fn.force_on_policy_ratio."
         )
 
 

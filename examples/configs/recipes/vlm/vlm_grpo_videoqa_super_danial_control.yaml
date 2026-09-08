@@ -1,0 +1,61 @@
+# Controlled reproduction of the configuration reported for Danial's
+# post-text-RL Super run. The parent retains the combined CAPRL + SA-V media
+# contract, tokenizer/chat-template parity, RADIO LayerScale fix, and full
+# checkpoint loading required for vision quality.
+defaults: ./vlm_grpo_videoqa_super_profile_band.yaml
+
+grpo:
+  num_prompts_per_step: 256
+  num_generations_per_prompt: 16
+  max_num_steps: 1000
+  max_num_epochs: 1
+  advantage_clip_low: -20
+  advantage_clip_high: 20
+  overlong_filtering: false
+  invalid_tool_call_advantage: -5.0
+  length_penalty:
+    default:
+      enabled: false
+    profile_band:
+      enabled: false
+
+loss_fn:
+  sequence_level_importance_ratios: false
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: 0.2
+
+checkpointing:
+  save_period: 10
+  keep_top_k: 20
+
+policy:
+  train_global_batch_size: 4096
+  max_total_sequence_length: 32768
+  sequence_packing:
+    logprob_mb_tokens: 32768
+  megatron_cfg:
+    checkpoint:
+      async_save: true
+    mtp_num_layers: 5
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    mtp_detach_heads: true
+    fp32_lm_head: tf32
+    scheduler:
+      override_opt_param_scheduler: true
+  generation:
+    max_new_tokens: 32768
+    vllm_cfg:
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.8
+      max_model_len: 32768
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+    vllm_kwargs:
+      reasoning_parser: nano_v3
+      moe_backend: flashinfer_trtllm
+      max_num_seqs: 128
+      max_num_batched_tokens: 8192

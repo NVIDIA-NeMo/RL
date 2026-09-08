@@ -30,14 +30,30 @@ from nemo_rl.data.multimodal_utils import (
     get_multimodal_default_settings_from_processor,
     load_media_from_message,
 )
-from nemo_rl.data.routed_experts import (
-    RoutedExpertsBatch,
-    RoutedExpertsTensorRef,
-)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = torch.Tensor
 TokenizerType = PreTrainedTokenizerBase
+
+
+def _routed_experts_ref_segments(value: Any) -> list[dict[str, Any]] | None:
+    """Normalize one message's Ray-backed route value to logical slices."""
+    # Keep Ray and the router-replay implementation off this common module's
+    # import path unless a reference-backed rollout is actually flattened.
+    from nemo_rl.utils.routed_experts_ref import (
+        is_routed_experts_ref,
+        validate_routed_experts_ref,
+    )
+
+    if is_routed_experts_ref(value):
+        return [validate_routed_experts_ref(value)]
+    if (
+        isinstance(value, list)
+        and value
+        and all(is_routed_experts_ref(segment) for segment in value)
+    ):
+        return [validate_routed_experts_ref(segment) for segment in value]
+    return None
 
 
 def _validated_packed_values(key: str, values: list[Any]) -> list[PackedTensor]:
@@ -129,18 +145,22 @@ def message_log_to_flat_messages(
     # Concatenate tensors for each key
     concat: FlatMessagesType = {}
     for key in result:
-        routed_refs = [
-            value
-            for value in result[key]
-            if isinstance(value, RoutedExpertsTensorRef)
-        ]
-        if routed_refs:
-            if len(routed_refs) != len(result[key]):
-                raise TypeError(
-                    f"Routed-expert key {key!r} contains mixed lazy/non-lazy values"
-                )
-            concat[key] = RoutedExpertsBatch.from_message_segments(routed_refs)  # type: ignore[assignment]
-            continue
+        if key == "routed_experts" and result[key]:
+            reference_segments = [
+                _routed_experts_ref_segments(value) for value in result[key]
+            ]
+            if any(segments is not None for segments in reference_segments):
+                if any(segments is None for segments in reference_segments):
+                    raise TypeError(
+                        "routed_experts cannot mix Ray references with another "
+                        "representation in one message log"
+                    )
+                concat[key] = [
+                    segment
+                    for segments in reference_segments
+                    for segment in cast(list[dict[str, Any]], segments)
+                ]
+                continue
         if result[key] and isinstance(result[key][0], Tensor):
             try:
                 concat[key] = torch.cat(result[key])
@@ -399,16 +419,6 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
-        routed_batches = [
-            value for value in values if isinstance(value, RoutedExpertsBatch)
-        ]
-        if routed_batches:
-            if len(routed_batches) != len(values):
-                raise TypeError(
-                    f"Routed-expert key {key!r} is missing from one or more rows"
-                )
-            result[key] = RoutedExpertsBatch.concat(routed_batches)  # type: ignore[assignment]
-            continue
         packed_values = _validated_packed_values(key, values)
         # Preserve one logical row for conversations missing this media key.
         # Async replay may concatenate text-only and multimodal prompt groups in
