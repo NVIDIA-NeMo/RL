@@ -84,7 +84,9 @@ _DEFAULT_COORDINATOR_POLICY = "longest_prefix"
 _DEFAULT_CUDA_GRAPH_SIZING = "hybrid"
 
 
-def _resolve_coordinator_policy(mcore_generation_config) -> PrefixCachingCoordinatorPolicy:
+def _resolve_coordinator_policy(
+    mcore_generation_config,
+) -> PrefixCachingCoordinatorPolicy:
     """Effective DP-coordinator routing policy for this generation config.
 
     Resolved in one place so the engine and the HTTP frontends cannot disagree:
@@ -436,7 +438,11 @@ class MegatronGenerationMixin:
                 )
             ),
             **(
-                {"cuda_graph_max_tokens": mcore_generation_config["cuda_graph_max_tokens"]}
+                {
+                    "cuda_graph_max_tokens": mcore_generation_config[
+                        "cuda_graph_max_tokens"
+                    ]
+                }
                 if "cuda_graph_max_tokens" in mcore_generation_config
                 else {}
             ),

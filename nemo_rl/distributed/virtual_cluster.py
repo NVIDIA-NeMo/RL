@@ -255,8 +255,6 @@ def _bind_socket_in_range(
 
     Raises ``RuntimeError`` after *max_retries* failed attempts.
     """
-    rng = rng if rng is not None else random
-
     excluded = excluded_ports or set()
     if max_retries is None:
         candidates = [
@@ -264,7 +262,10 @@ def _bind_socket_in_range(
             for port in range(port_range_low, port_range_high)
             if port not in excluded
         ]
-        rng.shuffle(candidates)
+        if rng is None:
+            random.shuffle(candidates)
+        else:
+            rng.shuffle(candidates)
         for port in candidates:
             try:
                 sock.bind(("", port))
@@ -274,7 +275,10 @@ def _bind_socket_in_range(
         retry_description = f"all {len(candidates)} available ports"
     else:
         for _ in range(max_retries):
-            port = rng.randint(port_range_low, port_range_high - 1)
+            if rng is None:
+                port = random.randint(port_range_low, port_range_high - 1)
+            else:
+                port = rng.randint(port_range_low, port_range_high - 1)
             if port in excluded:
                 continue
             try:

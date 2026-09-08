@@ -33,6 +33,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     text_generation_server as mlm_text_gen_server,
 )
@@ -41,9 +42,42 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import HeldPortReservation
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
+    _resolve_coordinator_policy,
 )
 
 PAD = 0
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("mcore_generation_config", "expected_policy"),
+    [
+        (
+            {
+                "enable_prefix_caching": False,
+                "prefix_caching_coordinator_policy": "longest_prefix",
+            },
+            PrefixCachingCoordinatorPolicy.LOAD_BALANCED,
+        ),
+        (
+            {"enable_prefix_caching": True},
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        ),
+        (
+            {
+                "enable_prefix_caching": True,
+                "prefix_caching_coordinator_policy": "first_prefix_block",
+            },
+            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+        ),
+    ],
+)
+def test_resolve_coordinator_policy(
+    mcore_generation_config: dict[str, object],
+    expected_policy: PrefixCachingCoordinatorPolicy,
+) -> None:
+    """The engine and every frontend must use the same routing policy."""
+    assert _resolve_coordinator_policy(mcore_generation_config) is expected_policy
 
 
 class FakeInferenceReply:
@@ -207,7 +241,7 @@ def test_http_server_port_reservation(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.distributed.virtual_cluster._get_free_port_local",
-        lambda: 12345,
+        lambda *_args, **_kwargs: 12345,
     )
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     requests_mock = MagicMock()
@@ -223,7 +257,15 @@ def test_http_server_port_reservation(monkeypatch):
             coordinator_addr="tcp://127.0.0.1:5555",
             megatron_tokenizer=object(),
             rank=0,
-            cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
+            cfg={
+                "generation": {
+                    "mcore_generation_config": {
+                        "block_size_tokens": 64,
+                        "enable_prefix_caching": False,
+                        "parsers": [],
+                    }
+                }
+            },
             _reserved_http_server_port=reserved_port,
             inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
         )
@@ -232,6 +274,11 @@ def test_http_server_port_reservation(monkeypatch):
         try:
             assert started["server_port"] == expected_port
             assert base_url == f"http://10.0.0.5:{expected_port}/v1"
+            assert started["block_size_tokens"] == 64
+            assert (
+                started["prefix_caching_coordinator_policy"]
+                is PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+            )
             if reserved_port is None:
                 assert reserved_socket is None
                 continue
