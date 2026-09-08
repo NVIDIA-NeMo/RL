@@ -3065,7 +3065,7 @@ class SingleControllerActor:
         """Mark the span where the serving set is deliberately empty.
 
         _recover_from_failed_refit marks every serving shard partial, so they all go
-        STALE and serving_shards() is empty until _promote_refit_shards runs -- after a
+        STALE and serving_shards() is empty until _record_refit_landed runs -- after a
         rebuild and a full retry refit, both of which await and yield the event loop.
 
         _stall_watchdog_pump is a task on that same loop and calls raise_if_exhausted()
@@ -3198,19 +3198,24 @@ class SingleControllerActor:
             if health.dp_shard_idx not in absent
         }
 
-    def _promote_refit_shards(self, participants: set[int]) -> None:
-        """Return shards holding current weights to the serving set.
+    def _record_refit_landed(self, participants: set[int]) -> None:
+        """Write down what each shard now holds, and return the STALE ones to service.
 
-        The exit from STALE, and the reason marking partial weights is safe rather than
-        terminal. An aborted refit leaves every engine that was receiving with a mix of
-        old and new weights, so they are pulled out of service -- but nothing else moves
-        a shard out of STALE, so without this the recovery would succeed and then leave
-        the fleet empty, which ``raise_if_exhausted`` would end the run over. A worse
+        Two things, because they are the same fact seen from two sides: this refit reached
+        these shards. The version is what they hold; promotion is what that entitles them
+        to.
+
+        Promotion is the exit from STALE, and the reason marking partial weights is safe
+        rather than terminal. An aborted refit leaves every engine that was receiving with
+        a mix of old and new weights, so they are pulled out of service -- but nothing else
+        moves a shard out of STALE, so without this the recovery would succeed and then
+        leave the fleet empty, which ``raise_if_exhausted`` would end the run over. A worse
         failure than the one being recovered from, and reached only on the recovery path.
 
-        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but
-        it is failing probes for its own reasons and promoting it here would reset the
-        failure count that is supposed to condemn it.
+        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but it
+        is failing probes for its own reasons and promoting it here would reset the failure
+        count that is supposed to condemn it. It is still stamped: what weights an engine
+        holds is not a verdict on how well it is serving them.
 
         And only STALE shards that were IN the refit. Asking "is this shard STALE?" alone
         was correct until restart existed, because nothing could turn a shard STALE while a
@@ -3221,6 +3226,13 @@ class SingleControllerActor:
         the outcome this module's docstring exists to prevent. It stays STALE, is not
         absent, and the next refit picks it up.
 
+        The stamp used to live inside ``report_refit`` alone, which meant it was only ever
+        written by a promotion. Nothing turns a shard STALE on a refit that succeeds, so a
+        fleet that has never lost a shard reports version 0 for the life of the run however
+        many refits it received -- and a metric that reads 0 on every healthy shard is one
+        nobody watches, which is the part that matters: this is the reading that would catch
+        the next bug of this shape.
+
         Args:
             participants: shards eligible for this refit, from :meth:`_refit_participants`
                 at the point membership settled.
@@ -3228,8 +3240,14 @@ class SingleControllerActor:
         if self._gen_fleet is None:
             return
         for health in self._gen_fleet.snapshot():
-            if health.state is ShardState.STALE and health.dp_shard_idx in participants:
+            if health.dp_shard_idx not in participants:
+                continue
+            if health.state is ShardState.STALE:
                 self._gen_fleet.report_refit(
+                    health.dp_shard_idx, weight_version=self._trainer_version
+                )
+            else:
+                self._gen_fleet.record_weight_version(
                     health.dp_shard_idx, weight_version=self._trainer_version
                 )
 
@@ -3716,14 +3734,14 @@ class SingleControllerActor:
                 await self._sync_weights_within(kv_scales, "retry")
                 # Inside the window: this is what refills the serving set, so releasing
                 # the flag before it runs would reopen the gap it exists to close.
-                self._promote_refit_shards(participants)
+                self._record_refit_landed(participants)
         else:
             # A completed refit is what makes an engine's weights current, so this is
             # where a shard pulled out of service for holding partial ones earns its way
             # back. else, not a trailing statement: the recovery path above already
             # promoted inside its window, and everything below this must still run on
             # both paths.
-            self._promote_refit_shards(participants)
+            self._record_refit_landed(participants)
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would

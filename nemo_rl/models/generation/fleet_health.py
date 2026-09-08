@@ -471,6 +471,23 @@ class GenerationFleetHealth:
             return
         self._transition(shard, ShardState.DEAD)
 
+    def record_weight_version(self, shard_idx: int, *, weight_version: int) -> None:
+        """This shard received this refit's weights. Nothing else changes.
+
+        The stamp without the promotion, for the shards a refit reached that are not STALE
+        -- which on a run where nothing has died is all of them. ``report_refit`` cannot
+        serve that case: it is a state transition, and driving one on a HEALTHY shard after
+        every refit would clear the reported-failure streak that is the only counter able to
+        condemn an engine that still answers ``is_alive``.
+
+        Absent shards received nothing, so the caller filters them out before calling; the
+        RETIRED guard here is belt-and-braces, matching ``report_refit``.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state is ShardState.RETIRED:
+            return
+        shard.weight_version = weight_version
+
     def report_refit(self, shard_idx: int, *, weight_version: int) -> None:
         """A completed refit is the only way back into the serving set."""
         shard = self._shards[shard_idx]

@@ -283,7 +283,7 @@ class TestPromotionIsWiredUp:
         assert monitor.state_of(1) is ShardState.STALE
 
         ctrl = self._controller(monitor)
-        ctrl._promote_refit_shards(ctrl._refit_participants())
+        ctrl._record_refit_landed(ctrl._refit_participants())
 
         assert monitor.state_of(1) is ShardState.HEALTHY
         assert 1 in monitor.serving_shards()
@@ -295,7 +295,7 @@ class TestPromotionIsWiredUp:
         asyncio.run(_tick_and_settle(supervisor))
 
         ctrl = self._controller(monitor, trainer_version=11)
-        ctrl._promote_refit_shards(ctrl._refit_participants())
+        ctrl._record_refit_landed(ctrl._refit_participants())
 
         assert monitor.snapshot()[0].weight_version == 11
 
@@ -307,13 +307,13 @@ class TestPromotionIsWiredUp:
         assert monitor.state_of(2) is ShardState.SUSPECT
 
         ctrl = self._controller(monitor)
-        ctrl._promote_refit_shards(ctrl._refit_participants())
+        ctrl._record_refit_landed(ctrl._refit_participants())
 
         assert monitor.state_of(2) is ShardState.SUSPECT
 
     def test_promotion_is_inert_without_fleet_health(self):
         ctrl = self._controller(None)
-        ctrl._promote_refit_shards(set())  # must not raise
+        ctrl._record_refit_landed(set())  # must not raise
 
 
 class TestOnlyTheShardsThatWereRefitArePromoted:
@@ -352,7 +352,7 @@ class TestOnlyTheShardsThatWereRefitArePromoted:
         assert monitor.state_of(2) is ShardState.STALE
         del supervisor
 
-        self._controller(monitor)._promote_refit_shards(participants)
+        self._controller(monitor)._record_refit_landed(participants)
 
         assert monitor.state_of(2) is ShardState.STALE, (
             "shard 2 received no weights from this refit and must not serve"
@@ -368,7 +368,7 @@ class TestOnlyTheShardsThatWereRefitArePromoted:
 
         participants = self._controller(monitor)._refit_participants()
         assert 2 in participants
-        self._controller(monitor, trainer_version=9)._promote_refit_shards(participants)
+        self._controller(monitor, trainer_version=9)._record_refit_landed(participants)
 
         assert monitor.state_of(2) is ShardState.HEALTHY
         assert monitor.snapshot()[2].weight_version == 9
@@ -380,9 +380,79 @@ class TestOnlyTheShardsThatWereRefitArePromoted:
         assert monitor.state_of(0) is ShardState.STALE
 
         participants = self._controller(monitor)._refit_participants()
-        self._controller(monitor)._promote_refit_shards(participants)
+        self._controller(monitor)._record_refit_landed(participants)
 
         assert monitor.state_of(0) is ShardState.HEALTHY
+
+
+class TestTheWeightVersionSaysWhatEachShardHolds:
+    """``gen_fleet/shard_weight_version`` has to be written where the weights land.
+
+    Writing it in the promotion instead makes it wrong in both directions at once. Nothing
+    turns a shard STALE on a refit that succeeds, so a fleet that never lost a shard is
+    never promoted and reports version 0 forever, however many refits it received -- which
+    is enough on its own to guarantee nobody looks at the metric. And the one shard that
+    reports the current version is the one the promotion touched, which after the
+    participants filter can be a shard that received nothing.
+    """
+
+    @staticmethod
+    def _controller(monitor, trainer_version=5):
+        from nemo_rl.algorithms.single_controller import SingleControllerActor
+
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._gen_fleet = monitor
+        ctrl._trainer_version = trainer_version
+        return ctrl
+
+    def test_an_ordinary_refit_stamps_every_shard_it_reached(self):
+        """The common case: nothing died, nothing is STALE, nothing gets promoted."""
+        monitor = _monitor()
+        ctrl = self._controller(monitor, trainer_version=7)
+
+        ctrl._record_refit_landed(ctrl._refit_participants())
+
+        assert [s.weight_version for s in monitor.snapshot()] == [7, 7, 7]
+        assert all(s.state is ShardState.HEALTHY for s in monitor.snapshot())
+
+    def test_a_shard_that_was_not_in_the_refit_keeps_its_old_version(self):
+        monitor = _monitor()
+        ctrl = self._controller(monitor, trainer_version=7)
+        ctrl._record_refit_landed(ctrl._refit_participants())
+
+        _condemn(monitor, 1)
+        monitor.mark_restarting(1)
+        later = self._controller(monitor, trainer_version=8)
+        later._record_refit_landed(later._refit_participants())
+
+        assert monitor.snapshot()[1].weight_version == 7, (
+            "shard 1 was absent for the version-8 refit; reporting 8 would say it holds "
+            "weights it never received"
+        )
+        assert monitor.snapshot()[0].weight_version == 8
+
+    def test_a_suspect_shard_is_stamped_but_still_not_promoted(self):
+        """The version is a fact about the engine's weights, not a verdict on its health."""
+        monitor = _monitor()
+        monitor.record_probe(2, ok=False, error="timeout")
+        assert monitor.state_of(2) is ShardState.SUSPECT
+
+        ctrl = self._controller(monitor, trainer_version=4)
+        ctrl._record_refit_landed(ctrl._refit_participants())
+
+        assert monitor.snapshot()[2].weight_version == 4
+        assert monitor.state_of(2) is ShardState.SUSPECT
+
+    def test_a_retired_shard_is_left_alone(self):
+        monitor = _monitor()
+        monitor.retire(1, reason="attempts exhausted")
+        assert monitor.state_of(1) is ShardState.RETIRED
+
+        ctrl = self._controller(monitor, trainer_version=3)
+        ctrl._record_refit_landed(ctrl._refit_participants())
+
+        assert monitor.snapshot()[1].weight_version == 0
+        assert monitor.state_of(1) is ShardState.RETIRED
 
 
 def test_every_supervised_backend_can_restart_a_shard():

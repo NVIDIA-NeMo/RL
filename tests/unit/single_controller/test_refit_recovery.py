@@ -230,13 +230,13 @@ class TestDeathInsideTheCollective:
         it. A refit used to.
 
         The path: serving_shards() includes SUSPECT, so mark_weights_partial moves the
-        suspect survivor to STALE, and _promote_refit_shards then promotes every STALE
+        suspect survivor to STALE, and _record_refit_landed then promotes every STALE
         shard through report_refit, which zeroes the counters. Net effect, a shard
         failing real generations could never reach unhealthy_threshold for as long as
         refits kept happening.
 
         Driven through the whole recovery on purpose: asserting against
-        _promote_refit_shards alone passes even with the bug present, because it is
+        _record_refit_landed alone passes even with the bug present, because it is
         mark_weights_partial -- in the other function -- that relabels SUSPECT to STALE.
         """
         ctrl, monitor, _ = _make_controller(ABORTED, shard_count=3, dead_shards=(0,))
