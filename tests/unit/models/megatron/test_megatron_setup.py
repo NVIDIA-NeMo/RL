@@ -1497,6 +1497,45 @@ class TestApplyPrecisionConfig:
         assert model_cfg.fp4_param is False
         assert model_cfg.fp8 is None
 
+    def test_fp4_param_rejects_generation_refit(self):
+        """Reject FP4 parameter storage when generation requires weight refit."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        config = {
+            "generation": {"backend": "vllm"},
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                    "fp4_param": True,
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="no FP4 parameter-and-scale export path"):
+            _apply_precision_config(SimpleNamespace(), config, torch.bfloat16)
+
+    def test_fp4_param_allows_training_without_refit(self):
+        """Allow FP4 parameter storage when no generation refit is configured."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(fp8=None)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                    "fp4_param": True,
+                },
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.fp4_param is True
+
     def test_fp8_and_fp4_are_mutually_exclusive(self):
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
@@ -1572,7 +1611,6 @@ class TestApplyPrecisionConfig:
             {"quant_cfg": "examples/modelopt/quant_configs/nvfp4_experts.yaml"},
             {"megatron_cfg": {"fp4_cfg": {"enabled": False}}},
             {"megatron_cfg": {"fp4_cfg": {"fp4_recipe": "other"}}},
-            {"megatron_cfg": {"fp4_cfg": {"fp4_param": True}}},
             {"megatron_cfg": {"env_vars": {"NVTE_BACKWARD_OVERRIDE": "dequantized"}}},
             {"megatron_cfg": {"te_precision_config_file": None}},
         ],

@@ -14,7 +14,7 @@ policy:
     nvfp4_pertoken_rollout:
       enabled: true
     vllm_kwargs:
-      moe_backend: auto
+      moe_backend: flashinfer_trtllm
   megatron_cfg:
     moe_router_dtype: fp32
     optimizer:

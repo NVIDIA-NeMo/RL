@@ -1516,6 +1516,17 @@ def _apply_precision_config(
     fp4_on = fp4_cfg is not None and fp4_cfg.enabled
 
     generation_cfg = config.get("generation")
+    if (
+        fp4_cfg is not None
+        and fp4_on
+        and fp4_cfg.fp4_param
+        and generation_cfg is not None
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.fp4_cfg.fp4_param=true is not supported when "
+            "policy.generation is configured because NeMo-RL refit has no FP4 "
+            "parameter-and-scale export path; set fp4_param=false."
+        )
     per_token_rollout = (
         parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_cfg))
         if generation_cfg is not None and generation_cfg.get("backend") == "vllm"
