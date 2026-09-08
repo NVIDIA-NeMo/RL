@@ -1,0 +1,43 @@
+# GDPO over the `example_tool_call_multireward` NeMo Gym environment.
+#
+# The env asks the model for a single `get_weather` tool call and its verifier returns
+# three decoupled reward components (correctness / format / schema_valid) via
+# `reward_components`. The Gym->NeMo-RL bridge (extract_reward_components /
+# build_reward_component_columns in nemo_rl/environments/nemo_gym.py) surfaces them as
+# `reward/<name>` batch keys, which GDPO's advantage estimator consumes. This is the
+# multi-reward gym path exercised by the nightly recipe under
+# examples/configs/recipes/llm/gdpo-qwen2.5-1.5b-1n8g-gym-multireward.yaml.
+#
+# Inherits the workplace-assistant gym recipe (policy / vLLM / gym plumbing) and swaps in
+# the multi-reward env, its data, and the GDPO estimator.
+defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+grpo:
+  adv_estimator:
+    name: "gdpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    # One weight per component, ordered alphabetically by name:
+    # reward/correctness, reward/format, reward/schema_valid.
+    reward_weights: [1.0, 0.5, 0.25]
+
+data:
+  # example_tool_call_multireward ships its data (data/example.jsonl); no HF download /
+  # ng_prepare_data step is needed. Same file for train/validation (smoke-scale env).
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/example_tool_call_multireward/data/example.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/example_tool_call_multireward/data/example.jsonl
+
+env:
+  nemo_gym:
+    # Replaces the workplace_assistant env list. vllm_model_for_training is required and
+    # must come first; then the multi-reward resources server + its agent.
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/example_tool_call_multireward/configs/example_tool_call_multireward.yaml
+
+logger:
+  wandb:
+    project: "gdpo-dev"
+    name: "gdpo-example-tool-call-multireward"

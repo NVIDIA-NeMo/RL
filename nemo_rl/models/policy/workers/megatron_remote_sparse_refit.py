@@ -19,8 +19,8 @@ from typing import Any
 import torch
 
 from nemo_rl.models.generation.vllm.config import (
-    VllmRefitConfig,
     VllmRefitTransportName,
+    VllmSparseRefitConfig,
 )
 from nemo_rl.utils.weight_transfer_sparse_codec import DeltaCompressionTracker
 from nemo_rl.utils.weight_transfer_stream import (
@@ -31,7 +31,7 @@ from nemo_rl.utils.weight_transfer_zmq import stream_sparse_delta_payloads_via_z
 
 
 class MegatronRemoteSparseRefit:
-    def __init__(self, worker: Any, refit_config: VllmRefitConfig) -> None:
+    def __init__(self, worker: Any, refit_config: VllmSparseRefitConfig) -> None:
         self._worker = worker
         self._tracker = DeltaCompressionTracker(refit_config)
 

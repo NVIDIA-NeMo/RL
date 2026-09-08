@@ -16,6 +16,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, fields
 from functools import partial
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -38,6 +39,10 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.setup import get_telemetry_handle
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -57,6 +62,21 @@ def _initial_rm_save_state() -> RMSaveState:
     return RMSaveState(
         epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
     )
+
+
+def _get_rm_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> RMSaveState:
+    if loaded_state is None:
+        return _initial_rm_save_state()
+
+    # Start from current defaults so partial/legacy checkpoints remain loadable.
+    known_fields = {field.name for field in fields(RMSaveState)}
+    state_values = vars(_initial_rm_save_state()).copy()
+    state_values.update(
+        {key: value for key, value in loaded_state.items() if key in known_fields}
+    )
+    return RMSaveState(**state_values)
 
 
 class RMConfig(BaseModel, extra="allow"):
@@ -80,6 +100,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    telemetry: Optional[TelemetryConfig] = None
 
 
 @dataclass
@@ -156,17 +177,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if loaded_state is not None:
-        # Filter to only known RMSaveState fields; checkpoints may carry
-        # extra keys (e.g. validation metrics from previous runs).
-        # Backcompat: checkpoints saved before total_valid_tokens was added.
-        loaded_state.setdefault("total_valid_tokens", 0)
-        known_fields = {f.name for f in fields(RMSaveState)}
-        rm_save_state = RMSaveState(
-            **{k: v for k, v in loaded_state.items() if k in known_fields}
-        )
-    else:
-        rm_save_state = _initial_rm_save_state()
+    rm_save_state = _get_rm_save_state(loaded_state)
 
     # ==========================
     #           Data
@@ -354,8 +365,17 @@ def validate_one_dataset(
         return
 
     timer = Timer()
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
 
-    with timer.time("total_validation_time"):
+    with (
+        timer.time("total_validation_time"),
+        managed_span(
+            RLSpanGroup.EVALUATE,
+            "rl.rm.evaluate",
+            tracer=_tracer,
+        ),
+    ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
         # Show a progress indicator for validation
@@ -460,6 +480,7 @@ def validate_one_dataset(
     return val_metrics, timing_metrics
 
 
+@trace_fn(RLSpanGroup.JOB, "rl.rm.job")
 def rm_train(
     policy,
     train_dataloader,
@@ -473,6 +494,8 @@ def rm_train(
 ):
     # Run basic rm training
     timer = Timer()
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -523,7 +546,15 @@ def rm_train(
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                managed_span(
+                    RLSpanGroup.STEP,
+                    "rl.rm.step",
+                    tracer=_tracer,
+                    **{"rl.iteration": total_steps + 1},
+                ),
+            ):
                 # Prepare batch and generate responses
                 print("▶ Taking a training step...")
 
@@ -651,7 +682,14 @@ def rm_train(
                                 metrics_source[metric_name],
                             )
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.rm.checkpointing",
+                            tracer=_tracer,
+                        ),
+                    ):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             total_steps + 1, vars(rm_save_state), master_config

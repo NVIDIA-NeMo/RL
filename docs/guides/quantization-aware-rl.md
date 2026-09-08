@@ -30,6 +30,45 @@ The following workflow + quantization recipe combinations have been validated en
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to the supported MLP/MoE weights while keeping Nano3-sensitive Mamba, attention, gate/router, shared-expert, norm, and selected layer paths in BF16 through the model-specific `real_quant_ignore` list in the example config.
 
+## Simulated KV-Cache Quantization
+
+QARL can apply ModelOpt fake quantization to the attention K/V tensors in both
+the Megatron policy and the vLLM rollout model. Use the same quantization recipe
+for both workers so calibrated K/V amax values from the policy can be
+transferred to matching rollout quantizers during refit. The only supported
+exception is rollout-only FP8 K/V fake quantization with
+`use_constant_amax: true`; vLLM computes the constant amax locally, so no
+policy-side K/V quantization or amax transfer is required.
+
+```yaml
+policy:
+  quant_cfg: /absolute/path/to/examples/modelopt/quant_configs/kv_cache_fp8.yaml
+
+  generation:
+    backend: vllm
+    quant_cfg: /absolute/path/to/examples/modelopt/quant_configs/kv_cache_fp8.yaml
+```
+
+The KV-only examples are:
+
+- `kv_cache_fp8.yaml`: FP8 E4M3 K/V fake quantization with constant amax.
+- `kv_cache_nvfp4.yaml`: calibrated NVFP4 K/V fake quantization with dynamic
+  per-block scales and a calibrated global amax.
+
+NVFP4 K/V quantization has shown training-quality degradation in current
+experiments. It is intended for studying QARL-based recovery of PTQ accuracy
+and alternative recipes, including mixed formats and quantizing K/V in only
+selected layers.
+
+These recipes enable only the attention K/V quantizers, isolating K/V fake
+quantization from weight and other activation quantization. To combine K/V
+quantization with other formats, define all required quantizers in a single
+recipe.
+
+This path does not enable vLLM's native FP8 KV-cache storage. Set neither
+`policy.generation.real_quant` nor a native vLLM KV-cache dtype for these
+simulated recipes.
+
 ## ModelOpt Layer Spec Toggle
 
 For QARL configs, try setting `policy.disable_modelopt_layer_spec=true` first.
@@ -328,6 +367,7 @@ Generation-specific parameters are added under `policy.generation`:
 | `quant_cfg` | Quantization config used by the vLLM generation worker. For QARL, this should normally match `policy.quant_cfg`. |
 | `real_quant` | When `true`, vLLM uses ModelOpt NVFP4 real kernels and receives packed quantized weights during refit. The effective `quant_cfg` selects W4A4 or W4A16; unsupported and mismatched formats fail during setup. When unset or `false`, vLLM uses fake-quantized generation. |
 | `real_quant_ignore` | Optional list of vLLM parameter name patterns that should stay in native dtype during real-quant rollout. If omitted, NeMo RL uses the default ModelOpt NVFP4 ignore set for sensitive layers such as attention and output heads. For Nano3 hybrid MoE/Mamba W4A16 real-quant rollout, use the model-specific list shown in the Nano3 example recipe. |
+| `real_quant_export_cpu_offload` | Optional boolean, default `true`. When `true`, packed NVFP4 export tensors are copied to CPU before refit. Set to `false` only for colocated CUDA-IPC refit without an explicit `refit_transport`; this avoids the CPU round trip at the cost of transient GPU memory. |
 
 ## Megatron Checkpoint Directory
 

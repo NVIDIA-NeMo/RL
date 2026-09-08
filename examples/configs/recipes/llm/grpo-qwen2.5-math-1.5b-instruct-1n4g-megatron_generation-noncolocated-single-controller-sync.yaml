@@ -1,0 +1,12 @@
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron-single-controller-sync.yaml
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron_generation-noncolocated-single-controller-sync
+  wandb:
+    name: grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron_generation-noncolocated-single-controller-sync
+checkpointing:
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron_generation-noncolocated-single-controller-sync
+policy:
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      kv_cache_management_mode: recompute

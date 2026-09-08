@@ -1,0 +1,1644 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for RolloutManager.
+
+Two groups:
+
+* TestGenerateAndPushFlow — lightweight unit tests for the reserve→run→commit
+  flow in generate_and_push (no Ray/vLLM; fakes for impl + tq_buffer).
+* AsyncRollout / AsyncNemoGymRollout tests — vLLM/Ray-backed end-to-end checks
+  for the underlying run_rollout paths (AsyncRolloutImpl / AsyncNemoGymRolloutImpl).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import tempfile
+import uuid
+from copy import deepcopy
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    PostWriteEnrichmentError,
+)
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets.response_datasets import NemoGymDataset
+from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.processors import nemo_gym_data_processor
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    Completion,
+    PromptGroupRecord,
+)
+from nemo_rl.experience.rollout_manager import (
+    AsyncNemoGymRolloutImpl,
+    AsyncRolloutImpl,
+    RolloutManager,
+    RolloutOutcome,
+    RolloutRetryPolicy,
+    RolloutStats,
+)
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.experience.rollouts import (
+    run_async_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
+)
+
+# Fixtures shared with the heavyweight rollout tests.
+from tests.unit.environments.test_nemo_gym import (
+    cluster,  # noqa: F401
+    nemo_gym,  # noqa: F401
+    nemo_gym_sanity_test_data,  # noqa: F401
+    nemo_gym_tokenizer,  # noqa: F401
+    nemo_gym_vllm_generation,  # noqa: F401
+)
+from tests.unit.experience.test_rollouts import (
+    initial_multi_step_calculator_batch,  # noqa: F401
+    multi_step_calculator_environment,  # noqa: F401
+    multi_step_setup_vllm_async,  # noqa: F401
+    rollout_cluster,  # noqa: F401
+    rollout_tokenizer,  # noqa: F401
+)
+from tests.unit.test_envs import MultiStepCalcMetadata
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _with_cut(buffer, callback):
+    async def apply():
+        async with buffer.data_plane_checkpoint_barrier.mutation() as cut:
+            return callback(cut)
+
+    return _run(apply())
+
+
+def test_generate_response_forwards_message_log_media_to_generation() -> None:
+    captured: dict[str, BatchedDataDict] = {}
+
+    class _Generation:
+        async def generate_async(self, data):
+            captured["data"] = data
+            input_len = int(data["input_lengths"][0])
+            yield (
+                0,
+                BatchedDataDict(
+                    {
+                        "output_ids": torch.cat(
+                            (data["input_ids"], torch.tensor([[42]])), dim=1
+                        ),
+                        "unpadded_sequence_lengths": torch.tensor([input_len + 1]),
+                        "logprobs": torch.zeros(1, input_len + 1),
+                    }
+                ),
+            )
+
+    manager = object.__new__(AsyncRolloutImpl)
+    manager._policy_generation = _Generation()
+    manager._tokenizer = SimpleNamespace(
+        pad_token_id=0,
+        decode=lambda *_args, **_kwargs: "answer",
+    )
+    manager._timeouts = SimpleNamespace(generation_s=10.0)
+    pixel_values = PackedTensor(torch.ones(2, 3, 4, 4), dim_to_pack=0)
+    imgs_sizes = PackedTensor(torch.tensor([[4, 4], [4, 4]]), dim_to_pack=0)
+    message_log = [
+        {
+            "role": "user",
+            "content": "image",
+            "token_ids": torch.tensor([1, 2, 3]),
+            "pixel_values": pixel_values,
+            "imgs_sizes": imgs_sizes,
+        },
+        {
+            "role": "assistant",
+            "content": "follow-up",
+            "token_ids": torch.tensor([4, 5]),
+        },
+    ]
+
+    assistant_message, input_lengths, _ = _run(
+        manager._generate_response(message_log, ["<stop>"])
+    )
+
+    generation_data = captured["data"]
+    assert generation_data["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
+    assert generation_data["input_lengths"].tolist() == [5]
+    assert generation_data["stop_strings"] == [["<stop>"]]
+    assert isinstance(generation_data["pixel_values"], PackedTensor)
+    assert isinstance(generation_data["imgs_sizes"], PackedTensor)
+    assert torch.equal(
+        generation_data["pixel_values"].as_tensor(), pixel_values.as_tensor()
+    )
+    assert torch.equal(
+        generation_data["imgs_sizes"].as_tensor(), imgs_sizes.as_tensor()
+    )
+    assert input_lengths.tolist() == [5]
+    assert assistant_message["content"] == "answer"
+    assert assistant_message["token_ids"].tolist() == [42]
+
+
+class _FakeBuffer:
+    """Minimal TQReplayBuffer stand-in that records reserve/commit calls."""
+
+    def __init__(self) -> None:
+        self.data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        self.reserve_calls: list[int] = []  # weight_versions passed to reserve
+        self.commit_calls: list[tuple[str, object, int, int]] = []
+        self.remove_calls: list[str] = []
+        self.abort_calls: list[str] = []
+        # reserve(weight_version=X) -> group_id; commit fills the slot.
+        self._slots: list[str] = []
+
+    def reserve(
+        self,
+        *,
+        weight_version: int,
+        target_step: int | None = None,
+        group_id: str | None = None,
+        rollout_ids: list[str] | None = None,
+    ) -> str:
+        del target_step, rollout_ids
+        if group_id is None:
+            group_id = str(uuid.uuid4())
+        self.reserve_calls.append(weight_version)
+        self._slots.append(group_id)
+        return group_id
+
+    def abort(self, group_id: str) -> bool:
+        self.abort_calls.append(group_id)
+        if group_id in self._slots:
+            self._slots.remove(group_id)
+            return True
+        return False
+
+    async def commit(
+        self,
+        group_id: str,
+        record,
+        start_weight_version: int,
+        end_weight_version: int,
+    ):
+        self.commit_calls.append(
+            (group_id, record, start_weight_version, end_weight_version)
+        )
+        return record
+
+    async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
+        del remove_in_dp
+        self.remove_calls.append(group_id)
+        self._slots.remove(group_id)
+        return 1
+
+
+class _FakeImpl:
+    """Stand-in for AsyncRolloutImpl that returns a sentinel record."""
+
+    def __init__(self, record="sentinel-record", on_run=None) -> None:
+        self._record = record
+        self._on_run = on_run
+
+    async def run_rollout(self, input_sample):
+        if self._on_run is not None:
+            await self._on_run(input_sample)
+        return self._record
+
+
+def _make_manager(
+    buffer: _FakeBuffer, impl: _FakeImpl, retry_policy: RolloutRetryPolicy | None = None
+) -> RolloutManager:
+    """Build a RolloutManager without firing the real __init__.
+
+    The default policy is single-attempt, matching RolloutRetryPolicy's own default, so
+    these tests keep exercising the no-retry path unless they ask for otherwise.
+    """
+    mgr = object.__new__(RolloutManager)
+    mgr._impl = impl
+    mgr._tokenizer = None
+    mgr._num_generations_per_prompt = 1
+    mgr._tq_buffer = buffer
+    mgr._recovery_ledger = RolloutRecoveryLedger()
+    mgr._env_handles = {}
+    mgr._weight_version = 0
+    mgr._retry_policy = (
+        retry_policy
+        if retry_policy is not None
+        else RolloutRetryPolicy.single_attempt()
+    )
+    mgr._stats = RolloutStats()
+    mgr._skipped_prompts = 0
+    mgr._consecutive_infra_drops = 0
+    return mgr
+
+
+class TestGenerateAndPushFlow:
+    def test_post_write_failure_does_not_regenerate_the_rollout(self):
+        class _EnrichmentFailBuffer(_FakeBuffer):
+            async def commit(
+                self,
+                group_id: str,
+                record,
+                start_weight_version: int,
+                end_weight_version: int,
+            ):
+                await super().commit(
+                    group_id,
+                    record,
+                    start_weight_version,
+                    end_weight_version,
+                )
+                raise PostWriteEnrichmentError("teacher stage failed")
+
+        rollout_calls = 0
+
+        async def _count_rollout(_sample):
+            nonlocal rollout_calls
+            rollout_calls += 1
+
+        buf = _EnrichmentFailBuffer()
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_count_rollout),
+            retry_policy=RolloutRetryPolicy(
+                max_infra_attempts=3,
+                max_data_attempts=3,
+                max_gym_row_attempts=1,
+            ),
+        )
+
+        with pytest.raises(PostWriteEnrichmentError, match="teacher stage failed"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert rollout_calls == 1
+        assert len(buf.reserve_calls) == 1
+        assert len(buf.remove_calls) == 1
+
+    def test_grouped_post_write_failure_does_not_regenerate_the_rollout(self):
+        """Rollback failures do not hide the post-write failure classification."""
+
+        class _GroupedEnrichmentFailBuffer(_FakeBuffer):
+            async def commit(
+                self,
+                group_id: str,
+                record,
+                start_weight_version: int,
+                end_weight_version: int,
+            ):
+                await super().commit(
+                    group_id,
+                    record,
+                    start_weight_version,
+                    end_weight_version,
+                )
+                raise ExceptionGroup(
+                    "commit and rollback both failed",
+                    [
+                        PostWriteEnrichmentError("teacher stage failed"),
+                        RuntimeError("rollback failed"),
+                    ],
+                )
+
+        rollout_calls = 0
+
+        async def _count_rollout(_sample):
+            nonlocal rollout_calls
+            rollout_calls += 1
+
+        buf = _GroupedEnrichmentFailBuffer()
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_count_rollout),
+            retry_policy=RolloutRetryPolicy(
+                max_infra_attempts=3,
+                max_data_attempts=3,
+                max_gym_row_attempts=1,
+            ),
+        )
+
+        with pytest.raises(ExceptionGroup, match="commit and rollback"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert rollout_calls == 1
+        assert len(buf.reserve_calls) == 1
+        assert len(buf.remove_calls) == 1
+
+    def test_explicit_registry_tracks_only_inflight_generation(self):
+        registry: dict[str, tuple[asyncio.Task[None], int]] = {}
+        buf = _FakeBuffer()
+
+        async def _assert_registered(_sample):
+            assert len(registry) == 1
+            task, start_version = next(iter(registry.values()))
+            assert task is asyncio.current_task()
+            assert start_version == 3
+
+        mgr = _make_manager(buf, _FakeImpl(on_run=_assert_registered))
+        mgr.set_weight_version(3)
+
+        _run(
+            mgr.generate_and_push(
+                {"prompt": "p"},
+                inflight_registry=registry,
+            )
+        )
+
+        assert registry == {}
+
+    def test_rollout_failure_removes_reserved_group(self):
+        async def _fail_rollout(_sample):
+            raise RuntimeError("injected rollout failure")
+
+        registry: dict[str, tuple[asyncio.Task[None], int]] = {}
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(on_run=_fail_rollout))
+
+        with pytest.raises(RuntimeError, match="injected rollout failure"):
+            _run(mgr.generate_and_push({"prompt": "p"}, inflight_registry=registry))
+
+        assert len(buf.reserve_calls) == 1
+        assert len(buf.remove_calls) == 1
+        assert buf._slots == []
+        assert buf.commit_calls == []
+        assert registry == {}
+
+    def test_cleanup_failure_does_not_mask_original_exception(self):
+        class _RaisingBuffer(_FakeBuffer):
+            async def remove_group(self, group_id, *, remove_in_dp=False):
+                raise RuntimeError("remove_group cleanup boom")
+
+        class _OriginalError(Exception):
+            pass
+
+        async def _raise_original(_sample):
+            raise _OriginalError("original rollout failure")
+
+        buf = _RaisingBuffer()
+        mgr = _make_manager(buf, _FakeImpl(on_run=_raise_original))
+
+        with pytest.raises(_OriginalError):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+    def test_reserves_then_runs_then_commits(self):
+        events: list[str] = []
+        buf = _FakeBuffer()
+
+        async def _track_run(_sample):
+            events.append("run")
+
+        impl = _FakeImpl(record="r0", on_run=_track_run)
+        mgr = _make_manager(buf, impl)
+
+        # Wrap reserve/commit to log ordering.
+        original_reserve = buf.reserve
+        original_commit = buf.commit
+
+        def _logged_reserve(**kwargs):
+            events.append("reserve")
+            return original_reserve(**kwargs)
+
+        async def _logged_commit(*args, **kwargs):
+            events.append("commit")
+            return await original_commit(*args, **kwargs)
+
+        buf.reserve = _logged_reserve  # type: ignore[method-assign]
+        buf.commit = _logged_commit  # type: ignore[method-assign]
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert events == ["reserve", "run", "commit"]
+        assert buf.reserve_calls == [0]
+        assert len(buf.commit_calls) == 1
+        gid, record, start_v, end_v = buf.commit_calls[0]
+        assert gid in buf._slots
+        assert record == "r0"
+        assert start_v == 0
+        assert end_v == 0
+        assert len(mgr.recovery_ledger) == 0
+
+    def test_ledger_hands_ownership_to_canonical_buffer_on_commit(self):
+        buf = _FakeBuffer()
+
+        async def _assert_ledger_owns_inflight_prompt(_sample):
+            groups = mgr.recovery_ledger.groups()
+            assert len(groups) == 1
+            assert groups[0].group_id in buf._slots
+
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_assert_ledger_owns_inflight_prompt),
+        )
+        prompt = {"idx": 0, "message_log": [], "prompt": "p"}
+        group_id = _with_cut(
+            buf,
+            lambda cut: mgr.reserve_prompt_group(
+                cut,
+                prompt,
+                target_step=None,
+            ),
+        )
+
+        _run(
+            mgr.generate_and_push(
+                prompt,
+                lineage_group_id=group_id,
+            )
+        )
+
+        assert len(mgr.recovery_ledger) == 0
+        assert buf._slots == [group_id]
+        assert buf.commit_calls[0][0] == group_id
+
+    def test_skipped_tracked_prompt_remains_owned_for_controller_handoff(self):
+        async def _fail_rollout(_sample):
+            raise RuntimeError("bad prompt")
+
+        buf = _FakeBuffer()
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_fail_rollout),
+            RolloutRetryPolicy.single_attempt(max_skipped_prompts=1),
+        )
+        group_id = _with_cut(
+            buf,
+            lambda cut: mgr.reserve_prompt_group(
+                cut,
+                {"idx": 7, "message_log": []},
+                target_step=7,
+            ),
+        )
+
+        outcome = _run(
+            mgr.generate_and_push(
+                {"idx": 7, "message_log": []},
+                target_step=7,
+                lineage_group_id=group_id,
+            )
+        )
+
+        assert outcome is RolloutOutcome.SKIPPED
+        assert mgr.recovery_ledger.get_group(group_id).target_step == 7
+
+    def test_tracked_dispatch_rejects_changed_generations_per_prompt(self):
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl())
+        _with_cut(
+            buf,
+            lambda cut: mgr.recovery_ledger.reserve_group(
+                cut,
+                group_id="g0",
+                prompt_id="0",
+                prompt_payload={"idx": 0, "message_log": []},
+                expected_generations=2,
+                target_step=0,
+                start_weight_version=0,
+                admitted=True,
+            ),
+        )
+
+        with pytest.raises(ValueError, match="expects 2 generation"):
+            _run(
+                mgr.generate_and_push(
+                    {"idx": 0, "message_log": []},
+                    target_step=0,
+                    lineage_group_id="g0",
+                )
+            )
+
+    def test_start_weight_version_pinned_at_reserve_time(self):
+        """If set_weight_version is called mid-rollout, start != end."""
+        buf = _FakeBuffer()
+
+        async def _bump_weight_mid_rollout(_sample):
+            # Simulate a sync_weights bump during the rollout.
+            mgr.set_weight_version(5)
+
+        impl = _FakeImpl(record="r0", on_run=_bump_weight_mid_rollout)
+        mgr = _make_manager(buf, impl)
+        mgr.set_weight_version(3)
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        # reserve happened before run_rollout → captured weight 3.
+        assert buf.reserve_calls == [3]
+        # commit's start is the same dispatch-time value; end reflects the post-rollout weight.
+        _, _, start_v, end_v = buf.commit_calls[0]
+        assert start_v == 3
+        assert end_v == 5
+
+    def test_no_weight_change_means_start_equals_end(self):
+        buf = _FakeBuffer()
+        impl = _FakeImpl(record="r0")
+        mgr = _make_manager(buf, impl)
+        mgr.set_weight_version(7)
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        _, _, start_v, end_v = buf.commit_calls[0]
+        assert start_v == 7
+        assert end_v == 7
+
+    def test_concurrent_dispatch_preserves_reserve_order(self):
+        """Two concurrent generate_and_push calls must reserve before either commits.
+
+        The contract: reserve order == dispatch order, even if rollouts finish
+        out of order. Slot order in the buffer reflects the order reserve was
+        called (not the order run_rollout completed).
+        """
+        buf = _FakeBuffer()
+
+        # First call's rollout blocks until second call has reserved.
+        first_reserved = asyncio.Event()
+        second_reserved = asyncio.Event()
+
+        async def _first_run(_sample):
+            first_reserved.set()
+            await second_reserved.wait()
+
+        async def _second_run(_sample):
+            # Second is dispatched only after first reserves, so by the time
+            # second's reserve fires, slots[0] == first's gid.
+            second_reserved.set()
+
+        first_impl = _FakeImpl(record="r0", on_run=_first_run)
+        second_impl = _FakeImpl(record="r1", on_run=_second_run)
+
+        first_mgr = _make_manager(buf, first_impl)
+        # Share buffer across two managers (mimics two dispatches from one pump).
+        # Built through the shared helper so new RolloutManager attributes only have to
+        # be added in one place.
+        second_mgr = _make_manager(buf, second_impl)
+
+        async def _drive():
+            t1 = asyncio.create_task(first_mgr.generate_and_push({"prompt": "p1"}))
+            # Wait until first has reserved before kicking off second so the
+            # reserve ordering is deterministic.
+            await first_reserved.wait()
+            t2 = asyncio.create_task(second_mgr.generate_and_push({"prompt": "p2"}))
+            await asyncio.gather(t1, t2)
+
+        _run(_drive())
+
+        # Slots in buffer == reserve order.
+        first_gid, second_gid = buf._slots
+        # Commit recorded both, in either order, but each maps to its own gid.
+        commit_gids = [c[0] for c in buf.commit_calls]
+        assert set(commit_gids) == {first_gid, second_gid}
+        assert buf.reserve_calls == [0, 0]
+
+    def test_requires_tq_buffer(self):
+        mgr = _make_manager(_FakeBuffer(), _FakeImpl())
+        mgr._tq_buffer = None
+        with pytest.raises(AssertionError, match="tq_buffer"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+    def test_failed_rollout_aborts_reserved_slot(self):
+        """A dispatch that raises must not leave a phantom unready slot."""
+
+        async def _boom(_input_sample):
+            raise RuntimeError("rollout exploded")
+
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(on_run=_boom))
+
+        with pytest.raises(RuntimeError, match="rollout exploded"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert len(buf.reserve_calls) == 1
+        assert buf.commit_calls == []
+        assert len(buf.remove_calls) == 1
+        assert buf._slots == []  # the reserved slot was dropped
+
+    def test_failed_commit_aborts_reserved_slot(self):
+        """Commit failures (e.g. evicted slot) also abort the reservation."""
+
+        class _CommitBoomBuffer(_FakeBuffer):
+            async def commit(
+                self, group_id, record, start_weight_version, end_weight_version
+            ):
+                raise ValueError("no live slot")
+
+        buf = _CommitBoomBuffer()
+        mgr = _make_manager(buf, _FakeImpl())
+
+        with pytest.raises(ValueError, match="no live slot"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+        assert len(buf.remove_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for RolloutManager
+# ---------------------------------------------------------------------------
+
+
+def test_rollout_manager_raises_without_impl_params():
+    """RolloutManager raises AssertionError when required params are missing."""
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+    }
+
+    with pytest.raises(AssertionError, match="num_generations_per_prompt must be >= 1"):
+        updated_common = common.copy()
+        updated_common["num_generations_per_prompt"] = 0
+        RolloutManager(**updated_common, use_nemo_gym=False)
+
+    with pytest.raises(AssertionError, match="policy_generation is required"):
+        RolloutManager(**common, use_nemo_gym=False)
+
+    with pytest.raises(AssertionError, match="generation_config is required"):
+        RolloutManager(**common, use_nemo_gym=True)
+
+
+def test_rollout_manager_forwards_mask_env_flagged_samples():
+    """env.should_mask_flagged_samples reaches the NeMo-Gym impl through RolloutManager."""
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+        "generation_config": {
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        "use_nemo_gym": True,
+    }
+
+    assert RolloutManager(**common)._impl._mask_env_flagged_samples is True
+    manager = RolloutManager(**common, mask_env_flagged_samples=False)
+    assert manager._impl._mask_env_flagged_samples is False
+    reward_penalty_config = {"penalize_empty_final_answer": True}
+    manager = RolloutManager(**common, reward_penalty_config=reward_penalty_config)
+    assert manager._impl._reward_penalty_config is reward_penalty_config
+
+
+def test_rollout_manager_forwards_log_full_result_tables():
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+        "generation_config": {
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        "use_nemo_gym": True,
+    }
+
+    assert RolloutManager(**common)._impl._log_full_result_tables is False
+    manager = RolloutManager(**common, log_full_result_tables=True)
+    assert manager._impl._log_full_result_tables is True
+
+
+def _nemo_gym_impl(
+    mask_env_flagged_samples,
+    reward_penalty_config=None,
+    *,
+    log_full_result_tables=False,
+):
+    return AsyncNemoGymRolloutImpl(
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=100,
+        max_rollout_turns=1,
+        generation_config={
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": 100,
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        mask_env_flagged_samples=mask_env_flagged_samples,
+        log_full_result_tables=log_full_result_tables,
+        reward_penalty_config=reward_penalty_config,
+    )
+
+
+def _mask_gate_result():
+    return {
+        "message_log": [
+            {
+                "role": "assistant",
+                "token_ids": [1, 2],
+                "generation_logprobs": [0.0, 0.0],
+            }
+        ],
+        "full_result": {
+            "reward": 1.0,
+            "instance_config": {"mask_sample": True, "other_key": "kept"},
+        },
+    }
+
+
+def test_result_to_completion_keeps_mask_flag_when_gate_on():
+    completion = _nemo_gym_impl(True)._results_to_completions([_mask_gate_result()])[0][
+        0
+    ]
+    assert completion.env_extras["instance_config"]["mask_sample"] is True
+
+
+def test_result_to_completion_drops_mask_flag_when_gate_off():
+    completion = _nemo_gym_impl(False)._results_to_completions([_mask_gate_result()])[
+        0
+    ][0]
+    assert "mask_sample" not in completion.env_extras["instance_config"]
+    assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
+def _mask_gate_receipt_result():
+    return {
+        "message_log": [],
+        "receipt": {"rollout_id": "r0", "manifest": []},
+        "rollout_id": "r0",
+        "full_result": {
+            "reward": 1.0,
+            "instance_config": {"mask_sample": True, "other_key": "kept"},
+        },
+    }
+
+
+def test_receipt_completion_keeps_mask_flag_when_gate_on():
+    completion = _nemo_gym_impl(True)._results_to_completions(
+        [_mask_gate_receipt_result()]
+    )[0][0]
+    assert completion.env_extras["instance_config"]["mask_sample"] is True
+    assert completion.truncated is False
+
+
+def test_receipt_completion_drops_mask_flag_when_gate_off():
+    completion = _nemo_gym_impl(False)._results_to_completions(
+        [_mask_gate_receipt_result()]
+    )[0][0]
+    assert "mask_sample" not in completion.env_extras["instance_config"]
+    assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
+    impl = _nemo_gym_impl(True, log_full_result_tables=log_full_result_tables)
+    completion = Completion(
+        message_log=[
+            {"role": "user", "token_ids": [1]},
+            {"role": "assistant", "token_ids": [2, 3]},
+        ],
+        env_extras={"reward": 1.0, "payload": "large"},
+        truncated=False,
+        reward=1.0,
+    )
+
+    metrics = impl._compute_rollout_metrics([completion], "agent")
+
+    assert ("agent/full_result" in metrics) is log_full_result_tables
+
+
+def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
+    assistant_message = {
+        "role": "assistant",
+        "content": "answer",
+        "token_ids": assistant_tokens or [2],
+        "generation_logprobs": [0.0] * len(assistant_tokens or [2]),
+    }
+    assistant_message.update(assistant_overrides or {})
+    return {
+        "message_log": [
+            {"role": "user", "content": "question", "token_ids": [1]},
+            assistant_message,
+        ],
+        "full_result": {
+            "reward": 1.0,
+            "response": {"output": output},
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    (
+        "reward_penalty_config",
+        "output",
+        "assistant_overrides",
+        "assistant_tokens",
+        "count_key",
+        "metric_name",
+    ),
+    [
+        (
+            {"penalize_duplicated_reasoning": True},
+            [
+                {"type": "reasoning", "summary": [{"text": "same"}]},
+                {"type": "message", "content": [{"text": "same"}]},
+            ],
+            None,
+            None,
+            "duplicated_reasoning",
+            "reasoning_equal_to_final_answer_rate",
+        ),
+        (
+            {"penalize_empty_final_answer": True},
+            [{"type": "message", "content": [{"text": ""}]}],
+            None,
+            None,
+            "empty_final_answer",
+            "empty_final_answer_rate",
+        ),
+        (
+            {
+                "penalize_unwanted_tokens": True,
+                "token_ids": {"unwanted": [99]},
+            },
+            [{"type": "message", "content": [{"text": "answer"}]}],
+            None,
+            [2, 99],
+            "unwanted_token",
+            "unwanted_token_rate",
+        ),
+        (
+            {
+                "penalize_malformed_think_tag": True,
+                "thinking_tags": ("<think>", "</think>"),
+            },
+            [{"type": "message", "content": [{"text": "answer"}]}],
+            {"has_malformed_thinking": True},
+            None,
+            "malformed_think_tag",
+            "malformed_think_tag_rate",
+        ),
+    ],
+)
+def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
+    reward_penalty_config,
+    output,
+    assistant_overrides,
+    assistant_tokens,
+    count_key,
+    metric_name,
+):
+    impl = _nemo_gym_impl(True, reward_penalty_config)
+    result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
+
+    completions, penalty_counts = impl._results_to_completions([result])
+
+    assert completions[0].reward == 0.0
+    assert penalty_counts[count_key] == 1
+    assert sum(penalty_counts.values()) == 1
+    assert impl._compute_reward_penalty_metrics(penalty_counts, 1) == {metric_name: 1.0}
+
+
+def test_nemo_gym_reward_penalty_metrics_compute_fractional_rate():
+    impl = _nemo_gym_impl(True, {"penalize_empty_final_answer": True})
+
+    metrics = impl._compute_reward_penalty_metrics(
+        {
+            "duplicated_reasoning": 0,
+            "empty_final_answer": 1,
+            "unwanted_token": 0,
+            "malformed_think_tag": 0,
+        },
+        3,
+    )
+
+    assert metrics == {"empty_final_answer_rate": 1 / 3}
+
+
+def test_nemo_gym_build_inputs_stamps_logical_group_coordinates():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    input_sample = {"extra_env_info": {"responses_create_params": {}}}
+
+    rows = impl._build_inputs(input_sample)
+
+    assert len({row[NEMO_GYM_GROUP_ID_KEY] for row in rows}) == 1
+    assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
+    assert [row["_rowidx"] for row in rows] == [0, 1, 2]
+
+
+def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    input_sample = {
+        "extra_env_info": {
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 2,
+            NEMO_GYM_GROUP_ID_KEY: "stable-group",
+            "responses_create_params": {},
+        }
+    }
+
+    rows = impl._build_inputs(input_sample)
+
+    assert [row[NEMO_GYM_GROUP_ID_KEY] for row in rows] == [
+        "stable-group",
+        "stable-group",
+    ]
+    assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [2, 2]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# Tests for AsyncRolloutManager (native async path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="function")
+def single_multi_step_calculator_input_sample(rollout_tokenizer):  # noqa: F811
+    """Returns a single DatumSpec prompt dict (problem 0) for AsyncRolloutManager tests."""
+    problem_text = "(5 + 3) * 2"
+    expected_answer = 16.0
+    max_steps = 5
+
+    tool_instructions = (
+        "You have a calculator tool. To use it, respond with:\n"
+        "'[operand1, operand2, operation_name]<call: calculator>'\n"
+        "The valid 'operation_name' values are exactly: 'sum', 'diff', 'prod', 'div'.\n"
+        "Example: [5, 3, sum]<call: calculator>\n"
+        "You will receive the result of your calculation as <result>...</result>\n"
+        "Use this result to make the next calculation if needed.\n"
+        "IMPORTANT: Only perform one calculation step (one tool call) before waiting for a result and making a new tool call.\n"
+        "IMPORTANT: Do not perform any other calculations or operations aside from the tool call and result. Doing so will result in failure.\n"
+        "To give the final answer, just output the number. numbers inside of <result> don't count, so output just the final number yourself outside of this.\n"
+        "Example full output: [2, 4, sum]<call: calculator>\n<result>6.0</result>\n[6, 6, diff]<call: calculator>\n<result>0.0</result> 0\n(note how you have to output the final 0 outside of the tags)"
+        "------\n"
+        f"Solve: {problem_text}"
+    )
+
+    initial_prompt_content = rollout_tokenizer.apply_chat_template(
+        [{"role": "user", "content": tool_instructions}],
+        tokenize=False,
+        add_system_prompt=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    tokenized_prompt = rollout_tokenizer(
+        initial_prompt_content, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
+    message_log = [
+        {
+            "role": "user",
+            "content": initial_prompt_content,
+            "token_ids": tokenized_prompt,
+        }
+    ]
+    metadata = MultiStepCalcMetadata(
+        problem=problem_text,
+        expected_final_answer=expected_answer,
+        max_steps=max_steps,
+        current_step=0,
+    )
+    return {
+        "message_log": message_log,
+        "extra_env_info": metadata,
+        "task_name": "multi_step_calculator_game",
+        "stop_strings": ["<call: calculator>"],
+        "idx": 0,
+    }
+
+
+@pytest.mark.vllm
+def test_async_rollout_manager(
+    multi_step_setup_vllm_async,  # noqa: F811
+    single_multi_step_calculator_input_sample,
+):
+    """Standalone test for AsyncRolloutManager.
+
+    Given 1 prompt with num_generations_per_prompt=N, asserts:
+    - output is a PromptGroupRecord with N Completion objects
+    - each Completion has a reward (float) and a non-empty message_log
+    - rollout_metrics has the expected keys with correct types
+    - completions hold independent (not aliased) message_log objects
+    """
+    vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
+    input_sample = {
+        **single_multi_step_calculator_input_sample,
+        "loss_multiplier": 0.25,
+    }
+    num_generations = 2
+    max_seq_len = 1024
+    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
+
+    manager = RolloutManager(
+        use_nemo_gym=False,
+        tokenizer=tokenizer,
+        task_to_env=task_to_env,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
+    )
+
+    vllm_generation.prepare_for_generation()
+    record = asyncio.run(manager.run_rollout(input_sample))
+    vllm_generation.finish_generation()
+
+    assert isinstance(record, PromptGroupRecord)
+    assert len(record.completions) == num_generations, (
+        f"Expected {num_generations} completions, got {len(record.completions)}"
+    )
+    assert record.prompt_idx == input_sample["idx"]
+    assert record.loss_multiplier == input_sample["loss_multiplier"]
+
+    for i, completion in enumerate(record.completions):
+        assert isinstance(completion, Completion)
+
+        # 1. message_log length
+        assert len(completion.message_log) >= 4, (
+            f"Completion {i}: expected >= 4 messages, got {len(completion.message_log)}"
+        )
+
+        # 2. last assistant content
+        last_assistant = next(
+            (m for m in reversed(completion.message_log) if m["role"] == "assistant"),
+            None,
+        )
+        assert last_assistant is not None, f"Completion {i}: no assistant message found"
+        assert last_assistant["content"].strip() == "16", (
+            f"Completion {i}: last assistant content {last_assistant['content']!r} != '16'"
+        )
+
+        # 3. reward
+        assert completion.reward == 1.0, (
+            f"Completion {i}: reward {completion.reward} != 1.0"
+        )
+
+    # completions must be independent objects
+    assert record.completions[0].message_log is not record.completions[1].message_log
+
+
+@pytest.mark.vllm
+def test_async_rollout_manager_truncation(
+    multi_step_setup_vllm_async,  # noqa: F811
+    single_multi_step_calculator_input_sample,
+):
+    """Small max_seq_len forces truncation and truncation_rate=1.0."""
+    vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
+    input_sample = single_multi_step_calculator_input_sample
+    num_generations = 2
+    max_seq_len = 290
+    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
+
+    manager = RolloutManager(
+        use_nemo_gym=False,
+        tokenizer=tokenizer,
+        task_to_env=task_to_env,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
+    )
+    vllm_generation.prepare_for_generation()
+    record = asyncio.run(manager.run_rollout(input_sample))
+    vllm_generation.finish_generation()
+
+    assert len(record.completions) == num_generations
+    assert all(c.truncated for c in record.completions)
+    assert record.rollout_metrics["truncation_rate"] == 1.0
+    assert record.rollout_metrics["natural_termination_rate"] == 0.0
+
+
+@pytest.mark.vllm
+def test_async_rollout_manager_matches_original(
+    multi_step_setup_vllm_async,  # noqa: F811
+    single_multi_step_calculator_input_sample,
+):
+    """Comparison test: AsyncRolloutManager output is structurally equivalent to the original.
+
+    Calls run_async_multi_turn_rollout with a batch of N identical prompts,
+    then calls AsyncRolloutManager with 1 prompt and N generations.
+    Asserts that both produce N results with matching message-log depth, rewards,
+    and rollout_metrics numeric values.
+
+    TODO: remove this test together with run_async_multi_turn_rollout when the legacy path is deleted.
+    """
+    vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
+    input_sample = single_multi_step_calculator_input_sample
+    num_generations = 2
+    max_seq_len = 1024
+    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
+
+    # Build a batch of N identical prompts for the original function
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                deepcopy(input_sample["message_log"]) for _ in range(num_generations)
+            ],
+            "extra_env_info": [
+                deepcopy(input_sample["extra_env_info"]) for _ in range(num_generations)
+            ],
+            "task_name": [input_sample["task_name"]] * num_generations,
+            "stop_strings": [input_sample["stop_strings"]] * num_generations,
+            "idx": list(range(num_generations)),
+            "loss_multiplier": [1.0] * num_generations,
+        }
+    )
+
+    vllm_generation.prepare_for_generation()
+    original_batch, original_metrics = run_async_multi_turn_rollout(
+        policy_generation=vllm_generation,
+        input_batch=batch,
+        tokenizer=tokenizer,
+        task_to_env=task_to_env,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+    )
+
+    manager = RolloutManager(
+        use_nemo_gym=False,
+        tokenizer=tokenizer,
+        task_to_env=task_to_env,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
+    )
+    record = asyncio.run(manager.run_rollout(input_sample))
+    vllm_generation.finish_generation()
+
+    # Both should produce N results
+    assert len(original_batch["message_log"]) == num_generations
+    assert len(record.completions) == num_generations
+
+    for i in range(num_generations):
+        orig_msg_log = original_batch["message_log"][i]
+        new_msg_log = record.completions[i].message_log
+
+        # 1. message_log length matches
+        assert len(orig_msg_log) == len(new_msg_log), (
+            f"Completion {i}: message_log length {len(new_msg_log)} != original {len(orig_msg_log)}"
+        )
+
+        # 2. last assistant content matches
+        def _last_assistant_content(msg_log):
+            for m in reversed(msg_log):
+                if m["role"] == "assistant":
+                    return m.get("content", "")
+            return ""
+
+        orig_last = _last_assistant_content(orig_msg_log)
+        new_last = _last_assistant_content(new_msg_log)
+        assert orig_last == new_last, (
+            f"Completion {i}: last assistant content mismatch\n"
+            f"  original:  {orig_last!r}\n"
+            f"  manager:   {new_last!r}"
+        )
+
+        # 3. reward matches
+        orig_reward = original_batch["total_reward"][i].item()
+        new_reward = record.completions[i].reward
+        assert orig_reward == new_reward, (
+            f"Completion {i}: reward mismatch — original {orig_reward}, manager {new_reward}"
+        )
+
+    # 4. rollout_metrics numeric values match (timing and histogram fields are excluded).
+    # The new impl emits slash-style keys (X/mean, X/max, X/min) via calculate_single_metric;
+    # translate the legacy prefix-style keys before comparing.
+    def _translate_legacy_key(key: str) -> str:
+        if key == "avg_turns_per_sample":
+            return "turns_per_sample/mean"
+        if key == "max_turns_reached_rate":
+            return key
+        # Keys already in slash-style (e.g. turns_per_sample/p95, max_gen_tokens_per_turn/max)
+        # are new-style and should not be re-translated by the prefix-strip logic.
+        if "/" in key:
+            return key
+        for prefix, suffix in (("mean_", "/mean"), ("max_", "/max"), ("min_", "/min")):
+            if key.startswith(prefix):
+                return f"{key[len(prefix) :]}{suffix}"
+        return key
+
+    new_metrics = record.rollout_metrics
+    for key in original_metrics.keys():
+        if key.startswith("timing/") or key.startswith("histogram/"):
+            continue
+
+        new_key = _translate_legacy_key(key)
+        assert new_key in new_metrics, (
+            f"rollout_metrics[{new_key!r}] missing from manager"
+        )
+
+        orig_val = original_metrics[key]
+        new_val = new_metrics[new_key]
+
+        assert type(orig_val) == type(new_val), (
+            f"rollout_metrics[{key!r}] type mismatch: {type(orig_val)} != {type(new_val)}"
+        )
+        if not isinstance(orig_val, (bool, int, float)):
+            continue
+
+        assert orig_val == pytest.approx(new_val), (
+            f"rollout_metrics[{key!r}] mismatch — original {orig_val}, manager {new_val}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for AsyncNemoGymRolloutManager
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.nemo_gym
+def test_async_nemo_gym_rollout_manager(
+    nemo_gym,  # noqa: F811
+    nemo_gym_vllm_generation,  # noqa: F811
+    nemo_gym_sanity_test_data,  # noqa: F811
+    nemo_gym_tokenizer,  # noqa: F811
+):
+    """Standalone test for AsyncNemoGymRolloutManager.
+
+    Given 1 prompt with num_generations_per_prompt=N, asserts:
+    - output is a PromptGroupRecord with N Completion objects
+    - each Completion has a reward (float) and a non-empty message_log
+    - completions hold independent message_log objects
+
+    If the result here does not match, please check the following:
+    1. Test data changed: re-run test_nemo_gym_sanity (tests/unit/environments/test_nemo_gym.py)
+       and use _write_actual_test_data output to refresh test_nemo_gym_sanity.json.
+    2. Logic changed: inspect recent changes to AsyncNemoGymRolloutManager or the gym env.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        for data in nemo_gym_sanity_test_data["input"]:
+            f.write(json.dumps(data) + "\n")
+        data_path = f.name
+
+    dataset = NemoGymDataset(data_path)
+    examples = [
+        nemo_gym_data_processor(dataset.dataset[idx], None, None, None, idx)
+        for idx in range(len(dataset.dataset))
+    ]
+    input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(examples)
+
+    # Use only the first prompt
+    single_prompt = {
+        "message_log": input_batch["message_log"][0],
+        "extra_env_info": input_batch["extra_env_info"][0],
+        "task_name": "nemo_gym",
+        "idx": 0,
+        "loss_multiplier": float(input_batch["loss_multiplier"][0]),
+    }
+    num_generations = 2
+
+    manager = RolloutManager(
+        use_nemo_gym=True,
+        tokenizer=nemo_gym_tokenizer,
+        task_to_env={"nemo_gym": nemo_gym},
+        num_generations_per_prompt=num_generations,
+        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+        generation_config=nemo_gym_vllm_generation.cfg,
+    )
+    record = asyncio.run(manager.run_rollout(single_prompt))
+
+    assert isinstance(record, PromptGroupRecord)
+    assert len(record.completions) == num_generations, (
+        f"Expected {num_generations} completions, got {len(record.completions)}"
+    )
+    assert record.prompt_idx == 0
+    assert record.loss_multiplier == single_prompt["loss_multiplier"]
+
+    for i, completion in enumerate(record.completions):
+        assert isinstance(completion, Completion)
+
+        # 1. message_log length
+        assert len(completion.message_log) == 2, (
+            f"Completion {i}: expected 2 messages, got {len(completion.message_log)}"
+        )
+
+        # 2. last assistant token_ids
+        last_assistant = next(
+            (m for m in reversed(completion.message_log) if m["role"] == "assistant"),
+            None,
+        )
+        assert last_assistant is not None, f"Completion {i}: no assistant message found"
+        assert torch.equal(
+            last_assistant["token_ids"],
+            torch.tensor([151667, 198, 32313, 11, 1077]),
+        ), (
+            f"Completion {i}: last assistant token_ids {last_assistant['token_ids'].tolist()} "
+            f"!= [151667, 198, 32313, 11, 1077]"
+        )
+
+        # 3. reward
+        assert completion.reward == 0.0, (
+            f"Completion {i}: reward {completion.reward} != 0.0"
+        )
+
+    # completions must be independent objects
+    assert record.completions[0].message_log is not record.completions[1].message_log
+
+
+@pytest.mark.nemo_gym
+def test_async_nemo_gym_rollout_manager_matches_original(
+    nemo_gym,  # noqa: F811
+    nemo_gym_vllm_generation,  # noqa: F811
+    nemo_gym_sanity_test_data,  # noqa: F811
+    nemo_gym_tokenizer,  # noqa: F811
+):
+    """Comparison test: AsyncNemoGymRolloutManager output is structurally equivalent to the original.
+
+    Calls run_async_nemo_gym_rollout with a batch of N identical rows,
+    then calls AsyncNemoGymRolloutManager with 1 prompt, N generations.
+    Asserts that both produce N results and rewards are in the same numeric domain.
+
+    TODO: remove this test together with run_async_nemo_gym_rollout when the legacy path is deleted.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        for data in nemo_gym_sanity_test_data["input"]:
+            f.write(json.dumps(data) + "\n")
+        data_path = f.name
+
+    dataset = NemoGymDataset(data_path)
+    examples = [
+        nemo_gym_data_processor(dataset.dataset[idx], None, None, None, idx)
+        for idx in range(len(dataset.dataset))
+    ]
+    input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(examples)
+
+    num_generations = 2
+    single_prompt = {
+        "message_log": input_batch["message_log"][0],
+        "extra_env_info": input_batch["extra_env_info"][0],
+        "task_name": "nemo_gym",
+        "idx": 0,
+        "loss_multiplier": float(input_batch["loss_multiplier"][0]),
+    }
+
+    # Build a batch of N identical rows for the original function
+    repeated_batch = BatchedDataDict(
+        {
+            "message_log": [
+                deepcopy(input_batch["message_log"][0]) for _ in range(num_generations)
+            ],
+            "extra_env_info": [
+                deepcopy(input_batch["extra_env_info"][0])
+                for _ in range(num_generations)
+            ],
+            "loss_multiplier": input_batch["loss_multiplier"][0:1].repeat(
+                num_generations
+            ),
+            "idx": list(range(num_generations)),
+            "task_name": ["nemo_gym"] * num_generations,
+        }
+    )
+
+    async def _collect_original_results():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=nemo_gym_vllm_generation,
+                input_batch=repeated_batch,
+                tokenizer=nemo_gym_tokenizer,
+                task_to_env={"nemo_gym": nemo_gym},
+                generation_config=nemo_gym_vllm_generation.cfg,
+                num_generations=num_generations,
+                log_full_result_tables=False,
+                max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+                max_rollout_turns=None,
+            )
+        ]
+
+    original_results = asyncio.run(_collect_original_results())
+    assert len(original_results) == 1
+    original_result = original_results[0]
+
+    manager = RolloutManager(
+        use_nemo_gym=True,
+        tokenizer=nemo_gym_tokenizer,
+        task_to_env={"nemo_gym": nemo_gym},
+        num_generations_per_prompt=num_generations,
+        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+        generation_config=nemo_gym_vllm_generation.cfg,
+    )
+    record = asyncio.run(manager.run_rollout(single_prompt))
+
+    # Both should produce N completions
+    assert len(original_result.final_batch["message_log"]) == num_generations
+    assert len(record.completions) == num_generations
+
+    for i in range(num_generations):
+        orig_msg_log = original_result.final_batch["message_log"][i]
+        new_msg_log = record.completions[i].message_log
+
+        # 1. message_log length matches
+        assert len(orig_msg_log) == len(new_msg_log), (
+            f"Completion {i}: message_log length {len(new_msg_log)} != original {len(orig_msg_log)}"
+        )
+
+        # 2. last assistant token_ids match
+        def _last_assistant_token_ids(msg_log):
+            for m in reversed(msg_log):
+                if m["role"] == "assistant":
+                    return m.get("token_ids")
+            return None
+
+        orig_token_ids = _last_assistant_token_ids(orig_msg_log)
+        new_token_ids = _last_assistant_token_ids(new_msg_log)
+        assert orig_token_ids is not None, (
+            f"Completion {i}: no assistant message in original"
+        )
+        assert new_token_ids is not None, (
+            f"Completion {i}: no assistant message in manager"
+        )
+        assert torch.equal(orig_token_ids, new_token_ids), (
+            f"Completion {i}: last assistant token_ids mismatch\n"
+            f"  original:  {orig_token_ids.tolist()}\n"
+            f"  manager:   {new_token_ids.tolist()}"
+        )
+
+        # 3. reward matches
+        orig_reward = original_result.final_batch["total_reward"][i].item()
+        new_reward = record.completions[i].reward
+        assert orig_reward == new_reward, (
+            f"Completion {i}: reward mismatch — original {orig_reward}, manager {new_reward}"
+        )
+
+    # 4. rollout_metrics numeric values match (timing and Table fields are excluded)
+    orig_metrics = original_result.rollout_metrics
+    new_metrics = record.rollout_metrics
+    for key in orig_metrics.keys():
+        # Skip timing and full_result fields
+        if key.startswith("timing/") or key.endswith("/full_result"):
+            continue
+
+        # Check that the key is present in the new metrics
+        assert key in new_metrics, f"rollout_metrics[{key!r}] missing from manager"
+
+        orig_val = orig_metrics[key]
+        new_val = new_metrics[key]
+
+        # Skip non-numeric fields
+        assert type(orig_val) == type(new_val), (
+            f"rollout_metrics[{key!r}] type mismatch: {type(orig_val)} != {type(new_val)}"
+        )
+        if not isinstance(orig_val, (bool, int, float)):
+            continue
+
+        # Check equal
+        assert orig_val == pytest.approx(new_val), (
+            f"rollout_metrics[{key!r}] mismatch — original {orig_val}, manager {new_val}"
+        )
+
+
+class _FakeCaptureBuffer(_FakeBuffer):
+    def __init__(self):
+        super().__init__()
+        self.reserve_rollout_ids: list[list[str] | None] = []
+
+    def reserve(
+        self, *, weight_version, target_step=None, group_id=None, rollout_ids=None
+    ):
+        self.reserve_rollout_ids.append(rollout_ids)
+        return super().reserve(
+            weight_version=weight_version,
+            target_step=target_step,
+            group_id=group_id,
+            rollout_ids=rollout_ids,
+        )
+
+
+def _receipt_record(
+    rollout_ids, receipts, instance_configs=None, *, loss_multiplier=1.0
+):
+    instance_configs = instance_configs or [None] * len(rollout_ids)
+    completions = [
+        Completion(
+            message_log=[],
+            env_extras={
+                "reward": 0.5,
+                "ng_receipt": receipt,
+                "ng_rollout_id": rid,
+                **({"instance_config": cfg} if cfg is not None else {}),
+            },
+            truncated=False,
+            reward=0.5,
+        )
+        for rid, receipt, cfg in zip(rollout_ids, receipts, instance_configs)
+    ]
+    return PromptGroupRecord(
+        prompt_idx=0,
+        prompt=[],
+        extra_env_info={},
+        metadata={"task_name": "nemo_gym"},
+        completions=completions,
+        rollout_metrics={},
+        loss_multiplier=loss_multiplier,
+    )
+
+
+def _make_capture_manager(
+    buf,
+    *,
+    on_run=None,
+    num_generations=2,
+    retry_policy: RolloutRetryPolicy | None = None,
+    instance_configs=None,
+):
+    mgr = object.__new__(RolloutManager)
+    mgr._tokenizer = None
+    mgr._num_generations_per_prompt = num_generations
+    mgr._tq_buffer = buf
+    mgr._env_handles = {}
+    mgr._weight_version = 7
+    mgr._retry_policy = (
+        retry_policy
+        if retry_policy is not None
+        else RolloutRetryPolicy.single_attempt()
+    )
+    mgr._stats = RolloutStats()
+    mgr._skipped_prompts = 0
+    mgr._consecutive_infra_drops = 0
+
+    class _CaptureImpl:
+        def __init__(self):
+            self.seen_rollout_ids = None
+
+        async def run_rollout(self, _sample, *, rollout_ids=None):
+            self.seen_rollout_ids = rollout_ids
+            if on_run is not None:
+                await on_run(_sample)
+            return _receipt_record(
+                rollout_ids,
+                [{"rollout_id": rid} for rid in rollout_ids],
+                instance_configs=instance_configs,
+                loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
+            )
+
+    mgr._impl = _CaptureImpl()
+    return mgr
+
+
+class TestGenerateForFinalizationFlow:
+    def test_request_carries_env_mask_flags(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(
+            buf, instance_configs=[{"mask_sample": True}, {"other": 1}]
+        )
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p"}))
+
+        # The gym mask flag is read from env_extras exactly like the token
+        # path's _mask_sample_flags. truncated is not part of this request --
+        # the dispatcher has no real tokens to measure it from; the finalizer
+        # computes it from each row's rebuilt length instead.
+        assert request.mask_sample == (True, False)
+
+    def test_mints_ids_and_returns_metadata_request(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+
+        request = _run(
+            mgr.generate_for_finalization(
+                {"prompt": "p", "loss_multiplier": 0.25}, target_step=5
+            )
+        )
+
+        # Rollout ids were minted from the reserved group id and threaded
+        # end to end: reserve -> impl -> metadata-only actor request.
+        (group_id,) = buf._slots
+        expected_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+        assert buf.reserve_rollout_ids == [expected_ids]
+        assert mgr._impl.seen_rollout_ids == expected_ids
+        assert request.group_id == group_id
+        assert request.rollout_ids == tuple(expected_ids)
+        assert [r["rollout_id"] for r in request.receipts] == expected_ids
+        assert request.rewards == (0.5, 0.5)
+        assert request.mask_sample == (False, False)
+        assert request.loss_multiplier == 0.25
+        assert request.fallback_weight_version == 7
+        # Finalization and commit are exclusively owned by the controller's
+        # actor-pool path; the manager leaves the reservation unready.
+        assert buf.commit_calls == []
+
+    def test_failed_dispatch_aborts_the_reservation(self):
+        buf = _FakeCaptureBuffer()
+
+        async def _boom(_sample):
+            raise RuntimeError("rollout exploded")
+
+        mgr = _make_capture_manager(buf, on_run=_boom)
+        with pytest.raises(RuntimeError, match="rollout exploded"):
+            _run(mgr.generate_for_finalization({"prompt": "p"}))
+        # The slot is released; abandoned staged rows are swept with the
+        # staging partition at run end (no per-rollout control-plane call).
+        assert len(buf.abort_calls) == 1

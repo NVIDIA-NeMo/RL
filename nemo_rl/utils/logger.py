@@ -42,6 +42,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -51,6 +53,11 @@ class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
     entity: NotRequired[str]
+    id: NotRequired[str]
+    resume: NotRequired[str]
+    # Log complete NeMo Gym result payloads as W&B Tables. These payloads can be
+    # very large, so the recommended default is false.
+    log_nemo_gym_full_result_tables: NotRequired[bool]
 
 
 class SwanlabConfig(TypedDict):
@@ -88,6 +95,13 @@ class LoggerConfig(TypedDict):
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
+
+
+def should_log_nemo_gym_full_result_tables(
+    *, wandb_enabled: bool, wandb_config: WandbConfig
+) -> bool:
+    """Return whether complete NeMo Gym results should become W&B Tables."""
+    return wandb_enabled and bool(wandb_config.get("log_nemo_gym_full_result_tables"))
 
 
 class LoggerInterface(ABC):
@@ -181,7 +195,8 @@ class TensorboardLogger(LoggerInterface):
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to Tensorboard."""
-        return
+        if len(histogram) > 0:
+            self.writer.add_histogram(name, np.asarray(histogram), step)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to Tensorboard.
@@ -206,7 +221,10 @@ class WandbLogger(LoggerInterface):
     """Weights & Biases logger backend."""
 
     def __init__(self, cfg: WandbConfig, log_dir: Optional[str] = None):
-        self.run = wandb.init(**cfg, dir=log_dir)
+        # NeMo RL logging controls are not valid wandb.init keyword arguments.
+        wandb_init_config = dict(cfg)
+        wandb_init_config.pop("log_nemo_gym_full_result_tables", None)
+        self.run = wandb.init(**wandb_init_config, dir=log_dir)
 
         if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
             print(
@@ -392,6 +410,16 @@ class WandbLogger(LoggerInterface):
             step: Global step value
         """
         self.run.log({name: figure}, step=step)
+
+    def finish(self) -> None:
+        """Flush queued metrics and close the wandb service.
+
+        Required when the run lives inside a Ray actor: Ray tears the worker
+        down before wandb's atexit hook can drain the IPC queue to the service.
+        """
+        if self.run is not None:
+            self.run.finish()
+            self.run = None
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to wandb.
@@ -1025,9 +1053,40 @@ class Logger(LoggerInterface):
             prefix: Optional prefix for metric names
             step_metric: Optional name of a field in metrics to use as step instead
                          of the provided step value (currently only needed for wandb)
+
+        Note:
+            Metrics identified by :func:`is_histogram_metric` are routed through
+            :meth:`log_histogram` instead of each backend's ``log_metrics``.
+            ``histogram/*`` keys retain their established
+            ``generation_metrics/`` namespace; other distributions inherit
+            ``prefix``.
         """
+        histogram_metrics = {
+            name: value for name, value in metrics.items() if is_histogram_metric(name)
+        }
+        metrics_to_log = {
+            name: value
+            for name, value in metrics.items()
+            if name not in histogram_metrics
+        }
+
+        for name, values in histogram_metrics.items():
+            # Preserve the established namespace for per-turn generation
+            # histograms; other distributions inherit the caller's prefix.
+            if name.startswith("histogram/"):
+                histogram_name = (
+                    f"generation_metrics/{name}"
+                    if prefix in ("", None, "train")
+                    else f"generation_metrics/{prefix}/{name}"
+                )
+            else:
+                histogram_name = f"{prefix}/{name}" if prefix else name
+            self.log_histogram(values, step, histogram_name)
+
         for logger in self.loggers:
-            logger.log_metrics(metrics, step, prefix, step_metric, step_finished)
+            logger.log_metrics(metrics_to_log, step, prefix, step_metric, step_finished)
+
+        tee_rl_metrics_to_otel(metrics, prefix)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.
@@ -1037,6 +1096,13 @@ class Logger(LoggerInterface):
         """
         for logger in self.loggers:
             logger.log_hyperparams(params)
+
+    def finish(self) -> None:
+        """Flush and close backends that need explicit teardown (e.g. wandb)."""
+        for logger in self.loggers:
+            finish = getattr(logger, "finish", None)
+            if callable(finish):
+                finish()
 
     def log_batched_dict_as_jsonl(
         self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str

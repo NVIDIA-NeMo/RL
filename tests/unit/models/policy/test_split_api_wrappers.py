@@ -32,6 +32,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.policy.tq_policy import TQPolicy
 
@@ -115,6 +116,7 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     """Bare TQPolicy with the attributes the split fan-out touches."""
     p = object.__new__(TQPolicy)
     p.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
+    p._router_replay_enabled = False
     p.flops_tracker = None
     wg = MagicMock()
     wg.run_all_workers_single_data.return_value = ["f0", "f1"]
@@ -147,10 +149,13 @@ class TestTQPolicySplitFanout:
             patch(
                 "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
                 return_value=([meta, meta], None),
-            ),
+            ) as mock_shard,
         ):
             out = p.train_microbatches_from_meta(meta)
         assert out is None
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == list(DP_TRAIN_FIELDS)
+        assert ROUTED_EXPERTS_FIELD not in train_meta.fields
         assert (
             wg.run_all_workers_sharded_data.call_args.args[0]
             == "train_microbatch_presharded"
@@ -158,6 +163,44 @@ class TestTQPolicySplitFanout:
         # sharded dispatch returns a MultiWorkerFuture → waited via
         # get_all_worker_results (unlike the single-data fan-outs)
         wg.get_all_worker_results.assert_called_once()
+
+    def test_train_microbatches_fetches_only_requested_fields(self):
+        p, _ = _make_tq_policy()
+        meta = _meta()
+        train_fields = tuple(
+            field
+            for field in DP_TRAIN_FIELDS
+            if field not in {"prev_logprobs", "reference_policy_logprobs"}
+        )
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            p.train_microbatches_from_meta(meta, train_fields=train_fields)
+
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == list(train_fields)
+
+    def test_train_microbatches_requests_routed_experts_for_router_replay(self):
+        p, _ = _make_tq_policy()
+        p._router_replay_enabled = True
+        meta = _meta()
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            p.train_microbatches_from_meta(meta)
+
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == [*DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD]
 
     def test_finish_dedupes_replica_twins(self):
         """TP/CP twins return identical metric copies; aggregating without
@@ -184,6 +227,31 @@ class TestTQPolicySplitFanout:
         assert out["all_mb_metrics"]["loss"] == [0.1, 0.1]  # twins dropped
         # _aggregate_train_results surfaces global_loss under "loss"
         assert out["loss"] == 1.0
+
+    def test_finish_propagates_mtp_metrics(self):
+        """Worker-reduced MTP metrics survive the TQPolicy aggregation layer."""
+        p, _ = _make_tq_policy()
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                {
+                    "global_loss": 1.0,
+                    "grad_norm": 0.5,
+                    "all_mb_metrics": {"loss": [0.1]},
+                    "mtp_metrics": {
+                        "mtp_1_loss": 0.25,
+                        "mtp_1_acceptance_rate": 75.0,
+                        "grad_norm": 1.25,
+                    },
+                    "is_replica_leader": True,
+                }
+            ]
+            out = p.finish_train_step()
+
+        assert out["mtp_metrics"] == {
+            "mtp_1_loss": 0.25,
+            "mtp_1_acceptance_rate": 75.0,
+            "grad_norm": 1.25,
+        }
 
     def test_abort_consumes_single_data_futures_with_ray_get(self):
         p, wg = _make_tq_policy()

@@ -83,7 +83,7 @@ grpo:
 > [!NOTE]
 > **Clip-Higher** and **Token-Level Policy Gradient Loss** are already supported in NeMo RL and can be configured through the `loss_fn` section of your experiment config:
 > - Set `ratio_clip_max` to enable Clip-Higher (e.g., `ratio_clip_max: 0.28`)
-> - Set `token_level_loss: true` to enable Token-Level Policy Gradient Loss
+> - Set `token_level_loss: true` to enable Token-Level Policy Gradient Loss (see [Loss Normalization](grpo.md#loss-normalization-token_level_loss) for what this changes and the tradeoff against sequence-level normalization)
 > 
 > See the full [DAPO example config](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml) for reference.
 

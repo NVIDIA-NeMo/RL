@@ -31,7 +31,7 @@ class OpenR1Math220KDataset(RawDataset):
 
     def __init__(
         self,
-        subset: str = "default",
+        subset: str | None = "default",
         split: str = "train",
         split_validation_size: float = 0.0,
         seed: int = 42,
@@ -40,7 +40,9 @@ class OpenR1Math220KDataset(RawDataset):
         self.task_name = "OpenR1-Math-220k"
 
         # load from huggingface
-        self.dataset = load_dataset("open-r1/OpenR1-Math-220k", subset, split=split)
+        self.dataset = load_dataset(
+            "open-r1/OpenR1-Math-220k", subset or "default", split=split
+        )
 
         # format the dataset
         self.dataset = self.dataset.map(

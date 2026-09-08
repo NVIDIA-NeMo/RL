@@ -156,7 +156,6 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: false
   nemo_gym:
-    rollout_max_attempts_to_avoid_lp_nan: 1
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - responses_api_agents/verifiers_agent/configs/acereason-math.yaml

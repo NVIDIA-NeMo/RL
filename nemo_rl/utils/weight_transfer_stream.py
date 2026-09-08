@@ -521,11 +521,12 @@ def stream_sparse_delta_payloads_via_s3_manifest(
     bucket = (refit_config.storage.s3_bucket or "").strip()
     if not bucket:
         raise RuntimeError(
-            "policy.generation.refit_cfg.storage.s3_bucket must be set for S3 refit."
+            "policy.generation.refit_cfg.sparse.storage.s3_bucket must be set "
+            "for S3 refit."
         )
     region = refit_config.storage.s3_region.strip()
     if not region:
-        raise ValueError("refit_cfg.storage.s3_region must not be empty.")
+        raise ValueError("refit_cfg.sparse.storage.s3_region must not be empty.")
     store = _get_manifest_s3_store(bucket, region)
     object_prefix = refit_config.storage.s3_prefix.strip("/")
     run_prefix = (

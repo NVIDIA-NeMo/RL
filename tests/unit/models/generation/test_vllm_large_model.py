@@ -38,6 +38,9 @@ large_model_vllm_config: VllmConfig = {
     "temperature": 0.8,
     "top_p": 1.0,
     "top_k": None,
+    "val_temperature": 0.8,
+    "val_top_p": 1.0,
+    "val_top_k": None,
     "stop_token_ids": None,
     "stop_strings": None,
     "vllm_cfg": {

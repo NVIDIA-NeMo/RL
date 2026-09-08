@@ -7,6 +7,7 @@ grpo:
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
+    max_generation_failures: 0
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"

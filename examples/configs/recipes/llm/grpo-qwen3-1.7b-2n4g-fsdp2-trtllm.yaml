@@ -1,0 +1,25 @@
+defaults: ../../grpo_math_1B_trtllm.yaml
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+  max_val_samples: 64
+  val_batch_size: 64
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-2n4g-fsdp2-trtllm
+policy:
+  model_name: Qwen/Qwen3-1.7B
+  max_total_sequence_length: 2048
+  train_global_batch_size: 16
+  generation_batch_size: 4
+  logprob_batch_size: 4
+  make_sequence_length_divisible_by: 1
+  generation:
+    trtllm_cfg:
+      tensor_parallel_size: 4
+logger:
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-1.7b-2n4g-fsdp2-trtllm
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2

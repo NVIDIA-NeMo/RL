@@ -40,7 +40,7 @@ uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METR
 # Real-quant rollout must go through the ModelOpt NVFP4 vLLM kernel path.
 grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
 grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
-grep -q "quantization=modelopt" "$RUN_LOG"
+grep -qE "quantization=(nemo_)?modelopt" "$RUN_LOG"  # vLLM 0.25 logs the registered NeMo quant name (e.g. nemo_modelopt_w4a16_nvfp4)
 grep -q "nvfp4_experts_weightonly.yaml" "$RUN_LOG"
 assert_not_grep "FakeQuantWorker" "$RUN_LOG" \
     "Real-quant run unexpectedly used FakeQuantWorker"

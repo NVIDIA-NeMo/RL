@@ -41,6 +41,12 @@ def main() -> None:
             "Ensure the Megatron-Bridge submodule is initialized."
         )
     sys.argv[0] = str(UPSTREAM_EXPORT)
+    # export.py imports sibling modules (quantize_utils) that only resolve when its own
+    # directory is on sys.path. `python export.py` gets that for free via sys.path[0];
+    # runpy.run_path() does not add it for a plain file path, so add it explicitly.
+    upstream_dir = str(UPSTREAM_EXPORT.parent)
+    if upstream_dir not in sys.path:
+        sys.path.insert(0, upstream_dir)
     runpy.run_path(str(UPSTREAM_EXPORT), run_name="__main__")
 
 

@@ -19,6 +19,7 @@ import torch
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
+    DistillationLossConfig,
     DistillationLossFn,
     DPOLossConfig,
     DPOLossFn,
@@ -38,7 +39,19 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     cp_load_balanced_to_contiguous,
     cp_shift_next,
+    vocab_parallel_gather_columns,
 )
+
+
+@pytest.mark.parametrize(
+    "invalid_penalty",
+    [-0.01, float("nan"), float("inf"), float("-inf")],
+)
+def test_clipped_pg_loss_config_rejects_invalid_reference_kl_penalty(
+    invalid_penalty: float,
+) -> None:
+    with pytest.raises(ValueError):
+        ClippedPGLossConfig(reference_policy_kl_penalty=invalid_penalty)
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -2011,6 +2024,33 @@ def test_clipped_pg_loss_gspo_batch_size_2():
     torch.testing.assert_close(actual_loss, expected_loss)
 
 
+def test_clipped_pg_loss_sequence_importance_ratio_averages_per_sample():
+    """Sequence-level importance-ratio metrics average one weight per sample."""
+    data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(
+        batch_size=2, seq_len=3, device="cpu"
+    )
+    data["generation_logprobs"][:, 1] = -torch.log(torch.tensor([2.0, 4.0]))
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True,
+            sequence_level_importance_ratios=True,
+            token_level_loss=False,
+        )
+    )
+    _, metrics = loss_fn(
+        next_token_logprobs=torch.zeros((batch_size, seq_len - 1)),
+        data=data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=(
+            data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+        ).sum(),
+    )
+
+    assert metrics["sampling_importance_ratio"] == pytest.approx(3.0)
+
+
 def test_clipped_pg_loss_gspo_importance_sampling_correction():
     """Tests GSPO w/ importance sampling correction in ClippedPGLossFn."""
     if not torch.cuda.is_available():
@@ -2158,11 +2198,11 @@ def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
     data, student_logits = setup_distillation_test_data()
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": kl_type,
-            "mixed_kl_weight": 0.3,
-            "zero_outside_topk": zero_outside_topk,
-        }
+        DistillationLossConfig(
+            kl_type=kl_type,
+            mixed_kl_weight=0.3,
+            zero_outside_topk=zero_outside_topk,
+        )
     )
 
     loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
@@ -2203,11 +2243,11 @@ def test_distillation_loss_topk_filtering(k, zero_outside_topk):
     data, student_logits = setup_distillation_test_data(topk=k)
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": zero_outside_topk,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=zero_outside_topk,
+        )
     )
 
     loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
@@ -2241,11 +2281,11 @@ def test_distillation_loss_invalid_k_zero():
     data, student_logits = setup_distillation_test_data(topk=0)
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     # This should raise a ValueError for k=0
@@ -2261,11 +2301,11 @@ def test_distillation_loss_gradient_flow():
     student_logits.requires_grad_(True)
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
@@ -2293,11 +2333,11 @@ def test_distillation_loss_edge_cases():
     data, student_logits = setup_distillation_test_data()
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     # Test with all-zero logits
@@ -2346,22 +2386,22 @@ def test_distillation_loss_edge_cases():
 def test_distillation_loss_fn_initialization():
     """Test DistillationLossFn initialization."""
     # Test with default values
-    default_config = {
-        "kl_type": "forward",
-        "mixed_kl_weight": 0.5,
-        "zero_outside_topk": False,
-    }
+    default_config = DistillationLossConfig(
+        kl_type="forward",
+        mixed_kl_weight=0.5,
+        zero_outside_topk=False,
+    )
     loss_fn = DistillationLossFn(default_config)
     assert loss_fn.kl_type == "forward"
     assert loss_fn.mixed_kl_weight == 0.5
     assert not loss_fn.zero_outside_topk
 
     # Test with custom values
-    custom_config = {
-        "kl_type": "reverse",
-        "mixed_kl_weight": 0.3,
-        "zero_outside_topk": True,
-    }
+    custom_config = DistillationLossConfig(
+        kl_type="reverse",
+        mixed_kl_weight=0.3,
+        zero_outside_topk=True,
+    )
     loss_fn = DistillationLossFn(custom_config)
     assert loss_fn.kl_type == "reverse"
     assert loss_fn.mixed_kl_weight == 0.3
@@ -2373,11 +2413,11 @@ def test_distillation_loss_fn_call():
     data, student_logits = setup_distillation_test_data()
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
@@ -2680,6 +2720,188 @@ def test_cross_tokenizer_ce_respects_sample_mask(tmp_path):
     assert torch.allclose(ce_masked, ce_single, atol=1e-6)
 
 
+def test_cross_tokenizer_prepare_loss_input_partitions_canonical_ce(
+    tmp_path, monkeypatch
+):
+    """Automodel CP assigns one disjoint canonical CE window to each rank."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    )
+    full_logprobs = torch.tensor([[-1.0, -2.0, -3.0]], requires_grad=True)
+    token_mask = torch.tensor([[1.0, 1.0, 0.0, 1.0]])
+    cp_group = object()
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2, 3]]),
+            "token_mask": token_mask,
+            "sample_mask": torch.ones(1),
+        }
+    )
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.prepare_xtoken_cross_tokenizer_loss_input",
+        lambda *args, **kwargs: (torch.empty(0), {}, {}, None, cp_group),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.get_cp_sharded_next_token_logprobs",
+        lambda *args, **kwargs: full_logprobs,
+    )
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 2)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group: 1)
+
+    loss_input, prepared_data = prepare_loss_input(
+        torch.empty(0),
+        data,
+        loss_fn,
+        context_parallel_group=cp_group,
+        cp_sharder=object(),
+    )
+
+    torch.testing.assert_close(
+        loss_input["student_next_token_logprobs"], torch.tensor([[-3.0, 0.0]])
+    )
+    torch.testing.assert_close(
+        loss_input["student_next_token_mask"], torch.tensor([[1.0, 0.0]])
+    )
+    assert prepared_data is data
+
+
+def test_cross_tokenizer_prepare_loss_input_rejects_nondivisible_cp_window(
+    tmp_path, monkeypatch
+):
+    """Automodel CP rejects canonical CE windows that cannot partition evenly."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    )
+    next_token_logprobs = torch.tensor(
+        [[-1.0, -2.0, -3.0, -4.0, -5.0]], requires_grad=True
+    )
+    cp_group = object()
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros((1, 6), dtype=torch.long),
+            "token_mask": torch.ones((1, 6)),
+            "sample_mask": torch.ones(1),
+        }
+    )
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.prepare_xtoken_cross_tokenizer_loss_input",
+        lambda *args, **kwargs: (torch.empty(0), {}, {}, None, cp_group),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.get_cp_sharded_next_token_logprobs",
+        lambda *args, **kwargs: next_token_logprobs,
+    )
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 4)
+
+    with pytest.raises(ValueError, match=r"sequence_length=6, cp_size=4"):
+        prepare_loss_input(
+            torch.empty(0),
+            data,
+            loss_fn,
+            context_parallel_group=cp_group,
+            cp_sharder=object(),
+        )
+
+
+def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
+    tmp_path, monkeypatch
+):
+    """Precomputed CE sums CP-window values while preserving local gradients."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    )
+    data = BatchedDataDict({"sample_mask": torch.ones(1)})
+    next_token_logprobs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+    next_token_mask = torch.ones_like(next_token_logprobs)
+    cp_group = object()
+    reduce_calls = []
+
+    def reduce_sum(value, group):
+        reduce_calls.append((value.detach().clone(), group))
+        return value
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.loss_functions.group_all_reduce_sum_with_grad",
+        reduce_sum,
+    )
+
+    ce = loss_fn._compute_ce(
+        torch.empty(0),
+        data,
+        torch.tensor(2.0),
+        student_next_token_logprobs=next_token_logprobs,
+        student_next_token_mask=next_token_mask,
+        cp_group=cp_group,
+    )
+
+    torch.testing.assert_close(ce, torch.tensor(1.5))
+    ce.backward()
+    torch.testing.assert_close(
+        next_token_logprobs.grad,
+        torch.tensor([[-0.5, -0.5]]),
+    )
+    assert len(reduce_calls) == 1
+    torch.testing.assert_close(reduce_calls[0][0], torch.tensor(1.5))
+    assert reduce_calls[0][1] is cp_group
+
+
+def test_cross_tokenizer_partitioned_cp_ce_matches_cp1_value_and_gradient(tmp_path):
+    """Summed CP2 CE windows are numerically identical to the CP1 full CE."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    )
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]]),
+            "sample_mask": torch.tensor([1.0, 0.0]),
+        }
+    )
+    global_valid_toks = torch.tensor(2.0)
+    full_mask = data["token_mask"].roll(shifts=-1, dims=1)
+    full_mask[:, -1] = 0
+
+    cp1_logprobs = torch.tensor(
+        [[-1.0, -2.0, -3.0], [-10.0, -20.0, -30.0]], requires_grad=True
+    )
+    cp1_loss = loss_fn._compute_ce(
+        torch.empty(0),
+        data,
+        global_valid_toks,
+        student_next_token_logprobs=cp1_logprobs,
+        student_next_token_mask=full_mask[:, :-1],
+        cp_group=None,
+    )
+    cp1_loss.backward()
+
+    cp2_logprobs = cp1_logprobs.detach().clone().requires_grad_(True)
+    cp2_padded = torch.cat([cp2_logprobs, torch.zeros_like(cp2_logprobs[:, :1])], dim=1)
+    cp2_local_seq_len = cp2_padded.shape[1] // 2
+    cp2_losses = []
+    for cp_rank in range(2):
+        seq_start = cp_rank * cp2_local_seq_len
+        cp2_losses.append(
+            loss_fn._compute_ce(
+                torch.empty(0),
+                data,
+                global_valid_toks,
+                student_next_token_logprobs=cp2_padded.narrow(
+                    1, seq_start, cp2_local_seq_len
+                ),
+                student_next_token_mask=full_mask.narrow(
+                    1, seq_start, cp2_local_seq_len
+                ),
+                cp_group=None,
+            )
+        )
+    cp2_loss = sum(cp2_losses)
+    cp2_loss.backward()
+
+    torch.testing.assert_close(cp2_loss, cp1_loss)
+    torch.testing.assert_close(cp2_logprobs.grad, cp1_logprobs.grad)
+
+
 # ── Metric-normalization advertisement (PR #2683) ─────────────────────────
 
 
@@ -2834,3 +3056,89 @@ def test_split_rescale_matches_sync_normalization():
     assert raw_totals["num_valid_samples"] == pytest.approx(
         sync_totals["num_valid_samples"]
     )
+
+
+# ---------------------------------------------------------------------------
+# vocab_parallel_gather_columns / _direct_topk_kl subset-softmax equivalence
+# (issue #3272): the K-subset renormalization cancels the full-vocab
+# partition function, so gathering K columns and softmaxing within the
+# subset must reproduce the previous full-vocab-log-softmax-then-renorm
+# form exactly — values and gradients.
+# ---------------------------------------------------------------------------
+
+
+def test_vocab_parallel_gather_columns_no_tp():
+    """No-TP path: plain column slice, upcast to fp32."""
+    logits = torch.randn(2, 3, 10, dtype=torch.bfloat16)
+    idx = torch.tensor([1, 4, 7])
+    out = vocab_parallel_gather_columns(logits, idx, tp_group=None)
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out, logits[..., idx].float())
+
+
+@pytest.mark.parametrize("temperature", [1.0, 2.0])
+def test_subset_softmax_matches_full_vocab_reference(temperature):
+    """log_softmax_K(logits[..., idx] / T) == full log_softmax -> slice ->
+    renorm, for both the forward value and the gradient w.r.t. logits."""
+    torch.manual_seed(0)
+    batch, seq, vocab, k = 2, 6, 64, 8
+    idx = torch.randperm(vocab)[:k].sort().values
+    base = torch.randn(batch, seq, vocab)
+
+    # reference: previous full-vocab formulation
+    ref_logits = base.clone().requires_grad_(True)
+    full = torch.log_softmax(ref_logits.float() / temperature, dim=-1)
+    gathered = full[..., idx]
+    ref = gathered - torch.logsumexp(gathered, dim=-1, keepdim=True)
+
+    # new: subset softmax over gathered columns
+    new_logits = base.clone().requires_grad_(True)
+    new = torch.log_softmax(
+        vocab_parallel_gather_columns(new_logits, idx, tp_group=None) / temperature,
+        dim=-1,
+    )
+
+    torch.testing.assert_close(new, ref, atol=1e-6, rtol=1e-6)
+    ref.sum().backward()
+    new.sum().backward()
+    torch.testing.assert_close(new_logits.grad, ref_logits.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
+    """TP path via an emulated 2-rank group: running the production code per
+    vocab shard and summing (what ``all_reduce(SUM)`` does — each column is
+    owned by exactly one rank) must reproduce the full-logits column slice,
+    and each shard's backward must receive exactly its own columns' grads."""
+    import nemo_rl.distributed.model_utils as mu
+
+    torch.manual_seed(7)
+    batch, seq, vocab, k = 2, 5, 32, 6
+    full = torch.randn(batch, seq, vocab)
+    idx = torch.randperm(vocab)[:k].sort().values
+    v_local = vocab // 2
+    shards = [
+        full[..., :v_local].clone().requires_grad_(True),
+        full[..., v_local:].clone().requires_grad_(True),
+    ]
+
+    outputs = []
+    for rank in (0, 1):
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda g=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda g=None, _r=rank: _r)
+        monkeypatch.setattr(
+            torch.distributed, "all_reduce", lambda t, op=None, group=None: None
+        )
+        outputs.append(
+            mu.vocab_parallel_gather_columns(shards[rank], idx, tp_group=object())
+        )
+    combined = outputs[0] + outputs[1]
+
+    truth = full[..., idx].float()
+    torch.testing.assert_close(combined, truth)
+
+    grad_out = torch.randn_like(combined)
+    combined.backward(grad_out)
+    ref = full.clone().requires_grad_(True)
+    ref[..., idx].float().backward(grad_out)
+    torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
+    torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])

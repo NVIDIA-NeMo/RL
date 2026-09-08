@@ -226,8 +226,9 @@ Mamba, padded or tied weights, grouped exports, adapters, and custom Bridge
 postprocessing all follow Bridge's canonical export semantics.
 
 Baselines use file-backed `torch.from_file` tensors by default;
-`refit_cfg.baseline.in_memory: true` keeps them in RAM. File backing reduces
-anonymous resident-memory pressure but does not reduce logical baseline bytes.
+`refit_cfg.sparse.baseline.in_memory: true` keeps them in RAM. File backing
+reduces anonymous resident-memory pressure but does not reduce logical baseline
+bytes.
 
 Baseline initialization also returns each canonical tensor's name, shape, and
 dtype. The synchronizer merges that metadata and asks every vLLM worker to
@@ -464,14 +465,15 @@ policy:
     backend: vllm
     refit_transport: vllm_s3_sparse  # or vllm_zmq_sparse
     refit_cfg:
-      delta_compression:
-        encoding: xor  # overwrite is selected automatically for opaque loaders
-      storage:
-        s3_bucket: my-refit-bucket  # required only for vllm_s3_sparse
-        s3_region: us-east-1
-      baseline:
-        in_memory: false
-      verify_samples_per_payload: 0
+      sparse:
+        delta_compression:
+          encoding: xor  # overwrite is selected automatically for opaque loaders
+        storage:
+          s3_bucket: my-refit-bucket  # required only for vllm_s3_sparse
+          s3_region: us-east-1
+        baseline:
+          in_memory: false
+        verify_samples_per_payload: 0
     colocated:
       enabled: false
     vllm_cfg:
@@ -483,9 +485,10 @@ policy:
       zmq_refit_server_port: null
 ```
 
-`refit_cfg` is optional; its Pydantic models resolve and log all defaults. S3
-fails during setup unless `refit_cfg.storage.s3_bucket` is nonempty. Its region
-and key prefix default to `us-east-1` and `nemo-rl-refit`. ZeroMQ requires
+`refit_cfg.sparse` is optional; its Pydantic model resolves and logs all
+defaults. S3 fails during setup unless
+`refit_cfg.sparse.storage.s3_bucket` is nonempty. Its region and key prefix
+default to `us-east-1` and `nemo-rl-refit`. ZeroMQ requires
 routable TCP access to the relay port. The HTTP and ZeroMQ servers are
 plaintext, so use a trusted or encrypted network. When
 `http_refit_api_key_env_var` is set, the named variable must contain the same
@@ -494,11 +497,11 @@ interfaces without a key emits a warning.
 
 | Control | Default |
 |---|---:|
-| `refit_cfg.delta_compression.encoding` | `xor` |
-| `refit_cfg.storage.s3_bucket` | none; required for S3 |
-| `refit_cfg.storage.s3_region` | `us-east-1` |
-| `refit_cfg.baseline.in_memory` | `false` |
-| `refit_cfg.verify_samples_per_payload` | `0` |
+| `refit_cfg.sparse.delta_compression.encoding` | `xor` |
+| `refit_cfg.sparse.storage.s3_bucket` | none; required for S3 |
+| `refit_cfg.sparse.storage.s3_region` | `us-east-1` |
+| `refit_cfg.sparse.baseline.in_memory` | `false` |
+| `refit_cfg.sparse.verify_samples_per_payload` | `0` |
 
 Export chunks are capped by `sparse_bucket_size_bytes` and the packed tensor
 limit. The S3 defaults were selected by balanced 120B sweeps. Increase one
@@ -518,7 +521,7 @@ logged config:
 ```bash
 uv run python examples/run_grpo.py \
   --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated.yaml \
-  policy.generation.refit_cfg.verify_samples_per_payload=32
+  policy.generation.refit_cfg.sparse.verify_samples_per_payload=32
 ```
 
 ## Metrics and profiling

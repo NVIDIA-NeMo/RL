@@ -27,6 +27,8 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,12 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
+    """Command each Ray actor launches under, one entry per uv extra combination.
+
+    Every uv command below is rewritten to SYSTEM when NEMO_RL_PY_EXECUTABLES_SYSTEM
+    is set to 1, so callers never apply that check themselves.
+    """
+
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
@@ -73,8 +81,41 @@ class PY_EXECUTABLES:
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
+    # Default env for the vLLM generation workers (see
+    # ray_actor_environment_registry.py). It carries nemo_gym so the worker can
+    # host Gym's token capture (token_capture.enabled) without swapping the
+    # worker's env at runtime: worker venvs are cached by actor class name, so
+    # a venv prebuilt with plain `--extra vllm` would be reused as-is and the
+    # nemo_gym import would fail.
+    VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
+
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and TRT-LLM.
+    TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and ModelOpt.
+    MODELOPT_VLLM = (
+        f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+    )
+    MODELOPT_AUTOMODEL = (
+        f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+    )
+    MODELOPT_MCORE = (
+        f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+    )
+
+    @classmethod
+    def _resolve_system_overrides(cls) -> None:
+        """Rewrite every uv command constant to the system executable when the flag is set."""
+        if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") != "1":
+            return
+        for name in [n for n in vars(cls) if n.isupper()]:
+            setattr(cls, name, cls.SYSTEM)
+
+
+PY_EXECUTABLES._resolve_system_overrides()
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
@@ -82,17 +123,33 @@ class PY_EXECUTABLES:
 # service port is pinned below 9000 to avoid TOCTOU collisions.  See ray.sub for
 # the full layout including Ray's own GCS / worker gRPC ports.
 #
+# Python port-range bounds below are half-open: [low, high).
+#
+#   [1202, 1300) SingleController gen. router    (driver-local allocation)
+#   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
-#   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init
-#                                                 (policy.generation.port_range_low/high)
+#   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
+#     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
+#     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
+#   6000         NeMo-Skills sandbox Nginx       (NEMO_SKILLS_SANDBOX_PORT; ray.sub starts one
+#                                                 sidecar per allocated node, driver included)
+#   6001-6999    NeMo-Skills sandbox uWSGI       (SANDBOX_BASE_PORT)
 #   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
 #   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
 #                                                 carved out of the vLLM band — only one rollout
 #                                                 backend runs at a time)
 #   8800-8999    SGLang Prometheus metrics       (DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_*, hard-coded)
+DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW = 1202
+DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH = 1300
 DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
+DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW = 1313
+DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH = 1400
+DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW = 3000
+DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH = 4000
+DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW = 4000
+DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH = 4100
 DEFAULT_GYM_PORT_RANGE_LOW = 5000
 DEFAULT_GYM_PORT_RANGE_HIGH = 5999
 # vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports starting
@@ -166,33 +223,64 @@ def _bind_socket_in_range(
     sock: socket.socket,
     port_range_low: int,
     port_range_high: int,
-    max_retries: int = 50,
+    max_retries: int | None = 50,
+    excluded_ports: set[int] | None = None,
 ) -> int:
     """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
-    Raises ``RuntimeError`` after *max_retries* failed attempts.
+    When *max_retries* is ``None``, try every non-excluded port once. Otherwise,
+    preserve the existing bounded random-retry behavior.
     """
     import random
 
-    for _ in range(max_retries):
-        port = random.randint(port_range_low, port_range_high - 1)
-        try:
-            sock.bind(("", port))
-            return port
-        except OSError:
-            continue
+    excluded = excluded_ports or set()
+    if max_retries is None:
+        candidates = [
+            port
+            for port in range(port_range_low, port_range_high)
+            if port not in excluded
+        ]
+        random.shuffle(candidates)
+        for port in candidates:
+            try:
+                sock.bind(("", port))
+                return port
+            except OSError:
+                continue
+        retry_description = f"all {len(candidates)} available ports"
+    else:
+        for _ in range(max_retries):
+            port = random.randint(port_range_low, port_range_high - 1)
+            if port in excluded:
+                continue
+            try:
+                sock.bind(("", port))
+                return port
+            except OSError:
+                continue
+        retry_description = f"{max_retries} attempts"
+
     raise RuntimeError(
         f"Could not find a free port in range [{port_range_low}, {port_range_high}) "
-        f"after {max_retries} attempts."
+        f"after {retry_description}."
     )
 
 
 def _get_free_port_local(
     port_range_low: int = DEFAULT_MASTER_PORT_RANGE_LOW,
     port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
+    *,
+    max_retries: int | None = 50,
+    excluded_ports: set[int] | None = None,
 ) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        port = _bind_socket_in_range(s, port_range_low, port_range_high)
+        port = _bind_socket_in_range(
+            s,
+            port_range_low,
+            port_range_high,
+            max_retries=max_retries,
+            excluded_ports=excluded_ports,
+        )
         s.listen(1)
 
     return port
@@ -239,12 +327,38 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     If that cluster uses the same CUDA_VISIBLE_DEVICES or Slurm managed tag we will reuse it.
     Otherwise, we will detach and start a fresh local cluster.
 
+    Any process env var that must reach every worker (e.g. a backend engine
+    knob such as data_plane's) has to be set before this call, in the caller
+    — this function snapshots ``dict(os.environ)`` below into
+    ``runtime_env["env_vars"]``, which is the only point such a setting
+    becomes cluster-wide. See
+    :func:`~nemo_rl.data_plane.factory.maybe_configure_data_plane_env`, which
+    a data-plane-enabled launcher calls immediately before this one.
+
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
     """
-    # Set up runtime environment
-    env_vars = dict(os.environ)
+    # Strip MPI/PMIx/SLURM launcher vars from the driver env before they get
+    # captured into runtime_env (both by `dict(os.environ)` below and by
+    # RayWorkerGroup, which re-reads os.environ). Otherwise they are forwarded
+    # into every actor, where they cause two failures in the TRT-LLM generation
+    # worker: (1) PMIX_/SLURM_STEP_ID make OMPI's MPI_Init abort with "OMPI was
+    # not built with SLURM's PMI support"; (2) any residual OMPI_/MPI_/SLURM_
+    # var makes TRT-LLM think it runs under an MPI launcher and pick the MPI
+    # orchestrator (MPI_Comm_Spawn -> MPI_ERR_SPAWN) instead of the Ray
+    # orchestrator. init_ray() runs before any worker group is built, so
+    # popping here cleans the env for all downstream captures.
+    for _k in list(os.environ):
+        if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
+            os.environ.pop(_k, None)
+
+    # Ray actors deserialize constructor arguments before importing NeMo-RL.
+    # Put Hugging Face's generated ``transformers_modules`` package on the
+    # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
+    # that boundary. This covers both V1 worker groups and direct V2/SC actors.
+    env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
     }

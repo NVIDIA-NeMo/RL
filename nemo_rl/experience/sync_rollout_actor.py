@@ -43,6 +43,10 @@ import numpy as np
 import ray
 import torch
 
+from nemo_rl.data.multimodal_utils import (
+    encode_multimodal_for_wire,
+    multimodal_row_tags,
+)
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
@@ -52,10 +56,11 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 # Carry keys producible by the rollout actor only when the caller opts in.
@@ -79,8 +84,12 @@ def _flatten_rollout_message_log_for_tq(
         extract_initial_prompt_messages,
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+    from nemo_rl.experience.rollouts import backfill_missing_routed_experts
 
     pad = {"pad_value_dict": {"token_ids": pad_token_id}}
+    # Must precede the prompt extraction: it reuses the same message dicts, so
+    # backfilling here also covers the prompt flatten below.
+    backfill_missing_routed_experts(message_logs)
     prompt_message_logs = extract_initial_prompt_messages(
         message_logs,
         prompt_lengths,
@@ -205,16 +214,16 @@ class SyncRolloutActor:
             uses for compute (rewards, masks, lengths, prompt_ids_for_adv,
             …) — stays on the driver, never crosses an actor boundary.
         """
-        # Lazy imports — avoid pulling grpo into this module at load.
-        from nemo_rl.algorithms.grpo import (
-            _should_use_async_rollouts,
-            _should_use_nemo_gym,
-        )
+        # Lazy imports keep rollout-specific dependencies off the actor startup path.
+        # ``_policy_dtype`` sizes the VLM pixel tensors below.
+        from nemo_rl.algorithms.grpo import _policy_dtype
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
             MESSAGE_LOG_BULK_FIELDS,
             decompose_message_log,
         )
+        from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+        from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 
         # Per-step generation-side metric hooks: snapshot once on the
         # first DS iter so backends with per-step deltas have a stable
@@ -240,12 +249,16 @@ class SyncRolloutActor:
         )
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
-        if _should_use_nemo_gym(cfg):
-            r = run_async_nemo_gym_rollout(
+        if should_use_nemo_gym(cfg):
+            r = run_nemo_gym_rollout_sync(
                 **common,
                 max_seq_len=None,
                 max_rollout_turns=None,
                 generation_config=cfg.policy["generation"],
+                log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                    wandb_enabled=cfg.logger["wandb_enabled"],
+                    wandb_config=cfg.logger["wandb"],
+                ),
                 effort_config=EffortLevelsConfig.model_validate(
                     cfg.env["nemo_gym"].get("effort_levels")
                 )
@@ -254,18 +267,21 @@ class SyncRolloutActor:
                 else None,
                 reward_penalty_config=cfg.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+                debug_payload_metrics=cfg.grpo.debug_payload_metrics,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:
             runner = (
                 run_async_multi_turn_rollout
-                if _should_use_async_rollouts(cfg)
+                if should_use_async_rollouts(cfg.policy["generation"])
                 else run_multi_turn_rollout
             )
             final_batch, rollout_metrics = runner(
                 **common,
                 max_seq_len=cfg.policy["max_total_sequence_length"],
-                max_rollout_turns=cfg.grpo["max_rollout_turns"],
+                max_rollout_turns=cfg.grpo.max_rollout_turns,
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
             )
         fb = final_batch.to("cpu")
         del final_batch
@@ -305,9 +321,19 @@ class SyncRolloutActor:
         )
         if ROUTED_EXPERTS_FIELD in flat:
             bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
-        for k, v in flat.get_multimodal_dict(as_tensors=False).items():
-            if isinstance(v, torch.Tensor):
-                bulk_batch[k] = v
+        # ``pixel_dtype`` mirrors the legacy analogs (``grpo._build_async_grpo_train_data``
+        # and the sync train-data builders): cast pixels to the policy precision
+        # once here, at the same point they'd be cast in-memory. No worker
+        # re-applies it, so without this the largest column crosses the wire in
+        # fp32 where legacy shipped bf16. ``PackedTensor.to_dtype`` leaves
+        # integer segments (grid_thw / imgs_sizes / num_frames) untouched.
+        multimodal = flat.get_multimodal_dict(
+            as_tensors=False, pixel_dtype=_policy_dtype(cfg.policy)
+        )
+        for k, v in multimodal.items():
+            wire_value = encode_multimodal_for_wire(k, v)
+            if wire_value is not None:
+                bulk_batch[k] = wire_value
         # ``content`` (raw assistant text per sample) — rides TQ as a
         # NonTensorStack so the driver can fetch it back at jsonl time
         # (kv_first_write wraps it via NonTensorStack).
@@ -394,6 +420,10 @@ class SyncRolloutActor:
             dp_client=self._dp_client,
             partition_id=partition_id,
             extra_info={"rollout_metrics": rollout_metrics},
+            # Per-row shapes the flattening removes from the payload. ``tags``
+            # is the transport's per-sample channel and is projected with the
+            # rows, so no consumer re-keys them.
+            tags=multimodal_row_tags(multimodal, len(sample_ids)),
             task_name=partition_id,
             pad_to_multiple=int(
                 cfg.policy.get("make_sequence_length_divisible_by") or 1

@@ -27,6 +27,7 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleConfig,
@@ -232,9 +233,11 @@ def main():
         )
 
     with rl_init_timer.time("ray_connect"):
+        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+        maybe_configure_data_plane_env(config.data_plane)
         init_ray()
 
-    set_seed(config.grpo["seed"])
+    set_seed(config.grpo.seed)
 
     with rl_init_timer.time("tokenizer"):
         tokenizer = get_tokenizer(config.policy["tokenizer"])
@@ -244,16 +247,16 @@ def main():
 
     with rl_init_timer.time("data"):
         ds_length = (
-            config.grpo["num_prompts_per_step"]
-            * config.grpo["num_generations_per_prompt"]
-            * config.grpo["max_num_steps"]
+            config.grpo.num_prompts_per_step
+            * config.grpo.num_generations_per_prompt
+            * config.grpo.max_num_steps
         )
         dataset, val_dataset, task_to_env, val_task_to_env = setup_puzzle_data(
             tokenizer=tokenizer,
             env_cfg=config.env,
             task_name="sliding_puzzle_game",
             length=ds_length,
-            val_length=config.grpo["max_val_samples"],
+            val_length=config.grpo.max_val_samples,
             add_system_prompt=config.data["add_system_prompt"],
         )
 

@@ -15,8 +15,32 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from omegaconf import OmegaConf
 
-from nemo_rl.utils.config import load_config
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+ULTRA_CONFIG_PATHS = [
+    "examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/student_rlvr2.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/ifbench_teacher.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/reasoning_teacher.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/rlhf_teacher.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/swe_teacher.yaml",
+    "examples/nemo_gym/nemotron-3-ultra/mopd.yaml",
+]
+NEMO_GYM_CONFIG_PATHS = ULTRA_CONFIG_PATHS + [
+    "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml",
+]
+# Select by content: every example that pins a service port range must stay
+# inside the layout in virtual_cluster.py. Configs without a port key inherit
+# the defaults and cannot violate the invariant themselves.
+PORT_ISOLATION_CONFIG_PATHS = sorted(
+    str(path.relative_to(REPO_ROOT))
+    for path in (REPO_ROOT / "examples").rglob("*.yaml")
+    if "port_range" in path.read_text()
+)
+assert PORT_ISOLATION_CONFIG_PATHS, "port-isolation config selection matched nothing"
 
 
 @pytest.fixture
@@ -175,6 +199,20 @@ def test_nested_inheritance(temp_config_dir):
     assert config.child_only.value == 300  # Child-only value exists
 
 
+def test_inheritance_preserves_missing_mandatory_value(temp_config_dir):
+    """Test that a mandatory parent value can be supplied after inheritance."""
+    create_test_config(temp_config_dir, "parent.yaml", "required: ???")
+    child_path = create_test_config(
+        temp_config_dir,
+        "child.yaml",
+        "defaults: parent.yaml",
+    )
+
+    config = load_config(child_path)
+
+    assert OmegaConf.is_missing(config, "required")
+
+
 def test_interpolation(temp_config_dir):
     """Test that interpolation works with inherited configs."""
     # Create parent config
@@ -198,10 +236,137 @@ def test_interpolation(temp_config_dir):
     assert config.derived.value == 43  # Interpolation uses child's base_value
 
 
+def test_add_resolver():
+    """Test the arithmetic resolver used by Ultra configs."""
+    register_omegaconf_resolvers()
+    config = OmegaConf.create({"value": "${add:2,3}"})
+
+    assert config.value == 5
+
+
+@pytest.mark.parametrize("config_path", NEMO_GYM_CONFIG_PATHS)
+def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
+    """Ensure production NeMo Gym configs satisfy the current GRPO contract."""
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.utils.checkpoint import CheckpointManager
+
+    register_omegaconf_resolvers()
+    config = load_config(REPO_ROOT / config_path)
+
+    # These values are intentionally supplied by recipe launchers at runtime.
+    config.policy.model_name = "test-model"
+    for split in ("train", "validation"):
+        datasets = config.data.get(split)
+        if datasets is None:
+            continue
+        if not OmegaConf.is_list(datasets):
+            datasets = [datasets]
+        for dataset in datasets:
+            if "data_path" in dataset:
+                dataset.data_path = "/tmp/test-data.jsonl"
+
+    if OmegaConf.is_missing(config, "sif_dir"):
+        config["sif_dir"] = "/tmp/test-sifs"
+    if "_teachers" in config and OmegaConf.is_missing(config["_teachers"], "general"):
+        config["_teachers"]["general"] = "/tmp/test-teacher"
+
+    resolved = OmegaConf.to_container(config, resolve=True)
+
+    if config_path == "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml":
+        assert resolved["grpo"]["val_num_generations_per_prompt"] == 2
+        assert resolved["checkpointing"]["metric_name"] is None
+
+    # The real contract checks: the config validates against GRPO's MasterConfig
+    # schema and the checkpointing block is accepted by CheckpointManager.
+    master_config = MasterConfig.model_validate(resolved)
+    CheckpointManager(master_config.checkpointing)
+
+
+@pytest.mark.parametrize("config_path", PORT_ISOLATION_CONFIG_PATHS)
+def test_example_service_port_ranges_are_isolated(config_path):
+    """Resolved example configs must not bypass the below-9000 port layout."""
+    from nemo_rl.distributed.virtual_cluster import (
+        DEFAULT_GENERATION_PORT_RANGE_HIGH,
+        DEFAULT_GENERATION_PORT_RANGE_LOW,
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+        DEFAULT_GYM_PORT_RANGE_HIGH,
+        DEFAULT_GYM_PORT_RANGE_LOW,
+        DEFAULT_MASTER_PORT_RANGE_HIGH,
+        DEFAULT_MASTER_PORT_RANGE_LOW,
+    )
+
+    config = load_config(REPO_ROOT / config_path)
+
+    def select_int(path: str, default: int) -> int:
+        value = OmegaConf.select(config, path, default=default)
+        assert isinstance(value, int)
+        return value
+
+    def effective_range(
+        prefix: str, default_low: int, default_high: int
+    ) -> tuple[int, int]:
+        return (
+            select_int(f"{prefix}.port_range_low", default_low),
+            select_int(f"{prefix}.port_range_high", default_high),
+        )
+
+    router_range = effective_range(
+        "async_rl.generation_router",
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    )
+    generation_range = effective_range(
+        "policy.generation",
+        DEFAULT_GENERATION_PORT_RANGE_LOW,
+        DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    )
+    gym_range = effective_range(
+        "env.nemo_gym",
+        DEFAULT_GYM_PORT_RANGE_LOW,
+        DEFAULT_GYM_PORT_RANGE_HIGH,
+    )
+
+    # cluster uses master_port_range_low/high rather than a nested master block.
+    master_range = (
+        select_int(
+            "cluster.master_port_range_low",
+            DEFAULT_MASTER_PORT_RANGE_LOW,
+        ),
+        select_int(
+            "cluster.master_port_range_high",
+            DEFAULT_MASTER_PORT_RANGE_HIGH,
+        ),
+    )
+
+    assert (
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        <= router_range[0]
+        < router_range[1]
+        <= DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+    )
+    assert DEFAULT_MASTER_PORT_RANGE_LOW <= master_range[0] < master_range[1]
+    assert master_range[1] <= DEFAULT_MASTER_PORT_RANGE_HIGH
+    assert (
+        DEFAULT_GENERATION_PORT_RANGE_LOW
+        <= generation_range[0]
+        < generation_range[1]
+        <= DEFAULT_GENERATION_PORT_RANGE_HIGH
+    )
+    assert (
+        DEFAULT_GYM_PORT_RANGE_LOW
+        <= gym_range[0]
+        < gym_range[1]
+        <= DEFAULT_GYM_PORT_RANGE_HIGH
+    )
+    assert router_range[1] <= master_range[0]
+    assert master_range[1] <= generation_range[0]
+    assert generation_range[1] <= gym_range[0]
+    assert gym_range[1] < 9000
+
+
 def test_parse_hydra_overrides():
     """Test parsing and applying Hydra overrides."""
-    from omegaconf import OmegaConf
-
     from nemo_rl.utils.config import OverridesError, parse_hydra_overrides
 
     # Create initial config

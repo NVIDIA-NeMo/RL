@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import torch
 import torch.distributed as dist
@@ -989,6 +990,32 @@ def get_attached_draft_model(model: list[MegatronModule]) -> MegatronModule | No
     return None
 
 
+@contextmanager
+def draft_model_detached(model: list[MegatronModule]) -> Iterator[None]:
+    """Temporarily detach the nested draft model from its owner chunk.
+
+    Megatron-Bridge conversion only covers the base model's HF architecture;
+    draft weights are refit through `export_eagle_weights_to_hf` instead.
+    """
+    owner_chunk: MegatronModule | None = None
+    draft_model: MegatronModule | None = None
+    for model_chunk in reversed(model):
+        unwrapped_chunk = unwrap_model(model_chunk)
+        chunk_draft = getattr(unwrapped_chunk, "draft_model", None)
+        if chunk_draft is not None:
+            owner_chunk = unwrapped_chunk
+            draft_model = chunk_draft
+            break
+    if owner_chunk is None:
+        yield
+        return
+    delattr(owner_chunk, "draft_model")
+    try:
+        yield
+    finally:
+        owner_chunk.draft_model = draft_model
+
+
 def _export_layer_weights_to_hf(
     *,
     source_state: Mapping[str, Tensor],
@@ -1203,6 +1230,28 @@ def copy_policy_lm_head_to_draft(
         )
 
 
+DRAFT_GRAD_NORM_GROUP = "draft"
+
+
+def register_draft_grad_norm_group() -> None:
+    """Register the 'draft' grad-norm group with Megatron's optimizer.
+
+    Megatron clips parameters in a registered group separately from the main
+    gradient norm (see MegatronOptimizer.clip_grad_norm and the 'mtp'
+    precedent in multi_token_prediction.py), so the draft head's large
+    early-training gradients do not shrink the policy update through the
+    shared global clip. Only called when a draft model is built, so baseline
+    (no-draft) runs keep Megatron's stock clipping behavior.
+    """
+    from megatron.core.optimizer import optimizer as mcore_optimizer
+
+    if DRAFT_GRAD_NORM_GROUP not in mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS:
+        mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS = (
+            *mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS,
+            DRAFT_GRAD_NORM_GROUP,
+        )
+
+
 def build_draft_model(
     model_provider,
     draft_config: dict[str, Any],
@@ -1346,5 +1395,12 @@ def build_draft_model(
             policy_model_chunk=policy_model_chunk,
         )
         print("[draft] Initialized draft LM head from the policy output layer.")
+
+    # Tag draft params before optimizer construction so
+    # copy_optimizer_param_metadata propagates the group to the distributed
+    # optimizer's shard/fp32 main params and they are clipped separately.
+    register_draft_grad_norm_group()
+    for param in draft_model.parameters():
+        param.grad_norm_group = DRAFT_GRAD_NORM_GROUP
 
     return draft_model

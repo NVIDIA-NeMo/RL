@@ -44,6 +44,29 @@ EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 SIF_DIR="${SIF_DIR:-}"
 CONTAINER_FORMATTER="${CONTAINER_FORMATTER:-}"
 
+# ---- MTP speculative decoding (optional) ----
+# Set ENABLE_MTP_INFERENCE=1 to turn on MTP (multi-token prediction) speculative
+# decoding for vLLM inference. The MTP weights are part of the model and arrive
+# via refit, so no separate draft checkpoint is needed.
+# Tune via NUM_SPECULATIVE_TOKENS / MAX_NUM_BATCHED_TOKENS if needed.
+#   ENABLE_MTP_INFERENCE=1 ./super_launch.sh
+#   ENABLE_MTP_INFERENCE=1 NUM_SPECULATIVE_TOKENS=3 ./super_launch.sh
+ENABLE_MTP_INFERENCE="${ENABLE_MTP_INFERENCE:-0}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8480}"
+MTP_EXTRA_ARGS=""
+if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
+    MTP_EXTRA_ARGS="\
+++policy.generation.vllm_cfg.enable_prefix_caching=false \
+++policy.generation.vllm_kwargs.enable_chunked_prefill=true \
+++policy.generation.vllm_kwargs.max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} \
+++policy.generation.vllm_kwargs.mamba_cache_mode=align \
+~policy.generation.vllm_kwargs.compilation_config.cudagraph_capture_sizes \
+++policy.generation.vllm_kwargs.speculative_config.num_speculative_tokens=${NUM_SPECULATIVE_TOKENS} \
+++policy.generation.vllm_kwargs.speculative_config.method=mtp"
+    echo "MTP speculative decoding ENABLED (num_speculative_tokens=${NUM_SPECULATIVE_TOKENS})"
+fi
+
 # ---- Derived paths ----
 CODE_DIR=$(realpath "$PWD")
 WANDB_NAME="${EXP_NAME}"
@@ -116,7 +139,7 @@ export SANDBOX_ENV_VARS="NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT}"
 
 # ---- Build the run command ----
 export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
-    python -c \"from transformers import AutoConfig, AutoTokenizer; p='${MODEL_PATH}'; AutoConfig.from_pretrained(p, trust_remote_code=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('Prewarmed HF dynamic modules cache')\" ; \
+    python -c \"import nemo_rl; from transformers import AutoConfig, AutoTokenizer; p='${MODEL_PATH}'; AutoConfig.from_pretrained(p, trust_remote_code=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('Prewarmed HF dynamic modules cache')\" ; \
     date ; \
     NRL_WG_USE_RAY_REF=1 \
     NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR} \
@@ -154,6 +177,15 @@ fi
 
 if [[ -n "$CONTAINER_FORMATTER" ]]; then
     COMMAND="$COMMAND env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter=${CONTAINER_FORMATTER}"
+fi
+
+if [[ -n "$MTP_EXTRA_ARGS" ]]; then
+    COMMAND="$COMMAND ${MTP_EXTRA_ARGS}"
+fi
+
+# Arbitrary extra Hydra overrides (space-separated), appended last so they win.
+if [[ -n "${EXTRA_HYDRA_ARGS:-}" ]]; then
+    COMMAND="$COMMAND ${EXTRA_HYDRA_ARGS}"
 fi
 
 export CONTAINER

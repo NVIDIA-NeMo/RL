@@ -20,14 +20,107 @@ import torch
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationDatumSpec,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
-R3_MISSING_ROUTE_SENTINEL = -1
+R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
+VLLM_LOGPROB_FLOOR = -9999.0
 
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+GROUPED_MOE_MXFP8_REFIT_ERROR = (
+    "MXFP8 refit does not support grouped MoE expert weights."
+)
+_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+)
+
+
+def assert_reload_refit_config_supported(config: VllmConfig) -> None:
+    """Reject pure-config combinations unsupported by vLLM reload refit."""
+    if not config["vllm_cfg"].get("refit_with_reload_api"):
+        return
+
+    assert not config["colocated"]["enabled"], (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+        "supported yet with colocated vLLM refit. Support for the "
+        "colocated IPC/ZMQ reload-refit path will be added later. Set "
+        "refit_with_reload_api=false for now."
+    )
+    refit_transport = config.get("refit_transport")
+    if refit_transport == "nccl_reshard":
+        raise AssertionError(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+            "explicitly unsupported with "
+            "policy.generation.refit_transport='nccl_reshard'. "
+            "nccl_reshard_refit is its own refit path and does not use "
+            "vLLM's reload_weights API."
+        )
+    if refit_transport == "nixl" or (
+        isinstance(refit_transport, str) and ":" in refit_transport
+    ):
+        raise AssertionError(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+            "supported yet with checkpoint-engine refit "
+            "(update_weights_from_checkpoint_engine). Support for using "
+            "vLLM's reload_weights API with checkpoint-engine transports is "
+            "future work. Set refit_transport=null or set "
+            "refit_with_reload_api=false for now."
+        )
+    assert refit_transport is None, (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is only "
+        "supported with the default non-colocated collective refit path. "
+        f"Got policy.generation.refit_transport={refit_transport!r}. Set "
+        "refit_transport=null or set refit_with_reload_api=false."
+    )
+    assert config.get("quant_cfg") is None, (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+        "explicitly unsupported with policy.generation.quant_cfg set. "
+        "ModelOpt quantized refit requires the ModelOpt weight-loading path. "
+        "Set quant_cfg=null or set refit_with_reload_api=false."
+    )
+    assert not config.get("_draft_weights_from_refit"), (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+        "supported yet when policy.draft.enabled=true. Support for Eagle "
+        "draft-weight refit with vLLM's reload_weights API will be added "
+        "later. Set policy.draft.enabled=false or set "
+        "refit_with_reload_api=false for now."
+    )
+    vllm_kwargs = config.get("vllm_kwargs") or {}
+    spec_cfg = vllm_kwargs.get("speculative_config")
+    spec_method = None
+    if isinstance(spec_cfg, dict) and spec_cfg.get("num_speculative_tokens") != 0:
+        spec_method = spec_cfg.get("method")
+    if spec_method in ("deepseek_mtp", "mtp") and config.get("_mtp_weights_from_refit"):
+        raise AssertionError(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+            "supported yet when vLLM refit also updates MTP draft weights. "
+            "Support for MTP speculative decoding with reload refit will be "
+            "added later. Set refit_with_reload_api=false for now."
+        )
+
+
+def is_grouped_moe_expert_weight_name(name: str) -> bool:
+    """Return whether a checkpoint key is a grouped MoE expert slab."""
+    return name.endswith(_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES)
+
+
+def assert_refit_unsupported_grouped_moe_params(
+    config: VllmConfig, state_dict_info: dict[str, Any]
+) -> None:
+    """Reject grouped MoE MXFP8 state-dict params before refit starts."""
+    vllm_cfg = config["vllm_cfg"]
+    if (
+        vllm_cfg.get("precision") == "fp8"
+        and vllm_cfg.get("is_mx")
+        and any(is_grouped_moe_expert_weight_name(name) for name in state_dict_info)
+    ):
+        raise AssertionError(GROUPED_MOE_MXFP8_REFIT_ERROR)
 
 
 def _as_routed_experts_tensor(
@@ -89,39 +182,38 @@ def format_prompt_for_vllm_generation(
         token_ids = valid_ids.tolist()
         return {"prompt_token_ids": token_ids}
 
-    # Check if this is VLM generation by looking for message_log with images
-    # Support for videos/audio/etc. can be added here
-    # if 'message_log' in data and any('images' in msg for msg in data['message_log']):
+    def _get_multi_modal_data(index: int) -> dict[str, Any]:
+        multi_modal_data = {}
+        images = data.get("vllm_images", None)
+        if images is not None and len(images[index]) > 0:
+            multi_modal_data["image"] = (
+                images[index][0] if len(images[index]) == 1 else images[index]
+            )
+        audios = data.get("vllm_audios", None)
+        if audios is not None and len(audios[index]) > 0:
+            multi_modal_data["audio"] = (
+                audios[index][0] if len(audios[index]) == 1 else audios[index]
+            )
+        videos = data.get("vllm_videos", None)
+        if videos is not None and len(videos[index]) > 0:
+            multi_modal_data["video"] = (
+                videos[index][0] if len(videos[index]) == 1 else videos[index]
+            )
+        return multi_modal_data
+
+    # Native image, audio, and video side channels share this formatter path.
     if "vllm_content" in data:
         # VLM generation using content and multi_modal_data
         for i in range(start_idx, end_idx):
             msg = data["vllm_content"][i]
-            # if msg is None, this conversation had no multimodal content, fallback to regular prompt
-            if msg is None:
-                prompts.append(_get_regular_prompt(i))
-                continue
-            # init prompt dict
-            prompt_dict = {"prompt": msg}
-            # collect multi_modal_data from images, audios, and videos
-            multi_modal_data = {}
-            images = data.get("vllm_images", None)
-            if images is not None and len(images[i]) > 0:
-                multi_modal_data["image"] = (
-                    images[i][0] if len(images[i]) == 1 else images[i]
-                )
-            audios = data.get("vllm_audios", None)
-            if audios is not None and len(audios[i]) > 0:
-                multi_modal_data["audio"] = (
-                    audios[i][0] if len(audios[i]) == 1 else audios[i]
-                )
-            videos = data.get("vllm_videos", None)
-            if videos is not None and len(videos[i]) > 0:
-                multi_modal_data["video"] = (
-                    videos[i][0] if len(videos[i]) == 1 else videos[i]
-                )
+            multi_modal_data = _get_multi_modal_data(i)
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
+            # Raw processor content is valid only for the initial turn. Later
+            # turns use the updated pre-tokenized conversation plus the same
+            # native media, preventing vLLM from regenerating the stale prompt.
+            prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
     else:
@@ -292,9 +384,13 @@ def attach_routed_experts_to_chat_response_choices(
                 r3_stats["actual_routes"],
                 r3_stats["expected_routes"],
             )
-        choice.message.routed_experts = routed_experts.to(
-            dtype=routed_experts_dtype
-        ).tolist()
+        # Base64 envelope instead of .tolist(): nested JSON int lists cost
+        # ~1s of CPU per serialize/parse hop at long context lengths and get
+        # re-validated at every gym HTTP hop; a single string passes through
+        # the gym chain opaquely.
+        choice.message.routed_experts = encode_routed_experts(
+            routed_experts.to(dtype=routed_experts_dtype)
+        )
 
     if len(attached_choice_indices) != len(choices):
         missing_choice_indices = sorted(
@@ -312,17 +408,119 @@ def attach_routed_experts_to_chat_response_choices(
     return response
 
 
-def model_dump_chat_response_with_routed_experts(response: Any) -> dict[str, Any]:
-    """Dump a vLLM OpenAI chat response while preserving dynamic R3 fields."""
+def attach_token_information_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+) -> Any:
+    """Attach engine-native token information to OpenAI chat response choices."""
+    prompt_token_ids = getattr(final_request_output, "prompt_token_ids", None)
+    if prompt_token_ids is None:
+        raise RuntimeError(
+            "vLLM was asked to return token information for the "
+            "OpenAI-compatible chat endpoint but the final request output did "
+            "not include prompt_token_ids."
+        )
+
+    generation_outputs = list(getattr(final_request_output, "outputs", []))
+    generation_output_indices = [output.index for output in generation_outputs]
+    outputs_by_index = {output.index: output for output in generation_outputs}
+    if len(outputs_by_index) != len(generation_outputs):
+        raise RuntimeError(
+            "vLLM returned duplicate generation output indices while attaching "
+            "token information to the OpenAI-compatible chat response."
+        )
+
+    choices = list(getattr(response, "choices", []))
+    choice_indices = [choice.index for choice in choices]
+    if len(set(choice_indices)) != len(choice_indices):
+        raise RuntimeError(
+            "vLLM returned duplicate response choice indices while attaching "
+            "token information to the OpenAI-compatible chat response."
+        )
+
+    choice_index_set = set(choice_indices)
+    output_index_set = set(generation_output_indices)
+    missing_choice_indices = sorted(choice_index_set - output_index_set)
+    unexpected_output_indices = sorted(output_index_set - choice_index_set)
+    if missing_choice_indices or unexpected_output_indices:
+        raise RuntimeError(
+            "vLLM was asked to return token information for the "
+            "OpenAI-compatible chat endpoint but response choices could not be "
+            "matched to generation outputs: "
+            f"missing_choice_indices={missing_choice_indices}, "
+            f"unexpected_output_indices={unexpected_output_indices}."
+        )
+
+    for choice in choices:
+        generation_details = outputs_by_index[choice.index]
+        output_token_ids = getattr(generation_details, "token_ids", None)
+        if output_token_ids is None:
+            raise RuntimeError(
+                "vLLM was asked to return token information for the "
+                "OpenAI-compatible chat endpoint but generation output "
+                f"choice_idx={choice.index} did not include token_ids."
+            )
+        generation_token_ids = list(output_token_ids)
+
+        generation_logprob_details = getattr(generation_details, "logprobs", None)
+        if generation_logprob_details is None:
+            if generation_token_ids:
+                raise RuntimeError(
+                    "vLLM was asked to return token information for the "
+                    "OpenAI-compatible chat endpoint but generation output "
+                    f"choice_idx={choice.index} did not include logprobs."
+                )
+            generation_log_probs = []
+        else:
+            if len(generation_token_ids) != len(generation_logprob_details):
+                raise RuntimeError(
+                    "vLLM returned mismatched generation token IDs and log "
+                    "probabilities for the OpenAI-compatible chat endpoint: "
+                    f"choice_idx={choice.index}, "
+                    f"token_count={len(generation_token_ids)}, "
+                    f"logprob_count={len(generation_logprob_details)}."
+                )
+            generation_log_probs = []
+            for token_id, position_logprobs in zip(
+                generation_token_ids, generation_logprob_details
+            ):
+                selected_token_logprob = position_logprobs.get(token_id)
+                if selected_token_logprob is None:
+                    raise RuntimeError(
+                        "vLLM generation log probabilities did not include the "
+                        "selected token while attaching token information to "
+                        "the OpenAI-compatible chat response: "
+                        f"choice_idx={choice.index}, token_id={token_id}."
+                    )
+                generation_log_probs.append(
+                    max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
+                )
+
+        choice.message.prompt_token_ids = list(prompt_token_ids)
+        choice.message.generation_token_ids = generation_token_ids
+        choice.message.generation_log_probs = generation_log_probs
+
+    return response
+
+
+def model_dump_chat_response_with_dynamic_message_fields(
+    response: Any,
+) -> dict[str, Any]:
+    """Dump a vLLM OpenAI chat response while preserving dynamic message fields."""
     response_dict = response.model_dump()
     for choice, choice_dict in zip(
         getattr(response, "choices", []), response_dict.get("choices", [])
     ):
-        routed_experts = getattr(
-            getattr(choice, "message", None), "routed_experts", None
-        )
-        if routed_experts is not None:
-            choice_dict.setdefault("message", {})["routed_experts"] = routed_experts
+        message = getattr(choice, "message", None)
+        for field_name in (
+            "routed_experts",
+            "prompt_token_ids",
+            "generation_token_ids",
+            "generation_log_probs",
+        ):
+            field_value = getattr(message, field_name, None)
+            if field_value is not None:
+                choice_dict.setdefault("message", {})[field_name] = field_value
     return response_dict
 
 

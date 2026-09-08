@@ -107,6 +107,7 @@ policy:
     train_mb_tokens: 2048
     logprob_mb_tokens: 2048
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
   optimizer:
     name: "torch.optim.AdamW"
@@ -176,6 +177,7 @@ teachers:
       train_mb_tokens: 2048
       logprob_mb_tokens: 2048
       algorithm: "modified_first_fit_decreasing"
+      microbatch_order: "packer"
       sequence_length_round: 64
     optimizer:
       name: "torch.optim.AdamW"
@@ -227,6 +229,7 @@ teachers:
       train_mb_tokens: 2048
       logprob_mb_tokens: 2048
       algorithm: "modified_first_fit_decreasing"
+      microbatch_order: "packer"
       sequence_length_round: 64
     optimizer:
       name: "torch.optim.AdamW"

@@ -31,8 +31,73 @@ from nemo_rl.models.policy.utils import (
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
+    resolve_model_class,
     stream_weights_via_ipc_zmq_impl,
 )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "hf_class_name", "nemo_class_name"),
+    [
+        ("qwen2_5_vl", "hf_image_text", "nemo_image_text"),
+        ("qwen2_5_omni", "hf_text_waveform", "nemo_text_waveform"),
+        ("unknown_model", "hf_causal_lm", "nemo_causal_lm"),
+    ],
+)
+@pytest.mark.parametrize("nemo_available", [False, True])
+def test_resolve_model_class_selects_requested_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    model_type: str,
+    hf_class_name: str,
+    nemo_class_name: str,
+    nemo_available: bool,
+) -> None:
+    """The caller chooses plain Transformers or NeMo AutoModel classes."""
+    hf_classes = {
+        "hf_image_text": object(),
+        "hf_text_waveform": object(),
+        "hf_causal_lm": object(),
+    }
+    nemo_classes = {
+        "nemo_image_text": object(),
+        "nemo_text_waveform": object(),
+        "nemo_causal_lm": object(),
+    }
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.HF_AUTOMODEL_FACTORY",
+        {
+            "qwen2_5_vl": hf_classes["hf_image_text"],
+            "qwen2_5_omni": hf_classes["hf_text_waveform"],
+        },
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.AUTOMODEL_FACTORY",
+        {
+            "qwen2_5_vl": nemo_classes["nemo_image_text"],
+            "qwen2_5_omni": nemo_classes["nemo_text_waveform"],
+        },
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.AutoModelForCausalLM",
+        hf_classes["hf_causal_lm"],
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.NeMoAutoModelForCausalLM",
+        nemo_classes["nemo_causal_lm"],
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.NEMO_AUTOMODEL_AVAILABLE", nemo_available
+    )
+
+    assert (
+        resolve_model_class(model_type, use_nemo_automodel=False)
+        is hf_classes[hf_class_name]
+    )
+    expected_default = (
+        nemo_classes[nemo_class_name] if nemo_available else hf_classes[hf_class_name]
+    )
+    assert resolve_model_class(model_type) is expected_default
 
 
 class TestGetMegatronCheckpointDir:
@@ -266,6 +331,63 @@ def test_stream_weights_via_ipc_zmq_aligns_cpu_tensor_groups(monkeypatch):
         calculate_aligned_size(tensor.nbytes) for _, tensor in tensors
     )
     assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_via_ipc_zmq_preserves_cpu_and_gpu_source_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CPU and GPU sources must produce identical CUDA IPC staging payloads."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    source_tensors = [
+        ("packed.weight", torch.tensor([[0, 1], [254, 255]], dtype=torch.uint8)),
+        ("weight_scale", torch.tensor([1.0, -2.0], dtype=torch.float32)),
+        ("weight_scale_2", torch.tensor([0.5], dtype=torch.float32)),
+    ]
+
+    def capture_staging_payload(
+        tensors: list[tuple[str, torch.Tensor]],
+    ) -> tuple[list[str], int, list[torch.Tensor]]:
+        captured: dict[str, torch.Tensor] = {}
+
+        def fake_get_handle_from_tensor(buffer: torch.Tensor) -> tuple[str]:
+            captured["buffer"] = buffer.detach().cpu().clone()
+            return ("ipc-handle",)
+
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.get_handle_from_tensor",
+            fake_get_handle_from_tensor,
+        )
+        socket = _FakeIpcSocket()
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=iter(tensors),
+            buffer_size_bytes=4096,
+            zmq_socket=socket,
+            rank=0,
+            worker_name="test_worker",
+        )
+        _, names, used_bytes = socket.sent[0]
+        offset = 0
+        tensor_bytes = []
+        for _, tensor in source_tensors:
+            tensor_bytes.append(captured["buffer"][offset : offset + tensor.nbytes])
+            offset += calculate_aligned_size(tensor.nbytes)
+        assert offset == used_bytes
+        return names, used_bytes, tensor_bytes
+
+    cpu_payload = capture_staging_payload(source_tensors)
+    gpu_payload = capture_staging_payload(
+        [(name, tensor.cuda()) for name, tensor in source_tensors]
+    )
+
+    assert cpu_payload[0] == gpu_payload[0]
+    assert cpu_payload[1] == gpu_payload[1]
+    assert all(
+        torch.equal(cpu_bytes, gpu_bytes)
+        for cpu_bytes, gpu_bytes in zip(cpu_payload[2], gpu_payload[2], strict=True)
+    )
 
 
 def server_process(

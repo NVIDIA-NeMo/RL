@@ -1,4 +1,10 @@
+---
+orphan: true
+---
+
 # Nemotron 3 Nano
+
+> **Note:** This document has moved and will be deprecated here. See the new location: https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/models/nemotron/nemotron-3-nano.md
 
 This guide explains how to post-train the [Nemotron 3 Nano model](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Nano-Technical-Report.pdf) using NeMo RL.
 

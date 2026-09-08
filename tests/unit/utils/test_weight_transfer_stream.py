@@ -24,7 +24,7 @@ import requests
 import torch
 import zstandard
 
-from nemo_rl.models.generation.vllm.config import VllmRefitConfig
+from nemo_rl.models.generation.vllm.config import VllmSparseRefitConfig
 from nemo_rl.utils import (
     weight_transfer_http,
     weight_transfer_stream,
@@ -62,8 +62,8 @@ def _refit_config(
     s3_transfer_workers: int = 32,
     zmq_transfer_workers: int = 4,
     zmq_retries: int = 3,
-) -> VllmRefitConfig:
-    return VllmRefitConfig(
+) -> VllmSparseRefitConfig:
+    return VllmSparseRefitConfig(
         delta_compression={
             "encoding": encoding,
             "sparse_bucket_size_bytes": bucket_bytes,
@@ -567,7 +567,7 @@ def test_s3_manifest_transport_validates_configuration(monkeypatch) -> None:
         )
 
     tracker.refit_config = _refit_config()
-    with pytest.raises(RuntimeError, match="refit_cfg.storage.s3_bucket"):
+    with pytest.raises(RuntimeError, match="refit_cfg.sparse.storage.s3_bucket"):
         weight_transfer_stream.stream_sparse_delta_payloads_via_s3_manifest(
             refit_targets=["http://receiver"], **kwargs
         )

@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
-
 from nemo_rl.environments.nemo_gym import NemoGym
 
 
@@ -27,6 +25,10 @@ def _routes(num_tokens: int) -> list[list[list[int]]]:
 
 
 def test_nemo_gym_postprocess_slices_routed_experts():
+    first_turn_routes = _routes(3)
+    first_turn_routes[-1] = [[0, 1]]
+    second_turn_routes = _routes(7)
+    second_turn_routes[2] = [[30, 31]]
     nemo_gym_result = {
         "response": {
             "output": [
@@ -34,13 +36,13 @@ def test_nemo_gym_postprocess_slices_routed_experts():
                     "prompt_token_ids": [1, 2],
                     "generation_token_ids": [3],
                     "generation_log_probs": [-0.1],
-                    "routed_experts": _routes(3),
+                    "routed_experts": first_turn_routes,
                 },
                 {
                     "prompt_token_ids": [1, 2, 3, 4, 5],
                     "generation_token_ids": [6, 7],
                     "generation_log_probs": [-0.2, -0.3],
-                    "routed_experts": _routes(7),
+                    "routed_experts": second_turn_routes,
                 },
             ]
         },
@@ -52,22 +54,29 @@ def test_nemo_gym_postprocess_slices_routed_experts():
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, _Tokenizer()
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
         )
     )
 
     message_log = result["message_log"]
     assert message_log[0]["token_ids"].tolist() == [1, 2]
-    assert message_log[0]["routed_experts"].tolist() == _routes(2)
+    assert message_log[0]["routed_experts"].tolist() == first_turn_routes[:2]
     assert message_log[1]["token_ids"].tolist() == [3]
-    assert message_log[1]["routed_experts"].tolist() == _routes(3)[2:3]
+    assert message_log[1]["routed_experts"].tolist() == second_turn_routes[2:3]
     assert message_log[2]["token_ids"].tolist() == [4, 5]
-    assert message_log[2]["routed_experts"].tolist() == _routes(7)[3:5]
+    assert message_log[2]["routed_experts"].tolist() == second_turn_routes[3:5]
     assert message_log[3]["token_ids"].tolist() == [6, 7]
-    assert message_log[3]["routed_experts"].tolist() == _routes(7)[5:7]
+    assert message_log[3]["routed_experts"].tolist() == second_turn_routes[5:7]
 
 
-def test_nemo_gym_postprocess_requires_routed_experts_when_configured():
+def test_nemo_gym_postprocess_tolerates_missing_routed_experts_when_configured():
+    """A trainable item without routes is kept routeless, not rejected.
+
+    Routes can be legitimately unrecoverable on the echo path (e.g. a
+    context-overflow rollout); ``backfill_missing_routed_experts`` sentinel-fills
+    such messages at flatten time and a batch-wide absence still fails at the
+    rollout actor's ``ROUTED_EXPERTS_FIELD`` guard.
+    """
     nemo_gym_result = {
         "response": {
             "output": [
@@ -84,10 +93,16 @@ def test_nemo_gym_postprocess_requires_routed_experts_when_configured():
     class _MockSelf:
         cfg = {"require_routed_experts": True}
 
-    with pytest.raises(ValueError, match="requires NeMo Gym output items"):
+    result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, _Tokenizer()
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
         )
+    )
+
+    message_log = result["message_log"]
+    assert [message["role"] for message in message_log] == ["user", "assistant"]
+    assert message_log[1]["token_ids"].tolist() == [3]
+    assert all("routed_experts" not in message for message in message_log)
 
 
 def test_nemo_gym_postprocess_casts_routed_experts_to_configured_dtype():
@@ -112,7 +127,7 @@ def test_nemo_gym_postprocess_casts_routed_experts_to_configured_dtype():
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, _Tokenizer()
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
         )
     )
 

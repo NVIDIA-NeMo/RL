@@ -36,7 +36,10 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.models.generation.vllm.config import VllmRefitConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmRefitConfig,
+    VllmSparseRefitConfig,
+)
 from nemo_rl.utils import weight_transfer_sparse_codec as sparse_codec
 from nemo_rl.utils.weight_transfer_http import (
     G_VLLM_REFIT_API_KEY_HEADER,
@@ -104,9 +107,8 @@ class VllmSparseRefitReceiver:
 
     def __init__(self, worker: Any) -> None:
         self._worker = worker
-        self._refit_config = VllmRefitConfig.model_validate(
-            worker.cfg.get("refit_cfg") or {}
-        )
+        refit_config = VllmRefitConfig.model_validate(worker.cfg.get("refit_cfg") or {})
+        self._refit_config: VllmSparseRefitConfig = refit_config.sparse
         tuning = self._refit_config.tuning
         self._refit_apply_queue_condition = threading.Condition()
         self._refit_apply_executor = ThreadPoolExecutor(
@@ -133,6 +135,9 @@ class VllmSparseRefitReceiver:
 
     def set_worker_hostnames(self, hostnames: list[str]) -> None:
         self._refit_workers_share_node = len(set(hostnames)) == 1
+
+    def set_async_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._refit_async_loop = loop
 
     def start_sync_server(self) -> None:
         llm = self._worker.llm
@@ -426,8 +431,6 @@ class VllmSparseRefitReceiver:
             raw_request: Request,
             action: Literal["prepare", "s3", "flush", "zmq_flush"],
         ) -> JSONResponse:
-            if cfg["vllm_cfg"]["async_engine"]:
-                self._refit_async_loop = asyncio.get_running_loop()
             supplied_token = raw_request.headers.get(G_VLLM_REFIT_API_KEY_HEADER)
             if token is not None and (
                 supplied_token is None or not hmac.compare_digest(token, supplied_token)

@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for ``nemo_rl.data.utils.get_train_dataset_name`` and
-``nemo_rl.data.utils.load_dataloader_state``.
+"""Unit tests for shared data configuration and checkpoint helpers.
 
 These helpers underpin the dataset-swap-aware checkpoint resume logic: when
 the saved ``dataset_name`` (read from the ``config.yaml`` written alongside
@@ -29,6 +28,7 @@ import torch
 import yaml
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.data.datasets import extract_necessary_env_names
 from nemo_rl.data.utils import get_train_dataset_name, load_dataloader_state
 
 # ---------------------------------------------------------------------------
@@ -98,6 +98,42 @@ def _write_checkpoint(
         with open(os.path.join(dir_path, "config.yaml"), "w") as f:
             yaml.safe_dump(cfg, f)
     return dir_path
+
+
+# ---------------------------------------------------------------------------
+# extract_necessary_env_names
+# ---------------------------------------------------------------------------
+
+
+def test_extract_necessary_env_names_handles_dataset_lists():
+    data_config = {
+        "train": [
+            {"dataset_name": "train-a", "env_name": "math"},
+            {"dataset_name": "train-b", "env_name": "reward_model"},
+        ],
+        "validation": [
+            {"dataset_name": "val-a", "env_name": "math"},
+            {"dataset_name": "val-b", "env_name": "code"},
+        ],
+        "default": {"env_name": "default-env"},
+    }
+
+    assert set(extract_necessary_env_names(data_config)) == {
+        "math",
+        "reward_model",
+        "code",
+        "default-env",
+    }
+
+
+def test_extract_necessary_env_names_ignores_missing_or_none_entries():
+    data_config = {
+        "train": [{"dataset_name": "train"}, None],
+        "validation": None,
+        "default": None,
+    }
+
+    assert extract_necessary_env_names(data_config) == []
 
 
 # ---------------------------------------------------------------------------

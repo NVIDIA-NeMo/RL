@@ -21,7 +21,7 @@ from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 def _patch_transformers_tokenizer_class_set():
     """Undo the transformers block on deepseek_v3 tokenizers.
 
-    Root cause: transformers 5.4-5.11 lists "deepseek_v3" in two internal
+    Root cause: transformers >=5.4 lists "deepseek_v3" in two internal
     registries -- MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS (a set) and
     TOKENIZER_MAPPING_NAMES (a dict pinning it to "TokenizersBackend"). Together
     they force the fast tokenizer backend and suppress trust_remote_code, so
@@ -42,16 +42,14 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # This whole patch exists only because Megatron-Bridge caps the transformers
-    # upper bound below 5.9 today, which forces us onto a transformers version
-    # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
-    # its transformers upper bound to >=5.12, we can drop this workaround.
-    # TODO: remove this patch (and the assert below) once MBridge relaxes its
-    # transformers upper bound past the deepseek_v3 fix (~transformers 5.12).
+    # Transformers 5.12.1 still ships both registry entries, so the patch remains
+    # load-bearing across the currently supported backend environments.
+    # TODO: remove this patch (and the assert below) once the deepseek_v3
+    # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.12.0"), (
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was written for <5.12. "
+        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
@@ -215,6 +213,12 @@ class SequencePackingConfig(TypedDict):
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
     algorithm: str
+    # Preserve the packer's order (or omit for backward compatibility), or
+    # execute each DP rank's assigned bins largest-first for allocator reuse.
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
+    fuse_loss: NotRequired[bool]
+    pair_grouping_key: NotRequired[Literal["pair_index"]]
+    max_sequences_per_bin: NotRequired[int]
 
 
 class RewardModelConfig(TypedDict):
@@ -260,9 +264,14 @@ class MegatronOptimizerConfig(TypedDict):
     clip_grad: float
     # knob to enable optimizer cpu offload
     optimizer_cpu_offload: bool
-    # knob to set the fraction of parameters to keep on CPU
-    # currently if optimizer_cpu_offload is true, this knob must be 1.0
+    # knob to set the fraction of optimizer state and work to keep on CPU
     optimizer_offload_fraction: float
+    # overlap optimizer state transfers with CPU optimizer updates
+    overlap_cpu_optimizer_d2h_h2d: NotRequired[bool]
+    # Precision-aware Adam moment / remainder dtypes (YAML strings resolved in setup).
+    exp_avg_dtype: NotRequired[str]
+    exp_avg_sq_dtype: NotRequired[str]
+    store_param_remainders: NotRequired[bool]
 
 
 class MegatronSchedulerConfig(TypedDict):
@@ -293,6 +302,8 @@ class Fp8Config(TypedDict):
     # When True, keep parameters in FP8. Can cause NaN token_mult_prob_error;
     # use with caution (see https://github.com/NVIDIA-NeMo/RL/issues/1164).
     fp8_param: NotRequired[bool]
+    # Python import path for a Transformer Engine custom recipe quantizer factory.
+    fp8_quantizer_factory: NotRequired[str]
     # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
     # buffers in offload_before_refit (before weight transfer to the inference
     # engine). These FP8 workspace tensors anchor large CUDA segments and
@@ -325,6 +336,10 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Arbitrary model-provider attributes applied recursively to the Megatron
+    # Bridge model config before model instantiation. Keys must match configurable
+    # provider fields and must not duplicate first-class megatron_cfg fields.
+    model_overrides: NotRequired[dict[str, Any]]
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
@@ -344,9 +359,28 @@ class MegatronConfig(TypedDict):
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
+    # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
+    # provider's checkpoint/default value.
+    radio_force_cpe_eval_mode: NotRequired[bool]
+    # Nemotron Omni tower freeze booleans. Omit any field to retain the model
+    # provider's checkpoint/default value.
+    freeze_vision_model: NotRequired[bool]
+    freeze_vision_projection: NotRequired[bool]
+    freeze_sound_encoder: NotRequired[bool]
+    freeze_sound_projection: NotRequired[bool]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
+    # Optional multimodal provider controls. These map legacy Omni recipe
+    # names onto the canonical NemotronOmniModel provider fields.
+    freeze_vision_encoder: NotRequired[bool]
+    freeze_vision_projector: NotRequired[bool]
+    freeze_audio_encoder: NotRequired[bool]
+    freeze_audio_projector: NotRequired[bool]
+    moe_router_dtype: str | None
+    moe_router_load_balancing_type: str | list[str]
+    moe_router_bias_update_rate: float
+    moe_permute_fusion: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
     # If True, defer the casting of logits to float32 until the backward pass.
@@ -380,17 +414,40 @@ class MegatronConfig(TypedDict):
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]
     moe_router_group_topk: NotRequired[int | None]
-    # Transformer implementation backing the model. Only valid on generation workers.
+    # Transformer implementation backing the model. 'inference_optimized'
+    # trains through the TE parent path and requires sequence_parallel with
+    # TP>1 (enforced at setup).
     # Options are 'transformer_engine' and 'inference_optimized'.
     transformer_impl: NotRequired[str]
     # CUDA-graph implementation.
     # Options: 'none', 'local', 'transformer_engine', 'full_iteration'.
     cuda_graph_impl: NotRequired[str]
+    # Training capture regions supported by Megatron-Core: attn, mlp, moe,
+    # moe_router, moe_preprocess, and mamba. An empty list captures whole layers.
+    # Scoped training capture requires the transformer_engine implementation.
+    cuda_graph_modules: NotRequired[str | list[str]]
+    # Number of training warmup steps before CUDA Graph capture. This is inactive
+    # when cuda_graph_impl is 'none'; the Megatron-Core default is 3.
+    cuda_graph_warmup_steps: NotRequired[int]
     # When True, each expert sees a fixed number of tokens for cuda-graph capture.
     # Required when cuda_graph_impl= 'local' with transformer_impl != 'inference_optimized'.
     moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Offload specific module activations to CPU to reduce peak GPU memory.
+    # Works with both dense and MoE models. Different from
+    # optimizer_cpu_offload which offloads optimizer states.
+    # Requires transformer_engine. For TE >= 2.10.0 also requires
+    # NVTE_CPU_OFFLOAD_V1=1 in the environment (validated by
+    # Megatron-Bridge at runtime).
+    fine_grained_activation_offloading: NotRequired[bool]
+    # Modules to offload when fine_grained_activation_offloading is True.
+    # Required (no default). Common examples: "core_attn", "attn_proj",
+    # "expert_fc1", and "moe_act". Supported names depend on the pinned
+    # Megatron-LM version and are validated by MCore. "attn_proj" requires
+    # "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: NotRequired[list[str] | None]
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
@@ -402,6 +459,9 @@ class MegatronConfig(TypedDict):
     # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
     moe_flex_dispatcher_backend: NotRequired[str]
     moe_hybridep_num_sms: NotRequired[int]
+    # Align packed inputs once before the model forward instead of padding in every
+    # MoE layer. Currently requires NeMo-owned packing, PP=1, and MTP disabled.
+    moe_hybridep_prepad_packed_inputs: NotRequired[bool]
     # Number of HybridEP ranks per NVLink domain (default: min(expert_model_parallel_size, 64))
     hybridep_num_ranks_per_nvlink_domain: NotRequired[int]
     # Enable multi-node NVLink support (default: expert_model_parallel_size > 4)
@@ -429,6 +489,8 @@ class MegatronConfig(TypedDict):
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: NotRequired[float]
+    # Populated by the algorithm before Megatron setup to size the LR scheduler.
+    train_iters: NotRequired[int]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.
     mtp_use_repeated_layer: NotRequired[bool]
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.
@@ -441,6 +503,13 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Path to a per-module Transformer Engine precision recipe loaded into
+    # Megatron quant_recipe.
+    te_precision_config_file: NotRequired[str]
+    # Passed through to the Megatron model's freeze() method.
+    # Supported keys are model-specific, such as freeze_vision_model,
+    # freeze_vision_projection, and freeze_language_model.
+    freeze_config: NotRequired[dict[str, Any]]
 
 
 class DraftConfigDisabled(TypedDict):
@@ -461,13 +530,19 @@ class DraftConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
-    chat_template: NotRequired[str]
+    # None selects NeMo-RL's passthrough prompt/response template.
+    chat_template: NotRequired[str | None]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    # Arguments forwarded to tokenizer loading via get_tokenizer.
+    tokenizer_kwargs: NotRequired[dict[str, Any] | None]
     # Multimodal configs
     audio: NotRequired[dict[str, Any]]
     video: NotRequired[dict[str, Any]]
     use_processor: NotRequired[bool]
+    # Opt-in fastokens Rust-backed BPE tokenizer for NeMo-RL tokenization.
+    # Defaults to off when absent; NRL_USE_FASTOKENS overrides this and also sets VLLM_USE_FASTOKENS.
+    use_fastokens: NotRequired[bool]
 
 
 class PytorchOptimizerConfig(TypedDict):
@@ -516,6 +591,7 @@ class PolicyConfig(TypedDict):
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
+    offload_optimizer_for_logprob: bool
     logprob_batch_size: NotRequired[int]
     # If set, log probability computation is chunked along the sequence dimension to avoid GPU OOM (especially during backward pass).
     # Within each chunk loop, logits casting (from float16/bfloat16 to float32) is done to prevent holding the entire float32 logits tensor in memory.
@@ -539,7 +615,7 @@ class PolicyConfig(TypedDict):
     max_total_sequence_length: int
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
-    refit_buffer_size_gb: NotRequired[float]
+    refit_buffer_size_gb: NotRequired[float | int]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
@@ -556,3 +632,5 @@ class PolicyConfig(TypedDict):
     # If true, use standard Megatron layer specs while keeping ModelOpt
     # quantization enabled. Useful for faster QARL runs and logged in configs.
     disable_modelopt_layer_spec: NotRequired[bool]
+
+    is_vlm: NotRequired[bool]

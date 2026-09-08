@@ -8,8 +8,14 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  ppo_epochs: 4
+  ppo_epochs: 4  # actor passes over each rollout batch
+  # Critic passes over each rollout batch; follows ppo_epochs unless overridden.
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
+  # step_<n> dir of a critic-pretrain run whose value/ seeds the critic.
+  # Only a fresh run reads it; a resume ignores it and restores the critic from
+  # its own checkpoint, so it can stay set.
+  warm_start_value_checkpoint: null
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -21,6 +27,17 @@ ppo:
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
   skip_reference_policy_logprobs_calculation: true  # No KL, so skip ref logprobs
+
+  # Async PPO requires non-colocated vLLM generation and importance correction.
+  async_ppo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    # Requires policy_training_start_step > 0. null uses max_trajectory_age_steps.
+    warmup_generation_lead_steps: null
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+    # true discards partial restored rows and fills from subsequent prompts.
+    drop_incomplete_targets_on_restore: false
 
   reward_shaping:
     enabled: true
@@ -47,6 +64,9 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
+  # Log train/generation probability mismatch. Set a threshold to mask
+  # high-error sequences; null keeps metrics-only behavior.
+  seq_logprob_error_threshold: null
 
 loss_fn:
   disable_ppo_ratio: false
@@ -125,6 +145,15 @@ policy:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection. Common
+    # examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"]. Supported
+    # names depend on the pinned Megatron-LM version and are validated by MCore.
+    # "attn_proj" requires "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
@@ -168,6 +197,7 @@ policy:
       clip_grad: ${policy.max_grad_norm}
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -203,6 +233,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
@@ -233,6 +264,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
@@ -244,10 +278,15 @@ policy:
       enable_chunked_prefill: true
       unified_memory_level: 0
       max_tokens: 16384
+      logprobs_mode: processed_logprobs
+      offload_policy_before_refit: true
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
+      logprobs_mode: processed_logprobs
+      # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+      refit_with_reload_api: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -309,6 +348,15 @@ value:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection. Common
+    # examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"]. Supported
+    # names depend on the pinned Megatron-LM version and are validated by MCore.
+    # "attn_proj" requires "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -351,6 +399,7 @@ value:
       clip_grad: 1.0
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: 0.1
@@ -388,6 +437,7 @@ value:
     train_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
 
   max_grad_norm: 1.0
 
@@ -414,6 +464,7 @@ data:
   max_input_seq_length: 2048
   shuffle: true
   num_workers: 1
+  use_multiple_dataloader: false
   train:
     dataset_name: DAPOMath17K
   validation:
@@ -440,6 +491,8 @@ logger:
   wandb:
     project: "ppo-dapo-dtensor-dev"
     name: "ppo_dapo_dtensor_1B"
+    # Complete Gym payloads can create very large W&B artifacts. Enable only for debugging.
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "ppo-dapo-dtensor-dev"
     name: "ppo_dapo_dtensor_1B"
@@ -454,3 +507,9 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+  # and per-worker available ports.  Kept below the OS ephemeral range
+  # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
+  master_port_range_low: 1400
+  master_port_range_high: 1999
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

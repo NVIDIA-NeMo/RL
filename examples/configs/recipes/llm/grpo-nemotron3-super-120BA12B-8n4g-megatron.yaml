@@ -30,6 +30,10 @@ policy:
     moe_router_bias_update_rate: 0.001
     moe_router_enable_expert_bias: true
     defer_fp32_logits: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+    mtp_use_repeated_layer: true
+    mtp_loss_scaling_factor: 0.3
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
@@ -43,9 +47,17 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
       env_vars:
         NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
         NRL_REFIT_NUM_BUFFERS: "1"
+    vllm_kwargs:
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8480
+      mamba_cache_mode: align
+      speculative_config:
+        num_speculative_tokens: 5
+        method: mtp
 
 logger:
   wandb_enabled: true

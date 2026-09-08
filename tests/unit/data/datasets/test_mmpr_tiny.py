@@ -128,7 +128,7 @@ class TestMMPRTinyDataset:
             MMPRTinyDataset(download_dir="")
 
 
-def _make_stub_nemotron_processor():
+def _make_stub_nemotron_processor(*, include_imgs_sizes=True, num_tiles=1):
     """Build a minimal stub whose class name is NemotronNanoVLV2Processor.
 
     The stub implements just enough of the AutoProcessor interface for
@@ -160,14 +160,20 @@ def _make_stub_nemotron_processor():
                     for item in content:
                         if isinstance(item, dict) and "text" in item:
                             parts.append(item["text"])
-            return " ".join(parts)
+            formatted_text = " ".join(parts)
+            if kwargs.get("tokenize"):
+                return {"input_ids": fake_input_ids}
+            return formatted_text
 
         def __call__(self, text=None, images=None, **kwargs):
             self.captured_call_text = text
-            return {
+            result = {
                 "input_ids": fake_input_ids,
-                "pixel_values": torch.randn(1, 3, 224, 224),
+                "pixel_values": torch.randn(num_tiles, 3, 224, 224),
             }
+            if include_imgs_sizes:
+                result["imgs_sizes"] = torch.tensor([[224, 224]] * num_tiles)
+            return result
 
     return NemotronNanoVLV2Processor()
 
@@ -191,7 +197,7 @@ _TEST_PROMPT_TEMPLATE = (
 )
 
 
-def _run_processor(tiny_image_path):
+def _run_processor(tiny_image_path, processor=None):
     """Helper: run vlm_hf_data_processor on an MMPR sample and return
     (result DatumSpec, stub processor with captured_call_text)."""
     from nemo_rl.data.interfaces import TaskDataSpec
@@ -199,7 +205,7 @@ def _run_processor(tiny_image_path):
 
     task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
     task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
-    processor = _make_stub_nemotron_processor()
+    processor = processor or _make_stub_nemotron_processor()
     sample = {
         "images": [tiny_image_path],
         "question": _RAW_QUESTION,
@@ -233,18 +239,88 @@ class TestVLMProcessorMMPRTiny:
         assert "vllm_images" in result
         assert len(result["vllm_images"]) == 1
         assert result["task_name"] == "mmpr-tiny"
+        user_message = result["message_log"][0]
+        assert torch.equal(user_message["num_frames"].as_tensor(), torch.tensor([1]))
+        assert user_message["pixel_values"].pad_to_max_shape is True
+        assert user_message["pixel_values"].as_tensor().dtype == torch.float32
+
+    def test_text_only_row_preserves_formatted_vllm_content(self):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        processor = _make_stub_nemotron_processor()
+        task_data_spec = TaskDataSpec(task_name="text-only")
+        task_data_spec.prompt = "Answer: {}"
+
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "messages": [
+                    {"role": "user", "content": "What is 2 + 2?"},
+                    {"role": "assistant", "content": "4"},
+                ],
+                "task_name": "text-only",
+            },
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        assert result["vllm_content"] == "Answer: What is 2 + 2?"
+        assert result["vllm_images"] == []
+
+    def test_conversation_preprocessor_is_preserved(self, tiny_image_path):
+        processor = _make_stub_nemotron_processor()
+        processor.conversation_preprocessor = MagicMock(
+            return_value={"role": "user", "content": "preprocessed"}
+        )
+
+        result, _ = _run_processor(tiny_image_path, processor=processor)
+
+        processor.conversation_preprocessor.assert_called_once()
+        assert result["vllm_content"] is None
+        assert processor.captured_call_text == "preprocessed"
+
+    def test_historical_tiled_processor_gets_media_metadata(self, tiny_image_path):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
+        task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
+        processor = _make_stub_nemotron_processor(include_imgs_sizes=False, num_tiles=3)
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "images": [tiny_image_path],
+                "question": _RAW_QUESTION,
+                "answer": "A",
+                "task_name": "mmpr-tiny",
+            },
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        user_message = result["message_log"][0]
+        assert torch.equal(
+            user_message["imgs_sizes"].as_tensor(),
+            torch.tensor([[224, 224], [224, 224], [224, 224]]),
+        )
+        assert torch.equal(
+            user_message["num_frames"].as_tensor(), torch.ones(3, dtype=torch.int32)
+        )
 
     def test_prompted_text_contains_boxed_literal_and_no_raw_dataset_string(
         self, tiny_image_path
     ):
-        result, _ = _run_processor(tiny_image_path)
-        vllm_content = result["vllm_content"]
+        result, processor = _run_processor(tiny_image_path)
+        processed_text = processor.captured_call_text
 
         # Positive: literal \boxed{} must survive prompt formatting
-        assert "\\boxed{}" in vllm_content
+        assert "\\boxed{}" in processed_text
 
         # Negative: the raw dataset string (with <image> prefix) must NOT leak through
-        assert _RAW_QUESTION not in vllm_content
+        assert _RAW_QUESTION not in processed_text
 
     def test_placeholder_conversion_exact_string(self, tiny_image_path):
         """Verify the exact tokenizer input for the placeholder-style processor path.
@@ -262,15 +338,15 @@ class TestVLMProcessorMMPRTiny:
 
         # The stub's apply_chat_template joins message parts with spaces,
         # so the captured text passed to __call__ is the chat-templated string.
-        # Verify the vllm_content (which is apply_chat_template output) matches.
-        vllm_content = result["vllm_content"]
-        assert vllm_content == expected_tokenizer_input
+        # Verify the apply_chat_template output through captured_call_text below;
+        # placeholder-style processors send expanded token IDs to vLLM.
+        assert result["vllm_content"] is None
 
         # Verify exactly one <image> token in the final output
-        assert vllm_content.count("<image>") == 1
+        assert processor.captured_call_text.count("<image>") == 1
 
         # Verify the question text is present
-        assert _CLEAN_QUESTION in vllm_content
+        assert _CLEAN_QUESTION in processor.captured_call_text
 
         # Verify the captured __call__ text also matches
         # (processor.__call__ receives the apply_chat_template output)

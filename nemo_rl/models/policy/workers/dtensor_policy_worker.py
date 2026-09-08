@@ -65,6 +65,10 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
+from nemo_rl.models.automodel.data import (
+    check_sequence_dim,
+    filter_multimodal_kwargs_for_model,
+)
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -87,6 +91,12 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.checkpoint_engine import (
+    DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
+    maybe_preinit_nixl_checkpoint_engine,
+)
+from nemo_rl.telemetry.setup import init_telemetry_worker
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -95,6 +105,15 @@ from nemo_rl.utils.native_checkpoint import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
+
+
+def dtensor_params_generator(
+    model: nn.Module, target_dtype: torch.dtype
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield contiguous full tensors from a DTensor-backed state dict."""
+    for name, tensor in model.state_dict().items():
+        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        yield name, full_tensor.to(target_dtype, non_blocking=True).contiguous()
 
 
 def _attach_context_parallel_hooks(model: nn.Module) -> None:
@@ -168,7 +187,11 @@ def get_cpu_state_dict(
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorPolicyWorkerImpl(
-    TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
+    TQWorkerMixin,
+    DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
+    AbstractPolicyWorker,
+    ColocatablePolicyInterface,
 ):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -209,6 +232,10 @@ class DTensorPolicyWorkerImpl(
         # benefit. ray.get_gpu_ids()[0] is the physical GPU index that keys the
         # affinity file, and reading it does not initialize CUDA.
         bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
 
         self.tokenizer = tokenizer
         self.processor = processor
@@ -316,7 +343,12 @@ class DTensorPolicyWorkerImpl(
                 raise ValueError(f"Unknown reward model type: {rm_type}")
         else:
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
-            model_class = resolve_model_class(model_config.model_type)
+            # This worker loads weights on rank 0 and applies FSDP itself. NeMo
+            # AutoModel wrappers may run collectives while the other ranks wait.
+            model_class = resolve_model_class(
+                model_config.model_type,
+                use_nemo_automodel=False,
+            )
 
         full_state_dict = None
         if self.rank == 0:
@@ -402,6 +434,7 @@ class DTensorPolicyWorkerImpl(
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.device_mesh = device_mesh
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
@@ -611,13 +644,9 @@ class DTensorPolicyWorkerImpl(
             "cross-tokenizer distillation requires dtensor_cfg._v2=True."
         )
         # dim 1 is always assumed to be the sequence dim, sanity check this here.
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Shared with the v2 worker so the multimodal skip (packed wire
+        # fields are not sequence-aligned) lives in exactly one place.
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -763,6 +792,9 @@ class DTensorPolicyWorkerImpl(
                         # add vlm kwargs to model call
                         vlm_kwargs = mb.get_multimodal_dict(
                             as_tensors=True, device=input_ids.device
+                        )
+                        vlm_kwargs = filter_multimodal_kwargs_for_model(
+                            self.model, vlm_kwargs
                         )
                         if len(vlm_kwargs) > 0:
                             position_ids = None
@@ -1021,13 +1053,9 @@ class DTensorPolicyWorkerImpl(
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Shared with the v2 worker so the multimodal skip (packed wire
+        # fields are not sequence-aligned) lives in exactly one place.
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         all_log_probs = []
         self.model.eval()
@@ -1069,6 +1097,7 @@ class DTensorPolicyWorkerImpl(
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
+                vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
 
                 batch_size, seq_len = input_ids.shape
                 if self.enable_seq_packing:
@@ -1323,13 +1352,9 @@ class DTensorPolicyWorkerImpl(
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Shared with the v2 worker so the multimodal skip (packed wire
+        # fields are not sequence-aligned) lives in exactly one place.
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
         self.model.eval()
 
         with unshard_fsdp2_model(self.model), torch.no_grad():
@@ -1513,6 +1538,7 @@ class DTensorPolicyWorkerImpl(
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
+                vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
                 batch_size, seq_len = input_ids.shape
 
                 # Store original shapes for unpacking later
@@ -1859,35 +1885,61 @@ class DTensorPolicyWorkerImpl(
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            for name, tensor in self.model.state_dict().items():
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
-
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(),
+            params_generator=dtensor_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
         )
 
+    def _checkpoint_engine_params(
+        self,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        return dtensor_params_generator(self.model, self.dtype)
+
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
     ) -> None:
-        """Broadcast the weights for collective communication."""
+        """Broadcast the weights for collective communication.
+
+        Guarded exactly as the Megatron worker is, and for the same reason: a generation
+        rank that dies mid-broadcast leaves this call blocked in NCCL with no timeout and
+        no error. Disarmed unless refit_timeout_s is set, so the default path is
+        unchanged.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            self._broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                buffer_size_bytes=buffer_size_bytes,
+                num_buffers=num_buffers,
+            )
+        if guard.fired:
+            # The aborted collective returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit broadcast exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+    ) -> None:
         if kv_scales is not None:
             raise NotImplementedError(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
@@ -1915,6 +1967,8 @@ class DTensorPolicyWorkerImpl(
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
+            buffer_size_bytes=buffer_size_bytes,
+            num_buffers=num_buffers,
         )
 
         # Manually move model to cpu for cpu offload case
@@ -1923,7 +1977,16 @@ class DTensorPolicyWorkerImpl(
             self.model = self.move_to_cpu(self.model)
 
     @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
-    def prepare_for_lp_inference(self) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the model in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave the optimizer state on CUDA because a train
+                step is already open. This backend accumulates gradients in
+                ``param.grad`` and never offloads them, so unlike the Megatron
+                backend there is nothing here that could discard them; the flag
+                only suppresses the per-chunk optimizer round trip.
+        """
         # onload model to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1934,7 +1997,11 @@ class DTensorPolicyWorkerImpl(
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
-        if self.optimizer is not None and self.offload_optimizer_for_logprob:
+        if (
+            not keep_train_buffers
+            and self.optimizer is not None
+            and self.offload_optimizer_for_logprob
+        ):
             self.move_optimizer_to_device("cpu")
 
         gc.collect()

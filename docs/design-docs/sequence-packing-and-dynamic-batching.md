@@ -7,11 +7,12 @@ This document describes the sequence packing and dynamic batching features imple
 1. [Problem](#problem)
 2. [Sequence Packing and Dynamic Batching](#sequence-packing-and-dynamic-batching)
 3. [Sequence Packing](#sequence-packing)
-4. [Dynamic Batching](#dynamic-batching)
-5. [Configuration](#configuration)
-6. [Integration with Training Pipeline](#integration-with-training-pipeline)
-7. [Metrics and Monitoring](#metrics-and-monitoring)
-8. [Usage](#usage)
+4. [HybridEP with Packed Sequences](#hybridep-with-packed-sequences)
+5. [Dynamic Batching](#dynamic-batching)
+6. [Configuration](#configuration)
+7. [Integration with Training Pipeline](#integration-with-training-pipeline)
+8. [Metrics and Monitoring](#metrics-and-monitoring)
+9. [Usage](#usage)
 
 ## Problem
 
@@ -226,6 +227,37 @@ Internally, DTensor and Megatron-Core are made aware of sequence packing with ei
 
 All together, we see **speedups in the ~2-3x range** when enabling sequence packing.
 
+### HybridEP with Packed Sequences
+
+Packed sequence lengths can differ across expert-parallel ranks. HybridEP
+collectives require every participating rank to use an aligned input length;
+otherwise a run can hang when communication overlaps. For the supported
+pipeline-parallel-size-one, MTP-disabled path, enable NeMo-RL's one-time input
+pre-padding:
+
+```yaml
+policy:
+  megatron_cfg:
+    moe_token_dispatcher_type: "flex"
+    moe_flex_dispatcher_backend: "hybridep"
+    moe_hybridep_prepad_packed_inputs: true
+    pipeline_model_parallel_size: 1
+    mtp_num_layers: 0
+  sequence_packing:
+    enabled: true
+```
+
+`moe_hybridep_prepad_packed_inputs: true` aligns the packed input length across
+the HybridEP group once before the forward pass. This avoids issuing an
+additional scalar alignment collective inside every MoE layer, where it can
+interleave with expert-parameter collectives and hang.
+
+The option is not enabled by default because this NeMo-RL-owned pre-padding
+path does not currently support pipeline parallelism or MTP. NeMo-RL rejects
+unsupported combinations during setup. When the option is omitted or `false`,
+no uneven-input alignment is applied, so HybridEP with packed sequences requires
+this option.
+
 ## Dynamic Batching
 
 Dynamic batching optimizes microbatch formation by:
@@ -348,8 +380,16 @@ class SequencePackingArgs(TypedDict):
     input_key: str                     # Input tensor key
     input_lengths_key: str             # Sequence lengths key
     algorithm: str                     # Packing algorithm name
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
     sequence_length_pad_multiple: int  # CP/TP alignment factor
 ```
+
+`microbatch_order` controls only the execution order of bins already assigned to
+each data-parallel rank. `packer` (and an omitted value for backward compatibility)
+preserves the packer's order. `largest_first` executes each rank's bins by
+nonincreasing padded-token count, allowing smaller microbatches to reuse allocator
+segments established by the largest shape. It does not change bin contents, rank
+assignment, or total padded tokens.
 
 ## Integration with Training Pipeline
 
@@ -377,6 +417,7 @@ policy:
     train_mb_tokens: 2048  # Target tokens per microbatch
     logprob_mb_tokens: 2048
     algorithm: "modified_first_fit_decreasing"  # Best algorithm
+    microbatch_order: "packer"  # Or "largest_first" to reduce allocator shape churn
     sequence_length_round: 64  # Hardware alignment
   
   dynamic_batching:

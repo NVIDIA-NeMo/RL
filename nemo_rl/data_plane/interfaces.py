@@ -37,9 +37,60 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
+from pathlib import Path
+from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
+from pydantic import BaseModel, Field
 from tensordict import TensorDict
+
+DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
+
+
+class SimpleStorageConfig(BaseModel, extra="allow"):
+    """Sizing for ``backend="simple"``. Ignored by every other backend.
+
+    ``num_storage_units`` scales with the cluster: TQ round-robins storage
+    units over Ray nodes and recommends ``>= 2 x`` the node count. No static
+    default is correct across cluster sizes, so this is required rather than
+    defaulted — a class field cannot see ``cluster.num_nodes``, only the
+    exemplar YAML can, via ``${mul:2, ${cluster.num_nodes}}``. Every recipe
+    inherits that from the exemplar; set a plain int to pin it.
+    """
+
+    storage_capacity: int = 1000000  # max samples retained per partition
+    num_storage_units: int
+
+
+class MooncakeCpuConfig(BaseModel, extra="allow"):
+    """Sizing and RDMA knobs for ``backend="mooncake_cpu"``. Ignored otherwise.
+
+    ``global_segment_size`` / ``local_buffer_size`` are per client *process*
+    (one per GPU), so a node pays ``gpus_per_node x (segment + buffer)``. Under
+    RDMA that memory is pinned and resident from setup, so keep the per-node
+    product in mind when raising them. Under-sizing surfaces as
+    ``batch_get_tensor returned None``.
+
+    ``reuse_registered_buffers`` keeps a pool of RDMA-registered buffers alive
+    instead of registering a fresh one per transfer; set false to fall back to
+    upstream's per-call registration.
+
+    ``staging_buffer_size`` is that pool's per-slot ceiling. It is a pooling
+    threshold, not a size limit: a bigger payload still transfers, just with a
+    transient registration. Slots ratchet — they grow to the largest payload
+    admitted and never shrink — so raise it only when a per-key payload (one
+    sample of one field) genuinely exceeds it, not for headroom.
+
+    Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
+    That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
+    transfer's peer rail to the local one by name; on a rail-isolated RoCE
+    fabric a cross-rail pair has no route. It is set on RoCE-only hosts by
+    ``nemo_rl.data_plane.adapters.transfer_queue_env.configure_engine_env``.
+    """
+
+    global_segment_size: int = 68719476736  # 64 GiB per client process
+    local_buffer_size: int = 4294967296  # 4 GiB per client process
+    reuse_registered_buffers: bool = True
+    staging_buffer_size: int = 268435456  # 256 MiB per pool slot
 
 
 class DataPlaneConfig(TypedDict):
@@ -49,28 +100,71 @@ class DataPlaneConfig(TypedDict):
     the TQ adapter, not by NeMo-RL. ``impl`` selects which adapter we go
     through.
 
-    Required keys (always set in exemplar YAML — never defaulted in code):
-    ``enabled``, ``impl``, ``backend``, ``storage_capacity``,
-    ``num_storage_units``, ``claim_meta_poll_interval_s``,
-    ``global_segment_size``, ``local_buffer_size``.
+    Backend-specific knobs live under a block named for the backend that reads
+    them — ``simple:`` and ``mooncake_cpu:`` — mirroring TransferQueue's own
+    ``config.yaml`` and the per-backend overlay :func:`_init_tq` builds. Only
+    the block named by ``backend`` is consulted, so a config selecting
+    ``simple`` never has to mention mooncake's RDMA sizing at all. An absent
+    ``mooncake_cpu:`` block means "use :class:`MooncakeCpuConfig`'s
+    defaults" — but ``simple:`` is **not** optional: ``num_storage_units``
+    has no static default, since no single value is right across cluster
+    sizes, so a ``simple`` run without the block fails validation.
 
-    ``global_segment_size`` / ``local_buffer_size`` are only *read* when
-    ``backend == "mooncake_cpu"``; the simple backend ignores them.
-    They are required (not NotRequired) so the YAML carries the full
-    schema and there are no hidden Python defaults.
+    Required keys (always set in the exemplar YAML): ``enabled``, ``impl``,
+    ``backend``, ``claim_meta_poll_interval_s``.
+
+    ``storage_capacity`` / ``num_storage_units`` / ``global_segment_size`` /
+    ``local_buffer_size`` used to sit at this level. A config still using that
+    spelling is not rejected — the flat key is simply never read, and
+    :func:`backend_config` resolves the nested block (or its defaults) as if it
+    were absent. See there.
     """
 
     enabled: bool
     impl: Literal["transfer_queue"]
     backend: Literal["simple", "mooncake_cpu"]
-    storage_capacity: int
-    num_storage_units: int
     claim_meta_poll_interval_s: float
-    global_segment_size: int
-    local_buffer_size: int
+    simple: NotRequired[SimpleStorageConfig]
+    mooncake_cpu: NotRequired[MooncakeCpuConfig]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
+
+
+_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple"})
+
+
+def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
+    """Return whether the configured backend supports complete save/load.
+
+    This is a static allow-list so an unrecognized future backend defaults to
+    unsupported until its storage payload and controller metadata are both
+    known to round-trip through a checkpoint.
+    """
+    return cfg["backend"] in _CHECKPOINTABLE_BACKENDS
+
+
+_BACKEND_MODELS: dict[str, type[BaseModel]] = {
+    "simple": SimpleStorageConfig,
+    "mooncake_cpu": MooncakeCpuConfig,
+}
+
+
+def backend_config(cfg: DataPlaneConfig) -> Any:
+    """Return the validated sizing block for ``cfg["backend"]``.
+
+    Reads the nested block and lets the model supply anything it omits, so no
+    caller ever writes a fallback. Works whether ``cfg`` came through pydantic
+    (block already coerced to a model) or as a plain dict from a test.
+
+    Sizing is read only from the nested block. A config still using the
+    pre-nesting flat spelling gets this backend's defaults, not its own values.
+    """
+    backend = cfg["backend"]
+    nested = cfg.get(backend) or {}
+    if isinstance(nested, BaseModel):
+        nested = nested.model_dump(exclude_unset=True)
+    return _BACKEND_MODELS[backend].model_validate(nested)
 
 
 class ObservabilityConfig(TypedDict):
@@ -86,6 +180,22 @@ class ObservabilityConfig(TypedDict):
 
     enabled: bool
     callback: NotRequired[Callable[[dict[str, Any]], None]]
+
+
+class LocalDataPlaneConfig(BaseModel, extra="allow"):
+    """User configuration for process-local data transfer.
+
+    ``max_partitions`` limits retained step batches. Set it to ``1`` for only
+    the active step or ``2`` to retain one prefetched step as well.
+    """
+
+    enabled: Literal[True] = True
+    impl: Literal["local"] = "local"
+    max_partitions: Annotated[int, Field(ge=1)] = 2
+    observability: ObservabilityConfig | None = None
+
+
+DataPlaneRuntimeConfig = DataPlaneConfig | LocalDataPlaneConfig
 
 
 @dataclass
@@ -202,7 +312,22 @@ class KVBatchMeta:
         )
 
     def concat(self, *others: "KVBatchMeta") -> "KVBatchMeta":
-        """Append ``others`` to ``self``. All metas must share ``partition_id``."""
+        """Append metadata from the same partition.
+
+        Sample IDs are concatenated in argument order, while fields are
+        unioned in first-seen order. Sequence lengths and tags are retained
+        only when every input provides them.
+
+        Args:
+            *others: Metadata batches whose ``partition_id`` matches this
+                batch.
+
+        Returns:
+            A new metadata batch containing all input rows.
+
+        Raises:
+            ValueError: If any input has a different ``partition_id``.
+        """
         if any(o.partition_id != self.partition_id for o in others):
             raise ValueError("KVBatchMeta.concat: partition_ids must match")
         all_m = (self, *others)
@@ -215,9 +340,14 @@ class KVBatchMeta:
         )
         all_have_tags = all(m.tags is not None for m in all_m)
         tags = [t for m in all_m for t in (m.tags or [])] if all_have_tags else None
-        return self._replace(
+        merged_fields = list(
+            dict.fromkeys(field for meta in all_m for field in (meta.fields or []))
+        )
+        result = self._replace(
             sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags
         )
+        result.fields = merged_fields or None
+        return result
 
     def drop(self, indices: "Sequence[int]") -> "KVBatchMeta | None":
         """Complement of :meth:`subset`. Returns ``None`` when all rows are dropped."""
@@ -259,7 +389,8 @@ class DataPlaneClient(ABC):
     B. *Direct-by-key* — used by stages that already know the exact uids
        (e.g. driver-side fan-out to DP ranks):
        :meth:`put_samples`, :meth:`get_samples`, :meth:`clear_samples`.
-    C. *Lifecycle* — :meth:`close`.
+    C. *Lifecycle* — :meth:`save_checkpoint`, :meth:`load_checkpoint`, and
+       :meth:`close`.
 
     Stage-completion signal: there is intentionally no ``mark_consumed``.
     The authoritative signal in TransferQueue is *field production* —
@@ -412,6 +543,22 @@ class DataPlaneClient(ABC):
         """
 
     @abstractmethod
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        """List the sample IDs currently stored in a partition.
+
+        This metadata-only operation is intended for recovery validation and
+        reconciliation. It must not fetch tensor payloads or advance consumer
+        cursors.
+
+        Args:
+            partition_id: Partition whose stored keys should be listed.
+
+        Returns:
+            Stable, sorted sample IDs. An unknown or empty partition returns
+            an empty list.
+        """
+
+    @abstractmethod
     def clear_samples(
         self,
         sample_ids: list[str] | None,
@@ -441,6 +588,44 @@ class DataPlaneClient(ABC):
         """
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    @abstractmethod
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist the complete data-plane state to ``checkpoint_dir``.
+
+        The checkpoint must include both data and the implementation's
+        scheduling/consumption metadata. Callers must serialize checkpoint
+        saves and prevent destructive operations such as clears until this
+        method returns.
+
+        Args:
+            checkpoint_dir: New durable directory for this checkpoint.
+            metadata: Optional JSON-compatible recovery metadata.
+        """
+
+    @abstractmethod
+    def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Restore a complete data-plane checkpoint.
+
+        The data-plane implementation must already be initialized, but no data
+        operations may have run before restore. Implementations must reject a
+        load after operations through the same client; callers must also ensure
+        that no other client has modified shared data-plane state.
+
+        Args:
+            checkpoint_dir: Directory previously written by
+                :meth:`save_checkpoint`.
+
+        Returns:
+            User metadata supplied to :meth:`save_checkpoint`. The caller may
+            validate this metadata, but restoring data-plane state does not
+            restore the surrounding controller or trainer state.
+        """
 
     @abstractmethod
     def close(self) -> None:

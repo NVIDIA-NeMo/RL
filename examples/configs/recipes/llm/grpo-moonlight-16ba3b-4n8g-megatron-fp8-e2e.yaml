@@ -43,6 +43,14 @@ policy:
       quantization_ignored_layer_kws:
       - a_proj
       - b_proj
+    vllm_kwargs:
+      # At the same gpu_memory_utilization, vLLM 0.25's profiling sizes the
+      # KV cache to ~34 GiB where 0.20 sized it to ~20 GiB, growing the
+      # CuMemAllocator sleep pool past what can be re-mapped at wake-up next
+      # to the colocated Megatron policy ("CUDA Error: out of memory at
+      # csrc/cumem_allocator.cpp"). Pin the KV cache to the 0.20-proven size
+      # (takes precedence over gpu_memory_utilization).
+      kv_cache_memory_bytes: 21474836480  # 20 GiB
 logger:
   monitor_gpus: false
   wandb:

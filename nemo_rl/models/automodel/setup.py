@@ -22,40 +22,21 @@ from typing import Any, Optional, Union
 
 import torch
 from hydra.utils import get_class
-from nemo_automodel import NeMoAutoModelForSequenceClassification
-
-try:
-    from nemo_automodel import NeMoAutoModelForTokenClassification
-except ImportError:
-    # Local backport until the pinned Automodel submodule exports
-    # NeMoAutoModelForTokenClassification. The tripwire test in
-    # tests/unit/models/automodel/test_automodel_setup.py should fail once this
-    # shim is no longer needed.
-    # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2948.
-    from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass
-    from transformers import AutoModelForTokenClassification
-
-    class NeMoAutoModelForTokenClassification(
-        _BaseNeMoAutoModelClass, AutoModelForTokenClassification
-    ):
-        """Backport shim - see surrounding comment."""
-
-        pass
-else:
-    raise RuntimeError(
-        "Automodel now exports NeMoAutoModelForTokenClassification; remove the "
-        "local backport shim in nemo_rl.models.automodel.setup."
-    )
-
-
+from nemo_automodel import (
+    NeMoAutoModelForSequenceClassification,
+    NeMoAutoModelForTokenClassification,
+)
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.config.loader import _resolve_target
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
+from nemo_automodel.components.distributed.config import (
+    DistributedSetup,
+    FSDP2Config,
+    MoEParallelizerConfig,
+)
+from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
-from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import (
     AutoConfig,
@@ -176,21 +157,31 @@ def get_tokenizer(
                     - A custom jinja2 template string
                     If not specified, the tokenizer's default template will be used.
                 - chat_template_kwargs: Arguments passed to tokenizer.apply_chat_template()
+                - tokenizer_kwargs: Extra keyword arguments forwarded to
+                  NeMoAutoTokenizer.from_pretrained(), e.g.
+                  {"fix_mistral_regex": False}. When get_processor=True, these
+                  are passed through AutoProcessor.from_pretrained().
         get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
 
     Returns:
         The configured tokenizer or processor instance.
     """
     processor = None
+    tokenizer_kwargs = dict(tokenizer_config.get("tokenizer_kwargs") or {})
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            use_fast=tokenizer_kwargs.pop("use_fast", True),
+            **tokenizer_kwargs,
         )
         tokenizer = processor.tokenizer
     else:
         tokenizer = NeMoAutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            **tokenizer_kwargs,
         )
 
     if tokenizer.pad_token is None:
@@ -261,11 +252,13 @@ def validate_and_prepare_config(
     # Set basic configuration
     is_vlm = processor is not None
     is_generation_colocated = None
+    rollout_backend = None
     sampling_params = None
     if "generation" in config and config["generation"] is not None:
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
+        rollout_backend = generation_cfg.get("backend")
         # set sampling params
         sampling_params = TrainingSamplingParams(
             top_k=generation_cfg["top_k"],
@@ -273,10 +266,11 @@ def validate_and_prepare_config(
             temperature=generation_cfg["temperature"],
         )
 
-    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
-    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-    if not is_generation_colocated:
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
+    # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.
+    # SGLang requires 0; the other refit communicators require 1. See issue #564.
+    # Keep the explicit ``is False`` guard: SFT/DPO have no generation config.
+    if is_generation_colocated is False:
+        os.environ["NCCL_CUMEM_ENABLE"] = "0" if rollout_backend == "sglang" else "1"
 
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
@@ -489,7 +483,6 @@ def setup_distributed(
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
         defer_fsdp_grad_sync=config["dtensor_cfg"].get("defer_fsdp_grad_sync", True),
-        backend="nccl",
     )
 
     # Create MoEParallelizerConfig from nested moe_parallelizer options
@@ -504,15 +497,18 @@ def setup_distributed(
         )
 
     # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
-    device_mesh, moe_mesh = create_device_mesh(
+    mesh_context = MeshContext.build(
         fsdp2_config,
-        dp_replicate_size=dp_replicate_size,
-        tp_size=tp_size,
-        pp_size=1,
-        cp_size=cp_size,
-        ep_size=ep_size,
+        ParallelismSizes(
+            dp_replicate_size=dp_replicate_size,
+            tp_size=tp_size,
+            pp_size=1,
+            cp_size=cp_size,
+            ep_size=ep_size,
+        ),
         world_size=world_size,
     )
+    device_mesh, moe_mesh = mesh_context.device_mesh, mesh_context.moe_mesh
 
     # Derive sizes from mesh
     resolved_dp_size = device_mesh["dp"].size()
@@ -528,49 +524,6 @@ def setup_distributed(
         tp_size=resolved_tp_size,
         cp_size=resolved_cp_size,
     )
-
-
-# AUTOMODEL-WORKAROUND(restore-dtype): TEMPORARY. Remove when the automodel pin includes
-# NVIDIA-NeMo/Automodel PR #2419 (rewrites _restore_loaded_model_dtype to honor an explicit
-# torch_dtype via promote_types). Currently pinned at automodel 6de0c361 (pre-#2419).
-def _disable_automodel_checkpoint_dtype_restore() -> None:
-    """No-op Automodel's ``_restore_loaded_model_dtype`` on the HF/force_hf load path.
-
-    NeMo-RL loads policy models with ``torch_dtype=float32`` to keep fp32 master weights
-    for the optimizer. Automodel's ``_restore_loaded_model_dtype`` (added after automodel
-    ``92635e74``) re-casts each loaded parameter back to the bf16 checkpoint dtype, silently
-    downgrading the master weights so AdamW updates underflow and the model fails to learn
-    (e.g. grpo-nano-v2-12b reward stuck ~0.18). Disable it so the requested fp32 load is
-    honored. Tracked by NVIDIA-NeMo/Automodel#2419; remove once the automodel pin includes it.
-    See ``test_automodel_dtype_restore_workaround_still_needed`` for the removal tripwire.
-    """
-    from nemo_automodel._transformers import model_init as _model_init
-
-    # Removal tripwire: if Automodel drops/renames this symbol (the likely shape of the
-    # upstream fix), the workaround is obsolete -> warn loudly and self-deactivate.
-    restore = getattr(_model_init, "_restore_loaded_model_dtype", None)
-    if restore is None:
-        import warnings
-
-        warnings.warn(
-            "Automodel no longer defines _restore_loaded_model_dtype; NeMo-RL's fp32 "
-            "master-weight workaround is obsolete - remove "
-            "_disable_automodel_checkpoint_dtype_restore() in setup.py.",
-            stacklevel=2,
-        )
-        return
-    if getattr(restore, "_nrl_disabled", False):
-        return
-
-    def _noop(*args, **kwargs) -> None:  # pragma: no cover
-        return None
-
-    _noop._nrl_disabled = True
-    # Stash the genuine function so the removal tripwire test
-    # (test_automodel_dtype_restore_workaround_still_needed) can exercise Automodel's
-    # real behavior even after this no-op has globally replaced the symbol process-wide.
-    _noop._nrl_original = restore
-    _model_init._restore_loaded_model_dtype = _noop
 
 
 def setup_model_and_optimizer(
@@ -644,18 +597,12 @@ def setup_model_and_optimizer(
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
 
-        if model_config.model_type == "qwen3_5":
-            raise AssertionError(
-                "Context parallel is not supported for Qwen3.5 dense models (only torch attention backend is available). "
-                "Please set cp_size = 1. For Qwen3.5 MoE models, CP is supported with the TE backend."
-            )
-
-        if model_config.model_type == "qwen3_5_moe":
+        if model_config.model_type in ("qwen3_5", "qwen3_5_moe"):
             try:
                 import fla  # noqa: F401
             except ImportError:
                 raise ImportError(
-                    "Qwen3.5 MoE requires flash-linear-attention for context parallel. "
+                    "Qwen3.5 requires flash-linear-attention for context parallel. "
                     "Please install it in your Automodel venv: pip install flash-linear-attention"
                 )
 
@@ -707,8 +654,9 @@ def setup_model_and_optimizer(
     from torch.nn.attention import SDPBackend
 
     if cp_size > 1:
-        # Match Automodel's `get_train_context` in `cp_utils.py` where only
-        # flash and efficient backends are supported
+        # Match Automodel's `get_train_context` in
+        # `components/distributed/context_parallel/utils.py`, where only flash
+        # and efficient backends are supported.
         sdpa_method = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
@@ -748,19 +696,24 @@ def setup_model_and_optimizer(
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
 
-    # Keep fp32 master weights: stop Automodel from restoring loaded params to the bf16
-    # checkpoint dtype, which would break optimizer master-weight precision (see helper).
-    _disable_automodel_checkpoint_dtype_restore()
+    # Bundle distributed topology + policies into a single DistributedSetup. Automodel
+    # r0.6.0's from_pretrained rejects the old separate distributed kwargs
+    # (moe_mesh/distributed_config/moe_config/activation_checkpointing/pipeline_config/tp_plan
+    # -- see _reject_separate_distributed_kwargs) and requires them via distributed_setup.
+    # pipeline_config=None: PP is not used here.
+    distributed_setup = DistributedSetup(
+        mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
+        strategy_config=fsdp2_config,
+        pipeline_config=None,
+        moe_parallel_config=moe_config if ep_size > 1 else None,
+        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+    )
 
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
         model_name,
-        device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
-        distributed_config=fsdp2_config,
-        moe_config=moe_config if ep_size > 1 else None,
-        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+        distributed_setup=distributed_setup,
         peft_config=peft_config,
         attn_implementation=attn_impl,
         torch_dtype=str(model_config.torch_dtype),

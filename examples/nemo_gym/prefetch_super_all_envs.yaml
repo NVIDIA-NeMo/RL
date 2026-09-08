@@ -60,6 +60,9 @@ env:
 
     # Thin vllm_model clients for the judge refs the bundled configs expect (so refs resolve and
     # the vllm_model venv builds). genrm_model is already defined by the bundled genrm_compare.yaml.
+    # return_token_id_information/uses_reasoning_parser have no defaults in Gym's VLLMModelConfig,
+    # so they must be set even here: Gym launches a process for every block carrying an
+    # entrypoint, and the dry run exits before serving rather than skipping validation.
     safety_judge_model:
       responses_api_models:
         vllm_model:
@@ -67,7 +70,8 @@ env:
           base_url: http://localhost:8000/v1
           api_key: dummy
           model: dummy-judge
-          spinup_server: false
+          return_token_id_information: false
+          uses_reasoning_parser: false
     judge_model:
       responses_api_models:
         vllm_model:
@@ -75,7 +79,8 @@ env:
           base_url: http://localhost:8000/v1
           api_key: dummy
           model: dummy-judge
-          spinup_server: false
+          return_token_id_information: false
+          uses_reasoning_parser: false
     # Thin client for the *_reasoning_off agent refs.
     policy_model_reasoning_off:
       responses_api_models:
@@ -84,18 +89,24 @@ env:
           base_url: http://localhost:8000/v1
           api_key: dummy
           model: dummy-model
-          spinup_server: false
+          return_token_id_information: false
+          uses_reasoning_parser: false
     # Standalone server defined only to bake the local_vllm_model venv (the runtime GPU judges
     # use this type). dry_run builds the venv without loading a model.
+    # LocalVLLMModelConfig extends VLLMModelConfig, so it needs the two fields above plus a
+    # vllm_serve_env_vars mapping (also default-less).
     prefetch_local_vllm_model:
       responses_api_models:
         local_vllm_model:
           entrypoint: app.py
           model: dummy-model
+          return_token_id_information: false
+          uses_reasoning_parser: false
           vllm_serve_kwargs:
             tensor_parallel_size: 1
             data_parallel_size: 1
             pipeline_parallel_size: 1
+          vllm_serve_env_vars: {}
 
     # swe_agents marks container_formatter/dataset_path mandatory; dummies satisfy the dry run.
     swe_agents_train:

@@ -22,7 +22,13 @@
 import argparse
 
 import torch
-from vllm import LLM, SamplingParams
+
+from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
+
+# Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+ensure_vllm_source_compat()
+
+from vllm import LLM, SamplingParams  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # ARC-AGI prompts validated against Nano v3 TME divergence investigation.
@@ -348,6 +354,11 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         seed=seed,
         gpu_memory_utilization=0.8,
+        # This diagnostic only submits a handful of prompts. vLLM >= 0.25
+        # hard-fails when the default max_num_seqs (1024) exceeds the
+        # available Mamba cache blocks on hybrid models (one block per
+        # decode sequence), so keep the sequence budget small.
+        max_num_seqs=64,
     )
     llm = LLM(**llm_kwargs)
 

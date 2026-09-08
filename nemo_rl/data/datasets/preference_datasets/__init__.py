@@ -16,16 +16,21 @@ from nemo_rl.data.datasets.preference_datasets.binary_preference_dataset import 
     BinaryPreferenceDataset,
 )
 from nemo_rl.data.datasets.preference_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.datasets.preference_datasets.mmpr import MMPRPreferenceDataset
 from nemo_rl.data.datasets.preference_datasets.preference_dataset import (
     PreferenceDataset,
 )
 from nemo_rl.data.datasets.preference_datasets.tulu3 import Tulu3PreferenceDataset
-from nemo_rl.data.datasets.utils import resolve_external_dataset_class
+from nemo_rl.data.datasets.utils import (
+    resolve_external_dataset_class,
+    warn_on_unsupported_dataset_config_keys,
+)
 
 DATASET_REGISTRY = {
     # built-in datasets
     "HelpSteer3": HelpSteer3Dataset,
     "Tulu3Preference": Tulu3PreferenceDataset,
+    "MMPRPreference": MMPRPreferenceDataset,
     # load from local JSONL file or HuggingFace
     "BinaryPreferenceDataset": BinaryPreferenceDataset,
     "PreferenceDataset": PreferenceDataset,
@@ -61,6 +66,10 @@ def load_preference_dataset(data_config: PreferenceDatasetConfig):
             "(ensure it is installed and importable from PYTHONPATH)."
         )
 
+    # Every dataset class accepts **kwargs, so unsupported config keys are
+    # otherwise swallowed silently (e.g. `split` on Tulu3PreferenceDataset).
+    warn_on_unsupported_dataset_config_keys(dataset_class, data_config)
+
     dataset = dataset_class(
         **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
     )
@@ -74,6 +83,7 @@ def load_preference_dataset(data_config: PreferenceDatasetConfig):
 __all__ = [
     "BinaryPreferenceDataset",
     "HelpSteer3Dataset",
+    "MMPRPreferenceDataset",
     "PreferenceDataset",
     "Tulu3PreferenceDataset",
     "load_preference_dataset",

@@ -23,7 +23,7 @@ policy:
         gpus_per_node: 8
     vllm_cfg:
       tensor_parallel_size: 8
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.88
       async_engine: true
 logger:
   log_dir: logs/grpo-qwen3-235b-32n8g-16T16G-async-1off

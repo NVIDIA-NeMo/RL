@@ -57,6 +57,12 @@ The virtual environment location depends on your runtime environment:
 - **Bare metal**: The venv defaults to `.venv/` local to your NeMo RL clone
 - **Container**: The container sets [`UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv`](https://github.com/NVIDIA-NeMo/RL/blob/main/docker/Dockerfile#L67), so the environment is synced to `/opt/nemo_rl_venv`. Note that this location is ephemeral to the container instance.
 
+> [!WARNING]
+> If you see a ray version or python version mismatch between the server and the client, it indicates
+> your container should be rebuilt since `ray` and/or `python` (and potentially several other packages)
+> have drifted between your container and code. Rebuilding the container will lead to faster startup
+> times since dependencies will not have to be synced on all the nodes simultaneously.
+
 ### 3. `source .venv/bin/activate`
 
 Activates the virtual environment, setting up the Python path and environment variables so your script runs with the correct dependencies.
@@ -88,12 +94,12 @@ Within the driver script, NeMo RL starts multiple [`RayWorkerGroup`](https://git
 - **Generation workers** (e.g., vLLM): Require `vllm` dependencies  
 - **Environment workers** (e.g., math evaluation): Use system/base dependencies
 
-Each worker type is mapped to a specific Python executable configuration in the [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py#L27-L46). This registry defines which virtual environment should be used for each actor type:
+Each worker type is mapped to a specific Python executable configuration in the [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py#L17-L55). This registry defines which virtual environment should be used for each actor type:
 
 ```python
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
-    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
-    "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": PY_EXECUTABLES.VLLM,
+    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": PY_EXECUTABLES.MCORE,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     # ... more mappings
 }

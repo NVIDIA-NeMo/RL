@@ -176,6 +176,20 @@ uv run --frozen ./examples/nemo_gym/run_grpo_nemo_gym.py \
 
 Stage 2 uses a smaller global batch (`num_prompts_per_step=8`, `train_global_batch_size=64`) because each rollout is an expensive multi-turn trajectory (`agent_max_turns=200`, `swebench_agent_timeout=1800s`), and bumps Megatron TP to 4. `policy.model_name` points at the HF-converted SWE1 checkpoint.
 
+## [Alternative] Using TensorRT-LLM generation backend in Stage 2
+
+The recipe also supports running Stage 2 generation with [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) instead of vLLM. This can be useful when TensorRT-LLM's in-flight weight update path offers better throughput for a given cluster configuration.
+
+Use [`examples/swe_bench/grpo_qwen3_30b_async_swe_trtllm.yaml`](../../examples/swe_bench/grpo_qwen3_30b_async_swe_trtllm.yaml), which inherits the SWE2 training and environment settings and switches the generation backend. Set `container_formatter` in the YAML to your `.sif` image template (same as Stage 2 vLLM), then launch with your Stage 1 checkpoint and data:
+
+```bash
+uv run --frozen ./examples/nemo_gym/run_grpo_nemo_gym.py \
+  --config examples/swe_bench/grpo_qwen3_30b_async_swe_trtllm.yaml \
+  policy.model_name=/path/to/swe1_checkpoint_hf \
+  data.train.data_path=/path/to/data/swe2/train-split.jsonl \
+  data.validation.data_path=/path/to/data/swe2/val-split.jsonl
+```
+
 ## What to monitor
 
 - **`train/total_reward/mean`** — primary signal and the checkpointing metric for both stages.

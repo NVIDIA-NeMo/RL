@@ -65,7 +65,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.megatron_cfg.sequence_parallel=false \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
     policy.generation.vllm_cfg.async_engine=true \
-    policy.max_total_sequence_length=512 \
+    policy.max_total_sequence_length=768 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
     policy.generation.colocated.resources.gpus_per_node=1 \

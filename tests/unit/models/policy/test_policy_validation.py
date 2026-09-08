@@ -28,6 +28,13 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 
+def test_shutdown_succeeds_before_worker_group_is_initialized(capsys) -> None:
+    policy = Policy.__new__(Policy)
+
+    assert policy.shutdown()
+    assert capsys.readouterr().out == ""
+
+
 def create_mock_cluster(world_size: int):
     """Create a mock cluster with the specified world size."""
     cluster = MagicMock()
@@ -162,6 +169,30 @@ def create_megatron_config(
             "betas": [0.9, 0.999],
         },
     }
+
+
+def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
+    cluster = create_mock_cluster(world_size=1)
+    tokenizer = create_mock_tokenizer()
+    config = create_dtensor_config("test/model", tp=1)
+    overrides = {"qk_rope_head_dim": 64}
+    config["hf_config_overrides"] = overrides
+    model_config = MagicMock()
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+        patch(
+            "nemo_rl.models.policy.lm_policy.get_hf_config",
+            return_value=model_config,
+        ) as mock_get_hf_config,
+        patch(
+            "nemo_rl.models.policy.lm_policy.FLOPTracker.from_config"
+        ) as mock_from_config,
+    ):
+        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    mock_get_hf_config.assert_called_once_with("test/model", **overrides)
+    mock_from_config.assert_called_once_with("test/model", model_config)
 
 
 @pytest.mark.parametrize(
