@@ -79,10 +79,13 @@ from nemo_rl.package_info import (
 
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
-# Reaping a dead generation worker's EngineCore needs a raylet setting too, but it is NOT
-# set here: it is a raylet-wide behaviour change that only fleet-health runs need, and
-# importing nemo_rl is not consent to it. See
-# nemo_rl.models.generation.maybe_configure_engine_reaping_env.
+# Reaping a dead generation worker's EngineCore needs a raylet setting too
+# (RAY_process_group_cleanup_enabled), but it is NOT set here: it is a raylet-wide
+# behaviour change and importing nemo_rl is not consent to it. It also would not work from
+# here on a cluster -- the raylet is already running by then. It belongs wherever the
+# raylet is launched: ray.sub for Slurm, and
+# nemo_rl.models.generation.maybe_configure_engine_reaping_env for a driver that starts its
+# own.
 
 
 def _is_build_isolation():

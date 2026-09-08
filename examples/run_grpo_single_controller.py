@@ -127,7 +127,7 @@ def main() -> None:
 
     # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
     maybe_configure_data_plane_env(config.data_plane)
-    maybe_configure_engine_reaping_env(config.async_rl.generation_fleet_health)
+    maybe_configure_engine_reaping_env(config.async_rl.generation_fleet_health.enabled)
     init_ray()
 
     processor = None

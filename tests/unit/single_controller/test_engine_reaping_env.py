@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``RAY_process_group_cleanup_enabled`` must reach fleet-health runs and nothing else.
+"""``RAY_process_group_cleanup_enabled`` must reach whichever process starts the raylet.
 
-It was originally set at ``import nemo_rl``, which handed a raylet-wide behaviour change
-to every SFT, DPO and distillation run in the repo -- none of which own an EngineCore to
-reap. See ``maybe_configure_engine_reaping_env`` for what the flag is for.
+Only the raylet reads it, and only at its own startup, so where it is set decides whether
+it works at all. Two shapes: the driver forks the raylet (local, single node) or ``ray
+start`` beat the driver to it (Slurm, k8s). This file pins both, and pins that the first
+shape stays scoped -- it was originally set at ``import nemo_rl``, which handed a
+raylet-wide behaviour change to every SFT, DPO and distillation run in the repo, none of
+which own an EngineCore to reap. See ``maybe_configure_engine_reaping_env`` for what the
+flag is for.
 """
 
 import ast
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -44,22 +47,17 @@ def _clean_flag():
 
 class TestTheGate:
     def test_a_fleet_health_run_gets_the_flag(self):
-        maybe_configure_engine_reaping_env(SimpleNamespace(enabled=True))
+        maybe_configure_engine_reaping_env(True)
         assert os.environ[FLAG] == "1"
 
-    @pytest.mark.parametrize(
-        "cfg",
-        [None, SimpleNamespace(enabled=False)],
-        ids=["no-fleet-health-at-all", "fleet-health-off"],
-    )
-    def test_everything_else_is_left_alone(self, cfg):
-        maybe_configure_engine_reaping_env(cfg)
+    def test_everything_else_is_left_alone(self):
+        maybe_configure_engine_reaping_env(False)
         assert FLAG not in os.environ
 
     def test_an_explicit_operator_setting_wins(self):
         """setdefault, not assignment: someone debugging a wedged engine wants the corpse."""
         os.environ[FLAG] = "0"
-        maybe_configure_engine_reaping_env(SimpleNamespace(enabled=True))
+        maybe_configure_engine_reaping_env(True)
         assert os.environ[FLAG] == "0"
 
 
@@ -119,4 +117,44 @@ class TestTheCallSite:
             f"maybe_configure_engine_reaping_env at line {max(reaping)} runs after "
             f"init_ray() at line {min(init_ray)}; the raylet has already been spawned "
             "with the old environment by then."
+        )
+
+
+class TestTheClusterLauncher:
+    """On a cluster the driver is too late, so ray.sub has to carry the flag itself.
+
+    ``ray start`` runs on every node before the driver process exists, and ``init_ray()``
+    then attaches with ``address="auto"`` -- so the driver-side call above is inert there.
+    The failure is silent in the worst way: the run works, the shard restarts, and the GPU
+    is simply never returned. No SC functional test can catch it either, because none of
+    them start a cluster.
+    """
+
+    RAY_SUB = REPO_ROOT / "ray.sub"
+
+    def test_ray_sub_exports_the_flag_before_it_starts_any_raylet(self):
+        lines = self.RAY_SUB.read_text().splitlines()
+        exports = [
+            i for i, line in enumerate(lines) if line.startswith(f"export {FLAG}=")
+        ]
+        # Command lines only; the surrounding comments talk about `ray start` too.
+        starts = [
+            i for i, line in enumerate(lines) if line.strip().startswith("ray start")
+        ]
+        assert exports, (
+            f"ray.sub does not export {FLAG}. The raylet reads it at its own startup, "
+            "so every Slurm run leaks a dead generation worker's EngineCore GPU no "
+            "matter what the driver sets."
+        )
+        assert starts, "expected ray.sub to run `ray start`"
+        assert max(exports) < min(starts), (
+            f"ray.sub exports {FLAG} at line {max(exports) + 1}, after `ray start` at "
+            f"line {min(starts) + 1}; the raylet is already up with the old environment."
+        )
+
+    def test_the_export_honours_an_operator_override(self):
+        """Same reason as the driver-side setdefault: leave a deliberate 0 alone."""
+        assert f'export {FLAG}="${{{FLAG}:-1}}"' in self.RAY_SUB.read_text(), (
+            f"expected ray.sub to default {FLAG} with `:-` rather than assign it, so an "
+            "operator debugging a wedged engine can keep the corpse."
         )

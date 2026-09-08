@@ -13,7 +13,7 @@
 # limitations under the License.
 import os
 import warnings
-from typing import TYPE_CHECKING, Optional, cast
+from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
@@ -22,21 +22,11 @@ from nemo_rl.models.generation.trtllm import TrtllmConfig
 from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
 
-if TYPE_CHECKING:
-    from nemo_rl.algorithms.single_controller_utils.config import FleetHealthConfig
-
 TokenizerType = PreTrainedTokenizerBase
 
 
-def maybe_configure_engine_reaping_env(
-    fleet_health: "Optional[FleetHealthConfig]",
-) -> None:
-    """Let the raylet reap a dead generation worker's EngineCore.
-
-    Call this on the driver **before** ``init_ray()``, like
-    :func:`~nemo_rl.data_plane.factory.maybe_configure_data_plane_env`. The raylet reads
-    this setting when ``ray.init`` spawns it, and the raylet is the whole point: it
-    outlives the worker, so it can kill what the worker no longer can.
+def maybe_configure_engine_reaping_env(enabled: bool) -> None:
+    """Let the raylet reap a dead generation worker's EngineCore, on runs the driver owns.
 
     A vLLM generation worker spawns its EngineCore as a plain multiprocessing child --
     ``context.Process(target=EngineCoreProc.run_engine_core)``, no ``setsid``, not a
@@ -44,35 +34,41 @@ def maybe_configure_engine_reaping_env(
     that exists runs INSIDE the dying process, so SIGKILL defeats all of them: vLLM's
     ``weakref.finalize`` never fires, a non-daemon multiprocessing child is designed to
     outlive its parent, and Ray's default ``RAY_kill_child_processes_on_worker_exit`` is
-    the worker's own exit handler. The orphan then holds its GPU for the life of the job.
-    Because the EngineCore never calls ``setsid`` it stays in the worker's process group,
-    which is exactly what per-worker process-group cleanup reaches.
+    the worker's own exit handler. The orphan then holds its GPU for the life of the job:
+    measured on 4xGB200, one SIGKILLed shard left 114.95 GiB of a 184.31 GiB device still
+    held, and it did not come back across five restart attempts -- the replacement could
+    not fit, so re-admission failed while the survivors carried on. Because the EngineCore
+    never calls ``setsid`` it stays in the worker's process group, which is exactly what
+    per-worker process-group cleanup reaches.
 
-    Job 6720618 measured the leak on 4xGB200: after one shard was SIGKILLed, cuda:0
-    reported 69.36/184.31 GiB free -- 114.95 GiB still held, one engine at
-    ``gpu_memory_utilization=0.6`` plus overhead -- and that number did not move across
-    five restart attempts over 370s. The replacement could not fit, so re-admission
-    failed while the survivors carried on.
+    **The raylet is the only reader, and this only reaches the raylet on runs where the
+    driver starts it.** Ray reads ``process_group_cleanup_enabled`` in the raylet, at the
+    raylet's own startup. Call this **before** ``init_ray()``, like
+    :func:`~nemo_rl.data_plane.factory.maybe_configure_data_plane_env`, and on a
+    local/single-node run ``ray.init`` forks a raylet that inherits this environment, so it
+    lands. On a Slurm or k8s cluster it does NOT: ``ray start`` has already run on every
+    node before the driver process exists, and ``init_ray()`` then attaches to it with
+    ``address="auto"``. Nothing the driver sets afterwards can change a raylet that is
+    already up. Those deployments set the flag where the raylet is actually launched --
+    see the ``RAY_process_group_cleanup_enabled`` export in ``ray.sub`` -- which means it
+    is unconditional there, not scoped to fleet health.
 
-    Scoped to fleet-health runs rather than set on ``import nemo_rl``. Two reasons, and
-    the second is why this function exists at all:
-
-    - Only a run that tolerates a dead shard can leave an orphan behind. This is NOT
-      specific to restart -- any shard loss leaks that GPU for the rest of the run -- so
-      the gate is ``fleet_health.enabled``, not ``restart_dead_shards``.
-    - It is a raylet-wide behaviour change, and importing ``nemo_rl`` is not consent to
-      it. A plain SFT, DPO or distillation run has no EngineCore to reap, so the flag is
-      pure risk there.
+    So the gate below buys scoping on exactly one deployment shape. It is still worth
+    having: a raylet-wide behaviour change should not follow from ``import nemo_rl``, and a
+    plain SFT, DPO or distillation run has no EngineCore to reap. But it is not a property
+    of the flag, it is a property of who started the raylet.
 
     ``setdefault``, not assignment: an operator debugging a wedged engine may want the
-    corpse, and an explicit ``RAY_process_group_cleanup_enabled=0`` in the environment
-    stays honoured.
+    corpse, and an explicit ``RAY_process_group_cleanup_enabled=0`` stays honoured.
 
     Args:
-        fleet_health: The generation fleet-health config, or ``None`` on a path that has
-            no fleet health at all. No-op unless it is enabled.
+        enabled: Whether this run can lose a generation worker and keep going. A ``bool``
+            rather than the fleet-health config, so any entrypoint that builds vLLM
+            generation can call it -- the leak is not specific to fleet health, it just
+            takes a run that survives the loss to leave the orphan behind. Note this is
+            ``fleet_health.enabled``, not ``restart_dead_shards``: any shard loss leaks
+            that GPU, restarting is only what makes the loss survivable.
     """
-    enabled = getattr(fleet_health, "enabled", False) if fleet_health else False
     if not enabled:
         return
     os.environ.setdefault("RAY_process_group_cleanup_enabled", "1")
