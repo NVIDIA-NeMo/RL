@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import uuid
 from collections.abc import Iterable
 from functools import wraps
 from typing import Any, Optional
@@ -30,14 +31,61 @@ from nemo_rl.utils.r3_trace import (
     trace_router_replay_action,
     trace_router_replay_assignment,
 )
+from nemo_rl.utils.routed_experts_ref import ROUTED_EXPERTS_REF_TRANSPORT
 
 _ROUTER_REPLAY_VALIDATE_ENV = "NRL_ROUTER_REPLAY_VALIDATE"
+_ROUTER_REPLAY_EXCLUDE_MTP_ENV = "NRL_ROUTER_REPLAY_EXCLUDE_MTP"
 _MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 _MISSING_ROUTE_FALLBACK_PATCH_ATTR = "_nrl_missing_route_fallback_patch"
+_MISSING_ROUTE_FALLBACK_MASK_ATTR = "_nrl_missing_route_fallback_mask"
 
 
 def router_replay_enabled(config: PolicyConfig) -> bool:
     return bool((config.get("router_replay") or {}).get("enabled", False))
+
+
+def router_replay_transport(config: PolicyConfig) -> str:
+    return str((config.get("router_replay") or {}).get("transport", "inline"))
+
+
+def validate_router_replay_transport_path(
+    config: PolicyConfig,
+    *,
+    data_plane_enabled: bool,
+    async_grpo_enabled: bool,
+    nemo_gym_enabled: bool,
+) -> None:
+    """Reject transport/backend combinations that are not implemented yet."""
+    if (
+        router_replay_enabled(config)
+        and router_replay_transport(config) == ROUTED_EXPERTS_REF_TRANSPORT
+        and data_plane_enabled
+    ):
+        # TODO: Let TQ schemas carry opaque route-reference tags and resolve them
+        # in the selected policy microbatch, without materializing on the driver.
+        raise NotImplementedError(
+            "policy.router_replay.transport=ray is not supported with "
+            "data_plane.enabled=true yet. Use transport=inline for the existing "
+            "TransferQueue routing-replay path, or set data_plane.enabled=false "
+            "for the Ray-reference path."
+        )
+    if not (
+        router_replay_enabled(config)
+        and router_replay_transport(config) == ROUTED_EXPERTS_REF_TRANSPORT
+    ):
+        return
+    if not async_grpo_enabled:
+        raise NotImplementedError(
+            "policy.router_replay.transport=ray currently requires async GRPO; "
+            "its weight-version GC is tied to completion of an async optimizer "
+            "step."
+        )
+    if not nemo_gym_enabled:
+        raise NotImplementedError(
+            "policy.router_replay.transport=ray currently requires "
+            "env.should_use_nemo_gym=true because tags are emitted by the vLLM "
+            "Chat Completions endpoint."
+        )
 
 
 def configure_vllm_for_router_replay(config: PolicyConfig) -> None:
@@ -49,6 +97,15 @@ def configure_vllm_for_router_replay(config: PolicyConfig) -> None:
     vllm_kwargs = generation.setdefault("vllm_kwargs", {})
     vllm_kwargs["enable_return_routed_experts"] = True
 
+    if router_replay_transport(config) == ROUTED_EXPERTS_REF_TRANSPORT:
+        router_replay = config["router_replay"]
+        run_instance_id = router_replay.setdefault(
+            "_store_run_instance_id", uuid.uuid4().hex
+        )
+        vllm_cfg = generation.setdefault("vllm_cfg", {})
+        vllm_cfg["_routed_experts_transport"] = ROUTED_EXPERTS_REF_TRANSPORT
+        vllm_cfg["_routed_experts_store_run_instance_id"] = run_instance_id
+
 
 def validate_router_replay_config(config: PolicyConfig) -> None:
     if not router_replay_enabled(config):
@@ -56,11 +113,24 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
 
     generation = config.get("generation") or {}
     megatron_cfg = config.get("megatron_cfg") or {}
+    transport = router_replay_transport(config)
+
+    if transport not in {"inline", ROUTED_EXPERTS_REF_TRANSPORT}:
+        raise ValueError(
+            f"router_replay.transport must be 'inline' or 'ray', got {transport!r}."
+        )
 
     if generation.get("backend") != "vllm":
         raise ValueError("router_replay.enabled requires vLLM generation.")
     if not megatron_cfg.get("enabled", False):
         raise ValueError("router_replay.enabled requires the Megatron policy backend.")
+    if transport == ROUTED_EXPERTS_REF_TRANSPORT and not (
+        generation.get("vllm_cfg") or {}
+    ).get("async_engine", False):
+        raise ValueError(
+            "router_replay.transport=ray currently requires the vLLM "
+            "async engine used by the NeMo-Gym chat endpoint."
+        )
 
     vpp_size = megatron_cfg.get("virtual_pipeline_model_parallel_size")
     if vpp_size not in (None, 1):
@@ -81,6 +151,37 @@ def _iter_model_modules(model: Any) -> Iterable[Any]:
         yield from modules()
     else:
         yield model
+
+
+def _iter_model_modules_with_mtp_ancestry(
+    model: Any, *, beneath_mtp: bool = False
+) -> Iterable[tuple[Any, bool]]:
+    """Yield modules and whether MCore identifies them as part of an MTP layer."""
+    if isinstance(model, (list, tuple)):
+        for item in model:
+            yield from _iter_model_modules_with_mtp_ancestry(
+                item, beneath_mtp=beneath_mtp
+            )
+        return
+
+    beneath_mtp = beneath_mtp or bool(getattr(model, "is_mtp_layer", False))
+    yield model, beneath_mtp
+
+    children = getattr(model, "children", None)
+    if callable(children):
+        for child in children():
+            yield from _iter_model_modules_with_mtp_ancestry(
+                child, beneath_mtp=beneath_mtp
+            )
+
+
+def _router_replay_exclude_mtp_enabled() -> bool:
+    return os.getenv(_ROUTER_REPLAY_EXCLUDE_MTP_ENV, "1").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _unwrap_model_config(model: Any) -> Optional[Any]:
@@ -104,6 +205,29 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
 
 def _global_moe_layer_numbers(model_config: Any) -> list[int]:
     num_layers = int(getattr(model_config, "num_layers"))
+
+    # Hybrid models encode the actual layer type directly.  Prefer that over
+    # moe_layer_freq: Nemotron-H/Omni providers do not set moe_layer_freq, so
+    # its generic default of 1 would incorrectly classify every layer as MoE.
+    # The payload contains only main-decoder routes; pipeline separators and
+    # any unified MTP patterns therefore do not consume payload-layer slots.
+    hybrid_pattern = getattr(model_config, "hybrid_layer_pattern", None)
+    if hybrid_pattern is None:
+        hybrid_pattern = getattr(model_config, "hybrid_override_pattern", None)
+    if hybrid_pattern:
+        main_pattern = str(hybrid_pattern).split("/", 1)[0].replace("|", "")
+        if len(main_pattern) != num_layers:
+            raise ValueError(
+                "hybrid layer pattern has "
+                f"{len(main_pattern)} main-decoder layers but num_layers={num_layers}: "
+                f"{hybrid_pattern!r}"
+            )
+        return [
+            layer_idx + 1
+            for layer_idx, layer_type in enumerate(main_pattern)
+            if layer_type == "E"
+        ]
+
     moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
 
     if isinstance(moe_layer_freq, int):
@@ -125,7 +249,10 @@ def _global_moe_layer_numbers(model_config: Any) -> list[int]:
 def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:
     instances: list[tuple[Any, int]] = []
     seen: set[int] = set()
-    for module in _iter_model_modules(model):
+    exclude_mtp = _router_replay_exclude_mtp_enabled()
+    for module, beneath_mtp in _iter_model_modules_with_mtp_ancestry(model):
+        if exclude_mtp and beneath_mtp:
+            continue
         replay = getattr(module, "router_replay", None)
         layer_number = getattr(module, "layer_number", None)
         if replay is None or layer_number is None:
@@ -139,7 +266,10 @@ def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:
 
 def _local_layer_numbers_for_model(model: Any) -> set[int]:
     layer_numbers: set[int] = set()
-    for module in _iter_model_modules(model):
+    exclude_mtp = _router_replay_exclude_mtp_enabled()
+    for module, beneath_mtp in _iter_model_modules_with_mtp_ancestry(model):
+        if exclude_mtp and beneath_mtp:
+            continue
         layer_number = getattr(module, "layer_number", None)
         if layer_number is None:
             continue
@@ -292,10 +422,11 @@ def _install_missing_route_fallback_patch() -> None:
         default_compute_topk: Optional[Any] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         action = getattr(replay_instance, "router_replay_action", None)
-        if action not in {
-            RouterReplayAction.REPLAY_FORWARD,
-            RouterReplayAction.REPLAY_BACKWARD,
-        }:
+        if action != RouterReplayAction.REPLAY_FORWARD:
+            # Forward replaces every missing-route sentinel with the effective
+            # Megatron route before it enters replay_backward_list. Backward can
+            # therefore use MCore's normal FIFO replay path without scanning the
+            # tensor again (or synchronizing the GPU with the host).
             return original_get_replay_topk(
                 replay_instance,
                 scores,
@@ -305,12 +436,7 @@ def _install_missing_route_fallback_patch() -> None:
                 default_compute_topk,
             )
 
-        if action == RouterReplayAction.REPLAY_FORWARD:
-            target_topk_idx = getattr(replay_instance, "target_topk_idx", None)
-        else:
-            replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
-            target_topk_idx = replay_backward_list[0] if replay_backward_list else None
-
+        target_topk_idx = getattr(replay_instance, "target_topk_idx", None)
         if target_topk_idx is None:
             return original_get_replay_topk(
                 replay_instance,
@@ -321,17 +447,30 @@ def _install_missing_route_fallback_patch() -> None:
                 default_compute_topk,
             )
 
+        has_precomputed_fallback_state = hasattr(
+            replay_instance, _MISSING_ROUTE_FALLBACK_MASK_ATTR
+        )
+        if has_precomputed_fallback_state:
+            fallback_mask = getattr(replay_instance, _MISSING_ROUTE_FALLBACK_MASK_ATTR)
+            if fallback_mask is None:
+                return original_get_replay_topk(
+                    replay_instance,
+                    scores,
+                    topk,
+                    num_groups,
+                    group_topk,
+                    default_compute_topk,
+                )
+
         target_topk_idx = target_topk_idx.to(scores.device)
-        fallback_mask = target_topk_idx.eq(_MISSING_ROUTE_SENTINEL).all(dim=-1)
-        if not bool(fallback_mask.any().item()):
-            return original_get_replay_topk(
-                replay_instance,
-                scores,
-                topk,
-                num_groups,
-                group_topk,
-                default_compute_topk,
-            )
+        if has_precomputed_fallback_state:
+            fallback_mask = fallback_mask.to(scores.device)
+        else:
+            # Direct users of the monkey patch may bypass
+            # set_router_replay_forward(). Conservatively take the GPU-only
+            # fallback path in that case. The NeMo RL path always installs a
+            # precomputed mask or an explicit no-fallback marker.
+            fallback_mask = target_topk_idx.eq(_MISSING_ROUTE_SENTINEL).all(dim=-1)
 
         if default_compute_topk is None:
             raise RuntimeError(
@@ -348,17 +487,61 @@ def _install_missing_route_fallback_patch() -> None:
         effective_topk_idx[fallback_mask] = default_indices[fallback_mask]
         probs = scores.gather(1, effective_topk_idx)
 
-        if action == RouterReplayAction.REPLAY_FORWARD:
-            replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
-            if replay_backward_list:
-                replay_backward_list[-1] = effective_topk_idx.detach()
-        else:
-            getattr(replay_instance, "replay_backward_list").pop(0)
+        replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
+        if replay_backward_list:
+            replay_backward_list[-1] = effective_topk_idx.detach()
 
         return probs, effective_topk_idx
 
     setattr(wrapped_get_replay_topk, _MISSING_ROUTE_FALLBACK_PATCH_ATTR, True)
     RouterReplay.get_replay_topk = wrapped_get_replay_topk
+
+
+def _prepare_missing_route_fallback_masks(
+    replay_assignments: list[tuple[Any, torch.Tensor]],
+) -> None:
+    """Install per-layer fallback state with one setup-time device sync.
+
+    RouterReplay.get_replay_topk runs once per MoE layer during forward and
+    again during activation-checkpoint recomputation. Deciding whether a layer
+    contains a missing-route sentinel in that method would make every call
+    execute ``Tensor.item()``, serializing the CUDA stream with the host.
+
+    Compute the masks before model execution instead, then transfer only the
+    small vector of per-layer ``any`` results to the CPU. Layers without missing
+    routes carry an explicit ``None`` marker and take MCore's original fast path;
+    layers with missing routes retain their GPU mask for row-wise fallback.
+    """
+    if not replay_assignments:
+        return
+
+    fallback_masks = [
+        replay_tensor.eq(_MISSING_ROUTE_SENTINEL).all(dim=-1)
+        for _, replay_tensor in replay_assignments
+    ]
+    fallback_required = torch.stack(
+        [fallback_mask.any() for fallback_mask in fallback_masks]
+    )
+    # This is the only device-to-host synchronization needed to select the
+    # fallback path for the whole microbatch.
+    fallback_required_cpu = fallback_required.detach().to(device="cpu").tolist()
+
+    for (replay_instance, _), fallback_mask, is_required in zip(
+        replay_assignments,
+        fallback_masks,
+        fallback_required_cpu,
+        strict=True,
+    ):
+        setattr(
+            replay_instance,
+            _MISSING_ROUTE_FALLBACK_MASK_ATTR,
+            fallback_mask if bool(is_required) else None,
+        )
+
+
+def _clear_missing_route_fallback_mask(replay_instance: Any) -> None:
+    if hasattr(replay_instance, _MISSING_ROUTE_FALLBACK_MASK_ATTR):
+        delattr(replay_instance, _MISSING_ROUTE_FALLBACK_MASK_ATTR)
 
 
 def _get_tensor_model_parallel_world_size() -> int:
@@ -483,9 +666,9 @@ def set_router_replay_forward(model: Any, routed_experts: torch.Tensor) -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
     _install_missing_route_fallback_patch()
-    for replay_instance, replay_tensor in build_router_replay_assignments(
-        model, routed_experts
-    ):
+    replay_assignments = build_router_replay_assignments(model, routed_experts)
+    _prepare_missing_route_fallback_masks(replay_assignments)
+    for replay_instance, replay_tensor in replay_assignments:
         replay_instance.set_target_indices(replay_tensor)
         trace_router_replay_action(
             action="replay_forward",
@@ -517,11 +700,14 @@ def clear_router_replay(model: Optional[Any] = None) -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
     if model is None:
+        for replay_instance in RouterReplay.global_router_replay_instances:
+            _clear_missing_route_fallback_mask(replay_instance)
         RouterReplay.clear_global_router_replay_action()
         RouterReplay.clear_global_indices()
         return
 
     for replay_instance, _ in _router_replay_instances_for_model(model):
+        _clear_missing_route_fallback_mask(replay_instance)
         replay_instance.clear_router_replay_action()
         replay_instance.clear_indices()
 

@@ -35,6 +35,7 @@ from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
+from nemo_rl.utils.routed_experts_ref import materialize_routed_experts_refs
 
 
 @dataclass
@@ -123,6 +124,19 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
+        routed_experts = data_dict.get("routed_experts")
+        if routed_experts is not None and not isinstance(routed_experts, torch.Tensor):
+            if "input_lengths" not in data_dict:
+                raise ValueError(
+                    "Ray-reference routed_experts requires input_lengths for "
+                    "microbatch-local materialization."
+                )
+            data_dict["routed_experts"] = materialize_routed_experts_refs(
+                routed_experts,
+                input_ids=data_dict["input_ids"],
+                input_lengths=data_dict["input_lengths"],
+            )
+
         # Move to GPU
         data_dict = data_dict.to("cuda")
 

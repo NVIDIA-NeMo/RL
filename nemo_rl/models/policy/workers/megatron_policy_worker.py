@@ -1829,6 +1829,12 @@ class MegatronPolicyWorkerImpl(
 
         self.model.eval()
 
+        if not require_router_replay and "routed_experts" in data:
+            # Reference-policy logprobs intentionally use their own router.
+            # Drop both dense payloads and Ray tags before microbatch processing
+            # so this path never materializes rollout routes unnecessarily.
+            del data["routed_experts"]
+
         # Logprobs run the same forward as training, so a batch that needs the
         # mask needs it here too -- otherwise these logprobs would be taken
         # against a different media alignment than the one trained on.

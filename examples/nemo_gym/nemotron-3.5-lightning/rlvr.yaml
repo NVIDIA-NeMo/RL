@@ -116,6 +116,14 @@ loss_fn:
   kl_input_clamp_value: null
   kl_output_clamp_value: null
 
+  # KL(pi_gen || pi_curr) penalty toward the behaviour (rollout) policy.
+  # Bounds cumulative drift across async steps; clamps must stay set (k3
+  # blows up exponentially on bf16 logprob outliers).
+  behaviour_kl_penalty: 0.0
+  behaviour_kl_type: "k3"
+  behaviour_kl_input_clamp_value: 20.0
+  behaviour_kl_output_clamp_value: 10.0
+
   ratio_clip_min: 0.2
   ratio_clip_max: 0.28
   ratio_clip_c: null

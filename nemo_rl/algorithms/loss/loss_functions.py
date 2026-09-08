@@ -51,6 +51,148 @@ from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
+SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC = "_seq_logprob_error_sum_before"
+SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC = "_seq_logprob_error_count_before"
+SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC = "_seq_logprob_error_min_before"
+SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC = "_seq_logprob_error_max_before"
+SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC = "_seq_logprob_error_sum_after"
+SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC = "_seq_logprob_error_count_after"
+SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC = "_seq_logprob_error_min_after"
+SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC = "_seq_logprob_error_max_after"
+SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC = "_seq_logprob_error_masked_count"
+SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC = (
+    "_seq_logprob_error_masked_correct_count"
+)
+
+SEQ_LOGPROB_ERROR_MIN_METRICS = frozenset(
+    {
+        SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC,
+        SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC,
+    }
+)
+SEQ_LOGPROB_ERROR_MAX_METRICS = frozenset(
+    {
+        SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC,
+        SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC,
+    }
+)
+SEQ_LOGPROB_ERROR_ACCUM_METRICS = frozenset(
+    {
+        SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC,
+        SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC,
+        *SEQ_LOGPROB_ERROR_MIN_METRICS,
+        *SEQ_LOGPROB_ERROR_MAX_METRICS,
+        SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC,
+        SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC,
+        SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC,
+        SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC,
+    }
+)
+
+LOSS_METRIC_MIN_REDUCTION_NAMES = frozenset(
+    {
+        "probs_ratio_min",
+        "probs_ratio_clamped_min",
+        *SEQ_LOGPROB_ERROR_MIN_METRICS,
+    }
+)
+LOSS_METRIC_MAX_REDUCTION_NAMES = frozenset(
+    {
+        "probs_ratio_max",
+        "probs_ratio_clamped_max",
+        *SEQ_LOGPROB_ERROR_MAX_METRICS,
+    }
+)
+
+
+def _compute_seq_logprob_error_mask(
+    *,
+    generation_logprobs: torch.Tensor,
+    policy_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    rewards: torch.Tensor,
+    threshold: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Build a loss-only sequence mask and mergeable error statistics."""
+    if generation_logprobs.shape != policy_logprobs.shape:
+        raise ValueError(
+            "Expected generation and policy logprobs to have the same shape, got "
+            f"{tuple(generation_logprobs.shape)} and {tuple(policy_logprobs.shape)}."
+        )
+    if token_mask.shape != generation_logprobs.shape:
+        raise ValueError(
+            "Expected token_mask to match loss logprobs, got "
+            f"{tuple(token_mask.shape)} and {tuple(generation_logprobs.shape)}."
+        )
+    if sample_mask.ndim != 1 or sample_mask.shape[0] != token_mask.shape[0]:
+        raise ValueError(
+            "Expected sample_mask shape [batch], got "
+            f"{tuple(sample_mask.shape)} for batch {token_mask.shape[0]}."
+        )
+    if rewards.numel() != sample_mask.numel():
+        raise ValueError(
+            "Expected one reward per sequence for sequence logprob error metrics, got "
+            f"{rewards.numel()} rewards and {sample_mask.numel()} sequences."
+        )
+
+    with torch.no_grad():
+        base_mask = token_mask * sample_mask.unsqueeze(-1)
+        denom = base_mask.sum(dim=-1)
+        valid_seq_mask = denom > 0
+        lp_error = torch.abs(generation_logprobs - policy_logprobs.detach())
+        seq_mult_prob_error = torch.zeros_like(denom, dtype=lp_error.dtype)
+        if valid_seq_mask.any():
+            # torch.where prevents invalid/padded positions from contributing
+            # NaNs through the otherwise unsafe NaN * 0 pattern.
+            masked_lp_error = torch.where(
+                base_mask.bool(), lp_error * base_mask, torch.zeros_like(lp_error)
+            )
+            numerator = (torch.exp(masked_lp_error) * base_mask).sum(dim=-1)
+            seq_mult_prob_error[valid_seq_mask] = numerator[valid_seq_mask] / denom[
+                valid_seq_mask
+            ].clamp(min=1)
+
+        keep_mask_bool = torch.ones_like(valid_seq_mask)
+        keep_mask_bool[valid_seq_mask] = (
+            seq_mult_prob_error[valid_seq_mask] <= threshold
+        )
+        masked_seq_mask = valid_seq_mask & ~keep_mask_bool
+        kept_valid_seq_mask = valid_seq_mask & keep_mask_bool
+        effective_sample_mask = sample_mask * keep_mask_bool.to(
+            device=sample_mask.device, dtype=sample_mask.dtype
+        )
+
+        valid_errors = seq_mult_prob_error[valid_seq_mask]
+        kept_errors = seq_mult_prob_error[kept_valid_seq_mask]
+        rewards = rewards.detach().reshape(-1).to(device=masked_seq_mask.device)
+        masked_correct_count = (
+            (rewards[masked_seq_mask] == 1).sum().item() if masked_seq_mask.any() else 0
+        )
+
+        metrics = {
+            SEQ_LOGPROB_ERROR_SUM_BEFORE_METRIC: valid_errors.sum().item(),
+            SEQ_LOGPROB_ERROR_COUNT_BEFORE_METRIC: float(valid_errors.numel()),
+            SEQ_LOGPROB_ERROR_MIN_BEFORE_METRIC: (
+                valid_errors.min().item() if valid_errors.numel() else float("inf")
+            ),
+            SEQ_LOGPROB_ERROR_MAX_BEFORE_METRIC: (
+                valid_errors.max().item() if valid_errors.numel() else float("-inf")
+            ),
+            SEQ_LOGPROB_ERROR_SUM_AFTER_METRIC: kept_errors.sum().item(),
+            SEQ_LOGPROB_ERROR_COUNT_AFTER_METRIC: float(kept_errors.numel()),
+            SEQ_LOGPROB_ERROR_MIN_AFTER_METRIC: (
+                kept_errors.min().item() if kept_errors.numel() else float("inf")
+            ),
+            SEQ_LOGPROB_ERROR_MAX_AFTER_METRIC: (
+                kept_errors.max().item() if kept_errors.numel() else float("-inf")
+            ),
+            SEQ_LOGPROB_ERROR_MASKED_COUNT_METRIC: float(masked_seq_mask.sum().item()),
+            SEQ_LOGPROB_ERROR_MASKED_CORRECT_COUNT_METRIC: float(masked_correct_count),
+        }
+    return effective_sample_mask, metrics
+
+
 class DraftCrossEntropyLossConfig(TypedDict):
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
 
@@ -134,6 +276,19 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
     use_kl_in_reward: bool = False
 
+    # --- Behaviour-policy KL regularization ---
+    # Penalize KL(π_gen || π_curr) on rollout tokens, anchoring the policy to
+    # the behaviour (generation) policy. Bounds cumulative drift across async
+    # steps: clipping only limits per-update movement (prev_logprobs refreshes
+    # every update) and TIS only reweights the estimator after drift happened.
+    behaviour_kl_penalty: float = 0.0
+    # Can be set to k1, k2, k3 (see reference_policy_kl_type)
+    behaviour_kl_type: str = "k3"
+    # Separate clamps from the reference-policy KL so enabling this term is
+    # safe even in configs that set kl_{input,output}_clamp_value to null.
+    behaviour_kl_input_clamp_value: Optional[float] = 20.0
+    behaviour_kl_output_clamp_value: Optional[float] = 10.0
+
     # --- Importance sampling correction ---
     # Async GRPO requires importance sampling correction enabled
     # Set to true when async_grpo.enabled is true
@@ -174,6 +329,7 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    rewards: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -226,7 +382,11 @@ class ClippedPGLossFn(LossFunction):
     input_type = LossInputType.LOGPROB
 
     def __init__(
-        self, cfg: ClippedPGLossConfig, use_fused_linear_logprobs: bool = False
+        self,
+        cfg: ClippedPGLossConfig,
+        use_fused_linear_logprobs: bool = False,
+        *,
+        seq_logprob_error_threshold: float | None = None,
     ):
         # When True, the model forward is patched to return precomputed next-token
         # logprobs (via chunked linear CE fusion) instead of full logits. This is
@@ -243,6 +403,13 @@ class ClippedPGLossFn(LossFunction):
         self.reference_policy_kl_type = cfg.reference_policy_kl_type
         self.kl_input_clamp_value = cfg.kl_input_clamp_value
         self.kl_output_clamp_value = cfg.kl_output_clamp_value
+        self.behaviour_kl_penalty = cfg.behaviour_kl_penalty
+        self.behaviour_kl_type = cfg.behaviour_kl_type
+        self.behaviour_kl_input_clamp_value = cfg.behaviour_kl_input_clamp_value
+        self.behaviour_kl_output_clamp_value = cfg.behaviour_kl_output_clamp_value
+        assert self.behaviour_kl_type in ("k1", "k2", "k3"), (
+            f"behaviour_kl_type must be 'k1', 'k2', or 'k3', got {self.behaviour_kl_type}"
+        )
         self.use_importance_sampling_correction = cfg.use_importance_sampling_correction
         # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
         self.truncated_importance_sampling_type = cfg.truncated_importance_sampling_type
@@ -255,6 +422,12 @@ class ClippedPGLossFn(LossFunction):
         )
         self.use_on_policy_kl_approximation = cfg.use_on_policy_kl_approximation
         self.force_on_policy_ratio = cfg.force_on_policy_ratio  # Force ratio to 1.0
+        if seq_logprob_error_threshold is not None and not self.force_on_policy_ratio:
+            raise ValueError(
+                "Loss-side sequence logprob error masking requires "
+                "loss_fn.force_on_policy_ratio=true."
+            )
+        self.seq_logprob_error_threshold = seq_logprob_error_threshold
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
@@ -337,6 +510,7 @@ class ClippedPGLossFn(LossFunction):
             # Normalized like the gradient (loss_type-dependent).
             "loss": grad_normalizer,
             "kl_penalty": grad_normalizer,
+            "behaviour_kl": grad_normalizer,
             # Token-normalized diagnostics, independent of loss_type.
             "probs_ratio": MetricNormalizer.TOKENS,
             "probs_ratio_clamped": MetricNormalizer.TOKENS,
@@ -362,6 +536,9 @@ class ClippedPGLossFn(LossFunction):
             "probs_ratio_clamped_min": MetricNormalizer.NONE,
             "probs_ratio_clamped_max": MetricNormalizer.NONE,
         }
+        self.metric_normalizations.update(
+            {name: MetricNormalizer.NONE for name in SEQ_LOGPROB_ERROR_ACCUM_METRICS}
+        )
         if self.truncated_importance_sampling_type is not None:
             # Keyed on the TIS type, NOT loss_type: seq-mask-tis masks whole
             # sequences (÷ global_valid_seqs); tis/icepop are token-level.
@@ -400,6 +577,26 @@ class ClippedPGLossFn(LossFunction):
         # This avoids computing prev_logprobs upstream
         if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
+
+        loss_sample_mask = sample_mask
+        loss_mask = mask
+        seq_logprob_error_metrics: dict[str, float] = {}
+        if self.seq_logprob_error_threshold is not None:
+            if "rewards" not in data:
+                raise ValueError(
+                    "Sequence logprob error masking requires rewards in the loss batch."
+                )
+            loss_sample_mask, seq_logprob_error_metrics = (
+                _compute_seq_logprob_error_mask(
+                    generation_logprobs=generation_logprobs,
+                    policy_logprobs=curr_logprobs,
+                    token_mask=token_mask,
+                    sample_mask=sample_mask,
+                    rewards=data["rewards"],
+                    threshold=self.seq_logprob_error_threshold,
+                )
+            )
+            loss_mask = token_mask * loss_sample_mask.unsqueeze(-1)
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -505,16 +702,45 @@ class ClippedPGLossFn(LossFunction):
             # Reduce KL loss
             if self.loss_type == LossType.TOKEN_LEVEL:
                 kl = masked_mean(
-                    kl, mask, global_normalization_factor=global_valid_toks
+                    kl, loss_mask, global_normalization_factor=global_valid_toks
                 )
             else:
                 kl = masked_mean(
                     masked_mean(kl, token_mask, dim=-1),
-                    sample_mask,
+                    loss_sample_mask,
                     global_normalization_factor=global_valid_seqs,
                 )
         else:
             kl = torch.tensor(0.0)
+
+        # Behaviour-policy KL penalty: KL(π_gen || π_curr) estimated on rollout
+        # tokens. Samples come from π_gen (θ-independent), so unlike the
+        # reference-policy KL above, no importance-sampling weights are needed
+        # and the pathwise gradient through curr_logprobs is unbiased.
+        # curr_logprobs (not curr_logprobs_unfiltered) is used to match the
+        # other π_gen-facing terms (actor IS weights, approx_entropy).
+        if self.behaviour_kl_penalty != 0:
+            behaviour_kl = self.behaviour_kl_penalty * calculate_kl(
+                logprobs=generation_logprobs,
+                logprobs_reference=curr_logprobs,
+                kl_type=self.behaviour_kl_type,
+                input_clamp_value=self.behaviour_kl_input_clamp_value,
+                output_clamp_value=self.behaviour_kl_output_clamp_value,
+            )
+            if self.loss_type == LossType.TOKEN_LEVEL:
+                behaviour_kl = masked_mean(
+                    behaviour_kl,
+                    loss_mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            else:
+                behaviour_kl = masked_mean(
+                    masked_mean(behaviour_kl, token_mask, dim=-1),
+                    loss_sample_mask,
+                    global_normalization_factor=global_valid_seqs,
+                )
+        else:
+            behaviour_kl = torch.tensor(0.0)
 
         # Calculate clipped loss function if ppo ratio is enabled.
         if self.force_on_policy_ratio:
@@ -678,7 +904,7 @@ class ClippedPGLossFn(LossFunction):
         if self.loss_type == LossType.TOKEN_LEVEL:
             actor_loss = masked_mean(
                 importance_weights_to_use * clip_loss,
-                mask,
+                loss_mask,
                 global_normalization_factor=global_valid_toks,
             )
         else:
@@ -688,7 +914,7 @@ class ClippedPGLossFn(LossFunction):
                     token_mask,
                     dim=-1,
                 ),
-                sample_mask,
+                loss_sample_mask,
                 global_normalization_factor=global_valid_seqs,
             )
 
@@ -723,7 +949,7 @@ class ClippedPGLossFn(LossFunction):
         nll_loss = torch.tensor(0.0, device=mask.device)
         if self.positive_example_nll_weight > 0 and "rewards" in data:
             correct_sample_mask = (data["rewards"] > 0).float()  # [batch]
-            correct_mask = mask * correct_sample_mask.unsqueeze(-1)
+            correct_mask = loss_mask * correct_sample_mask.unsqueeze(-1)
             correct_valid_toks = correct_mask.sum()
             if correct_valid_toks > 0:
                 nll_loss = masked_mean(
@@ -732,7 +958,9 @@ class ClippedPGLossFn(LossFunction):
                     global_normalization_factor=correct_valid_toks,
                 )
 
-        loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
+        loss = (
+            actor_loss + kl + behaviour_kl + self.positive_example_nll_weight * nll_loss
+        )
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
@@ -775,6 +1003,9 @@ class ClippedPGLossFn(LossFunction):
                 "probs_ratio_clamped_min": probs_ratio_clamped_min,
                 "probs_ratio_clamped_max": probs_ratio_clamped_max,
                 "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
+                "behaviour_kl": behaviour_kl.item() / self.behaviour_kl_penalty
+                if behaviour_kl
+                else 0,
                 "token_mult_prob_error": mult_prob_error,
                 "gen_kl_error": gen_kl_error,
                 "policy_kl_error": policy_kl_error,
@@ -784,6 +1015,7 @@ class ClippedPGLossFn(LossFunction):
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 "positive_nll_loss": nll_loss.item(),
+                **seq_logprob_error_metrics,
             },
         )
 
