@@ -38,6 +38,8 @@ def _fallback_routes(count: int) -> torch.Tensor:
 
 
 class _FakeTokenizer:
+    pad_token_id = 0
+
     def decode(self, token_ids: torch.Tensor, skip_special_tokens: bool) -> str:
         del token_ids, skip_special_tokens
         return "generated"
