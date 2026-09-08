@@ -742,6 +742,7 @@ class TestProcessMicrobatch:
             packed_routes[:, [0, 3, 4, 7]],
         )
         mock_indices.assert_called_once()
+        assert mock_indices.call_args.kwargs["device"] == packed_tokens.device
 
     def test_process_microbatch_packing_requires_seq_length_key(self):
         """Test that packing requires seq_length_key."""
@@ -1449,6 +1450,68 @@ class TestMakeProcessedMicrobatchIterator:
         assert call_kwargs["pad_individual_seqs_to_multiple_of"] == 8
         assert call_kwargs["pad_packed_seq_to_multiple_of"] == 16
         assert call_kwargs["pad_full_seq_to"] == 1024
+
+    @patch("nemo_rl.models.megatron.data.process_microbatch")
+    def test_packed_routed_experts_skip_rectangular_h2d(self, mock_process):
+        """Only the packed CP-local routes should be moved by processing."""
+        from nemo_rl.models.megatron.data import (
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
+
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+        input_lengths = torch.tensor([3, 2])
+        rectangular_routes = torch.arange(
+            2 * 4 * 3 * 2, dtype=torch.int16
+        ).reshape(2, 4, 3, 2)
+        packed_routes = rectangular_routes[:, :3].reshape(1, 6, 3, 2)
+        cp_local_routes = packed_routes[:, ::2]
+        data_dict = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "routed_experts": rectangular_routes,
+            }
+        )
+
+        def fake_to(device):
+            assert device == "cuda"
+            assert "routed_experts" not in data_dict
+            return data_dict
+
+        data_dict.to = MagicMock(side_effect=fake_to)
+
+        def fake_process(**kwargs):
+            processed_data = kwargs["data_dict"]
+            assert processed_data["routed_experts"] is rectangular_routes
+            return ProcessedInputs(
+                input_ids=input_ids,
+                input_ids_cp_sharded=input_ids,
+                attention_mask=None,
+                position_ids=None,
+                packed_seq_params=MagicMock(),
+                cu_seqlens_padded=MagicMock(),
+                routed_experts=packed_routes,
+                routed_experts_cp_sharded=cp_local_routes,
+            )
+
+        mock_process.side_effect = fake_process
+        processed_iterator = make_processed_microbatch_iterator(
+            raw_iterator=iter([data_dict]),
+            cfg={"sequence_packing": {"enabled": True}},
+            seq_length_key="input_lengths",
+            pad_individual_seqs_to_multiple_of=4,
+            pad_packed_seq_to_multiple_of=4,
+            straggler_timer=MagicMock(),
+            pad_full_seq_to=None,
+        )
+
+        microbatch = next(processed_iterator)
+
+        data_dict.to.assert_called_once_with("cuda")
+        assert "routed_experts" not in microbatch.data_dict
+        assert microbatch.routed_experts is packed_routes
+        assert microbatch.routed_experts_cp_sharded is cp_local_routes
 
 
 PACK_SEQUENCES_TEST_ACTOR_FQN = (
