@@ -17,8 +17,13 @@ import os
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
+# vLLM workers always get the vllm + nemo_gym extras. Token capture
+# (token_capture.enabled) needs nemo_gym inside the worker, and worker venvs
+# are cached by actor class name, so the extras must be fixed here rather than
+# swapped in at runtime (a venv prebuilt with plain `--extra vllm` would be
+# reused as-is and the nemo_gym import would fail).
 VLLM_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.VLLM
+    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.VLLM_GYM
 )
 SGLANG_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.SGLANG

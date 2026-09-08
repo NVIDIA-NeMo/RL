@@ -13,7 +13,7 @@ fi
 
 GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
 if (( GPU_COUNT < 2 )); then
-    echo "SKIP: Omni Gym-video Megatron smoke requires at least two GPUs"
+    echo "SKIP: Omni Gym-video SingleController smoke requires at least two GPUs"
     exit 0
 fi
 DETECTED_CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0)
@@ -79,17 +79,17 @@ uv run --no-sync examples/nemo_gym/prepare_video_dataset.py convert \
     --input "${RAW_VAL_PATH}" \
     --output "${VAL_PATH}"
 
-# TODO(@cspades): Replace Omni 30B with a smaller pretrained model.
-# For now, just use this as a partially-trainable functional test
-# (frozen decoder trunk) for inference and multimodal RL.
-uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
+# SingleController requires disaggregated generation. One frozen-decoder model
+# fits on each GB200, so split the two visible GPUs 1 trainer + 1 generator.
+uv run --no-sync python examples/run_grpo_single_controller.py \
     --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml \
     cluster.num_nodes=1 \
     cluster.gpus_per_node=2 \
+    ++cluster.segment_size=1 \
     policy.megatron_cfg.env_vars.TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
-    policy.megatron_cfg.tensor_model_parallel_size=2 \
+    policy.megatron_cfg.tensor_model_parallel_size=1 \
     policy.megatron_cfg.pipeline_model_parallel_size=1 \
-    policy.megatron_cfg.expert_model_parallel_size=2 \
+    policy.megatron_cfg.expert_model_parallel_size=1 \
     policy.megatron_cfg.expert_tensor_parallel_size=1 \
     policy.megatron_cfg.context_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=true \
@@ -105,13 +105,13 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++policy.megatron_cfg.optimizer.store_param_remainders=false \
     policy.generation.backend=megatron \
     ++policy.generation.bad_words=null \
-    policy.generation.colocated.enabled=true \
+    policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
-    policy.generation.colocated.resources.gpus_per_node=2 \
+    policy.generation.colocated.resources.gpus_per_node=1 \
     policy.generation.max_new_tokens=128 \
     policy.generation.mcore_generation_config.expose_http_server=true \
-    policy.generation.mcore_generation_config.tensor_model_parallel_size=2 \
-    policy.generation.mcore_generation_config.expert_model_parallel_size=2 \
+    policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
+    policy.generation.mcore_generation_config.expert_model_parallel_size=1 \
     policy.generation.mcore_generation_config.expert_tensor_parallel_size=1 \
     ++policy.generation.mcore_generation_config.context_parallel_size=1 \
     ++policy.generation.mcore_generation_config.moe_router_dtype=fp32 \
@@ -141,9 +141,7 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     data.train.data_path="${TRAIN_PATH}" \
     data.validation.data_path="${VAL_PATH}" \
     grpo.deduplicate_multimodal_data=false \
-    grpo.async_grpo.enabled=true \
-    grpo.async_grpo.max_trajectory_age_steps=2 \
-    grpo.async_grpo.in_flight_weight_updates=true \
+    grpo.async_grpo=null \
     grpo.num_prompts_per_step=1 \
     grpo.num_generations_per_prompt=2 \
     grpo.max_num_steps=1 \
@@ -152,6 +150,17 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     grpo.val_at_end=false \
     policy.train_global_batch_size=2 \
     policy.train_micro_batch_size=1 \
+    ++data_plane.enabled=true \
+    ++data_plane.impl=transfer_queue \
+    ++data_plane.backend=simple \
+    ++data_plane.claim_meta_poll_interval_s=0.5 \
+    ++data_plane.simple.num_storage_units=2 \
+    ++async_rl.sampler.name=in_order \
+    ++async_rl.sampler.max_lookahead_versions=1 \
+    ++async_rl.recompute_kv_cache_after_weight_updates=false \
+    ++async_rl.min_groups_for_streaming_train=1 \
+    ++async_rl.max_inflight_prompts=2 \
+    ++async_rl.max_buffered_rollouts=2 \
     logger.tensorboard_enabled=true \
     logger.log_dir="${LOG_DIR}" \
     logger.wandb_enabled=false \
