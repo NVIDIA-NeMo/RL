@@ -2241,13 +2241,7 @@ def _prepare_nemo_gym_rows(
 
         responses_create_params["temperature"] = sampling_params.temperature
         responses_create_params["top_p"] = sampling_params.top_p
-        configured_max_tokens = generation_config["max_new_tokens"]
-        row_max_tokens = responses_create_params.get("max_output_tokens")
-        responses_create_params["max_output_tokens"] = (
-            min(row_max_tokens, configured_max_tokens)
-            if row_max_tokens is not None
-            else configured_max_tokens
-        )
+        responses_create_params["max_output_tokens"] = None
         row["_rowidx"] = row_index
 
         task_index = row.get(NEMO_GYM_TASK_INDEX_KEY)
