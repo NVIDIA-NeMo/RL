@@ -52,5 +52,5 @@ uv run python -c "import ray; ray.shutdown()"
 
 # Exercise one pinned example from each L0 Gym environment through the real NeMo RL rollout boundary.
 ./tests/run_unit.sh \
-    unit/environments/test_l0_nemo_gym_rollout_acceptance.py::test_l0_gym_environments_roll_out_through_nemo_rl \
+    unit/environments/test_nemo_gym_rollout.py::test_l0_gym_environments_roll_out_through_nemo_rl \
     --nemo-gym-only
