@@ -233,6 +233,95 @@ def test_every_efficiency_timer_at_a_call_site_is_declared():
     assert used, "found no idle/* or wasted/* timers -- has the matcher gone stale?"
 
 
+def _teed_logger_keys() -> dict[str, int]:
+    """``{logger key: line}`` for every ``_TeedMetric`` declared in metrics.py.
+
+    Parsed rather than imported for the reason the module header gives, and
+    because the key is the first positional argument either way -- importing
+    would buy nothing but a dependency on lens being installed.
+    """
+    source = _REPO / "nemo_rl" / "telemetry" / "metrics.py"
+    keys: dict[str, int] = {}
+    for node in ast.walk(ast.parse(source.read_text())):
+        if not isinstance(node, ast.Call):
+            continue
+        if (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) != (
+            "_TeedMetric"
+        ):
+            continue
+        key = _string_arg(node)
+        if key:
+            keys[key] = node.lineno
+    return keys
+
+
+def _metric_dict_keys(root: Path) -> dict[str, str]:
+    """String literals used as metrics-dict keys under *root*.
+
+    Two shapes, which is how every teed scalar is actually produced: a literal
+    key in a dict display, and a subscript assignment onto an accumulating dict.
+    Deliberately not "every string constant in the file" -- that would also
+    match a key named only in a docstring, and a rename that updated the prose
+    but not the code would still pass.
+    """
+    found: dict[str, str] = {}
+    for source in _python_sources(root):
+        where = source.relative_to(_REPO).as_posix()
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(node, ast.Dict):
+                for key in node.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        found.setdefault(key.value, where)
+            elif isinstance(node, ast.Assign | ast.AugAssign):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                for target in targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)
+                    ):
+                        found.setdefault(target.slice.value, where)
+    return found
+
+
+def test_every_teed_logger_key_is_emitted():
+    """Direction is ``declared <= emitted``.
+
+    ``_TeedMetric`` is both the declaration of an OTel series and the mapping
+    from the logger key that feeds it, which is the whole point of keeping them
+    in one row: an earlier design kept a separate key-to-field map, three of its
+    entries pointed at keys nothing emitted, and those gauges reported a flat
+    line rather than an error. Nothing at runtime can catch that -- the tee
+    reads the key out of the metrics dict with ``.get`` and a miss is
+    indistinguishable from a step that did not report the value -- so a rename
+    on one side only has to fail here or not at all.
+    """
+    declared = _teed_logger_keys()
+    emitted: dict[str, str] = {}
+    for directory in (
+        _ALGORITHMS,
+        _REPO / "nemo_rl" / "models",
+        _REPO / "nemo_rl" / "experience",
+    ):
+        emitted.update(_metric_dict_keys(directory))
+
+    unemitted = {
+        key: f"metrics.py:{line}"
+        for key, line in declared.items()
+        if key not in emitted
+    }
+    assert not unemitted, (
+        "logger keys declared in _TEED_SCALARS that no call site emits, so each "
+        f"is a gauge that will report nothing: {unemitted}"
+    )
+    # Sanity on both halves, so neither a moved declaration nor a stale matcher
+    # can turn this into a tautology.
+    assert declared, "found no _TeedMetric declarations -- has the matcher gone stale?"
+    assert emitted, "found no metrics-dict keys -- has the matcher gone stale?"
+
+
 def _emitted_span_name(called: str, node: ast.Call) -> str | None:
     """The span name a call emits, or None if the call does not emit one.
 
