@@ -67,6 +67,15 @@ _RUN_ID_ENV = f"{_OTEL_PREFIX}_RUN_ID"
 # Set per worker by ``RayWorkerGroup`` from the group's ``name_prefix``.
 _WORKER_GROUP_ENV = "NRL_WORKER_GROUP"
 
+# Which stage of a model's lifecycle (pretrain -> SFT -> RL) produced this
+# telemetry. A backend collecting several NeMo products selects the RL stage on
+# this rather than on service names, which differ per launcher. Constant rather
+# than configurable: a process running this package *is* the RL stage. Seeded
+# into both the driver and the worker attributes, since a resource is per
+# process and neither path sees the other's.
+_CAMPAIGN_STAGE_ATTR = "nv.dl.campaign.stage"
+_CAMPAIGN_STAGE = "RL"
+
 # TelemetryConfig field -> NEMO_RL_OTEL_* env var. ``service_name`` maps to the
 # standard ``OTEL_SERVICE_NAME`` (lens reads it directly, unprefixed).
 _ENV_FIELD_MAP = {
@@ -159,7 +168,10 @@ def _build_resource_attributes(
     Best-effort: a missing key simply omits that attribute — never raises.
     Rank identity comes from :func:`_rank_attributes`, which the callers merge in.
     """
-    attrs: dict[str, Any] = {"rl.algorithm": algorithm}
+    attrs: dict[str, Any] = {
+        _CAMPAIGN_STAGE_ATTR: _CAMPAIGN_STAGE,
+        "rl.algorithm": algorithm,
+    }
 
     model = _dig(master_config, "policy", "model_name")
     if model:
@@ -328,7 +340,7 @@ def _worker_resource_attributes(
     (``lm_policy``, ``vllm_policy``, ...), which ``RayWorkerGroup`` exports as
     ``NRL_WORKER_GROUP``. Explicit ``extra`` attributes win.
     """
-    attrs: dict[str, Any] = {}
+    attrs: dict[str, Any] = {_CAMPAIGN_STAGE_ATTR: _CAMPAIGN_STAGE}
     worker_group = os.environ.get(_WORKER_GROUP_ENV, "").strip()
     if worker_group:
         attrs["rl.worker_group"] = worker_group

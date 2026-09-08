@@ -81,10 +81,11 @@ Filter by `run_id` in your backend to isolate a specific run.
 
 ## Resource attributes
 
-`init_telemetry_driver` sets stable-for-the-run values on the OTel `Resource`, so they appear on every span/metric as backend "Process" tags:
+Each process sets stable-for-the-run values on its OTel `Resource` — `init_telemetry_driver` on the driver, `init_telemetry_worker` in each Ray actor — so they appear on every span/metric as backend "Process" tags:
 
 | Attribute | Source |
 |---|---|
+| `nv.dl.campaign.stage` | always the literal `RL`. Set by every NeMo-RL process, driver and worker, so a backend collecting several stages of a model's lifecycle (pretrain → SFT → RL) can select this stage without matching on service names |
 | `rl.algorithm` | the `algorithm="<algo>"` passed to `init_telemetry_driver` |
 | `rl.model` | `policy.model_name` |
 | `nemo.precision` | `policy.precision` |

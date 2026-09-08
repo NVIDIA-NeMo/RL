@@ -62,6 +62,21 @@ def test_build_resource_attributes():
     assert attrs["dl.pipeline_parallel.size"] == 1
 
 
+def test_campaign_stage_is_tagged_on_driver_and_worker():
+    """Both paths, because a resource is per process and neither sees the other.
+
+    A backend collecting several stages of one model's lifecycle selects the RL
+    stage on this attribute, so a process that omits it drops out of that view
+    entirely -- and the driver and the workers reach lens through two separate
+    builders, so tagging only one leaves half a run unselectable.
+    """
+    assert (
+        _build_resource_attributes(_FakeMasterConfig(), "grpo")["nv.dl.campaign.stage"]
+        == "RL"
+    )
+    assert _worker_resource_attributes(None)["nv.dl.campaign.stage"] == "RL"
+
+
 def test_build_resource_attributes_dtensor_tp():
     cfg = _FakeMasterConfig(
         policy={
@@ -231,18 +246,25 @@ def test_vllm_native_tracing_needs_the_master_switch(monkeypatch):
 
 def test_worker_resource_attributes_carries_worker_group(monkeypatch):
     monkeypatch.setenv("NRL_WORKER_GROUP", "vllm_policy")
-    assert _worker_resource_attributes(None) == {"rl.worker_group": "vllm_policy"}
+    assert _worker_resource_attributes(None) == {
+        "nv.dl.campaign.stage": "RL",
+        "rl.worker_group": "vllm_policy",
+    }
 
 
 def test_worker_resource_attributes_without_group_env():
     # Workers not created by RayWorkerGroup simply omit the attribute.
-    assert _worker_resource_attributes(None) == {}
+    assert _worker_resource_attributes(None) == {"nv.dl.campaign.stage": "RL"}
 
 
 def test_worker_resource_attributes_explicit_extra_wins(monkeypatch):
     monkeypatch.setenv("NRL_WORKER_GROUP", "lm_policy")
     attrs = _worker_resource_attributes({"rl.worker_group": "override", "k": 1})
-    assert attrs == {"rl.worker_group": "override", "k": 1}
+    assert attrs == {
+        "nv.dl.campaign.stage": "RL",
+        "rl.worker_group": "override",
+        "k": 1,
+    }
 
 
 def test_init_worker_sets_worker_group_attribute(monkeypatch):
@@ -264,6 +286,7 @@ def test_init_worker_sets_worker_group_attribute(monkeypatch):
     # Rank reaches lens as a resource attribute now, alongside the group name:
     # RANK is group-local, so the two are only useful together.
     assert captured["resource_attributes"] == {
+        "nv.dl.campaign.stage": "RL",
         "rl.worker_group": "vllm_policy",
         "nv.dl.rank": 3,
         "nv.dl.world_size": 8,
