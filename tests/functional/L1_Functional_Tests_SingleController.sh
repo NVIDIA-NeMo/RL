@@ -184,10 +184,10 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
