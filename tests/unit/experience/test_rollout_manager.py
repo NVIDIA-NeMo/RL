@@ -1998,10 +1998,17 @@ class TestGenerateForFinalizationFlow:
     def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf)
+        pending_acknowledgement_history: list[list[tuple[str, int, str]]] = []
 
         request = _run(
             mgr.generate_for_finalization(
-                {"prompt": "p", "idx": 0, "loss_multiplier": 0.25}, target_step=5
+                {"prompt": "p", "idx": 0, "loss_multiplier": 0.25},
+                target_step=5,
+                on_gym_acknowledgements_ready=lambda: (
+                    pending_acknowledgement_history.append(
+                        mgr.recovery_ledger.pending_completed_execution_acknowledgements()
+                    )
+                ),
             )
         )
         assert request is not None
@@ -2024,6 +2031,13 @@ class TestGenerateForFinalizationFlow:
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
         assert request.fallback_weight_version == 7
+        assert pending_acknowledgement_history == [
+            [(canonical_ids[0], 0, "test-agent")],
+            [
+                (canonical_ids[0], 0, "test-agent"),
+                (canonical_ids[1], 0, "test-agent"),
+            ],
+        ]
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
@@ -2070,6 +2084,8 @@ class TestGenerateForFinalizationFlow:
                     "manifest": [{"staging_key": f"{rollout_id}/call"}],
                 }
                 completion = _receipt_record([rollout_id], [receipt]).completions[0]
+                assert completion.env_extras is not None
+                completion.env_extras["_ng_resolved_agent_ref"] = {"name": "test-agent"}
                 await on_completion(generation_index, completion)
                 raise GenerationUnavailable("worker disappeared")
 
@@ -2192,6 +2208,10 @@ class TestGenerateForFinalizationFlow:
                         "manifest": [{"staging_key": f"{rollout_id}/call"}],
                     }
                     completion = _receipt_record([rollout_id], [receipt]).completions[0]
+                    assert completion.env_extras is not None
+                    completion.env_extras["_ng_resolved_agent_ref"] = {
+                        "name": "test-agent"
+                    }
                     completions.append(completion)
                     await on_completion(generation_index, completion)
                     if len(self.generation_indices) == 1:
@@ -2207,8 +2227,18 @@ class TestGenerateForFinalizationFlow:
 
         impl = _PartialCaptureImpl()
         mgr._impl = impl
+        pending_acknowledgement_history: list[list[tuple[str, int, str]]] = []
 
-        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 9}))
+        request = _run(
+            mgr.generate_for_finalization(
+                {"prompt": "p", "idx": 9},
+                on_gym_acknowledgements_ready=lambda: (
+                    pending_acknowledgement_history.append(
+                        mgr.recovery_ledger.pending_completed_execution_acknowledgements()
+                    )
+                ),
+            )
+        )
 
         assert request is not None
         assert request.prompt_idx == 9
@@ -2222,6 +2252,12 @@ class TestGenerateForFinalizationFlow:
         assert second_ids[0] != first_ids[0]
         assert second_ids[1] != first_ids[1]
         assert request.rollout_ids == (second_ids[0], second_ids[1])
+        assert pending_acknowledgement_history == [
+            [
+                (f"{request.group_id}_g0", 1, "test-agent"),
+                (f"{request.group_id}_g1", 1, "test-agent"),
+            ]
+        ]
 
     def test_prompt_group_restore_redispatches_every_sibling(self):
         recovery_config = RolloutRecoveryConfig(

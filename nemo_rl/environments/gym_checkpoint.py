@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
 GYM_CHECKPOINT_SCHEMA_VERSION = 1
 GYM_CHECKPOINT_CONTROL_PREFIX = "/ng-control/v1"
@@ -33,6 +34,9 @@ GYM_CHECKPOINT_CAPABILITIES_PATH = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/capabilitie
 GYM_MODEL_ADMISSION_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/model-admission"
 GYM_MODEL_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/model-checkpoint"
 GYM_AGENT_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/agent-checkpoint"
+GYM_AGENT_COMPLETION_ACK_PATH = (
+    f"{GYM_AGENT_CHECKPOINT_PREFIX}/acknowledge-completed"
+)
 GYM_RESOURCES_CHECKPOINT_PREFIX = (
     f"{GYM_CHECKPOINT_CONTROL_PREFIX}/resources-checkpoint"
 )
@@ -44,6 +48,7 @@ GymComponent: TypeAlias = Literal[
     "responses_api_agents",
     "resources_servers",
 ]
+GymCheckpointFeature: TypeAlias = Literal["completed_result_acknowledgement"]
 NonNegativeInt: TypeAlias = Annotated[int, Field(strict=True, ge=0)]
 PositiveInt: TypeAlias = Annotated[int, Field(strict=True, ge=1)]
 NonNegativeFloat: TypeAlias = Annotated[float, Field(ge=0)]
@@ -121,6 +126,7 @@ class GymControlCapabilities(_StrictWireModel):
     ]
     active_checkpoint_id: str | None = None
     deadline_ts: FiniteFloat | None = None
+    features: list[GymCheckpointFeature] = Field(default_factory=list)
 
     def participant(self, server_name: str) -> GymParticipantIdentity:
         """Bind Gym's reported identity to its NeMo-RL routing name."""
@@ -152,6 +158,7 @@ class GymCheckpointParticipantContract(_StrictWireModel):
     ]
     multi_process: GymMultiProcessCapability
     instance_role: Literal["policy", "auxiliary"] | None = None
+    features: list[GymCheckpointFeature] = Field(default_factory=list)
 
     @classmethod
     def from_discovered(
@@ -168,6 +175,7 @@ class GymCheckpointParticipantContract(_StrictWireModel):
             concurrency_contract=capabilities.concurrency_contract,
             multi_process=capabilities.multi_process,
             instance_role=capabilities.instance_role,
+            features=sorted(capabilities.features),
         )
 
 
@@ -205,6 +213,35 @@ class GymCheckpointTopology(_StrictWireModel):
         ).encode()
         return hashlib.sha256(payload).hexdigest()
 
+    def validate_checkpoint_participants(
+        self,
+        checkpoint: "GymCheckpointCommitResult",
+    ) -> None:
+        """Require stateful discovered participants to match the saved export."""
+        expected = {
+            (
+                contract.participant.server_name,
+                contract.participant.component,
+                contract.participant.participant_name,
+            )
+            for contract in self.participants
+            if contract.checkpoint_mode == "export_restore"
+        }
+        actual = {
+            (
+                result.participant.server_name,
+                result.participant.component,
+                result.participant.participant_name,
+            )
+            for result in checkpoint.participants
+        }
+        if actual != expected:
+            raise ValueError(
+                "Gym checkpoint participants do not match the discovered stateful "
+                f"topology: missing={sorted(expected - actual)!r}, "
+                f"unexpected={sorted(actual - expected)!r}"
+            )
+
 
 class GymCheckpointControlRequest(_StrictWireModel):
     """Fields shared by all Gym checkpoint control requests."""
@@ -216,6 +253,38 @@ class GymCheckpointControlRequest(_StrictWireModel):
         pattern=_IDENTITY_PATTERN,
     )
     deadline_ts: FiniteFloat
+
+
+class GymCompletedExecution(_StrictWireModel):
+    """A completed Gym execution plus the agent participant that owns it."""
+
+    execution: GymExecutionIdentity
+    agent_name: str = Field(min_length=1)
+
+
+class GymCompletedExecutionAcknowledgementRequest(_StrictWireModel):
+    """Idempotent batch release of terminal results owned durably by RL."""
+
+    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
+    executions: list[GymExecutionIdentity] = Field(min_length=1)
+
+
+class GymCompletedExecutionAcknowledgementResponse(_StrictWireModel):
+    """Every requested identity the agent now considers acknowledged."""
+
+    acknowledged: list[GymExecutionIdentity]
+
+    @model_validator(mode="after")
+    def validate_unique_identities(
+        self,
+    ) -> "GymCompletedExecutionAcknowledgementResponse":
+        keys = [
+            (identity.rollout_id, identity.attempt_index)
+            for identity in self.acknowledged
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("acknowledged Gym execution identities must be unique")
+        return self
 
 
 class GymCheckpointDirectoryRequest(GymCheckpointControlRequest):
@@ -378,6 +447,67 @@ class GymParticipantCommitResult(_StrictWireModel):
 class GymCheckpointCommitResult(_StrictWireModel):
     checkpoint_id: str
     participants: list[GymParticipantCommitResult]
+
+    @model_validator(mode="after")
+    def validate_participants(self) -> "GymCheckpointCommitResult":
+        identities: list[tuple[str, str, str]] = []
+        for result in self.participants:
+            if result.manifest.participant != result.participant:
+                raise ValueError(
+                    "Gym participant manifest identity does not match its commit "
+                    f"result: participant={result.participant!r}, "
+                    f"manifest={result.manifest.participant!r}"
+                )
+            participant = result.participant
+            identities.append(
+                (
+                    participant.server_name,
+                    participant.component,
+                    participant.participant_name,
+                )
+            )
+        if len(identities) != len(set(identities)):
+            raise ValueError("Gym checkpoint commit contains duplicate participants")
+        return self
+
+
+def validate_gym_checkpoint_manifests(
+    checkpoint_dir: Path,
+    checkpoint: GymCheckpointCommitResult,
+) -> None:
+    """Verify every participant manifest before the outer snapshot publishes."""
+    root = checkpoint_dir.resolve()
+    seen_paths: set[Path] = set()
+    for result in checkpoint.participants:
+        relative_path = Path(result.manifest.relative_path)
+        if relative_path.is_absolute():
+            raise ValueError(
+                "Gym participant manifest path must be relative: "
+                f"{relative_path}"
+            )
+        path = (root / relative_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise ValueError(
+                "Gym participant manifest escapes the checkpoint directory: "
+                f"{relative_path}"
+            ) from error
+        if path in seen_paths:
+            raise ValueError(f"duplicate Gym participant manifest path: {relative_path}")
+        seen_paths.add(path)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Gym participant manifest is missing: {relative_path}"
+            )
+        actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual_digest != result.manifest.manifest_digest:
+            raise ValueError(
+                "Gym participant manifest digest mismatch: "
+                f"path={relative_path}, "
+                f"expected={result.manifest.manifest_digest}, "
+                f"actual={actual_digest}"
+            )
 
 
 class GymModelRestoreResponse(_StrictWireModel):

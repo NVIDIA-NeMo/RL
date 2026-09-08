@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from nemo_rl.environments.nemo_gym import (
+    GymControlRequestError,
     NemoGym,
     _adapt_execution_identity_for_installed_gym,
 )
@@ -415,9 +416,14 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
         env.commit_checkpoint("snapshot-7", 123.0, "/tmp/snapshot-7")
     )
     restored = asyncio.run(
-        env.restore_checkpoint("snapshot-7", 123.0, "/tmp/snapshot-7")
+        env.restore_checkpoint(
+            "restore-7",
+            123.0,
+            "/tmp/snapshot-7",
+            source_checkpoint_id="snapshot-7",
+        )
     )
-    resumed = asyncio.run(env.resume_checkpoint("snapshot-7", 123.0))
+    resumed = asyncio.run(env.resume_checkpoint("restore-7", 123.0))
 
     assert {
         item["manifest"]["relative_path"] for item in committed["participants"]
@@ -450,3 +456,116 @@ def test_abort_checkpoint_uses_idempotent_resume_routes() -> None:
 
     assert result == {"checkpoint_id": "snapshot-7"}
     env.resume_checkpoint.assert_awaited_once_with("snapshot-7", 123.0)
+
+
+def test_completed_results_are_acknowledged_by_resolved_agent() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent-route": _capability(
+            "responses_api_agents",
+            "resolved-agent",
+            features=["completed_result_acknowledgement"],
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+
+    async def acknowledge_control(method, path, *, server_name, json, **_kwargs):
+        assert method == "POST"
+        assert path.endswith("/acknowledge-completed")
+        assert server_name == "agent-route"
+        assert json == {
+            "schema_version": 1,
+            "executions": [{"rollout_id": "group-7_g0", "attempt_index": 2}],
+        }
+        return {"acknowledged": json["executions"]}
+
+    env._control = AsyncMock(side_effect=acknowledge_control)
+    result = asyncio.run(
+        env.acknowledge_completed_executions(
+            [
+                {
+                    "execution": {
+                        "rollout_id": "group-7_g0",
+                        "attempt_index": 2,
+                    },
+                    "agent_name": "resolved-agent",
+                }
+            ]
+        )
+    )
+
+    assert result["acknowledged"] == [
+        {
+            "execution": {"rollout_id": "group-7_g0", "attempt_index": 2},
+            "agent_name": "resolved-agent",
+        }
+    ]
+
+
+def test_agent_prepare_retries_completed_result_blocker() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent": _capability("responses_api_agents", "agent"),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    calls = [0]
+
+    async def prepare_control(_method, path, *, server_name, **_kwargs):
+        if server_name == "policy":
+            return {
+                "state": "paused",
+                "workers": {"acknowledged": 1, "expected": 1},
+                "inflight_total": 0,
+                "waiters_total": 0,
+            }
+        assert path.endswith("/prepare")
+        calls[0] += 1
+        if calls[0] == 1:
+            raise GymControlRequestError(
+                "not ready",
+                status=409,
+                error_code="agent_prepare_incomplete",
+            )
+        return {
+            "state": "preparing",
+            "ready_to_commit": True,
+            "running": 0,
+            "parked": 0,
+            "parked_with_boundary": 0,
+            "parked_without_boundary": 0,
+            "completed_unacknowledged": 0,
+            "active": 0,
+            "blocking_attempts": [],
+            "completed_unacknowledged_attempts": [],
+            "executions": [],
+        }
+
+    env._control = AsyncMock(side_effect=prepare_control)
+    result = asyncio.run(env.prepare_checkpoint("snapshot-ack", time.time() + 2.0))
+
+    assert result["ready"] is True
+    assert calls == [2]
