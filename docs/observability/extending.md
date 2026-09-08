@@ -44,14 +44,16 @@ spelled using its `U_` alias:
 ```python
 from nemo_rl.telemetry.instrumentation import umbrella_span, umbrella_trace_fn
 
-with umbrella_span(RLSpanGroup.U_ROLLOUT, "rl.sc.generate_and_push", tracer=tracer):
+with umbrella_span(
+    RLSpanGroup.U_PER_PROMPT, "rl.sc.generate_and_push", tracer=tracer
+):
     ...
 ```
 
 The `U_` names are aliases — `RLSpanGroup.U_ROLLOUT == RLSpanGroup.ROLLOUT ==
 "rollout"` — so presets, the `span_groups` spec and every config are unchanged.
-The six are `U_JOB`, `U_STEP`, `U_ROLLOUT`, `U_MODEL_INIT`, `U_EVALUATE` and
-`U_SETUP`.
+The seven are `U_JOB`, `U_STEP`, `U_ROLLOUT`, `U_MODEL_INIT`, `U_EVALUATE`,
+`U_SETUP` and `U_PER_PROMPT`.
 
 Reach for an umbrella whenever a span can overlap **another instance of
 itself**: concurrent spans sum past the wall clock they happened in, so a bucket

@@ -8,7 +8,7 @@ Generation is where most of an RL step's wall-clock goes, so NeMo-RL instruments
 | Where | driver, `nemo_rl/models/generation/vllm/vllm_generation.py` | vLLM engine, enabled in `vllm_worker.py` |
 | Enabled by | `generation` span group (on by default in `per_step`/`all`) | opt-in: `telemetry.vllm_native_tracing: true` |
 | Transport | rides the normal lens OTLP path (`http/protobuf` OK) | **gRPC-only** (needs an OTLP/gRPC endpoint / collector) |
-| Correlation | nested under the rollout span (parent-child) | via shared `run_id` / resource attributes (not parent-child) |
+| Correlation | nested under the rollout span (parent-child) | via shared `nemo.run.id` / resource attributes (not parent-child) |
 
 ## Layer 1 — RL-side generation spans (default)
 
@@ -54,9 +54,9 @@ So to get vLLM's native spans you need a gRPC OTLP receiver in the picture (e.g.
 
 ### Caveat 3 — offline generation cannot carry a trace context
 
-NeMo-RL drives vLLM through the offline `LLM.generate()` API, which does not accept a per-request trace context. So vLLM's native spans **cannot** nest as children of the RL rollout span. Instead they correlate to the RL run through the **shared `run_id` and resource attributes** that every process in the job carries — you line them up by run, not by parent-child edges in one waterfall.
+NeMo-RL drives vLLM through the offline `LLM.generate()` API, which does not accept a per-request trace context. So vLLM's native spans **cannot** nest as children of the RL rollout span. Instead they correlate to the RL run through the **shared `nemo.run.id` and resource attributes** that every process in the job carries — you line them up by run, not by parent-child edges in one waterfall.
 
-Practically: Layer 1 gives you generation timing *inside* the RL step tree; Layer 2 gives you vLLM engine internals as a separate set of spans tagged with the same `run_id`. Use both when you need to see why generation was slow at the engine level.
+Practically: Layer 1 gives you generation timing *inside* the RL step tree; Layer 2 gives you vLLM engine internals as a separate set of spans tagged with the same `nemo.run.id`. Use both when you need to see why generation was slow at the engine level.
 
 ### Graceful degradation
 
@@ -66,4 +66,4 @@ If the installed vLLM does not support `otlp_traces_endpoint` (older versions), 
 
 - **Just want to see generation cost per rollout?** Layer 1 — enable the `generation` group. Works over any transport, including a direct-to-backend `http/protobuf` path.
 - **Want engine behaviour over a whole run (throughput, queue time, preemptions, finish reasons)?** The `vllm/*` metrics, on by default — no per-request spans, no collector needed. See [Metrics](metrics.md).
-- **Debugging vLLM engine internals (scheduling, batching, prefill/decode) on a specific step?** Add Layer 2 — but stand up a gRPC OTLP collector first, correlate by `run_id`, and turn it off again: it emits one span per request (see Caveat 1).
+- **Debugging vLLM engine internals (scheduling, batching, prefill/decode) on a specific step?** Add Layer 2 — but stand up a gRPC OTLP collector first, correlate by `nemo.run.id`, and turn it off again: it emits one span per request (see Caveat 1).

@@ -2,9 +2,9 @@
 
 This module contains NeMo-RL's OpenTelemetry integration, built on top of [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens).
 
-It emits **traces** at RL-algorithm boundaries (rollout, generation, reward, advantage, policy update, checkpoint, evaluate) and **metrics** (`rl.*`: reward, loss, KL, grad norm, learning rate, throughput) that export to any OTLP-compatible backend.
+It emits **traces** at RL-algorithm boundaries (rollout, generation, reward, advantage, policy update, checkpoint, evaluate) and **metrics** (`rl.*`: reward, KL, policy and value loss, entropy, response length, grad norm, learning rate, plus `rl.efficiency.*`, `rl.setup.duration` and the `rl.vllm.*` engine deltas) that export to any OTLP-compatible backend.
 
-Telemetry is **optional**: it activates only when `enabled` is true *and* nemo-lens is installed. When either is absent, every instrumentation site degrades to a ~0-cost no-op.
+Telemetry is **optional**: `enabled` is the single switch. nemo-lens is a base dependency rather than an extra, so when `enabled` is false every instrumentation site degrades to a ~0-cost no-op.
 
 ## Contents
 
@@ -34,7 +34,7 @@ Trace context does not cross the Ray call boundary on its own, so a worker's spa
 - **The presharded worker entrypoints** (`TQPolicy`, `TQValue`, the frozen teacher) are decorated with `@accepts_trace_context` and dispatched with `trace_context_kwargs()`, so their data-plane spans nest under the driver phase that asked for the work. `test_every_context_accepting_method_is_dispatched_with_a_carrier` fails the build if one half of that pair is wired without the other.
 - **The NeMo-Gym actor** takes the carrier on `run_rollouts` and additionally calls `instrument_aiohttp_client()`, which stamps a `traceparent` on the HTTP requests Gym's own client makes. Gated on the `per_prompt` group: the instrumentor spans every request off the global tracer, so its volume is prompts × turns × tool calls. Ask for it with `per_step,per_prompt`.
 
-Everything else still emits root spans, correlated to the driver by `run_id` rather than parented to it — see the gap table below.
+Everything else still emits root spans, correlated to the driver by `nemo.run.id` rather than parented to it — see the gap table below.
 
 Not yet wired:
 
@@ -46,7 +46,7 @@ Not yet wired:
 | Startup sub-phases inside `setup()` | `rl.setup.workers` is one block on the driver: its phases run concurrently in worker threads, which OTel context does not reach. Each worker's own load is a span (`rl.policy.load_model` / `rl.value.load_model` / `rl.vllm.load_model`) in a separate trace; the driver-side per-phase breakdown is in the `rl.setup.duration` metric |
 | Driver-side startup phases as metrics | `rl_init_timer`'s outer phases (`config`, `ray_connect`, `tokenizer`, `data`, `setup`) are printed by the launcher but never logged, so `rl.setup.duration` carries only the phases from inside `setup()`. Summing the metric does not reconstruct `rl.startup` |
 | `rl.init.total` on async PPO | the `init/total` timer is recorded, but `async_ppo_train` is otherwise uninstrumented, so no span is emitted for the initial buffer fill there |
-| SingleController's generation workers | the actor's phases, the transfer queue and the `TQPolicy` / `TQValue` presharded entrypoints are instrumented and parented, but no trace context reaches the generation workers, so their spans form separate traces correlated by `run_id` |
+| SingleController's generation workers | the actor's phases, the transfer queue and the `TQPolicy` / `TQValue` presharded entrypoints are instrumented and parented, but no trace context reaches the generation workers, so their spans form separate traces correlated by `nemo.run.id` |
 | `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | no `init_telemetry_driver`, so a `telemetry:` block in those configs parses and the run succeeds while emitting nothing, driver *and* worker |
 | `VllmGeneration.generate_async` | no `rl.vllm.generate` span, so async rollouts and async validation show `rl.grpo.generation` / `rl.grpo.evaluate` with no generate breakdown inside |
 | `SyncRolloutActor` | the sync data-plane counterpart of the collector; no `init_telemetry_worker`, no rollout spans |

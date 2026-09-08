@@ -80,7 +80,7 @@ Each span belongs to a **span group** that controls whether it is emitted at run
 ## What gets exported
 
 - **Traces**: any OTLP-compatible backend (Jaeger, Grafana Tempo, an OpenTelemetry Collector, ...) via OTLP.
-- **Metrics**: the `rl.efficiency.*` async accounting teed from the driver's metrics logger, plus the vLLM `gen_ai.*` series — see [Metrics](metrics.md).
+- **Metrics**: the `rl.efficiency.*` async accounting teed from the driver's metrics logger, the training scalars (`rl.reward.mean`, `rl.policy.loss`, …), `rl.setup.duration` for the startup phases, the `rl.vllm.*` engine deltas, and the driver-side `gen_ai.*` generation series — see [Metrics](metrics.md).
 - **Logs** (optional): via the OTel log bridge when `telemetry.logs_enabled` is true — correlates Python `logging` records with the active span's trace ID.
 
 **Every** process that enables telemetry exports, each labelled with `nv.dl.rank` / `nv.dl.world_size`. Narrowing a large fleet down is a collector-side filter rather than a config setting — see [Configuration — Which ranks export](configuration.md#which-ranks-export).

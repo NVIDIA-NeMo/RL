@@ -61,7 +61,7 @@ One consequence worth knowing: registration is an *import side effect*, so a gro
 | `advantage` | RL | `rl.<algo>.advantage_calculation` |
 | `policy_update` | RL | `rl.<algo>.policy_training` (and `rl.ppo.value_training` for PPO) |
 | `data_processing` | RL | `rl.<algo>.data_processing` |
-| `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation (`put`, `get`, `claim_meta`, `clear`, …) from a batch-shaped caller |
+| `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation from a batch-shaped caller. The eleven ops are `register`, `claim_meta`, `get_data`, `check_consumption_status`, `put`, `get`, `list_sample_ids`, `clear`, `save_checkpoint`, `load_checkpoint`, `close` |
 | `per_prompt` | RL | spans emitted once per prompt: `rl.sc.generate_and_push` and the rollout path's `rl.data_plane.put`. A cardinality axis rather than a phase — see [Per-prompt spans](#per-prompt-spans) |
 | `efficiency` | RL | idle phases on async GRPO — driver-side `rl.idle.buffer_starvation`, `rl.idle.refit_bubble`, and collector-side `rl.idle.refit_event_wait`, `rl.idle.generation_limit_pause` |
 
@@ -90,7 +90,7 @@ Span names follow `rl.<algorithm>.<phase>`, where `<phase>` is the `Timer` key t
 
 Two spans deliberately do not follow it. `rl.<algorithm>.step` wraps `total_step_time` and `rl.<algorithm>.evaluate` wraps `total_validation_time`: a span's duration is intrinsic, so naming one after a `total_*_time` measurement is tautological, and these two are the umbrella spans a reader meets first in a waterfall. They are named after the operation instead. Every span *inside* them matches its timer key.
 
-The controlling group is shown for each; a span is only emitted when its group is enabled *and* the rank is exporting.
+The controlling group is shown for each; a span is emitted whenever its group is enabled in the process that opens it.
 
 | Algorithm | Spans |
 |---|---|
@@ -127,6 +127,13 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 | `rl.num_prompt_groups` | async rollout batch width, so a gap-filling batch is not read as an unexplained speed-up |
 | `rl.gym.batch_size` | how many examples one `rl.gym.run_rollouts` span covers — the NeMo-Gym counterpart to `rl.num_prompt_groups` |
 | `rl.rollout.attempt` | SingleController dispatch attempt: `0` is a first try, `> 0` a substitution after a skipped group, whose tokens were discarded |
+| `rl.target_step` | the training step an `rl.sc.generate_and_push` dispatch is aimed at; omitted when the dispatch is unstamped |
+| `rl.critic_epochs` | critic epochs covered by one `rl.sc.value_training` span |
+| `rl.ppo_epoch` | PPO epoch index on `rl.sc.policy_training` |
+| `rl.data_plane.op` | which transfer-queue operation an `rl.data_plane.<op>` span covers — the same value as the span-name suffix, so you can group on it without parsing names |
+| `rl.data_plane.partition` | the partition the operation targets |
+| `rl.data_plane.keys` / `rl.data_plane.bytes` | key count and payload size for that one operation. Set after the inner client returns, since neither is known at span open |
+| `rl.data_plane.status` | `ok` / `error` / `timeout` — distinguishes a timeout from a generic failure, which the recorded exception alone does not |
 | `rl.bucket` | goodput bucket: `productive` / `overhead` / `idle` / `wasted` (omit on umbrellas) |
 
 `rl.sc.step` carries `rl.iteration` and `rl.weight_version` but no `rl.epoch`.
@@ -538,9 +545,9 @@ blanks today, so an empty trace is not read as a broken exporter:
 | Startup phases inside `setup()` | `rl.setup.workers` is one block; its sub-phases run concurrently in worker threads, which OTel context does not reach, so they would detach into their own traces. Read the `rl.setup.duration` metric for the breakdown |
 | `rl.startup` outside GRPO | only `run_grpo.py` and `run_grpo_single_controller.py` open the umbrella, so on other launchers `rl.setup.ray_init` is a root span rather than part of a startup waterfall |
 | `rl.init.total` on async PPO | the timer is recorded, but `async_ppo_train` is otherwise uninstrumented, so the span is not emitted there |
-| SingleController generation workers | the actor's own phases are instrumented and the `TQPolicy` / `TQValue` presharded entrypoints are parented, but the generation workers get no trace context, so their spans are separate traces correlated by `run_id` |
+| SingleController generation workers | the actor's own phases are instrumented and the `TQPolicy` / `TQValue` presharded entrypoints are parented, but the generation workers get no trace context, so their spans are separate traces correlated by `nemo.run.id` |
 | `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | these call the instrumented loops but never `init_telemetry_driver`, so a `telemetry:` block in their configs parses, the run succeeds, and nothing is emitted — driver or worker |
-| Non-presharded worker calls | the presharded data-plane entrypoints are parented, but `lm_policy` / `lm_value`'s own `train` / `get_logprobs` / `get_values` and every vLLM worker method are dispatched without a carrier, so those spans stay separate traces correlated by `run_id` |
+| Non-presharded worker calls | the presharded data-plane entrypoints are parented, but `lm_policy` / `lm_value`'s own `train` / `get_logprobs` / `get_values` and every vLLM worker method are dispatched without a carrier, so those spans stay separate traces correlated by `nemo.run.id` |
 | Worker `__init__` spans | `rl.*.load_model` is opened before any call carries context, so the load spans are roots no matter what the caller does |
 
 ## Resource attributes (process tags)
@@ -556,4 +563,4 @@ Stable-for-the-run values, set once at init and attached to every span/metric: `
 | `per_step` | Moderate | Per-step profiling; one trace for the whole run |
 | `all` | Highest | Development / deep debugging |
 
-Non-exporting ranks have an empty span-group set — `is_span_group_enabled()` returns `False` everywhere, so no span objects are created at all. The disabled path is a `frozenset` lookup and an immediate return. See [lens: architecture](https://github.com/NVIDIA-NeMo/Lens).
+A process with telemetry disabled has an empty span-group set — `is_span_group_enabled()` returns `False` everywhere, so no span objects are created at all. The disabled path is a `frozenset` lookup and an immediate return. See [lens: architecture](https://github.com/NVIDIA-NeMo/Lens).

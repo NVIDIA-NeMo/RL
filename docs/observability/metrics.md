@@ -58,9 +58,9 @@ Async GRPO measures where wall time goes with a `Timer` and logs the result as `
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
 | `rl.efficiency.seconds` | Gauge (`s`) | `rl.efficiency.category`, `rl.efficiency.measurement`, `rl.efficiency.window`, `rl.bucket` | Time attributed to one efficiency category |
-| `rl.efficiency.pct` | Gauge (`%`) | `rl.efficiency.measurement`, `rl.efficiency.window` | Productive share of one step's driver-side wall clock |
+| `rl.efficiency.pct` | Gauge (`%`) | `rl.efficiency.measurement`, `rl.efficiency.window` | Productive share of driver-side wall clock over the window named by `rl.efficiency.window` |
 
-The single-controller path reuses two of these category names — `idle/buffer_starvation` for its `exposed_generation` phase and `idle/refit_bubble` for `weight_sync` — so a goodput rollup reads the same vocabulary on both paths.
+The single-controller path reuses two of these category names — `idle/buffer_starvation` for the wait when the training fleet is stalled on the buffer, and `idle/refit_bubble` for `weight_sync` — so a goodput rollup reads the same vocabulary on both paths. Both are spans only there; the single controller logs no `efficiency/*` scalars of its own.
 
 ### Always filter on `rl.efficiency.measurement`
 
@@ -88,11 +88,11 @@ Two deliberate metric/span disagreements to know about before comparing a metric
 | `rl.efficiency.window` | Categories | Meaning |
 |---|---|---|
 | `step` | `idle/buffer_starvation`, `idle/refit_bubble`, `idle/validation` | per-step delta — the driver resets its `Timer` every step, so these sum across steps |
-| `run` | `init/total`, and all four collector-side categories | cumulative since the process started — consecutive points already contain each other, so summing across steps multiplies by the step count |
+| `run` | `init/total`, all four collector-side categories, and `rl.efficiency.pct` on the async PPO path | cumulative since the process started — consecutive points already contain each other, so summing across steps multiplies by the step count |
 
 `init/total` is the driver-side exception: it is measured once, waiting for the first buffer fill before the step loop, then republished unchanged every step so it does not disappear from a dashboard after step 1. Read it as a constant. The collector's `Timer` is never reset, which is why everything from it is `run`.
 
-`rl.efficiency.pct` is tagged `window="step"` for the same reason its numerator is: the three `step`-window idle categories over that step's wall time. `init/total` is deliberately excluded — it is a run constant, so folding it in would charge the whole startup cost to every step — and so are the collector's categories, which are on another clock. Against the run's elapsed time the ratio would climb toward 100% as the run lengthened no matter what the idle time did, which is why the denominator is one step and not the run.
+**`rl.efficiency.pct` carries whichever window its denominator had — read the attribute, do not assume.** `print_efficiency_summary` tags it `window="step"` when the caller passed a per-step wall time and `window="run"` when it fell back to the run's elapsed time. Async GRPO passes the per-step value; async PPO does not, so its points are `run`. The per-step form is the one to trust: its numerator is the three `step`-window idle categories over that step's wall time. `init/total` is deliberately excluded — it is a run constant, so folding it in would charge the whole startup cost to every step — and so are the collector's categories, which are on another clock. Against the run's elapsed time the ratio climbs toward 100% as the run lengthens no matter what the idle time does, which is why a `window="run"` point says little about how the run is actually doing.
 
 ## vLLM engine metrics (`rl.vllm.*`)
 
@@ -158,4 +158,4 @@ Metric names use the **application scope** (`rl.*`); attribute names use the **s
 
 ## Filtering across runs
 
-Every `rl.*` data point carries the `run_id` resource attribute. Use it to isolate or compare runs in your backend (Grafana/Prometheus, or any OTLP-compatible backend). See [Configuration — Run identification](configuration.md#run-identification).
+Every `rl.*` data point carries the `nemo.run.id` resource attribute. Use it to isolate or compare runs in your backend (Grafana/Prometheus, or any OTLP-compatible backend). See [Configuration — Run identification](configuration.md#run-identification).

@@ -67,7 +67,7 @@ If you previously set `export_strategy` or one of its companions, the key still 
 
 ## Run identification
 
-Every run gets a `run_id` that flows to all backends as a resource attribute and is shared by the driver and every worker.
+Every run gets an id that flows to all backends as the **`nemo.run.id`** resource attribute, shared by the driver and every worker. Note the spelling: `run_id` is the config field you set, `nemo.run.id` is the attribute key lens emits and the one your backend indexes.
 
 **Priority order:**
 
@@ -75,9 +75,9 @@ Every run gets a `run_id` that flows to all backends as a resource attribute and
 2. `SLURM_JOB_ID` (auto-detected on SLURM clusters).
 3. Auto-generated 12-character hex id (fallback).
 
-The `run_id` is written to the environment on the driver **before** `init_ray()`, so every worker inherits the same value and correlates to the same run. This is also how vLLM's native spans are correlated back to the RL run — see [vLLM Tracing](vllm-tracing.md).
+The run id is written to the environment on the driver **before** `init_ray()`, so every worker inherits the same value and correlates to the same run. This is also how vLLM's native spans are correlated back to the RL run — see [vLLM Tracing](vllm-tracing.md).
 
-Filter by `run_id` in your backend to isolate a specific run.
+Filter by `nemo.run.id` in your backend to isolate a specific run.
 
 ## Resource attributes
 
@@ -85,6 +85,7 @@ Each process sets stable-for-the-run values on its OTel `Resource` — `init_tel
 
 | Attribute | Source |
 |---|---|
+| `nemo.run.id` | the run id resolved above (`NEMO_RL_OTEL_RUN_ID` / `SLURM_JOB_ID` / generated). Emitted by lens from the `run_id` config field — see [Run identification](#run-identification) |
 | `nv.dl.campaign.stage` | always the literal `RL`. Set by every NeMo-RL process, driver and worker, so a backend collecting several stages of a model's lifecycle (pretrain → SFT → RL) can select this stage without matching on service names |
 | `rl.algorithm` | the `algorithm="<algo>"` passed to `init_telemetry_driver` |
 | `rl.model` | `policy.model_name` |
