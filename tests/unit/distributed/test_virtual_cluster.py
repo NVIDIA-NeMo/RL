@@ -330,6 +330,10 @@ def test_init_ray_alone_has_no_data_plane_awareness():
         assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in env_vars
 
 
+@pytest.mark.skipif(
+    os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1",
+    reason="No venv is built when every PY_EXECUTABLES entry is sys.executable",
+)
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project
@@ -771,11 +775,16 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 envs = {fqn: get_actor_python_env(fqn) for fqn in ACTOR_ENVIRONMENT_REGISTRY}
+# Also assert on PY_EXECUTABLES directly: a constant with no registry entry
+# is invisible to envs, so the class-level promise needs its own check.
+constants = {n: getattr(PY_EXECUTABLES, n) for n in vars(PY_EXECUTABLES) if n.isupper()}
 print(
     json.dumps(
         {
-            "all_system": set(envs.values()) == {PY_EXECUTABLES.SYSTEM},
+            "all_system": set(envs.values()) | set(constants.values())
+            == {PY_EXECUTABLES.SYSTEM},
             "envs": envs,
+            "constants": constants,
         }
     )
 )
@@ -798,7 +807,7 @@ def test_actor_registry_honors_system_flag(use_system_executable):
     payload = json.loads(result.stdout.strip().splitlines()[-1])
 
     if use_system_executable:
-        assert payload["all_system"], payload["envs"]
+        assert payload["all_system"], (payload["envs"], payload["constants"])
     else:
         envs = payload["envs"]
         assert envs[

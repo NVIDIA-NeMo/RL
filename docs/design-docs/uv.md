@@ -59,7 +59,7 @@ class PY_EXECUTABLES:
 
 To ensure consistent dependencies between actors, we run with `--locked` to make sure the dependencies are consistent with the contents of `uv.lock`.
 
-Setting the `NEMO_RL_PY_EXECUTABLES_SYSTEM=1` environment variable rewrites every `uv run` command above to `SYSTEM`, so all actors launch on the driver's interpreter and no per-actor venv is created. Use it only in an environment where every actor's dependencies are already installed, such as a single-environment container image.
+Setting the `NEMO_RL_PY_EXECUTABLES_SYSTEM=1` environment variable rewrites every `uv run` command in `PY_EXECUTABLES` — not only the ones shown here — to `SYSTEM`, so all actors launch on the driver's interpreter and no per-actor venv is created. Use it only in an environment where every actor's dependencies are already installed, such as a single-environment container image.
 
 ### Customization
 
