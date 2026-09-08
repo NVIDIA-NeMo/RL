@@ -21,6 +21,8 @@ refactor from silently changing a durable RL checkpoint protocol.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
@@ -136,6 +138,74 @@ class GymDiscoveredParticipant(_StrictWireModel):
     capabilities: GymControlCapabilities
 
 
+class GymCheckpointParticipantContract(_StrictWireModel):
+    """Credential-free participant properties that must match on restore."""
+
+    participant: GymParticipantIdentity
+    schema_version: Literal[1]
+    admission_states: list[Literal["accepting", "draining", "paused"]]
+    checkpoint_mode: Literal["stateless", "export_restore"]
+    concurrency_contract: Literal[
+        "stateless",
+        "serialized_per_session",
+        "transactional_parallel",
+    ]
+    multi_process: GymMultiProcessCapability
+    instance_role: Literal["policy", "auxiliary"] | None = None
+
+    @classmethod
+    def from_discovered(
+        cls,
+        discovered: GymDiscoveredParticipant,
+    ) -> "GymCheckpointParticipantContract":
+        """Project one dynamic capability response onto restore semantics."""
+        capabilities = discovered.capabilities
+        return cls(
+            participant=discovered.participant,
+            schema_version=capabilities.schema_version,
+            admission_states=sorted(capabilities.admission_states),
+            checkpoint_mode=capabilities.checkpoint_mode,
+            concurrency_contract=capabilities.concurrency_contract,
+            multi_process=capabilities.multi_process,
+            instance_role=capabilities.instance_role,
+        )
+
+
+class GymCheckpointTopology(_StrictWireModel):
+    """Stable participant topology cached by setup and bound to snapshots."""
+
+    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
+    participants: list[GymCheckpointParticipantContract]
+
+    @classmethod
+    def from_discovered(
+        cls,
+        participants: list[GymDiscoveredParticipant],
+    ) -> "GymCheckpointTopology":
+        """Build a deterministically ordered topology from discovery results."""
+        contracts = [
+            GymCheckpointParticipantContract.from_discovered(participant)
+            for participant in participants
+        ]
+        contracts.sort(
+            key=lambda item: (
+                item.participant.component,
+                item.participant.server_name,
+                item.participant.participant_name,
+            )
+        )
+        return cls(participants=contracts)
+
+    def fingerprint(self) -> str:
+        """Return a canonical digest without runtime routing or credentials."""
+        payload = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+
 class GymCheckpointControlRequest(_StrictWireModel):
     """Fields shared by all Gym checkpoint control requests."""
 
@@ -164,6 +234,49 @@ class GymModelPrepareResponse(_StrictWireModel):
     workers: GymWorkerAcknowledgements
     inflight_total: NonNegativeInt
     waiters_total: NonNegativeInt
+
+
+class GymModelInflightRequest(_StrictWireModel):
+    rollout_id: str | None = Field(default=None, pattern=_IDENTITY_PATTERN)
+    attempt_index: NonNegativeInt | None = None
+    plane: str | None
+    age_seconds: NonNegativeFloat
+
+
+class GymSingleWorkerModelStatus(_StrictWireModel):
+    state: Literal["accepting", "draining", "paused"]
+    inflight: NonNegativeInt
+
+
+class GymSingleWorkerModelStatusResponse(_StrictWireModel):
+    checkpoint_id: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
+    state: Literal["accepting", "draining", "paused"]
+    per_worker: dict[str, GymSingleWorkerModelStatus]
+    inflight_total: NonNegativeInt
+    waiters_total: NonNegativeInt
+    inflight: list[GymModelInflightRequest]
+    tombstones: list[GymExecutionIdentity]
+
+
+class GymCoordinatorWorkers(_StrictWireModel):
+    acknowledged: NonNegativeInt
+    expected: PositiveInt
+    live: NonNegativeInt
+
+
+class GymCoordinatorWorkerStatus(_StrictWireModel):
+    acked_seq: NonNegativeInt
+    inflight: NonNegativeInt
+    connected: bool
+
+
+class GymCoordinatorModelStatusResponse(_StrictWireModel):
+    state: Literal["accepting", "draining", "paused"]
+    workers: GymCoordinatorWorkers
+    missing_workers: NonNegativeInt
+    inflight_total: NonNegativeInt
+    waiters_total: NonNegativeInt
+    per_worker: dict[str, GymCoordinatorWorkerStatus]
 
 
 class GymAgentExecutionStatus(GymExecutionIdentity):
@@ -218,7 +331,7 @@ class GymParticipantPrepareResult(_StrictWireModel):
 
 
 class GymCheckpointPrepareResult(_StrictWireModel):
-    """One non-blocking prepare observation across discovered participants."""
+    """One complete, safe checkpoint boundary across discovered participants."""
 
     checkpoint_id: str
     ready: bool
