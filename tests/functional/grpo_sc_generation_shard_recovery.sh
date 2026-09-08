@@ -296,13 +296,13 @@ uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     logger.wandb_enabled=false \
     logger.tensorboard_enabled=true \
     logger.monitor_gpus=false \
-    ++async_rl.generation_fleet_health.enabled=true \
-    ++async_rl.generation_fleet_health.restart_dead_shards="$RESTART_DEAD_SHARDS" \
-    ++async_rl.generation_fleet_health.probe_interval_s=$PROBE_INTERVAL_S \
-    ++async_rl.generation_fleet_health.unhealthy_threshold=$UNHEALTHY_THRESHOLD \
-    ++async_rl.generation_fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
-    ++async_rl.stall_watchdog.interval_s=30.0 \
-    ++async_rl.stall_watchdog.stall_timeout_s=300.0 \
+    async_rl.generation_fleet_health.enabled=true \
+    async_rl.generation_fleet_health.restart_dead_shards="$RESTART_DEAD_SHARDS" \
+    async_rl.generation_fleet_health.probe_interval_s=$PROBE_INTERVAL_S \
+    async_rl.generation_fleet_health.unhealthy_threshold=$UNHEALTHY_THRESHOLD \
+    async_rl.generation_fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
+    async_rl.stall_watchdog.interval_s=30.0 \
+    async_rl.stall_watchdog.stall_timeout_s=300.0 \
     "$@" \
     > "$RUN_LOG" 2>&1 &
 TRAIN_PID=$!
