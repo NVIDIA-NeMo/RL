@@ -1053,8 +1053,11 @@ class TQDataPlaneClient(DataPlaneClient):
                 for key in wire_fields.keys()
             )
         )
-        gdr_staging = None
         if confirm_gdr_put:
+            # Checked before the put, not after: TQ fixes GDR eligibility when
+            # the client attaches, so this is decidable up front — and once
+            # `kv_batch_put` returns, the rows are already durable and the
+            # controller has been notified, so raising then would strand them.
             tq_client = tq.get_client()
             storage_manager = getattr(tq_client, "storage_manager", None)
             storage_client = getattr(storage_manager, "storage_client", None)
@@ -1074,11 +1077,6 @@ class TQDataPlaneClient(DataPlaneClient):
             tags=user_tags,
         )
         if confirm_gdr_put:
-            if not getattr(gdr_staging, "_initialized", False):
-                raise RuntimeError(
-                    "TransferQueue tensor PUT completed without initializing "
-                    "the requested GDR staging buffer"
-                )
             LOGGER.info(
                 "TransferQueue GDR tensor PUT active (partition=%s)", partition_id
             )

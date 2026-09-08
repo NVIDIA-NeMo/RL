@@ -103,8 +103,8 @@ def test_cpu_only_client_may_attach_with_gdr_config(monkeypatch) -> None:
 def test_gdr_tensor_put_is_confirmed_once_and_never_falls_back(
     monkeypatch, caplog
 ) -> None:
-    """A CUDA client's first tensor PUT must initialize the GDR path."""
-    staging = SimpleNamespace(_initialized=False)
+    """A CUDA client's tensor PUT must take GDR, and say so exactly once."""
+    staging = SimpleNamespace()
     storage_client = SimpleNamespace(use_gdr=True, _gdr_staging=None)
     tq_client = SimpleNamespace(
         storage_manager=SimpleNamespace(storage_client=storage_client)
@@ -132,17 +132,21 @@ def test_gdr_tensor_put_is_confirmed_once_and_never_falls_back(
 
     storage_client._gdr_staging = staging
 
-    def put_with_gdr(**kwargs) -> None:
-        staging._initialized = True
-
-    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", put_with_gdr)
+    puts: list[dict] = []
+    monkeypatch.setattr(
+        tq_adapter.tq, "kv_batch_put", lambda **kwargs: puts.append(kwargs)
+    )
     with caplog.at_level(logging.INFO, logger=tq_adapter.LOGGER.name):
         client.put_samples(["sample-0"], "rollout_staging", fields)
         client.put_samples(["sample-1"], "rollout_staging", fields)
 
-    assert caplog.messages.count(
-        "TransferQueue GDR tensor PUT active (partition=rollout_staging)"
-    ) == 1
+    assert len(puts) == 2
+    assert (
+        caplog.messages.count(
+            "TransferQueue GDR tensor PUT active (partition=rollout_staging)"
+        )
+        == 1
+    )
 
 
 def test_gdr_receiver_requires_cuda_initialized(monkeypatch) -> None:
