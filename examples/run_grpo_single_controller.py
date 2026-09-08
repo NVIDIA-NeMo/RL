@@ -141,7 +141,14 @@ def main() -> None:
         init_ray()
 
         with setup_span("tokenizer"):
-            tokenizer = get_tokenizer(config.policy["tokenizer"])
+            processor = None
+            if config.policy.get("is_vlm"):
+                processor = get_tokenizer(
+                    config.policy["tokenizer"], get_processor=True
+                )
+                tokenizer = processor.tokenizer
+            else:
+                tokenizer = get_tokenizer(config.policy["tokenizer"])
             assert config.policy["generation"] is not None, (
                 "A generation config is required for SC-driven async GRPO"
             )
@@ -168,7 +175,7 @@ def main() -> None:
         # rl.setup.duration metric, which is measured inside each phase.
         with setup_span("workers"):
             actor_args, setup_timing_metrics = setup_single_controller(
-                config, tokenizer
+                config, tokenizer, processor=processor
             )
 
     print("🚀 Launching SingleControllerActor")

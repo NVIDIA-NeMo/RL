@@ -15,8 +15,69 @@
 
 from __future__ import annotations
 
-from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneConfig
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+from nemo_rl.data_plane.interfaces import (
+    DataPlaneClient,
+    DataPlaneConfig,
+    DataPlaneRuntimeConfig,
+    LocalDataPlaneConfig,
+)
 from nemo_rl.telemetry.setup import telemetry_enabled_in_env
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import MasterConfig
+
+
+def data_plane_enabled(cfg: DataPlaneConfig | None) -> bool:
+    """Whether the data plane is on. ``None`` (key absent) means off."""
+    return cfg is not None and bool(cfg.get("enabled", False))
+
+
+def select_sync_trainer(
+    master_config: "MasterConfig", *, label: str = "GRPO"
+) -> Callable[..., Any]:
+    """Pick the synchronous trainer based on ``data_plane.enabled``.
+
+    Shared by every launcher so trainer choice cannot drift between them.
+    Pairs with :func:`make_policy_factory`: turning the data plane on means
+    picking *both* the TQ-mediated trainer and a ``TQPolicy``, and a launcher
+    that picked only one would fail after a full model load.
+
+    Args:
+        master_config: The resolved config; only ``data_plane`` is read.
+        label: Algorithm name for the progress line (e.g. ``"VLM GRPO"``).
+    """
+    if data_plane_enabled(master_config.data_plane):
+        from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+        print(f"🚀 Running synchronous {label} training (TransferQueue)")
+        return grpo_train_sync
+
+    from nemo_rl.algorithms.grpo import grpo_train
+
+    print(f"🚀 Running synchronous {label} training (legacy)")
+    return grpo_train
+
+
+def make_policy_factory(
+    cfg: DataPlaneConfig | None,
+) -> Optional[Callable[..., Any]]:
+    """The ``policy_factory`` for ``setup()``, or ``None`` for a plain ``Policy``.
+
+    Lives at the launcher level so the legacy trainer stays data-plane-agnostic
+    (architectural invariant — see
+    ``tests/unit/data_plane/test_architecture_invariants.py``).
+    """
+    if not data_plane_enabled(cfg):
+        return None
+
+    from nemo_rl.models.policy.tq_policy import TQPolicy
+
+    def _make_policy(**kwargs: Any) -> TQPolicy:
+        return TQPolicy(**kwargs, dp_cfg=cfg)
+
+    return _make_policy
 
 
 def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
@@ -58,13 +119,13 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
 
 
 def build_data_plane_client(
-    cfg: DataPlaneConfig | None, *, bootstrap: bool = True
+    cfg: DataPlaneRuntimeConfig | None, *, bootstrap: bool = True
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 
-    Dispatches on ``cfg["impl"]``. Only ``"transfer_queue"`` ships today;
-    other adapters can be added behind this factory without touching
-    call sites. Raises if data_plane is disabled — the legacy trainer
+    Dispatches on the configured implementation. TransferQueue supports
+    cross-process transfer; the local adapter keeps colocated SFT batches in
+    one process. Raises if data_plane is disabled — the legacy trainer
     (``nemo_rl.algorithms.grpo.grpo_train``) should be used in that case
     rather than a NoOp fallback here.
 
@@ -78,22 +139,46 @@ def build_data_plane_client(
         A configured ``DataPlaneClient``; wrapped in
         :class:`MetricsDataPlaneClient` when observability is enabled.
     """
-    if cfg is None or not cfg["enabled"]:
+    if cfg is None:
+        raise ValueError(
+            "build_data_plane_client called with data_plane disabled. "
+            "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer "
+            "(which never engages the data plane) for that case."
+        )
+    if isinstance(cfg, LocalDataPlaneConfig):
+        enabled = cfg.enabled
+    else:
+        enabled = cfg["enabled"]
+    if not enabled:
         raise ValueError(
             "build_data_plane_client called with data_plane disabled. "
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer "
             "(which never engages the data plane) for that case."
         )
 
-    impl = cfg["impl"]
+    impl = cfg.impl if isinstance(cfg, LocalDataPlaneConfig) else cfg["impl"]
     if impl == "transfer_queue":
         from nemo_rl.data_plane.adapters.transfer_queue import TQDataPlaneClient
 
+        assert not isinstance(cfg, LocalDataPlaneConfig)
         client: DataPlaneClient = TQDataPlaneClient(cfg, bootstrap=bootstrap)
+    elif impl == "local":
+        from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient
+
+        local_cfg = (
+            cfg
+            if isinstance(cfg, LocalDataPlaneConfig)
+            else LocalDataPlaneConfig.model_validate(cfg)
+        )
+        client = LocalDataPlaneClient(local_cfg)
     else:
         raise ValueError(f"unknown data_plane impl: {impl!r}")
 
-    obs = cfg.get("observability") or {}
+    obs = (
+        cfg.observability
+        if isinstance(cfg, LocalDataPlaneConfig)
+        else cfg.get("observability")
+    ) or {}
     obs_enabled = obs.get("enabled", False)
     # The wrapper carries the trace spans as well as the event callback, so
     # telemetry alone is reason enough to install it -- otherwise transfer-queue

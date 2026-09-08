@@ -43,6 +43,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
@@ -54,6 +55,20 @@ class _InitBuffer:
     """Minimal non-optional TQ buffer contract for actor-init tests."""
 
     def __init__(self) -> None:
+        self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
+
+
+class _InitRolloutManager:
+    """Minimal rollout-manager contract for actor-init tests."""
+
+    def __init__(self, tq_buffer: _InitBuffer) -> None:
+        self._tq_buffer = tq_buffer
+        self.recovery_ledger = RolloutRecoveryLedger()
         self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
 
     def set_data_plane_checkpoint_barrier(
@@ -111,7 +126,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
+        rollout_manager=_InitRolloutManager(tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -119,6 +134,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
     )
     args.update(overrides)
@@ -169,7 +185,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
+        rollout_manager=_InitRolloutManager(tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -227,7 +243,9 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         setup_timing_metrics=SetupTimingMetrics(),
     )
 
-    logger.log_hyperparams.assert_called_once_with(master_config.model_dump())
+    expected_hparams = master_config.model_dump()
+    expected_hparams["token_capture"]["control_auth_token"] = "<redacted>"
+    logger.log_hyperparams.assert_called_once_with(expected_hparams)
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output
@@ -483,7 +501,9 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     asyncio.run(ctrl._sync_weights())
 
@@ -513,7 +533,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
     calibration_data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[1, 2]]),
@@ -611,6 +633,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._message_level_advantage_penalties_enabled = True
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
@@ -703,6 +726,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     )
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -766,6 +790,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -834,6 +859,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -896,6 +922,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -956,6 +983,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -1039,6 +1067,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1389,8 +1418,10 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    ctrl._finalizer_metrics_by_group = {}
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
@@ -2253,6 +2284,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],

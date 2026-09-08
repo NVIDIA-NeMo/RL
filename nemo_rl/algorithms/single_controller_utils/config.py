@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, Optional
 
@@ -57,6 +58,7 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -588,6 +590,131 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
+class TokenCaptureConfig(BaseModel, extra="allow"):
+    """Ledger-authoritative token capture (token-in/token-out via NeMo-Gym).
+
+    Dormant by default: with ``enabled=False`` every legacy codepath behaves
+    exactly as before — no staging partition is registered, no ledger is
+    installed, and rollouts ride the token-echo path.
+    """
+
+    enabled: bool = False
+    # TQ partition holding per-call staged token deltas (cleared by the
+    # finalizer; distinct from the canonical rollout partition).
+    staging_partition: str = "rollout_staging"
+    # Drop the whole group when fewer than this fraction of its rollouts
+    # produced valid rows (None keeps every group).
+    min_valid_fraction_per_group: Optional[float] = None
+    # Bearer token for Gym's token-capture control routes. None =
+    # minted per run at setup; set explicitly only for multi-controller
+    # setups that must share one ledger.
+    control_auth_token: Optional[str] = None
+    # Hard deadline per control-plane call (S5 finding: control-plane death must
+    # surface as a failed dispatch, not a silent retry stall).
+    control_timeout_s: float = 60.0
+    # Root for Gym's per-rollout capture ledgers and base capture layer. None =
+    # derived at setup
+    # under the run's log dir.
+    capture_dir: Optional[str] = None
+    # Keep routed_experts out of canonical rows and assemble them on policy
+    # workers from strict staged-fragment plans.
+    defer_routed_experts_to_policy: bool = False
+    # Fixed CPU finalizer pool size; actors are never automatically replaced.
+    num_reassembler_workers: PositiveInt = 2
+
+
+@dataclass(frozen=True)
+class TaskSourceRecoveryGranularity:
+    """Recovery granularity selected for a prompt-group reservation.
+
+    ``task_source`` is copied from the raw Gym row when present. ``granularity``
+    is selected from an explicit agent override, a task-source override, or the
+    global default.
+    """
+
+    task_source: Optional[str]
+    granularity: RecoveryGranularity
+
+
+class RolloutRecoveryConfig(BaseModel, extra="allow"):
+    """Retry and restore policy for unfinished token-capture prompt groups.
+
+    ``sibling`` (the default) preserves completed generations and retries only
+    the missing ones. Prefer it when reusing work and avoiding repeated long-tail
+    generations matters more than keeping a group on one policy version.
+
+    ``prompt_group`` discards and regenerates every sibling when any generation
+    is unfinished. It costs a full group per recovery, but keeps the regenerated
+    group on the policy weights live at redispatch instead of mixing those results
+    with older sealed siblings.
+
+    The resolved value is persisted on each ledger group, so restoring a saved
+    group does not reinterpret it using a newer configuration. The same
+    granularity governs failures handled in-process and after a process restart.
+    """
+
+    default_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING
+    # Keyed by ``extra_env_info.task_source``, which is available before Gym
+    # resolves the concrete agent used to execute the row.
+    task_source_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+        default_factory=dict
+    )
+    # Keyed by ``extra_env_info.agent_ref.name`` when the input row already has
+    # a concrete Gym route. A matching agent override wins over task_source.
+    agent_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="after")
+    def _reject_removed_override_keys(self) -> "RolloutRecoveryConfig":
+        """Reject the removed task-name map instead of silently ignoring it."""
+        removed = {"task_granularity_overrides"}.intersection(self.model_extra or {})
+        if removed:
+            raise ValueError(
+                f"rollout_recovery fields {sorted(removed)!r} were replaced by "
+                "task_source_granularity_overrides"
+            )
+        return self
+
+    def resolve_for_prompt(
+        self, prompt: Mapping[str, Any]
+    ) -> TaskSourceRecoveryGranularity:
+        """Resolve using matching agent, matching task source, then default."""
+        extra_env_info = prompt.get("extra_env_info")
+        task_source: Optional[str] = None
+        agent_name: Optional[str] = None
+        if isinstance(extra_env_info, Mapping):
+            raw_task_source = extra_env_info.get("task_source")
+            if raw_task_source is not None and not isinstance(raw_task_source, str):
+                raise TypeError("prompt task_source must be a string or None")
+            task_source = raw_task_source
+            agent_ref = extra_env_info.get("agent_ref")
+            if agent_ref is not None and not isinstance(agent_ref, Mapping):
+                raise TypeError("prompt agent_ref must be a mapping or None")
+            if isinstance(agent_ref, Mapping):
+                raw_agent_name = agent_ref.get("name")
+                if raw_agent_name is not None and not isinstance(raw_agent_name, str):
+                    raise TypeError("prompt agent_ref.name must be a string or None")
+                agent_name = raw_agent_name
+        if agent_name is not None:
+            if task_source is None:
+                warnings.warn(
+                    "rollout recovery is using legacy agent_ref because "
+                    "task_source is missing; re-collate the dataset with "
+                    "the current NeMo Gym",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+            override = self.agent_granularity_overrides.get(agent_name)
+            if override is not None:
+                return TaskSourceRecoveryGranularity(task_source, override)
+        if task_source is not None:
+            override = self.task_source_granularity_overrides.get(task_source)
+            if override is not None:
+                return TaskSourceRecoveryGranularity(task_source, override)
+        return TaskSourceRecoveryGranularity(task_source, self.default_granularity)
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -605,8 +732,12 @@ class MasterConfig(BaseModel, extra="allow"):
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+    rollout_recovery: RolloutRecoveryConfig = Field(
+        default_factory=RolloutRecoveryConfig
+    )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
     telemetry: Optional[TelemetryConfig] = None
+    token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
@@ -1016,6 +1147,57 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "'train:loss') or set checkpointing.metric_name=null."
         )
 
+    token_capture_config = master_config.token_capture
+    recovery_config = master_config.rollout_recovery
+    if not token_capture_config.enabled and (
+        recovery_config.default_granularity is not RecoveryGranularity.SIBLING
+        or recovery_config.task_source_granularity_overrides
+        or recovery_config.agent_granularity_overrides
+    ):
+        raise ValueError(
+            "non-default rollout_recovery policies require "
+            "token_capture.enabled=true; without token capture, unfinished Gym "
+            "siblings have no durable receipts to recover"
+        )
+    if token_capture_config.defer_routed_experts_to_policy and not (
+        token_capture_config.enabled
+    ):
+        raise ValueError(
+            "token_capture.defer_routed_experts_to_policy requires "
+            "token_capture.enabled=true"
+        )
+    if (
+        token_capture_config.enabled
+        and token_capture_config.num_reassembler_workers
+        > async_config.max_buffered_rollouts
+    ):
+        warnings.warn(
+            "token_capture.num_reassembler_workers exceeds "
+            "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
+            stacklevel=2,
+        )
+    if token_capture_config.enabled and reward_penalties_enabled:
+        warnings.warn(
+            "reward_penalties are enabled but token-capture receipt rollouts "
+            "carry no generated tokens/text at rollout time, so the penalty "
+            "checks are skipped and capture-path rewards stay unpenalized "
+            "(penalty-rate metrics will read 0). Disable the reward_penalties "
+            "flags to make this explicit, or run without token capture to "
+            "train with penalized rewards.",
+            stacklevel=2,
+        )
+    if (
+        token_capture_config.enabled
+        and async_config.rollout_failure.max_skipped_prompts
+    ):
+        warnings.warn(
+            "async_rl.rollout_failure.max_skipped_prompts does nothing with "
+            "token_capture.enabled=true: the capture dispatch path re-raises a "
+            "deterministic failure instead of skipping the prompt, so the run "
+            "ends on the first prompt that exhausts max_data_attempts.",
+            stacklevel=2,
+        )
+
     # A non-zero reference-policy KL penalty makes the loss read
     # ``reference_policy_logprobs``, but the SC train pump only computes them
     # when ``skip_reference_policy_logprobs_calculation`` is false (see
@@ -1068,6 +1250,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         algo_cfg.invalid_tool_call_advantage is not None
         or algo_cfg.malformed_thinking_advantage is not None
     )
+    if penalties_enabled and token_capture_config.enabled:
+        # TODO(token-capture): thread the per-message violation flags through
+        # capture receipts/staging so RolloutReassembler can emit
+        # invalid_tool_call_mask/malformed_thinking_mask; then drop this guard.
+        # Checked before the gym-path validation: the conflict exists
+        # regardless of how the rollout path is configured.
+        raise NotImplementedError(
+            "invalid_tool_call_advantage/malformed_thinking_advantage require "
+            "the invalid_tool_call_mask/malformed_thinking_mask train-batch "
+            "columns, which the token-capture finalizer does not emit — the "
+            "first streamed group would crash the train pump with a KeyError "
+            "at the advantage stage. Set grpo.invalid_tool_call_advantage=null "
+            "and grpo.malformed_thinking_advantage=null to run with token "
+            "capture; mask support on the capture path is a follow-up."
+        )
     if penalties_enabled and not should_use_nemo_gym(master_config):
         raise ValueError(
             "invalid_tool_call_advantage and malformed_thinking_advantage on the "

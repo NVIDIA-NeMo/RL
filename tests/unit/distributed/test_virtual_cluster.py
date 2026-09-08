@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 import re
 import socket
 import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -320,6 +322,31 @@ def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
         assert env_vars["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
 
 
+def test_init_ray_adds_hf_modules_cache_to_cluster_pythonpath():
+    """Direct actors must import trust_remote_code classes while unpickling."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "HF_MODULES_CACHE": "/hf/modules",
+            "PYTHONPATH": "/project",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            init_ray()
+
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert env_vars["HF_MODULES_CACHE"] == "/hf/modules"
+        assert env_vars["PYTHONPATH"].split(os.pathsep) == [
+            "/hf/modules",
+            "/project",
+        ]
+
+
 def test_init_ray_alone_has_no_data_plane_awareness():
     """Every non-data-plane launcher's call (bare init_ray(), no preceding
     maybe_configure_data_plane_env) must not touch mooncake env vars --
@@ -340,6 +367,10 @@ def test_init_ray_alone_has_no_data_plane_awareness():
         assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in env_vars
 
 
+@pytest.mark.skipif(
+    os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1",
+    reason="No venv is built when every PY_EXECUTABLES entry is sys.executable",
+)
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project
@@ -769,3 +800,54 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     # Avoid privileged ports (<1024).
     assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
+
+
+_REGISTRY_PROBE = """
+import json
+
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+    get_actor_python_env,
+)
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+envs = {fqn: get_actor_python_env(fqn) for fqn in ACTOR_ENVIRONMENT_REGISTRY}
+# Also assert on PY_EXECUTABLES directly: a constant with no registry entry
+# is invisible to envs, so the class-level promise needs its own check.
+constants = {n: getattr(PY_EXECUTABLES, n) for n in vars(PY_EXECUTABLES) if n.isupper()}
+print(
+    json.dumps(
+        {
+            "all_system": set(envs.values()) | set(constants.values())
+            == {PY_EXECUTABLES.SYSTEM},
+            "envs": envs,
+            "constants": constants,
+        }
+    )
+)
+"""
+
+
+@pytest.mark.parametrize("use_system_executable", [False, True])
+def test_actor_registry_honors_system_flag(use_system_executable):
+    # The registry freezes its executable strings at import, so the flag can
+    # only be exercised in a fresh interpreter.
+    env = dict(os.environ)
+    env["NEMO_RL_PY_EXECUTABLES_SYSTEM"] = "1" if use_system_executable else "0"
+    result = subprocess.run(
+        [sys.executable, "-c", _REGISTRY_PROBE],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+
+    if use_system_executable:
+        assert payload["all_system"], (payload["envs"], payload["constants"])
+    else:
+        envs = payload["envs"]
+        assert envs[
+            "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+        ].startswith("uv run")
+        assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")

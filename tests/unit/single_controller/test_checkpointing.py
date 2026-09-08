@@ -80,10 +80,16 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     RolloutRecoveryLedger,
+)
+from nemo_rl.experience.route_plan import (
+    ROUTE_PLAN_SCHEMA_VERSION,
+    RouteAssemblyPlan,
+    encode_route_plan,
 )
 from nemo_rl.utils.checkpoint import CheckpointManager
 
@@ -98,6 +104,17 @@ from tests.unit.single_controller.test_setup import (
 _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
 
 _PARTITION_ID = "rollout_data"
+
+
+def _consumed_meta(*sample_ids: str) -> KVBatchMeta:
+    """A train-consumed canonical meta as the train pump hands to cleanup."""
+    return KVBatchMeta(
+        partition_id=_PARTITION_ID,
+        task_name="train",
+        sample_ids=list(sample_ids),
+        fields=["input_ids"],
+        tags=[{"weight_version": 0} for _ in sample_ids],
+    )
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────
@@ -338,6 +355,25 @@ class _FakeDPClient:
             json.dump({"user_metadata": metadata or {}}, f)
 
 
+class _StagingInventoryDPClient:
+    """Partition-scoped fake for rollout-recovery inventory validation."""
+
+    def __init__(self, sample_ids: list[str], *, partition_id: str) -> None:
+        self.sample_ids = list(sample_ids)
+        self.partition_id = partition_id
+        self.clear_calls: list[tuple[list[str], str]] = []
+
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        assert partition_id == self.partition_id
+        return sorted(self.sample_ids)
+
+    def clear_samples(self, sample_ids: list[str], partition_id: str) -> None:
+        assert partition_id == self.partition_id
+        self.clear_calls.append((list(sample_ids), partition_id))
+        cleared = set(sample_ids)
+        self.sample_ids = [key for key in self.sample_ids if key not in cleared]
+
+
 class _BlockingDPClient(_FakeDPClient):
     def __init__(self) -> None:
         super().__init__()
@@ -378,6 +414,9 @@ class _FakeRolloutManager:
         self._tq_buffer = None
         self.recovery_ledger = RolloutRecoveryLedger()
 
+    def set_data_plane_checkpoint_barrier(self, barrier: Any) -> None:
+        self.data_plane_checkpoint_barrier = barrier
+
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
 
@@ -404,6 +443,10 @@ class _FakeTQBuffer:
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
+
+    @property
+    def group_ids(self) -> tuple[str, ...]:
+        return ()
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -572,6 +615,7 @@ def _make_actor_args(
             save_state if save_state is not None else _initial_grpo_save_state()
         ),
         last_checkpoint_path=last_checkpoint_path,
+        finalizer_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
     )
 
@@ -600,6 +644,42 @@ def _data_plane_checkpoint_metadata(
         "replay_manifest_digest": manifest_digest,
         "replay_group_count": group_count,
     }
+
+
+def _sealed_recovery_ledger(staging_key: str) -> RolloutRecoveryLedger:
+    """Build one ledger whose only sibling owns a sealed staging row."""
+    ledger = RolloutRecoveryLedger()
+
+    async def seed() -> None:
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            group = ledger.reserve_group(
+                cut,
+                group_id="recovery-group",
+                admission_id="recovery-batch",
+                prompt_id="7",
+                prompt_payload={"idx": 7, "message_log": []},
+                expected_generations=1,
+                target_step=7,
+                start_weight_version=6,
+                admitted=True,
+            )
+            ledger.mark_group_dispatched(cut, group.group_id)
+            gate_id = group.gate_rollout_id(0)
+            ledger.mark_sibling_sealed(
+                cut,
+                group.group_id,
+                generation_index=0,
+                gate_rollout_id=gate_id,
+                receipt={
+                    "rollout_id": gate_id,
+                    "manifest": [{"staging_key": staging_key}],
+                },
+                reward=1.0,
+                mask_sample=False,
+            )
+
+    asyncio.run(seed())
+    return ledger
 
 
 def _run_train_pump(
@@ -1142,6 +1222,74 @@ class TestDataPlaneCheckpoint:
 
         assert not (tmp_path / "checkpoints" / "step_1").exists()
 
+    def test_rollout_recovery_inventory_rejects_missing_staging_rows(self):
+        staging_partition = "rollout_staging"
+        actor = object.__new__(_ACTOR_CLS)
+        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
+        actor._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition=staging_partition)
+        )
+        actor._dp_client = _StagingInventoryDPClient([], partition_id=staging_partition)
+
+        async def validate_inventory() -> None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=None,
+                    clear_unreferenced=False,
+                )
+
+        with pytest.raises(RuntimeError, match=r"missing=\['sealed-key'\]"):
+            asyncio.run(validate_inventory())
+
+    def test_rollout_recovery_inventory_merges_routes_and_clears_orphans(self):
+        staging_partition = "rollout_staging"
+        route_key = "canonical-route-key"
+        route_plan = encode_route_plan(
+            RouteAssemblyPlan(
+                schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                staging_partition=staging_partition,
+                spans=(),
+                cleanup_staging_keys=(route_key,),
+                expected_token_length=0,
+            )
+        )
+        replay_metadata = {
+            "groups": [
+                {
+                    "meta": KVBatchMeta(
+                        partition_id=_PARTITION_ID,
+                        task_name="train",
+                        sample_ids=["canonical-sample"],
+                        tags=[{ROUTE_PLAN_TAG: route_plan}],
+                    )
+                }
+            ]
+        }
+        dp_client = _StagingInventoryDPClient(
+            ["sealed-key", route_key, "orphan-key"],
+            partition_id=staging_partition,
+        )
+        actor = object.__new__(_ACTOR_CLS)
+        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
+        actor._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition=staging_partition)
+        )
+        actor._dp_client = dp_client
+
+        async def validate_inventory() -> None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=replay_metadata,  # type: ignore[arg-type]
+                    clear_unreferenced=True,
+                )
+
+        asyncio.run(validate_inventory())
+
+        assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
+        assert sorted(dp_client.sample_ids) == [route_key, "sealed-key"]
+
     def test_gated_sampler_writes_authoritative_tq_checkpoint(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
@@ -1200,7 +1348,7 @@ class TestDataPlaneCheckpoint:
             assert started
 
             clear_task = asyncio.create_task(
-                actor._clear_data_plane_samples(["sample-0"])
+                actor._cleanup_consumed_metas([_consumed_meta("sample-0")])
             )
             await asyncio.sleep(0)
             assert dp_client.clear_calls == []
@@ -1222,7 +1370,7 @@ class TestDataPlaneCheckpoint:
                 mc, _make_actor_args(dp_client=dp_client), SetupTimingMetrics()
             )
             event_loop_thread_id = threading.get_ident()
-            await actor._clear_data_plane_samples(["sample-0"])
+            await actor._cleanup_consumed_metas([_consumed_meta("sample-0")])
             actor._checkpointer.shutdown()
             return event_loop_thread_id
 
@@ -1561,6 +1709,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             val_at_start=False,
             val_at_end=False,
         ),
+        logger={"wandb_enabled": False, "wandb": {}},
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,
