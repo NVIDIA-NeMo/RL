@@ -1857,7 +1857,12 @@ class _NemoGymStreamAccumulator:
     def is_complete(self) -> bool:
         return len(self._received_row_indices) == len(self._rows)
 
-    def add(self, row_index: int, result: dict) -> _CompletedNemoGymGroup | None:
+    def add(
+        self,
+        row_index: int,
+        result: dict,
+        resolved_agent_ref: dict,
+    ) -> _CompletedNemoGymGroup | None:
         """Add one streamed row and return its group when that group is complete."""
         if not isinstance(row_index, int):
             raise TypeError(
@@ -1871,6 +1876,7 @@ class _NemoGymStreamAccumulator:
         if row_index in self._received_row_indices:
             raise ValueError(f"NeMo-Gym returned duplicate row index {row_index}")
 
+        self._rows[row_index]["agent_ref"] = resolved_agent_ref
         self._received_row_indices.add(row_index)
         group_index = row_index // self._num_generations
         group_results = self._pending_results[group_index]
@@ -2616,14 +2622,14 @@ async def run_async_nemo_gym_rollout(
                 except StopAsyncIteration:
                     stream_finished = True
                 else:
-                    rowidx, result, timing_metrics = await future
+                    rowidx, resolved_agent_ref, result, timing_metrics = await future
                     # Measure the received streaming Ray value in the caller. In
                     # async training this runs in the collector actor; validation
                     # runs in the driver, so the two phases cannot share a metric
                     # accumulator even when they share the NeMo-Gym actor.
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
-                            (rowidx, result, timing_metrics),
+                            (rowidx, resolved_agent_ref, result, timing_metrics),
                             "nemo_gym_return",
                             enabled=debug_payload_metrics,
                         )
@@ -2634,7 +2640,9 @@ async def run_async_nemo_gym_rollout(
                     actor_timing_metrics = timing_metrics
 
                 _tensorize_nemo_gym_result(result)
-                completed_group = accumulator.add(rowidx, result)
+                completed_group = accumulator.add(
+                    rowidx, result, resolved_agent_ref=resolved_agent_ref
+                )
                 if original_message_logs is not None:
                     _reattach_static_multimodal_payloads_to_result(
                         result, original_message_logs[rowidx]

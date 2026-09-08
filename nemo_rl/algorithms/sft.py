@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import os
 import warnings
 from dataclasses import dataclass, fields
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import numpy as np
 import torch
@@ -31,6 +33,7 @@ from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
 )
+from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -49,6 +52,9 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+
+if TYPE_CHECKING:
+    from nemo_rl.data.energon.sft_dataloader import SFTDataLoader
 
 
 @dataclass
@@ -112,13 +118,13 @@ class MasterConfig(BaseModel, extra="allow"):
 def setup(
     master_config: MasterConfig,
     tokenizer: AutoTokenizer,
-    train_dataset: AllTaskProcessedDataset,
+    train_dataset: Optional[AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
     Policy,
     RayVirtualCluster,
-    StatefulDataLoader,
-    Optional[StatefulDataLoader],
+    SFTDataLoader,
+    Optional[SFTDataLoader],
     NLLLossFn,
     Logger,
     CheckpointManager,
@@ -139,6 +145,12 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
+
+    # VLM entry points pass a processor in the tokenizer position.
+    processor = None
+    if not isinstance(tokenizer, PreTrainedTokenizerBase):
+        processor = tokenizer
+        tokenizer = processor.tokenizer
 
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
@@ -161,29 +173,34 @@ def setup(
     # ==========================
     #           Data
     # ==========================
-    train_dataloader = StatefulDataLoader(
-        train_dataset,
-        batch_size=policy_config["train_global_batch_size"],
-        shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
-        drop_last=True,
-        num_workers=data_config["num_workers"],
-    )
+    if data_config.get("backend") == "energon":
+        raise ValueError("Energon SFT is not supported yet.")
+    else:
+        if train_dataset is None:
+            raise ValueError("The Hugging Face SFT backend requires a train dataset.")
+        train_dataloader = StatefulDataLoader(
+            train_dataset,
+            batch_size=policy_config["train_global_batch_size"],
+            shuffle=data_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=True,
+            num_workers=data_config["num_workers"],
+        )
+
+        if val_dataset is not None:
+            val_dataloader = StatefulDataLoader(
+                val_dataset,
+                batch_size=sft_config.val_global_batch_size,
+                shuffle=False,
+                collate_fn=rl_collate_fn,
+                drop_last=False,
+                num_workers=data_config["num_workers"],
+            )
+        else:
+            val_dataloader = None
 
     if last_checkpoint_path is not None:
         load_dataloader_state(train_dataloader, last_checkpoint_path, data_config)
-
-    if val_dataset is not None:
-        val_dataloader = StatefulDataLoader(
-            val_dataset,
-            batch_size=sft_config.val_global_batch_size,
-            shuffle=False,
-            collate_fn=rl_collate_fn,
-            drop_last=False,
-            num_workers=data_config["num_workers"],
-        )
-    else:
-        val_dataloader = None
 
     # ==========================
     #          Cluster
@@ -215,12 +232,6 @@ def setup(
             sft_config.max_num_epochs * len(train_dataloader),
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
-    # check if tokenizer is a processor (e.g. for VLMs)
-    processor = None
-    if not isinstance(tokenizer, PreTrainedTokenizerBase):
-        processor = tokenizer
-        tokenizer = processor.tokenizer
-
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
     policy = Policy(
@@ -262,9 +273,130 @@ def setup(
 # =======================================================
 # Training & Validation
 # =======================================================
+def _validate_prepared_sft_batch(batch: BatchedDataDict) -> None:
+    required_keys = {"input_ids", "input_lengths", "token_mask", "sample_mask"}
+    missing_keys = required_keys.difference(batch)
+    if missing_keys:
+        raise ValueError(f"Prepared SFT batch is missing keys: {sorted(missing_keys)}.")
+
+    input_ids = batch["input_ids"]
+    input_lengths = batch["input_lengths"]
+    token_mask = batch["token_mask"]
+    sample_mask = batch["sample_mask"]
+    if not all(
+        isinstance(value, torch.Tensor)
+        for value in (input_ids, input_lengths, token_mask, sample_mask)
+    ):
+        raise TypeError("Prepared SFT core fields must be torch tensors.")
+    if input_ids.ndim != 2 or token_mask.shape != input_ids.shape:
+        raise ValueError("Prepared input_ids and token_mask must have matching [B, S].")
+    batch_size, sequence_length = input_ids.shape
+    if input_lengths.shape != (batch_size,) or sample_mask.shape != (batch_size,):
+        raise ValueError("Prepared input_lengths and sample_mask must have shape [B].")
+    if bool(torch.any(input_lengths < 0)) or bool(
+        torch.any(input_lengths > sequence_length)
+    ):
+        raise ValueError("Prepared input_lengths must be within the padded sequence.")
+    trainable_by_row = token_mask.bool().any(dim=-1)
+    degenerate = sample_mask.bool() & ~trainable_by_row
+    if bool(torch.any(degenerate)):
+        # Such a row contributed exactly 0 to the loss before this validation
+        # existed, so mask it out rather than killing a run hours in over one
+        # bad sample (e.g. a conversation with no assistant turn).
+        warnings.warn(
+            f"{int(degenerate.sum())} active SFT rows have no trainable token; "
+            "masking them out of this batch.",
+            stacklevel=2,
+        )
+        batch["sample_mask"] = sample_mask * (~degenerate).to(sample_mask.dtype)
+
+    for key, value in batch.items():
+        if isinstance(value, PackedTensor) and len(value) != batch_size:
+            raise ValueError(
+                f"Prepared PackedTensor {key!r} has {len(value)} rows; "
+                f"expected {batch_size}."
+            )
+    for key in PER_TOKEN_MULTIMODAL_FIELDS:
+        value = batch.get(key)
+        if isinstance(value, torch.Tensor) and value.shape != input_ids.shape:
+            raise ValueError(
+                f"Prepared sequence side tensor {key!r} must match input_ids."
+            )
+
+
+def prepare_sft_batch(
+    batch: Mapping[str, Any],
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    only_unmask_final: bool,
+    make_sequence_length_divisible_by: int,
+) -> BatchedDataDict:
+    """Normalize a tokenized message-log batch or an already prepared batch."""
+    if "message_log" in batch:
+        loss_mask_mode = batch.get("loss_mask_mode")
+        if loss_mask_mode == "precomputed":
+            if only_unmask_final:
+                raise ValueError(
+                    "only_unmask_final cannot override precomputed SFT loss masks."
+                )
+            for message_log in batch["message_log"]:
+                for message in message_log:
+                    tokens = message.get("token_ids")
+                    mask = message.get("token_loss_mask")
+                    if (
+                        not isinstance(tokens, torch.Tensor)
+                        or not isinstance(mask, torch.Tensor)
+                        or tokens.ndim != 1
+                        or mask.ndim != 1
+                        or tokens.shape != mask.shape
+                        or bool(((mask != 0) & (mask != 1)).any())
+                    ):
+                        raise ValueError(
+                            "Precomputed SFT masks must be binary vectors matching "
+                            "each token vector."
+                        )
+        elif loss_mask_mode is None:
+            add_loss_mask_to_message_log(
+                batch["message_log"],
+                roles_to_train_on=["assistant"],
+                only_unmask_final=only_unmask_final,
+            )
+        else:
+            raise ValueError(f"Unsupported SFT loss_mask_mode={loss_mask_mode!r}.")
+        cat_and_padded, input_lengths = batched_message_log_to_flat_message(
+            batch["message_log"],
+            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+            make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+        )
+        sample_mask = batch["loss_multiplier"]
+        if isinstance(sample_mask, torch.Tensor) and sample_mask.ndim == 0:
+            sample_mask = sample_mask.unsqueeze(0)
+        prepared = BatchedDataDict(
+            {
+                "input_ids": cat_and_padded["token_ids"],
+                "input_lengths": input_lengths,
+                "token_mask": cat_and_padded["token_loss_mask"],
+                "sample_mask": sample_mask,
+            }
+        )
+        prepared.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+        # get_multimodal_dict only carries PackedTensor leaves and the optional
+        # sequence-aligned tensors, so per-sample provenance has to come across
+        # explicitly or the data plane tags every row "unknown:<row>".
+        if "source_ids" in batch:
+            prepared["source_ids"] = batch["source_ids"]
+    else:
+        prepared = (
+            batch if isinstance(batch, BatchedDataDict) else BatchedDataDict(batch)
+        )
+
+    _validate_prepared_sft_batch(prepared)
+    return prepared
+
+
 def validate(
     policy: PolicyInterface,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: Optional[SFTDataLoader],
     tokenizer,
     loss_fn,
     step: int,
@@ -304,32 +436,14 @@ def validate(
 
         policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(val_dataloader):
-            ## add loss mask based on role to every message
-            add_loss_mask_to_message_log(
-                val_batch["message_log"],
-                roles_to_train_on=["assistant"],
+            val_data = prepare_sft_batch(
+                val_batch,
+                tokenizer=tokenizer,
                 only_unmask_final=master_config.sft.only_unmask_final,
-            )
-
-            cat_and_padded, input_lengths = batched_message_log_to_flat_message(
-                val_batch["message_log"],
-                pad_value_dict={"token_ids": tokenizer.pad_token_id},
                 make_sequence_length_divisible_by=master_config.policy[
                     "make_sequence_length_divisible_by"
                 ],
             )
-
-            val_data: BatchedDataDict = BatchedDataDict(
-                {
-                    "input_ids": cat_and_padded["token_ids"],
-                    "input_lengths": input_lengths,
-                    "token_mask": cat_and_padded["token_loss_mask"],
-                    "sample_mask": val_batch["loss_multiplier"],
-                }
-            )
-
-            # update multimodal data
-            val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
             # When running validation with drop_last=False, we might end up with a partial batch.
             # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size.
             if val_data.size < val_batch_size:
@@ -478,31 +592,13 @@ def sft_train(
                         tracer=_tracer,
                     ),
                 ):
-                    ## add loss mask based on role to every message
-                    add_loss_mask_to_message_log(
-                        batch["message_log"],
-                        roles_to_train_on=["assistant"],
+                    train_data = prepare_sft_batch(
+                        batch,
+                        tokenizer=tokenizer,
                         only_unmask_final=master_config.sft.only_unmask_final,
-                    )
-
-                    cat_and_padded, input_lengths = batched_message_log_to_flat_message(
-                        batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
                         make_sequence_length_divisible_by=master_config.policy[
                             "make_sequence_length_divisible_by"
                         ],
-                    )
-
-                    train_data: BatchedDataDict = BatchedDataDict(
-                        {
-                            "input_ids": cat_and_padded["token_ids"],
-                            "input_lengths": input_lengths,
-                            "token_mask": cat_and_padded["token_loss_mask"],
-                            "sample_mask": batch["loss_multiplier"],
-                        }
-                    )
-                    train_data.update(
-                        cat_and_padded.get_multimodal_dict(as_tensors=False)
                     )
 
                 print("▶ Taking a training step...")

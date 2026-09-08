@@ -31,6 +31,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -454,6 +455,7 @@ class AsyncRolloutImpl:
             metadata={"task_name": input_sample["task_name"]},
             completions=completions,
             rollout_metrics=rollout_metrics,
+            loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
         )
 
     async def _run_single_rollout(
@@ -633,15 +635,23 @@ class AsyncRolloutImpl:
         Returns:
             Tuple of (assistant_message, input_lengths, gen_metrics)
         """
-        # Prepare generation input
-        input_ids = torch.cat([m["token_ids"] for m in message_log]).unsqueeze(0)
-        input_lengths = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
+        # Flatten both tokens and model-ready multimodal inputs. Building this
+        # from token_ids alone leaves expanded media placeholders in the prompt
+        # without the pixel tensors Megatron needs to project.
+        flat_messages, input_lengths = batched_message_log_to_flat_message(
+            [message_log],
+            pad_value_dict={"token_ids": self._tokenizer.pad_token_id},
+        )
+        input_ids = flat_messages["token_ids"]
         generation_input_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": input_ids,
                 "input_lengths": input_lengths,
                 "stop_strings": [stop_strings],
             }
+        )
+        generation_input_data.update(
+            flat_messages.get_multimodal_dict(as_tensors=False)
         )
 
         # Generate response
@@ -858,13 +868,26 @@ class AsyncNemoGymRolloutImpl:
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
 
+        resolved_agent_ref = rollout_inputs[0].get("agent_ref")
+        if not isinstance(resolved_agent_ref, dict):
+            raise ValueError("NeMo-Gym did not return a resolved agent_ref")
+        if any(
+            row.get("agent_ref") != resolved_agent_ref for row in rollout_inputs[1:]
+        ):
+            raise ValueError(
+                "NeMo-Gym resolved one prompt group to inconsistent agent_ref values"
+            )
+        record_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
+        record_extra_env_info["agent_ref"] = copy.deepcopy(resolved_agent_ref)
+
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
             prompt=prompt_message_log,
-            extra_env_info=input_sample["extra_env_info"],
+            extra_env_info=record_extra_env_info,
             metadata={"task_name": "nemo_gym"},
             completions=completions,
             rollout_metrics=rollout_metrics,
+            loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
         )
 
     def _validate_init_params(self) -> None:
@@ -954,13 +977,14 @@ class AsyncNemoGymRolloutImpl:
             The environment's timing metrics, or None if the stream ended without them.
         """
         dispatched = {row["_rowidx"] for row in pending}
+        pending_by_rowidx = {row["_rowidx"]: row for row in pending}
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
         async for result_ref in nemo_gym_env.run_rollouts.options(
             num_returns="streaming"
         ).remote(pending, timer_prefix):
-            rowidx, result, timing_metrics = await result_ref
+            rowidx, resolved_agent_ref, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.
             if not isinstance(rowidx, int) or not 0 <= rowidx < total_rows:
@@ -976,6 +1000,7 @@ class AsyncNemoGymRolloutImpl:
             if rowidx in received:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
+            pending_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
             results[rowidx] = result
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
@@ -1912,6 +1937,7 @@ class RolloutManager:
                 fallback_weight_version=start_version,
                 prompt_idx=record.prompt_idx,
                 mask_sample=mask_sample,
+                loss_multiplier=record.loss_multiplier,
             )
             from nemo_rl.experience.rollout_reassembler_actor import (
                 assert_metadata_only,

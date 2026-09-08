@@ -24,6 +24,8 @@ policy:
       exp_avg_sq_dtype: torch.bfloat16
   dtensor_cfg:
     activation_checkpointing: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig

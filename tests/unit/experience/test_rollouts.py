@@ -1877,7 +1877,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                     ],
                 }
                 timing = {"timing/remote": 1.0} if position == 3 else None
-                values.append(_ReadyRef((rowidx, result, timing)))
+                values.append(_ReadyRef((rowidx, {"name": "agent"}, result, timing)))
             return _AsyncOnlyStream(values)
 
     class _PolicyGeneration:
@@ -1887,7 +1887,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     for task_index in (10, 10, 11, 11):
         rows.append(
             {
-                "agent_ref": {"name": "agent"},
+                "task_source": "workplace_assistant",
                 "responses_create_params": {},
                 "_ng_task_index": task_index,
             }
@@ -1921,6 +1921,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
     def _postprocess_group(**kwargs):
         assert kwargs["log_full_result_tables"] is False
+        assert all(
+            row["agent_ref"] == {"name": "agent"} for row in kwargs["nemo_gym_rows"]
+        )
         task_index = int(kwargs["nemo_gym_rows"][0]["_ng_task_index"])
         for result, original_log in zip(
             kwargs["results"], kwargs["input_batch"]["message_log"]
@@ -2013,7 +2016,8 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
         assert boundary == "nemo_gym_return"
         assert enabled is True
         assert payload[0] == expected_rowidx
-        assert payload[1]["rowidx"] == expected_rowidx
+        assert payload[1] == {"name": "agent"}
+        assert payload[2]["rowidx"] == expected_rowidx
     assert all(
         captured_video_payloads[rowidx] is video_payloads[rowidx] for rowidx in range(4)
     )
@@ -2024,8 +2028,8 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
 def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
     rows = [
-        {"agent_ref": {"name": "agent"}},
-        {"agent_ref": {"name": "agent"}},
+        {"task_source": "workplace_assistant"},
+        {"task_source": "workplace_assistant"},
     ]
     accumulator = rollouts_mod._NemoGymStreamAccumulator(
         rows=rows,
@@ -2033,33 +2037,46 @@ def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
         allow_mixed_agents=False,
     )
 
-    assert accumulator.add(0, {"row": 0}) is None
+    resolved_agent_ref = {
+        "type": "responses_api_agents",
+        "name": "workplace_assistant_simple_agent",
+    }
+    assert accumulator.add(0, {"row": 0}, resolved_agent_ref=resolved_agent_ref) is None
     with pytest.raises(ValueError, match="duplicate row index 0"):
-        accumulator.add(0, {"row": 0})
+        accumulator.add(0, {"row": 0}, resolved_agent_ref=resolved_agent_ref)
     with pytest.raises(RuntimeError, match=r"missing row indices \[1\]"):
         accumulator.finish()
+
+    completed = accumulator.add(1, {"row": 1}, resolved_agent_ref=resolved_agent_ref)
+    assert completed is not None
+    assert [row["agent_ref"] for row in completed.rows] == [
+        resolved_agent_ref,
+        resolved_agent_ref,
+    ]
 
     with pytest.raises(ValueError, match="outside the expected range"):
         rollouts_mod._NemoGymStreamAccumulator(
             rows=rows,
             num_generations=2,
             allow_mixed_agents=False,
-        ).add(2, {"row": 2})
+        ).add(2, {"row": 2}, resolved_agent_ref=resolved_agent_ref)
 
 
 def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
     accumulator = rollouts_mod._NemoGymStreamAccumulator(
         rows=[
-            {"agent_ref": {"name": "agent-a"}},
-            {"agent_ref": {"name": "agent-b"}},
+            {"task_source": "task"},
+            {"task_source": "task"},
         ],
         num_generations=2,
         allow_mixed_agents=False,
     )
 
-    assert accumulator.add(0, {"row": 0}) is None
+    assert (
+        accumulator.add(0, {"row": 0}, resolved_agent_ref={"name": "agent-a"}) is None
+    )
     with pytest.raises(ValueError, match="one NeMo-Gym agent"):
-        accumulator.add(1, {"row": 1})
+        accumulator.add(1, {"row": 1}, resolved_agent_ref={"name": "agent-b"})
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
@@ -2164,6 +2181,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
                     _ReadyRef(
                         (
                             1,
+                            {"name": "agent"},
                             {
                                 "value": "second",
                                 "input_message_log": [
@@ -2176,6 +2194,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
                     _ReadyRef(
                         (
                             0,
+                            {"name": "agent"},
                             {
                                 "value": "first",
                                 "input_message_log": [
@@ -2228,8 +2247,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     completions, prompt_message_log, metrics = asyncio.run(
         manager._run_rollouts(
             inputs=[
-                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
-                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 0, "task_source": "workplace_assistant"},
+                {"_rowidx": 1, "task_source": "workplace_assistant"},
             ],
             timer=rollouts_mod.Timer(),
             timer_prefix="timing/test",
@@ -2244,6 +2263,44 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "agent": "agent",
         "remote_time": 2.0,
     }
+
+
+def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._num_generations_per_prompt = 2
+    manager._generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 32,
+    }
+
+    resolved_agent_ref = {
+        "type": "responses_api_agents",
+        "name": "workplace_assistant_simple_agent",
+    }
+
+    async def _run_rollouts(inputs, timer, timer_prefix):
+        del timer, timer_prefix
+        for row in inputs:
+            row["agent_ref"] = resolved_agent_ref
+        receipt_completion = SimpleNamespace(env_extras={"ng_receipt": {}})
+        return [receipt_completion, receipt_completion], [], {}
+
+    manager._run_rollouts = _run_rollouts
+    input_sample = {
+        "idx": 4,
+        "message_log": [],
+        "extra_env_info": {
+            "task_source": "workplace_assistant",
+            "responses_create_params": {},
+        },
+    }
+
+    record = asyncio.run(manager.run_rollout(input_sample))
+
+    assert "agent_ref" not in input_sample["extra_env_info"]
+    assert record.extra_env_info["task_source"] == "workplace_assistant"
+    assert record.extra_env_info["agent_ref"] == resolved_agent_ref
 
 
 def test_rollout_manager_rejects_duplicate_stream_rows():
@@ -2261,8 +2318,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
         def __init__(self):
             self.values = iter(
                 [
-                    _ReadyRef((0, {"value": "first"}, None)),
-                    _ReadyRef((0, {"value": "duplicate"}, None)),
+                    _ReadyRef((0, {"name": "agent"}, {"value": "first"}, None)),
+                    _ReadyRef((0, {"name": "agent"}, {"value": "duplicate"}, None)),
                 ]
             )
 

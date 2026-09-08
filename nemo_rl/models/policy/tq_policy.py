@@ -39,11 +39,14 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
+from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
+from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
+from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
+    GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
@@ -111,7 +114,7 @@ class TQPolicy(TQDriverMixin, Policy):
     def __init__(
         self,
         *args: Any,
-        dp_cfg: DataPlaneConfig,
+        dp_cfg: DataPlaneRuntimeConfig,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -535,6 +538,77 @@ class TQPolicy(TQDriverMixin, Policy):
                 dynamic_batching_args=dba,
             )
 
+        self._dispatch_train_microbatches(dp_metas, timer=timer)
+
+    def train_placed_microbatches(
+        self,
+        dp_metas: list[KVBatchMeta],
+        timer: Optional[Timer] = None,
+    ) -> None:
+        """Dispatch one producer-assigned metadata batch per logical DP rank.
+
+        The input order is the logical DP-rank order. Producer field lists
+        remain unchanged because an SFT loader can provide a narrower schema
+        than the rollout training path.
+        """
+        dp_world = self.sharding_annotations.get_axis_size("data_parallel")
+        if len(dp_metas) != dp_world:
+            raise ValueError(
+                "Placed metadata must contain exactly one batch per DP rank: "
+                f"got {len(dp_metas)} batches for dp_world={dp_world}."
+            )
+        spa, dba = self._packing_args("train_mb_tokens")
+        if spa is not None or dba is not None:
+            raise ValueError(
+                "Placed metadata supports fixed batches only. Disable NeMo-RL "
+                "sequence packing and dynamic batching."
+            )
+        train_metas = [
+            replace(meta, task_name="train")
+            for meta in self._stamp_placed_pad_seqlen(dp_metas)
+        ]
+        self._dispatch_train_microbatches(train_metas, timer=timer)
+
+    def _stamp_placed_pad_seqlen(
+        self, dp_metas: list[KVBatchMeta]
+    ) -> list[KVBatchMeta]:
+        """Mint one fresh forward padding target across all placed DP batches.
+
+        Returns new metadata rather than mutating the caller's, and ignores any
+        inherited target: reusing one would let it ratchet upward across steps
+        and pad every later step to a historical maximum. This mirrors
+        ``TQDriverMixin._isolated_meta``, which pops the key for the same reason.
+        """
+        sequence_lengths = [
+            length for meta in dp_metas for length in (meta.sequence_lengths or [])
+        ]
+        if not sequence_lengths:
+            return list(dp_metas)
+        _, dynamic_args = self._packing_args("train_mb_tokens")
+        sequence_round = (
+            int(dynamic_args["sequence_length_round"])
+            if dynamic_args is not None
+            else 1
+        )
+        pad_multiple = max(
+            [int(meta.extra_info.get("pad_to_multiple", 1)) for meta in dp_metas]
+        )
+        target = round_up(max(sequence_lengths), max(pad_multiple, sequence_round))
+        return [
+            replace(
+                meta,
+                extra_info={**meta.extra_info, GLOBAL_FORWARD_PAD_SEQLEN: target},
+            )
+            for meta in dp_metas
+        ]
+
+    def _dispatch_train_microbatches(
+        self,
+        dp_metas: list[KVBatchMeta],
+        *,
+        timer: Optional[Timer],
+    ) -> None:
+        """Send prepared per-DP metadata into an open train step."""
         if self.flops_tracker is not None:
             for m in dp_metas:
                 self.flops_tracker.track_batch(list(m.sequence_lengths or []))
