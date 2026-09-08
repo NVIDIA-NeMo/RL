@@ -31,6 +31,11 @@ def prefetch_venvs(filters=None, negative_filters=None):
                 be prefetched. If None, all venvs are prefetched.
         negative_filters: List of strings to exclude from prefetching. Actors whose
                 FQN contains any of these strings will be skipped.
+
+    Returns:
+        The FQNs whose venv failed to build. Empty when everything succeeded.
+        Callers are expected to treat a non-empty list as a failure -- see the
+        __main__ block, which exits 1.
     """
     print("Prefetching virtual environments...")
     if filters:
@@ -108,6 +113,8 @@ def prefetch_venvs(filters=None, negative_filters=None):
 
     # Create convenience python wrapper scripts for frozen environment support (container-only)
     create_frozen_environment_symlinks(venv_configs)
+
+    return failed
 
 
 def create_frozen_environment_symlinks(venv_configs):
@@ -238,7 +245,14 @@ Examples:
     )
     args = parser.parse_args()
 
-    prefetch_venvs(
+    failed = prefetch_venvs(
         filters=args.filters if args.filters else None,
         negative_filters=args.negative_filters if args.negative_filters else None,
     )
+    # Exit non-zero if any venv failed to build. The per-actor loop above keeps
+    # going after a failure so one broken venv does not hide the others, but the
+    # process must still fail: this runs in the image build, and exiting 0 here
+    # ships an image that is missing a venv, with the actor only dying the first
+    # time someone launches it.
+    if failed:
+        raise SystemExit(1)
