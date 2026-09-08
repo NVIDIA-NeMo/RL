@@ -93,9 +93,7 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             ) from self._terminal_error
 
     def _use_fault_tolerance(self) -> bool:
-        return bool(
-            self._generation.sglang_cfg["sglang_cfg"].get("use_fault_tolerance")
-        )
+        return self._generation.sglang_cfg["sglang_cfg"]["use_fault_tolerance"]
 
     def _ensure_ready_and_consume_count(self) -> None:
         """(Re)initialize the communicator; consume SGLang's new-engine count.
@@ -139,9 +137,7 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
                 # about to replace. Retryable, so no terminal latch.
                 self._checkpoint_engine_ready = False
                 raise
-            (_, _, num_new_engines, _, _) = (
-                self._generation.get_updatable_engines_and_lock()
-            )
+            _, num_new_engines, _, _ = self._generation.get_updatable_engines()
             if num_new_engines > 0:
                 # Replacement actors have no receivers and their paired policy
                 # senders still bind the dead agents; force a full rebind.

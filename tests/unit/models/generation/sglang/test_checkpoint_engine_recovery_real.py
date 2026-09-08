@@ -23,8 +23,8 @@ driven by the real ``CheckpointEngineWeightSynchronizer``.
 Flow (the design's functional contract):
   1. init communicator + baseline refit (consumes the startup engine count);
   2. record engine 0's actor identity and its receivers' NIXL agent_names;
-  3. crash engine 0 via ``_simulate_crash``; wait for the health monitor to
-     mark its slot ``None``;
+  3. shut down engine 0; detect it either with the running health monitor or
+     at the refit boundary while monitoring is paused;
   4. recover; assert a NEW actor identity;
   5. weight oracle ON THE REPLACEMENT: snapshot -> reset_tensors (garbage the
      weights) -> ``sync_weights()`` (probe -> rebind -> transfer) ->
@@ -107,6 +107,7 @@ def _make_recovery_cfg(pad_token_id):
             "rollout_health_check_interval": CHECK_INTERVAL,
             "rollout_health_check_timeout": CHECK_TIMEOUT,
             "rollout_health_check_first_wait": 0,
+            "rollout_max_restart_attempts": 3,
         },
         "sglang_kwargs": {},
     }
@@ -256,8 +257,9 @@ def _receiver_agent_names(gen):
     return names
 
 
+@pytest.mark.parametrize("detection", ["monitor", "refit"])
 def test_crashed_engine_is_rebound_and_receives_current_weights(
-    recovery_stack, tokenizer
+    recovery_stack, tokenizer, detection
 ):
     gen, sync = recovery_stack
 
@@ -275,9 +277,20 @@ def test_crashed_engine_is_rebound_and_receives_current_weights(
     old_actor_id = gen.all_engines[0]._actor_id.hex()
     old_agent_names = _receiver_agent_names(gen)
 
-    # --- Crash engine 0; the health monitor must notice on its own. ---
-    ray.get(gen.all_engines[0]._simulate_crash.remote())
-    assert _wait_for_dead_slot(gen, 0), "health monitor did not kill the crashed engine"
+    # --- Server death during serving or while the monitor is paused. ---
+    victim = gen.all_engines[0]
+    if detection == "refit":
+        gen.finish_generation()
+        assert gen._health_monitor._pause_event.is_set()
+    ray.get(victim.shutdown.remote(), timeout=CHECK_TIMEOUT)
+    if detection == "monitor":
+        assert _wait_for_dead_slot(gen, 0), (
+            "health monitor did not kill the crashed engine"
+        )
+    else:
+        assert gen.all_engines[0] is victim, (
+            "the paused monitor must leave the dead handle for refit to probe"
+        )
 
     # --- Recover: fresh actor, then garbage its weights (the oracle). ---
     gen.recover_updatable_engines()

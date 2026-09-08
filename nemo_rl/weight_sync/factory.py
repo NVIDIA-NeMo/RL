@@ -125,7 +125,7 @@ def create_weight_synchronizer(
                     "shard_expert_weights=true; use full-weight MoE refit instead."
                 )
             if (
-                sglang_cfg.get("use_fault_tolerance")
+                sglang_cfg["use_fault_tolerance"]
                 and checkpoint_engine_config["backend"] != "nixl"
             ):
                 # Engine recovery rebinds receivers through the built-in NIXL

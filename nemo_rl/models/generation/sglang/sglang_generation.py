@@ -449,17 +449,20 @@ class SGLangGeneration(GenerationInterface):
     ) -> None:
         """Kill a (possibly partially initialized) replacement cohort.
 
-        Mirrors the health monitor's kill path: a bounded best-effort graceful
-        ``shutdown`` first — it deregisters the worker from the router and
-        kills the spawned server process tree — then ``ray.kill``. Replacements
-        whose init never reached ``self.process`` fail the graceful step; that
-        is expected and tolerated.
+        Deregister each logical engine using cached URLs, then attempt bounded
+        graceful shutdown before ``ray.kill``. A failed actor cannot deregister
+        itself. Replacements whose init never reached ``self.process`` fail
+        the graceful step; that is expected and tolerated. Actor kill failure
+        propagates because the cohort cannot then be considered rolled back.
         """
         graceful_timeout = (
             self._health_monitor.check_timeout
             if self._health_monitor is not None
             else _ROLLBACK_GRACEFUL_SHUTDOWN_TIMEOUT_S
         )
+        if self._health_monitor is not None:
+            for engine_id in sorted({i // self.nodes_per_engine for i in dead_indices}):
+                self._health_monitor._remove_router_worker(engine_id)
         for i in dead_indices:
             engine = self.all_engines[i]
             if engine is not None:

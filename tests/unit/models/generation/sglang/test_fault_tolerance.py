@@ -759,6 +759,7 @@ def _bare_generation_for_recover():
     gen.num_new_engines = 0
     gen._health_monitor = None
     gen.needs_offload = False
+    gen.nodes_per_engine = 1
     return gen
 
 
@@ -878,7 +879,7 @@ def test_recover_rolls_back_when_start_engines_itself_fails(monkeypatch):
 def test_recover_rolls_back_when_the_offload_transition_fails(monkeypatch):
     """Post-init recovery work is part of the same atomic attempt.
 
-    If the ``needs_offload`` release/resume RPCs fail after the replacement
+    If the ``needs_offload`` release RPCs fail after the replacement
     initialized, leaving the cohort published would make the next recovery
     see no dead slot and rebind a partially transitioned engine. The whole
     attempt must roll back — including a graceful shutdown of the (fully
@@ -891,13 +892,7 @@ def test_recover_rolls_back_when_the_offload_transition_fails(monkeypatch):
     gen = _bare_generation_for_recover()
     gen.needs_offload = True
 
-    class _StubMonitor:
-        check_timeout = 7.5
-
-        def arm_first_wait(self):
-            pass
-
-    gen._health_monitor = _StubMonitor()
+    gen._health_monitor = MagicMock(check_timeout=7.5)
     fake_actor = MagicMock()
 
     def fake_start_engines(port_cursors=None):
@@ -931,3 +926,81 @@ def test_recover_rolls_back_when_the_offload_transition_fails(monkeypatch):
     # timeout — an unbounded ray.get could hang the rollback forever on a
     # wedged replacement.
     assert get_calls[2][1] == 7.5
+    gen._health_monitor._remove_router_worker.assert_called_once_with(1)
+    fake_actor.resume_memory_occupation.remote.assert_not_called()
+
+
+def test_refit_liveness_recovery_rollback_keeps_the_restart_budget(
+    monkeypatch, monitor_factory, fake_ray
+):
+    """A failed replacement cannot reset its boot budget during cohort rollback."""
+    monkeypatch.setattr(sglang_generation, "ray", fake_ray)
+    gen = _bare_generation_for_recover()
+    survivor = _FakeEngine()
+    dead = _FakeEngine(alive_fn=lambda: False)
+    replacement = _FakeEngine()
+    gen.all_engines = [survivor, dead]
+    gen._engine_urls = [None, None]
+    gen.num_new_engines = 3
+    gen._health_monitor = monitor_factory(gen, max_restarts=1)
+    gen._health_monitor.start()
+
+    def fail_init():
+        raise RuntimeError("replacement init died")
+
+    def start_engines(port_cursors):
+        assert gen.all_engines == [survivor, None]
+        gen.all_engines[1] = replacement
+        gen.num_new_engines = 1
+        return [fail_init], port_cursors
+
+    gen._start_engines = MagicMock(side_effect=start_engines)
+
+    with pytest.raises(RuntimeError, match="replacement init died"):
+        gen.recover_updatable_engines()
+
+    assert gen.all_engines == [survivor, None]
+    assert gen.num_new_engines == 3
+    assert fake_ray.killed == [dead, replacement]
+    assert gen._health_monitor._restart_attempts == [0, 1]
+    with pytest.raises(RuntimeError, match="exhausted rollout_max_restart_attempts"):
+        gen.recover_updatable_engines()
+    gen._start_engines.assert_called_once()
+
+
+@pytest.mark.parametrize("shutdown_fails", [False, True])
+def test_rollback_deregisters_each_logical_engine_before_actor_kill(
+    monkeypatch, shutdown_fails
+):
+    """Deregister a multi-node cohort even when its actors cannot shut down."""
+    gen = _bare_generation_for_recover()
+    actors = [MagicMock() for _ in range(6)]
+    gen.all_engines = actors.copy()
+    gen.nodes_per_engine = 2
+    gen.num_new_engines = 4
+    gen._health_monitor = MagicMock(check_timeout=7.5)
+    events = []
+    gen._health_monitor._remove_router_worker.side_effect = lambda engine_id: (
+        events.append(("deregister", engine_id))
+    )
+    get = MagicMock(side_effect=RayActorError() if shutdown_fails else None)
+    monkeypatch.setattr(sglang_generation.ray, "get", get)
+    monkeypatch.setattr(
+        sglang_generation.ray,
+        "kill",
+        lambda actor: events.append(("kill", actors.index(actor))),
+    )
+
+    gen._rollback_replacement_cohort([2, 3, 4, 5], pre_attempt_count=3)
+
+    assert events == [
+        ("deregister", 1),
+        ("deregister", 2),
+        ("kill", 2),
+        ("kill", 3),
+        ("kill", 4),
+        ("kill", 5),
+    ]
+    assert all(call.kwargs == {"timeout": 7.5} for call in get.call_args_list)
+    assert gen.all_engines == [*actors[:2], None, None, None, None]
+    assert gen.num_new_engines == 3

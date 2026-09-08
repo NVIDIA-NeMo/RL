@@ -48,9 +48,9 @@ def _mock_policy(**overrides):
 def _mock_generation(**overrides):
     gen = MagicMock()
     gen.cfg = {}
-    # Fault tolerance defaults off: a bare MagicMock would return a truthy mock
-    # from .get("use_fault_tolerance") and fake-enable the recovery path.
-    gen.sglang_cfg = {"sglang_cfg": {}}
+    # Set the required fault-tolerance flag explicitly so a bare MagicMock
+    # cannot accidentally enable recovery.
+    gen.sglang_cfg = {"sglang_cfg": {"use_fault_tolerance": False}}
     gen.prepare_for_generation.return_value = True
     gen.finish_generation.return_value = True
     gen.prepare_refit_info.return_value = None
@@ -103,6 +103,7 @@ def _sglang_refit_cfg(*, release_after_refit=False):
         "dp_size": 1,
         "pp_size": 1,
         "quantization": {"scheme": "bf16"},
+        "use_fault_tolerance": False,
     }
     return cfg
 
@@ -443,9 +444,8 @@ class TestCheckpointEngineWeightSynchronizer:
         generation.prepare_for_generation.return_value = None
         generation.pause_generation_mode = "retract"
         generation.invalidate_kv_cache.return_value = True
-        generation.get_updatable_engines_and_lock.return_value = (
+        generation.get_updatable_engines.return_value = (
             ["engine-0", "engine-1"],
-            object(),
             1,
             [1, 1],
             [0, 1],
@@ -491,9 +491,8 @@ class TestCheckpointEngineWeightSynchronizer:
         generation.prepare_for_generation.return_value = None
         generation.pause_generation_mode = "retract"
         generation.invalidate_kv_cache.return_value = True
-        generation.get_updatable_engines_and_lock.return_value = (
+        generation.get_updatable_engines.return_value = (
             ["engine-0"],
-            object(),
             0,
             [1],
             [0],
@@ -591,9 +590,8 @@ class TestCheckpointEngineWeightSynchronizer:
         generation.sglang_cfg = {"sglang_cfg": {"use_fault_tolerance": True}}
         generation.run_checkpoint_engine_method.return_value = ["generation-prepare"]
         generation.init_checkpoint_engine_process_groups.return_value = ["pg-init"]
-        generation.get_updatable_engines_and_lock.return_value = (
+        generation.get_updatable_engines.return_value = (
             ["engine-0"],
-            object(),
             1,  # a freshly recovered replacement forces the rebind
             [1],
             [0],
