@@ -13,6 +13,7 @@ NATIVE_REFIT_AUDIT="${NATIVE_REFIT_AUDIT:-0}"
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
 PARTITION=${PARTITION:-batch}
+USE_GRES=${USE_GRES:-1}
 LOCAL_SCRATCH=${LOCAL_SCRATCH:-/raid/scratch/${USER}}
 SLURM_HELPER_CANDIDATE_DIRS=${SLURM_HELPER_CANDIDATE_DIRS:-/usr/local/bin:/usr/bin:/bin}
 SLURM_HELPER_RESOLVER_CANDIDATES=${SLURM_HELPER_RESOLVER_CANDIDATES:-/usr/bin/readlink:/bin/readlink:/usr/bin/realpath:/bin/realpath}
@@ -53,6 +54,14 @@ case "${NATIVE_REFIT_AUDIT}" in
   0|1) ;;
   *)
     echo "NATIVE_REFIT_AUDIT must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+
+case "${USE_GRES}" in
+  0|1) ;;
+  *)
+    echo "USE_GRES must be 0 or 1" >&2
     exit 2
     ;;
 esac
@@ -350,9 +359,14 @@ if [[ "${ACTION}" == test-only ]]; then
   SBATCH_ACTION=(--test-only)
 fi
 
+SBATCH_GPU_ARGS=()
+if [[ "${USE_GRES}" == 1 ]]; then
+  SBATCH_GPU_ARGS=(--gres=gpu:4)
+fi
+
 SBATCH_ARGS=(
   --nodes="${NUM_NODES}"
-  --gres=gpu:4
+  "${SBATCH_GPU_ARGS[@]}"
   --exclusive
   --account="${SLURM_ACCOUNT}"
   --partition="${PARTITION}"
