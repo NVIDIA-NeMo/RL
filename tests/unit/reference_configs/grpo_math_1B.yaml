@@ -319,7 +319,11 @@ policy:
     # fields (block_size, target_layer_ids, mask_token_id, markov/confidence
     # head layout) come from the draft checkpoint's config.json.
     dspark:
-      num_anchors: 512
+      # Draft-side transient memory scales with num_anchors x block_size x
+      # vocab (draft logits + markov bias + teacher gather); co-training
+      # shares the GPU with full policy training, so headroom is tight --
+      # shipped recipes use 32-64, not a pretraining-scale value.
+      num_anchors: 64
       # Draft param-group lr; must far exceed the policy RL lr so the draft
       # tracks policy drift (pretraining used 6e-4).
       learning_rate: 1.0e-04

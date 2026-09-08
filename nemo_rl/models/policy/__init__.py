@@ -505,8 +505,12 @@ class DSparkDraftOptions(BaseModel, extra="allow"):
     """
 
     # Anchor blocks sampled per sequence each training forward (capped by the
-    # number of valid response positions).
-    num_anchors: int = 512
+    # number of valid response positions). Draft-side transient memory scales
+    # with num_anchors * block_size * vocab (draft logits + markov bias +
+    # teacher gather); co-training shares the GPU with full policy training,
+    # so headroom is tight -- shipped recipes use 32-64, not this default's
+    # pretraining-scale value.
+    num_anchors: int = 64
     # Learning rate for the draft's optimizer param group. The draft needs a
     # much higher rate than the policy's RL lr to track the policy's
     # distribution drift (dspark pretraining used 6e-4; the policy trains at
