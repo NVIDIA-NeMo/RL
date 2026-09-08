@@ -293,9 +293,10 @@ class RoundTrip:
     run has not lost the prompt, and either way these tests notice.
     ``ready`` and ``pending`` are reported separately for diagnosis only;
     nothing asserts on them. ``stamps`` records each restored group's
-    ``target_step`` and start weight. ``selected`` and ``selected_count`` report
-    the optional restore-then-select result used to verify each sampler's
-    recovery key at multiple gate lags. The sealed-sibling and redispatch maps
+    ``target_step`` and start weight. ``selected``, ``selected_count``,
+    ``evicted_after_restore``, and ``evicted_count_after_restore`` report the
+    optional restore-then-evict-and-select result used to verify each sampler's
+    recovery key and staleness behavior. The sealed-sibling and redispatch maps
     verify that an unfinished group keeps completed work and retries only its
     missing generation indices. The staging-row sets verify that the matching
     token-capture payload survived the data-plane checkpoint.
@@ -310,6 +311,8 @@ class RoundTrip:
     stamps: dict[str, tuple[int | None, int]]
     selected: set[str]
     selected_count: int
+    evicted_after_restore: set[str]
+    evicted_count_after_restore: int
     sealed_before: dict[str, tuple[int, ...]]
     sealed_after: dict[str, tuple[int, ...]]
     redispatched: dict[str, tuple[int, ...]]
@@ -323,6 +326,8 @@ async def _round_trip(
     tmp_path: Path,
     *,
     select_current_train_weight: int | None = None,
+    select_min_prompt_groups: int = GROUPS_PER_STEP,
+    select_max_prompt_groups: int = GROUPS_PER_STEP,
 ) -> RoundTrip:
     dp_a = _fresh_client(register=True)
     buf_a = _new_buffer(dp_a)
@@ -464,11 +469,18 @@ async def _round_trip(
     }
     selected: set[str] = set()
     selected_count = 0
+    evicted_after_restore: set[str] = set()
+    evicted_count_after_restore = 0
     if select_current_train_weight is not None:
+        groups_before_evict = set(buf_b._group_ids)
+        evicted_count_after_restore = await sampler_b.evict(
+            current_train_weight=select_current_train_weight
+        )
+        evicted_after_restore = groups_before_evict - set(buf_b._group_ids)
         selected_meta, selected_count = await sampler_b.select(
             current_train_weight=select_current_train_weight,
-            min_prompt_groups=GROUPS_PER_STEP,
-            max_prompt_groups=GROUPS_PER_STEP,
+            min_prompt_groups=select_min_prompt_groups,
+            max_prompt_groups=select_max_prompt_groups,
         )
         if selected_meta is not None:
             selected = {
@@ -484,6 +496,8 @@ async def _round_trip(
         stamps=stamps,
         selected=selected,
         selected_count=selected_count,
+        evicted_after_restore=evicted_after_restore,
+        evicted_count_after_restore=evicted_count_after_restore,
         sealed_before=sealed_before,
         sealed_after=sealed_after,
         redispatched=redispatched,
@@ -498,6 +512,8 @@ def round_trip(
     tmp_path: Path,
     *,
     select_current_train_weight: int | None = None,
+    select_min_prompt_groups: int = GROUPS_PER_STEP,
+    select_max_prompt_groups: int = GROUPS_PER_STEP,
 ) -> RoundTrip:
     """Save the scenario, restore it into a fresh buffer, report what came back."""
     return asyncio.run(
@@ -506,6 +522,8 @@ def round_trip(
             sampler_name,
             tmp_path,
             select_current_train_weight=select_current_train_weight,
+            select_min_prompt_groups=select_min_prompt_groups,
+            select_max_prompt_groups=select_max_prompt_groups,
         )
     )
 
@@ -664,6 +682,19 @@ S_STALE_ONLY = Scenario(
     lag=1,
 )
 
+S_LONG_STALLED_PARTIAL = Scenario(
+    name="long-stalled-partly-generated",
+    groups=(
+        Group(12, 1, weight=1, target=1),
+        Group(13, ROLLOUTS_PER_GROUP, weight=8, target=8),
+        Group(14, ROLLOUTS_PER_GROUP, weight=8, target=8),
+        Group(15, ROLLOUTS_PER_GROUP, weight=8, target=8),
+    ),
+    cursor=16,
+    trained=frozenset(),
+    lag=1,
+)
+
 # Everything fully generated -- the case this PR set out to recover.
 FULLY_GENERATED = (S_ZERO_LAG_ALL_COMPLETE, S_ALL_COMPLETE, S_STALE_ONLY)
 # At least one group still generating when the snapshot was taken.
@@ -673,6 +704,12 @@ WITH_IN_FLIGHT = (
     S_LAG2,
     S_EVICTED,
     S_TRAINED_OUT_OF_ORDER,
+    S_LONG_STALLED_PARTIAL,
 )
-WITH_SEALED_SIBLINGS = (S_ZERO_LAG_PARTIAL, S_PARTIAL, S_LAG2)
+WITH_SEALED_SIBLINGS = (
+    S_ZERO_LAG_PARTIAL,
+    S_PARTIAL,
+    S_LAG2,
+    S_LONG_STALLED_PARTIAL,
+)
 ALL_SCENARIOS = FULLY_GENERATED + WITH_IN_FLIGHT
