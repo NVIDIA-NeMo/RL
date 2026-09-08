@@ -289,6 +289,12 @@ _TEED_SCALARS: tuple[_TeedMetric, ...] = _TRAIN_SCALARS + _VLLM_STEP_METRICS
 # here would take down training, not just telemetry.
 _REGISTERED = False
 
+#: Set when registration failed for a reason retrying cannot change, so the
+#: per-step tee stops re-attempting it. Separate from _REGISTERED because the
+#: two answer different questions: whether the group is usable, and whether
+#: asking again is worth the work.
+_REGISTRATION_FAILED = False
+
 _WARNED: set[str] = set()
 
 
@@ -366,18 +372,36 @@ def ensure_metric_group_registered() -> bool:
         installed lens has no metric registry, which makes every tee below a
         no-op rather than an error.
     """
-    global _REGISTERED
+    global _REGISTERED, _REGISTRATION_FAILED
     if _REGISTERED:
         return True
+    # Both failures below are permanent for the process, so the attempt is not
+    # repeated: the tee runs once per log_metrics, and retrying would rebuild
+    # every MetricSpec each step for a group that will never register.
+    if _REGISTRATION_FAILED:
+        return False
     try:
         from nemo.lens.instruments import register_metric_group
 
         register_metric_group(RL_METRIC_GROUP, _metric_specs())
-    except Exception:
+    except (ImportError, AttributeError):
+        _REGISTRATION_FAILED = True
         warn_once(
             "registry",
             "could not declare the 'rl' metric group; RL metrics will not be "
             "exported (a lens build with the metric registry is required)",
+        )
+        return False
+    except ValueError as exc:
+        # Separated because this is our declaration, not the dependency: lens
+        # raises ValueError for a duplicate key, an empty spec list or a second
+        # registration of the group. Reporting those as "install a newer lens"
+        # sends the reader to the wrong file entirely.
+        _REGISTRATION_FAILED = True
+        warn_once(
+            "registry",
+            f"the '{RL_METRIC_GROUP}' metric group is declared invalidly, so RL "
+            f"metrics will not be exported; fix _metric_specs(): {exc}",
         )
         return False
     _REGISTERED = True

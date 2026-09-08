@@ -49,6 +49,10 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
+    FINISHED_REASON_LABEL,
+    HISTOGRAM_COUNT_PART,
+    HISTOGRAM_SUM_PART,
+    encode_counter_key,
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
 )
@@ -896,17 +900,8 @@ class BaseVllmGenerationWorker:
         Returns:
             Dictionary mapping metric names to their values.
             Values may be floats or lists of floats (for per-position metrics).
-
-        Raises:
-            AssertionError: If called before vLLM engine is initialized.
+            Empty before the engine is initialized.
         """
-        from nemo_rl.models.generation.vllm.utils import (
-            FINISHED_REASON_LABEL,
-            HISTOGRAM_COUNT_PART,
-            HISTOGRAM_SUM_PART,
-            encode_counter_key,
-        )
-
         metrics: dict[str, float | list[float]] = {}
         if self.llm is None:
             return metrics

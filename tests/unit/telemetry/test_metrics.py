@@ -539,6 +539,7 @@ def test_a_missing_metric_registry_disables_the_tee_without_raising(
     from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 
     monkeypatch.setattr(metrics_mod, "_REGISTERED", False)
+    monkeypatch.setattr(metrics_mod, "_REGISTRATION_FAILED", False)
     monkeypatch.setattr(metrics_mod, "_WARNED", set())
     monkeypatch.setattr(
         metrics_mod,

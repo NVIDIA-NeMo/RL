@@ -238,10 +238,11 @@ def init_telemetry_driver(
 
     from nemo.lens import NemoLensConfig, setup_telemetry
 
-    # Imported for its import side effect as much as for the name: importing
-    # this module is what registers NeMo-RL's groups with lens's SpanRegistry,
-    # and the spec below can only resolve against groups already registered.
-    from nemo_rl.telemetry.span_groups import RLSpanGroup
+    # Imported purely for the side effect: importing this module is what
+    # registers NeMo-RL's groups with lens's SpanRegistry, and setup_telemetry
+    # below resolves span_groups against whatever is registered by then. Without
+    # this every RL group would come back pending and select nothing.
+    from nemo_rl.telemetry import span_groups as _rl_span_groups  # noqa: F401
 
     config = NemoLensConfig.from_env(
         prefix=_OTEL_PREFIX,
@@ -266,24 +267,13 @@ def init_telemetry_driver(
         os.environ[_RUN_ID_ENV] = run_id
         config.run_id = run_id
 
-    # Resolved eagerly so a typo is reported here rather than silently selecting
-    # less than the user asked for. Lens treats an unknown entry as pending, not
-    # an error, because the library that owns it may not have been imported yet.
-    # On the driver that is usually a typo, but not always: workers receive the
-    # raw spec and resolve it themselves, so a group owned by a library imported
-    # only in the workers (Megatron's forward_backward, say) is pending here and
-    # live there. Hence a warning that says so, rather than a raise.
-    _, pending = RLSpanGroup.resolve_with_pending(config.span_groups)
-    if pending:
-        logger.warning(
-            "nemo-lens: telemetry.span_groups names %s, which match nothing "
-            "NeMo-RL registers. They select no driver spans -- check for a typo. "
-            "They still apply in workers if another library registers them "
-            "there. Registered groups: %s.",
-            sorted(pending),
-            sorted(RLSpanGroup.ALL_GROUPS),
-        )
-
+    # An unresolvable span_groups entry is warned about by lens itself, from
+    # set_span_group_spec inside the setup_telemetry call below. Not duplicated
+    # here: lens resolves the spec against every namespace registered in the
+    # process, so it can name the registered groups, presets and namespaces,
+    # where this module knows only its own -- and a warning that listed only
+    # NeMo-RL's groups would call a Megatron group unregistered.
+    #
     # Unguarded on purpose: _build_resource_attributes is total by construction
     # (missing keys omit an attribute), so a raise here is a real bug, and
     # swallowing it would drop rl.model / nemo.precision / dl.*_parallel.size

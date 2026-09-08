@@ -143,6 +143,10 @@ def test_init_driver_warns_about_an_unknown_span_group_without_raising(caplog):
     because a registry is per-process while a spec is job-wide. NeMo-RL registers
     everything it emits at import, so on the driver a pending entry really is a
     typo -- and the user would otherwise get silence and an empty trace.
+
+    The warning is lens's, emitted from ``set_span_group_spec`` during
+    ``setup_telemetry``; this module deliberately does not add one of its own.
+    Captured without naming a logger so the assertion survives lens moving it.
     """
     pytest.importorskip("nemo.lens")
     config = SimpleNamespace(
@@ -150,7 +154,7 @@ def test_init_driver_warns_about_an_unknown_span_group_without_raising(caplog):
             enabled=True, exporter="console", span_groups="per_stp"
         )
     )
-    with caplog.at_level(logging.WARNING, logger="nemo_rl.telemetry.setup"):
+    with caplog.at_level(logging.WARNING):
         handle = init_telemetry_driver(config, algorithm="grpo")
 
     assert handle is not None
@@ -160,10 +164,11 @@ def test_init_driver_warns_about_an_unknown_span_group_without_raising(caplog):
 def test_init_driver_does_not_warn_for_a_valid_spec(caplog):
     pytest.importorskip("nemo.lens")
     cfg = TelemetryConfig(enabled=True, exporter="console", span_groups="per_step")
-    with caplog.at_level(logging.WARNING, logger="nemo_rl.telemetry.setup"):
+    with caplog.at_level(logging.WARNING):
         assert init_telemetry_driver(_FakeMasterConfig(cfg), "grpo") is not None
 
-    assert "match no registered" not in caplog.text
+    # The pending branch of lens's warning names the spec it could not resolve.
+    assert "per_step" not in caplog.text
 
 
 def test_init_driver_tags_itself_as_rank_zero_of_one(monkeypatch):

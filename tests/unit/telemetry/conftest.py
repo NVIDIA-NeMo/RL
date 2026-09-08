@@ -74,6 +74,10 @@ def _reset_rl_telemetry() -> None:
     # test would otherwise satisfy the next test's registration guard and hide
     # a regression in it.
     metrics_mod._REGISTERED = False
+    # Also the failure memo, which is what makes a failure permanent: a test
+    # that forces registration to fail would otherwise disable the tee for
+    # every test after it in the session.
+    metrics_mod._REGISTRATION_FAILED = False
     metrics_mod._WARNED.clear()
     try:
         from nemo.lens.instruments import unregister_metric_group
