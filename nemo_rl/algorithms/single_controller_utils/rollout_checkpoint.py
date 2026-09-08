@@ -228,6 +228,7 @@ class RolloutSnapshotManifest:
     mutation_version: int
     rolled_back_train_group_count: int
     bootstrap_fingerprint: Optional[str]
+    gym_topology_fingerprint: Optional[str] = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> RolloutSnapshotManifest:
@@ -252,6 +253,15 @@ class RolloutSnapshotManifest:
             raise ValueError(
                 "rollout snapshot bootstrap_fingerprint must be a string or null"
             )
+        gym_topology_fingerprint = raw.get("gym_topology_fingerprint")
+        if gym_topology_fingerprint is not None and (
+            not isinstance(gym_topology_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", gym_topology_fingerprint) is None
+        ):
+            raise ValueError(
+                "rollout snapshot gym_topology_fingerprint must be a SHA-256 "
+                "digest or null"
+            )
         manifest = cls(
             schema_version=raw["schema_version"],
             base_train_step=raw["base_train_step"],
@@ -261,6 +271,7 @@ class RolloutSnapshotManifest:
             mutation_version=raw["mutation_version"],
             rolled_back_train_group_count=raw["rolled_back_train_group_count"],
             bootstrap_fingerprint=fingerprint,
+            gym_topology_fingerprint=gym_topology_fingerprint,
         )
         if manifest.schema_version != ROLLOUT_SNAPSHOT_SCHEMA_VERSION:
             raise ValueError(

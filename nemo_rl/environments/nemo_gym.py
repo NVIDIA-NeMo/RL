@@ -58,6 +58,8 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointPrepareResult,
     GymCheckpointResumeResult,
     GymCheckpointRestoreResult,
+    GymCheckpointTopology,
+    GymCoordinatorModelStatusResponse,
     GymControlCapabilities,
     GymDiscoveredParticipant,
     GymExecutionIdentity,
@@ -75,6 +77,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymResourcesPrepareResponse,
     GymResourcesRestoreResponse,
     GymResourcesResumeResponse,
+    GymSingleWorkerModelStatusResponse,
     gym_capture_key,
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
@@ -418,6 +421,7 @@ class NemoGym(EnvironmentInterface):
         self._checkpoint_control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         self._gym_checkpoint_participants: tuple[GymDiscoveredParticipant, ...] = ()
+        self._gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -560,6 +564,7 @@ Depending on your data shape, you may want to change these values."""
         )
         self._control_timeout_s = 60.0
         self._gym_checkpoint_participants = ()
+        self._gym_checkpoint_topology = None
         if self._token_capture_enabled:
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
@@ -705,11 +710,10 @@ Depending on your data shape, you may want to change these values."""
     async def discover_checkpoint_capabilities(
         self,
         server_names: Optional[list[str]] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Discover and validate checkpoint capabilities without enabling saves.
 
-        The result is cached only for later explicit control calls on this actor.
-        Single Controller setup does not invoke this method yet.
+        The result is cached for later explicit control calls on this actor.
         """
         self._require_spinup()
         candidates = (
@@ -767,7 +771,10 @@ Depending on your data shape, you may want to change these values."""
                 "NeMo-Gym checkpoint topology has no policy model participant"
             )
         self._gym_checkpoint_participants = tuple(participants)
-        return [participant.model_dump(mode="json") for participant in participants]
+        self._gym_checkpoint_topology = GymCheckpointTopology.from_discovered(
+            participants
+        )
+        return self._gym_checkpoint_topology.model_dump(mode="json")
 
     def _checkpoint_participants(self) -> tuple[GymDiscoveredParticipant, ...]:
         if not self._gym_checkpoint_participants:
@@ -822,76 +829,198 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_id: str,
         deadline_ts: float,
     ) -> dict[str, Any]:
-        """Issue one non-blocking prepare call to each stateful participant."""
+        """Prepare every participant or fail closed and reopen live work.
+
+        Gym's agent and resources prepare routes wait for their safe boundary.
+        Policy admission pause is intentionally non-blocking, so a draining
+        policy server is observed through its status route until the common
+        deadline. No incomplete cut is returned to a checkpoint coordinator.
+        """
         request = GymCheckpointControlRequest(
             checkpoint_id=checkpoint_id,
             deadline_ts=deadline_ts,
         ).model_dump(mode="json")
         results: list[GymParticipantPrepareResult] = []
-        for discovered in self._ordered_checkpoint_participants():
-            participant = discovered.participant
-            capabilities = discovered.capabilities
-            payload: (
-                GymModelPrepareResponse
-                | GymAgentPrepareResponse
-                | GymResourcesPrepareResponse
-            )
-            if participant.component == "responses_api_models":
-                if capabilities.instance_role != "policy":
-                    continue
-                if "paused" not in capabilities.admission_states:
-                    raise RuntimeError(
-                        f"Gym policy model {participant.server_name!r} cannot pause"
+        touched: list[GymDiscoveredParticipant] = []
+        try:
+            for discovered in self._ordered_checkpoint_participants():
+                participant = discovered.participant
+                capabilities = discovered.capabilities
+                payload: (
+                    GymModelPrepareResponse
+                    | GymAgentPrepareResponse
+                    | GymResourcesPrepareResponse
+                )
+                if participant.component == "responses_api_models":
+                    if capabilities.instance_role != "policy":
+                        continue
+                    if "paused" not in capabilities.admission_states:
+                        raise RuntimeError(
+                            f"Gym policy model {participant.server_name!r} cannot pause"
+                        )
+                    touched.append(discovered)
+                    payload = GymModelPrepareResponse.model_validate(
+                        await self._control(
+                            "POST",
+                            f"{GYM_MODEL_ADMISSION_PREFIX}/pause",
+                            server_name=participant.server_name,
+                            timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                            json=request,
+                        )
                     )
-                payload = GymModelPrepareResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{GYM_MODEL_ADMISSION_PREFIX}/pause",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
+                    ready = (
+                        payload.state == "paused"
+                        and payload.inflight_total == 0
+                        and payload.workers.acknowledged == payload.workers.expected
+                    )
+                elif participant.component == "responses_api_agents":
+                    if capabilities.checkpoint_mode != "export_restore":
+                        continue
+                    touched.append(discovered)
+                    payload = GymAgentPrepareResponse.model_validate(
+                        await self._control(
+                            "POST",
+                            f"{GYM_AGENT_CHECKPOINT_PREFIX}/prepare",
+                            server_name=participant.server_name,
+                            timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                            json=request,
+                        )
+                    )
+                    ready = payload.ready_to_commit
+                else:
+                    if capabilities.checkpoint_mode != "export_restore":
+                        continue
+                    touched.append(discovered)
+                    payload = GymResourcesPrepareResponse.model_validate(
+                        await self._control(
+                            "POST",
+                            f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/prepare",
+                            server_name=participant.server_name,
+                            timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                            json=request,
+                        )
+                    )
+                    ready = payload.state == "prepared"
+                results.append(
+                    GymParticipantPrepareResult(
+                        participant=participant,
+                        ready=ready,
+                        payload=payload,
                     )
                 )
-                ready = payload.state == "paused" and payload.inflight_total == 0
-            elif participant.component == "responses_api_agents":
-                if capabilities.checkpoint_mode != "export_restore":
+
+            for index, result in enumerate(results):
+                if (
+                    result.ready
+                    or result.participant.component != "responses_api_models"
+                ):
                     continue
-                payload = GymAgentPrepareResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{GYM_AGENT_CHECKPOINT_PREFIX}/prepare",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
+                discovered = next(
+                    item for item in touched if item.participant == result.participant
                 )
-                ready = payload.ready_to_commit
-            else:
-                if capabilities.checkpoint_mode != "export_restore":
-                    continue
-                payload = GymResourcesPrepareResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/prepare",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
+                payload = await self._wait_for_policy_model_pause(
+                    discovered,
+                    checkpoint_id=checkpoint_id,
+                    deadline_ts=deadline_ts,
                 )
-                ready = payload.state == "prepared"
-            results.append(
-                GymParticipantPrepareResult(
-                    participant=participant,
-                    ready=ready,
+                results[index] = GymParticipantPrepareResult(
+                    participant=result.participant,
+                    ready=(payload.state == "paused" and payload.inflight_total == 0),
                     payload=payload,
                 )
+
+            if not all(item.ready for item in results):
+                raise TimeoutError(
+                    f"Gym checkpoint {checkpoint_id!r} did not prepare before its deadline"
+                )
+        except (Exception, asyncio.CancelledError) as prepare_error:
+            abort_deadline_ts = max(
+                deadline_ts,
+                time.time() + self._control_timeout_s,
             )
-        result = GymCheckpointPrepareResult(
+            try:
+                await self._resume_checkpoint_participants(
+                    checkpoint_id,
+                    abort_deadline_ts,
+                    tuple(touched),
+                )
+            except (Exception, asyncio.CancelledError) as abort_error:
+                raise BaseExceptionGroup(
+                    "Gym checkpoint prepare failed and participant resume also failed",
+                    [prepare_error, abort_error],
+                ) from prepare_error
+            if time.time() >= deadline_ts and not isinstance(
+                prepare_error, asyncio.CancelledError
+            ):
+                raise TimeoutError(
+                    f"Gym checkpoint {checkpoint_id!r} exceeded its prepare deadline; "
+                    "participants were resumed and the previous checkpoint remains valid"
+                ) from prepare_error
+            raise
+
+        return GymCheckpointPrepareResult(
             checkpoint_id=checkpoint_id,
-            ready=all(item.ready for item in results),
+            ready=True,
             participants=results,
+        ).model_dump(mode="json")
+
+    async def _wait_for_policy_model_pause(
+        self,
+        discovered: GymDiscoveredParticipant,
+        *,
+        checkpoint_id: str,
+        deadline_ts: float,
+    ) -> GymModelPrepareResponse:
+        """Long-poll one policy model until its accepted calls have drained."""
+        participant = discovered.participant
+        remaining = deadline_ts - time.time()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Gym policy model {participant.server_name!r} missed the prepare deadline"
+            )
+        raw = await self._control(
+            "GET",
+            f"{GYM_MODEL_ADMISSION_PREFIX}/status",
+            server_name=participant.server_name,
+            timeout_s=remaining,
+            params={
+                "checkpoint_id": checkpoint_id,
+                "deadline_ts": deadline_ts,
+                "wait_state": "paused",
+                "timeout_s": remaining,
+            },
         )
-        return result.model_dump(mode="json")
+        if discovered.capabilities.multi_process.mode == "coordinator":
+            status = GymCoordinatorModelStatusResponse.model_validate(raw)
+            workers = {
+                "acknowledged": status.workers.acknowledged,
+                "expected": status.workers.expected,
+            }
+            ready = (
+                status.state == "paused"
+                and status.inflight_total == 0
+                and status.missing_workers == 0
+                and status.workers.acknowledged == status.workers.expected
+            )
+        else:
+            status = GymSingleWorkerModelStatusResponse.model_validate(raw)
+            workers = {
+                "acknowledged": len(status.per_worker),
+                "expected": discovered.capabilities.multi_process.num_workers,
+            }
+            ready = status.state == "paused" and status.inflight_total == 0
+        payload = GymModelPrepareResponse(
+            state=status.state,
+            workers=workers,
+            inflight_total=status.inflight_total,
+            waiters_total=status.waiters_total,
+        )
+        if not ready:
+            raise TimeoutError(
+                f"Gym policy model {participant.server_name!r} remained "
+                f"{payload.state!r} with {payload.inflight_total} in-flight request(s)"
+            )
+        return payload
 
     async def commit_checkpoint(
         self,
@@ -1037,65 +1166,111 @@ Depending on your data shape, you may want to change these values."""
         deadline_ts: float,
     ) -> dict[str, Any]:
         """Resume participants after commit, restore, or an aborted prepare."""
+        results = await self._resume_checkpoint_participants(
+            checkpoint_id,
+            deadline_ts,
+            self._checkpoint_participants(),
+        )
+        return GymCheckpointResumeResult(
+            checkpoint_id=checkpoint_id,
+            participants=results,
+        ).model_dump(mode="json")
+
+    async def _resume_checkpoint_participants(
+        self,
+        checkpoint_id: str,
+        deadline_ts: float,
+        participants: tuple[GymDiscoveredParticipant, ...],
+    ) -> list[GymParticipantResumeResult]:
+        """Resume a prepared subset, reopening policy admission last."""
         request = GymCheckpointControlRequest(
             checkpoint_id=checkpoint_id,
             deadline_ts=deadline_ts,
         ).model_dump(mode="json")
         results: list[GymParticipantResumeResult] = []
-        for discovered in self._ordered_checkpoint_participants(resume=True):
-            participant = discovered.participant
-            capabilities = discovered.capabilities
-            payload: (
-                GymModelResumeResponse
-                | GymAgentResumeResponse
-                | GymResourcesResumeResponse
+        component_order = {
+            "responses_api_models": 0,
+            "responses_api_agents": 1,
+            "resources_servers": 2,
+        }
+        ordered = sorted(
+            participants,
+            key=lambda item: component_order[item.participant.component],
+            reverse=True,
+        )
+        errors: list[BaseException] = []
+        for discovered in ordered:
+            try:
+                result = await self._resume_checkpoint_participant(
+                    discovered,
+                    request=request,
+                    deadline_ts=deadline_ts,
+                )
+            except (Exception, asyncio.CancelledError) as error:
+                errors.append(error)
+                continue
+            if result is not None:
+                results.append(result)
+        if errors:
+            raise BaseExceptionGroup(
+                "one or more Gym checkpoint participants failed to resume",
+                errors,
             )
-            if participant.component == "responses_api_models":
-                if capabilities.instance_role != "policy":
-                    continue
-                payload = GymModelResumeResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{GYM_MODEL_ADMISSION_PREFIX}/resume",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
-                )
-            elif participant.component == "responses_api_agents":
-                if capabilities.checkpoint_mode != "export_restore":
-                    continue
-                payload = GymAgentResumeResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{GYM_AGENT_CHECKPOINT_PREFIX}/resume",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
-                )
-            else:
-                if capabilities.checkpoint_mode != "export_restore":
-                    continue
-                payload = GymResourcesResumeResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/resume",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
-                )
-            results.append(
-                GymParticipantResumeResult(
-                    participant=participant,
-                    payload=payload,
+        return results
+
+    async def _resume_checkpoint_participant(
+        self,
+        discovered: GymDiscoveredParticipant,
+        *,
+        request: dict[str, Any],
+        deadline_ts: float,
+    ) -> Optional[GymParticipantResumeResult]:
+        """Resume one participant, returning None when it does not participate."""
+        participant = discovered.participant
+        capabilities = discovered.capabilities
+        payload: (
+            GymModelResumeResponse | GymAgentResumeResponse | GymResourcesResumeResponse
+        )
+        if participant.component == "responses_api_models":
+            if capabilities.instance_role != "policy":
+                return None
+            payload = GymModelResumeResponse.model_validate(
+                await self._control(
+                    "POST",
+                    f"{GYM_MODEL_ADMISSION_PREFIX}/resume",
+                    server_name=participant.server_name,
+                    timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                    json=request,
                 )
             )
-        return GymCheckpointResumeResult(
-            checkpoint_id=checkpoint_id,
-            participants=results,
-        ).model_dump(mode="json")
+        elif participant.component == "responses_api_agents":
+            if capabilities.checkpoint_mode != "export_restore":
+                return None
+            payload = GymAgentResumeResponse.model_validate(
+                await self._control(
+                    "POST",
+                    f"{GYM_AGENT_CHECKPOINT_PREFIX}/resume",
+                    server_name=participant.server_name,
+                    timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                    json=request,
+                )
+            )
+        else:
+            if capabilities.checkpoint_mode != "export_restore":
+                return None
+            payload = GymResourcesResumeResponse.model_validate(
+                await self._control(
+                    "POST",
+                    f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/resume",
+                    server_name=participant.server_name,
+                    timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                    json=request,
+                )
+            )
+        return GymParticipantResumeResult(
+            participant=participant,
+            payload=payload,
+        )
 
     async def abort_checkpoint(
         self,

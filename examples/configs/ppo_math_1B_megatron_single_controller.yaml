@@ -168,6 +168,10 @@ rollout_checkpointing:
   # Every config path not excluded here or by NeMo-RL's built-in denylist must
   # match before a bootstrap rollout snapshot can be restored.
   extra_fingerprint_excluded_paths: []
+  # Experimental multi-turn NeMo-Gym checkpoint control-plane discovery.
+  # Requires a Gym revision exposing the /ng-control/v1 checkpoint protocol.
+  gym:
+    capability_discovery_enabled: false
 
 policy:
   tokenizer:

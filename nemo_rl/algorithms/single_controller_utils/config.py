@@ -714,6 +714,17 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         return TaskSourceRecoveryGranularity(task_source, self.default_granularity)
 
 
+class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
+    """NeMo-Gym checkpoint control-plane discovery.
+
+    This is opt-in while the Gym control protocol is experimental. Discovery
+    validates and fingerprints every participant before training starts. It
+    does not by itself add Gym participant state to periodic snapshots.
+    """
+
+    capability_discovery_enabled: bool = False
+
+
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Frequent rollout-state snapshots anchored to durable trainer state.
 
@@ -752,6 +763,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+    gym: GymRolloutCheckpointConfig = Field(default_factory=GymRolloutCheckpointConfig)
 
     @model_validator(mode="after")
     def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":

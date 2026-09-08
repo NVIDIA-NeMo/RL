@@ -68,6 +68,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
+from nemo_rl.environments.gym_checkpoint import GymCheckpointTopology
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -741,6 +742,107 @@ class TestSetup:
 
         with pytest.raises(ValueError, match="requires checkpointing.enabled=true"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_gym_checkpointing_requires_periodic_snapshots(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            gym={"capability_discovery_enabled": True}
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "gym.capability_discovery_enabled=true requires.*"
+                "snapshot_attempt_interval_s"
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_gym_checkpointing_discovers_topology_during_setup(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config(colocated=False, backend="vllm")
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 1,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.logger["log_dir"] = str(tmp_path / "logs")
+        mc.token_capture.enabled = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={"capability_discovery_enabled": True},
+        )
+        topology = {
+            "schema_version": 1,
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "policy",
+                        "component": "responses_api_models",
+                        "participant_name": "policy",
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting", "draining", "paused"],
+                    "checkpoint_mode": "export_restore",
+                    "concurrency_contract": "stateless",
+                    "multi_process": {
+                        "mode": "single_worker",
+                        "num_workers": 1,
+                    },
+                    "instance_role": "policy",
+                }
+            ],
+        }
+        topology_ref = object()
+        fake_gym_actor = MagicMock(name="nemo_gym_actor")
+        fake_gym_actor.discover_checkpoint_capabilities.remote.return_value = (
+            topology_ref
+        )
+        fake_finalizers = [MagicMock(name="finalizer")]
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod,
+                "spinup_nemo_gym_actor",
+                return_value=fake_gym_actor,
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(
+                sc_setup_mod.ray,
+                "get",
+                side_effect=lambda ref: topology if ref is topology_ref else ref,
+            ),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                return_value=fake_finalizers,
+            ),
+        ):
+            actor_args, _ = setup_single_controller(
+                mc,
+                MagicMock(pad_token_id=0),
+            )
+
+        assert actor_args.gym_checkpoint_topology == (
+            GymCheckpointTopology.model_validate(topology)
+        )
+        fake_gym_actor.discover_checkpoint_capabilities.remote.assert_called_once_with()
 
     def test_periodic_checkpointing_requires_data_plane_save(self):
         mc = _make_master_config(

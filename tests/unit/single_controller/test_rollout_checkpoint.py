@@ -934,6 +934,23 @@ def test_manifest_rejects_bool_for_integer_field():
         RolloutSnapshotManifest.from_mapping(raw)
 
 
+def test_manifest_rejects_invalid_gym_topology_fingerprint():
+    raw = {
+        "schema_version": ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        "base_train_step": 0,
+        "trainer_version": 0,
+        "current_epoch": 0,
+        "sampler_dispatch_index": -1,
+        "mutation_version": 0,
+        "rolled_back_train_group_count": 0,
+        "bootstrap_fingerprint": "fingerprint-v1",
+        "gym_topology_fingerprint": "not-a-digest",
+    }
+
+    with pytest.raises(ValueError, match="gym_topology_fingerprint.*SHA-256"):
+        RolloutSnapshotManifest.from_mapping(raw)
+
+
 def test_manifest_rejects_dispatch_index_below_initial_state():
     raw = {
         "schema_version": ROLLOUT_SNAPSHOT_SCHEMA_VERSION,

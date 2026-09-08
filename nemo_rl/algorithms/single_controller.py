@@ -531,6 +531,7 @@ class SingleControllerActor:
         self._bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = (
             actor_args.bootstrap_identity
         )
+        self._gym_checkpoint_topology = actor_args.gym_checkpoint_topology
         self._rollout_checkpoint_stop_requested = asyncio.Event()
         # Narrow unsafe window after an optimizer mutates model state and before
         # SC publishes the matching TQ cleanup and trainer counters. Gradient
@@ -3887,6 +3888,11 @@ class SingleControllerActor:
                         snapshot_cut.rolled_back_train_group_count
                     ),
                     bootstrap_fingerprint=snapshot_fingerprint,
+                    gym_topology_fingerprint=(
+                        self._gym_checkpoint_topology.fingerprint()
+                        if self._gym_checkpoint_topology is not None
+                        else None
+                    ),
                 )
                 manifest_text = (
                     json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n"
