@@ -457,7 +457,7 @@ class GenerationFleetHealth:
             shard.state_before_partial = shard.state
         self._transition(shard, ShardState.STALE)
 
-    def mark_restart_failed(self, shard_idx: int) -> None:
+    def mark_restart_failed(self, shard_idx: int, *, error: str = "") -> None:
         """A restart attempt did not bring the engine up. Back to DEAD.
 
         Needed as its own transition because ``record_probe`` deliberately ignores
@@ -465,10 +465,20 @@ class GenerationFleetHealth:
         reported that way would leave the shard stuck in RESTARTING: never retried,
         because it is no longer DEAD, and never retired, because retirement is driven by
         restart attempts.
+
+        ``error`` matters more here than the two siblings that already take one. ``retire``
+        has exactly one caller -- attempts exhausted -- so ``last_error`` is the only
+        structured field that can say what the reloads failed on. Without this it still
+        holds the *original* death, which is wrong and plausible enough to be believed: a
+        GPU that an orphaned EngineCore held for 370s and a ``seed=None`` config error want
+        completely different responses and would otherwise be indistinguishable in the
+        record.
         """
         shard = self._shards[shard_idx]
         if shard.state is ShardState.RETIRED:
             return
+        if error:
+            shard.last_error = error
         self._transition(shard, ShardState.DEAD)
 
     def record_weight_version(self, shard_idx: int, *, weight_version: int) -> None:

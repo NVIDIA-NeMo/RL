@@ -486,6 +486,38 @@ class GenerationInterface(ABC):
         """Resume previously paused generation on the backend."""
         raise NotImplementedError
 
+    def restart_shard(self, shard_idx: int) -> Optional[str]:
+        """Rebuild one data-parallel shard's workers and bring its engine back up.
+
+        Declared here because ``EngineSupervisor`` calls it by name on whatever backend it
+        was handed. Undeclared, a backend that does not implement it -- or one that loses
+        the method to a merge, which has happened once already -- degrades to an
+        ``AttributeError`` swallowed by the supervisor's ``except``, and the shard is
+        recorded as a failed restart rather than as an unsupported one. Raising here says
+        which it is.
+
+        Blocking and slow -- it reloads the model -- so callers run it off the control
+        loop.
+
+        Returns:
+            The replacement's OpenAI base URL, or None for an engine that exposes no HTTP
+            server. The URL is expected to differ from the old one: the new engine binds
+            its own port, so callers must publish it rather than assume the fleet's URL
+            list is still accurate.
+        """
+        raise NotImplementedError
+
+    def log_shard_gpu_state(
+        self, shard_idx: int, *, label: str, timeout_s: float = 30.0
+    ) -> None:
+        """Print the state of the GPU one shard holds, from that shard's own node.
+
+        A no-op by default rather than ``NotImplementedError``, unlike ``restart_shard``
+        above: this is a diagnostic taken on the restart path, and a backend that cannot
+        provide it should cost the caller nothing. Failing a restart over a missing log
+        line would be worse than the missing log line.
+        """
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""

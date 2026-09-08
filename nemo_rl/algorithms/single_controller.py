@@ -150,6 +150,11 @@ Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
 
+# How long teardown waits for an in-flight engine restart. Short, and not the restart's own
+# budget: at this point the run is over, so the only thing a completed restart buys is a
+# cleaner exit. Not configurable for the same reason.
+_SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
+
 
 def _pooled_opd_metrics(
     stat_sum: float, stat_sumsq: float, count: int
@@ -309,10 +314,15 @@ class SingleControllerActor:
             self._teacher_coordinator = None
         # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
         # is nothing for a supervisor to restart.
+        _fleet_health_cfg = master_config.async_rl.generation_fleet_health
         self._engine_supervisor = (
-            EngineSupervisor(generation=self._gen, monitor=self._gen_fleet)
-            if self._gen_fleet is not None
-            and master_config.async_rl.generation_fleet_health.restart_dead_shards
+            EngineSupervisor(
+                generation=self._gen,
+                monitor=self._gen_fleet,
+                restart_timeout_s=_fleet_health_cfg.restart_timeout_s,
+                restart_backoff_s=_fleet_health_cfg.restart_backoff_s,
+            )
+            if self._gen_fleet is not None and _fleet_health_cfg.restart_dead_shards
             else None
         )
 
@@ -548,6 +558,15 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self._engine_supervisor is not None:
+                # Not in `tasks`: the supervisor creates a task per restart, on demand, so
+                # there is nothing to cancel in that list. Without this an in-flight
+                # restart at shutdown is simply abandoned mid-way. Bounded, because the
+                # thread underneath cannot be cancelled -- giving up is what lets the
+                # process exit, and the thread being a daemon is what makes that safe.
+                await self._engine_supervisor.drain(
+                    timeout_s=_SUPERVISOR_DRAIN_TIMEOUT_S
+                )
             for actor in self._finalizer_actors:
                 try:
                     ray.kill(actor, no_restart=True)

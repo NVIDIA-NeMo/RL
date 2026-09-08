@@ -726,6 +726,24 @@ class VllmGeneration(GenerationInterface):
     # attempt budget retires it. So restart never worked and never said so. See
     # test_every_supervised_backend_can_restart_a_shard, which now fails if it goes missing
     # again.
+    def log_shard_gpu_state(
+        self, shard_idx: int, *, label: str, timeout_s: float = 30.0
+    ) -> None:
+        """Read the shard leader's GPU from its own node. Never raises.
+
+        The leader is enough: every worker of a shard is on the same bundle set and it is
+        the leader's device that the replacement engine allocates on first.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            return
+        try:
+            leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
+            self.worker_group.log_worker_gpu_state(
+                leader_idx, label=label, timeout_s=timeout_s
+            )
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never fail the restart
+            print(f"  [GPU_DIAG] {label}: {type(e).__name__}: {e}", flush=True)
+
     def restart_shard(self, shard_idx: int) -> Optional[str]:
         """Rebuild one data-parallel shard's workers and bring its engine back up.
 

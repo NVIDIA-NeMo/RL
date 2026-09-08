@@ -706,6 +706,64 @@ class RayWorkerGroup:
                 }
             )
 
+    def log_worker_gpu_state(
+        self, worker_idx: int, *, label: str, timeout_s: float = 30.0
+    ) -> None:
+        """Print the state of the GPU a worker's bundle holds, from that node.
+
+        For the moment *before* a restart: what is on the device decides whether the
+        attempt can succeed at all. The same reading is already taken inside the new
+        worker, at ``_load_model`` -- but that is too late to be a signal (the old actor is
+        already killed and the replacement is mid-``__init__``) and it does not happen at
+        all in the case that matters most, a bundle that never gets scheduled, because
+        ``_load_model`` is never reached.
+
+        Runs as a short-lived task pinned to the same bundle, because the caller is the
+        controller and reading NVML there would report the controller's node. Bounded and
+        non-raising for the same reason the diagnostic itself is: a probe that hangs or
+        fails the restart path is worse than no probe. Not reaching the node is itself the
+        finding, so it is printed rather than swallowed.
+        """
+        spec = self._worker_specs.get(worker_idx)
+        if spec is None:
+            print(
+                f"  [GPU_DIAG] {label}: no creation spec for worker {worker_idx}; "
+                "cannot locate its bundle",
+                flush=True,
+            )
+            return
+
+        @ray.remote(num_cpus=0, num_gpus=0)
+        def _probe(probe_label: str, local_rank: int) -> None:
+            import os
+
+            from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+
+            # The task is pinned to the bundle, not given the GPU: taking num_gpus here
+            # would queue behind whatever still holds it, which is precisely the state
+            # being measured. LOCAL_RANK is how the helper resolves the device.
+            os.environ.setdefault("LOCAL_RANK", str(local_rank))
+            log_gpu_memory_diagnostics(
+                label=probe_label, worker_type="generation", device_id=local_rank
+            )
+
+        try:
+            ref = _probe.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=spec["pg"],
+                    placement_group_bundle_index=spec["bundle_idx"],
+                )
+            ).remote(label, spec["bundle_idx"])
+            ray.get(ref, timeout=timeout_s)
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never fail the caller
+            print(
+                f"  [GPU_DIAG] {label}: could not read the GPU on worker "
+                f"{worker_idx}'s bundle within {timeout_s}s "
+                f"({type(e).__name__}: {e}). The node may be gone, which is itself the "
+                "answer to whether a restart can succeed.",
+                flush=True,
+            )
+
     def recreate_worker(self, worker_idx: int) -> ray.actor.ActorHandle:
         """Rebuild one worker in place, replaying the call that created it.
 

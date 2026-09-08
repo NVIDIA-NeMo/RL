@@ -55,8 +55,13 @@ class _Generation:
 
     def __init__(self, *, fail=False, block=None):
         self.restarted = []
+        self.gpu_reads = []
         self.fail = fail
         self._block = block
+
+    def log_shard_gpu_state(self, shard_idx, *, label, timeout_s=30.0):
+        del timeout_s
+        self.gpu_reads.append((shard_idx, label))
 
     def restart_shard(self, shard_idx):
         if self._block is not None:
@@ -203,7 +208,11 @@ class TestFailedRestarts:
         policy = FleetHealthPolicy(max_restart_attempts_per_shard=2)
         monitor = _monitor(shard_count=2, max_restart_attempts_per_shard=2)
         gen = _Generation(fail=True)
-        supervisor = EngineSupervisor(generation=gen, monitor=monitor)
+        # No cooldown: the subject here is the attempt cap, and the default backoff would
+        # make every tick after the first a no-op. Spacing has its own tests.
+        supervisor = EngineSupervisor(
+            generation=gen, monitor=monitor, restart_backoff_s=0.0
+        )
 
         async def _main():
             # Each round: the shard is DEAD, a restart is attempted, it fails, and the
@@ -219,6 +228,146 @@ class TestFailedRestarts:
 
         assert monitor.state_of(0) is ShardState.RETIRED
         assert len(gen.restarted) <= policy.max_restart_attempts_per_shard
+
+
+class TestARestartThatNeverReturns:
+    """The failure the timeout exists for: nothing in the restart chain has a bound.
+
+    ``restart_shard`` ends in `ray.get`s with no timeout, and `create_worker` returns
+    before the actor is scheduled -- so a placement-group bundle that can never be filled,
+    which is what a lost node looks like, blocks inside `post_init` rather than raising.
+    Without a bound the `except` never fires: the shard sits in RESTARTING for the rest of
+    the run, never retried because it is no longer DEAD, and never retired because
+    retirement is driven by restart *attempts*.
+    """
+
+    def test_it_becomes_a_failed_restart_rather_than_a_permanent_restarting(self):
+        import threading
+
+        gate = threading.Event()
+        monitor, gen = _monitor(), _Generation(block=gate)
+        _condemn(monitor, 0)
+        supervisor = EngineSupervisor(
+            generation=gen, monitor=monitor, restart_timeout_s=0.05
+        )
+
+        async def _main():
+            supervisor.tick()
+            await supervisor.drain(timeout_s=5)
+            await asyncio.sleep(0)
+
+        try:
+            asyncio.run(_main())
+            assert monitor.state_of(0) is ShardState.DEAD
+            assert supervisor.metrics()["supervisor/restarts_failed"] == 1.0
+        finally:
+            # Let the parked thread finish so it does not outlive the test.
+            gate.set()
+
+    def test_the_reason_records_the_timeout(self):
+        import threading
+
+        gate = threading.Event()
+        monitor, gen = _monitor(), _Generation(block=gate)
+        _condemn(monitor, 0)
+        supervisor = EngineSupervisor(
+            generation=gen, monitor=monitor, restart_timeout_s=0.05
+        )
+
+        async def _main():
+            supervisor.tick()
+            await supervisor.drain(timeout_s=5)
+            await asyncio.sleep(0)
+
+        try:
+            asyncio.run(_main())
+            assert "0.05" in monitor.snapshot()[0].last_error
+        finally:
+            gate.set()
+
+    def test_the_worker_thread_is_a_daemon(self):
+        """A non-daemon thread stuck in a reload is joined at interpreter exit, with no
+        timeout, so it holds the whole process open. That is why this is not to_thread."""
+        import threading
+
+        gate = threading.Event()
+        seen: list[threading.Thread] = []
+        monitor = _monitor()
+        _condemn(monitor, 0)
+
+        class _Recording(_Generation):
+            def restart_shard(self, shard_idx):
+                seen.append(threading.current_thread())
+                return super().restart_shard(shard_idx)
+
+        gen = _Recording(block=gate)
+        supervisor = EngineSupervisor(generation=gen, monitor=monitor)
+
+        async def _main():
+            supervisor.tick()
+            gate.set()
+            await supervisor.drain(timeout_s=5)
+
+        asyncio.run(_main())
+
+        assert seen and all(t.daemon for t in seen), (
+            f"restart ran on non-daemon thread(s) {seen}; a reload that never returns "
+            "would hang interpreter exit"
+        )
+
+
+class TestAttemptsAreSpacedOut:
+    """Five attempts spent inside 25s is five attempts wasted on one transient cause.
+
+    A failed restart returns the shard to DEAD and the next probe tick picks it straight
+    back up, so without a cooldown the whole budget can burn before whatever broke the
+    restart -- a GPU still held by an orphaned EngineCore, say, which took 370s to come
+    back in job 6720618 -- has had any chance to clear.
+    """
+
+    def test_a_second_attempt_waits_for_the_backoff(self):
+        monitor, gen = _monitor(), _Generation(fail=True)
+        _condemn(monitor, 0)
+        supervisor = EngineSupervisor(
+            generation=gen, monitor=monitor, restart_backoff_s=1e6
+        )
+
+        async def _main():
+            await _tick_and_settle(supervisor)
+            await _tick_and_settle(supervisor)
+
+        asyncio.run(_main())
+
+        assert gen.restarted == [0], "the second tick must not spend another attempt"
+        assert monitor.snapshot()[0].restart_attempts == 1
+
+    def test_the_backoff_expires(self):
+        monitor, gen = _monitor(), _Generation(fail=True)
+        _condemn(monitor, 0)
+        supervisor = EngineSupervisor(
+            generation=gen, monitor=monitor, restart_backoff_s=0.0
+        )
+
+        async def _main():
+            await _tick_and_settle(supervisor)
+            await _tick_and_settle(supervisor)
+
+        asyncio.run(_main())
+
+        assert gen.restarted == [0, 0]
+
+    def test_a_successful_restart_is_not_delayed_by_a_previous_failure(self):
+        """The cooldown gates retries of a *failed* restart, not the first attempt."""
+        monitor, gen = _monitor(), _Generation()
+        _condemn(monitor, 1)
+        supervisor = EngineSupervisor(
+            generation=gen, monitor=monitor, restart_backoff_s=1e6
+        )
+
+        asyncio.run(_tick_and_settle(supervisor))
+
+        assert gen.restarted == [1]
+        assert monitor.state_of(1) is ShardState.STALE
 
 
 class TestItDoesNotBlockTheControlLoop:
@@ -455,6 +604,129 @@ class TestTheWeightVersionSaysWhatEachShardHolds:
         assert monitor.state_of(1) is ShardState.RETIRED
 
 
+class TestTheGpuIsReadBeforeTheRestart:
+    """The failure this feature was built around is only visible before the attempt.
+
+    An orphaned EngineCore still holding the memory is what makes a restart fail, and the
+    reading that would show it is taken inside the *new* worker at `_load_model` -- too
+    late to be a signal, and not taken at all when the replacement never gets scheduled,
+    which is exactly the case where you most want to know what is on that GPU.
+    """
+
+    def test_the_reading_is_taken_before_restart_shard_runs(self):
+        monitor, gen = _monitor(), _Generation()
+        _condemn(monitor, 1)
+        supervisor = EngineSupervisor(generation=gen, monitor=monitor)
+
+        asyncio.run(_tick_and_settle(supervisor))
+
+        assert [idx for idx, _ in gen.gpu_reads] == [1]
+        assert gen.restarted == [1]
+
+    def test_the_label_names_the_shard_and_the_attempt(self):
+        """Otherwise five [GPU_DIAG] blocks from one shard are indistinguishable."""
+        monitor, gen = _monitor(), _Generation(fail=True)
+        _condemn(monitor, 0)
+        supervisor = EngineSupervisor(
+            generation=gen, monitor=monitor, restart_backoff_s=0.0
+        )
+
+        async def _main():
+            await _tick_and_settle(supervisor)
+            await _tick_and_settle(supervisor)
+
+        asyncio.run(_main())
+
+        assert [label for _, label in gen.gpu_reads] == [
+            "pre_restart_shard0_attempt1",
+            "pre_restart_shard0_attempt2",
+        ]
+
+    def test_a_backend_without_the_diagnostic_still_restarts(self):
+        """The interface default is a no-op, not NotImplementedError, on purpose."""
+
+        class _Bare:
+            def __init__(self):
+                self.restarted = []
+
+            def log_shard_gpu_state(self, shard_idx, *, label, timeout_s=30.0):
+                del shard_idx, label, timeout_s
+
+            def restart_shard(self, shard_idx):
+                self.restarted.append(shard_idx)
+                return None
+
+        monitor, gen = _monitor(), _Bare()
+        _condemn(monitor, 2)
+        supervisor = EngineSupervisor(generation=gen, monitor=monitor)
+
+        asyncio.run(_tick_and_settle(supervisor))
+
+        assert gen.restarted == [2]
+        assert monitor.state_of(2) is ShardState.STALE
+
+
+class TestDrainIsActuallyWiredUp:
+    """A helper only the tests call is a safety net that is not there.
+
+    ``drain`` reads as "shutdown is handled", and the next person will believe it. But the
+    supervisor's restart tasks are created on demand, one per shard, so they are not in the
+    task list ``run()``'s teardown cancels -- nothing cancelled them and nothing waited for
+    them, and an in-flight restart at shutdown was simply abandoned mid-way.
+
+    Asserted against the source because reaching the real teardown means constructing the
+    whole controller; the same shape as the ordering check in test_engine_reaping_env.py.
+    """
+
+    def test_the_controller_teardown_drains_the_supervisor(self):
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[3]
+            / "nemo_rl"
+            / "algorithms"
+            / "single_controller.py"
+        ).read_text()
+        drains = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "drain"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "_engine_supervisor"
+        ]
+        assert drains, (
+            "single_controller.py never calls self._engine_supervisor.drain(); a restart "
+            "in flight when the run ends is abandoned, and drain() is left as a safety "
+            "net nothing uses"
+        )
+        assert all(call.keywords for call in drains), (
+            "drain() must be given a timeout: restart_shard can block on a bundle that "
+            "will never be filled again, and an unbounded wait in teardown would trade a "
+            "lost shard for a process that cannot exit"
+        )
+
+    def test_it_reports_what_it_gave_up_on(self, capsys):
+        import threading
+
+        gate = threading.Event()
+        monitor, gen = _monitor(), _Generation(block=gate)
+        _condemn(monitor, 0)
+        supervisor = EngineSupervisor(generation=gen, monitor=monitor)
+
+        async def _main():
+            supervisor.tick()
+            await supervisor.drain(timeout_s=0.05)
+
+        try:
+            asyncio.run(_main())
+            assert "still running after" in capsys.readouterr().out
+        finally:
+            gate.set()
+
+
 def test_every_supervised_backend_can_restart_a_shard():
     """The supervisor calls restart_shard by name, so a backend missing it degrades silently.
 
@@ -491,4 +763,24 @@ def test_every_supervised_backend_can_restart_a_shard():
         f"{backend.name} does not define {called}, but EngineSupervisor calls it on every "
         "restart. The failure is silent: _restart swallows the AttributeError and the "
         "shard is retried until its attempt budget retires it."
+    )
+
+    # And declared, not merely present on one backend. The supervisor is handed whatever
+    # GenerationInterface the config selected; a method that exists only on vLLM is a
+    # contract kept by coincidence.
+    interface = ast.parse(
+        (repo_root / "nemo_rl/models/generation/interfaces.py").read_text()
+    )
+    declared = {
+        n.name
+        for cls in ast.walk(interface)
+        if isinstance(cls, ast.ClassDef) and cls.name == "GenerationInterface"
+        for n in cls.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {called, "log_shard_gpu_state"} <= declared, (
+        "GenerationInterface does not declare "
+        f"{sorted({called, 'log_shard_gpu_state'} - declared)}, so a backend that omits "
+        "it fails as an AttributeError at restart time rather than as an unsupported "
+        "operation"
     )
