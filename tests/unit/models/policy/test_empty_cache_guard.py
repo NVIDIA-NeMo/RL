@@ -23,6 +23,7 @@ def test_empty_cache_guard_noops_without_expandable_segments(monkeypatch):
     )
 
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
     original = torch.cuda.empty_cache
     try:
         make_empty_cache_best_effort_under_expandable_segments()
@@ -41,6 +42,7 @@ def test_empty_cache_guard_skips_flush_entirely_under_es(monkeypatch):
     )
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
     original = torch.cuda.empty_cache
     calls = []
 
@@ -72,6 +74,7 @@ def test_empty_cache_guard_never_touches_broken_allocator(monkeypatch):
     )
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
     original = torch.cuda.empty_cache
 
     def _raises_other():
@@ -81,5 +84,23 @@ def test_empty_cache_guard_never_touches_broken_allocator(monkeypatch):
         torch.cuda.empty_cache = _raises_other
         make_empty_cache_best_effort_under_expandable_segments()
         torch.cuda.empty_cache()  # must not raise because it must not call through
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_requires_opt_in_env(monkeypatch):
+    """Patching a global torch API is opt-in: without
+    NRL_BEST_EFFORT_EMPTY_CACHE=1 the guard must leave empty_cache alone even
+    under expandable_segments."""
+    from nemo_rl.models.policy.utils import (
+        make_empty_cache_best_effort_under_expandable_segments,
+    )
+
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("NRL_BEST_EFFORT_EMPTY_CACHE", raising=False)
+    original = torch.cuda.empty_cache
+    try:
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is original
     finally:
         torch.cuda.empty_cache = original

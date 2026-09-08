@@ -233,7 +233,14 @@ def make_empty_cache_best_effort_under_expandable_segments() -> None:
     requirement — and expandable segments already return freed memory to the
     OS-level segment pool — so under that allocator mode we degrade the call
     to best-effort instead of letting a failed cache flush kill training.
+
+    Opt-in: patching a global torch API is intrusive, so this guard only
+    activates when ``NRL_BEST_EFFORT_EMPTY_CACHE=1`` is set in addition to
+    expandable segments being enabled. With the flag unset this function is
+    a no-op and ``torch.cuda.empty_cache`` is left untouched.
     """
+    if os.environ.get("NRL_BEST_EFFORT_EMPTY_CACHE", "0") != "1":
+        return
     alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
     if "expandable_segments:True" not in alloc_conf:
         return
