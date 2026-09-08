@@ -25,15 +25,17 @@ and own the GPU phase transitions around them.
 
 Colocated:
   1. policy.offload_before_refit()                        -- free GPU for staging
-  2. generation.prepare_for_generation(tags=["weights"])   -- allocate buffers
-  3. _refit()                                              -- Ray CUDA-IPC transfer
-  4. policy.offload_after_refit()                          -- restore optimizer state
-  5. generation.prepare_for_generation(tags=["kv_cache"])  -- rebuild KV cache
+  2. generation.recover_updatable_engines()                -- when fault tolerance is on
+  3. generation.prepare_for_generation(tags=["weights"])   -- allocate buffers
+  4. _refit()                                              -- Ray CUDA-IPC transfer
+  5. policy.offload_after_refit()                          -- restore optimizer state
+  6. generation.prepare_for_generation(tags=["kv_cache"])  -- rebuild KV cache
 
 Disaggregated:
-  1. generation.prepare_for_generation(tags=["weights"])
-  2. _refit()                                              -- NCCL broadcast
-  3. generation.prepare_for_generation(tags=["kv_cache"])
+  1. generation.recover_updatable_engines()                -- when fault tolerance is on
+  2. generation.prepare_for_generation(tags=["weights"])
+  3. _refit()                                              -- NCCL broadcast
+  4. generation.prepare_for_generation(tags=["kv_cache"])
 
 The policy offload steps are skipped when disaggregated: the trainer keeps
 its GPUs to itself, so there is nothing to make room for.
@@ -122,6 +124,11 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
                 f"got {sorted(kv_scales)!r}."
             )
 
+    def _recover_engines(self) -> None:
+        """Recover dead engines before any refit lifecycle RPCs."""
+        if self._generation.sglang_cfg["sglang_cfg"]["use_fault_tolerance"]:
+            self._generation.recover_updatable_engines()
+
     def _refit(self, buffer_size_bytes: int) -> None:
         from nemo_rl.models.generation.sglang.config import (
             get_sglang_quantization_scheme,
@@ -131,18 +138,12 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         # Validating read: a misspelled scheme must raise, not fall back to BF16.
         target_precision = get_sglang_quantization_scheme(sglang_quantization_cfg)
 
-        # Restart engines that died since the last refit, so the topology read
-        # below reflects the survivors. No-op when nothing died.
-        if self._generation.sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
-            self._generation.recover_updatable_engines()
-
         (
             rollout_engines,
-            _rollout_engine_lock,
             num_new_engines,
             engine_gpu_counts,
             engine_gpu_offsets,
-        ) = self._generation.get_updatable_engines_and_lock()
+        ) = self._generation.get_updatable_engines()
 
         if num_new_engines > 0:
             self._connect(
@@ -250,13 +251,17 @@ class SGLangColocatedWeightSynchronizer(_SGLangWeightSynchronizer):
         self._policy.offload_before_refit()
 
         sync_succeeded = False
+        recovery_succeeded = False
         try:
+            self._recover_engines()
+            recovery_succeeded = True
             self._generation.prepare_for_generation(tags=["weights"])
             self._timed_refit(timer)
             sync_succeeded = True
         finally:
             self._policy.offload_after_refit()
-            self._generation.prepare_for_generation(tags=["kv_cache"])
+            if recovery_succeeded:
+                self._generation.prepare_for_generation(tags=["kv_cache"])
 
         self._stale = not sync_succeeded
         return None
@@ -299,6 +304,7 @@ class SGLangDisaggregatedWeightSynchronizer(_SGLangWeightSynchronizer):
     ) -> Optional[dict[str, float]]:
         self._reject_kv_scales(kv_scales)
 
+        self._recover_engines()
         sync_succeeded = False
         try:
             self._generation.prepare_for_generation(tags=["weights"])
