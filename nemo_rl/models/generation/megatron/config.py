@@ -65,6 +65,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     mamba_inference_conv_states_dtype: NotRequired[str]
     prefix_caching_mamba_gb: NotRequired[int]
 
+    prefix_caching_eviction_policy: NotRequired[Literal["ref_zero", "lru"]]
     prefix_caching_coordinator_policy: NotRequired[
         Literal["load_balanced", "longest_prefix", "first_prefix_block"]
     ]
