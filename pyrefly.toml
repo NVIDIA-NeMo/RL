@@ -162,6 +162,7 @@ project-includes = [
   "nemo_rl/distributed/worker_group_utils.py",
   "nemo_rl/environments/__init__.py",
   "nemo_rl/environments/code_jaccard_environment.py",
+  "nemo_rl/environments/gym_checkpoint.py",
   "nemo_rl/environments/games/sliding_puzzle.py",
   "nemo_rl/environments/interfaces.py",
   "nemo_rl/environments/math_environment.py",

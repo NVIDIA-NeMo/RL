@@ -444,6 +444,7 @@ class AsyncRolloutImpl:
         input_sample: DatumSpec,
         *,
         rollout_ids: Optional[list[str]] = None,
+        attempt_indices: Optional[list[int]] = None,
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
@@ -459,6 +460,9 @@ class AsyncRolloutImpl:
         """
         assert rollout_ids is None, (
             "token capture (rollout_ids) is only supported on the NeMo-Gym path"
+        )
+        assert attempt_indices is None, (
+            "Gym execution attempt indices are only supported on the NeMo-Gym path"
         )
         assert generation_indices is None, (
             "partial sibling dispatch is only supported on the NeMo-Gym path"
@@ -875,6 +879,7 @@ class AsyncNemoGymRolloutImpl:
         input_sample: DatumSpec,
         *,
         rollout_ids: Optional[list[str]] = None,
+        attempt_indices: Optional[list[int]] = None,
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
@@ -883,10 +888,10 @@ class AsyncNemoGymRolloutImpl:
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
-            rollout_ids: Token-capture mode: gate-registered rollout ids, one
-                per generation, riding each row's run body as the opaque
-                ``_ng_rollout_id`` key (agents stamp /ng-rollout/<id> from it;
-                zero agent changes).
+            rollout_ids: Token-capture mode: stable logical rollout IDs, one
+                per generation, riding each row's run body as ``_ng_rollout_id``.
+            attempt_indices: Token-capture mode: numeric physical execution
+                attempt for each logical rollout ID.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -898,6 +903,7 @@ class AsyncNemoGymRolloutImpl:
         rollout_inputs = self._build_inputs(
             input_sample,
             rollout_ids=rollout_ids,
+            attempt_indices=attempt_indices,
             generation_indices=generation_indices,
         )
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
@@ -966,6 +972,7 @@ class AsyncNemoGymRolloutImpl:
         input_sample: DatumSpec,
         *,
         rollout_ids: Optional[list[str]] = None,
+        attempt_indices: Optional[list[int]] = None,
         generation_indices: Optional[list[int]] = None,
     ) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
@@ -992,6 +999,24 @@ class AsyncNemoGymRolloutImpl:
             assert len(rollout_ids) == self._num_generations_per_prompt, (
                 "token-capture rollout ids must be one per generation"
             )
+            if attempt_indices is None:
+                raise ValueError(
+                    "token-capture rollout ids require one Gym attempt index per "
+                    "generation"
+                )
+            if len(attempt_indices) != self._num_generations_per_prompt:
+                raise ValueError(
+                    "Gym attempt indices must be one per prompt generation"
+                )
+            if any(
+                isinstance(attempt_index, bool)
+                or not isinstance(attempt_index, int)
+                or attempt_index < 0
+                for attempt_index in attempt_indices
+            ):
+                raise ValueError("Gym attempt indices must be non-negative integers")
+        elif attempt_indices is not None:
+            raise ValueError("Gym attempt indices require stable rollout ids")
         group_id = template_row.get(NEMO_GYM_GROUP_ID_KEY) or uuid.uuid4().hex
         group_attempt = template_row.get(NEMO_GYM_GROUP_ATTEMPT_KEY, 0)
         if (
@@ -1021,10 +1046,11 @@ class AsyncNemoGymRolloutImpl:
             row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
             if rollout_ids is not None:
-                # Opaque run-body carrier (Gym's _ng_rollout_id key): the agent
-                # derives the id from the run body and stamps /ng-rollout/<id>
-                # on every model call, so the TQ sample id IS the capture key.
+                assert attempt_indices is not None
+                # Gym keeps this logical ID stable across restarts and derives
+                # its attempt-qualified capture key from both fields.
                 row["_ng_rollout_id"] = rollout_ids[i]
+                row["_ng_attempt_index"] = attempt_indices[i]
             rows.append(row)
         return rows
 
@@ -1675,11 +1701,13 @@ class RolloutManager:
         input_sample: DatumSpec,
         *,
         rollout_ids: Optional[list[str]] = None,
+        attempt_indices: Optional[list[int]] = None,
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
+            assert attempt_indices is None
             assert generation_indices is None
             assert on_completion is None
             assert recovery_granularity is RecoveryGranularity.SIBLING
@@ -1688,6 +1716,7 @@ class RolloutManager:
         return await self._impl.run_rollout(
             input_sample,
             rollout_ids=rollout_ids,
+            attempt_indices=attempt_indices,
             generation_indices=generation_indices,
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
@@ -2091,7 +2120,9 @@ class RolloutManager:
         ]
         group_id = recovery_group.group_id
         start_version = recovery_group.start_weight_version
-        rollout_ids = tuple(recovery_group.gate_rollout_ids)
+        logical_rollout_ids = tuple(recovery_group.logical_rollout_ids)
+        attempt_indices = tuple(recovery_group.current_attempt_indices)
+        capture_rollout_ids = tuple(recovery_group.gate_rollout_ids)
         attempt_input_sample = copy.deepcopy(input_sample)
         attempt_extra_env_info = attempt_input_sample.get("extra_env_info")
         if isinstance(attempt_extra_env_info, dict):
@@ -2103,7 +2134,7 @@ class RolloutManager:
             weight_version=start_version,
             target_step=recovery_group.target_step,
             group_id=group_id,
-            rollout_ids=list(rollout_ids),
+            rollout_ids=list(capture_rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
 
@@ -2127,12 +2158,12 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain its Gate rollout ID"
                 )
-            if not 0 <= generation_index < len(rollout_ids):
+            if not 0 <= generation_index < len(capture_rollout_ids):
                 raise ValueError(
                     f"streamed generation index {generation_index} is outside "
                     f"prompt group {group_id!r}"
                 )
-            expected_gate_rollout_id = rollout_ids[generation_index]
+            expected_gate_rollout_id = capture_rollout_ids[generation_index]
             if gate_rollout_id != expected_gate_rollout_id:
                 raise ValueError(
                     "streamed rollout identity mismatch: "
@@ -2205,7 +2236,8 @@ class RolloutManager:
                         )
                     await self.run_rollout(
                         attempt_input_sample,
-                        rollout_ids=list(rollout_ids),
+                        rollout_ids=list(logical_rollout_ids),
+                        attempt_indices=list(attempt_indices),
                         generation_indices=pending_indices,
                         on_completion=_record_streamed_completion,
                         recovery_granularity=recovery_group.recovery_granularity,

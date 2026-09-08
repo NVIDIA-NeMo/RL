@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import hashlib
 import math
 import os
 import subprocess
 import sys
+import time
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
@@ -39,6 +41,42 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.gym_checkpoint import (
+    GYM_AGENT_CHECKPOINT_PREFIX,
+    GYM_CHECKPOINT_CAPABILITIES_PATH,
+    GYM_CHECKPOINT_CONTROL_PREFIX,
+    GYM_MODEL_ADMISSION_PREFIX,
+    GYM_MODEL_CHECKPOINT_PREFIX,
+    GYM_RESOURCES_CHECKPOINT_PREFIX,
+    GymAgentCommitResponse,
+    GymAgentPrepareResponse,
+    GymAgentRestoreResponse,
+    GymAgentResumeResponse,
+    GymCheckpointCommitResult,
+    GymCheckpointControlRequest,
+    GymCheckpointDirectoryRequest,
+    GymCheckpointPrepareResult,
+    GymCheckpointResumeResult,
+    GymCheckpointRestoreResult,
+    GymControlCapabilities,
+    GymDiscoveredParticipant,
+    GymExecutionIdentity,
+    GymModelCommitResponse,
+    GymModelPrepareResponse,
+    GymModelRestoreResponse,
+    GymModelResumeResponse,
+    GymParticipantCommitResult,
+    GymParticipantIdentity,
+    GymParticipantManifestReference,
+    GymParticipantPrepareResult,
+    GymParticipantRestoreResult,
+    GymParticipantResumeResult,
+    GymResourcesCommitResponse,
+    GymResourcesPrepareResponse,
+    GymResourcesRestoreResponse,
+    GymResourcesResumeResponse,
+    gym_capture_key,
+)
 from nemo_rl.environments.nemo_gym_multimodal import (
     _index_per_turn_images,
     _is_trainable_output_item,
@@ -236,8 +274,38 @@ class NemoGymConfig(TypedDict):
 # model call, so the TQ sample id IS the capture key end to end.
 _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
+_NG_ATTEMPT_INDEX_BODY_KEY = "_ng_attempt_index"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+_CHECKPOINT_CONTROL_ENV = "NEMO_GYM_CHECKPOINT_CONTROL_TOKEN"
+_GYM_COMPONENT_KEYS = frozenset(
+    {"responses_api_models", "responses_api_agents", "resources_servers"}
+)
+
+
+def _checkpoint_server_names(global_config: Mapping[str, Any]) -> list[str]:
+    """Return deterministic Gym service routing names from resolved config."""
+    server_names: list[str] = []
+    for server_name, entry in global_config.items():
+        if not isinstance(server_name, str) or not isinstance(entry, Mapping):
+            continue
+        if len(_GYM_COMPONENT_KEYS.intersection(entry)) == 1:
+            server_names.append(server_name)
+    return sorted(server_names)
+
+
+def _adapt_execution_identity_for_installed_gym(
+    row: dict[str, Any],
+    *,
+    stable_execution_identity_enabled: bool,
+) -> None:
+    """Translate the new identity pair for Gym revisions that predate it."""
+    if stable_execution_identity_enabled or _NG_ATTEMPT_INDEX_BODY_KEY not in row:
+        return
+    row[_NG_ROLLOUT_ID_BODY_KEY] = gym_capture_key(
+        row[_NG_ROLLOUT_ID_BODY_KEY],
+        row.pop(_NG_ATTEMPT_INDEX_BODY_KEY),
+    )
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -344,6 +412,12 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
+        self._stable_execution_identity_enabled = False
+        self._server_client: Any = None
+        self._token_capture_control_headers: Dict[str, str] = {}
+        self._checkpoint_control_headers: Dict[str, str] = {}
+        self._control_timeout_s = 60.0
+        self._gym_checkpoint_participants: tuple[GymDiscoveredParticipant, ...] = ()
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -398,6 +472,7 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+        from nemo_gym import global_config as gym_global_config
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
         from omegaconf import DictConfig
@@ -409,6 +484,10 @@ class NemoGym(EnvironmentInterface):
         # do not mutate the caller's config dict (config.env["nemo_gym"]).
         initial_global_config_dict = dict(
             self.cfg.get("initial_global_config_dict") or {}
+        )
+        self._stable_execution_identity_enabled = (
+            getattr(gym_global_config, "ATTEMPT_INDEX_KEY_NAME", None)
+            == _NG_ATTEMPT_INDEX_BODY_KEY
         )
         # Strip NeMo-RL-only training knobs that must not be forwarded to the
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
@@ -472,8 +551,15 @@ Depending on your data shape, you may want to change these values."""
             token_capture and token_capture.get("enabled")
         )
         self._server_client = None
-        self._control_headers: Dict[str, str] = {}
+        checkpoint_control_token = os.environ.get(_CHECKPOINT_CONTROL_ENV)
+        self._token_capture_control_headers = {}
+        self._checkpoint_control_headers = (
+            {"Authorization": f"Bearer {checkpoint_control_token}"}
+            if checkpoint_control_token
+            else {}
+        )
         self._control_timeout_s = 60.0
+        self._gym_checkpoint_participants = ()
         if self._token_capture_enabled:
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
@@ -500,9 +586,15 @@ Depending on your data shape, you may want to change these values."""
             # only the variable name in serialized config and inherit the
             # secret through the server process environment.
             os.environ[_TOKEN_CAPTURE_CONTROL_ENV] = token_capture["control_auth_token"]
-            self._control_headers = {
+            self._token_capture_control_headers = {
                 "Authorization": f"Bearer {token_capture['control_auth_token']}"
             }
+            # Gym's checkpoint routes reuse the token-capture bearer only when
+            # no dedicated checkpoint bearer is configured.
+            if not checkpoint_control_token:
+                self._checkpoint_control_headers = dict(
+                    self._token_capture_control_headers
+                )
             self._control_timeout_s = float(
                 token_capture.get("control_timeout_s") or 60.0
             )
@@ -548,7 +640,7 @@ Depending on your data shape, you may want to change these values."""
         """
         self._tokenizer = tokenizer
 
-    # ── ledger control plane (token-capture mode) ───────────────────────────
+    # ── Gym token-capture and checkpoint control planes ─────────────────────
 
     def _control_client(self):
         """Gym ServerClient resolving servers by name from the head server."""
@@ -560,30 +652,462 @@ Depending on your data shape, you may want to change these values."""
             )
         return self._server_client
 
-    async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
-        headers = {**kwargs.pop("headers", {}), **self._control_headers}
+    async def _control(
+        self,
+        method: str,
+        path: str,
+        *,
+        server_name: str = _POLICY_SERVER_NAME,
+        timeout_s: Optional[float] = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        default_headers = (
+            self._checkpoint_control_headers
+            if path.startswith(GYM_CHECKPOINT_CONTROL_PREFIX)
+            else self._token_capture_control_headers
+        )
+        headers = {**kwargs.pop("headers", {}), **default_headers}
+        request_timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
         try:
             response = await asyncio.wait_for(
                 self._control_client().request(
-                    server_name=_POLICY_SERVER_NAME,
+                    server_name=server_name,
                     url_path=path,
                     method=method,
                     headers=headers,
                     **kwargs,
                 ),
-                timeout=self._control_timeout_s,
+                timeout=request_timeout_s,
             )
         except asyncio.TimeoutError:
             raise RuntimeError(
-                f"ledger control call {method} {path} exceeded "
-                f"{self._control_timeout_s}s (control plane unreachable or stalled)"
+                f"Gym control call to {server_name!r} {method} {path} exceeded "
+                f"{request_timeout_s}s (control plane unreachable or stalled)"
             ) from None
         if response.status != 200:
             raise RuntimeError(
-                f"ledger control call {method} {path} failed: "
+                f"Gym control call to {server_name!r} {method} {path} failed: "
                 f"HTTP {response.status} {await response.text()}"
             )
-        return await response.json()
+        payload = await response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Gym control call to {server_name!r} {method} {path} returned "
+                f"{type(payload).__name__}, expected an object"
+            )
+        return payload
+
+    @staticmethod
+    def _checkpoint_request_timeout(deadline_ts: float) -> float:
+        """Bound one control RPC by the transaction's absolute deadline."""
+        return max(0.001, deadline_ts - time.time())
+
+    async def discover_checkpoint_capabilities(
+        self,
+        server_names: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Discover and validate checkpoint capabilities without enabling saves.
+
+        The result is cached only for later explicit control calls on this actor.
+        Single Controller setup does not invoke this method yet.
+        """
+        self._require_spinup()
+        candidates = (
+            _checkpoint_server_names(self._control_client().global_config_dict)
+            if server_names is None
+            else sorted(set(server_names))
+        )
+        if not candidates:
+            raise RuntimeError("NeMo-Gym exposes no checkpoint participants")
+
+        participants: list[GymDiscoveredParticipant] = []
+        seen: set[tuple[str, str]] = set()
+        for server_name in candidates:
+            raw = await self._control(
+                "GET",
+                GYM_CHECKPOINT_CAPABILITIES_PATH,
+                server_name=server_name,
+            )
+            capabilities = GymControlCapabilities.model_validate(raw)
+            if capabilities.component == "responses_api_models":
+                if capabilities.instance_role is None:
+                    raise RuntimeError(
+                        f"Gym model participant {server_name!r} did not declare "
+                        "its policy or auxiliary role"
+                    )
+            elif capabilities.instance_role is not None:
+                raise RuntimeError(
+                    f"non-model Gym participant {server_name!r} unexpectedly "
+                    f"declared instance_role={capabilities.instance_role!r}"
+                )
+            if capabilities.multi_process.mode == "unmanaged":
+                raise RuntimeError(
+                    f"Gym checkpoint participant {server_name!r} runs "
+                    f"{capabilities.multi_process.num_workers} unmanaged workers"
+                )
+            participant = capabilities.participant(server_name)
+            identity_key = (participant.component, participant.participant_name)
+            if identity_key in seen:
+                raise RuntimeError(
+                    f"duplicate Gym checkpoint participant identity {identity_key!r}"
+                )
+            seen.add(identity_key)
+            participants.append(
+                GymDiscoveredParticipant(
+                    participant=participant,
+                    capabilities=capabilities,
+                )
+            )
+        if not any(
+            item.capabilities.component == "responses_api_models"
+            and item.capabilities.instance_role == "policy"
+            for item in participants
+        ):
+            raise RuntimeError(
+                "NeMo-Gym checkpoint topology has no policy model participant"
+            )
+        self._gym_checkpoint_participants = tuple(participants)
+        return [participant.model_dump(mode="json") for participant in participants]
+
+    def _checkpoint_participants(self) -> tuple[GymDiscoveredParticipant, ...]:
+        if not self._gym_checkpoint_participants:
+            raise RuntimeError(
+                "discover_checkpoint_capabilities must succeed before Gym "
+                "checkpoint control calls"
+            )
+        return self._gym_checkpoint_participants
+
+    def _ordered_checkpoint_participants(
+        self,
+        *,
+        resume: bool = False,
+    ) -> tuple[GymDiscoveredParticipant, ...]:
+        """Order policy fencing first and policy reopening last."""
+        component_order = {
+            "responses_api_models": 0,
+            "responses_api_agents": 1,
+            "resources_servers": 2,
+        }
+        return tuple(
+            sorted(
+                self._checkpoint_participants(),
+                key=lambda item: component_order[item.participant.component],
+                reverse=resume,
+            )
+        )
+
+    @staticmethod
+    def _participant_checkpoint_path(
+        participant: GymParticipantIdentity,
+    ) -> str:
+        if participant.component == "responses_api_models":
+            safe_name = GymExecutionIdentity(
+                rollout_id=participant.participant_name,
+                attempt_index=0,
+            ).rollout_id
+            return f"model-ledger/{safe_name}/manifest.json"
+        if participant.component == "resources_servers":
+            safe_name = GymExecutionIdentity(
+                rollout_id=participant.participant_name,
+                attempt_index=0,
+            ).rollout_id
+            return f"resources/{safe_name}/manifest.json"
+        name_digest = hashlib.sha256(
+            participant.participant_name.encode("utf-8")
+        ).hexdigest()
+        return f"agent/instance-{name_digest}/manifest.json"
+
+    async def prepare_checkpoint(
+        self,
+        checkpoint_id: str,
+        deadline_ts: float,
+    ) -> dict[str, Any]:
+        """Issue one non-blocking prepare call to each stateful participant."""
+        request = GymCheckpointControlRequest(
+            checkpoint_id=checkpoint_id,
+            deadline_ts=deadline_ts,
+        ).model_dump(mode="json")
+        results: list[GymParticipantPrepareResult] = []
+        for discovered in self._ordered_checkpoint_participants():
+            participant = discovered.participant
+            capabilities = discovered.capabilities
+            payload: (
+                GymModelPrepareResponse
+                | GymAgentPrepareResponse
+                | GymResourcesPrepareResponse
+            )
+            if participant.component == "responses_api_models":
+                if capabilities.instance_role != "policy":
+                    continue
+                if "paused" not in capabilities.admission_states:
+                    raise RuntimeError(
+                        f"Gym policy model {participant.server_name!r} cannot pause"
+                    )
+                payload = GymModelPrepareResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_MODEL_ADMISSION_PREFIX}/pause",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+                ready = payload.state == "paused" and payload.inflight_total == 0
+            elif participant.component == "responses_api_agents":
+                if capabilities.checkpoint_mode != "export_restore":
+                    continue
+                payload = GymAgentPrepareResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_AGENT_CHECKPOINT_PREFIX}/prepare",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+                ready = payload.ready_to_commit
+            else:
+                if capabilities.checkpoint_mode != "export_restore":
+                    continue
+                payload = GymResourcesPrepareResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/prepare",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+                ready = payload.state == "prepared"
+            results.append(
+                GymParticipantPrepareResult(
+                    participant=participant,
+                    ready=ready,
+                    payload=payload,
+                )
+            )
+        result = GymCheckpointPrepareResult(
+            checkpoint_id=checkpoint_id,
+            ready=all(item.ready for item in results),
+            participants=results,
+        )
+        return result.model_dump(mode="json")
+
+    async def commit_checkpoint(
+        self,
+        checkpoint_id: str,
+        deadline_ts: float,
+        checkpoint_dir: str,
+    ) -> dict[str, Any]:
+        """Commit every stateful participant into a caller-owned temp directory."""
+        request = GymCheckpointDirectoryRequest(
+            checkpoint_id=checkpoint_id,
+            deadline_ts=deadline_ts,
+            checkpoint_dir=checkpoint_dir,
+        ).model_dump(mode="json")
+        results: list[GymParticipantCommitResult] = []
+        for discovered in self._ordered_checkpoint_participants():
+            participant = discovered.participant
+            capabilities = discovered.capabilities
+            if capabilities.checkpoint_mode != "export_restore":
+                continue
+            payload: (
+                GymModelCommitResponse
+                | GymAgentCommitResponse
+                | GymResourcesCommitResponse
+            )
+            if participant.component == "responses_api_models":
+                if capabilities.instance_role != "policy":
+                    continue
+                payload = GymModelCommitResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_MODEL_CHECKPOINT_PREFIX}/commit",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+            elif participant.component == "responses_api_agents":
+                payload = GymAgentCommitResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_AGENT_CHECKPOINT_PREFIX}/commit",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+            else:
+                payload = GymResourcesCommitResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/commit",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+            manifest = GymParticipantManifestReference(
+                participant=participant,
+                relative_path=self._participant_checkpoint_path(participant),
+                manifest_digest=payload.manifest_digest,
+            )
+            results.append(
+                GymParticipantCommitResult(
+                    participant=participant,
+                    payload=payload,
+                    manifest=manifest,
+                )
+            )
+        return GymCheckpointCommitResult(
+            checkpoint_id=checkpoint_id,
+            participants=results,
+        ).model_dump(mode="json")
+
+    async def restore_checkpoint(
+        self,
+        checkpoint_id: str,
+        deadline_ts: float,
+        checkpoint_dir: str,
+    ) -> dict[str, Any]:
+        """Restore every stateful participant but leave admission paused."""
+        request = GymCheckpointDirectoryRequest(
+            checkpoint_id=checkpoint_id,
+            deadline_ts=deadline_ts,
+            checkpoint_dir=checkpoint_dir,
+        ).model_dump(mode="json")
+        results: list[GymParticipantRestoreResult] = []
+        for discovered in self._ordered_checkpoint_participants():
+            participant = discovered.participant
+            capabilities = discovered.capabilities
+            if capabilities.checkpoint_mode != "export_restore":
+                continue
+            payload: (
+                GymModelRestoreResponse
+                | GymAgentRestoreResponse
+                | GymResourcesRestoreResponse
+            )
+            if participant.component == "responses_api_models":
+                if capabilities.instance_role != "policy":
+                    continue
+                payload = GymModelRestoreResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_MODEL_CHECKPOINT_PREFIX}/restore",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+            elif participant.component == "responses_api_agents":
+                payload = GymAgentRestoreResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_AGENT_CHECKPOINT_PREFIX}/restore",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+            else:
+                payload = GymResourcesRestoreResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/restore",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+            results.append(
+                GymParticipantRestoreResult(
+                    participant=participant,
+                    payload=payload,
+                )
+            )
+        return GymCheckpointRestoreResult(
+            checkpoint_id=checkpoint_id,
+            participants=results,
+        ).model_dump(mode="json")
+
+    async def resume_checkpoint(
+        self,
+        checkpoint_id: str,
+        deadline_ts: float,
+    ) -> dict[str, Any]:
+        """Resume participants after commit, restore, or an aborted prepare."""
+        request = GymCheckpointControlRequest(
+            checkpoint_id=checkpoint_id,
+            deadline_ts=deadline_ts,
+        ).model_dump(mode="json")
+        results: list[GymParticipantResumeResult] = []
+        for discovered in self._ordered_checkpoint_participants(resume=True):
+            participant = discovered.participant
+            capabilities = discovered.capabilities
+            payload: (
+                GymModelResumeResponse
+                | GymAgentResumeResponse
+                | GymResourcesResumeResponse
+            )
+            if participant.component == "responses_api_models":
+                if capabilities.instance_role != "policy":
+                    continue
+                payload = GymModelResumeResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_MODEL_ADMISSION_PREFIX}/resume",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+            elif participant.component == "responses_api_agents":
+                if capabilities.checkpoint_mode != "export_restore":
+                    continue
+                payload = GymAgentResumeResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_AGENT_CHECKPOINT_PREFIX}/resume",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+            else:
+                if capabilities.checkpoint_mode != "export_restore":
+                    continue
+                payload = GymResourcesResumeResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/resume",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+            results.append(
+                GymParticipantResumeResult(
+                    participant=participant,
+                    payload=payload,
+                )
+            )
+        return GymCheckpointResumeResult(
+            checkpoint_id=checkpoint_id,
+            participants=results,
+        ).model_dump(mode="json")
+
+    async def abort_checkpoint(
+        self,
+        checkpoint_id: str,
+        deadline_ts: float,
+    ) -> dict[str, Any]:
+        """Abort an unpublished checkpoint by reopening every participant.
+
+        Gym's current wire protocol uses the same resume routes for successful
+        completion and abort; it does not expose a separate abort endpoint.
+        """
+        return await self.resume_checkpoint(checkpoint_id, deadline_ts)
 
     async def run_rollouts(
         self,
@@ -604,6 +1128,16 @@ Depending on your data shape, you may want to change these values."""
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
+
+        if not self._stable_execution_identity_enabled:
+            # Compatibility with Gym revisions predating the stable execution
+            # identity contract. They understand only one physical rollout ID,
+            # so qualify it here exactly as the newer Gym middleware would.
+            for row in nemo_gym_examples:
+                _adapt_execution_identity_for_installed_gym(
+                    row,
+                    stable_execution_identity_enabled=False,
+                )
 
         # Normalize local media before shipping requests to vLLM. Helper is a no-op
         # for text-only rows and already-qualified URLs.
@@ -709,7 +1243,13 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
-        rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
+        logical_rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
+        attempt_index = nemo_gym_row.get(_NG_ATTEMPT_INDEX_BODY_KEY, 0)
+        execution = GymExecutionIdentity(
+            rollout_id=logical_rollout_id,
+            attempt_index=attempt_index,
+        )
+        rollout_id = execution.capture_key
         # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the
         # harness kept (``response.id``), not the logical-request header.
         terminal_response_id = nemo_gym_result.get("terminal_response_id")

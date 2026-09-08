@@ -1110,6 +1110,32 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
 
 
+def test_nemo_gym_build_inputs_separates_stable_ids_from_attempts():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    input_sample = {"extra_env_info": {"responses_create_params": {}}}
+
+    rows = impl._build_inputs(
+        input_sample,
+        rollout_ids=["g7_g0", "g7_g1", "g7_g2"],
+        attempt_indices=[0, 2, 1],
+        generation_indices=[1, 2],
+    )
+
+    assert [row["_ng_rollout_id"] for row in rows] == ["g7_g1", "g7_g2"]
+    assert [row["_ng_attempt_index"] for row in rows] == [2, 1]
+    assert [row["_rowidx"] for row in rows] == [1, 2]
+
+
+def test_nemo_gym_build_inputs_requires_paired_attempt_indices():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    input_sample = {"extra_env_info": {"responses_create_params": {}}}
+
+    with pytest.raises(ValueError, match="require one Gym attempt index"):
+        impl._build_inputs(input_sample, rollout_ids=["g7_g0", "g7_g1"])
+
+
 # ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------
@@ -1739,6 +1765,7 @@ def _make_capture_manager(
     class _CaptureImpl:
         def __init__(self):
             self.seen_rollout_ids = None
+            self.seen_attempt_indices = None
             self.seen_generation_indices = None
             self.seen_recovery_granularity = None
 
@@ -1747,17 +1774,26 @@ def _make_capture_manager(
             _sample,
             *,
             rollout_ids=None,
+            attempt_indices=None,
             generation_indices=None,
             on_completion=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
         ):
             self.seen_rollout_ids = rollout_ids
+            self.seen_attempt_indices = attempt_indices
             self.seen_generation_indices = list(generation_indices or [])
             self.seen_recovery_granularity = recovery_granularity
             if on_run is not None:
                 await on_run(_sample)
             indices = generation_indices or list(range(len(rollout_ids)))
-            selected_ids = [rollout_ids[index] for index in indices]
+            selected_ids = [
+                (
+                    rollout_ids[index]
+                    if attempt_indices[index] == 0
+                    else f"{rollout_ids[index]}-a{attempt_indices[index]}"
+                )
+                for index in indices
+            ]
             selected_configs = (
                 [instance_configs[index] for index in indices]
                 if instance_configs is not None
@@ -1817,11 +1853,9 @@ class TestGenerateForFinalizationFlow:
         canonical_ids = [f"{group_id}_g0", f"{group_id}_g1"]
         attempt_ids = buf.reserve_rollout_ids[0]
         assert attempt_ids is not None
-        assert all(
-            attempt_id.startswith(f"{canonical_id}_a")
-            for attempt_id, canonical_id in zip(attempt_ids, canonical_ids)
-        )
-        assert mgr._impl.seen_rollout_ids == attempt_ids
+        assert attempt_ids == canonical_ids
+        assert mgr._impl.seen_rollout_ids == canonical_ids
+        assert mgr._impl.seen_attempt_indices == [0, 0]
         assert request.group_id == group_id
         assert request.prompt_idx == 0
         assert request.rollout_ids == tuple(attempt_ids)
@@ -1859,13 +1893,19 @@ class TestGenerateForFinalizationFlow:
                 _sample,
                 *,
                 rollout_ids=None,
+                attempt_indices=None,
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
             ):
                 del _sample, recovery_granularity
                 generation_index = generation_indices[0]
-                rollout_id = rollout_ids[generation_index]
+                attempt_index = attempt_indices[generation_index]
+                rollout_id = (
+                    rollout_ids[generation_index]
+                    if attempt_index == 0
+                    else f"{rollout_ids[generation_index]}-a{attempt_index}"
+                )
                 receipt = {
                     "rollout_id": rollout_id,
                     "manifest": [{"staging_key": f"{rollout_id}/call"}],
@@ -1972,6 +2012,7 @@ class TestGenerateForFinalizationFlow:
                 _sample,
                 *,
                 rollout_ids=None,
+                attempt_indices=None,
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
@@ -1981,7 +2022,12 @@ class TestGenerateForFinalizationFlow:
                 self.recovery_granularities.append(recovery_granularity)
                 completions = []
                 for generation_index in indices:
-                    rollout_id = rollout_ids[generation_index]
+                    attempt_index = attempt_indices[generation_index]
+                    rollout_id = (
+                        rollout_ids[generation_index]
+                        if attempt_index == 0
+                        else f"{rollout_ids[generation_index]}-a{attempt_index}"
+                    )
                     receipt = {
                         "rollout_id": rollout_id,
                         "manifest": [{"staging_key": f"{rollout_id}/call"}],

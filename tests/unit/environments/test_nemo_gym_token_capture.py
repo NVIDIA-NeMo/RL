@@ -122,6 +122,33 @@ def test_receipt_postprocess_fetches_manifest_and_selects_terminal_row() -> None
     assert [r["model_call_id"] for r in receipt["manifest"]] == ["c1", "c2"]
 
 
+def test_receipt_postprocess_fetches_attempt_qualified_capture_key() -> None:
+    env = _capture_env()
+    records = [_manifest_record("c1")]
+    env._control = AsyncMock(
+        return_value={
+            "rollout_id": "stable-rollout-a2",
+            "records": records,
+            "failures": [],
+        }
+    )
+
+    result = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "stable-rollout", "_ng_attempt_index": 2},
+            {"reward": 1.0, "terminal_response_id": "resp-c1"},
+        )
+    )
+
+    call = env._control.await_args
+    assert call.args == (
+        "GET",
+        "/training-token-capture/control/rollouts/stable-rollout-a2/manifest",
+    )
+    assert result["rollout_id"] == "stable-rollout-a2"
+    assert result["receipt"]["rollout_id"] == "stable-rollout-a2"
+
+
 def test_receipt_assembly_poisons_on_failure_rows() -> None:
     env = _capture_env()
     manifest = {
