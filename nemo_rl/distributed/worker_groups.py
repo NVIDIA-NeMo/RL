@@ -37,6 +37,28 @@ from nemo_rl.utils.venvs import (
 )
 
 
+@ray.remote(num_cpus=0, num_gpus=0)
+def _log_gpu_state_on_bundle(label: str, local_rank: int) -> None:
+    """Read one bundle's GPU from the node that holds it. See log_worker_gpu_state.
+
+    Module level, not defined inside the method that dispatches it: a ``@ray.remote``
+    decorator in a function body registers a new remote function with the GCS every call.
+
+    ``num_gpus=0`` deliberately. The task is pinned to the bundle, not given the device --
+    asking for the GPU would queue behind whatever is still holding it, which is precisely
+    the state being measured.
+    """
+    import os
+
+    from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+
+    # How the helper resolves which device to read when CUDA is not initialised.
+    os.environ.setdefault("LOCAL_RANK", str(local_rank))
+    log_gpu_memory_diagnostics(
+        label=label, worker_type="generation", device_id=local_rank
+    )
+
+
 def _get_initializer_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
     """Build the environment needed to unpickle worker constructor arguments."""
     initializer_env_vars = {
@@ -733,22 +755,8 @@ class RayWorkerGroup:
             )
             return
 
-        @ray.remote(num_cpus=0, num_gpus=0)
-        def _probe(probe_label: str, local_rank: int) -> None:
-            import os
-
-            from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
-
-            # The task is pinned to the bundle, not given the GPU: taking num_gpus here
-            # would queue behind whatever still holds it, which is precisely the state
-            # being measured. LOCAL_RANK is how the helper resolves the device.
-            os.environ.setdefault("LOCAL_RANK", str(local_rank))
-            log_gpu_memory_diagnostics(
-                label=probe_label, worker_type="generation", device_id=local_rank
-            )
-
         try:
-            ref = _probe.options(
+            ref = _log_gpu_state_on_bundle.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=spec["pg"],
                     placement_group_bundle_index=spec["bundle_idx"],
