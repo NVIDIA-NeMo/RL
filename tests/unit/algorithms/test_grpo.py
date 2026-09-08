@@ -93,7 +93,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
-from nemo_rl.models.generation.sglang import SGLangGeneration
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
