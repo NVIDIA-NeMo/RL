@@ -15,7 +15,8 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -25,6 +26,7 @@ from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
     _FORBIDDEN_RPC_KEYS,
     ReassemblyRequest,
+    RolloutReassemblerActor,
     assert_metadata_only,
 )
 
@@ -71,6 +73,34 @@ def test_finalizer_request_and_result_are_metadata_only() -> None:
     assert_metadata_only(result)
 
 
+def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._finalizer = MagicMock()
+    result = FinalizedGroup(
+        meta=None,
+        group_min_wv=4,
+        group_max_wv=4,
+        staging_keys=[],
+        dropped=True,
+        drop_reason="test",
+    )
+    actor._finalizer.finalize_group.return_value = result
+    request = replace(_request(), loss_multiplier=0.25)
+
+    assert actor.finalize(request) is result
+    actor._finalizer.finalize_group.assert_called_once_with(
+        "group",
+        ["group_g0"],
+        [request.receipts[0]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=4,
+        prompt_idx=0,
+        loss_multiplier=0.25,
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -100,6 +130,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "fallback_weight_version",
         "prompt_idx",
         "mask_sample",
+        "loss_multiplier",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
