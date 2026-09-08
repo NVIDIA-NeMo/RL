@@ -165,20 +165,6 @@ def test_actor_environments_module_is_stdlib_only():
             )
 
 
-def test_script_output_matches_the_registry():
-    """Running the module as a script lists exactly the venvs the runtime expects."""
-    proc = subprocess.run(
-        [sys.executable, str(MODULE_PATH), "all"],
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=git_root,
-    )
-    listed = {line.split("\t")[0] for line in proc.stdout.splitlines() if line.strip()}
-    expected = {fqn for fqn, extras in ACTOR_ENVIRONMENTS.items() if extras is not None}
-    assert listed == expected
-
-
 def test_script_rejects_a_typo_instead_of_printing_nothing():
     """A mistyped stage or skip extra must fail, not emit an empty list.
 
@@ -230,12 +216,12 @@ def test_registry_import_rejects_an_undeclared_extra(monkeypatch):
 
 
 def test_script_emits_the_stage_and_extra_flags_each_actor_needs():
-    """The Dockerfile builds each venv from columns 2 and 3, not just the name.
+    """The script lists exactly the venvs the runtime expects, with the right columns.
 
-    Column 3 is what `uv sync $extras` consumes, and column 2 is what the deps
-    layer branches on to leave the TRT-LLM venv base-only until its wheel exists.
-    Checking only column 1 lets both go wrong silently: emitting one extra per
-    actor, or staging everything as "deps", passes a name-only assertion.
+    The Dockerfile builds each venv from all three columns. Column 3 is what
+    `uv sync $extras` consumes, and column 2 is what the deps layer branches on to
+    leave the TRT-LLM venv base-only until its wheel exists. Comparing the whole
+    dict covers the actor list too, since dict equality requires the same keys.
     """
     proc = subprocess.run(
         [sys.executable, str(MODULE_PATH), "all"],
