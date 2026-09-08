@@ -223,6 +223,7 @@ def _sealed_attempt_state() -> dict[str, Any]:
 @pytest.mark.parametrize(
     ("case", "error_fragment"),
     [
+        ("attempt_index", "attempt indices must be contiguous"),
         ("attempt_uuid", "attempt_uuid must contain exactly 16 bytes"),
         ("status_type", "invalid rollout attempt status"),
         ("status_value", "invalid rollout attempt status"),
@@ -246,7 +247,9 @@ def test_restore_rejects_malformed_attempt_fields(
     state = _sealed_attempt_state()
     attempt = state["groups"][0]["siblings"][0]["attempts"][0]
 
-    if case == "attempt_uuid":
+    if case == "attempt_index":
+        attempt["attempt_index"] = 1
+    elif case == "attempt_uuid":
         attempt["attempt_uuid"] = b"short"
     elif case == "status_type":
         attempt["status"] = None
@@ -752,7 +755,11 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
 
     retry = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
     assert retry.siblings[0].current_attempt.attempt_id == sealed_attempt_id
+    assert retry.siblings[0].current_attempt.attempt_index == 0
     assert retry.siblings[0].current_attempt.status is RolloutAttemptStatus.SEALED
+    assert retry.siblings[1].current_attempt.attempt_index == 1
+    assert retry.logical_rollout_ids == ["g7_g0", "g7_g1"]
+    assert retry.gate_rollout_ids == ["g7_g0", "g7_g1-a1"]
     assert retry.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
 
 
@@ -831,7 +838,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 
