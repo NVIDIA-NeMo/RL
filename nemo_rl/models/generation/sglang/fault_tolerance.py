@@ -18,6 +18,8 @@ import time
 from typing import Optional
 
 import ray
+import requests
+from ray.exceptions import RayError
 
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 
@@ -43,10 +45,9 @@ class RolloutHealthMonitor:
         self._thread = None
         self._stop_event = None
         self._pause_event = None  # When set, health checking is paused
-        # The three knobs are NotRequired because they only matter when
-        # ``use_fault_tolerance`` is on, and the recipes that ship with it off
-        # do not carry them. Reaching this constructor means it is on, so name
-        # the missing keys rather than raising a bare KeyError from a thread.
+        # These knobs only matter when fault tolerance is enabled. Shipped
+        # recipes inherit them from the SGLang exemplar; name all missing keys
+        # together for hand-written configs at construction time.
         ft_cfg = sglang_cfg["sglang_cfg"]
         missing = [
             key
@@ -54,6 +55,7 @@ class RolloutHealthMonitor:
                 "rollout_health_check_interval",
                 "rollout_health_check_timeout",
                 "rollout_health_check_first_wait",
+                "rollout_max_restart_attempts",
             )
             if key not in ft_cfg
         ]
@@ -65,14 +67,77 @@ class RolloutHealthMonitor:
         self._check_interval = ft_cfg["rollout_health_check_interval"]
         self._check_timeout = ft_cfg["rollout_health_check_timeout"]
         self._check_first_wait = ft_cfg["rollout_health_check_first_wait"]
+        self._max_restart_attempts = ft_cfg["rollout_max_restart_attempts"]
+        if (
+            type(self._max_restart_attempts) is not int
+            or self._max_restart_attempts < 0
+        ):
+            raise ValueError(
+                "rollout_max_restart_attempts must be a nonnegative integer"
+            )
+        self._restart_attempts = [0] * len(sglang_generation.engines)
         # Absolute monotonic deadline before which no probe may run, giving a
         # booting engine time to become ready. It is a DEADLINE rather than a
         # "wait once" flag so that a pause part-way through cannot restart the
         # clock -- see ``arm_first_wait``.
         self._first_check_after: Optional[float] = None
-        self._is_checking_enabled = False  # Track if health checking should be active
         # Held for the duration of one check round so pause() can wait it out.
         self._check_lock = threading.Lock()
+
+    @property
+    def check_timeout(self) -> float:
+        """Configured timeout for a liveness probe or graceful shutdown."""
+        return self._check_timeout
+
+    def check_liveness(self) -> None:
+        """Clear dead engine groups before refit, even while serving is paused.
+
+        Probe every actor, including nonzero nodes of multi-node engines. Actor
+        replies check only the server process, so offloaded weights and an idle
+        scheduler do not cause false failures. Each call is bounded at Ray level.
+        """
+        with self._check_lock:
+            for index, engine in enumerate(self._sglang_generation.all_engines):
+                if engine is None:
+                    continue
+                try:
+                    alive = ray.get(
+                        engine.is_alive.remote(), timeout=self._check_timeout
+                    )
+                except RayError as exc:
+                    logger.warning(
+                        "Liveness probe failed for engine %s: %s", index, exc
+                    )
+                    alive = False
+                if not alive:
+                    self._kill_engine(
+                        rollout_engine_id=index
+                        // self._sglang_generation.nodes_per_engine
+                    )
+
+    def record_restart_attempts(self, dead_indices: list[int]) -> None:
+        """Reserve one attempt per logical engine, aborting before any boot at the cap."""
+        engine_ids = sorted(
+            {i // self._sglang_generation.nodes_per_engine for i in dead_indices}
+        )
+        exhausted = [
+            i
+            for i in engine_ids
+            if self._restart_attempts[i] >= self._max_restart_attempts
+        ]
+        if exhausted:
+            raise RuntimeError(
+                f"SGLang engines {exhausted} exhausted rollout_max_restart_attempts="
+                f"{self._max_restart_attempts}; aborting refit."
+            )
+        for i in engine_ids:
+            self._restart_attempts[i] += 1
+            logger.warning(
+                "Restarting SGLang engine %s (attempt %s/%s)",
+                i,
+                self._restart_attempts[i],
+                self._max_restart_attempts,
+            )
 
     def arm_first_wait(self) -> None:
         """Hold off probing until ``rollout_health_check_first_wait`` has elapsed.
@@ -128,7 +193,6 @@ class RolloutHealthMonitor:
             self._pause_event.clear()
         timeout = self._check_timeout + self._check_interval + 5
         self._thread.join(timeout=timeout)
-        self._is_checking_enabled = False
         if self._thread.is_alive():
             # Keep the events: the thread outlived the join and dereferences
             # them on its next iteration, so clearing them here would kill it
@@ -154,7 +218,6 @@ class RolloutHealthMonitor:
             return
         logger.info("Pausing health monitor...")
         self._pause_event.set()
-        self._is_checking_enabled = False
         # Wait out an in-flight round so callers may offload/refit right after.
         with self._check_lock:
             pass
@@ -167,11 +230,6 @@ class RolloutHealthMonitor:
         # The first-wait deadline is deliberately NOT re-armed here; see
         # ``arm_first_wait``. It is armed at start() and after a recovery.
         self._pause_event.clear()
-        self._is_checking_enabled = True
-
-    def is_checking_enabled(self) -> bool:
-        """Return whether health checking is currently enabled (not paused)."""
-        return self._is_checking_enabled
 
     def _health_monitor_loop(self) -> None:
         assert self._stop_event is not None
@@ -245,6 +303,7 @@ class RolloutHealthMonitor:
 
     def _kill_engine(self, rollout_engine_id: int):
         logger.info(f"Killing server group {rollout_engine_id}...")
+        self._remove_router_worker(rollout_engine_id)
         for i in range(
             rollout_engine_id * self._sglang_generation.nodes_per_engine,
             (rollout_engine_id + 1) * self._sglang_generation.nodes_per_engine,
@@ -266,3 +325,25 @@ class RolloutHealthMonitor:
             else:
                 logger.info(f"Engine at index {i} is already None")
             self._sglang_generation.all_engines[i] = None
+
+    def _remove_router_worker(self, rollout_engine_id: int) -> None:
+        """Deregister using cached endpoints, without contacting a failed actor."""
+        generation = self._sglang_generation
+        worker_url = generation._engine_urls[
+            rollout_engine_id * generation.nodes_per_engine
+        ]
+        if worker_url is None:
+            return
+        workers_url = f"http://{generation.router_ip}:{generation.router_port}/workers"
+        try:
+            response = requests.get(workers_url, timeout=self._check_timeout)
+            response.raise_for_status()
+            for worker in response.json()["workers"]:
+                if worker["url"] == worker_url:
+                    response = requests.delete(
+                        f"{workers_url}/{worker['id']}", timeout=self._check_timeout
+                    )
+                    response.raise_for_status()
+        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+            # Router failure must not prevent reaping the server process tree.
+            logger.warning("Failed to deregister worker %s: %s", worker_url, exc)

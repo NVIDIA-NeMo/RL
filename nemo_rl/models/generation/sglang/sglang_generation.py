@@ -44,6 +44,7 @@ from nemo_rl.models.generation.sglang.utils.async_utils import AsyncLoopThread
 from nemo_rl.models.generation.sglang.utils.http_utils import HttpClient
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import (
     _allocate_rollout_engine_addr_and_ports_normal,
+    _format_v6_uri,
 )
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
@@ -106,6 +107,9 @@ class SGLangGeneration(GenerationInterface):
         self.num_gpus_per_engine: int = gpus_per_engine
         self.num_gpus_per_node: int = num_gpus_per_node
         self.all_engines: list = [None] * num_engines
+        # Keep endpoints outside actors so a dead or wedged actor can still be
+        # removed from the router. Entries follow all_engines, including peers.
+        self._engine_urls: list[str | None] = [None] * num_engines
         # It will be useful for future features which involve pd disaggregation, mixture sglang config setup
         self.rank_offset: int = 0
         self.gpu_offset: int = 0
@@ -138,11 +142,11 @@ class SGLangGeneration(GenerationInterface):
         if init_handles:
             ray.get(init_handles)
 
-        # Serializes weight-update broadcasts. Engine recovery joins this lock
-        # when recovery support lands in #3613.
+        # Serializes weight-update broadcasts. Acquired per bucket by trainer
+        # rank 0 in policy/utils.py; nothing on the generation side takes it.
         self.rollout_engine_lock = Lock.options(num_cpus=0, num_gpus=0).remote()
 
-        if sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
+        if sglang_cfg["sglang_cfg"]["use_fault_tolerance"]:
             monitor = RolloutHealthMonitor(self, sglang_cfg)
             monitor.start()
             self._health_monitor = monitor
@@ -296,6 +300,12 @@ class SGLangGeneration(GenerationInterface):
             node_port_cursor=port_cursors,
         )
 
+        for rank, _engine in local_all_engines:
+            address = addr_and_ports[rank]
+            self._engine_urls[rank - self.rank_offset] = (
+                f"http://{_format_v6_uri(address['host'])}:{address['port']}"
+            )
+
         init_handles = [
             engine.init.remote(
                 **(addr_and_ports[rank]),
@@ -321,6 +331,10 @@ class SGLangGeneration(GenerationInterface):
 
     def _recover(self) -> None:
         """Recover dead engines, overlapping init."""
+        if self._health_monitor is not None:
+            # The serving probe is paused during training and refit. This
+            # actor/process probe also works with weights and KV cache offloaded.
+            self._health_monitor.check_liveness()
         dead_indices = [
             i for i, engine in enumerate(self.all_engines) if engine is None
         ]
@@ -332,6 +346,9 @@ class SGLangGeneration(GenerationInterface):
             # transport is ever built -- clearing it on the first refit leaves
             # every rank silently no-oping the weight send for the rest of the run.
             return
+
+        if self._health_monitor is not None:
+            self._health_monitor.record_restart_attempts(dead_indices)
 
         port_cursors: dict[int, int] = {}
         handles, _ = self._start_engines(port_cursors)
@@ -361,37 +378,24 @@ class SGLangGeneration(GenerationInterface):
                     for engine in new_engines
                 ]
             )
-            ray.get(
-                [
-                    engine.resume_memory_occupation.remote(tags=["weights"])
-                    for engine in new_engines
-                ]
-            )
+            # The synchronizer onloads weights after recovery for all engines.
+            # Resuming here too would onload a replacement twice.
 
-    def get_updatable_engines_and_lock(self):
+    def get_updatable_engines(self) -> tuple[list, int, list[int], list[int]]:
         """Return engines eligible for weight updates."""
         return (
             self.engines,
-            self.rollout_engine_lock,
             self.num_new_engines,
             self.engine_gpu_counts,
             self.engine_gpu_offsets,
         )
 
-    def recover_updatable_engines(self):
+    def recover_updatable_engines(self) -> None:
         """Restart any dead rollout engines and update ``num_new_engines``."""
         # Resumed by prepare_for_generation; probing earlier races the weight stream.
         self._health_monitor.pause()
 
         self._recover()
-
-        return (
-            self.engines,
-            self.rollout_engine_lock,
-            self.num_new_engines,
-            self.engine_gpu_counts,
-            self.engine_gpu_offsets,
-        )
 
     def clear_updatable_num_new_engines(self):
         # Called by the refit dispatch once it has connected the new engines, so

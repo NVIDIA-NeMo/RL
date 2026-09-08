@@ -17,6 +17,7 @@ import multiprocessing
 import os
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import ray
 import requests
@@ -30,7 +31,28 @@ from nemo_rl.models.generation.sglang.utils.ip_port_utils import _format_v6_uri
 from nemo_rl.models.generation.sglang.utils.patches import _apply_sglang_compat_patches
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_current_node_ip
 
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
 logger = logging.getLogger(__name__)
+
+
+def _launch_server_with_parent_guard(
+    server_args: "ServerArgs", parent_pid: int
+) -> None:
+    """Terminate the server process tree if its owning Ray actor dies."""
+    # SGLang is optional in the driver environment; load it in the server child.
+    from sglang.srt.entrypoints.http_server import launch_server
+    from sglang.srt.utils import kill_itself_when_parent_died
+
+    # SGLang already arms this guard in scheduler and detokenizer children.
+    # Complete the actor -> HTTP server -> GPU worker chain here.
+    kill_itself_when_parent_died()
+    if os.getppid() != parent_pid:
+        # The actor may have died before the guard was installed. No server or
+        # GPU child has started yet, so returning closes that startup race.
+        return
+    launch_server(server_args)
 
 
 @ray.remote  # pragma: no cover
@@ -81,7 +103,6 @@ class SGLangGenerationWorker:
         self._launch_server_process(server_args_dict)
 
     def _launch_server_process(self, server_args_dict):
-        from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
 
         logger.info(
@@ -91,7 +112,10 @@ class SGLangGenerationWorker:
         server_args = ServerArgs(**server_args_dict)
         multiprocessing.set_start_method("spawn", force=True)
         server_args.host = server_args.host.strip("[]")
-        p = multiprocessing.Process(target=launch_server, args=(server_args,))
+        p = multiprocessing.Process(
+            target=_launch_server_with_parent_guard,
+            args=(server_args, os.getpid()),
+        )
         p.start()
 
         if server_args.node_rank == 0:
@@ -202,6 +226,14 @@ class SGLangGenerationWorker:
         )
         response.raise_for_status()
         return True
+
+    def is_alive(self) -> bool:
+        """Check the actor and its server process without requiring loaded weights.
+
+        The Ray call detects actor death; the process check also detects a dead
+        server whose owning actor is still alive, including nonzero node ranks.
+        """
+        return self.process.is_alive()
 
     def update_weights_from_tensor(
         self,
@@ -367,17 +399,6 @@ class SGLangGenerationWorker:
     def end_weight_update(self):
         """Finalize quantized layouts after the last refit bucket."""
         return self._make_request("end_weight_update", {})
-
-    def _simulate_crash(self):
-        """Test-only: tear the engine down to simulate a crash.
-
-        Underscore-prefixed to signal this is **not** part of the public
-        worker API; production code should never call it.
-        """
-        logger.info(
-            f"Simulating crash on engine {self.server_host}:{self.server_port}..."
-        )
-        self.shutdown()
 
     def start_profile(
         self,

@@ -19,12 +19,21 @@ fakes and the ``ray`` module used by ``fault_tolerance`` is monkeypatched,
 so these run in the base (unmarked) unit-test shard.
 """
 
+import sys
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import requests
+from ray.exceptions import GetTimeoutError, RayActorError
 
-from nemo_rl.models.generation.sglang import fault_tolerance
+from nemo_rl.models.generation.sglang import (
+    fault_tolerance,
+    sglang_generation,
+    sglang_worker,
+)
 from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 
@@ -56,6 +65,8 @@ class _FakeRay:
 
     def get(self, ref, timeout=None):
         self.get_timeouts.append(timeout)
+        if isinstance(ref, list):
+            return [item() for item in ref]
         return ref()
 
     def kill(self, actor):
@@ -63,11 +74,12 @@ class _FakeRay:
 
 
 class _FakeEngine:
-    def __init__(self, health_fn=None, shutdown_fn=None):
+    def __init__(self, health_fn=None, shutdown_fn=None, alive_fn=None):
         self.health_check_count = 0
         self.shutdown_count = 0
         self.health_generate = _RemoteMethod(health_fn or self._health_generate)
         self.shutdown = _RemoteMethod(shutdown_fn or self._shutdown)
+        self.is_alive = _RemoteMethod(alive_fn or (lambda: True))
 
     def _health_generate(self, timeout=None):
         self.health_check_count += 1
@@ -81,6 +93,9 @@ class _FakeGeneration:
     def __init__(self, engines, nodes_per_engine=1):
         self.all_engines = list(engines)
         self.nodes_per_engine = nodes_per_engine
+        self._engine_urls = [None] * len(engines)
+        self.router_ip = "127.0.0.1"
+        self.router_port = 3000
 
     @property
     def engines(self):
@@ -103,13 +118,22 @@ class _RecordingMonitor:
     def stop(self):
         self.events.append("stop")
 
+    def check_liveness(self):
+        self.events.append("check_liveness")
 
-def _cfg(first_wait=0.0, interval=CHECK_INTERVAL, timeout=CHECK_TIMEOUT):
+    def record_restart_attempts(self, dead_indices):
+        self.events.append("record_restart_attempts")
+
+
+def _cfg(
+    first_wait=0.0, interval=CHECK_INTERVAL, timeout=CHECK_TIMEOUT, max_restarts=3
+):
     return {
         "sglang_cfg": {
             "rollout_health_check_interval": interval,
             "rollout_health_check_timeout": timeout,
             "rollout_health_check_first_wait": first_wait,
+            "rollout_max_restart_attempts": max_restarts,
         }
     }
 
@@ -167,12 +191,13 @@ def test_monitor_stays_idle_until_resumed(monitor_factory):
     monitor = monitor_factory(_FakeGeneration([engine]))
 
     monitor.start()
-    assert monitor.is_checking_enabled() is False
+    assert monitor._pause_event.is_set()
     time.sleep(0.2)
     assert engine.health_check_count == 0
 
     monitor.resume()
-    assert monitor.is_checking_enabled() is True
+    assert not monitor._pause_event.is_set()
+    assert not monitor._stop_event.is_set()
     assert _wait_until(lambda: engine.health_check_count > 0)
 
 
@@ -185,7 +210,7 @@ def test_pause_stops_further_checks(monitor_factory):
     assert _wait_until(lambda: engine.health_check_count > 0)
 
     monitor.pause()
-    assert monitor.is_checking_enabled() is False
+    assert monitor._pause_event.is_set()
     settled = engine.health_check_count
     time.sleep(0.2)
     assert engine.health_check_count == settled
@@ -257,7 +282,8 @@ def test_stop_terminates_the_thread(monitor_factory):
 
     monitor.stop()
     assert monitor._thread is None
-    assert monitor.is_checking_enabled() is False
+    assert monitor._stop_event is None
+    assert monitor._pause_event is None
     assert not thread.is_alive()
 
 
@@ -297,7 +323,6 @@ def test_stop_leaves_events_intact_when_the_join_times_out(monitor_factory):
         # The join could not reap the thread, so its events must survive.
         assert monitor._thread is not None
         assert monitor._stop_event is not None and monitor._stop_event.is_set()
-        assert monitor.is_checking_enabled() is False
 
         release.set()
         assert _wait_until(lambda: not monitor._thread.is_alive())
@@ -317,6 +342,14 @@ def test_health_check_is_bounded_by_a_ray_level_timeout(monitor_factory, fake_ra
     monitor._check_engine_health(0, engine)
 
     assert fake_ray.get_timeouts == [pytest.approx(2 * CHECK_TIMEOUT)]
+
+
+def test_health_check_passes_http_timeout(monitor_factory):
+    probe = MagicMock(return_value=True)
+    engine = _FakeEngine(health_fn=probe)
+    monitor = monitor_factory(_FakeGeneration([engine]))
+    monitor._check_engine_health(0, engine)
+    probe.assert_called_once_with(timeout=CHECK_TIMEOUT)
 
 
 def test_unhealthy_engine_is_killed_and_slot_cleared(monitor_factory, fake_ray):
@@ -427,19 +460,13 @@ def test_monitoring_survives_a_full_offload_recover_onload_cycle():
     assert monitor.events == ["pause", "pause", "resume"]
 
 
-def test_recover_updatable_engines_reports_engine_state():
+def test_recover_updatable_engines_preserves_unconsumed_count():
     gen = _make_generation(_RecordingMonitor())
     gen.num_new_engines = 2
 
-    engines, lock, num_new_engines, gpu_counts, gpu_offsets = (
-        gen.recover_updatable_engines()
-    )
-
-    assert engines == []
-    assert lock is None
-    assert num_new_engines == 2
-    assert gpu_counts == []
-    assert gpu_offsets == []
+    assert gen.recover_updatable_engines() is None
+    assert gen.num_new_engines == 2
+    assert gen.get_updatable_engines() == ([], 2, [], [])
 
 
 def test_recover_leaves_num_new_engines_alone_when_nothing_died():
@@ -473,7 +500,11 @@ def test_recover_rearms_the_grace_period_for_restarted_engines():
 
     SGLangGeneration._recover(gen)
 
-    assert monitor.events == ["arm_first_wait"]
+    assert monitor.events == [
+        "check_liveness",
+        "record_restart_attempts",
+        "arm_first_wait",
+    ]
 
 
 def test_generation_lifecycle_is_a_noop_without_fault_tolerance():
@@ -485,10 +516,7 @@ def test_generation_lifecycle_is_a_noop_without_fault_tolerance():
 
 
 def test_monitor_names_the_missing_tuning_keys():
-    """Every sglang recipe inherits ``grpo_math_1B.yaml``, which carries no
-    sglang keys, so flipping ``use_fault_tolerance: true`` in one of them
-    reaches this constructor with none of the three knobs set.
-    """
+    """Hand-written configs must name every tuning key when enabling FT."""
     with pytest.raises(AssertionError) as excinfo:
         RolloutHealthMonitor(
             _FakeGeneration([_FakeEngine()]),
@@ -500,6 +528,221 @@ def test_monitor_names_the_missing_tuning_keys():
         "rollout_health_check_interval",
         "rollout_health_check_timeout",
         "rollout_health_check_first_wait",
+        "rollout_max_restart_attempts",
     ):
         assert key in message
     assert "use_fault_tolerance" in message
+
+
+@pytest.mark.parametrize("failure", [False, RayActorError(), GetTimeoutError()])
+def test_refit_liveness_detects_death_while_monitor_paused(
+    monitor_factory, fake_ray, failure
+):
+    def probe():
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    dead = _FakeEngine(alive_fn=probe)
+    survivor = _FakeEngine()
+    generation = _FakeGeneration([dead, survivor])
+    monitor = monitor_factory(generation)
+    monitor.start()
+
+    monitor.check_liveness()
+
+    assert monitor._pause_event.is_set()
+    assert generation.all_engines == [None, survivor]
+    assert fake_ray.killed == [dead]
+    assert dead.health_check_count == survivor.health_check_count == 0
+    assert fake_ray.get_timeouts == [CHECK_TIMEOUT] * 3
+
+
+def test_refit_liveness_checks_nonzero_nodes_and_kills_entire_group(
+    monitor_factory, fake_ray
+):
+    engines = [_FakeEngine() for _ in range(4)]
+    engines[1] = _FakeEngine(alive_fn=lambda: False)
+    generation = _FakeGeneration(engines, nodes_per_engine=2)
+    monitor = monitor_factory(generation)
+
+    monitor.check_liveness()
+
+    assert generation.all_engines == [None, None, engines[2], engines[3]]
+    assert fake_ray.killed == engines[:2]
+
+
+def test_refit_liveness_keeps_healthy_offloaded_engines(monitor_factory, fake_ray):
+    engines = [_FakeEngine(), _FakeEngine()]
+    generation = _FakeGeneration(engines)
+    monitor = monitor_factory(generation)
+    monitor.start()
+
+    monitor.check_liveness()
+
+    assert generation.all_engines == engines
+    assert fake_ray.killed == []
+    assert fake_ray.get_timeouts == [CHECK_TIMEOUT] * 2
+    assert all(engine.health_check_count == 0 for engine in engines)
+
+
+def test_recover_probes_before_collecting_dead_slots(monitor_factory):
+    gen = _make_generation(None)
+    dead = _FakeEngine(alive_fn=lambda: False)
+    survivor = _FakeEngine()
+    replacement = _FakeEngine()
+    gen.all_engines = [dead, survivor]
+    gen._engine_urls = [None, None]
+    gen._health_monitor = monitor_factory(gen)
+    gen._health_monitor.start()
+    gen.needs_offload = False
+
+    def restart(port_cursors):
+        assert gen.all_engines == [None, survivor]
+        gen.all_engines[0] = replacement
+        gen.num_new_engines = 1
+        return [], port_cursors
+
+    gen._start_engines = restart
+    gen._recover = lambda: SGLangGeneration._recover(gen)
+    gen.recover_updatable_engines()
+    assert gen.all_engines == [replacement, survivor]
+    assert gen.num_new_engines == 1
+
+
+def test_replacement_weights_are_onloaded_once_after_recovery(monkeypatch, fake_ray):
+    monkeypatch.setattr(sglang_generation, "ray", fake_ray)
+    gen = _make_generation(_RecordingMonitor())
+    gen.all_engines = [None]
+    gen.num_new_engines = 1
+    events = []
+    replacement = _FakeEngine()
+    replacement.release_memory_occupation = _RemoteMethod(
+        lambda tags: events.append(("release", tags))
+    )
+    replacement.resume_memory_occupation = _RemoteMethod(
+        lambda tags: events.append(("resume", tags))
+    )
+
+    def restart(port_cursors):
+        gen.all_engines[0] = replacement
+        return [], port_cursors
+
+    gen._start_engines = restart
+    SGLangGeneration._recover(gen)
+    gen.prepare_for_generation(tags=["weights"])
+    gen.prepare_for_generation(tags=["kv_cache"])
+    assert events == [
+        ("release", ["weights"]),
+        ("release", ["kv_cache"]),
+        ("resume", ["weights"]),
+        ("resume", ["kv_cache"]),
+    ]
+
+
+@pytest.mark.parametrize("max_restarts", [0, 2])
+def test_restart_budget_aborts_before_boot(monitor_factory, max_restarts):
+    gen = _make_generation(None)
+    gen.all_engines = [None]
+    gen._health_monitor = monitor_factory(gen, max_restarts=max_restarts)
+    gen.needs_offload = False
+    gen.num_new_engines = 1
+    gen._start_engines = MagicMock(return_value=([], {}))
+
+    for _ in range(max_restarts):
+        SGLangGeneration._recover(gen)
+    with pytest.raises(RuntimeError, match="exhausted rollout_max_restart_attempts"):
+        SGLangGeneration._recover(gen)
+    assert gen._start_engines.call_count == max_restarts
+
+
+def test_restart_budget_counts_logical_engines_and_is_atomic(monitor_factory):
+    generation = _FakeGeneration([None] * 4, nodes_per_engine=2)
+    monitor = monitor_factory(generation, max_restarts=1)
+    monitor.record_restart_attempts([0, 1])
+    assert monitor._restart_attempts == [1, 0]
+    with pytest.raises(RuntimeError, match="exhausted"):
+        monitor.record_restart_attempts([0, 1, 2, 3])
+    assert monitor._restart_attempts == [1, 0]
+    monitor.record_restart_attempts([2, 3])
+    assert monitor._restart_attempts == [1, 1]
+
+
+@pytest.mark.parametrize("max_restarts", [-1, 1.5, True])
+def test_restart_budget_rejects_invalid_values(max_restarts):
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        RolloutHealthMonitor(_FakeGeneration([]), _cfg(max_restarts=max_restarts))
+
+
+def test_monitor_deregisters_dead_worker_before_shutdown_and_kill(
+    monitor_factory, fake_ray, monkeypatch
+):
+    events = []
+    engine = _FakeEngine(shutdown_fn=lambda: events.append("shutdown"))
+    generation = _FakeGeneration([engine])
+    generation._engine_urls = ["http://engine:3001"]
+    monitor = monitor_factory(generation)
+    listing = MagicMock()
+    listing.json.return_value = {
+        "workers": [
+            {"url": "http://survivor:3002", "id": "keep"},
+            {"url": "http://engine:3001", "id": "dead"},
+        ]
+    }
+    get = MagicMock(return_value=listing)
+    delete = MagicMock(
+        side_effect=lambda *args, **kwargs: events.append("delete") or MagicMock()
+    )
+    monkeypatch.setattr(fault_tolerance.requests, "get", get)
+    monkeypatch.setattr(fault_tolerance.requests, "delete", delete)
+    monkeypatch.setattr(fake_ray, "kill", lambda actor: events.append("kill"))
+
+    monitor._kill_engine(0)
+
+    get.assert_called_once_with("http://127.0.0.1:3000/workers", timeout=CHECK_TIMEOUT)
+    delete.assert_called_once_with(
+        "http://127.0.0.1:3000/workers/dead", timeout=CHECK_TIMEOUT
+    )
+    assert events == ["delete", "shutdown", "kill"]
+    assert generation.all_engines == [None]
+
+
+def test_router_failure_does_not_prevent_process_cleanup(
+    monitor_factory, fake_ray, monkeypatch
+):
+    engine = _FakeEngine()
+    generation = _FakeGeneration([engine])
+    generation._engine_urls = ["http://engine:3001"]
+    monitor = monitor_factory(generation)
+    monkeypatch.setattr(
+        fault_tolerance.requests,
+        "get",
+        MagicMock(side_effect=requests.Timeout("router unavailable")),
+    )
+    monitor._kill_engine(0)
+    assert engine.shutdown_count == 1
+    assert fake_ray.killed == [engine]
+    assert generation.all_engines == [None]
+
+
+@pytest.mark.parametrize("parent_alive", [True, False])
+def test_server_parent_guard_is_armed_before_launch(monkeypatch, parent_alive):
+    events = []
+    server_args = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.entrypoints.http_server",
+        SimpleNamespace(launch_server=lambda args: events.append(("launch", args))),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.utils",
+        SimpleNamespace(kill_itself_when_parent_died=lambda: events.append("guard")),
+    )
+    monkeypatch.setattr(
+        sglang_worker, "os", SimpleNamespace(getppid=lambda: 123 if parent_alive else 1)
+    )
+
+    sglang_worker._launch_server_with_parent_guard(server_args, parent_pid=123)
+
+    assert events == (["guard", ("launch", server_args)] if parent_alive else ["guard"])
