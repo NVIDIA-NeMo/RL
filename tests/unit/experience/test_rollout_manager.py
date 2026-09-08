@@ -885,7 +885,12 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
             del pending, timer_prefix
 
             async def result_ref():
-                return 0, _mask_gate_receipt_result(), None
+                return (
+                    0,
+                    {"name": "resolved-agent"},
+                    _mask_gate_receipt_result(),
+                    None,
+                )
 
             async def stream():
                 yield result_ref()

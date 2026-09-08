@@ -97,8 +97,9 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         [1.0],
         mask_sample=[False],
         fallback_weight_version=4,
-        prompt_idx=0,
+        prompt_idx=17,
         loss_multiplier=0.25,
+        canonical_sample_ids=["group_g0"],
     )
 
 
