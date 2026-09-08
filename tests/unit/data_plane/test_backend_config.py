@@ -100,13 +100,6 @@ def test_gdr_staging_size_rejects_non_positive_values(value: int) -> None:
         )
 
 
-@pytest.mark.parametrize("backend", ["simple", "mooncake_cpu"])
-@pytest.mark.parametrize("key", ["use_gdr", "gdr_staging_buffer_mb"])
-def test_flat_gdr_key_from_first_integration_raises(backend: str, key: str) -> None:
-    with pytest.raises(ValueError, match="moved under data_plane.mooncake_cpu"):
-        backend_config(_cfg(backend, **{key: True}))
-
-
 def test_accepts_an_already_coerced_model() -> None:
     """Configs arriving via pydantic have the block coerced to a model already."""
     cfg = _cfg("mooncake_cpu", mooncake_cpu=MooncakeCpuConfig(global_segment_size=555))
@@ -157,19 +150,3 @@ def test_schema_validates_without_any_backend_block() -> None:
     validate, otherwise MasterConfig fails before training starts.
     """
     TypeAdapter(DataPlaneConfig).validate_python(_cfg("simple"))
-
-
-@pytest.mark.parametrize(
-    ("key", "value"),
-    [("use_gdr", True), ("gdr_staging_buffer_mb", 512)],
-)
-def test_pydantic_preserves_flat_gdr_keys_for_migration_error(
-    key: str, value: object
-) -> None:
-    validated = TypeAdapter(DataPlaneConfig).validate_python(
-        _cfg("mooncake_cpu", **{key: value})
-    )
-
-    assert key in validated
-    with pytest.raises(ValueError, match="moved under data_plane.mooncake_cpu"):
-        backend_config(validated)

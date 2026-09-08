@@ -447,9 +447,7 @@ These keys used to sit directly under `data_plane:`. That spelling is not
 rejected — it is simply never read. A config still using it silently gets
 this backend's defaults instead of its own values: an inherited config
 supplies the nested block, so a surviving flat key always loses the merge,
-with no warning either way. Earlier revisions of PR #3501 also used flat
-`use_gdr` and `gdr_staging_buffer_mb` keys; those two spellings are rejected
-with a migration error because silently disabling GDR would invalidate a run.
+with no warning either way.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
