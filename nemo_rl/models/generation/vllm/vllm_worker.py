@@ -73,8 +73,11 @@ from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.quantization_logging import (
+    FP8_QUANTIZATION_IGNORE_DUMP_DEFAULT_PATH,
     FP8_QUANTIZATION_IGNORE_DUMP_ENV,
     FP8_QUANTIZATION_IGNORE_DUMP_PATH_ENV,
+    LAYER_QUANTIZATION_LOG_ENV,
+    VLLM_LAYER_QUANTIZATION_LEADER_ENV,
     is_truthy_env_var,
 )
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -226,16 +229,15 @@ def _log_fp8_quantization_ignore_report(
             "ignore": list(quantization_config.get("ignore", [])),
         },
     }
-    dump_path = os.environ.get(FP8_QUANTIZATION_IGNORE_DUMP_PATH_ENV)
-    if dump_path:
-        os.makedirs(os.path.dirname(os.path.abspath(dump_path)), exist_ok=True)
-        with open(dump_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
-            f.write("\n")
-        print(f"NRL_FP8_QUANTIZATION_IGNORE_DUMP_FILE={dump_path}")
-        return
-
-    print("NRL_FP8_QUANTIZATION_IGNORE_DUMP=" + json.dumps(payload, sort_keys=True))
+    dump_path = (
+        os.environ.get(FP8_QUANTIZATION_IGNORE_DUMP_PATH_ENV)
+        or FP8_QUANTIZATION_IGNORE_DUMP_DEFAULT_PATH
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(dump_path)), exist_ok=True)
+    with open(dump_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"NRL_FP8_QUANTIZATION_IGNORE_DUMP_FILE={dump_path}")
 
 
 def _should_log_fp8_quantization_ignore() -> bool:
@@ -473,9 +475,21 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
+        if (
+            is_truthy_env_var(LAYER_QUANTIZATION_LOG_ENV)
+            and os.environ.get("RANK") == "0"
+        ):
+            os.environ[VLLM_LAYER_QUANTIZATION_LEADER_ENV] = "1"
+        else:
+            os.environ.pop(VLLM_LAYER_QUANTIZATION_LEADER_ENV, None)
+        vllm_extra_env_vars = [
+            *(extra_env_vars or []),
+            LAYER_QUANTIZATION_LOG_ENV,
+            VLLM_LAYER_QUANTIZATION_LEADER_ENV,
+        ]
         _apply_vllm_patches(
             self.py_executable,
-            extra_env_vars=extra_env_vars,
+            extra_env_vars=vllm_extra_env_vars,
         )
 
         # Skip model loading if we're not the model owner

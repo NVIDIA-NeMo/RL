@@ -21,12 +21,24 @@ from typing import Any, cast
 
 from nemo_rl.utils.quantization_logging import (
     LAYER_QUANTIZATION_LOG_ENV,
+    VLLM_LAYER_QUANTIZATION_LEADER_ENV,
     is_truthy_env_var,
 )
 
 G_MODELOPT_LAYER_QUANTIZATION_PATCH_ATTR = (
     "_nrl_modelopt_layer_quantization_logging_patched"
 )
+
+
+def _should_log_vllm_layer_quantization() -> bool:
+    if not is_truthy_env_var(VLLM_LAYER_QUANTIZATION_LEADER_ENV):
+        return False
+    try:
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except (AssertionError, AttributeError, ImportError, RuntimeError):
+        return True
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -203,7 +215,10 @@ def _patch_vllm_modelopt_layer_quantization_logging(
         @wraps(typed_get_quant_method)
         def wrapped_get_quant_method(self: Any, layer: Any, prefix: str) -> Any:
             quant_method = typed_get_quant_method(self, layer, prefix)
-            if isinstance(layer, logged_layer_types):
+            if (
+                isinstance(layer, logged_layer_types)
+                and _should_log_vllm_layer_quantization()
+            ):
                 if (
                     quant_method is None
                     or type(quant_method).__name__ == "UnquantizedLinearMethod"

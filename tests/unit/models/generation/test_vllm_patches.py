@@ -39,6 +39,7 @@ import types
 import pytest
 
 from nemo_rl.models.generation.vllm import patches
+from nemo_rl.utils.quantization_logging import VLLM_LAYER_QUANTIZATION_LEADER_ENV
 from tests.unit.models.generation.vllm_patch_source_utils import (
     write_unpatched_copy,
 )
@@ -279,6 +280,46 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
     assert ray_executor.read_text() == once
 
 
+@pytest.mark.parametrize(
+    "is_leader,tp_rank,rank_error,expected",
+    [
+        (False, 0, None, False),
+        (True, 0, None, True),
+        (True, 1, None, False),
+        (True, 0, AssertionError("tensor parallel is not initialized"), True),
+    ],
+)
+def test_vllm_layer_quantization_logging_topology_gate(
+    monkeypatch, is_leader, tp_rank, rank_error, expected
+):
+    """Only the first generation engine logs, and only from TP rank 0."""
+    vllm_module = types.ModuleType("vllm")
+    vllm_module.__path__ = []
+    distributed_module = types.ModuleType("vllm.distributed")
+    distributed_module.__path__ = []
+    parallel_state_module = types.ModuleType("vllm.distributed.parallel_state")
+
+    def get_tensor_model_parallel_rank():
+        if rank_error is not None:
+            raise rank_error
+        return tp_rank
+
+    parallel_state_module.get_tensor_model_parallel_rank = (
+        get_tensor_model_parallel_rank
+    )
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
+    monkeypatch.setitem(
+        sys.modules, parallel_state_module.__name__, parallel_state_module
+    )
+    if is_leader:
+        monkeypatch.setenv(VLLM_LAYER_QUANTIZATION_LEADER_ENV, "1")
+    else:
+        monkeypatch.delenv(VLLM_LAYER_QUANTIZATION_LEADER_ENV, raising=False)
+
+    assert patches._should_log_vllm_layer_quantization() is expected
+
+
 def test_modelopt_layer_quantization_logging_patch(monkeypatch, caplog):
     """The logging monkeypatch reports ModelOpt's effective layer decision."""
     package_names = [
@@ -349,6 +390,7 @@ def test_modelopt_layer_quantization_logging_patch(monkeypatch, caplog):
         raising=False,
     )
     monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "1")
+    monkeypatch.setenv(VLLM_LAYER_QUANTIZATION_LEADER_ENV, "1")
 
     logger = logging.getLogger("test_modelopt_layer_quantization_logging_patch")
     patches._patch_vllm_modelopt_layer_quantization_logging(logger)
@@ -438,6 +480,7 @@ def test_modelopt_layer_quantization_logging_patches_mixed_precision_override(
         raising=False,
     )
     monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "on")
+    monkeypatch.setenv(VLLM_LAYER_QUANTIZATION_LEADER_ENV, "1")
 
     logger = logging.getLogger(
         "test_modelopt_layer_quantization_logging_patches_mixed_precision_override"

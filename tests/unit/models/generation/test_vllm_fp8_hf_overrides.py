@@ -31,6 +31,9 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
     _merge_fp8_kwargs,
     _should_log_fp8_quantization_ignore,
 )
+from nemo_rl.utils.quantization_logging import (
+    FP8_QUANTIZATION_IGNORE_DUMP_DEFAULT_PATH,
+)
 
 
 def test_logs_effective_quantization_ignore_patterns(capsys) -> None:
@@ -99,8 +102,11 @@ def test_log_fp8_quantization_ignore_report_writes_file(
     }
 
 
-def test_log_fp8_quantization_ignore_report_prints_json(monkeypatch, capsys) -> None:
+def test_log_fp8_quantization_ignore_report_writes_default_file(
+    monkeypatch, tmp_path, capsys
+) -> None:
     monkeypatch.delenv("NRL_DUMP_FP8_QUANTIZATION_IGNORE_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
     ignore_report = {"generated": {"ignored_layers": ["lm_head"]}, "sources": {}}
     vllm_kwargs = {
         "hf_overrides": {
@@ -113,9 +119,12 @@ def test_log_fp8_quantization_ignore_report_prints_json(monkeypatch, capsys) -> 
 
     _log_fp8_quantization_ignore_report(ignore_report, vllm_kwargs)
 
-    output = capsys.readouterr().out
-    assert output.startswith("NRL_FP8_QUANTIZATION_IGNORE_DUMP=")
-    assert json.loads(output.removeprefix("NRL_FP8_QUANTIZATION_IGNORE_DUMP=")) == {
+    assert capsys.readouterr().out == (
+        f"NRL_FP8_QUANTIZATION_IGNORE_DUMP_FILE="
+        f"{FP8_QUANTIZATION_IGNORE_DUMP_DEFAULT_PATH}\n"
+    )
+    dump_path = tmp_path / FP8_QUANTIZATION_IGNORE_DUMP_DEFAULT_PATH
+    assert json.loads(dump_path.read_text(encoding="utf-8")) == {
         "generated": {"ignored_layers": ["lm_head"]},
         "sources": {},
         "passed_to_vllm": {
