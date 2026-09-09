@@ -812,21 +812,23 @@ class TestForwardWithPostProcessingFn:
         draft_model.assert_called_once_with(
             hidden_states=hidden_states,
             input_embeds=shifted_embeds,
-            attention_mask=attention_mask,
+            # The draft decoder is forced onto the fused causal path (see
+            # EagleModel); the forward must pass attention_mask=None.
+            attention_mask=None,
             packed_seq_params=None,
         )
         assert data_dict["student_logits"] is student_logits
 
-    @patch("nemo_rl.models.megatron.train._pack_input_ids")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_capture_context")
     @patch("nemo_rl.models.megatron.train.model_forward")
-    def test_forward_with_draft_model_packed_shifts_ids_and_reembeds(
+    def test_forward_with_draft_model_packed_rolls_within_subsequences(
         self,
         mock_model_forward,
         mock_get_capture_context,
-        mock_pack_input_ids,
+        mock_get_cp_group,
     ):
-        """Packed draft forward must shift ids per segment, re-embed, and pass packed_seq_params."""
+        """Packed draft forward must shift embeds per segment and stash packed coords."""
         from nemo_rl.models.megatron.data import ProcessedMicrobatch
         from nemo_rl.models.megatron.train import (
             LogprobsPostProcessor,
@@ -836,8 +838,8 @@ class TestForwardWithPostProcessingFn:
         output_tensor = torch.randn(1, 6, 5)
         student_logits = torch.randn(1, 6, 5)
         hidden_states = torch.randn(6, 1, 4)
-        shifted_input_ids = torch.tensor([[2, 3, 0, 5, 6, 0]])
-        shifted_embeds = torch.randn(6, 1, 4)
+        # Rows valued 1..6 so the expected per-segment shift is exact.
+        inputs_embeds = torch.arange(1.0, 7.0).view(6, 1, 1).repeat(1, 1, 4)
         position_ids = torch.tensor([[0, 1, 2, 0, 1, 2]])
         packed_seq_params = SimpleNamespace(
             cu_seqlens_q=torch.tensor([0, 3, 6]),
@@ -845,13 +847,12 @@ class TestForwardWithPostProcessingFn:
         )
 
         mock_model_forward.return_value = output_tensor
-        mock_pack_input_ids.return_value = shifted_input_ids
+        mock_get_cp_group.return_value = MagicMock()
         mock_capture = MagicMock()
         mock_capture.get_captured_states.return_value = SimpleNamespace(
             hidden_states=hidden_states,
-            inputs_embeds=None,
+            inputs_embeds=inputs_embeds,
         )
-        mock_capture.model.embedding.return_value = shifted_embeds
         mock_get_capture_context.return_value = (nullcontext(), mock_capture)
 
         data_dict = {"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]])}
@@ -871,7 +872,11 @@ class TestForwardWithPostProcessingFn:
         )
         draft_model = MagicMock(return_value=student_logits)
 
-        with patch.object(post_processor, "__call__", return_value=MagicMock()):
+        with (
+            patch.object(post_processor, "__call__", return_value=MagicMock()),
+            patch("torch.distributed.get_world_size", return_value=1),
+            patch("torch.distributed.get_rank", return_value=0),
+        ):
             forward_with_post_processing_fn(
                 data_iterator=iter([processed_mb]),
                 model=MagicMock(),
@@ -879,22 +884,94 @@ class TestForwardWithPostProcessingFn:
                 draft_model=draft_model,
             )
 
-        mock_pack_input_ids.assert_called_once_with(
-            data_dict["input_ids"],
-            packed_seq_params.cu_seqlens_q,
-            packed_seq_params.cu_seqlens_q_padded,
-            roll_shift=-1,
+        assert torch.equal(
+            data_dict["draft_packed_seq_index"], torch.tensor([0, 0, 0, 1, 1, 1])
         )
-        mock_capture.model.embedding.assert_called_once_with(
-            input_ids=shifted_input_ids, position_ids=position_ids
+        assert torch.equal(
+            data_dict["draft_packed_pos_in_seq"], torch.tensor([0, 1, 2, 0, 1, 2])
         )
-        draft_model.assert_called_once_with(
+        assert torch.equal(
+            data_dict["draft_packed_local_cu_seqlens"],
+            torch.tensor([0, 3, 6], dtype=torch.int32),
+        )
+        kwargs = draft_model.call_args.kwargs
+        assert kwargs["hidden_states"] is hidden_states
+        assert kwargs["attention_mask"] is None
+        assert kwargs["packed_seq_params"] is packed_seq_params
+        # The shift must stop at the packing boundary: [1,2,3|4,5,6] ->
+        # [2,3,0|5,6,0], never leaking row 4 into the first segment.
+        expected_embeds = torch.roll(inputs_embeds, shifts=-1, dims=0)
+        expected_embeds[[2, 5]] = 0
+        torch.testing.assert_close(kwargs["input_embeds"], expected_embeds)
+        assert data_dict["student_logits"] is student_logits
+
+    @patch("megatron.core.transformer.multi_token_prediction.roll_tensor")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_capture_context")
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_with_ttt_draft_model_uses_forward_ttt(
+        self,
+        mock_model_forward,
+        mock_get_capture_context,
+        mock_get_cp_group,
+        mock_roll_tensor,
+    ):
+        """draft_ttt_steps > 1 must route through forward_ttt with per-pass logits."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        hidden_states = torch.randn(3, 1, 4)
+        inputs_embeds = torch.randn(3, 1, 4)
+        shifted_embeds = torch.randn(3, 1, 4)
+        logits_by_pass = [torch.randn(1, 3, 5), torch.randn(1, 3, 5)]
+
+        mock_model_forward.return_value = torch.randn(1, 3, 5)
+        mock_get_cp_group.return_value = MagicMock()
+        mock_roll_tensor.return_value = (shifted_embeds, None)
+        mock_capture = MagicMock()
+        mock_capture.get_captured_states.return_value = SimpleNamespace(
+            hidden_states=hidden_states,
+            inputs_embeds=inputs_embeds,
+        )
+        mock_get_capture_context.return_value = (nullcontext(), mock_capture)
+
+        data_dict = {"input_ids": torch.tensor([[1, 2, 3]])}
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=None,
+            position_ids=torch.tensor([[0, 1, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            original_seq_length=3,
+        )
+        post_processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}}
+        )
+        draft_model = MagicMock()
+        draft_model.forward_ttt.return_value = logits_by_pass
+
+        with patch.object(post_processor, "__call__", return_value=MagicMock()):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+                draft_model=draft_model,
+                draft_ttt_steps=2,
+            )
+
+        draft_model.forward_ttt.assert_called_once_with(
             hidden_states=hidden_states,
             input_embeds=shifted_embeds,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
+            packed_seq_params=None,
         )
-        assert data_dict["student_logits"] is student_logits
+        draft_model.assert_not_called()
+        assert data_dict["student_logits_by_pass"] is logits_by_pass
+        assert "student_logits" not in data_dict
 
 
 class TestMegatronForwardBackward:
