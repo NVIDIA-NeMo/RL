@@ -417,6 +417,34 @@ def test_store_state_retire_through_is_monotonic_and_rejects_late_puts():
         )
 
 
+@pytest.mark.parametrize("run_instance_id", [None, "run-a"])
+def test_retire_routed_experts_through_skips_disabled_ray_transport(
+    run_instance_id: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    get_actor = MagicMock()
+    ray_get = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_ref.ray.get_actor",
+        get_actor,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_ref.ray.get",
+        ray_get,
+    )
+    router_replay = {"enabled": False, "transport": "ray"}
+    if run_instance_id is not None:
+        router_replay["_store_run_instance_id"] = run_instance_id
+
+    result = retire_routed_experts_through(
+        {"router_replay": router_replay},
+        target_weight_version=3,
+    )
+
+    assert result is None
+    get_actor.assert_not_called()
+    ray_get.assert_not_called()
+
+
 def test_retire_routed_experts_through_skips_inline_transport(monkeypatch):
     get_actor = MagicMock()
     monkeypatch.setattr(

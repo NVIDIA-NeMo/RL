@@ -949,6 +949,8 @@ def retire_routed_experts_through(
 ) -> dict[str, int] | None:
     """Retire route objects consumed by a completed optimizer step."""
     router_replay = policy_config.get("router_replay") or {}
+    if not router_replay.get("enabled"):
+        return None
     if router_replay.get("transport", "inline") != ROUTED_EXPERTS_REF_TRANSPORT:
         return None
     run_instance_id = router_replay.get("_store_run_instance_id")
