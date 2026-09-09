@@ -19,6 +19,7 @@ import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from importlib import import_module
 from typing import Any, Literal, Optional
 
 import torch
@@ -197,16 +198,13 @@ def _convert_bf16_moe_weights_to_trtllm_block_layout_batched(
     if w13_weight.shape[0] != w2_weight.shape[0]:
         raise ValueError("W13 and W2 must contain the same number of experts")
 
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
+    flashinfer_moe_core = import_module("flashinfer.fused_moe.core")
 
     epilogue_tile_m = 128
     block_k = 128
     w13_expert_uint8 = w13_weight[0].view(torch.uint8)
     w2_expert_uint8 = w2_weight[0].view(torch.uint8)
-    w13_permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+    w13_permute_indices = flashinfer_moe_core._maybe_get_cached_w3_w1_permute_indices(
         cache_permute_indices,
         w13_expert_uint8,
         epilogue_tile_m,
@@ -215,7 +213,7 @@ def _convert_bf16_moe_weights_to_trtllm_block_layout_batched(
     if is_gated_act_gemm:
         rows = w13_expert_uint8.shape[0]
         w13_permute_indices = (w13_permute_indices + rows // 2) % rows
-    w2_permute_indices = get_w2_permute_indices_with_cache(
+    w2_permute_indices = flashinfer_moe_core.get_w2_permute_indices_with_cache(
         cache_permute_indices,
         w2_expert_uint8,
         epilogue_tile_m,
