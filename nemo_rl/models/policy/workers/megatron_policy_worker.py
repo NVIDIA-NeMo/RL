@@ -589,6 +589,22 @@ class MegatronPolicyWorkerImpl(
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
+        # PP > 1 draft co-training: every PP rank joins the tap channel (source
+        # stages write taps one-sided, the draft stage lands them); PP == 1
+        # keeps the rank-local capture path and needs no channel.
+        self.tap_channel = None
+        if (
+            "draft" in self.cfg
+            and self.cfg["draft"]["enabled"]
+            and parallel_state.get_pipeline_model_parallel_world_size() > 1
+        ):
+            from nemo_rl.models.megatron.draft.hidden_capture import (
+                build_tap_channel,
+            )
+
+            self.tap_channel = build_tap_channel(
+                self.model, draft_config=self.cfg["draft"], policy_cfg=self.cfg
+            )
         self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
@@ -1034,6 +1050,7 @@ class MegatronPolicyWorkerImpl(
                             straggler_timer=self.mcore_state.straggler_timer,
                             draft_model=self.draft_model,
                             enable_hidden_capture=draft_enabled,
+                            tap_channel=self.tap_channel,
                             draft_ttt_steps=draft_ttt_steps,
                             draft_aux_layer_indices=draft_aux_layer_ids,
                             use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
@@ -1212,6 +1229,25 @@ class MegatronPolicyWorkerImpl(
         self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
+        if self.tap_channel is not None:
+            # Only the draft stage accumulates rendezvous wait, but result
+            # collection dedups to one worker per tied group (PP rank 0), so
+            # max-reduce across the PP group to make it visible there.
+            wait = torch.tensor(
+                [
+                    self.tap_channel.pop_rendezvous_wait_s()
+                    if self.tap_channel.is_last_stage
+                    else 0.0
+                ],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            torch.distributed.all_reduce(
+                wait,
+                op=torch.distributed.ReduceOp.MAX,
+                group=parallel_state.get_pipeline_model_parallel_group(),
+            )
+            metrics["draft_tap_wait_s"] = wait.item()
 
         # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
         # samples but each packed sequence spans max_total_sequence_length tokens,
@@ -1650,6 +1686,7 @@ class MegatronPolicyWorkerImpl(
                     straggler_timer=self.mcore_state.straggler_timer,
                     draft_model=self.draft_model,
                     enable_hidden_capture=draft_enabled,
+                    tap_channel=self.tap_channel,
                     draft_ttt_steps=draft_ttt_steps,
                     draft_aux_layer_indices=draft_aux_layer_ids,
                     use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
@@ -2470,16 +2507,20 @@ class MegatronPolicyWorkerImpl(
             return broadcast_obj_from_pp_rank(size_in_bytes)
 
         for task in self.refit_conversion_tasks:
-            param_info.append(
-                (
-                    task.param_name,
-                    calculate_size_in_bytes(
-                        task.param_weight,
-                        task.mapping.tp_size,
-                        task.mapping.ep_size if task.mapping.is_expert else 1,
-                    ),
+            try:
+                size_in_bytes = calculate_size_in_bytes(
+                    task.param_weight,
+                    task.mapping.tp_size,
+                    task.mapping.ep_size if task.mapping.is_expert else 1,
                 )
-            )
+            except ValueError as e:
+                # The bare helper error doesn't say WHICH param broke the
+                # one-owner-per-PP-group invariant; that name is the whole
+                # diagnosis (tied embedding vs task-list desync).
+                raise ValueError(
+                    f"refit param info failed for {task.param_name!r}: {e}"
+                ) from e
+            param_info.append((task.param_name, size_in_bytes))
         return param_info
 
     def _iter_params_with_optional_kv_scales(
@@ -2519,12 +2560,38 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in base_iter:
             yield name, tensor
 
-        if include_draft and self.draft_model is not None:
+        if include_draft and "draft" in self.cfg and self.cfg["draft"]["enabled"]:
             from nemo_rl.models.megatron.draft import export_draft_weights_to_hf
 
-            draft_weights = export_draft_weights_to_hf(
-                self.draft_model,
+            # The draft lives on the last PP stage only, but every rank's
+            # iterator must yield the same key set: the refit metadata and each
+            # vLLM engine's IPC sender are rank-local, so a first-stage sender
+            # that skipped draft.* would leave its paired engine's drafter
+            # silently stale (and the metadata would miss the keys the last
+            # stage sends). Broadcast the exported weights across PP.
+            draft_weights = (
+                [
+                    (name, tensor.detach().to("cuda").contiguous())
+                    for name, tensor in export_draft_weights_to_hf(self.draft_model)
+                ]
+                if self.draft_model is not None
+                else None
             )
+            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+                meta = broadcast_obj_from_pp_rank(
+                    None
+                    if draft_weights is None
+                    else [(n, t.shape, t.dtype) for n, t in draft_weights]
+                )
+                if draft_weights is None:
+                    draft_weights = [
+                        (name, torch.empty(shape, dtype=dtype, device="cuda"))
+                        for name, shape, dtype in meta
+                    ]
+                pp_group = parallel_state.get_pipeline_model_parallel_group()
+                src = torch.distributed.get_process_group_ranks(pp_group)[-1]
+                for _, tensor in draft_weights:
+                    torch.distributed.broadcast(tensor, src=src, group=pp_group)
             for name, tensor in draft_weights:
                 yield f"draft.{name}", tensor
 
