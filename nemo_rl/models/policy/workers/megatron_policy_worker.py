@@ -77,7 +77,6 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
     apply_fp32_lm_head,
-    validate_fp32_lm_head_config,
     build_inference_model,
     finalize_megatron_setup,
     handle_model_import,
@@ -85,6 +84,7 @@ from nemo_rl.models.megatron.setup import (
     setup_model_and_optimizer,
     setup_reference_model_state,
     validate_and_set_config,
+    validate_fp32_lm_head_config,
     validate_model_paths,
 )
 from nemo_rl.models.megatron.train import (

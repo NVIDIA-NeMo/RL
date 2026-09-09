@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guards for the vLLM source patches that had no coverage.
+"""Guards for vLLM source patches that depend on pinned source anchors.
 
 The two port patches ship their own suites. These cover the remaining two:
 
@@ -26,6 +26,8 @@ The two port patches ship their own suites. These cover the remaining two:
   ``RAY_ENABLE_UV_RUN_RUNTIME_ENV`` and every user ``extra_env_vars`` to the
   Ray workers. Being additive rather than clobbering is the whole point of the
   rewrite, and it is pure string handling, so it is cheap to pin.
+* Nemotron Super-Omni checkpoints apply a learned final RADIO LayerNorm, but
+  vLLM 0.25.1 omits its module, forward operation, and weight mapping.
 """
 
 import ast
@@ -47,7 +49,10 @@ _PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
 _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
-_RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
+_RADIO_MARKER = 'initializer_factor = getattr(self.config, "initializer_factor", 1.0)'
+_NANO_VL_SOURCE = "model_executor/models/nano_nemotron_vl.py"
+_NANO_VL_PATCH_FN = "_patch_vllm_radio_final_layernorm"
+_NANO_VL_MARKER = "self.vision_final_layernorm = nn.LayerNorm("
 
 
 def test_external_vllm_patch_allowlist(monkeypatch):
@@ -91,6 +96,17 @@ def patched_radio_source(tmp_path, monkeypatch):
     copied = write_unpatched_copy(_RADIO_SOURCE, _RADIO_PATCH_FN, tmp_path / "radio.py")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.fixture
+def patched_nano_vl_source(tmp_path, monkeypatch):
+    """The installed Nemotron Omni model, unpatched then patched in tmp."""
+    copied = write_unpatched_copy(
+        _NANO_VL_SOURCE, _NANO_VL_PATCH_FN, tmp_path / "nano_nemotron_vl.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
     return copied
 
 
@@ -158,9 +174,9 @@ def test_radio_layerscale_patch_loads_explicit_and_initializes_folded_weights(
 ):
     content = patched_radio_source.read_text()
     assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
-    assert 'name.endswith((".ls1", ".ls2"))' in content
-    assert "param.data.fill_(initializer_factor)" in content
-    assert "loaded_params.add(name)" in content
+    assert 'ls_name.endswith((".ls1", ".ls2"))' in content
+    assert "ls_param.data.fill_(initializer_factor)" in content
+    assert "loaded_params.add(ls_name)" in content
 
 
 @pytest.mark.vllm
@@ -175,6 +191,34 @@ def test_radio_layerscale_patch_is_idempotent(patched_radio_source, monkeypatch)
     assert patched_radio_source.read_text() == before
 
 
+@pytest.mark.vllm
+def test_radio_final_layernorm_patch_covers_model_forward_and_loader(
+    patched_nano_vl_source,
+):
+    content = patched_nano_vl_source.read_text()
+
+    assert content.count(_NANO_VL_MARKER) == 1
+    # Dynamic images and fixed-resolution images/videos share the same helper.
+    assert content.count("self._apply_vision_final_layernorm(vit_embeds)") == 2
+    assert '"vision_final_layernorm"' in content
+    assert '"vision_projector.vision_final_layernorm."' in content
+    assert "final_layernorm_weights" in content
+    assert "default_weight_loader(param, w)" in content
+    ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_radio_final_layernorm_patch_is_idempotent(patched_nano_vl_source, monkeypatch):
+    before = patched_nano_vl_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_nano_vl_source)
+    )
+
+    patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
+
+    assert patched_nano_vl_source.read_text() == before
+
+
 def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, caplog):
     radio_source = tmp_path / "radio.py"
     radio_source.write_text("class RadioModel:\n    pass\n")
@@ -184,7 +228,7 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
         patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
-    assert "vLLM 0.25.1 source shape was not found" in caplog.text
+    assert "load_weights tail anchor was not found" in caplog.text
 
 
 @pytest.mark.parametrize(
