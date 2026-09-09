@@ -100,6 +100,22 @@ def test_capability_contract_binds_routing_and_participant_identity() -> None:
     }
 
 
+def test_capability_contract_accepts_additive_unknown_features() -> None:
+    capabilities = GymControlCapabilities.model_validate(
+        _capabilities(
+            features=[
+                "completed_result_acknowledgement",
+                "future_prefix_recovery",
+            ]
+        )
+    )
+
+    assert capabilities.features == [
+        "completed_result_acknowledgement",
+        "future_prefix_recovery",
+    ]
+
+
 def test_topology_fingerprint_excludes_dynamic_checkpoint_phase() -> None:
     first = GymControlCapabilities.model_validate(_capabilities())
     second = GymControlCapabilities.model_validate(
@@ -108,6 +124,7 @@ def test_topology_fingerprint_excludes_dynamic_checkpoint_phase() -> None:
             phase="preparing",
             active_checkpoint_id="snapshot-7",
             deadline_ts=123.0,
+            features=["future_prefix_recovery"],
         )
     )
 
