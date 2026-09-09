@@ -368,9 +368,7 @@ class GymCheckpointArtifactReference(_StrictWireModel):
 
 
 class GymAgentCheckpointDirectoryRequest(GymCheckpointDirectoryRequest):
-    """Agent commit/restore request opting into continuation coordinates."""
-
-    include_continuation_index: bool = True
+    """Agent commit/restore request returning continuation coordinates."""
 
 
 class GymModelCheckpointCommitRequest(GymCheckpointDirectoryRequest):
@@ -380,9 +378,7 @@ class GymModelCheckpointCommitRequest(GymCheckpointDirectoryRequest):
 
 
 class GymModelCheckpointRestoreRequest(GymCheckpointDirectoryRequest):
-    """Model restore request asking Gym to return its storage index."""
-
-    include_storage_reference_index: bool = True
+    """Model restore request returning its external-storage index."""
 
 
 class GymWorkerAcknowledgements(_StrictWireModel):

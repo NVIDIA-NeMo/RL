@@ -471,11 +471,11 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
         "policy",
     ]
     commit_calls = calls[:3]
-    assert commit_calls[0][2]["include_continuation_index"] is True
+    assert "include_continuation_index" not in commit_calls[0][2]
     assert commit_calls[1][2]["continuation_indexes"] == [continuation_index]
     restore_calls = calls[3:6]
-    assert restore_calls[0][2]["include_storage_reference_index"] is True
-    assert restore_calls[1][2]["include_continuation_index"] is True
+    assert "include_storage_reference_index" not in restore_calls[0][2]
+    assert "include_continuation_index" not in restore_calls[1][2]
 
 
 def test_abort_checkpoint_uses_idempotent_resume_routes() -> None:
