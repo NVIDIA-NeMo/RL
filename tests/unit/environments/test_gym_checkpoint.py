@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
+    GymAgentCheckpointDirectoryRequest,
     GymAgentCommitResponse,
     GymAgentRestoreResponse,
     GymCheckpointCommitResult,
@@ -30,6 +31,8 @@ from nemo_rl.environments.gym_checkpoint import (
     GymControlCapabilities,
     GymDiscoveredParticipant,
     GymExecutionIdentity,
+    GymModelCheckpointCommitRequest,
+    GymModelCheckpointRestoreRequest,
     GymModelCommitResponse,
     GymModelRestoreResponse,
     gym_capture_key,
@@ -65,6 +68,35 @@ def test_gym_execution_identity_separates_logical_id_from_capture_key() -> None:
     assert first.capture_key == "group-7_g0"
     assert retry.capture_key == "group-7_g0-a2"
     assert gym_capture_key("group-7_g0", 2) == retry.capture_key
+
+
+def test_checkpoint_requests_use_required_new_only_artifact_contract() -> None:
+    common = {
+        "checkpoint_id": "checkpoint-1",
+        "deadline_ts": 123.0,
+        "checkpoint_dir": "/checkpoint",
+    }
+    expected_common = {"schema_version": GYM_CHECKPOINT_SCHEMA_VERSION, **common}
+
+    assert GymAgentCheckpointDirectoryRequest(**common).model_dump() == expected_common
+    assert GymModelCheckpointRestoreRequest(**common).model_dump() == expected_common
+    assert GymModelCheckpointCommitRequest(
+        **common,
+        continuation_indexes=[],
+    ).model_dump() == {**expected_common, "continuation_indexes": []}
+
+    with pytest.raises(ValidationError, match="continuation_indexes"):
+        GymModelCheckpointCommitRequest(**common)
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        GymAgentCheckpointDirectoryRequest(
+            **common,
+            include_continuation_index=True,
+        )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        GymModelCheckpointRestoreRequest(
+            **common,
+            include_storage_reference_index=True,
+        )
 
 
 @pytest.mark.parametrize(
