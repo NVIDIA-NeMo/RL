@@ -190,6 +190,9 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
 
 if [[ -n "${VAL_PATH}" ]]; then
     COMMAND="$COMMAND data.validation.data_path=${VAL_PATH}"
+else
+    # Override any validation placeholder inherited from the stage config.
+    COMMAND="$COMMAND data.validation=null"
 fi
 
 if [[ -n "$SIF_DIR" ]]; then
