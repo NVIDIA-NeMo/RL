@@ -31,6 +31,7 @@ from nemo_rl.distributed.batched_data_dict import (
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
@@ -130,6 +131,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
                 "a custom policy worker cannot be combined with ModelOpt quantization"
             )
+        if extension_fqn is not None:
+            # Validate registration before allocating workers or placement groups.
+            get_actor_python_env(extension_fqn)
 
         if weights_path:
             weights_path = os.path.abspath(weights_path)
