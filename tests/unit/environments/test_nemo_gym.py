@@ -109,6 +109,10 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             head_server_config = object()
             _token_capture_enabled = False
             _tokenizer = object()
+            # run_rollouts is a thin span-opening wrapper that delegates the
+            # streaming to _stream_rollouts, so the mock has to supply the real
+            # one for the generator below to produce anything.
+            _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
 
             def _require_spinup(self):
                 pass
