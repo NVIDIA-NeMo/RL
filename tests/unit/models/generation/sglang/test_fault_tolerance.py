@@ -754,12 +754,10 @@ def test_server_parent_guard_is_armed_before_launch(monkeypatch, parent_alive):
 
 
 def _bare_generation_for_recover():
-    gen = SGLangGeneration.__new__(SGLangGeneration)
+    gen = _make_generation(None)
+    del gen._recover
     gen.all_engines = ["survivor", None]
-    gen.num_new_engines = 0
-    gen._health_monitor = None
     gen.needs_offload = False
-    gen.nodes_per_engine = 1
     return gen
 
 
@@ -976,7 +974,7 @@ def test_rollback_deregisters_each_logical_engine_before_actor_kill(
     gen = _bare_generation_for_recover()
     actors = [MagicMock() for _ in range(6)]
     gen.all_engines = actors.copy()
-    gen.nodes_per_engine = 2
+    gen.num_gpus_per_engine = 2
     gen.num_new_engines = 4
     gen._health_monitor = MagicMock(check_timeout=7.5)
     events = []
