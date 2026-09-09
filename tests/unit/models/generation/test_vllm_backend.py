@@ -1065,7 +1065,7 @@ def test_native_lora_collective_clones_buffers_and_installs_adapter(monkeypatch)
     monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
     monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
 
-    assert ext._update_weights_from_collective() is True
+    assert ext._update_weights_from_collective(refit_with_reload_api=False) is True
     assert set(installed) == set(ext.state_dict_info)
     torch.testing.assert_close(installed["model.layer.lora_A.weight"], source_a)
     torch.testing.assert_close(installed["model.layer.lora_B.weight"], source_b)
