@@ -652,6 +652,15 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         )
 
     if megatron_enabled:
+        etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
+
+        # ETP with vLLM generation has not been fully tested yet.
+        if backend == "vllm" and etp not in (1, None):
+            violations.append(
+                "policy.megatron_cfg.expert_tensor_parallel_size must be 1 "
+                f"for vLLM generation until ETP is fully tested (got {etp})."
+            )
+
         # PP-layout knobs that _build_layer_to_pp_stage doesn't yet handle.
         if megatron_cfg.get("pipeline_model_parallel_layout") is not None:
             violations.append(
