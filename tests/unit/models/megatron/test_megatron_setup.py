@@ -1616,6 +1616,8 @@ class TestApplyPrecisionConfig:
         ],
     )
     def test_nvfp4_pertoken_requires_validated_training_contract(self, policy_update):
+        from pathlib import Path
+
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
         config = {
@@ -1634,8 +1636,9 @@ class TestApplyPrecisionConfig:
                     "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
                     "NVTE_BACKWARD_OVERRIDE": "dequantized",
                 },
-                "te_precision_config_file": (
-                    "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                "te_precision_config_file": str(
+                    Path(__file__).resolve().parents[4]
+                    / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
                 ),
             },
         }
