@@ -106,9 +106,10 @@ def configure_vllm_for_router_replay(config: PolicyConfig) -> None:
 
     if router_replay_transport(config) == ROUTED_EXPERTS_REF_TRANSPORT:
         router_replay = config["router_replay"]
-        run_instance_id = router_replay.setdefault(
-            "_store_run_instance_id", uuid.uuid4().hex
-        )
+        # This runtime-only actor namespace may be present in a checkpointed
+        # config. Never inherit it into a new training invocation.
+        run_instance_id = uuid.uuid4().hex
+        router_replay["_store_run_instance_id"] = run_instance_id
         vllm_cfg = generation.setdefault("vllm_cfg", {})
         vllm_cfg["_routed_experts_transport"] = ROUTED_EXPERTS_REF_TRANSPORT
         vllm_cfg["_routed_experts_store_run_instance_id"] = run_instance_id

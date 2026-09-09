@@ -56,33 +56,43 @@ def test_validate_router_replay_config_allows_prefix_cache_default():
 
 
 @pytest.mark.mcore
-def test_configure_vllm_for_ray_router_replay_sets_stable_internal_store_id():
-    from nemo_rl.models.megatron.router_replay import (
-        configure_vllm_for_router_replay,
-        validate_router_replay_config,
+def test_configure_vllm_for_ray_router_replay_replaces_inherited_store_id(
+    monkeypatch,
+):
+    from nemo_rl.models.megatron import router_replay
+
+    monkeypatch.setattr(
+        router_replay.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fresh-run"),
     )
 
     config = {
-        "router_replay": {"enabled": True, "transport": "ray"},
+        "router_replay": {
+            "enabled": True,
+            "transport": "ray",
+            "_store_run_instance_id": "checkpoint-run",
+        },
         "generation": {
             "backend": "vllm",
-            "vllm_cfg": {"async_engine": True},
+            "vllm_cfg": {
+                "async_engine": True,
+                "_routed_experts_store_run_instance_id": "checkpoint-run",
+            },
             "vllm_kwargs": {},
         },
         "megatron_cfg": {"enabled": True},
     }
 
-    configure_vllm_for_router_replay(config)
-    first_id = config["router_replay"]["_store_run_instance_id"]
-    configure_vllm_for_router_replay(config)
+    router_replay.configure_vllm_for_router_replay(config)
 
-    assert config["router_replay"]["_store_run_instance_id"] == first_id
+    assert config["router_replay"]["_store_run_instance_id"] == "fresh-run"
     assert config["generation"]["vllm_cfg"]["_routed_experts_transport"] == "ray"
     assert (
         config["generation"]["vllm_cfg"]["_routed_experts_store_run_instance_id"]
-        == first_id
+        == "fresh-run"
     )
-    validate_router_replay_config(config)
+    router_replay.validate_router_replay_config(config)
 
 
 @pytest.mark.mcore
