@@ -3901,6 +3901,52 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
             )
 
 
+def test_async_grpo_retires_routed_experts_after_policy_train(
+    mock_grpo_components, monkeypatch
+):
+    policy = mock_grpo_components["policy"]
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["router_replay"] = {
+        "enabled": True,
+        "transport": "ray",
+        "_store_run_instance_id": "run-a",
+    }
+
+    events = []
+    train_result = policy.train.return_value
+
+    def train(*args, **kwargs):
+        events.append("policy_train")
+        return train_result
+
+    retired = {
+        "retired_through": 0,
+        "stores": 1,
+        "retired_objects": 1,
+        "retired_bytes": 40,
+        "remaining_objects": 0,
+    }
+
+    def retire(policy_config, target_weight_version):
+        assert policy_config is master_config.policy
+        events.append(("retire", target_weight_version))
+        return retired
+
+    policy.train.side_effect = train
+    with patch(
+        "nemo_rl.algorithms.grpo.retire_routed_experts_through",
+        side_effect=retire,
+    ) as mock_retire:
+        _run_single_grpo_train_step(
+            mock_grpo_components,
+            async_grpo_train,
+            monkeypatch,
+        )
+
+    assert events == ["policy_train", ("retire", 0)]
+    mock_retire.assert_called_once_with(master_config.policy, 0)
+
+
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 def test_grpo_train_clips_advantages_when_configured(
     mock_grpo_components, train_func, monkeypatch

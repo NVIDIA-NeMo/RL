@@ -133,6 +133,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
+    validate_router_replay_transport_path,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -152,6 +153,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.routed_experts_ref import retire_routed_experts_through
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -565,6 +567,15 @@ def setup(
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
+    validate_router_replay_transport_path(
+        policy_config,
+        data_plane_enabled=bool((master_config.data_plane or {}).get("enabled", False)),
+        async_grpo_enabled=bool(
+            grpo_config.async_grpo and grpo_config.async_grpo.enabled
+        ),
+        nemo_gym_enabled=enable_nemo_gym,
+        load_replay_buffer=checkpointing_config.get("load_replay_buffer"),
+    )
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -5347,6 +5358,20 @@ def async_grpo_train(
                         train_data,
                         loss_fn,
                         timer=timer,
+                    )
+
+                # weight_version is the target version just consumed. The
+                # policy call has joined every worker, while all future
+                # buffered/in-flight rollouts target strictly newer versions.
+                with timer.time("router_replay_gc"):
+                    routed_experts_gc = retire_routed_experts_through(
+                        master_config.policy, weight_version
+                    )
+                if routed_experts_gc is not None:
+                    print(
+                        "🧹 Retired routed-experts Ray objects through target "
+                        f"{weight_version}: {routed_experts_gc}",
+                        flush=True,
                     )
 
                 is_last_step = step + 1 == master_config.grpo.max_num_steps

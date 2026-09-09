@@ -15,7 +15,7 @@
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import is_dataclass, replace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -29,10 +29,6 @@ from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 VLLM_LOGPROB_FLOOR = -9999.0
-
-# The expert-id range vs carry dtype is model-constant, so it is verified on the
-# first non-empty routed-experts tensor per process and skipped afterwards.
-G_ROUTED_EXPERTS_RANGE_CHECKED = False
 
 
 def remap_multimodal_placeholders(
@@ -151,26 +147,15 @@ def remap_multimodal_placeholders(
 def _as_routed_experts_tensor(
     value: Any, *, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Convert backend routed-expert ids to the resolved carry dtype.
+    """Convert backend routed-expert ids to the metadata-selected carry dtype.
 
-    Guards against expert ids overflowing ``dtype`` before the narrowing cast,
-    which would otherwise wrap silently (e.g. if the expert count was
-    mis-detected when resolving the dtype).
+    Do not reduce the full payload to validate its maximum value here. vLLM
+    0.25.1 can return torch.uint16 routes, for which Tensor.max is not
+    implemented, and an upcast would add a large temporary allocation. The
+    destination dtype is resolved from model expert-count metadata; downstream
+    alignment still validates payload rank, shape, and route completeness.
     """
-    global G_ROUTED_EXPERTS_RANGE_CHECKED
-    tensor = torch.as_tensor(value, device=device)
-    if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
-        max_id = int(tensor.max())
-        limit = torch.iinfo(dtype).max
-        if max_id > limit:
-            raise ValueError(
-                f"routed expert id {max_id} exceeds the resolved carry dtype "
-                f"{dtype} (max {limit}); the model's expert count was likely "
-                "mis-detected (see resolve_routed_experts_dtype in "
-                "nemo_rl.models.generation.interfaces)."
-            )
-        G_ROUTED_EXPERTS_RANGE_CHECKED = True
-    return tensor.to(dtype=dtype)
+    return torch.as_tensor(value, device=device).to(dtype=dtype)
 
 
 def format_prompt_for_vllm_generation(
@@ -357,6 +342,9 @@ def attach_routed_experts_to_chat_response_choices(
     device: torch.device,
     logger: Any = None,
     routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+    routed_experts_ref_factory: Optional[
+        Callable[[torch.Tensor], dict[str, Any]]
+    ] = None,
 ) -> Any:
     """Attach aligned routed experts to OpenAI chat response choices."""
     outputs_by_index = {
@@ -367,6 +355,13 @@ def attach_routed_experts_to_chat_response_choices(
     )
 
     choices = list(getattr(response, "choices", []))
+    if routed_experts_ref_factory is not None and (
+        len(choices) != 1 or choices[0].index != 0
+    ):
+        raise RuntimeError(
+            "Ray-reference router replay currently requires exactly one chat "
+            "choice with index 0."
+        )
     attached_choice_indices = set()
     for choice in choices:
         generation_details = outputs_by_index.get(choice.index)
@@ -409,13 +404,16 @@ def attach_routed_experts_to_chat_response_choices(
                 r3_stats["actual_routes"],
                 r3_stats["expected_routes"],
             )
-        # Base64 envelope instead of .tolist(): nested JSON int lists cost
-        # ~1s of CPU per serialize/parse hop at long context lengths and get
-        # re-validated at every gym HTTP hop; a single string passes through
-        # the gym chain opaquely.
-        choice.message.routed_experts = encode_routed_experts(
-            routed_experts.to(dtype=routed_experts_dtype)
-        )
+        if routed_experts_ref_factory is not None:
+            choice.message.routed_experts = routed_experts_ref_factory(routed_experts)
+        else:
+            # Base64 envelope instead of .tolist(): nested JSON int lists cost
+            # ~1s of CPU per serialize/parse hop at long context lengths and get
+            # re-validated at every gym HTTP hop; a single string passes through
+            # the gym chain opaquely.
+            choice.message.routed_experts = encode_routed_experts(
+                routed_experts.to(dtype=routed_experts_dtype)
+            )
 
     if len(attached_choice_indices) != len(choices):
         missing_choice_indices = sorted(

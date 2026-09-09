@@ -56,6 +56,11 @@ from nemo_rl.experience.interfaces import NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+from nemo_rl.utils.routed_experts_ref import (
+    is_routed_experts_ref,
+    slice_routed_experts_ref,
+    validate_routed_experts_ref,
+)
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
@@ -74,6 +79,56 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _replace_last_routed_experts_ref(
+    previous_routes: Any,
+    replacement: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Replace the final logical route in a reference-backed message.
+
+    vLLM cannot report the route used to predict the final generated token in
+    the same decode response. The following turn's prefill does contain that
+    route. Dense router replay patches the final row in place; reference-backed
+    replay represents the same operation by trimming the prior slice and
+    appending a one-token slice from the next request.
+    """
+    if is_routed_experts_ref(previous_routes):
+        segments = [validate_routed_experts_ref(previous_routes)]
+    elif isinstance(previous_routes, list) and previous_routes:
+        segments = [validate_routed_experts_ref(segment) for segment in previous_routes]
+    else:
+        raise TypeError(
+            "Cannot patch a reference-backed routed-experts turn whose previous "
+            f"routes have type {type(previous_routes).__name__}."
+        )
+
+    last_nonempty = next(
+        (
+            index
+            for index in range(len(segments) - 1, -1, -1)
+            if int(segments[index]["length"]) > 0
+        ),
+        None,
+    )
+    if last_nonempty is None:
+        raise ValueError(
+            "Cannot replace the final route of an empty routed-experts turn"
+        )
+
+    last = segments[last_nonempty]
+    updated = segments[:last_nonempty]
+    if int(last["length"]) > 1:
+        updated.append(
+            slice_routed_experts_ref(
+                last,
+                offset=int(last["offset"]),
+                length=int(last["length"]) - 1,
+            )
+        )
+    updated.append(validate_routed_experts_ref(dict(replacement)))
+    updated.extend(segments[last_nonempty + 1 :])
+    return updated
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -1020,27 +1075,47 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
             routed_experts = None
+            routed_experts_ref = None
             if routed_experts_raw is not None:
-                routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
-                    self.cfg.get("routed_experts_dtype", "int16")
-                ]
-                routed_experts = decode_routed_experts(
-                    routed_experts_raw, dtype=routed_experts_dtype
-                )
-                if routed_experts.dim() != 3:
-                    raise ValueError(
-                        "NeMo Gym returned routed_experts with invalid shape. "
-                        "Expected [tokens, num_moe_layers, topk], got "
-                        f"{tuple(routed_experts.shape)}."
-                    )
                 expected_tokens = len(prompt_token_ids) + len(generation_token_ids)
-                if routed_experts.shape[0] < expected_tokens:
-                    raise ValueError(
-                        "NeMo Gym returned too few routed_experts rows for a "
-                        "trainable output item: "
-                        f"routes={routed_experts.shape[0]}, expected_at_least="
-                        f"{expected_tokens}."
+                if is_routed_experts_ref(routed_experts_raw):
+                    routed_experts_ref = validate_routed_experts_ref(routed_experts_raw)
+                    if (
+                        routed_experts_ref["offset"] != 0
+                        or routed_experts_ref["length"]
+                        != routed_experts_ref["shape"][0]
+                    ):
+                        raise ValueError(
+                            "NeMo Gym expects the vLLM boundary to return one "
+                            "full routed-experts object reference."
+                        )
+                    if routed_experts_ref["shape"][0] < expected_tokens:
+                        raise ValueError(
+                            "NeMo Gym returned too few routed_experts rows for a "
+                            "trainable output item: "
+                            f"routes={routed_experts_ref['shape'][0]}, "
+                            f"expected_at_least={expected_tokens}."
+                        )
+                else:
+                    routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
+                        self.cfg.get("routed_experts_dtype", "int16")
+                    ]
+                    routed_experts = decode_routed_experts(
+                        routed_experts_raw, dtype=routed_experts_dtype
                     )
+                    if routed_experts.dim() != 3:
+                        raise ValueError(
+                            "NeMo Gym returned routed_experts with invalid shape. "
+                            "Expected [tokens, num_moe_layers, topk], got "
+                            f"{tuple(routed_experts.shape)}."
+                        )
+                    if routed_experts.shape[0] < expected_tokens:
+                        raise ValueError(
+                            "NeMo Gym returned too few routed_experts rows for a "
+                            "trainable output item: "
+                            f"routes={routed_experts.shape[0]}, expected_at_least="
+                            f"{expected_tokens}."
+                        )
             elif self.cfg.get("require_routed_experts", False):
                 raise ValueError(
                     "policy.router_replay.enabled=true requires NeMo Gym output "
@@ -1056,6 +1131,18 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 previous_routes = nemo_rl_message_log[-1].get("routed_experts")
                 if isinstance(previous_routes, torch.Tensor):
                     previous_routes[-1] = routed_experts[len(seen_token_ids) - 1]
+            elif routed_experts_ref is not None and seen_token_ids:
+                previous_routes = nemo_rl_message_log[-1].get("routed_experts")
+                nemo_rl_message_log[-1]["routed_experts"] = (
+                    _replace_last_routed_experts_ref(
+                        previous_routes,
+                        slice_routed_experts_ref(
+                            routed_experts_ref,
+                            offset=len(seen_token_ids) - 1,
+                            length=1,
+                        ),
+                    )
+                )
 
             prompt_start = len(seen_token_ids)
             prompt_end = len(prompt_token_ids)
@@ -1069,6 +1156,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             }
             if routed_experts is not None:
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
+            elif routed_experts_ref is not None:
+                user_message["routed_experts"] = slice_routed_experts_ref(
+                    routed_experts_ref,
+                    offset=prompt_start,
+                    length=prompt_end - prompt_start,
+                )
             nemo_rl_message_log.append(user_message)
 
             if processor is not None:
@@ -1112,6 +1205,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 assistant_message["routed_experts"] = routed_experts[
                     generation_start:generation_end
                 ]
+            elif routed_experts_ref is not None:
+                assistant_message["routed_experts"] = slice_routed_experts_ref(
+                    routed_experts_ref,
+                    offset=generation_start,
+                    length=generation_end - generation_start,
+                )
             nemo_rl_message_log.append(assistant_message)
 
             seen_token_ids.extend(new_prompt_token_ids)
