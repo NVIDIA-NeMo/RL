@@ -152,6 +152,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.routed_experts_ref import retire_routed_experts_through
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -5299,6 +5300,20 @@ def async_grpo_train(
                         train_data,
                         loss_fn,
                         timer=timer,
+                    )
+
+                # weight_version is the target version just consumed. The
+                # policy call has joined every worker, while all future
+                # buffered/in-flight rollouts target strictly newer versions.
+                with timer.time("router_replay_gc"):
+                    routed_experts_gc = retire_routed_experts_through(
+                        master_config.policy, weight_version
+                    )
+                if routed_experts_gc is not None:
+                    print(
+                        "🧹 Retired routed-experts Ray objects through target "
+                        f"{weight_version}: {routed_experts_gc}",
+                        flush=True,
                     )
 
                 is_last_step = step + 1 == master_config.grpo.max_num_steps

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
 import torch
@@ -20,8 +22,11 @@ from nemo_rl.utils.routed_experts_ref import (
     ROUTED_EXPERTS_REF_DTYPE,
     ROUTED_EXPERTS_REF_KEY,
     ROUTED_EXPERTS_REF_SCHEMA,
+    ROUTED_EXPERTS_RAY_NAMESPACE,
     RoutedExpertsStoreState,
     materialize_routed_experts_refs,
+    registry_actor_name,
+    retire_routed_experts_through,
     routed_experts_ref_lookup_key,
     slice_routed_experts_ref,
 )
@@ -126,4 +131,70 @@ def test_store_state_retire_through_is_monotonic_and_rejects_late_puts():
             nbytes=40,
             shape=(5, 2, 2),
             dtype="int16",
+        )
+
+
+def test_retire_routed_experts_through_skips_inline_transport(monkeypatch):
+    get_actor = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_ref.ray.get_actor",
+        get_actor,
+    )
+
+    result = retire_routed_experts_through(
+        {"router_replay": {"enabled": True}},
+        target_weight_version=3,
+    )
+
+    assert result is None
+    get_actor.assert_not_called()
+
+
+def test_retire_routed_experts_through_dispatches_to_run_registry(monkeypatch):
+    retired = {
+        "retired_through": 7,
+        "stores": 2,
+        "retired_objects": 8,
+        "retired_bytes": 160,
+        "remaining_objects": 4,
+    }
+    retire_ref = object()
+    registry = MagicMock()
+    registry.retire_through.remote.return_value = retire_ref
+    get_actor = MagicMock(return_value=registry)
+    ray_get = MagicMock(return_value=retired)
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_ref.ray.get_actor",
+        get_actor,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_ref.ray.get",
+        ray_get,
+    )
+
+    result = retire_routed_experts_through(
+        {
+            "router_replay": {
+                "enabled": True,
+                "transport": "ray",
+                "_store_run_instance_id": "run-a",
+            }
+        },
+        target_weight_version=7,
+    )
+
+    assert result == retired
+    get_actor.assert_called_once_with(
+        registry_actor_name("run-a"),
+        namespace=ROUTED_EXPERTS_RAY_NAMESPACE,
+    )
+    registry.retire_through.remote.assert_called_once_with(7)
+    ray_get.assert_called_once_with(retire_ref)
+
+
+def test_retire_routed_experts_through_requires_run_instance_id():
+    with pytest.raises(RuntimeError, match="missing its store run instance id"):
+        retire_routed_experts_through(
+            {"router_replay": {"enabled": True, "transport": "ray"}},
+            target_weight_version=3,
         )
