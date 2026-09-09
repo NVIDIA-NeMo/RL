@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 
 import pytest
 import torch
@@ -589,6 +590,36 @@ def test_clipped_pg_loss_reinforce_mode():
         **loss_input,
     )
     torch.testing.assert_close(actual_loss, expected_loss)
+
+
+def test_clipped_pg_loss_js_divergence_error_stays_finite_on_underflow():
+    """Tests that js_divergence_error stays finite when logprobs underflow to zero.
+
+    Building the mixture as log(0.5*exp(a) + 0.5*exp(b)) collapses to log(0)
+    once both logprobs underflow in fp32 (roughly below -88), and the KL
+    terms downstream turn that into inf - inf = NaN.
+    """
+    device = "cpu"
+    data, _, _, _ = _setup_clipped_pg_test_data(batch_size=1, seq_len=2, device=device)
+
+    cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+    loss_fn = ClippedPGLossFn(cfg)
+
+    # exp(-200) underflows to exactly 0.0 in fp32.
+    underflowing_logprob = torch.tensor([[-200.0]], device=device)
+    data["prev_logprobs"][:, 1:] = underflowing_logprob
+    data["generation_logprobs"][:, 1:] = underflowing_logprob
+
+    _, metrics = loss_fn(
+        next_token_logprobs=underflowing_logprob,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+
+    assert math.isfinite(metrics["js_divergence_error"]), (
+        f"js_divergence_error should stay finite under logprob underflow, got {metrics['js_divergence_error']}"
+    )
 
 
 def test_clipped_pg_loss_force_on_policy_ratio():

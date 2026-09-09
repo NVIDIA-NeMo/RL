@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
@@ -445,8 +446,10 @@ class ClippedPGLossFn(LossFunction):
         # Jensen-Shannon divergence
         # M = 0.5 * (P_train + P_gen)
         # JSD = 0.5 * KL(P_train || M) + 0.5 * KL(P_gen || M)
-        log_mixture = torch.log(
-            0.5 * torch.exp(prev_logprobs) + 0.5 * torch.exp(generation_logprobs)
+        # Use logaddexp instead of log(0.5 * exp(a) + 0.5 * exp(b)) so this stays
+        # finite when both logprobs underflow to zero in fp32.
+        log_mixture = torch.logaddexp(prev_logprobs, generation_logprobs) - math.log(
+            2.0
         )
         # KL(P_train || M)
         kl_prev_to_mixture = (
