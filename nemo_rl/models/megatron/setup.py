@@ -838,7 +838,11 @@ def setup_model_config(
     # serialized defaults. Apply explicit recipe controls before model
     # construction so RADIO positional encoding and frozen towers are stable
     # and consistent between logprob and training passes.
+    from nemo_rl.models.policy import provider_override_allowed
+
     for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
+        if not provider_override_allowed(config["megatron_cfg"], vlm_key):
+            continue
         if not hasattr(model_cfg, vlm_key):
             raise ValueError(
                 f"megatron_cfg set '{vlm_key}' but {type(model_cfg).__name__} has no "
@@ -1168,17 +1172,23 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
+    from nemo_rl.models.policy import provider_override_allowed
+
     megatron_cfg = config["megatron_cfg"]
-    if "mtp_num_layers" in megatron_cfg:
+
+    def _allowed(key: str) -> bool:
+        return provider_override_allowed(megatron_cfg, key)
+
+    if "mtp_num_layers" in megatron_cfg and _allowed("mtp_num_layers"):
         # In mcore, mtp_num_layers is both the number of MTP layers (when
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
-    if "mtp_loss_scaling_factor" in megatron_cfg:
+    if "mtp_loss_scaling_factor" in megatron_cfg and _allowed("mtp_loss_scaling_factor"):
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
-    if "mtp_use_repeated_layer" in megatron_cfg:
+    if "mtp_use_repeated_layer" in megatron_cfg and _allowed("mtp_use_repeated_layer"):
         model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
-    if "mtp_detach_heads" in megatron_cfg:
+    if "mtp_detach_heads" in megatron_cfg and _allowed("mtp_detach_heads"):
         model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
 
 

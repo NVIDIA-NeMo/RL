@@ -100,7 +100,10 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    get_runtime_env_for_policy_worker,
+    make_empty_cache_best_effort_under_expandable_segments,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     MegatronCheckpointEngineSendMixin,
@@ -426,6 +429,7 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        make_empty_cache_best_effort_under_expandable_segments()
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
         # not initialize a CUDA context ahead of the set_device below.
         log_gpu_memory_diagnostics(
@@ -2263,10 +2267,19 @@ class MegatronPolicyWorkerImpl(
             return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
                 self.megatron_bridge.hf_pretrained, [self.model]
             )
+        # NRL_REFIT_SKIP_MTP=1: drop MTP params from refit entirely. The
+        # nemotron_omni bridge's megatron->HF mapping still misses MTP
+        # layer-norm params on the refit-export path (jobs 6296933, 6371264:
+        # "Unrecognized mapping type" -> TP ranks desync -> ALLGATHER hangs to
+        # the 600s NCCL watchdog in prepare_refit_info). Generation engines
+        # without speculative decoding never consume MTP weights, so skipping
+        # them here (identically on every rank) is safe.
+        skip_mtp = os.environ.get("NRL_REFIT_SKIP_MTP", "0") == "1"
         return [
             task
             for task in self.megatron_bridge.get_conversion_tasks([self.model])
             if task is not None
+            and not (skip_mtp and "mtp." in task.global_param_name)
         ]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
