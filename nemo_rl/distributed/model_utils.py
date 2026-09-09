@@ -30,6 +30,37 @@ if TYPE_CHECKING:
     from megatron.core.models.gpt import GPTModel
 
 
+@torch.no_grad()
+def distributed_vocab_logsumexp(
+    vocab_parallel_logits: torch.Tensor,
+    group: torch.distributed.ProcessGroup,
+    chunk_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Stable full-vocabulary logsumexp for TP-sharded logits."""
+    if chunk_size is None:
+        logits = vocab_parallel_logits.to(dtype=torch.float32)
+        logits_max = torch.amax(logits, dim=-1)
+        torch.distributed.all_reduce(
+            logits_max, op=torch.distributed.ReduceOp.MAX, group=group
+        )
+        sum_exp_logits = torch.exp(logits - logits_max.unsqueeze(-1)).sum(dim=-1)
+        torch.distributed.all_reduce(
+            sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=group
+        )
+        return logits_max + sum_exp_logits.clamp_min(1e-45).log()
+
+    chunks = []
+    seq_size = int(vocab_parallel_logits.shape[1])
+    for chunk_start in range(0, seq_size, int(chunk_size)):
+        chunk_end = min(seq_size, chunk_start + int(chunk_size))
+        chunks.append(
+            distributed_vocab_logsumexp(
+                vocab_parallel_logits[:, chunk_start:chunk_end, :], group
+            )
+        )
+    return torch.cat(chunks, dim=1)
+
+
 def _compute_distributed_log_softmax_with_grad(
     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:

@@ -1021,7 +1021,10 @@ class DTensorPolicyWorkerImpl(
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
     @wrap_with_nvtx_name("dtensor_policy_worker/get_logprobs")
     def get_logprobs(
-        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        topk: Optional[int] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -1035,6 +1038,11 @@ class DTensorPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        if topk is not None:
+            raise NotImplementedError(
+                "Fused student logprob/top-k capture is supported only by the "
+                "Megatron policy backend"
+            )
         self.timer.start("get_logprobs")
         logprob_batch_size = (
             micro_batch_size
@@ -1476,6 +1484,7 @@ class DTensorPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         k: int,
         micro_batch_size: Optional[int] = None,
+        return_logsumexp: bool = False,
     ) -> BatchedDataDict[Any]:
         """Return per-position top-k logits and corresponding global indices.
 
@@ -1487,6 +1496,11 @@ class DTensorPolicyWorkerImpl(
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
+        if return_logsumexp:
+            raise NotImplementedError(
+                "Full-vocabulary logsumexp capture is supported only by the "
+                "Megatron policy backend"
+            )
         self.timer.start("get_topk_logits")
         topk_batch_size = (
             micro_batch_size

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import Any, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -27,6 +27,8 @@ class LogprobOutputSpec(TypedDict):
     """logprobs: Tensor of log probabilities."""
 
     logprobs: torch.Tensor
+    topk_logprobs: NotRequired[torch.Tensor]
+    topk_indices: NotRequired[torch.Tensor]
 
 
 class ReferenceLogprobOutputSpec(TypedDict):
@@ -46,6 +48,7 @@ class TopkLogitsOutputSpec(TypedDict):
 
     topk_logits: torch.Tensor
     topk_indices: torch.Tensor
+    V_logsumexp: NotRequired[torch.Tensor]
 
 
 class PolicyInterface(ABC):
@@ -56,6 +59,7 @@ class PolicyInterface(ABC):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         timer: Optional[Timer] = None,
+        topk: Optional[int] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -93,6 +97,7 @@ class PolicyInterface(ABC):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        return_logsumexp: bool = False,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Get per-position top-k logits and global indices for a batch of inputs.
 
