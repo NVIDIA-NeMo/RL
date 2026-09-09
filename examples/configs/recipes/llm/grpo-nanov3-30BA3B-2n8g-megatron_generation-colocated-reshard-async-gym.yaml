@@ -26,6 +26,9 @@ policy:
     mcore_generation_config:
       tensor_model_parallel_size: 4
       expert_model_parallel_size: 4
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_coordinator_policy: longest_prefix
 logger:
   wandb_enabled: true
   tensorboard_enabled: true

@@ -80,8 +80,6 @@ from nemo_rl.models.megatron.memory_saver import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
-_DEFAULT_COORDINATOR_POLICY = "longest_prefix"
-
 
 def _resolve_coordinator_policy(
     mcore_generation_config,
@@ -94,10 +92,10 @@ def _resolve_coordinator_policy(
     """
     if not mcore_generation_config["enable_prefix_caching"]:
         return PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+    if "prefix_caching_coordinator_policy" not in mcore_generation_config:
+        return InferenceConfig.prefix_caching_coordinator_policy
     return PrefixCachingCoordinatorPolicy(
-        mcore_generation_config.get(
-            "prefix_caching_coordinator_policy", _DEFAULT_COORDINATOR_POLICY
-        )
+        mcore_generation_config["prefix_caching_coordinator_policy"]
     )
 
 
@@ -415,6 +413,9 @@ class MegatronGenerationMixin:
             "materialize_only_last_token_logits": materialize_only_last_token_logits,
             "enable_chunked_prefill": enable_chunked_prefill,
             "enable_prefix_caching": mcore_generation_config["enable_prefix_caching"],
+            "prefix_caching_coordinator_policy": _resolve_coordinator_policy(
+                mcore_generation_config
+            ),
             "pg_collection": pg_collection,
             "mamba_inference_state_config": mamba_inference_state_config,
             # Reserve more KV-cache space when speculative decoding is enabled.
@@ -454,10 +455,6 @@ class MegatronGenerationMixin:
                 PrefixCachingEvictionPolicy(
                     mcore_generation_config["prefix_caching_eviction_policy"]
                 )
-            )
-        if "prefix_caching_coordinator_policy" in mcore_generation_config:
-            inference_config_kwargs["prefix_caching_coordinator_policy"] = (
-                _resolve_coordinator_policy(mcore_generation_config)
             )
         if "prefix_caching_mamba_gb" in mcore_generation_config:
             inference_config_kwargs["prefix_caching_mamba_gb"] = (
@@ -624,9 +621,9 @@ class MegatronGenerationMixin:
                 rng=random.Random(torch.distributed.get_rank())
             )
 
-        # Each replica is one asyncio event loop, so this is the per-host
-        # frontend capacity; every model-parallel coordinator hosts a set.
-        num_replicas = 8
+        server_kwargs: dict[str, Any] = {}
+        if "http_server_num_replicas" in gen_cfg:
+            server_kwargs["num_replicas"] = int(gen_cfg["http_server_num_replicas"])
 
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
@@ -637,13 +634,13 @@ class MegatronGenerationMixin:
             verbose=False,
             sock=reserved_socket,
             multimodal_prompt_config=self.inference_wrapped_model.multimodal_prompt_config,
-            num_replicas=num_replicas,
             # The frontend hashes prompts so the coordinator does not have to.
             # Whether it bothers follows from the routing policy, so pass that
             # rather than encoding the decision here; the block size is only the
             # granularity and must match the engine's.
             block_size_tokens=gen_cfg["block_size_tokens"],
             prefix_caching_coordinator_policy=coordinator_policy,
+            **server_kwargs,
         )
 
         base_url = f"http://{ip}:{server_port}/v1"

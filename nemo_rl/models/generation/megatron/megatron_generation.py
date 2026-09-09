@@ -108,17 +108,21 @@ class MegatronGeneration(GenerationInterface):
     def frontend_ranks(cluster: RayVirtualCluster, config: PolicyConfig) -> list[int]:
         """Distributed ranks that will host an HTTP frontend.
 
-        One frontend per model-parallel group, mirroring the engine-side
-        ``is_mp_coordinator`` predicate the workers use: tensor-parallel ranks
-        are innermost, so the coordinator of each group is the first rank in it.
+        Copy of the engine's ``is_mp_coordinator = tp_rank == 0 and pp_rank == 0``.
+        Megatron orders ranks TP-fastest, PP-slowest, so PP selects a leading
+        slice and TP a stride within it. CP and DP are not divided out because
+        the predicate ignores them.
         """
         mcore_cfg = MegatronGeneration.effective_megatron_cfg(config)
-        model_parallel_size = (
-            mcore_cfg["tensor_model_parallel_size"]
-            * mcore_cfg["pipeline_model_parallel_size"]
-            * mcore_cfg.get("context_parallel_size", 1)
+        tensor_model_parallel_size = mcore_cfg["tensor_model_parallel_size"]
+        pipeline_model_parallel_size = mcore_cfg["pipeline_model_parallel_size"]
+        return list(
+            range(
+                0,
+                cluster.world_size() // pipeline_model_parallel_size,
+                tensor_model_parallel_size,
+            )
         )
-        return list(range(0, cluster.world_size(), model_parallel_size))
 
     @staticmethod
     def _rank_placement(cluster: RayVirtualCluster) -> list[tuple[int, int]]:
@@ -130,10 +134,9 @@ class MegatronGeneration(GenerationInterface):
         holder on the bundle that rank will land on, so the two must agree.
         """
         if cluster._sorted_bundle_indices is not None:
-            group_size = cluster.num_gpus_per_node
+            # Sorted indices imply a unified PG, and there is only ever one.
             return [
-                (i // group_size, bundle_index)
-                for i, bundle_index in enumerate(cluster._sorted_bundle_indices)
+                (0, bundle_index) for bundle_index in cluster._sorted_bundle_indices
             ]
         return [
             (pg_index, bundle_index)

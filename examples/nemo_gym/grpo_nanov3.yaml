@@ -250,6 +250,7 @@ policy:
       offload_policy_before_refit: false
       expose_http_server: true
       enable_prefix_caching: true
+      http_server_num_replicas: 8
       parsers:
         - deepseek-r1-reasoning
         - qwen3-coder-tool

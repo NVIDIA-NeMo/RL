@@ -931,8 +931,9 @@ def _bundles_via_worker_group(sorted_bundle_indices, group_size, placement_group
     """The (pg index, bundle) each RANK actually lands on, reconstructed from the live code.
 
     Mirrors lm_policy.py's tied_groups for a unified PG and RayWorkerGroup's
-    default per-node tuples otherwise -- the two branches
-    reserve_http_server_addresses must agree with.
+    default per-node tuples otherwise, then RayWorkerGroup's single-placement-
+    group collapse -- the two branches reserve_http_server_addresses must agree
+    with.
 
     Deliberately a hand-copy rather than a call into the code under test (or a
     shared helper): sharing the implementation would make the assertion a
@@ -953,6 +954,9 @@ def _bundles_via_worker_group(sorted_bundle_indices, group_size, placement_group
             for pg_idx, pg in enumerate(placement_groups)
             for bundle_idx in range(pg.bundle_count)
         ]
+    # RayWorkerGroup collapses the group index when there is only one PG.
+    if len(placement_groups) == 1:
+        return [(0, bundles[0]) for _, bundles in tied_groups]
     return [(pg_idx, bundles[0]) for pg_idx, bundles in tied_groups]
 
 
@@ -998,10 +1002,13 @@ def test_reserve_http_server_addresses_pins_every_frontend_bundle(
     the URLs it is handed, so a single reservation would pin every session to
     one frontend however many the engine goes on to start.
     """
-    placement_groups = [
-        SimpleNamespace(bundle_count=2),
-        SimpleNamespace(bundle_count=2),
-    ]
+    if sorted_bundle_indices is not None:
+        placement_groups = [SimpleNamespace(bundle_count=4)]
+    else:
+        placement_groups = [
+            SimpleNamespace(bundle_count=2),
+            SimpleNamespace(bundle_count=2),
+        ]
     cluster = SimpleNamespace(
         num_gpus_per_node=2,
         _sorted_bundle_indices=sorted_bundle_indices,
@@ -1071,3 +1078,57 @@ def test_frontend_ranks_uses_dedicated_colocated_inference_layout():
     }
 
     assert MegatronGeneration.frontend_ranks(cluster, config) == [0, 1]
+
+
+def _mp_coordinator_ranks(tp: int, pp: int, world_size: int) -> list[int]:
+    """Ranks satisfying MCore's `is_mp_coordinator`, by explicit decomposition.
+
+    Per-rank rather than a stride: sharing frontend_ranks' formula would make
+    the assertion a tautology. CP and DP cancel, so they take no parameter.
+    """
+    ranks_per_pp_stage = world_size // pp
+    return [
+        rank
+        for rank in range(world_size)
+        if rank % tp == 0 and rank // ranks_per_pp_stage == 0
+    ]
+
+
+@pytest.mark.parametrize(
+    "tp, cp, pp, world_size",
+    [
+        (1, 1, 1, 8),
+        (2, 1, 1, 8),
+        (4, 1, 1, 16),
+        (2, 2, 1, 8),
+        # PP > 1: a TP*PP stride picks 0 and 4 here instead of 0 and 2.
+        (2, 1, 2, 8),
+        (2, 2, 2, 16),
+        (4, 1, 2, 16),
+    ],
+)
+def test_frontend_ranks_matches_is_mp_coordinator(tp, cp, pp, world_size):
+    """frontend_ranks is a driver-side copy of the engine's own predicate.
+
+    Reservation runs before any worker exists, so the set must be predicted.
+    `is_mp_coordinator` needs a real engine, so without this the copy only
+    drifts loudly on a multi-node nightly.
+    """
+    cluster = SimpleNamespace(world_size=lambda: world_size)
+    config = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": tp,
+            "pipeline_model_parallel_size": pp,
+            "expert_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "context_parallel_size": cp,
+        },
+        "generation": {
+            "colocated": {"enabled": True},
+            "mcore_generation_config": {"expose_http_server": True},
+        },
+    }
+
+    assert MegatronGeneration.frontend_ranks(cluster, config) == _mp_coordinator_ranks(
+        tp, pp, world_size
+    )

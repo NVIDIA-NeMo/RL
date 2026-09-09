@@ -82,6 +82,7 @@ policy:
       offload_policy_before_refit: false
       parsers: []
       expose_http_server: false
+      http_server_num_replicas: 8
 
   # Needs to be set to whatever backend TP size.
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}

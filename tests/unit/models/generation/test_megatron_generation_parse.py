@@ -33,7 +33,10 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.config import (
+    InferenceConfig,
+    PrefixCachingCoordinatorPolicy,
+)
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     text_generation_server as mlm_text_gen_server,
 )
@@ -61,6 +64,13 @@ PAD = 0
         ),
         (
             {"enable_prefix_caching": True},
+            InferenceConfig.prefix_caching_coordinator_policy,
+        ),
+        (
+            {
+                "enable_prefix_caching": True,
+                "prefix_caching_coordinator_policy": "longest_prefix",
+            },
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
         ),
         (
@@ -306,3 +316,64 @@ def test_http_server_port_reservation(monkeypatch):
         finally:
             if reserved_socket is not None:
                 reserved_socket.close()
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("gen_cfg_extra", "expected_num_replicas"),
+    [
+        ({}, None),
+        ({"http_server_num_replicas": 8}, 8),
+    ],
+)
+def test_http_server_num_replicas_is_forwarded_only_when_set(
+    monkeypatch, gen_cfg_extra, expected_num_replicas
+):
+    """Replica count reaches MCore, and stays absent when unconfigured."""
+    started = {}
+    monkeypatch.setattr(
+        mlm_text_gen_server,
+        "start_text_gen_server",
+        lambda **kwargs: started.update(kwargs),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
+        lambda: "10.0.0.5",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_free_port_local",
+        lambda *_args, **_kwargs: 12345,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    requests_mock = MagicMock()
+    health_get = requests_mock.Session.return_value.__enter__.return_value.get
+    health_get.return_value.status_code = 200
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.requests",
+        requests_mock,
+    )
+
+    worker = SimpleNamespace(
+        coordinator_addr="tcp://127.0.0.1:5555",
+        megatron_tokenizer=object(),
+        rank=0,
+        cfg={
+            "generation": {
+                "mcore_generation_config": {
+                    "block_size_tokens": 64,
+                    "enable_prefix_caching": False,
+                    "parsers": [],
+                    **gen_cfg_extra,
+                }
+            }
+        },
+        _reserved_http_server_port=None,
+        inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
+    )
+
+    MegatronGenerationMixin._setup_openai_api_server(worker)
+
+    if expected_num_replicas is None:
+        assert "num_replicas" not in started
+    else:
+        assert started["num_replicas"] == expected_num_replicas

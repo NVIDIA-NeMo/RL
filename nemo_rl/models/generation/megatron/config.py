@@ -27,6 +27,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     """
 
     expose_http_server: bool
+    http_server_num_replicas: NotRequired[int]
     parsers: list[str]
     buffer_size_gb: int
     block_size_tokens: int
@@ -63,7 +64,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
-    prefix_caching_mamba_gb: NotRequired[int]
+    prefix_caching_mamba_gb: NotRequired[float]
 
     prefix_caching_eviction_policy: NotRequired[Literal["ref_zero", "lru"]]
     prefix_caching_coordinator_policy: NotRequired[
