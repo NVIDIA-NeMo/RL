@@ -284,3 +284,40 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
     actor._spinup.remote.assert_called_once_with()
     actor.set_tokenizer.remote.assert_called_once_with(tokenizer)
     assert mock_ray.get.call_args_list == [call("spinup-ref"), call("tokenizer-ref")]
+
+
+class TestUnresolvedAgentRefsAreDiagnosable:
+    """A Gym older than the checkout that prepared the data must say so.
+
+    ``task_source`` routing is new. A current Gym strips ``agent_ref`` from collated rows
+    and stamps ``task_source`` instead, then resolves it back inside ``run_examples``. An
+    older Gym has no resolver, so the same dataset arrives unroutable -- and the first
+    thing that touched it was an unguarded ``row["agent_ref"]``, which surfaced as a bare
+    KeyError inside a Ray TaskError inside an ExceptionGroup.
+    """
+
+    def test_resolved_rows_pass_through(self):
+        rows = [{"agent_ref": {"name": "a"}}, {"agent_ref": {"name": "b"}}]
+        nemo_gym_mod._require_resolved_agent_refs(rows)  # must not raise
+
+    def test_a_stale_gym_is_named_along_with_the_remedy(self):
+        rows = [
+            {"agent_ref": {"name": "a"}},
+            {"task_source": "workplace_assistant_simple_agent"},
+        ]
+        with pytest.raises(RuntimeError) as excinfo:
+            nemo_gym_mod._require_resolved_agent_refs(rows)
+        message = str(excinfo.value)
+        assert "1 of 2" in message
+        assert "workplace_assistant_simple_agent" in message
+        assert "NRL_FORCE_REBUILD_VENVS" in message
+
+    def test_a_row_with_no_routing_at_all_says_that_instead(self):
+        """Different cause, different fix: rebuilding venvs would not help here."""
+        with pytest.raises(RuntimeError, match="no task_source either"):
+            nemo_gym_mod._require_resolved_agent_refs([{"id": "x"}])
+
+    def test_an_empty_agent_ref_counts_as_unresolved(self):
+        """Gym writes {"name": ...}; a bare {} routes nowhere."""
+        with pytest.raises(RuntimeError):
+            nemo_gym_mod._require_resolved_agent_refs([{"agent_ref": {}}])

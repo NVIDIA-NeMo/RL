@@ -78,6 +78,50 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
+def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
+    """Fail readably when Gym did not stamp an agent_ref onto every row.
+
+    ``run_examples`` resolves ``task_source`` to ``agent_ref`` in place before it returns,
+    and every read after that point -- this module's counters, and Gym's own dispatch,
+    which posts to ``row["agent_ref"]["name"]`` -- assumes it happened. Unguarded, a row
+    that was not resolved surfaces as ``KeyError: 'agent_ref'`` inside a Ray TaskError
+    inside an ExceptionGroup, forty lines from anything that names the cause.
+
+    The cause worth naming is a version skew rather than a bad row. ``task_source`` routing
+    is new: an older Gym has no resolver, so a dataset prepared with a current Gym -- which
+    strips ``agent_ref`` and stamps ``task_source`` instead -- arrives unroutable. That
+    happens when the Gym actor's venv is older than the checkout that prepared the data,
+    which is what ``NRL_FORCE_REBUILD_VENVS=true`` exists to correct.
+    """
+    unresolved = [
+        index
+        for index, row in enumerate(nemo_gym_examples)
+        if not (row.get("agent_ref") or {}).get("name")
+    ]
+    if not unresolved:
+        return
+    task_sources = sorted(
+        {
+            source
+            for index in unresolved
+            if (source := nemo_gym_examples[index].get("task_source")) is not None
+        }
+    )
+    raise RuntimeError(
+        f"{len(unresolved)} of {len(nemo_gym_examples)} rollout rows have no agent_ref "
+        "after run_examples(), so Gym cannot route them and neither can this actor. "
+        + (
+            f"They carry task_source {task_sources}, which a current Gym resolves and an "
+            "older one ignores -- the Gym in this actor's venv is most likely older than "
+            "the checkout that prepared the data. Rebuild the actor venvs "
+            "(NRL_FORCE_REBUILD_VENVS=true) so both come from the same Gym."
+            if task_sources
+            else "They carry no task_source either, so nothing can route them: the "
+            "dataset was prepared without routing information."
+        )
+    )
+
+
 class NemoGymCompatibleConfig(Protocol):
     """Configuration fields required to select the NeMo Gym rollout path."""
 
@@ -617,6 +661,7 @@ Depending on your data shape, you may want to change these values."""
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
+        _require_resolved_agent_refs(nemo_gym_examples)
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
