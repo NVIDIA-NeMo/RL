@@ -510,7 +510,25 @@ fi
 
 echo "[recovery] waiting up to ${COMPLETION_DEADLINE_S}s for the run to finish..."
 FINISHED=0
+# Was the victim ever observed STOPPED while the run was still going?
+#
+# This used to be checked after the run exited -- "never killed, so it must still be
+# there". That stopped being true when this feature turned on per-worker process-group
+# cleanup: teardown SIGKILLs the whole group, and SIGKILL lands on a stopped process, so
+# the reaper legitimately removes the victim before anything can look for it. Job 7011909
+# failed both frozen variants on that check alone, with the abort, the attribution and the
+# exit code all correct.
+#
+# State T while the run is live is the same evidence taken at a moment when it still
+# exists, and it is strictly stronger: absence afterwards only said "something removed
+# it", whereas this says "it really was frozen, not dead". /proc/PID/status rather than
+# /proc/PID/stat because the comm field can contain spaces, which shifts stat's columns.
+VICTIM_SEEN_STOPPED=0
 for _ in $(seq 1 $((COMPLETION_DEADLINE_S / 10))); do
+    if [[ "$FREEZE_VICTIM" == "true" ]] && \
+       [[ "$(awk '/^State:/{print $2}' "/proc/$VICTIM/status" 2>/dev/null)" == "T" ]]; then
+        VICTIM_SEEN_STOPPED=1
+    fi
     if ! kill -0 $TRAIN_PID 2>/dev/null; then FINISHED=1; break; fi
     sleep 10
 done
@@ -610,10 +628,10 @@ if [[ "$KILL_DURING_REFIT" == "true" && "$REFIT_TRANSPORT" == "nccl_reshard" ]];
         echo "[recovery] exist to make this fast; something is waiting that should not be."
         exit 1
     fi
-    if [[ "$FREEZE_VICTIM" == "true" ]] && \
-       [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
-        echo "[recovery] FAIL: the frozen victim disappeared; it was not the frozen-rank"
-        echo "[recovery] scenario that failed, so the result does not mean what it says."
+    if [[ "$FREEZE_VICTIM" == "true" && "$VICTIM_SEEN_STOPPED" != "1" ]]; then
+        echo "[recovery] FAIL: the victim was never seen stopped while the run was live, so"
+        echo "[recovery] it was not the frozen-rank scenario that failed and the result does"
+        echo "[recovery] not mean what it says."
         exit 1
     fi
     # The guard has to be REACHED, not merely consistent with the exit code. Without this
@@ -667,11 +685,12 @@ if [[ "$FREEZE_VICTIM" == "true" ]]; then
         grep -E "already suspect|identified as absent|gen_fleet: shard" "$RUN_LOG" | tail -20
         exit 1
     fi
-    # Never killed, so it must still be there -- stopped. If it is gone, something else
-    # reaped it and this was the actor-death path after all.
-    if [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
-        echo "[recovery] FAIL: the frozen victim disappeared; it was not the frozen-rank"
-        echo "[recovery] scenario that recovered, so the result does not mean what it says."
+    # Never killed, so it must have been STOPPED while the run was going. Sampled during
+    # the wait rather than looked for afterwards -- see VICTIM_SEEN_STOPPED.
+    if [[ "$VICTIM_SEEN_STOPPED" != "1" ]]; then
+        echo "[recovery] FAIL: the victim was never seen stopped while the run was live, so"
+        echo "[recovery] it was not the frozen-rank scenario that recovered and the result"
+        echo "[recovery] does not mean what it says."
         exit 1
     fi
     echo "[recovery] abort observed:"; grep -m3 "RefitAborted" "$RUN_LOG"
