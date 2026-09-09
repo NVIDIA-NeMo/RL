@@ -268,8 +268,9 @@ class _RemoteMethod:
     def __init__(self, function: Any) -> None:
         self.function = function
 
-    def remote(self, *args: Any) -> Any:
-        return self.function(*args)
+    def remote(self, *, body: dict[str, Any]) -> Any:
+        # Ray's cross-environment placeholder handles accept keyword calls only.
+        return self.function(body)
 
 
 _SOURCE_IDENTITIES = [

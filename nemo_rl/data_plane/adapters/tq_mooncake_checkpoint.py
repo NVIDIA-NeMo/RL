@@ -704,7 +704,7 @@ def _fanout_requests(
                 else:
                     pending[participant_id] = workers[
                         participant_id
-                    ].mooncake_checkpoint.remote(request.body)
+                    ].mooncake_checkpoint.remote(body=request.body)
             # Remote I/O runs concurrently with this process's own shard I/O.
             for request in local_requests:
                 assert local is not None
@@ -744,7 +744,7 @@ def _live_participants(
     body = _request_body(manager, "DESCRIBE")
     try:
         responses = ray.get(
-            [worker.mooncake_checkpoint.remote(body) for worker in workers],
+            [worker.mooncake_checkpoint.remote(body=body) for worker in workers],
             timeout=_checkpoint_timeout_s(manager.config),
         )
     except Exception as error:
