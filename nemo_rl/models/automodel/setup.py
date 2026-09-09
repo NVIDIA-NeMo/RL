@@ -18,8 +18,6 @@ import importlib
 import inspect
 import json
 import os
-import shutil
-import tempfile
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -29,7 +27,6 @@ from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
     NeMoAutoModelForTokenClassification,
 )
-from safetensors import safe_open
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
@@ -47,6 +44,8 @@ from nemo_automodel.components.distributed.config import (
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from safetensors import safe_open
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import (
     AutoConfig,
@@ -57,6 +56,10 @@ from transformers import (
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.models.automodel.checkpoint import (
+    AutomodelCheckpointManager,
+    _resolve_lora_adapter_dir,
+)
 from nemo_rl.models.automodel.config import (
     DistributedContext,
     ModelAndOptimizerState,
@@ -536,25 +539,6 @@ def setup_distributed(
     )
 
 
-def _resolve_lora_adapter_dir(restore_from: str) -> str:
-    """Resolve a ``lora_cfg.restore_from`` path to the directory holding the adapter files.
-
-    Accepts a NeMo RL checkpoint weights directory (``step_*/policy/weights``),
-    its ``model`` subdirectory, or any directory directly containing
-    ``adapter_model.safetensors`` + ``adapter_config.json`` (HF PEFT layout).
-    """
-    for candidate in (restore_from, os.path.join(restore_from, "model")):
-        if os.path.isfile(os.path.join(candidate, "adapter_model.safetensors")):
-            return candidate
-    raise FileNotFoundError(
-        f"dtensor_cfg.lora_cfg.restore_from={restore_from!r}: no "
-        "adapter_model.safetensors found there or in its 'model' subdirectory. "
-        "restore_from must point to a PEFT adapter checkpoint (a directory "
-        "containing adapter_model.safetensors + adapter_config.json, e.g. a "
-        "previous run's step_*/policy/weights directory)."
-    )
-
-
 def _validate_lora_adapter_config(
     adapter_dir: str, lora_cfg: LoRAConfig, model_name: str
 ) -> None:
@@ -631,7 +615,7 @@ def _validate_lora_adapter_keys(
     }
 
     expected_state_dict = {
-        f"{prefix}{name.replace('_checkpoint_wrapped_module.', '')}": (
+        f"{prefix}{canonical_parameter_fqn(name)}": (
             param.full_tensor().detach().cpu()
             if hasattr(param, "full_tensor")
             else param.detach().cpu()
@@ -665,7 +649,7 @@ def _validate_lora_adapter_keys(
 
 def _load_initial_lora_adapter(
     model: torch.nn.Module,
-    checkpoint_manager: Any,
+    checkpoint_manager: AutomodelCheckpointManager,
     restore_from: str,
     lora_cfg: LoRAConfig,
     model_name: str,
@@ -686,34 +670,7 @@ def _load_initial_lora_adapter(
         model,
         moe_mesh=getattr(checkpoint_manager, "moe_mesh", None),
     )
-    staging_dir = None
-    load_dir = adapter_dir
-    if os.path.basename(adapter_dir.rstrip(os.sep)) != "model":
-        # Automodel's checkpointer selects its PEFT safetensors read by a
-        # substring test on the path ("/model" in path); a bare adapter
-        # directory would fall through to the DCP/HF-storage-reader branch
-        # instead. Expose it under a temporary "model" path component.
-        staging_dir = tempfile.mkdtemp(prefix="nrl_lora_warm_start_")
-        load_dir = os.path.join(staging_dir, "model")
-        os.symlink(adapter_dir, load_dir)
-    assert checkpoint_manager.checkpointer is not None, (
-        "Checkpointer must be initialized before warm starting LoRA adapters."
-    )
-    checkpoint_manager.update_checkpointer_config(
-        config_updates={
-            "model_save_format": "safetensors",
-            "is_peft": True,
-            # The donor checkpoint is already dequantized.
-            "dequantize_base_checkpoint": False,
-        },
-        checkpoint_root=os.path.dirname(load_dir.rstrip(os.sep)),
-    )
-    try:
-        checkpoint_manager.checkpointer.load_model(model=model, model_path=load_dir)
-    finally:
-        if staging_dir is not None:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-    print(f"Warm-started LoRA adapters from {adapter_dir}")
+    checkpoint_manager.load_lora_adapter(model, adapter_dir)
 
 
 def setup_model_and_optimizer(

@@ -4337,6 +4337,27 @@ class TestPeftWarmStart:
             yaml.dump(run_config, f)
         return iter_dir
 
+    @pytest.mark.parametrize("key", ["target_modules", "exclude_modules"])
+    def test_null_module_list_matches_empty(self, tmp_path, key):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        donor = self._peft_cfg(**{key: None})
+        iter_dir = self._make_donor_iter_dir(tmp_path, donor)
+        _validate_peft_restore_config(str(iter_dir), self._peft_cfg(**{key: []}))
+
+    def test_moe_layout_uses_bridge_defaults(self, tmp_path):
+        import nemo_rl.models.megatron.setup as setup_mod
+
+        @dataclass
+        class UpdatedLoRA(setup_mod.LoRA):
+            normalize_moe_lora: bool = True
+
+        iter_dir = self._make_donor_iter_dir(
+            tmp_path, self._peft_cfg(normalize_moe_lora=True)
+        )
+        with patch.object(setup_mod, "LoRA", UpdatedLoRA):
+            setup_mod._validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
     def test_resolve_iter_dir_directly(self, tmp_path):
         from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
 
@@ -4829,8 +4850,8 @@ class TestPeftWarmStart:
     def _run_policy_setup(self, tmp_path, *, resume_exists):
         """Run setup_model_and_optimizer with PEFT warm start configured.
 
-        Returns the _create_peft_warm_start_hook mock so the caller can assert
-        whether the hook was composed into the policy's pre-wrap hooks.
+        Returns the warm-start hook factory mock and the actual pre-wrap hooks
+        passed to get_model, so callers can check presence and ordering.
         """
         import nemo_rl.models.megatron.setup as setup_mod
 
@@ -4871,7 +4892,9 @@ class TestPeftWarmStart:
             patch.object(setup_mod, "set_jit_fusion_options"),
             patch.object(setup_mod, "init_checkpointing_context"),
             patch.object(setup_mod, "build_tokenizer"),
-            patch.object(setup_mod, "get_model", return_value=[mock_model_chunk]),
+            patch.object(
+                setup_mod, "get_model", return_value=[mock_model_chunk]
+            ) as mock_get_model,
             patch.object(
                 setup_mod,
                 "setup_optimizer",
@@ -4894,17 +4917,25 @@ class TestPeftWarmStart:
                 policy_cfg=policy_cfg,
                 megatron_cfg=megatron_cfg,
             )
-        return mock_hook
+        return mock_hook, mock_get_model.call_args.kwargs["pre_wrap_hook"]
 
     def test_policy_warm_start_hook_appended_on_fresh_run(self, tmp_path):
         """No resume checkpoint -> the policy warm-start hook is composed."""
-        mock_hook = self._run_policy_setup(tmp_path, resume_exists=False)
+        mock_hook, hooks = self._run_policy_setup(tmp_path, resume_exists=False)
         mock_hook.assert_called_once()
+        peft_index = next(
+            i
+            for i, hook in enumerate(hooks)
+            if hook is not mock_hook.return_value
+            and hook.__name__ == "composed_peft_hook"
+        )
+        assert hooks[peft_index + 1] is mock_hook.return_value
 
     def test_policy_warm_start_hook_skipped_on_resume(self, tmp_path):
         """Resume checkpoint already carries this run's adapters -> no hook."""
-        mock_hook = self._run_policy_setup(tmp_path, resume_exists=True)
+        mock_hook, hooks = self._run_policy_setup(tmp_path, resume_exists=True)
         mock_hook.assert_not_called()
+        assert mock_hook.return_value not in hooks
 
     def test_reference_warm_start_hook_appended_unconditionally(self, tmp_path):
         """The reference model warm-starts even when the policy resumes.

@@ -143,7 +143,10 @@ SFT LoRA into GRPO. The accepted path format differs by backend:
 - **Megatron Core**: `policy.megatron_cfg.peft.restore_from` — a native Megatron `iter_XXXXXXX`
   directory, or a checkpoint root containing one.
 
-The donor's `dim`/`alpha` must match this run's; setup fails loudly otherwise. Optimizer, RNG,
+The donor's `dim`/`alpha` must match this run's. On DTensor, a donor's recorded
+`base_model_name_or_path` (unless absent, empty, or `N/A`) must also equal this run's
+`policy.model_name` as an exact string: an HF repo ID and a local path for the same model
+will not match, nor will a model moved to a different path. Setup fails loudly otherwise. Optimizer, RNG,
 and train state always start fresh. `restore_from` requires `enabled: true`. When resuming from a
 NeMo RL training checkpoint, the resumed weights take precedence for the policy; the KL reference
 policy still anchors to the warm-started (donor) adapters, not to the bare base model.

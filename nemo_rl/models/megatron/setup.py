@@ -677,7 +677,7 @@ def _validate_peft_restore_config(
                 f"checkpoint's run_config.yaml peft section has no {key!r} key; "
                 "cannot verify compatibility with this run's peft config."
             )
-        if set(saved_peft[key]) != set(peft_cfg[key]):
+        if set(saved_peft[key] or []) != set(peft_cfg[key] or []):
             raise ValueError(
                 f"megatron_cfg.peft.restore_from={restore_dir!r}: donor "
                 f"checkpoint peft.{key}={saved_peft[key]} does not match this "
@@ -688,12 +688,13 @@ def _validate_peft_restore_config(
     # for MoE expert layers. NeMo RL never sets them (a run always uses the
     # bridge defaults), but a native Megatron-Bridge donor checkpoint may
     # have; a mismatch would restore onto a different adapter layout.
-    moe_shaping_defaults = {
-        "normalize_moe_lora": False,
-        "share_expert_adapters": True,
-        "experts_shared_outer_loras": False,
-    }
-    for key, default in moe_shaping_defaults.items():
+    lora_field_defaults = {field.name: field.default for field in fields(LoRA)}
+    for key in (
+        "normalize_moe_lora",
+        "share_expert_adapters",
+        "experts_shared_outer_loras",
+    ):
+        default = lora_field_defaults[key]
         if key in saved_peft and saved_peft[key] != peft_cfg.get(key, default):
             raise ValueError(
                 f"megatron_cfg.peft.restore_from={restore_dir!r}: donor "

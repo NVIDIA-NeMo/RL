@@ -27,6 +27,9 @@ except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
 import torch
+from nemo_automodel.components.checkpoint._backports.filesystem import (
+    SerializationFormat,
+)
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
@@ -1714,8 +1717,14 @@ class TestSetupModelAndOptimizer:
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
     @patch("nemo_rl.models.automodel.setup.PeftConfig")
+    @pytest.mark.parametrize(
+        "weights_path,restore_from",
+        [(None, None), (None, "/donor"), ("/resume", "/donor")],
+    )
+    @patch("nemo_rl.models.automodel.setup._load_initial_lora_adapter")
     def test_setup_model_with_lora(
         self,
+        mock_warm_start,
         mock_peft_config,
         mock_get_class,
         mock_get_rank,
@@ -1725,6 +1734,8 @@ class TestSetupModelAndOptimizer:
         mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
+        weights_path,
+        restore_from,
     ):
         """Test model setup with LoRA enabled."""
         mock_get_rank.return_value = 0
@@ -1748,6 +1759,7 @@ class TestSetupModelAndOptimizer:
             "enabled": True,
             "use_triton": False,
             "rank": 8,
+            "restore_from": restore_from,
         }
 
         result = setup_model_and_optimizer(
@@ -1756,6 +1768,7 @@ class TestSetupModelAndOptimizer:
             runtime_config=mock_runtime_config,
             distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
+            weights_path=weights_path,
         )
 
         mock_peft_config.from_dict.assert_called_once()
@@ -1763,6 +1776,15 @@ class TestSetupModelAndOptimizer:
         call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
         assert call_kwargs["peft_config"] == mock_peft_config_instance
         assert result.peft_config == mock_peft_config_instance
+
+        if weights_path:
+            mock_checkpoint_manager.load_checkpoint.assert_called_once()
+            mock_warm_start.assert_not_called()
+        elif restore_from:
+            mock_checkpoint_manager.load_checkpoint.assert_not_called()
+            mock_warm_start.assert_called_once()
+        else:
+            mock_warm_start.assert_not_called()
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -2394,7 +2416,7 @@ def _lora_cfg(dim=2, alpha=4):
 @pytest.mark.automodel
 class TestResolveLoraAdapterDir:
     def test_direct_adapter_dir(self, tmp_path):
-        from nemo_rl.models.automodel.setup import _resolve_lora_adapter_dir
+        from nemo_rl.models.automodel.checkpoint import _resolve_lora_adapter_dir
 
         _write_adapter_checkpoint(tmp_path / "adapter")
         assert _resolve_lora_adapter_dir(str(tmp_path / "adapter")) == str(
@@ -2402,14 +2424,14 @@ class TestResolveLoraAdapterDir:
         )
 
     def test_weights_dir_with_model_subdir(self, tmp_path):
-        from nemo_rl.models.automodel.setup import _resolve_lora_adapter_dir
+        from nemo_rl.models.automodel.checkpoint import _resolve_lora_adapter_dir
 
         weights_dir = tmp_path / "step_5" / "policy" / "weights"
         _write_adapter_checkpoint(weights_dir / "model")
         assert _resolve_lora_adapter_dir(str(weights_dir)) == str(weights_dir / "model")
 
     def test_missing_adapter_file_raises(self, tmp_path):
-        from nemo_rl.models.automodel.setup import _resolve_lora_adapter_dir
+        from nemo_rl.models.automodel.checkpoint import _resolve_lora_adapter_dir
 
         with pytest.raises(FileNotFoundError, match="adapter_model.safetensors"):
             _resolve_lora_adapter_dir(str(tmp_path))
@@ -2555,6 +2577,50 @@ class TestValidateLoraAdapterKeys:
 
 @pytest.mark.automodel
 class TestLoadInitialLoraAdapter:
+    @pytest.mark.parametrize("fail_load", [False, True])
+    def test_restores_config_and_removes_staging(self, tmp_path, fail_load):
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir)
+        manager = AutomodelCheckpointManager(dp_mesh=MagicMock(), tp_mesh=MagicMock())
+        manager.checkpointer = MagicMock()
+        cfg = manager.checkpointer.config
+        cfg.model_save_format = SerializationFormat.SAFETENSORS
+        cfg.is_peft = False
+        cfg.dequantize_base_checkpoint = True
+        cfg.checkpoint_dir = "/original"
+        previous_config = (
+            cfg.model_save_format,
+            cfg.is_peft,
+            cfg.dequantize_base_checkpoint,
+            cfg.checkpoint_dir,
+        )
+        seen = []
+
+        def load_model(*, model, model_path):
+            seen.append(model_path)
+            assert os.path.isfile(os.path.join(model_path, "adapter_model.safetensors"))
+            assert cfg.is_peft is True
+            assert cfg.dequantize_base_checkpoint is False
+            assert cfg.checkpoint_dir == os.path.dirname(model_path)
+            if fail_load:
+                raise RuntimeError("load failed")
+
+        manager.checkpointer.load_model.side_effect = load_model
+        with patch.object(manager, "_rebuild_checkpointer_addons"):
+            if fail_load:
+                with pytest.raises(RuntimeError, match="load failed"):
+                    manager.load_lora_adapter(_TinyLoraModel(), str(adapter_dir))
+            else:
+                manager.load_lora_adapter(_TinyLoraModel(), str(adapter_dir))
+        assert (
+            cfg.model_save_format,
+            cfg.is_peft,
+            cfg.dequantize_base_checkpoint,
+            cfg.checkpoint_dir,
+        ) == previous_config
+        assert len(seen) == 1
+        assert not os.path.exists(os.path.dirname(seen[0]))
+
     def test_loads_through_checkpointer(self, tmp_path):
         from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
 
@@ -2572,6 +2638,10 @@ class TestLoadInitialLoraAdapter:
         # name in setup.py fails the test instead of silently recording a call.
         manager = create_autospec(AutomodelCheckpointManager, instance=True)
         manager.checkpointer = create_autospec(Checkpointer, instance=True)
+        manager.checkpointer.config = MagicMock()
+        manager.load_lora_adapter.side_effect = lambda model, adapter_dir: (
+            AutomodelCheckpointManager.load_lora_adapter(manager, model, adapter_dir)
+        )
         _load_initial_lora_adapter(
             model=model,
             checkpoint_manager=manager,
@@ -2579,8 +2649,8 @@ class TestLoadInitialLoraAdapter:
             lora_cfg=_lora_cfg(),
             model_name="tiny-model",
         )
-        manager.update_checkpointer_config.assert_called_once()
-        config_updates = manager.update_checkpointer_config.call_args.kwargs[
+        assert manager.update_checkpointer_config.call_count == 2
+        config_updates = manager.update_checkpointer_config.call_args_list[0].kwargs[
             "config_updates"
         ]
         assert config_updates["is_peft"] is True
@@ -2608,8 +2678,8 @@ class TestLoadInitialLoraAdapter:
     def test_bare_adapter_dir_loaded_via_model_path(self, tmp_path):
         """A bare adapter dir must still take the checkpointer's PEFT branch.
 
-        Automodel selects its PEFT safetensors read by a substring test on the
-        path ("/model" in path), so the bare layout is staged under a
+        Automodel selects its PEFT safetensors read by a basename test on the
+        path (Path(path).name == "model"), so the bare layout is staged under a
         temporary "model" path component before loading.
         """
         from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
@@ -2625,6 +2695,10 @@ class TestLoadInitialLoraAdapter:
         model = _TinyLoraModel()
         manager = create_autospec(AutomodelCheckpointManager, instance=True)
         manager.checkpointer = create_autospec(Checkpointer, instance=True)
+        manager.checkpointer.config = MagicMock()
+        manager.load_lora_adapter.side_effect = lambda model, adapter_dir: (
+            AutomodelCheckpointManager.load_lora_adapter(manager, model, adapter_dir)
+        )
 
         seen = {}
 
@@ -2666,6 +2740,10 @@ class TestLoadInitialLoraAdapter:
         monkeypatch.chdir(tmp_path)
         manager = create_autospec(AutomodelCheckpointManager, instance=True)
         manager.checkpointer = create_autospec(Checkpointer, instance=True)
+        manager.checkpointer.config = MagicMock()
+        manager.load_lora_adapter.side_effect = lambda model, adapter_dir: (
+            AutomodelCheckpointManager.load_lora_adapter(manager, model, adapter_dir)
+        )
         seen = {}
 
         def fake_load_model(*, model, model_path, **kwargs):
