@@ -1642,9 +1642,7 @@ def setup_single_controller(
         # Reject a corrupt or incomplete participant export before mutating the
         # live data plane. Each Gym participant validates its own manifest again
         # while restoring.
-        gym_checkpoint_topology.validate_checkpoint_participants(
-            saved_gym_checkpoint
-        )
+        gym_checkpoint_topology.validate_checkpoint_participants(saved_gym_checkpoint)
         validate_gym_checkpoint_manifests(
             resolved_snapshot.path,
             saved_gym_checkpoint,
@@ -1678,9 +1676,7 @@ def setup_single_controller(
         assert resolved_snapshot is not None
         awaitable_gym_actor = env_handles["nemo_gym"]
         gym_checkpoint_restore_operation_id = f"restore-{uuid.uuid4().hex}"
-        restore_deadline_ts = (
-            time.time() + rollout_checkpoint_cfg.gym.prepare_timeout_s
-        )
+        restore_deadline_ts = time.time() + rollout_checkpoint_cfg.gym.prepare_timeout_s
         restored_gym_checkpoint = GymCheckpointRestoreResult.model_validate(
             ray.get(
                 awaitable_gym_actor.restore_checkpoint.remote(

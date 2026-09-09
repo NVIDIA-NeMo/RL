@@ -881,7 +881,7 @@ class TestSetup:
                         "agent_continuation_index_v1",
                         "completed_result_acknowledgement",
                     ],
-                }
+                },
             ],
         }
         topology_ref = object()
