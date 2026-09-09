@@ -15,10 +15,11 @@ No unrelated Gym environment is required by this recipe.
 
 ## Recipe
 
-The published stage starts from the Ultra SFT checkpoint:
+The published stage starts from the Nemotron-3-Ultra-GA checkpoint, released as
+[NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16):
 
 ```text
-Ultra SFT checkpoint
+Nemotron-3-Ultra-GA checkpoint (converted to Transformers v4)
         |
         v
   proof generation  -- run_proof_v1.sh
@@ -76,8 +77,19 @@ The launcher binds each judge to `0.0.0.0` so the Ray workers can reach it on
 the cluster network. Keep these endpoints on a trusted, access-controlled
 cluster network; do not route or expose the judge ports to the public internet.
 
-Prepare the starting Ultra SFT checkpoint using the
-[Ultra v5-to-v4 conversion instructions](nemotron-3-ultra.md#prepare-the-starting-checkpoint).
+Download the starting GA checkpoint from
+[`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16)
+to `/path/to/ultra_ga_checkpoint_v5`. It uses Transformers v5. Convert it
+to Transformers v4 before using it with NeMo RL, following the
+[Ultra v5-to-v4 conversion instructions](nemotron-3-ultra.md#prepare-the-starting-checkpoint)
+with the GA checkpoint as the source:
+
+```bash
+uv run python examples/converters/ultra/convert_ultra_ckpt_t5_to_t4.py \
+  --source /path/to/ultra_ga_checkpoint_v5 \
+  --output /path/to/ultra_ga_checkpoint_v4
+```
+
 Set `MODEL_PATH` to the converted output; neither the config nor launcher
 contains a private or machine-specific model path.
 
@@ -86,13 +98,19 @@ contains a private or machine-specific model path.
 The proof-generation RL data is published separately in
 [Nemotron-Math-Proofs-v3-RL](https://huggingface.co/datasets/nvidia/Nemotron-Math-Proofs-v3-RL).
 The repository contains only the proof-generation data, so no subset selection
-is needed. Export the dataset to JSONL for the launch script. Confirm that the
-dataset terms permit your intended use and redistribution.
+is needed. Confirm that the dataset terms permit your intended use and
+redistribution.
 
-### Proof generation
+### Released training data
 
-The raw proof-generation JSONL needs a `problem` field. Convert it to the Gym
-schema with the released prompt template:
+Download `data/train.jsonl` from the dataset repository and use the downloaded
+file directly as `TRAIN_PATH`. It is already NeMo Gym-compatible and does not
+need conversion with `prepare_data.py`.
+
+### Custom proof data
+
+For custom data, the raw proof-generation JSONL needs a `problem` field. Convert
+it to the Gym schema with the released prompt template:
 
 ```bash
 uv run python \
@@ -112,8 +130,8 @@ The script uses the following public variables:
 |---|---|
 | `CONTAINER` | NeMo RL image URI or squashfs path |
 | `HET_SERVER_CONTAINER` | SGLang judge image URI or squashfs path |
-| `MODEL_PATH` | Hugging Face model ID or mounted checkpoint path |
-| `TRAIN_PATH` | Converted Gym JSONL file |
+| `MODEL_PATH` | Mounted Nemotron-3-Ultra-GA checkpoint converted to Transformers v4 |
+| `TRAIN_PATH` | Released `data/train.jsonl` used directly, or custom Gym-compatible JSONL |
 | `VAL_PATH` | Optional validation JSONL; defaults to `TRAIN_PATH` |
 | `PERSISTENT_CACHE` | Shared cache directory visible to all Ray nodes |
 | `SLURM_ACCOUNT`, `SLURM_PARTITION` | Values for your SLURM cluster |
@@ -151,8 +169,8 @@ Set paths for your cluster and inspect the fully resolved command first:
 ```bash
 export CONTAINER=/path/to/nemo-rl.sqsh
 export HET_SERVER_CONTAINER=/path/to/sglang.sqsh
-export MODEL_PATH=/path/to/ultra_sft_checkpoint_v4
-export TRAIN_PATH=/path/to/proof_generation.jsonl
+export MODEL_PATH=/path/to/ultra_ga_checkpoint_v4
+export TRAIN_PATH=/path/to/Nemotron-Math-Proofs-v3-RL/data/train.jsonl
 export PERSISTENT_CACHE=/path/to/shared/cache/nemotron-3-ultra-imo
 export EXTRA_MOUNTS=/path/to/shared:/path/to/shared
 export SLURM_ACCOUNT=your_account

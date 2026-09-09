@@ -29,7 +29,7 @@ export HET_SERVER_GPUS_PER_NODE="${HET_SERVER_GPUS_PER_NODE:-4}"
 export PROOF_JUDGE_MODEL="${PROOF_JUDGE_MODEL:-deepseek-ai/DeepSeek-Math-V2}"
 export PROOF_JUDGE_PORT="${PROOF_JUDGE_PORT:-5000}"
 
-# Point this at the converted Ultra SFT checkpoint described in the guide.
+# Point this at the Nemotron-3-Ultra-GA checkpoint converted to Transformers v4.
 export NRL_MODEL_PATH="${NRL_MODEL_PATH:-${MODEL_PATH:-}}"
 export NRL_TRAIN_PATH="${NRL_TRAIN_PATH:-${TRAIN_PATH:-}}"
 export NRL_VAL_PATH="${NRL_VAL_PATH:-${VAL_PATH:-${NRL_TRAIN_PATH}}}"
