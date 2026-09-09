@@ -61,6 +61,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutStats,
     _nemo_gym_metric_namespace,
+    _rollout_environment_metric_component,
 )
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
@@ -835,6 +836,11 @@ def test_nemo_gym_metric_namespace_supports_task_source_only_rows(
     assert _nemo_gym_metric_namespace(row) == expected
 
 
+def test_rollout_environment_metric_component_avoids_sanitization_collisions():
+    assert _rollout_environment_metric_component("swe-e2e") == "swe-e2e"
+    assert _rollout_environment_metric_component("swe/e2e").startswith("swe_e2e-")
+
+
 def _mask_gate_result():
     return {
         "message_log": [
@@ -960,6 +966,47 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     metrics = impl._compute_rollout_metrics([completion], "agent")
 
     assert ("agent/full_result" in metrics) is log_full_result_tables
+
+
+def test_nemo_gym_rollout_metrics_include_environment_distributions():
+    impl = _nemo_gym_impl(True)
+    completions = [
+        Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1]},
+                {"role": "assistant", "token_ids": [2, 3]},
+            ],
+            env_extras={"judge_score": 0.75},
+            truncated=False,
+            reward=1.0,
+        ),
+        Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1]},
+                {"role": "assistant", "token_ids": [2, 3, 4, 5]},
+            ],
+            env_extras={"judge_score": 0.25},
+            truncated=True,
+            reward=0.0,
+        ),
+    ]
+
+    metrics = impl._compute_rollout_metrics(completions, "swe/e2e")
+    prefix = "environment/swe_e2e-"
+    environment_prefix = next(
+        key.removesuffix("/gen_tokens_per_sample/histogram")
+        for key in metrics
+        if key.startswith(prefix) and key.endswith("/gen_tokens_per_sample/histogram")
+    )
+
+    assert metrics[f"{environment_prefix}/gen_tokens_per_sample/histogram"] == [2, 4]
+    assert metrics[f"{environment_prefix}/total_reward/histogram"] == [1.0, 0.0]
+    assert metrics[f"{environment_prefix}/truncated/histogram"] == [0, 1]
+    assert metrics[f"{environment_prefix}/env_extra/judge_score/histogram"] == [
+        0.75,
+        0.25,
+    ]
+    assert metrics[f"{environment_prefix}/sample_count"] == 2
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):

@@ -5972,6 +5972,27 @@ class TestAggregateRolloutMetrics:
         assert result["agent/reward/histogram"] == [0.1, 0.2, 0.3]
         assert result["histogram/gen_tokens_length"] == [10, 20, 30]
 
+    def test_environment_histogram_recomputes_exact_step_statistics(self):
+        metrics = {
+            "environment/swe/gen_tokens_per_sample/mean": [15.0, 70.0],
+            "environment/swe/gen_tokens_per_sample/median": [15.0, 70.0],
+            "environment/swe/gen_tokens_per_sample/histogram": [
+                [10, 20],
+                [40, 100],
+            ],
+            "environment/swe/sample_count": [2, 2],
+        }
+
+        result = aggregate_rollout_metrics(metrics)
+
+        assert result["environment/swe/gen_tokens_per_sample/mean"] == 42.5
+        assert result["environment/swe/gen_tokens_per_sample/median"] == 30.0
+        assert result["environment/swe/gen_tokens_per_sample/p50"] == 30.0
+        assert result["environment/swe/gen_tokens_per_sample/p95"] == pytest.approx(
+            91.0
+        )
+        assert result["environment/swe/sample_count"] == 4
+
     def test_histogram_substring_keys_still_average(self):
         """Histogram-like substrings do not identify distributions."""
         metrics = {
