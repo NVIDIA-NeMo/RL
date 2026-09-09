@@ -46,7 +46,6 @@ GymComponent: TypeAlias = Literal[
     "responses_api_agents",
     "resources_servers",
 ]
-GymCheckpointFeature: TypeAlias = Literal["completed_result_acknowledgement"]
 NonNegativeInt: TypeAlias = Annotated[int, Field(strict=True, ge=0)]
 PositiveInt: TypeAlias = Annotated[int, Field(strict=True, ge=1)]
 NonNegativeFloat: TypeAlias = Annotated[float, Field(ge=0)]
@@ -124,7 +123,9 @@ class GymControlCapabilities(_StrictWireModel):
     ]
     active_checkpoint_id: str | None = None
     deadline_ts: FiniteFloat | None = None
-    features: list[GymCheckpointFeature] = Field(default_factory=list)
+    # Capabilities are additive. Older NeMo-RL clients must tolerate features
+    # advertised by a newer Gym and explicitly check only the ones they require.
+    features: list[str] = Field(default_factory=list)
 
     def participant(self, server_name: str) -> GymParticipantIdentity:
         """Bind Gym's reported identity to its NeMo-RL routing name."""
@@ -156,7 +157,7 @@ class GymCheckpointParticipantContract(_StrictWireModel):
     ]
     multi_process: GymMultiProcessCapability
     instance_role: Literal["policy", "auxiliary"] | None = None
-    features: list[GymCheckpointFeature] = Field(default_factory=list)
+    features: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_discovered(
@@ -203,9 +204,16 @@ class GymCheckpointTopology(_StrictWireModel):
         return cls(participants=contracts)
 
     def fingerprint(self) -> str:
-        """Return a canonical digest without runtime routing or credentials."""
+        """Return a canonical digest without runtime or additive capabilities."""
+        compatibility_identity = {
+            "schema_version": self.schema_version,
+            "participants": [
+                participant.model_dump(mode="json", exclude={"features"})
+                for participant in self.participants
+            ],
+        }
         payload = json.dumps(
-            self.model_dump(mode="json"),
+            compatibility_identity,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
