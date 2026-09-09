@@ -190,3 +190,30 @@ def test_main_preserves_generation_config_through_setup(
         config_for_setup.policy["generation"]["vllm_cfg"]["refit_with_reload_api"]
         is True
     )
+
+
+def test_main_passes_processor_for_vlm(
+    main_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = SimpleNamespace(tokenizer="vlm-tokenizer")
+    get_tokenizer = MagicMock(return_value=processor)
+    setup_single_controller = MagicMock(
+        return_value=(main_context.actor_args, SetupTimingMetrics())
+    )
+    main_context.config.policy["is_vlm"] = True
+    monkeypatch.setattr(run_grpo_single_controller, "get_tokenizer", get_tokenizer)
+    monkeypatch.setattr(
+        run_grpo_single_controller,
+        "setup_single_controller",
+        setup_single_controller,
+    )
+
+    run_grpo_single_controller.main()
+
+    get_tokenizer.assert_called_once_with(
+        main_context.config.policy["tokenizer"], get_processor=True
+    )
+    setup_single_controller.assert_called_once_with(
+        main_context.config, "vlm-tokenizer", processor=processor
+    )

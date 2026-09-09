@@ -146,6 +146,27 @@ checkpointing:
   enabled: false
   checkpoint_dir: results/ppo-single-controller
   metric_name: null
+  # Periodic rollout snapshots need an immutable trainer anchor for every
+  # completed step. Keep this at 1 when
+  # rollout_checkpointing.snapshot_attempt_interval_s is set.
+  save_period: 1
+  # Include native TQ state and the metadata-only replay index. A save failure
+  # aborts checkpoint finalization.
+  save_data_plane: true
+
+# Frequent rollout-only snapshots are disabled unless
+# snapshot_attempt_interval_s is set. When
+# disabled, existing periodic snapshots are ignored. Enabling them requires a
+# durable trainer checkpoint for the current completed step and native TQ
+# checkpoint support. save_period=1 provides an anchor after every train step.
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+  keep_latest_k: 2
+  restore_mode: latest
+  # Advanced escape hatch for runtime-only fields from external integrations.
+  # Every config path not excluded here or by NeMo-RL's built-in denylist must
+  # match before a bootstrap rollout snapshot can be restored.
+  extra_fingerprint_excluded_paths: []
 
 policy:
   tokenizer:
@@ -217,6 +238,24 @@ data_plane:
 token_capture:
   enabled: false
   staging_partition: rollout_staging
+
+# Retry and restore policy for unfinished token-capture groups. "sibling" reuses
+# already sealed generations; "prompt_group" regenerates every sibling when any
+# sibling fails in-process or was unfinished at a checkpoint.
+rollout_recovery:
+  default_granularity: sibling
+  # Per-Gym-task-source override, keyed on extra_env_info.task_source.
+  #   task_source_granularity_overrides:
+  #     genrm_compare_resources_server: prompt_group
+  task_source_granularity_overrides: {}
+  # Agent-specific override for rows already carrying extra_env_info.agent_ref.
+  # A matching agent entry wins over a matching task-source entry and also
+  # provides compatibility for legacy datasets without task_source.
+  #   agent_granularity_overrides: {genrm_agent: prompt_group}
+  agent_granularity_overrides: {}
+
+# Leaving either map above non-empty requires the top-level token_capture section
+# to set enabled: true.
 
 cluster:
   # Master ports inherit the shared 1400-1999 band from ppo_math_1B.yaml.
