@@ -60,6 +60,8 @@ LoRA settings live under `policy.dtensor_cfg.lora_cfg`:
 policy:
   dtensor_cfg:
     _v2: true                   # LoRA requires DTensor v2
+    automodel_kwargs:
+      force_hf: true            # Required for native vLLM LoRA refit
     lora_cfg:
       enabled: False            # Set to True to enable LoRA fine-tuning
       target_modules: []        # List of module names to apply LoRA
@@ -154,16 +156,35 @@ See the [SFT guide](sft.md) for the full SFT workflow.
 GRPO supports LoRA on both backends. Enable the DTensor adapter with:
 
 ```bash
-uv run examples/run_grpo.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_grpo.py \
+  policy.dtensor_cfg.lora_cfg.enabled=true \
+  policy.dtensor_cfg.automodel_kwargs.force_hf=true
 ```
 
-The DTensor GRPO LoRA path uses a **merge-weight** approach: during generation, LoRA adapter
-weights are merged into the base linear weights. This improves performance at the cost of a
-small train/inference mismatch that we consider acceptable. If you require strict
-train/inference parity, use the
-[split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async),
-which may trade off some performance. For a comparison between merge-weight and split-weight,
-see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
+For DTensor v2 training with synchronous vLLM generation, **native LoRA refit is the
+default**: NeMo RL sends only the factorized A/B tensors, replaces an in-memory vLLM
+adapter, and selects it on every generation request. The base model is loaded once and is
+not overwritten during adapter updates.
+
+Native refit currently supports the topology-default transport (colocated CUDA IPC or
+non-colocated NCCL), BF16/FP16 rollout policies, and the Hugging Face Automodel path
+(`policy.dtensor_cfg.automodel_kwargs.force_hf=true`). It fails at setup for unsupported
+combinations such as asynchronous vLLM, speculative decoding, quantized rollout models,
+custom refit transports, or Megatron LoRA. Models with dynamically updated MoE router
+bias fail before their first native refit rather than silently omitting that mutable state.
+
+The previous full-weight behavior remains available as an explicit compatibility or
+performance opt-in:
+
+```yaml
+policy:
+  generation:
+    lora_refit_mode: merged
+```
+
+Merged refit materializes `W + scale * B @ A` in the rollout dtype. In reduced precision,
+this can discard LoRA updates that are smaller than the BF16/FP16 spacing of the base
+weight and therefore can increase the trainer/generation logprob mismatch.
 
 See the [GRPO guide](grpo.md) for the full GRPO workflow.
 
