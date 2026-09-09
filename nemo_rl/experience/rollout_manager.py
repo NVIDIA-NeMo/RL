@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import enum
+import hashlib
 import json
 import math
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -130,6 +132,18 @@ def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
     if isinstance(task_source, str) and task_source:
         return f"task-source:{task_source}"
     return "nemo_gym"
+
+
+_METRIC_COMPONENT_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _rollout_environment_metric_component(environment: str) -> str:
+    """Return a readable metric path component without silent collisions."""
+    sanitized = _METRIC_COMPONENT_PATTERN.sub("_", environment).strip("_.")
+    if sanitized == environment:
+        return sanitized
+    digest = hashlib.blake2s(environment.encode(), digest_size=8).hexdigest()
+    return f"{sanitized or 'unknown'}-{digest}"
 
 
 class RolloutOutcome(str, enum.Enum):
@@ -1550,6 +1564,48 @@ class AsyncNemoGymRolloutImpl:
             f"{agent_name}/truncation_rate": truncation_rate,
         }
 
+        # Keep global metrics for continuity, and also retain distributions under
+        # the resolved environment name. SingleController selects the exact groups
+        # used by training before aggregating these observations, so mixed-task
+        # runs can diagnose one environment without contamination from another.
+        environment = _rollout_environment_metric_component(agent_name)
+        environment_prefix = f"environment/{environment}"
+        rollout_metrics.update(
+            calculate_single_metric(
+                total_reward, n, f"{environment_prefix}/total_reward"
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                turn_count, n, f"{environment_prefix}/turns_per_sample"
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                total_tokens, n, f"{environment_prefix}/total_tokens_per_sample"
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                assistant_tokens, n, f"{environment_prefix}/gen_tokens_per_sample"
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                max_gen_tokens_per_turn,
+                n,
+                f"{environment_prefix}/max_gen_tokens_per_turn",
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                [int(value) for value in truncated],
+                n,
+                f"{environment_prefix}/truncated",
+            )
+        )
+        rollout_metrics[f"{environment_prefix}/sample_count"] = n
+
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
         agent_extras = [
@@ -1565,6 +1621,13 @@ class AsyncNemoGymRolloutImpl:
             if values:
                 rollout_metrics.update(
                     calculate_single_metric(values, n, f"{agent_name}/{key}")
+                )
+                rollout_metrics.update(
+                    calculate_single_metric(
+                        values,
+                        n,
+                        f"{environment_prefix}/env_extra/{key}",
+                    )
                 )
 
         # Emit authoritative live token metrics after full-result metrics so
