@@ -158,8 +158,9 @@ indexes. It also requires
 terminal result until the canonical TQ and replay-buffer commit has succeeded.
 On restore, Gym validates and rehydrates its own artifacts, and NeMo-RL checks
 that Gym reports the same sidecar digests and that every indexed TQ row exists.
-NeMo-RL retains a full-lineage scan only for restoring snapshots created before
-the sidecar contract existed.
+The continuation and external-storage indexes are required; checkpoints that
+omit either sidecar fail closed instead of making NeMo-RL inspect Gym's private
+lineage format.
 Use `restore_mode: latest`: full trainer checkpoints do not yet contain Gym
 participant state, so startup fails safely if no compatible periodic rollout
 snapshot exists for the selected trainer anchor.

@@ -22,12 +22,16 @@ from pydantic import ValidationError
 
 from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
+    GymAgentCommitResponse,
+    GymAgentRestoreResponse,
     GymCheckpointCommitResult,
     GymCheckpointRestoreResult,
     GymCheckpointTopology,
     GymControlCapabilities,
     GymDiscoveredParticipant,
     GymExecutionIdentity,
+    GymModelCommitResponse,
+    GymModelRestoreResponse,
     gym_capture_key,
     gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
@@ -209,7 +213,7 @@ def test_turn_recovery_capability_guardrails(
 
 
 def test_participant_manifest_digest_is_verified_before_publication(tmp_path) -> None:
-    manifest_path = tmp_path / "agent" / "manifest.json"
+    manifest_path = tmp_path / "resources" / "manifest.json"
     manifest_path.parent.mkdir()
     manifest_path.write_text("{}")
     digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
@@ -219,18 +223,18 @@ def test_participant_manifest_digest_is_verified_before_publication(tmp_path) ->
             "participants": [
                 {
                     "participant": {
-                        "server_name": "agent-route",
-                        "component": "responses_api_agents",
-                        "participant_name": "agent",
+                        "server_name": "resources-route",
+                        "component": "resources_servers",
+                        "participant_name": "resources",
                     },
-                    "payload": {"records": 1, "manifest_digest": digest},
+                    "payload": {"sessions": 1, "manifest_digest": digest},
                     "manifest": {
                         "participant": {
-                            "server_name": "agent-route",
-                            "component": "responses_api_agents",
-                            "participant_name": "agent",
+                            "server_name": "resources-route",
+                            "component": "resources_servers",
+                            "participant_name": "resources",
                         },
-                        "relative_path": "agent/manifest.json",
+                        "relative_path": "resources/manifest.json",
                         "manifest_digest": digest,
                     },
                 }
@@ -245,7 +249,7 @@ def test_participant_manifest_digest_is_verified_before_publication(tmp_path) ->
         validate_gym_checkpoint_manifests(tmp_path, checkpoint)
 
 
-def test_model_lineage_staging_keys_are_bound_to_the_tq_snapshot(tmp_path) -> None:
+def test_private_lineage_is_not_scanned_for_tq_staging_ownership(tmp_path) -> None:
     agent_dir = tmp_path / "agent" / "instance-test"
     agent_dir.mkdir(parents=True)
     agent_record_path = agent_dir / "group-7_g0.a0.json"
@@ -260,11 +264,34 @@ def test_model_lineage_staging_keys_are_bound_to_the_tq_snapshot(tmp_path) -> No
         )
     )
     agent_record_digest = hashlib.sha256(agent_record_path.read_bytes()).hexdigest()
+    continuation_path = agent_dir / "continuations.jsonl"
+    continuation_payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "rollout_id": "group-7_g0",
+                "attempt_index": 0,
+                "capture_key": "group-7_g0",
+                "last_committed_model_call_id": "call-1",
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+    continuation_path.write_bytes(continuation_payload)
+    continuation_reference = {
+        "schema_version": 1,
+        "relative_path": "agent/instance-test/continuations.jsonl",
+        "sha256": hashlib.sha256(continuation_payload).hexdigest(),
+        "records": 1,
+        "bytes": len(continuation_payload),
+    }
     agent_manifest_path = agent_dir / "manifest.json"
     agent_manifest_path.write_text(
         json.dumps(
             {
                 "files": {agent_record_path.name: agent_record_digest},
+                "continuation_index": continuation_reference,
             }
         )
     )
@@ -331,6 +358,29 @@ def test_model_lineage_staging_keys_are_bound_to_the_tq_snapshot(tmp_path) -> No
         )
     )
     manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    reference_path = ledger_dir / "storage-references.jsonl"
+    reference_rows = [
+        {
+            "schema_version": 1,
+            "capture_key": "group-7_g0",
+            "boundary_model_call_id": "call-1",
+            "kind": "token_capture_staging",
+            "key": key,
+        }
+        for key in ("group-7_g0/source-call", "group-7_g0/call-1")
+    ]
+    reference_payload = b"".join(
+        json.dumps(row, separators=(",", ":")).encode() + b"\n"
+        for row in reference_rows
+    )
+    reference_path.write_bytes(reference_payload)
+    storage_reference = {
+        "schema_version": 1,
+        "relative_path": "model-ledger/policy_model/storage-references.jsonl",
+        "sha256": hashlib.sha256(reference_payload).hexdigest(),
+        "records": len(reference_rows),
+        "bytes": len(reference_payload),
+    }
     checkpoint = GymCheckpointCommitResult.model_validate(
         {
             "checkpoint_id": "snapshot-7",
@@ -346,6 +396,7 @@ def test_model_lineage_staging_keys_are_bound_to_the_tq_snapshot(tmp_path) -> No
                         "rows": 3,
                         "excluded_tombstoned": 0,
                         "manifest_digest": manifest_digest,
+                        "storage_reference_index": storage_reference,
                     },
                     "manifest": {
                         "participant": {
@@ -366,6 +417,7 @@ def test_model_lineage_staging_keys_are_bound_to_the_tq_snapshot(tmp_path) -> No
                     "payload": {
                         "records": 1,
                         "manifest_digest": agent_manifest_digest,
+                        "continuation_index": continuation_reference,
                     },
                     "manifest": {
                         "participant": {
@@ -387,8 +439,52 @@ def test_model_lineage_staging_keys_are_bound_to_the_tq_snapshot(tmp_path) -> No
     }
 
     lineage_path.write_text("{}\n")
-    with pytest.raises(ValueError, match="lineage digest mismatch"):
-        gym_checkpoint_staging_keys(tmp_path, checkpoint)
+    assert gym_checkpoint_staging_keys(tmp_path, checkpoint) == {
+        "group-7_g0/source-call",
+        "group-7_g0/call-1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("response_type", "payload", "missing_field"),
+    [
+        (
+            GymModelCommitResponse,
+            {
+                "rollouts": 0,
+                "rows": 0,
+                "excluded_tombstoned": 0,
+                "manifest_digest": "a" * 64,
+            },
+            "storage_reference_index",
+        ),
+        (
+            GymAgentCommitResponse,
+            {"records": 0, "manifest_digest": "a" * 64},
+            "continuation_index",
+        ),
+        (
+            GymModelRestoreResponse,
+            {
+                "rollouts": 0,
+                "rows": 0,
+                "tombstones": [],
+                "source_attempts": [],
+            },
+            "storage_reference_index",
+        ),
+        (
+            GymAgentRestoreResponse,
+            {"records": 0, "source_checkpoint_id": "snapshot-7"},
+            "continuation_index",
+        ),
+    ],
+)
+def test_checkpoint_wire_contract_requires_artifact_indexes(
+    response_type, payload, missing_field
+) -> None:
+    with pytest.raises(ValidationError, match=missing_field):
+        response_type.model_validate(payload)
 
 
 def test_storage_reference_index_avoids_private_lineage_scan(tmp_path) -> None:
@@ -533,6 +629,10 @@ def test_restore_must_report_the_committed_artifact_coordinates() -> None:
                         "checkpoint_id": "snapshot-7",
                         "tombstones": [],
                         "source_attempts": [],
+                        "storage_reference_index": {
+                            **storage_reference,
+                            "sha256": "e" * 64,
+                        },
                     },
                 }
             ],
@@ -557,6 +657,13 @@ def test_checkpoint_commit_rejects_mismatched_manifest_identity() -> None:
                         "payload": {
                             "records": 1,
                             "manifest_digest": "a" * 64,
+                            "continuation_index": {
+                                "schema_version": 1,
+                                "relative_path": "agent/continuations.jsonl",
+                                "sha256": "b" * 64,
+                                "records": 1,
+                                "bytes": 64,
+                            },
                         },
                         "manifest": {
                             "participant": {
