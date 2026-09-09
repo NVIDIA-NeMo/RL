@@ -24,6 +24,8 @@ policy:
   dtensor_cfg:
     expert_parallel_size: 8
     activation_checkpointing: true
+    moe_parallelizer:
+      reshard_after_forward: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     automodel_kwargs:

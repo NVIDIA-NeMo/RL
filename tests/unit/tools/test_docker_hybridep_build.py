@@ -82,6 +82,13 @@ def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
             assert "HYBRID_EP_MULTINODE" in cache_key_line, (
                 f"{dockerfile} can reuse a single-node DeepEP wheel"
             )
+            actor_prefetch_end = "done < /opt/actor_venvs.tsv"
+            assert actor_prefetch_end in lines, (
+                f"{dockerfile} does not prefetch actor dependencies"
+            )
+            assert lines.index(actor_prefetch_end) < nvml_link_dependency_purge_index, (
+                f"{dockerfile} removes the NVML link dependency before actor venv sync"
+            )
 
         assert (
             lines.index(setting)

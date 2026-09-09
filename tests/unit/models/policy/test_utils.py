@@ -100,6 +100,10 @@ def test_resolve_model_class_selects_requested_loader(
     assert resolve_model_class(model_type) is expected_default
 
 
+def test_resolve_model_class_routes_gemma4_unified_to_image_text_model():
+    assert "ImageTextToText" in resolve_model_class("gemma4_unified").__name__
+
+
 class TestGetMegatronCheckpointDir:
     """Test cases for the get_megatron_checkpoint_dir function."""
 
