@@ -43,6 +43,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
@@ -54,6 +55,20 @@ class _InitBuffer:
     """Minimal non-optional TQ buffer contract for actor-init tests."""
 
     def __init__(self) -> None:
+        self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
+
+
+class _InitRolloutManager:
+    """Minimal rollout-manager contract for actor-init tests."""
+
+    def __init__(self, tq_buffer: _InitBuffer) -> None:
+        self._tq_buffer = tq_buffer
+        self.recovery_ledger = RolloutRecoveryLedger()
         self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
 
     def set_data_plane_checkpoint_barrier(
@@ -111,7 +126,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
+        rollout_manager=_InitRolloutManager(tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -121,6 +136,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         last_checkpoint_path=None,
         finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
+        bootstrap_identity=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -161,7 +177,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
+        rollout_manager=_InitRolloutManager(tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -595,6 +611,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -655,6 +672,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
     assert "advantages" in (result_meta.fields or [])
+    assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
 
 
 @pytest.mark.parametrize(
@@ -693,6 +711,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -757,6 +776,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -822,6 +842,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -889,6 +910,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -950,6 +972,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -1030,6 +1053,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
 
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = FakeEstimator()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
@@ -1195,6 +1219,12 @@ class _SequenceSampler(_EmptySampler):
 class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
+
+    def training_owned_group_ids(self) -> set[str]:
+        return set()
+
+    def release_training_claims(self, group_ids: list[str]) -> None:
+        assert not group_ids
 
 
 class _NoOpTrainer:
@@ -2340,6 +2370,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False

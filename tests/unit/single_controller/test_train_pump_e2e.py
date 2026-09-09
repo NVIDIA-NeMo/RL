@@ -306,10 +306,13 @@ def test_train_pump_drives_mcore_training_step(
             sync_weights=lambda *, kv_scales=None: None,
         )
         adv_est = _FakeAdvEstimator()
-        # Rollout manager stub — SC.__init__ only touches ._tq_buffer; the pump
-        # additionally publishes versions and resumes request-deadline clocks.
+        # Rollout manager stub — recovery is disabled for this native rollout test,
+        # but SC still binds the shared data-plane checkpoint barrier at startup; the
+        # pump additionally publishes versions and resumes request-deadline clocks.
         rollout_manager = SimpleNamespace(
             _tq_buffer=None,
+            recovery_ledger=None,
+            set_data_plane_checkpoint_barrier=lambda _barrier: None,
             set_weight_version=lambda v: ray.get(
                 log.record.remote("set_weight_version", {"version": int(v)})
             ),
