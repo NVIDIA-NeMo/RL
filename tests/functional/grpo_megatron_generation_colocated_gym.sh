@@ -89,7 +89,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Smoke-level thresholds, mirroring grpo_megatron_generation_async_gym.sh.
+# Lag-0 run: strict engine/trainer token parity on top of the standard gym gates.
 uv run tests/check_metrics.py $JSON_METRICS \
+    'max(data["train/token_mult_prob_error"]) < 1.05' \
     'median(data["train/gen_kl_error"]) < 1.3' \
     'data["validation/accuracy"]["10"] > 0.1'

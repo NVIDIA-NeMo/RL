@@ -142,6 +142,11 @@ def _prepopulate_buffer(
     # Group id follows pack_payload's "{group_uuid}_g{i}" convention.
     group_id = meta.sample_ids[0].rpartition("_g")[0]
     buffer._group_ids.append(group_id)
+    # Token-capture bookkeeping: a hand-inserted, already-finalized slot owns
+    # no rollout ids and no staged rows. Every parallel list must stay in
+    # lockstep or remove() indexes past the end.
+    buffer._rollout_ids_list.append(None)
+    buffer._staging_keys_list.append(None)
 
 
 @pytest.fixture(scope="function")
@@ -179,6 +184,15 @@ class _FakeAdvEstimator:
 
 class _FakeGeneration:
     """Unsupported generation backend for this training-pump-only test."""
+
+    def blocks_training(self) -> bool:
+        return False
+
+    def snapshot_step_metrics(self) -> None:
+        pass
+
+    def get_step_metrics(self) -> dict[str, float]:
+        return {}
 
     def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
         del clear_cache
@@ -312,12 +326,18 @@ def test_train_pump_drives_mcore_training_step(
             sync_weights=lambda *, kv_scales=None: None,
         )
         adv_est = _FakeAdvEstimator()
-        # Rollout manager stub — SC.__init__ only touches ._tq_buffer.
+        # Rollout manager stub — recovery is disabled for this native rollout test,
+        # but SC still binds the shared data-plane checkpoint barrier at startup; the
+        # pump additionally publishes versions and resumes request-deadline clocks.
         rollout_manager = SimpleNamespace(
             _tq_buffer=None,
+            recovery_ledger=None,
+            set_data_plane_checkpoint_barrier=lambda _barrier: None,
             set_weight_version=lambda v: ray.get(
                 log.record.remote("set_weight_version", {"version": int(v)})
             ),
+            suspend_request_deadlines=lambda: None,
+            resume_request_deadlines=lambda: None,
         )
 
         master_config = MasterConfig.model_construct(
@@ -379,6 +399,7 @@ def test_train_pump_drives_mcore_training_step(
             partition_id=_PARTITION_ID,
             save_state=_initial_grpo_save_state(),
             last_checkpoint_path=None,
+            finalizer_actors=[],
         )
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,

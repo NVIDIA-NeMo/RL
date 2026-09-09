@@ -35,6 +35,7 @@ import numpy as np
 import torch
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
+from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS
 from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -45,7 +46,11 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-TOKEN_ALIGNED_FIELDS = frozenset(
+# Fields the codec packs jagged via ``pack_per_token_field``. Rest go
+# through ``.detach().contiguous()``. Add per-token fields here — no
+# separate structural check is needed because the codec's binary
+# dispatch (Tensor | ndarray[object]) errors loudly on unknown types.
+_TEXT_TOKEN_ALIGNED_FIELDS = frozenset(
     {
         "input_ids",
         "generation_logprobs",
@@ -62,6 +67,11 @@ TOKEN_ALIGNED_FIELDS = frozenset(
         MALFORMED_THINKING_MASK,
     }
 )
+
+# Per-token multimodal type maps are sequence-aligned too, so they pack the
+# same way. Unioned from the registry rather than re-listed, so a new
+# per-token modality cannot be added there and silently forgotten here.
+TOKEN_ALIGNED_FIELDS = _TEXT_TOKEN_ALIGNED_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
 
 
 def round_up(value: int, multiple: int) -> int:
@@ -108,6 +118,7 @@ def read_columns(
         layout=layout,
         pad_value_dict=pad_value_dict,
         pad_to_seqlen=pad_to_seqlen,
+        tags=meta.tags,
     )
     attach_message_log_view(data)
     return data
@@ -197,12 +208,26 @@ def kv_first_write(
             f"kv_first_write: tags ({len(tags)}) must match batch size ({n})"
         )
     lengths = final_batch_cpu["input_lengths"]
-    fields: dict[str, torch.Tensor | np.ndarray] = {
-        k: v
-        for k, v in final_batch_cpu.items()
-        if isinstance(v, torch.Tensor)
-        or (isinstance(v, np.ndarray) and v.dtype == object)
-    }
+    # Binary wire dispatch: only ``torch.Tensor`` (including
+    # ``torch.nested``) and ``np.ndarray[object]`` cross the codec.
+    # Raise loudly on anything else instead of silently dropping —
+    # that's the class of silent-drop bug that let PackedTensor
+    # pixel_values disappear from the TQ pipe pre-Option B.
+    fields: dict[str, torch.Tensor | np.ndarray] = {}
+    for k, v in final_batch_cpu.items():
+        if isinstance(v, torch.Tensor) or (
+            isinstance(v, np.ndarray) and v.dtype == object
+        ):
+            fields[k] = v
+        else:
+            raise TypeError(
+                f"Field {k!r}: unexpected wire type {type(v).__name__}. "
+                "Only torch.Tensor (incl. torch.nested) and "
+                "np.ndarray[object] cross the wire boundary. Convert "
+                "domain-layer wrappers (e.g. PackedTensor via "
+                "torch.nested.as_nested_tensor) in the rollout actor "
+                "before calling kv_first_write."
+            )
     td = pack_jagged_fields(
         fields,
         lengths=lengths,

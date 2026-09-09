@@ -17,11 +17,13 @@ from collections import Counter
 import pytest
 from PIL import Image
 
-import nemo_rl.data.multimodal_utils as multimodal_utils
+import nemo_rl.environments.nemo_gym_multimodal as nemo_gym_multimodal
 from nemo_rl.data.multimodal_utils import (
-    encode_images_in_examples,
     image_to_data_url,
     resolve_to_image,
+)
+from nemo_rl.environments.nemo_gym_multimodal import (
+    normalize_media_in_examples,
 )
 
 
@@ -59,7 +61,7 @@ def test_resolve_to_image_accepts_file_scheme(tmp_path):
     assert resolve_to_image(path).size == (5, 6)
 
 
-def test_encode_images_encodes_local_paths_and_file_urls(tmp_path):
+def test_normalize_media_encodes_local_image_paths_and_file_urls(tmp_path):
     plain = _write_png(tmp_path, "plain.png", (2, 2))
     file_url = "file://" + _write_png(tmp_path, "scheme.png", (3, 3))
 
@@ -70,7 +72,7 @@ def test_encode_images_encodes_local_paths_and_file_urls(tmp_path):
             {"type": "input_text", "text": "describe"},
         )
     ]
-    encode_images_in_examples(examples)
+    normalize_media_in_examples(examples)
 
     parts = examples[0]["responses_create_params"]["input"][0]["content"]
     assert parts[0]["image_url"].startswith("data:image/png;base64,")
@@ -81,7 +83,7 @@ def test_encode_images_encodes_local_paths_and_file_urls(tmp_path):
     assert parts[2] == {"type": "input_text", "text": "describe"}
 
 
-def test_encode_images_passes_through_http_and_data_urls():
+def test_normalize_media_passes_through_http_and_data_urls():
     data_url = image_to_data_url(Image.new("RGB", (2, 2)))
     examples = [
         _example(
@@ -90,7 +92,7 @@ def test_encode_images_passes_through_http_and_data_urls():
             {"type": "input_image", "image_url": data_url},
         )
     ]
-    encode_images_in_examples(examples)
+    normalize_media_in_examples(examples)
 
     parts = examples[0]["responses_create_params"]["input"][0]["content"]
     assert parts[0]["image_url"] == "https://example.com/cat.png"
@@ -104,7 +106,7 @@ def test_encode_images_deduplicates_sources_and_uses_a_bounded_thread_pool(
     first = _write_png(tmp_path, "first.png", (2, 3))
     second = _write_png(tmp_path, "second.png", (4, 5))
     expected = {
-        source: multimodal_utils._encode_single_image_source(source)
+        source: nemo_gym_multimodal._encode_single_image_source(source)
         for source in (first, second)
     }
     examples = [
@@ -117,31 +119,117 @@ def test_encode_images_deduplicates_sources_and_uses_a_bounded_thread_pool(
     ]
 
     resolve_calls = []
-    original_resolve = multimodal_utils.resolve_to_image
+    original_resolve = nemo_gym_multimodal.resolve_to_image
 
     def tracking_resolve(source):
         resolve_calls.append(source)
         return original_resolve(source)
 
     observed_max_workers = []
-    original_executor = multimodal_utils.ThreadPoolExecutor
+    original_executor = nemo_gym_multimodal.ThreadPoolExecutor
 
     def tracking_executor(*args, **kwargs):
         observed_max_workers.append(kwargs.get("max_workers"))
         return original_executor(*args, **kwargs)
 
-    monkeypatch.setattr(multimodal_utils, "resolve_to_image", tracking_resolve)
-    monkeypatch.setattr(multimodal_utils, "ThreadPoolExecutor", tracking_executor)
+    monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", tracking_resolve)
+    monkeypatch.setattr(nemo_gym_multimodal, "ThreadPoolExecutor", tracking_executor)
 
-    encode_images_in_examples(examples)
+    normalize_media_in_examples(examples)
 
     assert Counter(resolve_calls) == Counter({first: 1, second: 1})
-    assert observed_max_workers == [multimodal_utils.NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS]
+    assert observed_max_workers == [
+        nemo_gym_multimodal._NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
+    ]
     for example in examples:
         parts = example["responses_create_params"]["input"][0]["content"]
-        assert parts[0]["image_url"] == expected[first]
-        assert parts[1]["image"] == expected[first]
-        assert parts[2]["url"] == expected[second]
+        assert parts[0] == {
+            "type": "input_image",
+            "image_url": expected[first],
+        }
+        assert parts[1] == {
+            "type": "input_image",
+            "image_url": expected[first],
+        }
+        assert parts[2] == {
+            "type": "input_image",
+            "image_url": expected[second],
+        }
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "image", "image": "a.png", "url": "b.png"},
+        {"type": "image"},
+    ],
+)
+def test_normalize_media_requires_exactly_one_source_key(part):
+    with pytest.raises(ValueError, match="requires exactly one"):
+        normalize_media_in_examples([_example(part)])
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["", {"url": ""}],
+)
+def test_normalize_media_rejects_empty_urls(source):
+    with pytest.raises(ValueError, match="requires a non-empty media URL"):
+        normalize_media_in_examples(
+            [_example({"type": "input_image", "image_url": source})]
+        )
+
+
+def test_normalize_media_preserves_input_image_file_id():
+    part = {"type": "input_image", "file_id": "file-123", "detail": "high"}
+    examples = [_example(part)]
+
+    normalize_media_in_examples(examples)
+
+    assert examples[0]["responses_create_params"]["input"][0]["content"][0] == {
+        "type": "input_image",
+        "file_id": "file-123",
+        "detail": "high",
+    }
+
+
+def test_normalize_media_promotes_nested_image_detail():
+    data_url = image_to_data_url(Image.new("RGB", (2, 2)))
+    examples = [
+        _example(
+            {
+                "type": "image",
+                "image": {"url": data_url, "detail": "high"},
+            }
+        )
+    ]
+
+    normalize_media_in_examples(examples)
+
+    assert examples[0]["responses_create_params"]["input"][0]["content"][0] == {
+        "type": "input_image",
+        "image_url": data_url,
+        "detail": "high",
+    }
+
+
+def test_normalize_media_canonicalizes_local_video(tmp_path, monkeypatch):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    encoded_url = "data:video/mp4;base64,dmlkZW8="
+    monkeypatch.setattr(
+        nemo_gym_multimodal,
+        "video_path_to_data_url",
+        lambda source: encoded_url,
+    )
+    examples = [_example({"type": "video", "url": str(video_path)})]
+
+    normalize_media_in_examples(examples)
+
+    assert examples[0]["responses_create_params"]["input"][0]["content"][0] == {
+        "type": "input_video",
+        "video_url": encoded_url,
+    }
 
 
 def test_encode_images_does_not_partially_mutate_on_error(tmp_path):
@@ -155,7 +243,7 @@ def test_encode_images_does_not_partially_mutate_on_error(tmp_path):
     ]
 
     with pytest.raises(FileNotFoundError):
-        encode_images_in_examples(examples)
+        normalize_media_in_examples(examples)
 
     parts = examples[0]["responses_create_params"]["input"][0]["content"]
     assert parts[0]["image_url"] == existing
@@ -164,15 +252,15 @@ def test_encode_images_does_not_partially_mutate_on_error(tmp_path):
 
 def test_encode_single_image_source_closes_image_on_success(monkeypatch):
     image = _CloseTrackingImage()
-    monkeypatch.setattr(multimodal_utils, "resolve_to_image", lambda _: image)
+    monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", lambda _: image)
     monkeypatch.setattr(
-        multimodal_utils,
+        nemo_gym_multimodal,
         "image_to_data_url",
         lambda _: "data:image/png;base64,AA",
     )
 
     assert (
-        multimodal_utils._encode_single_image_source("image.png")
+        nemo_gym_multimodal._encode_single_image_source("image.png")
         == "data:image/png;base64,AA"
     )
     assert image.closed
@@ -180,27 +268,29 @@ def test_encode_single_image_source_closes_image_on_success(monkeypatch):
 
 def test_encode_single_image_source_closes_image_on_error(monkeypatch):
     image = _CloseTrackingImage()
-    monkeypatch.setattr(multimodal_utils, "resolve_to_image", lambda _: image)
+    monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", lambda _: image)
 
     def fail_to_encode(_):
         raise RuntimeError("encoding failed")
 
-    monkeypatch.setattr(multimodal_utils, "image_to_data_url", fail_to_encode)
+    monkeypatch.setattr(nemo_gym_multimodal, "image_to_data_url", fail_to_encode)
 
     with pytest.raises(RuntimeError, match="encoding failed"):
-        multimodal_utils._encode_single_image_source("image.png")
+        nemo_gym_multimodal._encode_single_image_source("image.png")
     assert image.closed
 
 
-def test_encode_images_is_a_noop_for_text_only_examples():
+def test_normalize_media_is_a_noop_for_text_only_examples():
     examples = [_example({"type": "input_text", "text": "no images here"})]
     before = [
         dict(part)
         for part in examples[0]["responses_create_params"]["input"][0]["content"]
     ]
-    assert encode_images_in_examples(examples) is examples
+    assert normalize_media_in_examples(examples) is examples
     assert examples[0]["responses_create_params"]["input"][0]["content"] == before
 
     # Missing/oddly-shaped payloads must not raise.
-    assert encode_images_in_examples([{}, {"responses_create_params": {}}]) is not None
-    assert encode_images_in_examples([{"responses_create_params": {"input": "nope"}}])
+    assert (
+        normalize_media_in_examples([{}, {"responses_create_params": {}}]) is not None
+    )
+    assert normalize_media_in_examples([{"responses_create_params": {"input": "nope"}}])

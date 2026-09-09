@@ -216,6 +216,9 @@ class SequencePackingConfig(TypedDict):
     # Preserve the packer's order (or omit for backward compatibility), or
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
+    fuse_loss: NotRequired[bool]
+    pair_grouping_key: NotRequired[Literal["pair_index"]]
+    max_sequences_per_bin: NotRequired[int]
 
 
 class RewardModelConfig(TypedDict):
@@ -265,6 +268,10 @@ class MegatronOptimizerConfig(TypedDict):
     optimizer_offload_fraction: float
     # overlap optimizer state transfers with CPU optimizer updates
     overlap_cpu_optimizer_d2h_h2d: NotRequired[bool]
+    # Precision-aware Adam moment / remainder dtypes (YAML strings resolved in setup).
+    exp_avg_dtype: NotRequired[str]
+    exp_avg_sq_dtype: NotRequired[str]
+    store_param_remainders: NotRequired[bool]
 
 
 class MegatronSchedulerConfig(TypedDict):
@@ -295,6 +302,8 @@ class Fp8Config(TypedDict):
     # When True, keep parameters in FP8. Can cause NaN token_mult_prob_error;
     # use with caution (see https://github.com/NVIDIA-NeMo/RL/issues/1164).
     fp8_param: NotRequired[bool]
+    # Python import path for a Transformer Engine custom recipe quantizer factory.
+    fp8_quantizer_factory: NotRequired[str]
     # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
     # buffers in offload_before_refit (before weight transfer to the inference
     # engine). These FP8 workspace tensors anchor large CUDA segments and
@@ -362,6 +371,16 @@ class MegatronConfig(TypedDict):
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
+    # Optional multimodal provider controls. These map legacy Omni recipe
+    # names onto the canonical NemotronOmniModel provider fields.
+    freeze_vision_encoder: NotRequired[bool]
+    freeze_vision_projector: NotRequired[bool]
+    freeze_audio_encoder: NotRequired[bool]
+    freeze_audio_projector: NotRequired[bool]
+    moe_router_dtype: str | None
+    moe_router_load_balancing_type: str | list[str]
+    moe_router_bias_update_rate: float
+    moe_permute_fusion: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
     # If True, defer the casting of logits to float32 until the backward pass.
@@ -440,6 +459,9 @@ class MegatronConfig(TypedDict):
     # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
     moe_flex_dispatcher_backend: NotRequired[str]
     moe_hybridep_num_sms: NotRequired[int]
+    # Align packed inputs once before the model forward instead of padding in every
+    # MoE layer. Currently requires NeMo-owned packing, PP=1, and MTP disabled.
+    moe_hybridep_prepad_packed_inputs: NotRequired[bool]
     # Number of HybridEP ranks per NVLink domain (default: min(expert_model_parallel_size, 64))
     hybridep_num_ranks_per_nvlink_domain: NotRequired[int]
     # Enable multi-node NVLink support (default: expert_model_parallel_size > 4)
@@ -467,6 +489,8 @@ class MegatronConfig(TypedDict):
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: NotRequired[float]
+    # Populated by the algorithm before Megatron setup to size the LR scheduler.
+    train_iters: NotRequired[int]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.
     mtp_use_repeated_layer: NotRequired[bool]
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.
@@ -567,6 +591,7 @@ class PolicyConfig(TypedDict):
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
+    offload_optimizer_for_logprob: bool
     logprob_batch_size: NotRequired[int]
     # If set, log probability computation is chunked along the sequence dimension to avoid GPU OOM (especially during backward pass).
     # Within each chunk loop, logits casting (from float16/bfloat16 to float32) is done to prevent holding the entire float32 logits tensor in memory.

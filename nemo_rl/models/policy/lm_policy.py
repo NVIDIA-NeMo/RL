@@ -399,6 +399,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             microbatch_order = config["sequence_packing"].get("microbatch_order")
             if microbatch_order is not None:
                 self.sequence_packing_args["microbatch_order"] = microbatch_order
+            if pair_grouping_key := config["sequence_packing"].get("pair_grouping_key"):
+                self.sequence_packing_args["pair_grouping_key"] = pair_grouping_key
+            if (
+                max_sequences_per_bin := config["sequence_packing"].get(
+                    "max_sequences_per_bin"
+                )
+            ) is not None:
+                self.sequence_packing_args["max_sequences_per_bin"] = (
+                    max_sequences_per_bin
+                )
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )
