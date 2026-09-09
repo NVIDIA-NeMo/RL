@@ -459,7 +459,8 @@ def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
     assert move_kwargs == [{"move_params": True, "move_grads": False}]
 
 
-def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
+@pytest.mark.parametrize("hook_enabled", [False, True])
+def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch, hook_enabled):
     """Params offloaded by colocated generation must be onloaded before the save walks them."""
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -473,7 +474,10 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     worker.optimizer = object()
     worker.scheduler = None
     worker.optimizer_cpu_offload = False
-    worker.should_disable_forward_pre_hook = False
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = lambda: hook_enabled
+    worker.disable_forward_pre_hook = lambda: events.append("disable_hook")
+    worker.enable_forward_pre_hook = lambda: events.append("enable_hook")
     worker.checkpointing_context = None
     worker.mcore_state = SimpleNamespace(
         cfg=SimpleNamespace(
@@ -505,6 +509,9 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     assert events.index("move_model_cuda") < events.index("mcore_save")
     assert events.index("move_optimizer_cuda") < events.index("mcore_save")
     assert events.index("synchronize") < events.index("mcore_save")
+    assert [event for event in events if event.endswith("_hook")] == (
+        ["disable_hook", "enable_hook"] if hook_enabled else []
+    )
     assert worker.mcore_state.cfg.checkpoint.save == "original_path"
 
 
