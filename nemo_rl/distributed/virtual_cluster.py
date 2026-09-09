@@ -16,7 +16,7 @@ import os
 import socket
 import sys
 import time
-from typing import NamedTuple, NotRequired, Optional, TypedDict
+from typing import NamedTuple, NotRequired, Optional, Sequence, TypedDict
 
 import ray
 from ray.util.placement_group import (
@@ -126,6 +126,19 @@ class PY_EXECUTABLES:
 
 
 PY_EXECUTABLES._resolve_system_overrides()
+
+
+def uv_py_executable(extras: Sequence[str]) -> str:
+    """py_executable of a uv-managed venv with the given extras (same shape as PY_EXECUTABLES.*).
+
+    Honors NEMO_RL_PY_EXECUTABLES_SYSTEM the same way the PY_EXECUTABLES constants do.
+    The check has to live here as well: _resolve_system_overrides rewrites the class
+    attributes, but this builds a fresh string, so the rewrite cannot reach it.
+    """
+    if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1":
+        return PY_EXECUTABLES.SYSTEM
+    extra_flags = "".join(f"--extra {extra} " for extra in extras)
+    return f"uv run --locked {extra_flags}--directory {git_root}"
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
