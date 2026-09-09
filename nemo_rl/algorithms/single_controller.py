@@ -95,8 +95,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
-    validate_sampler_buffer_capacity,
-    validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
@@ -250,8 +248,6 @@ class SingleControllerActor:
             actor_args: Pre-built actor args from setup_single_controller.
             setup_timing_metrics: Driver-side setup timings; logged here (Logger isn't cloudpickleable).
         """
-        validate_single_controller_config(master_config)
-
         self._advantage_cfg = AdvantageConfig()
         self._partition_id: str = actor_args.partition_id
 
@@ -380,7 +376,11 @@ class SingleControllerActor:
             else actor_args.save_state.current_step
         )
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
-        self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
+        self._sampler = create_sampler(
+            self._buffer,
+            self._async_cfg.sampler,
+            min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
+        )
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
         if restored_dispatch_index is None:
             # Checkpoints predating exact sampler state reconstruct the original
@@ -413,13 +413,6 @@ class SingleControllerActor:
                 and self._sampler.supports_buffer_checkpoint
             )
         )
-        required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
-        validate_sampler_buffer_capacity(
-            self._async_cfg,
-            required_capacity=required_capacity,
-            sampler_name=type(self._sampler).__name__,
-        )
-
         # ── asyncio state ──────────────────────────────────────────────────
         # Commits and destructive clears use this lock with TQ snapshots. This
         # makes the native snapshot match the controller's metadata-only replay
@@ -2325,6 +2318,7 @@ class SingleControllerActor:
                         max_prompt_groups = target_groups - groups_dispatched
                         if max_prompt_groups <= 0:
                             break
+                        # For a colocated engine this is max_prompt_groups, pinned inside setup.
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
@@ -2412,13 +2406,22 @@ class SingleControllerActor:
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
                         )
 
-                    if groups_dispatched == 0 and self._gen is not None:
+                    if groups_dispatched == 0:
                         try:
                             await asyncio.to_thread(self._gen.snapshot_step_metrics)
                         except RayActorError as error:
                             log.warning(
                                 "Skipping generation snapshot metrics: %s", error
                             )
+
+                    # Safe mid-loop: colocated steps are assembled whole, so the loop closes after this.
+                    # The gate reopens at the post-step _sync_weights wake, or after the save on save-bound steps.
+                    if self._gen.blocks_training():
+                        self._rollout_permitted.clear()
+                        # Deadline clocks measure inference service time, not wall clock:
+                        # the switch to training must not tick them down.
+                        self._rollout_manager.suspend_request_deadlines()
+                        await asyncio.to_thread(self._gen.finish_generation)
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
@@ -2651,13 +2654,12 @@ class SingleControllerActor:
                 step_metrics.update(
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
-                if self._gen is not None:
-                    try:
-                        step_metrics.update(
-                            await asyncio.to_thread(self._gen.get_step_metrics)
-                        )
-                    except RayActorError as error:
-                        log.warning("Skipping generation step metrics: %s", error)
+                try:
+                    step_metrics.update(
+                        await asyncio.to_thread(self._gen.get_step_metrics)
+                    )
+                except RayActorError as error:
+                    log.warning("Skipping generation step metrics: %s", error)
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
@@ -2702,46 +2704,6 @@ class SingleControllerActor:
                     for step, promoted in self._batch_promotions.items()
                     if step > version_during_step
                 }
-
-                # ---- 6. Refit the model ----
-                with self._timer.time("weight_sync"):
-                    calibration_data = (
-                        BatchedDataDict.from_batches(calibration_batches)
-                        if calibration_batches
-                        else None
-                    )
-                    # Critic warmup doesn't need refit, and the version still advances.
-                    aborted_stale_inflight_groups = 0
-                    if is_policy_training_step:
-                        aborted_stale_inflight_groups = await self._sync_weights(
-                            calibration_data=calibration_data
-                        )
-                    self._retune_lookahead_versions()
-                    self._rollout_manager.set_weight_version(self._trainer_version)
-                    step_metrics.update(
-                        {
-                            "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
-                            "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
-                            # Non-zero means this step trained on a smaller batch than
-                            # num_prompts_per_step, which any comparison of step metrics
-                            # across steps has to account for.
-                            "dropped_prompt_groups": dropped_prompt_groups,
-                            # Groups filled by a spare prompt this step waited on --
-                            # either one it lost itself, or one it lent to an earlier
-                            # step and was repaid for. Non-zero here with zero above is
-                            # the healthy shape of on_dropped_prompt="replace": the
-                            # batch stayed whole, and the cost was the wall-clock spent
-                            # waiting on the spare.
-                            "replaced_prompt_groups": replaced_prompt_groups,
-                            # Groups this step lost and filled by borrowing finished work
-                            # from a later step. The better shape of the same thing: the
-                            # batch stayed whole and nothing waited for it, with the
-                            # repayment showing up as a replacement on the lender.
-                            "promoted_prompt_groups": promoted_prompt_groups,
-                        }
-                    )
-
-                # Checkpointing (mirrors async_grpo_train's save block).
                 # What the step actually trained on, which is num_prompts_per_step only
                 # when nothing was dropped. Counted from the dispatch tally rather than
                 # derived from the shortfall so the figure does not depend on the
@@ -2766,16 +2728,89 @@ class SingleControllerActor:
                         and self._train_steps % ft_save_period == 0
                     )
                 )
+                # Call once per step and reuse the bool.
                 should_save_by_timeout = self._timeout.check_save()
+                will_save_checkpoint = self._master_config.checkpointing[
+                    "enabled"
+                ] and (should_save_by_step or should_save_by_timeout)
+                # A colocated Megatron wake is itself the refit (prepare_for_generation reshards or
+                # shares the trainer's tensors), so a save-bound step skips _sync_weights and
+                # splits it: offload before the save, wake after it.
+                defer_refit_for_save = (
+                    will_save_checkpoint
+                    and self._gen.blocks_training()
+                    and self._gen.wake_carries_weight_updates()
+                )
 
-                if self._master_config.checkpointing["enabled"] and (
-                    should_save_by_step or should_save_by_timeout
-                ):
+                # ---- 6. Refit the model ----
+                # Critic warmup doesn't need a refit and the version still advances.
+                # But a colocated engine that was stood down still needs to be woken up via reshard.
+                aborted_stale_inflight_groups = 0
+                if is_policy_training_step or self._gen.blocks_training():
+                    if defer_refit_for_save:
+                        # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
+                        # Record `weight_sync` for consistency in reports.
+                        with self._timer.time("weight_sync"):
+                            pass
+                        with self._timer.time("offload_before_refit"):
+                            await asyncio.to_thread(self._trainer.offload_before_refit)
+                    else:
+                        with self._timer.time("weight_sync"):
+                            calibration_data = (
+                                BatchedDataDict.from_batches(calibration_batches)
+                                if calibration_batches
+                                else None
+                            )
+                            aborted_stale_inflight_groups = await self._sync_weights(
+                                calibration_data=calibration_data,
+                            )
+                self._retune_lookahead_versions()
+                self._rollout_manager.set_weight_version(self._trainer_version)
+                step_metrics.update(
+                    {
+                        "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
+                        "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
+                        # Non-zero means this step trained on a smaller batch than
+                        # num_prompts_per_step, which any comparison of step metrics
+                        # across steps has to account for.
+                        "dropped_prompt_groups": dropped_prompt_groups,
+                        # Groups filled by a spare prompt this step waited on --
+                        # either one it lost itself, or one it lent to an earlier
+                        # step and was repaid for. Non-zero here with zero above is
+                        # the healthy shape of on_dropped_prompt="replace": the
+                        # batch stayed whole, and the cost was the wall-clock spent
+                        # waiting on the spare.
+                        "replaced_prompt_groups": replaced_prompt_groups,
+                        # Groups this step lost and filled by borrowing finished work
+                        # from a later step. The better shape of the same thing: the
+                        # batch stayed whole and nothing waited for it, with the
+                        # repayment showing up as a replacement on the lender.
+                        "promoted_prompt_groups": promoted_prompt_groups,
+                    }
+                )
+
+                # Checkpointing (mirrors async_grpo_train's save block).
+                if will_save_checkpoint:
                     with self._timer.time("checkpointing"):
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
                         )
+                    if defer_refit_for_save:
+                        # The save is done; wake the engine unless the loop is about to exit.
+                        # Deliberately a bare wake, not `_sync_weights`.
+                        loop_will_exit = is_last_step or should_save_by_timeout
+                        if not loop_will_exit:
+                            with self._timer.time("weight_sync"):
+                                # The save onloaded model+optimizer; generation needs offload.
+                                await asyncio.to_thread(
+                                    self._trainer.offload_after_refit
+                                )
+                                await asyncio.to_thread(
+                                    self._gen.prepare_for_generation
+                                )
+                                self._rollout_permitted.set()
+                                self._rollout_manager.resume_request_deadlines()
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -3676,10 +3711,10 @@ class SingleControllerActor:
     ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
-        Everything except the (possibly async) policy weight write must be
-        on disk before begin_finalization; rollouts keep running throughout.
-        The policy optimizer is skipped during critic warmup -- it has never
-        stepped.
+        Everything except the (possibly async) policy weight write must be on disk
+        before `begin_finalization`. Non-colocated engines keep serving rollouts throughout.
+        Colocated engines are stood down for the save.
+        The policy optimizer is skipped during critic warmup: it has never stepped.
         """
         save_state = self._save_state
         # SC has no validation loop yet; drop the default sentinel instead of
@@ -3966,9 +4001,9 @@ class SingleControllerActor:
     ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
-        SC owns the pause gate; in-flight generations continue through the
-        refit — vLLM V1 async engine supports weight updates during pending
-        requests.
+        SC owns the pause gate. vLLM serves through the refit; it supports live weight updates.
+        A colocated engine is instead already stood down: the synchronizer's sync is the wake,
+        and step 4 resumes dispatch.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
@@ -4085,6 +4120,7 @@ class SingleControllerActor:
                 self._gen.set_rollout_weight_version, self._trainer_version
             )
         self._rollout_permitted.set()
+        self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
 
     async def _value_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
