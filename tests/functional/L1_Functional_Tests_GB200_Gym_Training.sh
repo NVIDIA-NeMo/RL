@@ -22,7 +22,7 @@ PROJECT_ROOT=$(realpath "${SCRIPT_DIR}/../..")
 cd "${PROJECT_ROOT}"
 
 if [[ "${FAST:-0}" == "1" ]]; then
-    echo "FAST: Skipping Nano 4B Gym training E2E"
+    echo "FAST: Skipping Nano 4B Gym training E2E on GB200"
 else
     time uv run --no-sync bash ./tests/functional/grpo_nano4b_gym_training_e2e.sh
 fi
