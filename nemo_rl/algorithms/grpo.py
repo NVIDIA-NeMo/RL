@@ -4223,8 +4223,10 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
+        # Cover the whole validation set: the last wave may be a partial batch
+        # (e.g. 251 prompts in waves of 126), so round up instead of down.
+        max_batches = -(
+            -master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
