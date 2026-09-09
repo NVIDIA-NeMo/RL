@@ -30,6 +30,7 @@ from ray.util.placement_group import PlacementGroup
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.fleet_health import (
@@ -44,6 +45,8 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
+    assert_refit_unsupported_grouped_moe_params,
+    assert_reload_refit_config_supported,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
@@ -212,6 +215,19 @@ class VllmGeneration(GenerationInterface):
             f"Please update your configuration to include all required VLLM parameters."
         )
 
+        assert_reload_refit_config_supported(self.cfg)
+
+        extension_fqn = self.cfg.get("worker_extension_cls_fqn")
+        if extension_fqn is not None and self.cfg.get("quant_cfg") is not None:
+            raise ValueError(
+                "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
+                "a custom generation worker cannot be combined with ModelOpt "
+                "quantization"
+            )
+        if extension_fqn is not None:
+            # Validate registration before allocating workers or placement groups.
+            get_actor_python_env(extension_fqn)
+
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
                 self.dp_size, self.pp_size, self.tp_size
@@ -243,6 +259,8 @@ class VllmGeneration(GenerationInterface):
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
+        if extension_fqn is not None:
+            worker_cls = extension_fqn
         if self.cfg["vllm_cfg"]["async_engine"]:
             worker_builder = RayWorkerBuilder(
                 worker_cls, config, defer_model_load=defer_model_load
@@ -589,6 +607,36 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         results = ray.get(futures)
         return results
+
+    def setup_token_capture(
+        self, dp_cfg: dict[str, Any], staging_partition: str
+    ) -> None:
+        """Install ledger-authoritative token capture in every DP-leader worker.
+
+        Called once at setup when ``token_capture.enabled``; each async worker
+        builds its in-worker data-plane client + TQTokenSink and makes the
+        single Gym ``install_capture`` call.
+        """
+        assert self.cfg["vllm_cfg"]["async_engine"], (
+            "token capture requires the async vLLM engine (the capture host "
+            "is the worker's in-process HTTP server)"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            "setup_token_capture",
+            dp_cfg=dp_cfg,
+            staging_partition=staging_partition,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the weight version workers stamp on captured model calls."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "set_rollout_weight_version",
+            version=version,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
 
     def _get_raw_spec_counters(self) -> dict[str | tuple[str, int], float]:
         """Collect raw spec decode counters from workers."""
@@ -1172,6 +1220,8 @@ class VllmGeneration(GenerationInterface):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
+        assert_refit_unsupported_grouped_moe_params(self.cfg, state_dict_info)
+
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "prepare_refit_info_async"

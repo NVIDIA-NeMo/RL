@@ -70,6 +70,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -841,12 +842,34 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.policy["generation"]["backend"] = "vllm"
+
+    # Data plane + NeMo-Gym stays rejected: ``grpo_train_sync`` never calls
+    # ``attach_initial_nemo_gym_image_payloads``, so the run would silently
+    # train on the media a Gym dataset omits from ``extra_env_info``.
     master_config.data_plane = {"enabled": True}
-    with pytest.raises(NotImplementedError, match="data_plane.enabled=false"):
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        with pytest.raises(NotImplementedError, match="NeMo-Gym"):
+            _validate_multimodal_dedup_capability(master_config)
+
+    # Data plane without Gym is supported: the wire format carries dedup
+    # (``PackedTensor.to_wire`` emits one row per *logical* row), and the Gym
+    # attach helper is itself gated on ``should_use_nemo_gym``. Rejecting this
+    # blocked every Nemotron-Omni recipe, since all of them set
+    # ``deduplicate_multimodal_data: true``.
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=False):
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.data_plane = {"enabled": False}
     _validate_multimodal_dedup_capability(master_config)
+
+    # And with dedup off, nothing is gated — the guard returns before it looks
+    # at the backend or at NeMo-Gym, so a text-only sync GRPO + Gym run is not
+    # blocked by a multimodal validator.
+    master_config.grpo.deduplicate_multimodal_data = False
+    master_config.policy["generation"]["backend"] = "sglang"
+    master_config.data_plane = {"enabled": True}
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        _validate_multimodal_dedup_capability(master_config)
 
 
 def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
@@ -1236,16 +1259,11 @@ def mock_async_grpo_infrastructure(
         checkpoint_cut_ordinal=checkpoint_cut_ordinal,
     )
 
-    # Patch venv creation
+    # Patch actor runtime environment creation
     stack.enter_context(
         patch(
-            "nemo_rl.algorithms.grpo.create_local_venv_on_each_node",
-            return_value="/fake/venv",
-        )
-    )
-    stack.enter_context(
-        patch(
-            "nemo_rl.algorithms.grpo.get_actor_python_env", return_value="/fake/python"
+            "nemo_rl.algorithms.grpo.make_actor_runtime_env",
+            return_value={"py_executable": "/fake/python", "env_vars": {}},
         )
     )
 
@@ -2990,12 +3008,11 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
     synchronizer.init_communicator.assert_called_once_with()
     spinup_nemo_gym_actor.assert_called_once_with(
-        env_configs=master_config.env,
+        master_config.env,
         base_urls=["http://dynamo-wrapper.example/v1"],
         model_name=master_config.policy["model_name"],
         tokenizer=tokenizer,
         enable_router_replay=False,
-        routed_experts_dtype="int16",
         use_fastokens=False,
     )
 
@@ -3364,12 +3381,11 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
 
     assert result[2] is nemo_gym_actor
     spinup_nemo_gym_actor.assert_called_once_with(
-        env_configs=master_config.env,
+        master_config.env,
         base_urls=["http://trtllm.example/v1"],
         model_name="test-model",
         tokenizer=tokenizer,
         enable_router_replay=False,
-        routed_experts_dtype="int16",
         use_fastokens=False,
     )
 
@@ -3413,7 +3429,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     synchronizer.sync_weights.side_effect = sync_weights
     nemo_gym_actor = object()
 
-    def spinup_nemo_gym_actor(**kwargs):
+    def spinup_nemo_gym_actor(_env_configs, **kwargs):
         assert kwargs["base_urls"] == [reserved_url]
         events.append("gym_started")
         gym_started.set()
@@ -4590,6 +4606,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     # Set max steps to 12
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 12
+    master_config.grpo.max_num_epochs = 100
 
     grpo_save_state = _initial_grpo_save_state()
 
@@ -4657,7 +4674,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
 
 @pytest.mark.parametrize(
     "train_func", [grpo_train]
-)  # Only test sync version for epochs (async uses steps)
+)  # Sync coverage retained alongside the async regression below.
 def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
@@ -4707,6 +4724,63 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
 
     # Verify we trained for exactly two epochs (20 batches)
     assert mock_grpo_components["policy"].train.call_count == 20
+
+
+def test_async_grpo_exit_on_max_epochs(mock_grpo_components, tmp_path):
+    """Async GRPO stops and saves at the epoch bound when it comes first."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_epochs = 2
+    master_config.grpo.max_num_steps = 100
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 100
+    master_config.checkpointing["metric_name"] = None
+
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+
+    grpo_save_state = _initial_grpo_save_state()
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        patch(
+            "nemo_rl.algorithms.grpo.CyclingDataLoader",
+            wraps=CyclingDataLoader,
+        ) as cycling_dataloader_cls,
+        patch("nemo_rl.algorithms.grpo.torch.save"),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            grpo_save_state,
+            master_config,
+        )
+
+    assert mock_grpo_components["policy"].train.call_count == 20
+    assert [
+        call.args[0] for call in checkpointer.init_tmp_checkpoint.call_args_list
+    ] == [20]
+    assert grpo_save_state.current_step == 20
+    assert grpo_save_state.total_steps == 20
+    assert master_config.grpo.max_num_steps == 20
+    cycling_dataloader_cls.assert_called_once_with(
+        mock_grpo_components["train_dataloader"]
+    )
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])

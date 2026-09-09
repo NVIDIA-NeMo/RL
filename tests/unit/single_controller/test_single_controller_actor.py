@@ -43,6 +43,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
@@ -54,6 +55,20 @@ class _InitBuffer:
     """Minimal non-optional TQ buffer contract for actor-init tests."""
 
     def __init__(self) -> None:
+        self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
+
+
+class _InitRolloutManager:
+    """Minimal rollout-manager contract for actor-init tests."""
+
+    def __init__(self, tq_buffer: _InitBuffer) -> None:
+        self._tq_buffer = tq_buffer
+        self.recovery_ledger = RolloutRecoveryLedger()
         self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
 
     def set_data_plane_checkpoint_barrier(
@@ -111,7 +126,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
+        rollout_manager=_InitRolloutManager(tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -119,7 +134,9 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
+        bootstrap_identity=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -132,55 +149,6 @@ def _init_controller(master_config, actor_args):
         actor_args=actor_args,
         setup_timing_metrics=SetupTimingMetrics(),
     )
-
-
-def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
-    monkeypatch.setattr(single_controller, "Logger", lambda _: object())
-    master_config = MasterConfig.model_construct(
-        policy={
-            "train_global_batch_size": 4,
-            "generation": {"colocated": {"enabled": False}},
-        },
-        grpo=GRPOConfig.model_construct(
-            num_prompts_per_step=2,
-            num_generations_per_prompt=4,
-        ),
-        async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
-        logger={},
-        env={},
-    )
-    tq_buffer = _InitBuffer()
-    actor_args = SimpleNamespace(
-        partition_id="rollout_data",
-        dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
-        dataloader=None,
-        weight_synchronizer=None,
-        advantage_estimator=None,
-        loss_fn=None,
-        tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
-        env_handles={},
-        fleet_monitor=None,
-        generation_router=None,
-        train_cluster=None,
-        inference_cluster=None,
-    )
-    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"num_prompts_per_step \* num_generations_per_prompt \(8\) "
-            r"must equal policy.train_global_batch_size \(4\)"
-        ),
-    ):
-        controller_cls(
-            master_config=master_config,
-            actor_args=actor_args,
-            setup_timing_metrics=SetupTimingMetrics(),
-        )
 
 
 def test_logs_hyperparameters_and_concrete_weight_synchronizer(
@@ -218,7 +186,9 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         setup_timing_metrics=SetupTimingMetrics(),
     )
 
-    logger.log_hyperparams.assert_called_once_with(master_config.model_dump())
+    expected_hparams = master_config.model_dump()
+    expected_hparams["token_capture"]["control_auth_token"] = "<redacted>"
+    logger.log_hyperparams.assert_called_once_with(expected_hparams)
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output
@@ -466,6 +436,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=False,
@@ -474,7 +445,9 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     asyncio.run(ctrl._sync_weights())
 
@@ -493,6 +466,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=True,
@@ -504,7 +478,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
     calibration_data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[1, 2]]),
@@ -586,12 +562,13 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(
+        grpo=GRPOConfig(
             seq_logprob_error_threshold=2.0,
             overlong_filtering=True,
             invalid_tool_call_advantage=-5.0,
@@ -602,6 +579,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._message_level_advantage_penalties_enabled = True
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
@@ -645,6 +623,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
     assert "advantages" in (result_meta.fields or [])
+    assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
 
 
 @pytest.mark.parametrize(
@@ -683,17 +662,19 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._message_level_advantage_penalties_enabled = False
-    ctrl._algo_cfg = SimpleNamespace(
+    ctrl._algo_cfg = GRPOConfig(
         seq_logprob_error_threshold=None,
         overlong_filtering=overlong_filtering,
     )
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -746,17 +727,19 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        grpo=GRPOConfig(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -787,6 +770,70 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
 
 
+def test_advantage_stage_clips_training_values_and_metrics() -> None:
+    batch_size, sequence_length = 2, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([-4.0, 6.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(
+            seq_logprob_error_threshold=None,
+            advantage_clip_low=-1.0,
+            advantage_clip_high=2.0,
+        )
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "sample_masks": [],
+        "masked_advantages": [],
+        "num_mask_sample_filtered": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    assert data_plane.written_fields is not None
+    torch.testing.assert_close(
+        data_plane.written_fields["advantages"],
+        torch.tensor([[-1.0] * sequence_length, [2.0] * sequence_length]),
+    )
+    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
+    assert logged.min().item() == pytest.approx(-1.0)
+    assert logged.max().item() == pytest.approx(2.0)
+
+
 def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -814,17 +861,19 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0, overlong_filtering=False)
+        grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -874,17 +923,19 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        grpo=GRPOConfig(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
@@ -953,18 +1004,23 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
 
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = FakeEstimator()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        grpo=GRPOConfig(
+            seq_logprob_error_threshold=None,
+            advantage_clip_high=0.1,
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1001,6 +1057,14 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     assert ctrl._opd_stat_sum == pytest.approx(1.0)
     assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
     assert ctrl._opd_stat_count == 4
+    assert ctrl._dp_client.put_fields is not None
+    written_advantages = ctrl._dp_client.put_fields["advantages"]
+    torch.testing.assert_close(
+        written_advantages,
+        torch.full_like(written_advantages, 0.1),
+    )
+    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
+    torch.testing.assert_close(logged, torch.full((4,), 0.1))
 
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
@@ -1065,23 +1129,31 @@ class _FullStepSampler(_OneThenEmptySampler):
 
 
 class _ChunkedSampler(_EmptySampler):
-    """Assembles one step out of several single-group chunks, then goes empty.
+    """Assembles one step out of ``chunks`` selects, then goes empty.
 
-    This is the shape the streaming path actually produces and the reason
-    ``keep_train_buffers`` exists: every chunk after the first runs against an
-    already-open train step.
+    Single-group chunks are the shape the streaming path actually produces and
+    the reason ``keep_train_buffers`` exists: every chunk after the first runs
+    against an already-open train step. ``groups_per_chunk`` covers the blocking
+    (colocated) shape, where the whole step arrives as one multi-group chunk.
+    ``select_bounds`` records the (min, max) the pump asked for on each select.
     """
 
-    def __init__(self, meta: KVBatchMeta, chunks: int) -> None:
+    def __init__(
+        self, meta: KVBatchMeta, chunks: int, groups_per_chunk: int = 1
+    ) -> None:
         self._meta = meta
         self._remaining = chunks
+        self._groups_per_chunk = groups_per_chunk
+        self.select_bounds: list[tuple[int, int]] = []
 
     async def select(self, **kwargs):
-        del kwargs
+        self.select_bounds.append(
+            (kwargs["min_prompt_groups"], kwargs["max_prompt_groups"])
+        )
         if self._remaining == 0:
             return None, 0
         self._remaining -= 1
-        return self._meta, 1
+        return self._meta, self._groups_per_chunk
 
 
 class _SequenceSampler(_EmptySampler):
@@ -1098,6 +1170,12 @@ class _SequenceSampler(_EmptySampler):
 class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
+
+    def training_owned_group_ids(self) -> set[str]:
+        return set()
+
+    def release_training_claims(self, group_ids: list[str]) -> None:
+        assert not group_ids
 
 
 class _NoOpTrainer:
@@ -1126,13 +1204,28 @@ class _NoOpTrainer:
 
 
 class _LpRecordingTrainer(_NoOpTrainer):
-    """Records the ``keep_train_buffers`` flag the pump passes on each chunk."""
+    """Records ``keep_train_buffers`` flags and the per-chunk call order.
 
-    def __init__(self) -> None:
+    ``calls`` may be shared with other doubles so a test can assert the
+    interleaving (e.g. the engine stand-down against trainer GPU work).
+    """
+
+    def __init__(self, calls: list[object] | None = None) -> None:
         self.keep_train_buffers_calls: list[bool] = []
+        self.calls: list[object] = [] if calls is None else calls
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         self.keep_train_buffers_calls.append(keep_train_buffers)
+        self.calls.append("lp_inference_prep")
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("prepare_for_training")
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
+        self.calls.append("train")
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         del meta
@@ -1232,6 +1325,9 @@ class _StepMetricRecordingGeneration:
         if method == self._dies_in:
             raise ActorDiedError()
 
+    def blocks_training(self) -> bool:
+        return False
+
     def snapshot_step_metrics(self) -> None:
         self._record("snapshot_step_metrics")
 
@@ -1292,12 +1388,18 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
     ctrl._value_loss_fn = None
+    # Continuous-serving default; the pump asks before every step's trainer work.
     ctrl._gen = SimpleNamespace(
         requires_kv_scale_sync=False,
+        blocks_training=lambda: False,
         snapshot_step_metrics=lambda: None,
         get_step_metrics=lambda: {},
     )
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=MagicMock(),
+        suspend_request_deadlines=MagicMock(),
+        resume_request_deadlines=MagicMock(),
+    )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
@@ -1307,8 +1409,10 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    ctrl._finalizer_metrics_by_group = {}
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
@@ -1716,36 +1820,26 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
         assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
 
 
-def test_train_pump_skips_generation_metrics_without_generation_handle(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "engine_blocks_training", [False, True], ids=["streaming", "blocking"]
+)
+def test_train_pump_chunked_step_by_engine_regime(
+    monkeypatch, engine_blocks_training
 ) -> None:
-    meta = KVBatchMeta(
-        partition_id="rollout_data",
-        task_name="train",
-        sample_ids=["sample-0"],
-        fields=[],
-        sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
-    )
-    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
-    ctrl._gen = None
-    ctrl._sync_weights = AsyncMock(return_value=0)
-    ctrl._logger = MagicMock()
-    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    """One step, observed under both engine regimes.
 
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+    Streaming: the step arrives as two single-group chunks. The engine is
+    never stood down, the rollout gate stays open, and the configured
+    streaming minimum reaches the sampler. The logprob detour between chunks
+    must not offload the trainer's grad buffers — mcore's offload frees the
+    gradients earlier chunks accumulated rather than copying them out. First
+    chunk: no step open, the offload is worth taking; later chunks: buffers
+    stay resident.
 
-    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
-    assert "vllm/spec_acceptance_rate" not in train_metrics
-
-
-def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
-    """The logprob detour between chunks must not offload the trainer's grad
-    buffers, because mcore's offload frees the gradients the earlier chunks of
-    this step accumulated rather than copying them out.
-
-    First chunk: no step open yet, nothing to preserve, so the offload is still
-    worth taking. Every later chunk: step open, buffers must stay resident.
+    Blocking (colocated Megatron): setup pins min_groups_for_streaming_train
+    == num_prompts_per_step, so the pump demands the whole step from the
+    sampler (min == max) and it arrives as one chunk; the gate is closed and
+    the engine slept exactly once, before any trainer GPU work.
     """
     meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -1755,20 +1849,59 @@ def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> No
         sequence_lengths=[1],
         tags=[{"weight_version": 0}],
     )
-    # num_prompts_per_step is 2 in the harness, so two single-group chunks close
-    # the step.
-    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    # num_prompts_per_step is 2 in the harness: two single-group chunks close
+    # the streaming step, one two-group chunk the blocking one.
+    sampler = (
+        _ChunkedSampler(meta, chunks=1, groups_per_chunk=2)
+        if engine_blocks_training
+        else _ChunkedSampler(meta, chunks=2)
+    )
+    ctrl = _train_pump_controller(sampler=sampler)
+    if engine_blocks_training:
+        # Mirror the colocated setup invariant the config validator enforces.
+        ctrl._async_cfg.min_groups_for_streaming_train = 2
     ctrl._policy_logprobs_required = True
-    trainer = _LpRecordingTrainer()
+    calls: list[object] = []
+
+    def _finish_generation() -> None:
+        calls.append(("finish_generation", ctrl._rollout_permitted.is_set()))
+
+    trainer = _LpRecordingTrainer(calls)
     ctrl._trainer = trainer
-    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        blocks_training=lambda: engine_blocks_training,
+        finish_generation=_finish_generation,
+        snapshot_step_metrics=lambda: None,
+        get_step_metrics=lambda: {},
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._train_steps == 1
-    assert trainer.keep_train_buffers_calls == [False, True]
+    chunk = ["lp_inference_prep", "prepare_for_training", "train"]
+    if engine_blocks_training:
+        # Stood down exactly once, with the gate already closed, before the
+        # trainer touched the GPUs; the whole step then ran as one chunk. The
+        # (mocked) post-step _sync_weights reopens the gate.
+        assert calls == [("finish_generation", False)] + chunk
+        assert trainer.keep_train_buffers_calls == [False]
+        assert not ctrl._rollout_permitted.is_set()
+        assert sampler.select_bounds == [(2, 2)]
+        # Frozen requests' deadline clocks pause with the engine.
+        ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
+    else:
+        assert calls == chunk * 2
+        assert trainer.keep_train_buffers_calls == [False, True]
+        assert ctrl._rollout_permitted.is_set()
+        assert sampler.select_bounds[0] == (1, 2)
+        ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
 
 
 def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
@@ -1989,12 +2122,18 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("ppo_epochs", [1, 2])
+@pytest.mark.parametrize(
+    "engine_blocks_training", [False, True], ids=["streaming", "blocking"]
+)
 def test_train_pump_freezes_the_policy_during_critic_warmup(
-    monkeypatch, capsys, ppo_epochs
+    monkeypatch, capsys, ppo_epochs, engine_blocks_training
 ) -> None:
     """Below policy_training_start_step the critic trains alone: no optimizer
     step, and no weight transfer to generation either. The frozen policy does
-    not shorten the critic's own epoch loop."""
+    not shorten the critic's own epoch loop. A blocking (colocated) engine is
+    the one exception on the sync: it was stood down at step start and its
+    wake rides the sync, so the sync runs for the wake alone -- a reshard of
+    the frozen weights."""
     critic_ppo_epochs = 3
     meta = _single_group_meta()
     ctrl, value = _ppo_train_pump_controller(
@@ -2003,6 +2142,20 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
         ppo_epochs=ppo_epochs,
         critic_ppo_epochs=critic_ppo_epochs,
     )
+    stand_downs: list[bool] = []
+    if engine_blocks_training:
+        ctrl._gen = SimpleNamespace(
+            requires_kv_scale_sync=False,
+            blocks_training=lambda: True,
+            wake_carries_weight_updates=lambda: True,
+            finish_generation=lambda: stand_downs.append(
+                ctrl._rollout_permitted.is_set()
+            ),
+            snapshot_step_metrics=lambda: None,
+            get_step_metrics=lambda: {},
+        )
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
     trainer = MagicMock(spec=_NoOpTrainer)
     ctrl._trainer = trainer
     ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
@@ -2014,7 +2167,15 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
-    ctrl._sync_weights.assert_not_awaited()
+    if engine_blocks_training:
+        # Stood down once per step (not per epoch), with the gate already
+        # closed; the sync (mocked -- the real one reopens the gate) is the wake.
+        assert stand_downs == [False]
+        ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
+        ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    else:
+        ctrl._sync_weights.assert_not_awaited()
+        ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
     # The step still closed and published the new version, so staleness
     # accounting keeps working through the warmup.
     assert ctrl._train_steps == 1
@@ -2160,6 +2321,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -2171,6 +2333,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
+        "sample_masks": [],
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],

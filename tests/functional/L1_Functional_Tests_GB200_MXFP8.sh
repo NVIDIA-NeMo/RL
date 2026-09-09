@@ -35,9 +35,6 @@ run_test() {
 }
 
 run_test uv run --no-sync bash ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
-# Disabled: sized for 4 GPUs (2 train + 2 inference, EP=2 per side) but this shard's
-# gcp-gpu-x2 runner has 2, so the inference placement group can never be satisfied (#3731).
-# run_test uv run --no-sync bash ./tests/functional/grpo_megatron_mxfp8_refit_gb200.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

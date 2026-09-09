@@ -56,6 +56,7 @@ from nemo_rl.models.generation.vllm.video_utils import (
     register_torchcodec_vllm_video_loader,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
+    find_tokenizer_required_architectures,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
@@ -456,6 +457,9 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
+    def _refit_with_reload_api_enabled(self) -> bool:
+        return bool(self.cfg["vllm_cfg"].get("refit_with_reload_api"))
+
     @trace_fn(RLSpanGroup.MODEL_INIT, "rl.vllm.load_model")
     def _load_model(self, bundle_indices, seed):
         """Perform the heavy model loading and engine creation.
@@ -562,10 +566,13 @@ class BaseVllmGenerationWorker:
         # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
         spec_cfg = vllm_kwargs.get("speculative_config")
         mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        self._mtp_speculative_enabled = spec_cfg is not None and spec_cfg.get(
+            "method"
+        ) in ("deepseek_mtp", "mtp")
+        self._mtp_weights_from_refit = mtp_weights_from_refit
         self._mtp_load_from_disk: bool = (
             load_format == "dummy"
-            and spec_cfg is not None
-            and spec_cfg.get("method") in ("deepseek_mtp", "mtp")
+            and self._mtp_speculative_enabled
             and not mtp_weights_from_refit
         )
 
@@ -613,28 +620,9 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
-        elif any(
-            arch in getattr(hf_config, "architectures", [])
-            for arch in (
-                "Gemma3ForConditionalGeneration",
-                "Gemma4ForConditionalGeneration",
-                "Mistral3ForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-            )
+        elif detected_arch := find_tokenizer_required_architectures(
+            getattr(hf_config, "architectures", None)
         ):
-            detected_arch = [
-                arch
-                for arch in getattr(hf_config, "architectures", [])
-                if arch
-                in (
-                    "Gemma3ForConditionalGeneration",
-                    "Gemma4ForConditionalGeneration",
-                    "Mistral3ForConditionalGeneration",
-                    "Qwen3_5ForConditionalGeneration",
-                    "Qwen3_5MoeForConditionalGeneration",
-                )
-            ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
                 print(
                     f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
@@ -934,6 +922,11 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         if self.llm is not None:
             self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
+        if self._mtp_speculative_enabled:
+            self.llm.collective_rpc(
+                "configure_mtp_drafter_weight_source",
+                args=(self._mtp_weights_from_refit,),
+            )
         if self._mtp_load_from_disk:
             self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
@@ -1339,7 +1332,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=(refit_timeout_s,)
+                "update_weights_from_collective",
+                args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
             )
             worker_results = cast(list[bool], result_or_coro)
 

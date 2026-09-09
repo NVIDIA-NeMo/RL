@@ -21,13 +21,16 @@ from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
-    grpo_train,
     setup,
     shutdown_environments,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
-from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+from nemo_rl.data_plane.factory import (
+    make_policy_factory,
+    maybe_configure_data_plane_env,
+    select_sync_trainer,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
@@ -38,22 +41,6 @@ from nemo_rl.utils.config import (
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
 from nemo_rl.utils.timer import Timer
-
-
-def _select_trainer(master_config: MasterConfig):
-    """Pick the synchronous trainer based on ``data_plane.enabled``.
-
-    Factored out so test_architecture_invariants can verify dispatch
-    without the full setup() path.
-    """
-    dp_cfg = master_config.data_plane or {}
-    if dp_cfg.get("enabled", False):
-        from nemo_rl.algorithms.grpo_sync import grpo_train_sync
-
-        print("🚀 Running synchronous GRPO training (TransferQueue)")
-        return grpo_train_sync
-    print("🚀 Running synchronous GRPO training (legacy)")
-    return grpo_train
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -142,20 +129,6 @@ def main() -> None:
                 tokenizer, config.data, config.env
             )
 
-        # Pick the policy factory at the launcher level so the legacy trainer
-        # stays data-plane-agnostic (architectural invariant — see
-        # tests/data_plane/unit/test_architecture_invariants.py).
-        _dp_cfg = config.data_plane or {}
-        if _dp_cfg.get("enabled", False):
-            from nemo_rl.models.policy.tq_policy import TQPolicy
-
-            def _make_policy(**kwargs):
-                return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
-
-            _policy_factory = _make_policy
-        else:
-            _policy_factory = None  # setup() defaults to plain Policy
-
         with rl_init_timer.time("setup"):
             (
                 policy,
@@ -176,7 +149,7 @@ def main() -> None:
                 tokenizer,
                 dataset,
                 val_dataset,
-                policy_factory=_policy_factory,
+                policy_factory=make_policy_factory(config.data_plane),
             )
 
         rl_init_timer.record("total", time.perf_counter() - main_start)
@@ -237,7 +210,7 @@ def main() -> None:
             else:
                 # Two parallel synchronous trainers (verl-style — main_ppo.py vs
                 # main_ppo_sync.py). data_plane.enabled selects which one runs.
-                trainer = _select_trainer(master_config)
+                trainer = select_sync_trainer(master_config)
                 # grpo_train_sync defers checkpoint finalization to the checkpointer's
                 # background threads; the context manager guarantees they are flushed on
                 # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
