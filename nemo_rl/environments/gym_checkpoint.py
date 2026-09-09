@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Annotated, Any, Literal, Mapping, TypeAlias, TypeVar
+from typing import Annotated, Any, Literal, Mapping, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
@@ -39,9 +39,7 @@ GYM_RESOURCES_CHECKPOINT_PREFIX = (
     f"{GYM_CHECKPOINT_CONTROL_PREFIX}/resources-checkpoint"
 )
 GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
-GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = (
-    "external_storage_reference_index_v1"
-)
+GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
@@ -173,7 +171,10 @@ class GymCheckpointParticipantContract(_StrictWireModel):
         return cls(
             participant=discovered.participant,
             schema_version=capabilities.schema_version,
-            admission_states=sorted(capabilities.admission_states),
+            admission_states=cast(
+                list[Literal["accepting", "draining", "paused"]],
+                sorted(capabilities.admission_states),
+            ),
             checkpoint_mode=capabilities.checkpoint_mode,
             concurrency_contract=capabilities.concurrency_contract,
             multi_process=capabilities.multi_process,
@@ -897,9 +898,7 @@ def gym_checkpoint_staging_keys(
     if not indexed_results:
         return _legacy_gym_checkpoint_staging_keys(checkpoint_dir, checkpoint)
     if len(indexed_results) != len(model_results):
-        raise ValueError(
-            "Gym checkpoint mixes indexed and legacy model participants"
-        )
+        raise ValueError("Gym checkpoint mixes indexed and legacy model participants")
 
     references_by_key: dict[str, GymExternalStorageReference] = {}
     for result in indexed_results:

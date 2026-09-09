@@ -461,7 +461,7 @@ def test_storage_reference_index_avoids_private_lineage_scan(tmp_path) -> None:
         "group-7_g0/call-1",
     }
 
-    reference_path.write_text("{}\n")
+    reference_path.write_bytes(reference_payload + b"\n")
     with pytest.raises(ValueError, match="artifact digest mismatch"):
         gym_checkpoint_staging_keys(tmp_path, checkpoint)
 
