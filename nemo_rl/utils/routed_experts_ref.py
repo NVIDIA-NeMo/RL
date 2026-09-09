@@ -243,6 +243,9 @@ def _normalize_routed_experts_batch(
         if is_routed_experts_ref(raw_segments):
             raw_segments = [raw_segments]
         if not isinstance(raw_segments, list) or not raw_segments:
+            # TODO: Represent eligible loss-masked samples as all--1
+            # [tokens, layers, topk] fillers before sequence packing so only
+            # those tokens fall back to normal Megatron routing.
             raise ValueError(
                 f"Sample {sample_index} has no routed-experts reference segments"
             )
