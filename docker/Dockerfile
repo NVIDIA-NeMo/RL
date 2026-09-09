@@ -241,6 +241,7 @@ apt-get update
 # DeepEP's multinode link needs the exact filename libnvidia-ml.so.1; the CUDA base
 # only ships stubs/libnvidia-ml.so. Purged again after the syncs below.
 apt-get install -y --no-install-recommends libnvidia-ml-dev
+uv cache clean deep-ep
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project
