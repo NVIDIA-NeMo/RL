@@ -76,7 +76,10 @@ checkpointing:
   save_period: 5
   keep_top_k: 2
   save_optimizer: true
-  save_replay_buffer: false
+  # Replay entries can contain R3 payload references whose Ray actors are
+  # scoped to one Slurm/Ray session. Regenerate the buffered window after a
+  # restart while still restoring policy and optimizer state.
+  load_replay_buffer: false
 
 policy:
   is_vlm: true
