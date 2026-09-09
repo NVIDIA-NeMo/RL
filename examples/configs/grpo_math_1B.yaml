@@ -49,6 +49,27 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
+  # Wall-clock time-efficiency reward for NeMo-Gym agentic rollouts (training only):
+  #   reward = reward - lambda_time * (openhands_run_time / 60)
+  # lambda_time 1/60 makes a 60-minute rollout cost exactly 1.0. apply_to "all"
+  # deducts from every rollout, including failures; "correct" deducts only from
+  # resolved rollouts whose reward survived the reward-zeroing penalties. Rows the
+  # env flags mask_sample (e.g. timeouts) are not charged while
+  # env.should_mask_flagged_samples is on. lambda_call_bonus > 0 adds a bonus
+  # lambda_call_bonus * min(calls / call_bonus_ref, 1) for well-formed tool calls
+  # (pays for exploring; calibrate call_bonus_ref to the untrained checkpoint's
+  # mean calls per solved task, read from time_efficiency/calls/mean at step 1,
+  # and use apply_to "correct" with it). floor clamps the adjusted reward; null
+  # disables. Requires the NeMo-Gym path.
+  # Pair with a tight advantage_clip_low/high (e.g. -3/3) when normalize_rewards
+  # is true, otherwise a narrow group reward spread amplifies this small term.
+  time_efficiency:
+    enabled: false
+    lambda_time: 0.016666666666666666  # 1/60 per minute
+    apply_to: "all"  # "all" | "correct"
+    lambda_call_bonus: 0.0  # e.g. 0.10 with call_bonus_ref set
+    call_bonus_ref: null  # required when lambda_call_bonus > 0
+    floor: null
   seq_logprob_error_threshold: null
   # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
   invalid_tool_call_advantage: null

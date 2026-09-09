@@ -145,6 +145,7 @@ class SyncRolloutActor:
         finish_generation: bool = True,
         task_to_env_override: Optional[dict[str, EnvironmentInterface]] = None,
         carry_keys: Optional[list[str]] = None,
+        is_validation: bool = False,
     ) -> tuple[
         KVBatchMeta,
         dict[str, Any],
@@ -203,6 +204,11 @@ class SyncRolloutActor:
                 (training uses this). Validation passes a slim list
                 (e.g. ``["total_reward"]``) to avoid wasting Ray transfer
                 on fields it doesn't consume.
+            is_validation: ``True`` for validation rollouts. Skips the
+                training-only ``grpo.time_efficiency`` reward so validation
+                accuracy reflects the raw env reward, mirroring
+                ``grpo.validate()``. Effort shaping and reward penalties are
+                applied in both modes (pre-existing behavior).
 
         Returns:
             ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
@@ -260,6 +266,9 @@ class SyncRolloutActor:
                 and cfg.env["nemo_gym"].get("effort_levels") is not None
                 else None,
                 reward_penalty_config=cfg.reward_penalties,
+                time_efficiency_config=(
+                    None if is_validation else cfg.grpo.time_efficiency
+                ),
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
