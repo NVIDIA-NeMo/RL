@@ -66,6 +66,22 @@ def _validate_participant_manifest(snapshot: Path, participant: dict[str, Any]) 
     return path
 
 
+def _read_artifact(snapshot: Path, reference: dict[str, Any]) -> list[dict[str, Any]]:
+    path = (snapshot / reference["relative_path"]).resolve()
+    path.relative_to(snapshot.resolve())
+    payload = path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != reference["sha256"]:
+        raise AssertionError(f"artifact digest mismatch for {path}")
+    if len(payload) != reference["bytes"]:
+        raise AssertionError(f"artifact byte count mismatch for {path}")
+    records = [json.loads(line) for line in payload.splitlines() if line.strip()]
+    if len(records) != reference["records"]:
+        raise AssertionError(f"artifact record count mismatch for {path}")
+    if not all(isinstance(record, dict) for record in records):
+        raise TypeError(f"artifact rows must be objects in {path}")
+    return records
+
+
 def _matching_recovery_attempt(
     recovery: dict[str, Any], rollout_id: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -115,12 +131,50 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
     if resources["payload"]["sessions"] < 1:
         raise AssertionError("Gym resources participant has no saved environment")
 
+    continuation_rows = _read_artifact(
+        snapshot,
+        agent["payload"]["continuation_index"],
+    )
+    storage_reference_rows = _read_artifact(
+        snapshot,
+        model["payload"]["storage_reference_index"],
+    )
+    if not continuation_rows:
+        raise AssertionError("Gym checkpoint has no active continuation roots")
+    if not storage_reference_rows:
+        raise AssertionError("Gym checkpoint has no referenced TQ staging rows")
+    if model["payload"].get("excluded_inactive", 0) < 1:
+        raise AssertionError(
+            "Gym checkpoint did not exclude any completed/acknowledged lineage; "
+            "the test requires one inactive rollout alongside the continuation"
+        )
+    continuation_capture_keys = {
+        row["capture_key"] for row in continuation_rows
+    }
+    storage_capture_keys = {
+        row["capture_key"] for row in storage_reference_rows
+    }
+    if not storage_capture_keys.issubset(continuation_capture_keys):
+        raise AssertionError(
+            "Gym storage references contain a rollout with no parked continuation"
+        )
+
     agent_manifest_path = _validate_participant_manifest(snapshot, agent)
     agent_manifest = _read_json(agent_manifest_path)
     agent_dir = agent_manifest_path.parent
     recovery = torch.load(snapshot / "rollout_recovery.pt", weights_only=True)
     if not isinstance(recovery, dict):
         raise TypeError("rollout recovery sidecar is not a mapping")
+    replay = torch.load(snapshot / "replay_buffer_metadata.pt", weights_only=True)
+    if not isinstance(replay, dict) or not replay.get("groups"):
+        raise AssertionError(
+            "snapshot has no completed canonical group alongside the unfinished "
+            "Gym continuation"
+        )
+    if recovery.get("pending_completed_execution_acknowledgements"):
+        raise AssertionError(
+            "completed Gym executions were not acknowledged before checkpoint commit"
+        )
 
     candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for name, expected_digest in agent_manifest.get("files", {}).items():
@@ -163,6 +217,9 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         "last_committed_model_call_id": boundary["last_committed_model_call_id"],
         "resource_state_revisions": boundary["resource_state_revisions"],
         "group_id": group["group_id"],
+        "completed_group_ids": sorted(
+            item["group_id"] for item in replay["groups"]
+        ),
     }
 
 
@@ -245,6 +302,17 @@ def verify_restore(args: argparse.Namespace) -> None:
     if stale_dispatches:
         raise AssertionError(
             "restore reused the tombstoned source attempt instead of incrementing it"
+        )
+    regenerated_completed_groups = [
+        event
+        for event in events
+        if event.get("event") == "dispatch"
+        and event.get("group_id") in selected["completed_group_ids"]
+    ]
+    if regenerated_completed_groups:
+        raise AssertionError(
+            "a completed, checkpointed group was regenerated after restore: "
+            f"events={regenerated_completed_groups!r}"
         )
 
 
