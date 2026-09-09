@@ -216,7 +216,7 @@ def _leaf_digests(
         seed = seeds.get(length)
         if seed is None:
             seed = seeds[length] = zlib.crc32(f"{dtype}|{row_shape(length)}".encode())
-        digests.append(fold ^ seed)
+        digests.append(int(fold) ^ seed)
     return digests
 
 
@@ -419,6 +419,7 @@ def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
         return 0
     budget = [max_nodes]
     total = 0
+    # pyrefly: ignore  # bad-assignment
     for _, v in td.items(include_nested=True, leaves_only=False):
         if isinstance(v, torch.Tensor):
             total += _tensor_bytes(v)
@@ -1341,8 +1342,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
             if not isinstance(v, torch.Tensor) or v.ndim < 1:
                 stats.fields_skipped += 1
                 continue
-            # Declared up front: the two branches below bind lambdas with
-            # different capture defaults, and their union is not assignable to
+            # Declared up front: the two branches below bind different
+            # lambdas, and their union is not assignable to
             # ``_leaf_digests``'s ``row_shape`` parameter without this.
             row_shape: Callable[[int], tuple[int, ...]]
             if v.is_nested:
@@ -1354,7 +1355,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 # A jagged row is its own length followed by the values
                 # buffer's trailing dims.
                 tail = tuple(leaf.shape[1:])
-                row_shape = lambda length, tail=tail: (length, *tail)
+                row_shape = lambda length: (length, *tail)
             elif v.shape[0] != n_rows:
                 stats.fields_skipped += 1
                 continue
@@ -1370,7 +1371,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 # instead would make ``(N, L, D)`` say ``(1, L, D)`` and every
                 # round trip a mismatch.
                 shape = tuple(v.shape[1:])
-                row_shape = lambda _length, shape=shape: shape
+                row_shape = lambda _length: shape
             name = key if isinstance(key, str) else ".".join(key)
             out[name] = _leaf_digests(leaf, bounds, row_shape, v.dtype)
         return out
