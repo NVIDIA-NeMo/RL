@@ -5,6 +5,7 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
+GYM_ROOT=${NEMO_GYM_SOURCE_DIR:-$PROJECT_ROOT/3rdparty/Gym-workspace/Gym}
 # Mark the current repo as safe, since wandb fetches metadata about the repo
 git config --global --add safe.directory $PROJECT_ROOT
 
@@ -18,7 +19,9 @@ RUN_LOG=$EXP_DIR/run.log
 CHECKPOINT_DIR=$EXP_DIR/checkpoints
 DATA_DIR=$EXP_DIR/data
 SC_ENTRYPOINT=${SC_TEST_ENTRYPOINT:-$PROJECT_ROOT/examples/run_grpo_single_controller.py}
-export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
+# Functional stacks can exercise an unmerged Gym checkpoint branch without
+# changing NeMo-RL's submodule pin. The in-tree submodule remains the default.
+export PYTHONPATH=${GYM_ROOT}:${PROJECT_ROOT}:${PYTHONPATH:-}
 
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR $CHECKPOINT_DIR $DATA_DIR
@@ -30,7 +33,7 @@ cd $PROJECT_ROOT
 
 # Follow nemo-gym instructions here to get this data:
 # https://docs.nvidia.com/nemo/gym/0.1.0/tutorials/nemo-rl-grpo/setup.html#training-nemo-rl-grpo-setup
-cd 3rdparty/Gym-workspace/Gym
+cd "$GYM_ROOT"
 
 # We need HF_TOKEN to download the data from huggingface
 if [[ ! -f env.yaml ]]; then
@@ -53,8 +56,8 @@ cd -
 # smoke test, we trim all but the first tool
 TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
 VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > $TRAIN_PATH
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
+jq -c '.responses_create_params.tools |= (.[0:1])' "$GYM_ROOT/data/workplace_assistant/train.jsonl" > $TRAIN_PATH
+jq -c '.responses_create_params.tools |= (.[0:1])' "$GYM_ROOT/data/workplace_assistant/validation.jsonl" > $VALIDATION_PATH
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $SC_ENTRYPOINT \

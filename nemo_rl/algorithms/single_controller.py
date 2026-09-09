@@ -144,6 +144,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointCommitResult,
     GymCheckpointPrepareResult,
     GymCompletedExecution,
+    gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -502,6 +503,9 @@ class SingleControllerActor:
         self._gym_checkpoint_topology = actor_args.gym_checkpoint_topology
         self._gym_checkpoint_restore_operation_id = (
             actor_args.gym_checkpoint_restore_operation_id
+        )
+        self._restored_gym_checkpoint_staging_keys = set(
+            actor_args.gym_checkpoint_staging_keys
         )
         self._rollout_checkpoint_stop_requested = asyncio.Event()
         # Narrow unsafe window after an optimizer mutates model state and before
@@ -996,6 +1000,7 @@ class SingleControllerActor:
                     cut,
                     replay_metadata=canonical_state,
                     clear_unreferenced=True,
+                    gym_staging_keys=self._restored_gym_checkpoint_staging_keys,
                 )
             await self._rehydrate_rollout_recovery_prompts(cut)
         self._sampler_stamps_target_steps = (
@@ -1334,10 +1339,12 @@ class SingleControllerActor:
         *,
         replay_metadata: Optional[TQReplayMetadataState],
         clear_unreferenced: bool,
+        gym_staging_keys: set[str] | None = None,
     ) -> int:
         """Validate staging ownership while the caller holds a stable cut."""
         cut.require_live()
         expected_staging_keys = self._rollout_recovery_ledger.expected_staging_keys()
+        expected_staging_keys.update(gym_staging_keys or ())
         if replay_metadata is not None:
             for group in replay_metadata["groups"]:
                 for tag in group["meta"].tags or []:
@@ -3845,6 +3852,8 @@ class SingleControllerActor:
         self,
         cut: DataPlaneMutationCut,
         checkpoint_path: PathLike,
+        *,
+        gym_staging_keys: set[str] | None = None,
     ) -> _RolloutCheckpointCut:
         """Save TQ and capture matching restart state under the barrier.
 
@@ -3887,6 +3896,7 @@ class SingleControllerActor:
                 cut,
                 replay_metadata=replay_metadata,
                 clear_unreferenced=False,
+                gym_staging_keys=gym_staging_keys,
             )
         tq_save_started = time.monotonic()
         await self._save_data_plane_checkpoint(
@@ -4045,6 +4055,7 @@ class SingleControllerActor:
                 prepare_snapshot_paths, anchor
             )
             gym_checkpoint: Optional[GymCheckpointCommitResult] = None
+            gym_staging_keys: set[str] = set()
             # A failed attempt removes its temporary directory, so its numeric
             # snapshot sequence can be reused. Gym retires every completed or
             # aborted control ID, however; add a nonce so the next attempt is not
@@ -4058,6 +4069,11 @@ class SingleControllerActor:
                     gym_checkpoint = await self._prepare_and_commit_gym_checkpoint(
                         checkpoint_id,
                         tmp_path,
+                    )
+                    gym_staging_keys = await asyncio.to_thread(
+                        gym_checkpoint_staging_keys,
+                        tmp_path,
+                        gym_checkpoint,
                     )
                 except BaseException:
                     if tmp_path.exists():
@@ -4084,7 +4100,9 @@ class SingleControllerActor:
                         )
                     snapshot_epoch = self._current_epoch
                     snapshot_cut = await self._capture_rollout_checkpoint_cut(
-                        cut, tmp_path
+                        cut,
+                        tmp_path,
+                        gym_staging_keys=gym_staging_keys,
                     )
                 barrier_released = time.monotonic()
 
