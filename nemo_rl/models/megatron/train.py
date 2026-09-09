@@ -607,6 +607,8 @@ class LogprobsPostProcessor:
     ):
         if topk is not None and topk <= 0:
             raise ValueError(f"topk must be positive when set, got {topk}")
+        if topk is not None and use_fused_linear_logprobs:
+            raise ValueError("Top-k capture is incompatible with fused-linear logprobs")
         self.cfg = cfg
         self.sampling_params = sampling_params
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
@@ -684,10 +686,6 @@ class LogprobsPostProcessor:
 
             result = {"logprobs": token_logprobs}
             if self.topk is not None:
-                if self.use_fused_linear_logprobs:
-                    raise ValueError(
-                        "Top-k capture is incompatible with fused-linear logprobs"
-                    )
                 _, topk_result = TopkLogitsPostProcessor(
                     cfg=self.cfg, k=self.topk, return_logsumexp=True
                 )(data_dict, cu_seqlens_padded)(output_tensor)

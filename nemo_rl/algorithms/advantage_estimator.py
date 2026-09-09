@@ -29,9 +29,10 @@ Reference papers:
 """
 
 import math
+from typing import Annotated
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -54,6 +55,9 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     reward_weights: list[float] | None = None
     # Reinforce++ specific
     minus_baseline: bool = True
+    # OPD specific
+    proximal_teacher_alpha: Annotated[float, Field(gt=0.0, le=1.0)] = 1.0
+    subtract_global_baseline: bool = False
 
 
 class GRPOAdvantageEstimator:
@@ -574,19 +578,11 @@ class OPDAdvantageEstimator:
 
     def __init__(
         self,
-        estimator_config: dict,
-        loss_config: dict,
-        *,
-        proximal_teacher_alpha: float = 1.0,
-        subtract_global_baseline: bool = False,
+        estimator_config: AdvEstimatorConfig,
+        loss_config: ClippedPGLossConfig,
     ):
-        self.proximal_teacher_alpha = float(proximal_teacher_alpha)
-        if not 0.0 < self.proximal_teacher_alpha <= 1.0:
-            raise ValueError(
-                "proximal_teacher_alpha must be in (0, 1], got "
-                f"{self.proximal_teacher_alpha}"
-            )
-        self.subtract_global_baseline = bool(subtract_global_baseline)
+        self.proximal_teacher_alpha = estimator_config.proximal_teacher_alpha
+        self.subtract_global_baseline = estimator_config.subtract_global_baseline
         self.last_metrics: dict[str, float] = {}
 
     def compute_advantage(

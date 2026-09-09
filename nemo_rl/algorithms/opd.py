@@ -68,10 +68,6 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
     enabled: bool = False
-    use_orm_advantage: bool = False
-    orm_advantage_weight: float = 0.0
-    proximal_teacher_alpha: float = Field(default=1.0, gt=0.0, le=1.0)
-    subtract_global_baseline: bool = False
     log_sample_stats: bool = False
     sample_stats_log_period: PositiveInt = 1
     log_sample_responses: bool = False
@@ -84,6 +80,8 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
         "student_online_teacher_deferred"
     )
     topk_stats_k: PositiveInt = 32
+    # Applied after full top-k tensors reach the driver: this bounds saved
+    # payload size, not teacher/student inference transfer or host memory.
     topk_stats_max_tokens: Optional[PositiveInt] = None
     teacher_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
     default_teacher_alias: Optional[str] = None
@@ -151,6 +149,34 @@ def assert_prev_logprobs_available(master_config: Any) -> None:
             "adv_estimator='opd' requires real prev_logprobs, but the config zeros them "
             "(loss_fn.force_on_policy_ratio=True with grpo.seq_logprob_error_threshold unset). "
             "Set seq_logprob_error_threshold or disable force_on_policy_ratio."
+        )
+
+
+def assert_topk_stats_supported(master_config: Any) -> None:
+    """Reject top-k diagnostic combinations that cannot run successfully."""
+    opd_cfg = master_config.on_policy_distillation
+    if opd_cfg is None or not opd_cfg.enabled or not opd_cfg.log_topk_stats:
+        return
+
+    policy_cfg = master_config.policy
+    if policy_cfg["dtensor_cfg"]["enabled"]:
+        raise ValueError(
+            "OPD top-k diagnostics require the Megatron policy backend; "
+            "policy.dtensor_cfg.enabled must be false."
+        )
+    megatron_cfg = policy_cfg.get("megatron_cfg")
+    if megatron_cfg is not None and megatron_cfg.get("use_fused_linear_logprobs"):
+        raise ValueError(
+            "OPD top-k diagnostics are incompatible with "
+            "policy.megatron_cfg.use_fused_linear_logprobs=true."
+        )
+    if opd_cfg.topk_stats_mode == "online" and (
+        opd_cfg.non_colocated_teachers is None
+        or not opd_cfg.non_colocated_teachers.enabled
+    ):
+        raise ValueError(
+            "on_policy_distillation.topk_stats_mode='online' requires "
+            "non_colocated_teachers.enabled=true."
         )
 
 

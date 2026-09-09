@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import threading
+
 import pytest
 import torch
 
@@ -280,20 +283,22 @@ def test_compute_teacher_topk_selects_multimodal_rows_per_teacher():
         _has_distillation_teachers=True,
     )
 
-    result = collector.compute_teacher_topk(
-        torch.randint(0, 100, (4, 8)),
-        [
-            {"name": "vision_agent"},
-            {"name": "text_agent"},
-            {"name": "vision_agent"},
-            {"name": "text_agent"},
-        ],
-        input_lengths=torch.full((4,), 8),
-        k=3,
-        multimodal_data={
-            "pixel_values": _row_marked_packed_tensor([0, None, 2, None]),
-            "imgs_sizes": _row_marked_packed_tensor([10, None, 12, None]),
-        },
+    result = asyncio.run(
+        collector.compute_teacher_topk(
+            torch.randint(0, 100, (4, 8)),
+            [
+                {"name": "vision_agent"},
+                {"name": "text_agent"},
+                {"name": "vision_agent"},
+                {"name": "text_agent"},
+            ],
+            input_lengths=torch.full((4,), 8),
+            k=3,
+            multimodal_data={
+                "pixel_values": _row_marked_packed_tensor([0, None, 2, None]),
+                "imgs_sizes": _row_marked_packed_tensor([10, None, 12, None]),
+            },
+        )
     )
 
     assert vision_twg.received is not None
@@ -321,14 +326,16 @@ def test_compute_teacher_topk_dp_padding_repeats_multimodal_row():
         _has_distillation_teachers=True,
     )
 
-    result = collector.compute_teacher_topk(
-        torch.randint(0, 100, (1, 8)),
-        [{"name": "vision_agent"}],
-        k=2,
-        multimodal_data={
-            "pixel_values": _row_marked_packed_tensor([7]),
-            "num_frames": _row_marked_packed_tensor([1]),
-        },
+    result = asyncio.run(
+        collector.compute_teacher_topk(
+            torch.randint(0, 100, (1, 8)),
+            [{"name": "vision_agent"}],
+            k=2,
+            multimodal_data={
+                "pixel_values": _row_marked_packed_tensor([7]),
+                "num_frames": _row_marked_packed_tensor([1]),
+            },
+        )
     )
 
     assert twg.received is not None
@@ -529,6 +536,57 @@ def test_is_non_colocated_teachers_enabled():
             }
         }
     )
+
+
+@pytest.mark.parametrize(
+    "policy,opd_overrides,error_match",
+    [
+        (
+            {"dtensor_cfg": {"enabled": True}},
+            {},
+            "Megatron policy backend",
+        ),
+        (
+            {
+                "dtensor_cfg": {"enabled": False},
+                "megatron_cfg": {
+                    "enabled": True,
+                    "use_fused_linear_logprobs": True,
+                },
+            },
+            {},
+            "fused_linear_logprobs",
+        ),
+        (
+            {
+                "dtensor_cfg": {"enabled": False},
+                "megatron_cfg": {"enabled": True},
+            },
+            {"topk_stats_mode": "online"},
+            "non_colocated_teachers.enabled",
+        ),
+    ],
+)
+def test_assert_topk_stats_supported_rejects_invalid_configs(
+    policy, opd_overrides, error_match
+):
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.opd import (
+        OnPolicyDistillationConfig,
+        assert_topk_stats_supported,
+    )
+
+    master_config = SimpleNamespace(
+        policy=policy,
+        on_policy_distillation=OnPolicyDistillationConfig(
+            enabled=True,
+            log_topk_stats=True,
+            **opd_overrides,
+        ),
+    )
+    with pytest.raises(ValueError, match=error_match):
+        assert_topk_stats_supported(master_config)
 
 
 def test_resolve_reference_aliases_bad_agent_ref():
@@ -822,13 +880,15 @@ def test_create_advantage_estimator_opd_branch():
         truncated_importance_sampling_type="none",
     )
     master_config = SimpleNamespace(
-        grpo=GRPOConfig(adv_estimator=AdvEstimatorConfig(name="opd")),
-        loss_fn=loss_fn,
-        on_policy_distillation=OnPolicyDistillationConfig(
-            enabled=True,
-            proximal_teacher_alpha=0.2,
-            subtract_global_baseline=True,
+        grpo=GRPOConfig(
+            adv_estimator=AdvEstimatorConfig(
+                name="opd",
+                proximal_teacher_alpha=0.2,
+                subtract_global_baseline=True,
+            )
         ),
+        loss_fn=loss_fn,
+        on_policy_distillation=OnPolicyDistillationConfig(enabled=True),
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -837,3 +897,23 @@ def test_create_advantage_estimator_opd_branch():
     assert estimator.proximal_teacher_alpha == 0.2
     assert estimator.subtract_global_baseline is True
     assert len(caught) == 3
+
+
+def test_compute_teacher_topk_runs_off_actor_event_loop():
+    collector = _make_collector()
+    event_loop_thread = threading.get_ident()
+
+    def compute_sync(
+        input_ids, agent_refs, input_lengths=None, k=32, multimodal_data=None
+    ):
+        return threading.get_ident()
+
+    collector._compute_teacher_topk_sync = compute_sync
+    worker_thread = asyncio.run(
+        collector.compute_teacher_topk(
+            torch.zeros(1, 1, dtype=torch.long),
+            [{"name": "math_agent"}],
+        )
+    )
+
+    assert worker_thread != event_loop_thread

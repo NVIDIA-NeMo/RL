@@ -14,16 +14,22 @@
 
 import pytest
 import torch
+from pydantic import ValidationError
 
-from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    OPDAdvantageEstimator,
+)
 
 
 def _make_estimator(alpha=1.0, subtract_global_baseline=False):
     return OPDAdvantageEstimator(
-        {"name": "opd"},
+        AdvEstimatorConfig(
+            name="opd",
+            proximal_teacher_alpha=alpha,
+            subtract_global_baseline=subtract_global_baseline,
+        ),
         {},
-        proximal_teacher_alpha=alpha,
-        subtract_global_baseline=subtract_global_baseline,
     )
 
 
@@ -154,12 +160,12 @@ def test_tropd_interpolates_teacher_and_student_probabilities():
 
 @pytest.mark.parametrize("alpha", [0.0, -0.1, 1.01])
 def test_tropd_rejects_invalid_alpha(alpha):
-    with pytest.raises(ValueError, match="proximal_teacher_alpha"):
+    with pytest.raises(ValidationError, match="proximal_teacher_alpha"):
         _make_estimator(alpha=alpha)
 
 
 def test_tropd_global_baseline_uses_only_valid_tokens_after_interpolation():
-    teacher = torch.tensor([[0.0, -2.0, 100.0]])
+    teacher = torch.tensor([[0.0, -1.0, 100.0]])
     student = torch.tensor([[-1.0, -1.0, -100.0]])
     mask = torch.tensor([[1.0, 1.0, 0.0]])
     estimator = _make_estimator(alpha=0.2, subtract_global_baseline=True)
@@ -184,7 +190,7 @@ def test_tropd_global_baseline_uses_only_valid_tokens_after_interpolation():
     )
     assert estimator.last_metrics[
         "on_policy_distillation/teacher_student_logprob_gap_mean"
-    ] == pytest.approx(0.0)
+    ] == pytest.approx(0.5)
 
 
 def test_tropd_all_masked_batch_is_finite_zero():

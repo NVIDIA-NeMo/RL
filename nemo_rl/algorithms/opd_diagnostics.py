@@ -21,11 +21,28 @@ training loop.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 
+import ray
 import torch
+
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+class _CommonOpdDiagnosticPayloadArgs(TypedDict):
+    step: int
+    num_generations_per_prompt: int
+    input_ids: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+    rewards: torch.Tensor
+    input_lengths: torch.Tensor
+    repeated_batch: Any
+    pre_seq_error_sample_loss_mask: torch.Tensor
+    seq_mult_prob_error: torch.Tensor
+    masked_by_seq_logprob_error: torch.Tensor
 
 
 def _opd_config(master_config: Any) -> OnPolicyDistillationConfig:
@@ -939,13 +956,13 @@ def _compute_topk_full_vocab_terms_chunked(
     teacher_V_logsumexp: torch.Tensor,
     chunk_size: int = 262_144,
 ) -> dict[str, torch.Tensor]:
-    """Compute exact saved top-k mass terms and coarsened entropy/CE terms.
+    """Compute saved top-k mass terms and coarsened entropy/CE terms.
 
-    Own top-k probabilities are exact full-vocab probabilities because logits
-    are normalized by V_logsumexp. Entropy is exact for the saved top-k head;
-    tail entropy and residual cross-entropy terms treat all non-observed mass
-    as a single bucket, so they are coarsened diagnostics rather than exact
-    full-vocabulary entropy or cross-entropy.
+    Own top-k probabilities are normalized against the full vocabulary using
+    V_logsumexp, with precision limited by the stored tensor dtypes. Entropy is
+    computed for the saved top-k head; tail entropy and residual cross-entropy
+    terms treat all non-observed mass as a single bucket, so they are coarsened
+    diagnostics rather than exact full-vocabulary entropy or cross-entropy.
     """
     num_tokens = int(student_ids.shape[0])
     k = int(student_ids.shape[-1]) if student_ids.ndim == 2 else 0
@@ -1638,9 +1655,9 @@ def _build_opd_topk_stats_payload(
             "from next-token outputs onto the input token positions they predict. "
             "Weighted Jaccard/probability overlap metrics are truncated and "
             "conditional over each model's saved top-k logits, not full-vocab "
-            "probability overlaps. V_logsumexp fields are full-vocab "
-            "normalizers for exact own-top-k logprobs via logits - logsumexp. "
-            "Head/tail mass fields use exact own-top-k full-vocab probabilities. "
+            "probability overlaps. V_logsumexp fields provide full-vocabulary "
+            "normalization via logits - logsumexp; precision is limited by the "
+            "stored tensor dtypes. "
             "Tail entropy and residual cross-entropy bucket fields collapse all "
             "unobserved vocabulary mass into one residual bucket."
         ),
@@ -1750,3 +1767,182 @@ def _build_opd_topk_stats_payload(
             mask=valid_token_mask,
         )
     return payload, metrics
+
+
+def _opd_seq_error_logging_fields(
+    train_data: BatchedDataDict,
+    pre_seq_error_sample_loss_mask: torch.Tensor,
+    *,
+    have_real_prev_logprobs: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reconstruct per-sample sequence-error fields used by legacy payloads."""
+    if not have_real_prev_logprobs:
+        return (
+            torch.full_like(pre_seq_error_sample_loss_mask, float("nan")),
+            torch.zeros_like(pre_seq_error_sample_loss_mask, dtype=torch.bool),
+        )
+    token_mask = train_data["token_mask"][:, 1:]
+    mask = token_mask * pre_seq_error_sample_loss_mask.unsqueeze(-1)
+    error = torch.abs(
+        train_data["generation_logprobs"][:, 1:] - train_data["prev_logprobs"][:, 1:]
+    )
+    denom = mask.sum(dim=-1)
+    seq_mult_prob_error = torch.zeros_like(denom, dtype=error.dtype)
+    valid = denom > 0
+    if valid.any():
+        numerator = (torch.exp(error * mask) * mask).sum(dim=-1)
+        seq_mult_prob_error[valid] = numerator[valid] / denom[valid]
+    masked_by_seq_logprob_error = (
+        pre_seq_error_sample_loss_mask > train_data["sample_mask"]
+    )
+    return seq_mult_prob_error, masked_by_seq_logprob_error
+
+
+def _collect_opd_diagnostic_payloads(
+    *,
+    master_config: Any,
+    step: int,
+    tokenizer: Any,
+    policy: Any,
+    trajectory_collector: Any,
+    train_data: BatchedDataDict,
+    repeated_batch: BatchedDataDict,
+    rewards: torch.Tensor,
+    input_lengths: torch.Tensor,
+    teacher_logprobs: Optional[torch.Tensor],
+    fused_student_topk: Optional[dict[str, torch.Tensor]],
+    pre_seq_error_sample_loss_mask: torch.Tensor,
+    have_real_prev_logprobs: bool,
+    timer: Any,
+) -> tuple[dict[str, Any], dict[str, float]]:
+    """Build requested legacy-compatible OPD artifacts for one async step."""
+    payloads: dict[str, Any] = {}
+    metrics: dict[str, float] = {}
+    if not opd_module.is_opd_enabled(master_config):
+        return payloads, metrics
+
+    log_sample_stats = _should_log_opd_sample_stats(master_config, step)
+    log_token_stats = _should_log_opd_token_stats(master_config, step)
+    log_topk_stats = _should_log_opd_topk_stats(master_config, step)
+    if not (log_sample_stats or log_token_stats or log_topk_stats):
+        return payloads, metrics
+
+    seq_mult_prob_error, masked_by_seq_logprob_error = _opd_seq_error_logging_fields(
+        train_data,
+        pre_seq_error_sample_loss_mask,
+        have_real_prev_logprobs=have_real_prev_logprobs,
+    )
+    common: _CommonOpdDiagnosticPayloadArgs = {
+        "step": step,
+        "num_generations_per_prompt": master_config.grpo.num_generations_per_prompt,
+        "input_ids": train_data["input_ids"],
+        "token_mask": train_data["token_mask"],
+        "sample_mask": train_data["sample_mask"],
+        "rewards": rewards,
+        "input_lengths": input_lengths,
+        "repeated_batch": repeated_batch,
+        "pre_seq_error_sample_loss_mask": pre_seq_error_sample_loss_mask,
+        "seq_mult_prob_error": seq_mult_prob_error,
+        "masked_by_seq_logprob_error": masked_by_seq_logprob_error,
+    }
+
+    if log_sample_stats:
+        if teacher_logprobs is None:
+            metrics[
+                "on_policy_distillation/sample_stats/skipped_no_teacher_logprobs"
+            ] = 1.0
+        else:
+            log_responses, response_max_tokens = (
+                _get_opd_sample_response_logging_config(master_config)
+            )
+            payload, payload_metrics = _build_opd_sample_stats_log_data(
+                tokenizer=tokenizer,
+                log_sample_responses=log_responses,
+                sample_response_max_tokens=response_max_tokens,
+                teacher_logprobs=teacher_logprobs,
+                prev_logprobs=train_data["prev_logprobs"],
+                generation_logprobs=train_data["generation_logprobs"],
+                **common,
+            )
+            payloads["sample"] = payload
+            metrics.update(payload_metrics)
+
+    if log_token_stats:
+        if teacher_logprobs is None:
+            metrics[
+                "on_policy_distillation/token_stats/skipped_no_teacher_logprobs"
+            ] = 1.0
+        else:
+            payload, payload_metrics = _build_opd_token_stats_payload(
+                teacher_logprobs=teacher_logprobs,
+                prev_logprobs=train_data["prev_logprobs"],
+                generation_logprobs=train_data["generation_logprobs"],
+                **common,
+            )
+            payloads["token"] = payload
+            metrics.update(payload_metrics)
+
+    if not log_topk_stats:
+        return payloads, metrics
+    if "agent_ref" not in repeated_batch:
+        metrics["on_policy_distillation/topk_stats/skipped_no_agent_ref"] = 1.0
+        return payloads, metrics
+
+    mode = _get_opd_topk_stats_mode(master_config)
+    k = _get_opd_topk_stats_k(master_config)
+    max_tokens = _get_opd_topk_stats_max_tokens(master_config)
+    if mode == OPD_TOPK_STATS_MODE_STUDENT_ONLINE_TEACHER_DEFERRED:
+        offline, offline_metrics = _build_opd_topk_offline_inputs_payload(
+            k=k,
+            max_logged_tokens=max_tokens,
+            topk_stats_mode=mode,
+            **common,
+        )
+        payloads["topk_offline_inputs"] = offline
+        metrics.update(offline_metrics)
+        if fused_student_topk is None:
+            metrics["on_policy_distillation/topk_stats/skipped_no_student_topk"] = 1.0
+            return payloads, metrics
+        student, student_metrics = _build_opd_student_topk_stats_payload(
+            student_prev_topk_logprobs=fused_student_topk["topk_logprobs"],
+            student_prev_topk_indices=fused_student_topk["topk_indices"],
+            max_logged_tokens=max_tokens,
+            **common,
+        )
+        payloads["topk_student_stats"] = student
+        metrics.update(student_metrics)
+        metrics["on_policy_distillation/topk_stats/student/fused_with_logprobs"] = 1.0
+        return payloads, metrics
+
+    with timer.time("opd_topk_stats_inference"):
+        student_topk = policy.get_topk_logits(
+            train_data, k=k, timer=timer, return_logsumexp=True
+        )
+        teacher_topk = ray.get(
+            trajectory_collector.compute_teacher_topk.remote(
+                train_data["input_ids"].cpu(),
+                repeated_batch["agent_ref"],
+                input_lengths=input_lengths.cpu(),
+                k=k,
+                # Same media the student top-k saw; the teacher path slices
+                # it per teacher exactly like _compute_teacher_logprobs.
+                multimodal_data=train_data.get_multimodal_dict(as_tensors=False),
+            )
+        )
+    online, online_metrics = _build_opd_topk_stats_payload(
+        student_topk_logits=student_topk["topk_logits"],
+        student_topk_indices=student_topk["topk_indices"],
+        student_V_logsumexp=student_topk["V_logsumexp"],
+        teacher_topk_logits=teacher_topk["topk_logits"],
+        teacher_topk_indices=teacher_topk["topk_indices"],
+        teacher_V_logsumexp=teacher_topk["V_logsumexp"],
+        max_logged_tokens=max_tokens,
+        **common,
+    )
+    payloads["topk_stats"] = online
+    metrics.update(online_metrics)
+    metrics["on_policy_distillation/topk_stats/teacher_topk_time"] = float(
+        teacher_topk.get("teacher_topk_time", 0.0)
+    )
+    metrics["on_policy_distillation/topk_stats/online"] = 1.0
+    return payloads, metrics

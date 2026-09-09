@@ -2436,6 +2436,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
+        opd_module.assert_topk_stats_supported(master_config)
         opd_config = master_config.on_policy_distillation
         if opd_config is None:
             raise ValueError(
@@ -2443,10 +2444,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
                 "on_policy_distillation config block"
             )
         adv_estimator = OPDAdvantageEstimator(
-            {"name": "opd"},
+            adv_estimator_config,
             loss_config,
-            proximal_teacher_alpha=opd_config.proximal_teacher_alpha,
-            subtract_global_baseline=opd_config.subtract_global_baseline,
         )
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
@@ -2837,175 +2836,6 @@ def compute_and_apply_seq_logprob_error_masking(
         "num_masked_seqs": num_masked_seqs,
         "masked_correct_pct": masked_correct_pct,
     }
-
-
-def _opd_seq_error_logging_fields(
-    train_data: BatchedDataDict,
-    pre_seq_error_sample_loss_mask: torch.Tensor,
-    *,
-    have_real_prev_logprobs: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reconstruct per-sample sequence-error fields used by legacy payloads."""
-    if not have_real_prev_logprobs:
-        return (
-            torch.full_like(pre_seq_error_sample_loss_mask, float("nan")),
-            torch.zeros_like(pre_seq_error_sample_loss_mask, dtype=torch.bool),
-        )
-    token_mask = train_data["token_mask"][:, 1:]
-    mask = token_mask * pre_seq_error_sample_loss_mask.unsqueeze(-1)
-    error = torch.abs(
-        train_data["generation_logprobs"][:, 1:] - train_data["prev_logprobs"][:, 1:]
-    )
-    denom = mask.sum(dim=-1)
-    seq_mult_prob_error = torch.zeros_like(denom, dtype=error.dtype)
-    valid = denom > 0
-    if valid.any():
-        numerator = (torch.exp(error * mask) * mask).sum(dim=-1)
-        seq_mult_prob_error[valid] = numerator[valid] / denom[valid]
-    masked_by_seq_logprob_error = (
-        pre_seq_error_sample_loss_mask > train_data["sample_mask"]
-    )
-    return seq_mult_prob_error, masked_by_seq_logprob_error
-
-
-def _collect_opd_diagnostic_payloads(
-    *,
-    master_config: MasterConfig,
-    step: int,
-    tokenizer: Any,
-    policy: Policy,
-    trajectory_collector: Any,
-    train_data: BatchedDataDict,
-    repeated_batch: BatchedDataDict,
-    rewards: torch.Tensor,
-    input_lengths: torch.Tensor,
-    teacher_logprobs: Optional[torch.Tensor],
-    fused_student_topk: Optional[dict[str, torch.Tensor]],
-    pre_seq_error_sample_loss_mask: torch.Tensor,
-    seq_mult_prob_error: torch.Tensor,
-    masked_by_seq_logprob_error: torch.Tensor,
-    timer: Timer,
-) -> tuple[dict[str, Any], dict[str, float]]:
-    """Build requested legacy-compatible OPD artifacts for one async step."""
-    payloads: dict[str, Any] = {}
-    metrics: dict[str, float] = {}
-    if not opd_module.is_opd_enabled(master_config):
-        return payloads, metrics
-
-    common = {
-        "step": step,
-        "num_generations_per_prompt": master_config.grpo.num_generations_per_prompt,
-        "input_ids": train_data["input_ids"],
-        "token_mask": train_data["token_mask"],
-        "sample_mask": train_data["sample_mask"],
-        "rewards": rewards,
-        "input_lengths": input_lengths,
-        "repeated_batch": repeated_batch,
-        "pre_seq_error_sample_loss_mask": pre_seq_error_sample_loss_mask,
-        "seq_mult_prob_error": seq_mult_prob_error,
-        "masked_by_seq_logprob_error": masked_by_seq_logprob_error,
-    }
-
-    if opd_diag._should_log_opd_sample_stats(master_config, step):
-        if teacher_logprobs is None:
-            metrics[
-                "on_policy_distillation/sample_stats/skipped_no_teacher_logprobs"
-            ] = 1.0
-        else:
-            log_responses, response_max_tokens = (
-                opd_diag._get_opd_sample_response_logging_config(master_config)
-            )
-            payload, payload_metrics = opd_diag._build_opd_sample_stats_log_data(
-                tokenizer=tokenizer,
-                log_sample_responses=log_responses,
-                sample_response_max_tokens=response_max_tokens,
-                teacher_logprobs=teacher_logprobs,
-                prev_logprobs=train_data["prev_logprobs"],
-                generation_logprobs=train_data["generation_logprobs"],
-                **common,
-            )
-            payloads["sample"] = payload
-            metrics.update(payload_metrics)
-
-    if opd_diag._should_log_opd_token_stats(master_config, step):
-        if teacher_logprobs is None:
-            metrics[
-                "on_policy_distillation/token_stats/skipped_no_teacher_logprobs"
-            ] = 1.0
-        else:
-            payload, payload_metrics = opd_diag._build_opd_token_stats_payload(
-                teacher_logprobs=teacher_logprobs,
-                prev_logprobs=train_data["prev_logprobs"],
-                generation_logprobs=train_data["generation_logprobs"],
-                **common,
-            )
-            payloads["token"] = payload
-            metrics.update(payload_metrics)
-
-    if not opd_diag._should_log_opd_topk_stats(master_config, step):
-        return payloads, metrics
-    if "agent_ref" not in repeated_batch:
-        metrics["on_policy_distillation/topk_stats/skipped_no_agent_ref"] = 1.0
-        return payloads, metrics
-
-    mode = opd_diag._get_opd_topk_stats_mode(master_config)
-    k = opd_diag._get_opd_topk_stats_k(master_config)
-    max_tokens = opd_diag._get_opd_topk_stats_max_tokens(master_config)
-    if mode == opd_diag.OPD_TOPK_STATS_MODE_STUDENT_ONLINE_TEACHER_DEFERRED:
-        offline, offline_metrics = opd_diag._build_opd_topk_offline_inputs_payload(
-            k=k,
-            max_logged_tokens=max_tokens,
-            topk_stats_mode=mode,
-            **common,
-        )
-        payloads["topk_offline_inputs"] = offline
-        metrics.update(offline_metrics)
-        if fused_student_topk is None:
-            metrics["on_policy_distillation/topk_stats/skipped_no_student_topk"] = 1.0
-            return payloads, metrics
-        student, student_metrics = opd_diag._build_opd_student_topk_stats_payload(
-            student_prev_topk_logprobs=fused_student_topk["topk_logprobs"],
-            student_prev_topk_indices=fused_student_topk["topk_indices"],
-            max_logged_tokens=max_tokens,
-            **common,
-        )
-        payloads["topk_student_stats"] = student
-        metrics.update(student_metrics)
-        metrics["on_policy_distillation/topk_stats/student/fused_with_logprobs"] = 1.0
-        return payloads, metrics
-
-    with timer.time("opd_topk_stats_inference"):
-        student_topk = policy.get_topk_logits(
-            train_data, k=k, timer=timer, return_logsumexp=True
-        )
-        teacher_topk = ray.get(
-            trajectory_collector.compute_teacher_topk.remote(
-                train_data["input_ids"].cpu(),
-                repeated_batch["agent_ref"],
-                input_lengths=input_lengths.cpu(),
-                k=k,
-                # Same media the student top-k saw; the teacher path slices
-                # it per teacher exactly like _compute_teacher_logprobs.
-                multimodal_data=train_data.get_multimodal_dict(as_tensors=False),
-            )
-        )
-    online, online_metrics = opd_diag._build_opd_topk_stats_payload(
-        student_topk_logits=student_topk["topk_logits"],
-        student_topk_indices=student_topk["topk_indices"],
-        student_V_logsumexp=student_topk["V_logsumexp"],
-        teacher_topk_logits=teacher_topk["topk_logits"],
-        teacher_topk_indices=teacher_topk["topk_indices"],
-        teacher_V_logsumexp=teacher_topk["V_logsumexp"],
-        max_logged_tokens=max_tokens,
-        **common,
-    )
-    payloads["topk_stats"] = online
-    metrics.update(online_metrics)
-    metrics["on_policy_distillation/topk_stats/teacher_topk_time"] = float(
-        teacher_topk.get("teacher_topk_time", 0.0)
-    )
-    metrics["on_policy_distillation/topk_stats/online"] = 1.0
-    return payloads, metrics
 
 
 # ===============================================================================
@@ -5429,17 +5259,9 @@ def async_grpo_train(
                     )
 
                 (
-                    seq_mult_prob_error,
-                    masked_by_seq_logprob_error,
-                ) = _opd_seq_error_logging_fields(
-                    train_data,
-                    pre_seq_error_sample_loss_mask,
-                    have_real_prev_logprobs=not skip_prev_logprobs,
-                )
-                (
                     opd_diagnostic_payloads,
                     opd_diagnostic_metrics,
-                ) = _collect_opd_diagnostic_payloads(
+                ) = opd_diag._collect_opd_diagnostic_payloads(
                     master_config=master_config,
                     step=step,
                     tokenizer=tokenizer,
@@ -5452,8 +5274,7 @@ def async_grpo_train(
                     teacher_logprobs=trajectory_teacher_logprobs,
                     fused_student_topk=fused_student_topk,
                     pre_seq_error_sample_loss_mask=pre_seq_error_sample_loss_mask,
-                    seq_mult_prob_error=seq_mult_prob_error,
-                    masked_by_seq_logprob_error=masked_by_seq_logprob_error,
+                    have_real_prev_logprobs=not skip_prev_logprobs,
                     timer=timer,
                 )
                 rollout_metrics.update(opd_diagnostic_metrics)

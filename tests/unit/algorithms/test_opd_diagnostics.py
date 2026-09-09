@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -72,7 +73,6 @@ def test_diagnostic_periods_are_one_based():
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("proximal_teacher_alpha", 0.0),
         ("sample_stats_log_period", 0),
         ("token_stats_log_period", 0),
         ("topk_stats_log_period", 0),
@@ -127,18 +127,134 @@ def test_next_token_topk_alignment_and_full_vocab_terms():
         torch.tensor([[[-1, -1], [5, 7], [6, 8], [9, 1]]]),
     )
 
-    student_logits = torch.log(torch.tensor([[0.6, 0.2]]))
-    teacher_logits = torch.log(torch.tensor([[0.5, 0.3]]))
+    # Non-zero normalizer so the test exercises logits - V_logsumexp.
+    shift = 1.5
+    student_logits = torch.log(torch.tensor([[0.6, 0.2]])) + shift
+    teacher_logits = torch.log(torch.tensor([[0.5, 0.3]])) + shift
     terms = diagnostics._compute_topk_full_vocab_terms_chunked(
         student_ids=torch.tensor([[1, 2]]),
         teacher_ids=torch.tensor([[1, 3]]),
         student_logits=student_logits,
         teacher_logits=teacher_logits,
-        student_V_logsumexp=torch.tensor([0.0]),
-        teacher_V_logsumexp=torch.tensor([0.0]),
+        student_V_logsumexp=torch.tensor([shift]),
+        teacher_V_logsumexp=torch.tensor([shift]),
     )
 
     assert terms["student_topk_head_prob_mass"].item() == pytest.approx(0.8)
     assert terms["teacher_topk_head_prob_mass"].item() == pytest.approx(0.8)
     assert terms["student_topk_mass_in_teacher_topk"].item() == pytest.approx(0.6)
     assert terms["teacher_topk_mass_in_student_topk"].item() == pytest.approx(0.5)
+
+
+def test_opd_seq_error_logging_fields_match_seq_logprob_error_masking():
+    """The per-sample OPD payload fields agree with the masking helper."""
+    from nemo_rl.algorithms.grpo import compute_and_apply_seq_logprob_error_masking
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    generation_logprobs = torch.zeros(4, 6)
+    prev_logprobs = torch.zeros(4, 6)
+    prev_logprobs[1, :] = -0.1
+    prev_logprobs[2, :] = -0.5
+    # Position 0 is never a response token; both helpers must ignore it.
+    prev_logprobs[:, 0] = -5.0
+    token_mask = torch.ones(4, 6)
+    token_mask[:, 1] = 0.0
+    token_mask[3] = 0.0
+    train_data = BatchedDataDict(
+        {
+            "token_mask": token_mask,
+            "sample_mask": torch.ones(4),
+            "prev_logprobs": prev_logprobs,
+            "generation_logprobs": generation_logprobs,
+        }
+    )
+    rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    pre_mask = train_data["sample_mask"].clone()
+
+    legacy = compute_and_apply_seq_logprob_error_masking(
+        train_data, rewards, seq_logprob_error_threshold=1.2
+    )
+    seq_error, masked = diagnostics._opd_seq_error_logging_fields(
+        train_data, pre_mask, have_real_prev_logprobs=True
+    )
+
+    torch.testing.assert_close(seq_error[:3], torch.exp(torch.tensor([0.0, 0.1, 0.5])))
+    assert seq_error[3] == 0.0
+    assert seq_error[:3].max().item() == pytest.approx(
+        legacy["max_seq_mult_prob_error"]
+    )
+    assert seq_error[:3].mean().item() == pytest.approx(
+        legacy["mean_seq_mult_prob_error"]
+    )
+    assert seq_error[:3].min().item() == pytest.approx(
+        legacy["min_seq_mult_prob_error"]
+    )
+    assert masked.tolist() == [False, False, True, False]
+    assert int(masked.sum()) == legacy["num_masked_seqs"]
+    assert torch.equal(masked, pre_mask.bool() & ~train_data["sample_mask"].bool())
+
+    nan_error, no_mask = diagnostics._opd_seq_error_logging_fields(
+        train_data, pre_mask, have_real_prev_logprobs=False
+    )
+    assert torch.isnan(nan_error).all()
+    assert not no_mask.any()
+
+
+@pytest.mark.parametrize(
+    "opd_config",
+    [
+        None,
+        {
+            "enabled": False,
+            "log_sample_stats": True,
+            "log_token_stats": True,
+            "log_topk_stats": True,
+        },
+        {"enabled": True},
+    ],
+)
+def test_collect_opd_diagnostic_payloads_is_noop_unless_logging_requested(
+    opd_config,
+):
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    master_config = SimpleNamespace(
+        on_policy_distillation=(
+            None if opd_config is None else OnPolicyDistillationConfig(**opd_config)
+        ),
+        grpo=SimpleNamespace(num_generations_per_prompt=2),
+    )
+    policy = MagicMock()
+    trajectory_collector = MagicMock()
+    train_data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(2, 4, dtype=torch.long),
+            "token_mask": torch.ones(2, 4),
+            "sample_mask": torch.ones(2),
+            # These deliberately fail tensor math if the no-op gate regresses.
+            "prev_logprobs": MagicMock(),
+            "generation_logprobs": MagicMock(),
+        }
+    )
+
+    payloads, metrics = diagnostics._collect_opd_diagnostic_payloads(
+        master_config=master_config,
+        step=0,
+        tokenizer=None,
+        policy=policy,
+        trajectory_collector=trajectory_collector,
+        train_data=train_data,
+        repeated_batch=BatchedDataDict({"agent_ref": [{"name": "a"}, {"name": "b"}]}),
+        rewards=torch.ones(2),
+        input_lengths=torch.tensor([4, 4]),
+        teacher_logprobs=torch.zeros(2, 4),
+        fused_student_topk=None,
+        pre_seq_error_sample_loss_mask=torch.ones(2),
+        have_real_prev_logprobs=True,
+        timer=MagicMock(),
+    )
+
+    assert payloads == {}
+    assert metrics == {}
+    policy.get_topk_logits.assert_not_called()
+    trajectory_collector.compute_teacher_topk.remote.assert_not_called()

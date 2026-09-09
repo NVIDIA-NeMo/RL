@@ -1278,7 +1278,25 @@ class AsyncTrajectoryCollector:
 
         return result, total_time
 
-    def compute_teacher_topk(
+    async def compute_teacher_topk(
+        self,
+        input_ids: torch.Tensor,
+        agent_refs: list[dict[str, Any]],
+        input_lengths: Optional[torch.Tensor] = None,
+        k: int = 32,
+        multimodal_data: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Compute teacher top-k logits without blocking the actor event loop."""
+        return await asyncio.to_thread(
+            self._compute_teacher_topk_sync,
+            input_ids,
+            agent_refs,
+            input_lengths=input_lengths,
+            k=k,
+            multimodal_data=multimodal_data,
+        )
+
+    def _compute_teacher_topk_sync(
         self,
         input_ids: torch.Tensor,
         agent_refs: list[dict[str, Any]],
