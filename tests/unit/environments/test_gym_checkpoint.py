@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 from pydantic import ValidationError
@@ -27,6 +28,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymDiscoveredParticipant,
     GymExecutionIdentity,
     gym_capture_key,
+    gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
 )
 
@@ -164,6 +166,152 @@ def test_participant_manifest_digest_is_verified_before_publication(tmp_path) ->
 
     with pytest.raises(ValueError, match="manifest digest mismatch"):
         validate_gym_checkpoint_manifests(tmp_path, checkpoint)
+
+
+def test_model_lineage_staging_keys_are_bound_to_the_tq_snapshot(tmp_path) -> None:
+    agent_dir = tmp_path / "agent" / "instance-test"
+    agent_dir.mkdir(parents=True)
+    agent_record_path = agent_dir / "group-7_g0.a0.json"
+    agent_record_path.write_text(
+        json.dumps(
+            {
+                "rollout_id": "group-7_g0",
+                "attempt_index": 0,
+                "boundary_index": 1,
+                "last_committed_model_call_id": "call-1",
+            }
+        )
+    )
+    agent_record_digest = hashlib.sha256(agent_record_path.read_bytes()).hexdigest()
+    agent_manifest_path = agent_dir / "manifest.json"
+    agent_manifest_path.write_text(
+        json.dumps(
+            {
+                "files": {agent_record_path.name: agent_record_digest},
+            }
+        )
+    )
+    agent_manifest_digest = hashlib.sha256(agent_manifest_path.read_bytes()).hexdigest()
+
+    ledger_dir = tmp_path / "model-ledger" / "policy_model"
+    ledger_dir.mkdir(parents=True)
+    lineage_path = ledger_dir / "group-7_g0.lineage.jsonl"
+    lineage_path.write_text(
+        json.dumps({"kind": "request", "staging_key": None})
+        + "\n"
+        + json.dumps(
+            {
+                "kind": "response",
+                "model_call_id": "call-1",
+                "staging_key": "group-7_g0/call-1",
+                "staging_chain": [
+                    "group-7_g0/source-call",
+                    "group-7_g0/call-1",
+                ],
+            }
+        )
+        + "\n"
+    )
+    lineage_digest = hashlib.sha256(lineage_path.read_bytes()).hexdigest()
+    completed_lineage_path = ledger_dir / "completed_g1.lineage.jsonl"
+    completed_lineage_path.write_text(
+        json.dumps(
+            {
+                "kind": "response",
+                "staging_key": "completed_g1/call-1",
+            }
+        )
+        + "\n"
+    )
+    completed_lineage_digest = hashlib.sha256(
+        completed_lineage_path.read_bytes()
+    ).hexdigest()
+    manifest_path = ledger_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "checkpoint_id": "snapshot-7",
+                "server_name": "policy_model",
+                "rollouts": {
+                    "group-7_g0": {
+                        "files": {lineage_path.name: lineage_digest},
+                        "rows": 2,
+                    },
+                    # Model lineage can outlive an acknowledged completed
+                    # execution. It must not keep that execution's old staging
+                    # tensors alive when no parked agent boundary references it.
+                    "completed_g1": {
+                        "files": {
+                            completed_lineage_path.name: completed_lineage_digest
+                        },
+                        "rows": 1,
+                    },
+                },
+                "tombstones": [],
+                "source_attempts": [],
+            }
+        )
+    )
+    manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    checkpoint = GymCheckpointCommitResult.model_validate(
+        {
+            "checkpoint_id": "snapshot-7",
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "policy-route",
+                        "component": "responses_api_models",
+                        "participant_name": "policy_model",
+                    },
+                    "payload": {
+                        "rollouts": 2,
+                        "rows": 3,
+                        "excluded_tombstoned": 0,
+                        "manifest_digest": manifest_digest,
+                    },
+                    "manifest": {
+                        "participant": {
+                            "server_name": "policy-route",
+                            "component": "responses_api_models",
+                            "participant_name": "policy_model",
+                        },
+                        "relative_path": "model-ledger/policy_model/manifest.json",
+                        "manifest_digest": manifest_digest,
+                    },
+                },
+                {
+                    "participant": {
+                        "server_name": "agent-route",
+                        "component": "responses_api_agents",
+                        "participant_name": "agent",
+                    },
+                    "payload": {
+                        "records": 1,
+                        "manifest_digest": agent_manifest_digest,
+                    },
+                    "manifest": {
+                        "participant": {
+                            "server_name": "agent-route",
+                            "component": "responses_api_agents",
+                            "participant_name": "agent",
+                        },
+                        "relative_path": "agent/instance-test/manifest.json",
+                        "manifest_digest": agent_manifest_digest,
+                    },
+                },
+            ],
+        }
+    )
+
+    assert gym_checkpoint_staging_keys(tmp_path, checkpoint) == {
+        "group-7_g0/source-call",
+        "group-7_g0/call-1",
+    }
+
+    lineage_path.write_text("{}\n")
+    with pytest.raises(ValueError, match="lineage digest mismatch"):
+        gym_checkpoint_staging_keys(tmp_path, checkpoint)
 
 
 def test_checkpoint_commit_rejects_mismatched_manifest_identity() -> None:

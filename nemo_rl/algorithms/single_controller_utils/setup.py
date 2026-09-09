@@ -99,6 +99,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointTopology,
+    gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -175,6 +176,7 @@ class SingleControllerActorArgs:
     # addresses, and credentials are excluded from this identity.
     gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
     gym_checkpoint_restore_operation_id: Optional[str] = None
+    gym_checkpoint_staging_keys: tuple[str, ...] = ()
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -1642,6 +1644,7 @@ def setup_single_controller(
     if "value_time" in time_metrics:
         setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
 
+    restored_gym_checkpoint_staging_keys: tuple[str, ...] = ()
     if saved_gym_checkpoint is not None:
         assert resolved_snapshot is not None
         assert gym_checkpoint_topology is not None
@@ -1654,6 +1657,14 @@ def setup_single_controller(
         validate_gym_checkpoint_manifests(
             resolved_snapshot.path,
             saved_gym_checkpoint,
+        )
+        restored_gym_checkpoint_staging_keys = tuple(
+            sorted(
+                gym_checkpoint_staging_keys(
+                    resolved_snapshot.path,
+                    saved_gym_checkpoint,
+                )
+            )
         )
 
     # Native TQ restore must run through the trainer's bootstrap client before
@@ -1925,6 +1936,7 @@ def setup_single_controller(
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         gym_checkpoint_topology=gym_checkpoint_topology,
         gym_checkpoint_restore_operation_id=gym_checkpoint_restore_operation_id,
+        gym_checkpoint_staging_keys=restored_gym_checkpoint_staging_keys,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

@@ -2000,6 +2000,33 @@ class TestDataPlaneCheckpoint:
         assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
         assert sorted(dp_client.sample_ids) == [route_key, "sealed-key"]
 
+    def test_rollout_recovery_inventory_preserves_gym_turn_lineage(self):
+        staging_partition = "rollout_staging"
+        gym_turn_key = "group-7_g0/model-call-2"
+        dp_client = _StagingInventoryDPClient(
+            [gym_turn_key, "orphan-key"],
+            partition_id=staging_partition,
+        )
+        actor = object.__new__(_ACTOR_CLS)
+        actor._rollout_recovery_ledger = RolloutRecoveryLedger()
+        actor._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition=staging_partition)
+        )
+        actor._dp_client = dp_client
+
+        async def validate_inventory() -> int:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                return await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=None,
+                    clear_unreferenced=True,
+                    gym_staging_keys={gym_turn_key},
+                )
+
+        assert asyncio.run(validate_inventory()) == 1
+        assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
+        assert dp_client.sample_ids == [gym_turn_key]
+
     def test_gated_sampler_writes_authoritative_tq_checkpoint(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
