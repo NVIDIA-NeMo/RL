@@ -1,0 +1,8 @@
+# The H100 nightly suite allocates eight GPUs, but this smoke uses three:
+# one for training, one for prefill, and one for decode.
+defaults: ../../grpo_math_1B_dynamo_disagg.yaml
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  tokenizer:
+    name: Qwen/Qwen3-0.6B
