@@ -56,7 +56,7 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.policy import DEFAULT_DRAFT_ALGO, PolicyConfig
+from nemo_rl.models.policy import DSparkDraftOptions, Eagle3DraftOptions, PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -385,10 +385,13 @@ class DTensorPolicyWorkerV2Impl(
                 DSparkRuntime,
                 Eagle3Runtime,
             )
-            from nemo_rl.models.policy import Eagle3DraftOptions
 
             draft_cfg = config.get("draft", {})
-            self.draft_algo = draft_cfg.get("algo", DEFAULT_DRAFT_ALGO)
+            # Required key, not a call-site default: the exemplar YAML
+            # always sets policy.draft.algo (config-conventions v1
+            # TypedDict rule), and self.draft_model is only built when
+            # draft is enabled.
+            self.draft_algo = draft_cfg["algo"]
             # loss_weight has no call-site default: its default lives in the
             # exemplar YAML (grpo_math_1B.yaml) like every other draft knob.
             loss_weight = float(draft_cfg["loss_weight"])
@@ -407,8 +410,6 @@ class DTensorPolicyWorkerV2Impl(
                     **common_groups,
                 )
             else:
-                from nemo_rl.models.policy import DSparkDraftOptions
-
                 self.draft_runtime = DSparkRuntime(
                     draft_model=self.draft_model,
                     dspark_options=DSparkDraftOptions.model_validate(
@@ -488,7 +489,7 @@ class DTensorPolicyWorkerV2Impl(
         return torch.autocast(device_type="cuda", dtype=self.dtype)
 
     def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
-        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+        """Record the rollout engine's TP size for later use by weight-streaming refit."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
@@ -598,10 +599,16 @@ class DTensorPolicyWorkerV2Impl(
                     # Slot count = DP-max of valid microbatch counts, i.e. the
                     # padded (dummy-including) count every rank actually runs.
                     # Used to average the per-slot draft losses so the summed
-                    # backward keeps a global-mean gradient scale. Counts can
-                    # differ across ranks only under dynamic batching (packing
-                    # is rejected for draft co-training); otherwise skip the
-                    # collective.
+                    # backward keeps a global-mean gradient scale. Dynamic
+                    # batching builds one shared microbatch plan from the
+                    # cross-shard max seqlen (batched_data_dict.py), so
+                    # iterator_len is already identical on every DP rank here
+                    # and this all-reduce is a no-op; it's the dummy-padding
+                    # path under sequence packing (automodel/data.py) that can
+                    # actually make counts differ across ranks, but packing is
+                    # rejected for draft co-training (automodel/train.py).
+                    # Kept as defense-in-depth in case that restriction ever
+                    # loosens.
                     if self.cfg["dynamic_batching"]["enabled"]:
                         mb_slots_t = torch.tensor(iterator_len, device="cuda")
                         torch.distributed.all_reduce(
@@ -1302,47 +1309,6 @@ class DTensorPolicyWorkerV2Impl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
-        )
-
-    @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
-    def stream_weights_via_http(
-        self,
-        rollout_engine_urls: list[str],
-        buffer_size_bytes: int,
-    ) -> None:
-        """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
-
-        Args:
-            rollout_engine_urls: ``http://host:port`` base URLs of each
-                engine's ``node_rank=0`` SGLang HTTP server. The driver
-                resolves these once via ``engine.get_base_url`` and passes
-                them down so every FSDP rank doesn't redo the Ray RPC.
-            buffer_size_bytes: Max bucket size in bytes before flushing.
-
-        ``num_gpus_per_engine`` is recorded once via
-        ``set_rollout_num_gpus_per_engine`` after the SGLang generation handle
-        is created, so the caller doesn't have to pass it on every refit.
-        """
-        assert self._rollout_num_gpus_per_engine is not None, (
-            "stream_weights_via_http called before set_rollout_num_gpus_per_engine; "
-            "wire the rollout TP size on the policy after SGLangGeneration is built."
-        )
-
-        # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
-            self.model = self.move_to_cuda(self.model)
-
-        from nemo_rl.models.policy.utils import stream_weights_via_http_impl
-
-        stream_weights_via_http_impl(
-            params_generator=self._refit_params_generator(),
-            rollout_engine_urls=rollout_engine_urls,
-            num_gpus_per_engine=self._rollout_num_gpus_per_engine,
-            rank=self.rank,
-            world_size=torch.distributed.get_world_size(),
-            worker_name=str(self),
-            buffer_size_bytes=buffer_size_bytes,
         )
 
     @torch.no_grad()

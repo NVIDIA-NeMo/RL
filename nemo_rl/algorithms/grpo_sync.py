@@ -67,6 +67,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    finalize_draft_ratio_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
@@ -87,25 +88,6 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
-
-
-def _finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
-    """Lazily defer to automodel's draft integration; no-op if it isn't installed.
-
-    Called unconditionally every step regardless of ``policy.draft.enabled`` or
-    backend, so importing ``nemo_rl.models.automodel.draft`` (which eagerly
-    imports ``nemo_automodel`` at package-init time) can't be a module-level
-    import here -- that would force every sync-GRPO run, including
-    Megatron-only runs, to have ``nemo_automodel`` importable in the driver's
-    venv. Deferred: only paid for when draft co-training is actually used.
-    """
-    try:
-        from nemo_rl.models.automodel.draft.integration import (
-            finalize_draft_ratio_metrics,
-        )
-    except ImportError:
-        return
-    finalize_draft_ratio_metrics(metrics)
 
 
 def _raise_if_message_level_advantage_penalties_enabled(
@@ -1126,7 +1108,7 @@ def grpo_train_sync(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
-                _finalize_draft_ratio_metrics(metrics)
+                finalize_draft_ratio_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics

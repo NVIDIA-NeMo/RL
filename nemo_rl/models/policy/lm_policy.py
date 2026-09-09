@@ -40,7 +40,6 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.policy import (
     BLOCK_DRAFT_ALGOS,
-    DEFAULT_DRAFT_ALGO,
     DRAFT_ALGOS,
     PolicyConfig,
 )
@@ -135,7 +134,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "reserved_http_server_port is only supported by the Megatron "
                 "worker (policy.megatron_cfg.enabled=true)."
             )
-        draft_algo = draft_cfg.get("algo", DEFAULT_DRAFT_ALGO)
+        # Required key, not a call-site default: the exemplar YAML always
+        # sets policy.draft.algo (config-conventions v1 TypedDict rule), so
+        # every recipe inherits a value.
+        draft_algo = draft_cfg["algo"] if draft_enabled else None
         if draft_enabled and draft_algo not in DRAFT_ALGOS:
             raise ValueError(
                 f"policy.draft.algo must be one of {set(DRAFT_ALGOS)} "

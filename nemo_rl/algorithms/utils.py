@@ -14,6 +14,7 @@
 
 import math
 import random
+import re
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
@@ -1085,3 +1086,34 @@ def print_efficiency_summary(
     loggable["efficiency/efficiency_pct_is_per_step"] = float(pct_is_per_step)
 
     return loggable
+
+
+_DRAFT_RATIO_NUM_RE = re.compile(r"^(draft_.*)_num(@\d+)?$")
+
+
+def finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
+    """Turn summed ``draft_*_num``/``draft_*_den`` metric pairs back into ratios, in place.
+
+    DSparkRuntime/Eagle3Runtime (``nemo_rl/models/automodel/draft/integration.py``)
+    emit per-microbatch accuracy/rate metrics as raw num/den pairs instead of
+    pre-divided ratios, because the training loop's default per-key metric
+    reduction sums every metric not on its small mean-reduction allowlist
+    across all microbatches and DP ranks -- summing a pre-divided
+    per-microbatch ratio would produce a meaningless value (e.g. a
+    "draft_full_acc@0" of 240 instead of a rate in [0, 1]). Call this AFTER
+    that per-key reduction has summed the raw num/den pairs into global
+    totals, so the ratio it computes is the correct token-weighted global
+    rate. Deliberately dependency-free (no nemo_automodel import) so the
+    driver process can call it unconditionally.
+    """
+    for key in list(metrics.keys()):
+        match = _DRAFT_RATIO_NUM_RE.match(key)
+        if match is None:
+            continue
+        base, suffix = match.group(1), match.group(2) or ""
+        den_key = f"{base}_den{suffix}"
+        if den_key not in metrics:
+            continue
+        num = metrics.pop(key)
+        den = metrics.pop(den_key)
+        metrics[f"{base}{suffix}"] = num / den if den > 0 else 0.0

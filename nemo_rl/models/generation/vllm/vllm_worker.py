@@ -158,19 +158,24 @@ def _draft_module_sharing_disable_required(config: dict[str, Any]) -> bool:
     embed_tokens/lm_head. Under load_format="dummy" the pinned vLLM would
     alias those drafter modules to the target model's (no checkpoint load
     ever marks them as owned), and the draft refit would then overwrite the
-    policy's serving weights through the alias. dspark/dflash exist only on
-    the DTensor-v2 full-stream path; eagle3 is gated on _draft_full_refit
-    because the megatron eagle3 trainer streams a PARTIAL set (no
-    embed_tokens) and relies on the drafter sharing the target's embedding.
+    policy's serving weights through the alias. The method name alone
+    doesn't imply a full stream -- Megatron block-drafter paths can use the
+    same dspark/dflash method names with a headless exporter that relies on
+    module sharing, just like the megatron eagle3 path does -- so gate on
+    _draft_full_refit (true only for DTensor-v2 co-training, which always
+    streams the drafter's entire state_dict) for all three methods.
     """
     load_format = config["vllm_cfg"]["load_format"]
     spec_cfg = config.get("vllm_kwargs", {}).get("speculative_config")
     if load_format != "dummy" or spec_cfg is None:
         return False
     method = spec_cfg.get("method")
-    if method in ("dspark", "dflash"):
-        return True
-    return method == "eagle3" and bool(config.get("_draft_full_refit"))
+    # Mirrors vllm_backend.COTRAINED_SPECULATIVE_METHODS; not imported to
+    # avoid pulling in vllm_backend's eager vllm import here (this runs at
+    # actor-creation time, before the engine -- or vllm itself -- exists).
+    return method in ("dspark", "dflash", "eagle3") and bool(
+        config.get("_draft_full_refit")
+    )
 
 
 def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:

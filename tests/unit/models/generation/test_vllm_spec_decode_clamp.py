@@ -14,7 +14,10 @@
 
 import pytest
 
-from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
+    _draft_module_sharing_disable_required,
+)
 
 
 @pytest.mark.parametrize(
@@ -60,3 +63,47 @@ def test_request_max_new_tokens_combines_context_and_spec_limits(
         )
         == expected
     )
+
+
+def _draft_config(
+    method: str, load_format: str = "dummy", draft_full_refit: bool = False
+) -> dict:
+    return {
+        "vllm_cfg": {"load_format": load_format},
+        "vllm_kwargs": {"speculative_config": {"method": method}},
+        "_draft_full_refit": draft_full_refit,
+    }
+
+
+@pytest.mark.parametrize(
+    ("method", "load_format", "draft_full_refit", "expected"),
+    [
+        # DTensor-v2 full-stream co-training (all 3 methods): disable
+        # required regardless of method name.
+        ("dspark", "dummy", True, True),
+        ("dflash", "dummy", True, True),
+        ("eagle3", "dummy", True, True),
+        # Megatron partial-stream co-training (relies on module sharing):
+        # method name alone must NOT imply full-stream.
+        ("dspark", "dummy", False, False),
+        ("dflash", "dummy", False, False),
+        ("eagle3", "dummy", False, False),
+        # load_format != "dummy": weights are loaded from checkpoint, no
+        # dummy-init alias to guard against.
+        ("dspark", "auto", True, False),
+        # Non-cotrained method: never applies.
+        ("mtp", "dummy", True, False),
+    ],
+)
+def test_draft_module_sharing_disable_required(
+    method, load_format, draft_full_refit, expected
+):
+    config = _draft_config(
+        method, load_format=load_format, draft_full_refit=draft_full_refit
+    )
+    assert _draft_module_sharing_disable_required(config) == expected
+
+
+def test_draft_module_sharing_disable_required_no_speculative_config():
+    config = {"vllm_cfg": {"load_format": "dummy"}, "vllm_kwargs": {}}
+    assert _draft_module_sharing_disable_required(config) is False

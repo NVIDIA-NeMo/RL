@@ -23,7 +23,6 @@ policy with a validated metadata record.
 import contextlib
 import json
 import os
-import re
 from typing import Any, Optional
 
 import torch
@@ -954,9 +953,10 @@ class DSparkRuntime(_DraftRuntimeBase):
         (``grpo.py``'s per-key reduction) sums every metric not on its small
         mean-reduction allowlist across all microbatches and DP ranks, so a
         pre-divided per-microbatch ratio would be summed into a meaningless
-        value (see ``finalize_draft_ratio_metrics``, which the training loop
-        calls after that reduction to turn the summed num/den pairs back into
-        the correct token-weighted global ratio).
+        value (see ``nemo_rl.algorithms.utils.finalize_draft_ratio_metrics``,
+        which the training loop calls after that reduction to turn the
+        summed num/den pairs back into the correct token-weighted global
+        ratio).
         """
         metrics: dict[str, float] = {
             "draft_loss": float(terms["loss"].item()),
@@ -1002,6 +1002,18 @@ def next_token_position_mask(token_mask: torch.Tensor) -> torch.Tensor:
     """
     shifted = torch.zeros_like(token_mask)
     shifted[:, :-1] = token_mask[:, 1:]
+    return shifted
+
+
+def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
+    """Shift a sequence tensor left by one position along dim 1, zero-tailed.
+
+    ``shifted[:, t] = tensor[:, t + 1]``; the last position is zeroed.
+    Matches Automodel's ``Eagle3Target._shift_left_with_zero`` convention
+    (``speculative/eagle/target.py``).
+    """
+    shifted = torch.zeros_like(tensor)
+    shifted[:, :-1] = tensor[:, 1:]
     return shifted
 
 
@@ -1079,6 +1091,16 @@ class Eagle3Runtime(_DraftRuntimeBase):
                     input_ids, self.cp_group, seq_dim=1
                 )
 
+        # vLLM's eagle proposer feeds h[t] + token[t + 1] and predicts
+        # token[t + 2] (see llm_base_proposer.py's "Shift the input ids by
+        # one token"); shift input_ids and teacher_logits left by one to
+        # match that contract -- hidden states stay unshifted since they're
+        # the target's own per-position captures. loss_mask needs the same
+        # shift on top of next_token_position_mask's existing one.
+        input_ids = _shift_left_with_zero(input_ids)
+        teacher_logits = _shift_left_with_zero(teacher_logits)
+        loss_mask = _shift_left_with_zero(loss_mask)
+
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -1147,8 +1169,9 @@ class Eagle3Runtime(_DraftRuntimeBase):
         )
         loss_nums, loss_dens, full_nums, full_dens, cond_nums, cond_dens = stats
         # Raw num/den pairs, NOT pre-divided: see
-        # DSparkRuntime._terms_to_metrics / finalize_draft_ratio_metrics for
-        # why (grpo.py sums per-microbatch metrics across microbatches and DP
+        # DSparkRuntime._terms_to_metrics /
+        # nemo_rl.algorithms.utils.finalize_draft_ratio_metrics for why
+        # (grpo.py sums per-microbatch metrics across microbatches and DP
         # ranks by default; a pre-divided ratio would be summed into a
         # meaningless value).
         metrics: dict[str, float] = {}
@@ -1167,35 +1190,6 @@ class Eagle3Runtime(_DraftRuntimeBase):
         self._teacher_logits = None
         self.capture.clear()
         return loss, metrics
-
-
-_RATIO_NUM_RE = re.compile(r"^(.*)_num(@\d+)?$")
-
-
-def finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
-    """Turn summed ``*_num``/``*_den`` metric pairs back into ratios, in place.
-
-    DSparkRuntime/Eagle3Runtime emit per-microbatch accuracy/rate metrics as
-    raw num/den pairs instead of pre-divided ratios, because the training
-    loop's default per-key metric reduction (``grpo.py``) sums every metric
-    not on its small mean-reduction allowlist across all microbatches and DP
-    ranks -- summing a pre-divided per-microbatch ratio would produce a
-    meaningless value (e.g. a "draft_full_acc@0" of 240 instead of a rate in
-    [0, 1]). Call this AFTER that per-key reduction has summed the raw num/den
-    pairs into global totals, so the ratio it computes is the correct
-    token-weighted global rate.
-    """
-    for key in list(metrics.keys()):
-        match = _RATIO_NUM_RE.match(key)
-        if match is None:
-            continue
-        base, suffix = match.group(1), match.group(2) or ""
-        den_key = f"{base}_den{suffix}"
-        if den_key not in metrics:
-            continue
-        num = metrics.pop(key)
-        den = metrics.pop(den_key)
-        metrics[f"{base}{suffix}"] = num / den if den > 0 else 0.0
 
 
 DSPARK_OPTIMIZER_GROUP_NAMES = ("policy", "draft")

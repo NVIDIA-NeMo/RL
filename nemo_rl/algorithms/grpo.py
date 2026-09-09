@@ -59,6 +59,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    finalize_draft_ratio_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -163,26 +164,6 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
-
-
-def _finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
-    """Lazily defer to automodel's draft integration; no-op if it isn't installed.
-
-    Called unconditionally every step regardless of ``policy.draft.enabled`` or
-    backend, so importing ``nemo_rl.models.automodel.draft`` (which eagerly
-    imports ``nemo_automodel`` at package-init time) can't be a module-level
-    import here -- that would force every ``grpo.py`` user, including
-    Megatron-only runs, to have ``nemo_automodel`` importable in the driver's
-    venv. Deferred: only paid for when draft co-training is actually used.
-    """
-    try:
-        from nemo_rl.models.automodel.draft.integration import (
-            finalize_draft_ratio_metrics,
-        )
-    except ImportError:
-        return
-    finalize_draft_ratio_metrics(metrics)
-
 
 # ===============================================================================
 # Configuration
@@ -3766,7 +3747,7 @@ def grpo_train(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
-                _finalize_draft_ratio_metrics(metrics)
+                finalize_draft_ratio_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -5649,7 +5630,7 @@ def async_grpo_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
-                _finalize_draft_ratio_metrics(metrics)
+                finalize_draft_ratio_metrics(metrics)
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics

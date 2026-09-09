@@ -161,9 +161,10 @@ def test_rope_stays_precise_after_bf16_cast():
     assert cast.model.fc.weight.dtype == torch.bfloat16
 
 
-def test_chunked_kl_matches_unchunked_reference(monkeypatch):
-    """Sequence-chunked + checkpointed KL must equal the one-shot computation
-    exactly (per-position KL is independent), including gradients."""
+def test_kl_div_per_position_chunk_matches_full_batch_computation():
+    """Computing KL chunk-by-chunk must equal computing it over the full
+    sequence in one call (per-position KL is independent), including
+    gradients -- this is the actual chunking pattern the TTT loop uses."""
     import torch
 
     from nemo_rl.models.automodel.draft import eagle3_llama as m
@@ -175,18 +176,21 @@ def test_chunked_kl_matches_unchunked_reference(monkeypatch):
     reference = m._kl_div_per_position_chunk(logits_ref, targets)
     reference.sum().backward()
 
-    monkeypatch.setattr(m, "_KL_CHUNK_TOKENS", 3)  # force multi-chunk path
     logits_chunked = logits_ref.detach().clone().requires_grad_(True)
-    chunked = m._kl_div_per_position(logits_chunked, targets)
+    pieces = []
+    chunk_size = 3
+    for start in range(0, logits_chunked.size(1), chunk_size):
+        end = start + chunk_size
+        pieces.append(
+            m._kl_div_per_position_chunk(
+                logits_chunked[:, start:end], targets[:, start:end]
+            )
+        )
+    chunked = torch.cat(pieces, dim=1)
     chunked.sum().backward()
 
     assert torch.allclose(chunked, reference, atol=1e-6)
     assert torch.allclose(logits_chunked.grad, logits_ref.grad, atol=1e-6)
-
-    # No-grad path (eval) takes the plain branch and must agree too.
-    with torch.no_grad():
-        eval_out = m._kl_div_per_position(logits_ref.detach(), targets)
-    assert torch.allclose(eval_out, reference, atol=1e-6)
 
 
 def _run_ttt_forward_backward(model):

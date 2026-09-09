@@ -137,13 +137,17 @@ _DRAFT_SKIPPED_KEY_SUBSTRINGS = {
 }
 
 
-def _is_full_eagle3_stream(draft_keys: "set[str] | list[str]") -> bool:
-    """Whether an eagle3 ``draft.*`` stream is the DTensor-v2 FULL drafter.
+def _is_full_draft_stream(draft_keys: "set[str] | list[str]") -> bool:
+    """Whether a ``draft.*`` stream is the DTensor-v2 FULL drafter.
 
     The DTensor-v2 co-training path streams the vendored model's entire
-    state_dict (always including ``embed_tokens``); the megatron eagle3
-    exporter intentionally omits ``embed_tokens`` and uses the ``midlayer.*``
-    alias, relying on drafter module sharing at serve time.
+    state_dict (always including ``embed_tokens``), regardless of method
+    (dspark/dflash/eagle3). A megatron co-training exporter may instead
+    stream a PARTIAL drafter -- the megatron eagle3 exporter intentionally
+    omits ``embed_tokens`` and uses the ``midlayer.*`` alias, relying on
+    drafter module sharing at serve time -- and future megatron block
+    drafters (dspark/dflash) may do the same, so this checks the actual
+    keys rather than trusting the method name.
     """
     return any("embed_tokens" in key for key in draft_keys)
 
@@ -828,12 +832,13 @@ class VllmInternalWorkerExtension:
             # carry only policy weights. Exact-key validation applies only when
             # the trainer co-trains (and therefore streams) the draft.
             return
-        if method == "eagle3" and not _is_full_eagle3_stream(provided):
-            # Megatron eagle3 co-training streams a PARTIAL drafter (no
-            # embed_tokens, midlayer.* alias for the single layer) and relies
-            # on the drafter sharing the target's embedding; exact-key
-            # validation against the vLLM parameter layout only applies to
-            # the DTensor-v2 full stream.
+        if not _is_full_draft_stream(provided):
+            # Megatron co-training (eagle3 today; block drafters may follow)
+            # can stream a PARTIAL drafter (no embed_tokens, e.g. eagle3's
+            # midlayer.* alias for the single layer) and relies on the
+            # drafter sharing the target's embedding; exact-key validation
+            # against the vLLM parameter layout only applies to the
+            # DTensor-v2 full stream.
             return
         expected = self._expected_draft_keys()
         skipped = _DRAFT_SKIPPED_KEY_SUBSTRINGS[method]
@@ -877,12 +882,10 @@ class VllmInternalWorkerExtension:
             return
 
         method = self._speculative_method()
-        # The megatron eagle3 partial stream predates (and must keep) the
-        # lenient path: no alias guard, warn-and-skip on a missing drafter.
-        strict_cotraining = method in ("dspark", "dflash") or (
-            method == "eagle3"
-            and _is_full_eagle3_stream([name for name, _ in draft_weights])
-        )
+        # A megatron partial stream (no embed_tokens) predates (and must
+        # keep) the lenient path: no alias guard, warn-and-skip on a missing
+        # drafter.
+        strict_cotraining = _is_full_draft_stream([name for name, _ in draft_weights])
         draft_model = self._get_drafter_model()
         if draft_model is None:
             if strict_cotraining:

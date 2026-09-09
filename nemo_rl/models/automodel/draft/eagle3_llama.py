@@ -38,9 +38,12 @@
 #   `seq_lens` packing path, so this file drives the model's per-piece public
 #   API (`embed_input_ids` / `project_hidden_states` / `model.layers[0]` /
 #   `compute_logits`) directly instead of going through that wrapper.
-# - Chunked `compute_logits` + KL along the sequence, to avoid materializing
-#   the full ``[1, T, draft_vocab]`` logits tensor at once (~2.4 GiB at
-#   20k-token sequences with a 64000 draft vocab -- see `_kl_div_per_position`).
+# - Chunked `compute_logits` + KL along the sequence, to cap the TRANSIENT
+#   peak instead of materializing the full ``[1, T, draft_vocab]`` logits
+#   tensor at once (~2.4 GiB at 20k-token sequences with a 64000 draft
+#   vocab) -- see `_kl_div_per_position_chunk`. This caps the per-chunk
+#   peak, not the total memory retained for backward across the step (no
+#   chunk is checkpointed).
 """EAGLE3 TTT training forward, built on automodel's LlamaEagle3DraftModel."""
 
 from dataclasses import dataclass
@@ -53,7 +56,6 @@ from nemo_automodel.components.speculative.eagle.draft_llama import (
     LlamaEagle3DraftModel,
     _seq_lens_to_cu_seqlens,
 )
-from torch.utils.checkpoint import checkpoint
 
 _LOSS_REDUCTION_EPS = 1e-5
 _KL_CHUNK_TOKENS = 512
@@ -128,41 +130,20 @@ class Eagle3ForwardTerms:
 def _kl_div_per_position_chunk(
     logits: torch.Tensor, targets: torch.Tensor
 ) -> torch.Tensor:
+    """Per-position KL over the draft vocab for one sequence chunk.
+
+    Each position's KL is independent, so calling this per-chunk (as the TTT
+    loop does, alongside chunking ``compute_logits`` itself) is
+    mathematically exact and caps the per-chunk TRANSIENT peak -- the
+    fp32 ``[*, chunk, V]`` intermediates (log_softmax, softmax, elementwise
+    kl) never materialize for the FULL row at once. It does NOT reduce the
+    cumulative memory retained for backward across the whole step: none of
+    the chunks are checkpointed, so autograd still holds onto each chunk's
+    saved activations until the eventual ``.backward()``.
+    """
     log_p = F.log_softmax(logits, dim=-1, dtype=torch.float32)
     target_p = F.softmax(targets, dim=-1, dtype=torch.float32)
     return F.kl_div(log_p, target_p, reduction="none", log_target=False).sum(dim=-1)
-
-
-def _kl_div_per_position(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """Per-position KL over the draft vocab, chunked along the sequence.
-
-    Each position's KL is independent, so chunking is mathematically exact.
-    The fp32 ``[*, chunk, V]`` transients (log_softmax, softmax, elementwise
-    kl) would otherwise materialize for the FULL row at once -- at 18k-token
-    generations with a 32000 draft vocab that is ~2.3 GiB per tensor per TTT
-    step, which OOMs the tp=2 co-training layout. Checkpointing recomputes
-    the transients per chunk in backward (same pattern as the dspark loss's
-    chunked fp32 probability distance).
-    """
-    seq_len = logits.size(1)
-    if seq_len <= _KL_CHUNK_TOKENS:
-        return _kl_div_per_position_chunk(logits, targets)
-    pieces = []
-    for start in range(0, seq_len, _KL_CHUNK_TOKENS):
-        logit_chunk = logits[:, start : start + _KL_CHUNK_TOKENS]
-        target_chunk = targets[:, start : start + _KL_CHUNK_TOKENS]
-        if logits.requires_grad:
-            piece = checkpoint(
-                _kl_div_per_position_chunk,
-                logit_chunk,
-                target_chunk,
-                use_reentrant=False,
-                preserve_rng_state=False,
-            )
-        else:
-            piece = _kl_div_per_position_chunk(logit_chunk, target_chunk)
-        pieces.append(piece)
-    return torch.cat(pieces, dim=1)
 
 
 def _build_attention_mask(

@@ -18,17 +18,7 @@ small mean-reduction allowlist) — not the wrong value a pre-divided
 per-microbatch ratio would sum into.
 """
 
-import pytest
-
-# Skip entire module if nemo_automodel is not available
-try:
-    import nemo_automodel  # noqa: F401
-except ImportError:
-    pytest.skip("nemo_automodel not available", allow_module_level=True)
-
-from nemo_rl.models.automodel.draft.integration import finalize_draft_ratio_metrics
-
-pytestmark = pytest.mark.automodel
+from nemo_rl.algorithms.utils import finalize_draft_ratio_metrics
 
 
 def test_finalize_ratio_metrics_reproduces_token_weighted_global_ratio():
@@ -69,3 +59,11 @@ def test_finalize_ratio_metrics_leaves_unpaired_num_alone():
     metrics = {"some_other_num": 3.0}
     finalize_draft_ratio_metrics(metrics)
     assert metrics == {"some_other_num": 3.0}
+
+
+def test_finalize_ratio_metrics_ignores_non_draft_num_den_pairs():
+    # The regex is anchored to draft_* so unrelated *_num/*_den metrics
+    # elsewhere in the training loop are never touched.
+    metrics = {"other_num": 5.0, "other_den": 10.0}
+    finalize_draft_ratio_metrics(metrics)
+    assert metrics == {"other_num": 5.0, "other_den": 10.0}

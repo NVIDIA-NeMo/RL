@@ -53,8 +53,8 @@ from nemo_rl.models.automodel.config import (
     RuntimeConfig,
 )
 from nemo_rl.models.policy import (
-    DEFAULT_DRAFT_ALGO,
-    DRAFT_ALGOS,
+    DSparkDraftOptions,
+    Eagle3DraftOptions,
     PolicyConfig,
     TokenizerConfig,
 )
@@ -761,11 +761,15 @@ def setup_model_and_optimizer(
     # Build the DSpark draft model before optimizer construction so its params
     # join the optimizer (and any optimizer-state resume) from the start.
     draft_cfg = config.get("draft", {}) or {}
-    draft_algo = draft_cfg.get("algo", DEFAULT_DRAFT_ALGO)
-    draft_enabled = bool(draft_cfg.get("enabled", False)) and draft_algo in DRAFT_ALGOS
+    # lm_policy.py already validated policy.draft.algo in DRAFT_ALGOS when
+    # enabled=true, so enablement alone is the gate here.
+    draft_enabled = bool(draft_cfg.get("enabled", False))
     draft_model = None
     composite_model = None
     if draft_enabled:
+        # Required key, not a call-site default: the exemplar YAML always
+        # sets policy.draft.algo (config-conventions v1 TypedDict rule).
+        draft_algo = draft_cfg["algo"]
         from nemo_rl.models.automodel.draft.integration import (
             PolicyWithDraft,
             build_dspark_draft_model,
@@ -779,8 +783,6 @@ def setup_model_and_optimizer(
         # The shared optimizer's master weights preserve update precision.
         draft_dtype = runtime_config.dtype
         if draft_algo == "eagle3":
-            from nemo_rl.models.policy import Eagle3DraftOptions
-
             # The BaseModel centralizes the option defaults (v2 config
             # convention); the loaded dict is validated against it once here.
             eagle3_options = Eagle3DraftOptions.model_validate(
@@ -800,8 +802,6 @@ def setup_model_and_optimizer(
             draft_learning_rate = float(eagle3_options.learning_rate)
             draft_ttt_steps = int(eagle3_options.ttt_steps)
         else:
-            from nemo_rl.models.policy import DSparkDraftOptions
-
             # The BaseModel centralizes the option defaults (v2 config
             # convention); the loaded dict is validated against it once here
             # and passed on fully populated so downstream consumers never
