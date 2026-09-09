@@ -56,6 +56,7 @@ from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutTimeouts,
 )
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import (
     _add_multimodal_generation_payload,
     _reattach_original_multimodal_payloads,
@@ -2226,6 +2227,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
@@ -2279,8 +2281,15 @@ def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
         "name": "workplace_assistant_simple_agent",
     }
 
-    async def _run_rollouts(inputs, timer, timer_prefix):
-        del timer, timer_prefix
+    async def _run_rollouts(
+        inputs,
+        timer,
+        timer_prefix,
+        *,
+        on_completion=None,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+    ):
+        del timer, timer_prefix, on_completion, recovery_granularity
         for row in inputs:
             row["agent_ref"] = resolved_agent_ref
         receipt_completion = SimpleNamespace(env_extras={"ng_receipt": {}})
@@ -2342,6 +2351,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
@@ -2349,6 +2359,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
+    manager._effort_config = None
 
     with pytest.raises(ValueError, match="duplicate row index 0"):
         asyncio.run(
