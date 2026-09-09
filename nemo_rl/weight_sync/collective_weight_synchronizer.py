@@ -315,8 +315,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # the whole fleet while no membership is recorded -- so a dispatch that runs before
         # this line addresses the shard the reconcile is in the middle of removing.
         #
-        # This sat 21 lines lower, after prepare_refit_info, and job 6718736 died there:
-        # ActorDiedError out of reconcile_communicator, 20s after the rebuild had already
+        # It sat 21 lines lower, after prepare_refit_info, and that ordering raised
+        # ActorDiedError out of reconcile_communicator after the rebuild had already
         # succeeded. Every collective-transport recovery variant failed and every
         # nccl_reshard one passed, because _build on that side records it first.
         self._generation.set_refit_membership(membership)

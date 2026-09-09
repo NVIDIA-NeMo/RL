@@ -783,7 +783,7 @@ class VllmGeneration(GenerationInterface):
         #     self._deferred_seed = seed
         #
         # Calling load_model there re-enters _create_engine with seed=None, and vLLM's
-        # ModelConfig requires an int: job 6722014 failed five restarts with
+        # ModelConfig requires an int, so this fails five restarts in a row with
         # "ValidationError: seed - Input should be a valid integer". The recreated worker
         # already had a working engine; this call broke it.
         #
@@ -1303,11 +1303,10 @@ class VllmGeneration(GenerationInterface):
         # Surviving leaders only, like update_weights_from_collective and the reshard
         # plan distribution. run_all_workers_single_data walks the WHOLE group, so once a
         # shard is lost this called its dead actor and raised ActorDiedError -- out of
-        # reconcile_communicator, past the recovery, and into the run. Job 6718090: the
-        # rebuild had just succeeded ("rebuilding communicator over shards [1]") and this
-        # line killed the run 20s later. It is reached on the recovery path precisely
-        # because a shard is absent, so the whole-group fan-out is wrong exactly when it
-        # runs.
+        # reconcile_communicator, past the recovery, and into the run -- killing it
+        # seconds after the rebuild had already succeeded. It is reached on the recovery
+        # path precisely because a shard is absent, so the whole-group fan-out is wrong
+        # exactly when it runs.
         #
         # rank_0_only over tensor_parallel/pipeline_parallel is what the group call did,
         # and _refit_leader_workers is the same set restricted to the live membership.
