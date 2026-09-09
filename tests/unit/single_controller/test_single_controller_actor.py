@@ -1106,6 +1106,7 @@ def test_gdpo_advantage_stage_reconstructs_named_reward_columns() -> None:
         overlong_filtering=False,
     )
     ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._step_log_dict = {
         "rewards": [],
         "sample_masks": [],

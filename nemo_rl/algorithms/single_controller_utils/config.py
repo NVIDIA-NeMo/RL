@@ -1315,6 +1315,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     token_capture_config = master_config.token_capture
+    if (
+        token_capture_config.enabled
+        and not is_ppo_run(master_config)
+        and algo_cfg.adv_estimator.name == "gdpo"
+    ):
+        raise NotImplementedError(
+            "grpo.adv_estimator.name='gdpo' is not supported with "
+            "token_capture.enabled=true: the token-capture finalizer currently "
+            "publishes only the scalar total_reward and would drop the named "
+            "reward components required by GDPO. Disable token capture for GDPO "
+            "until reward-component metadata is carried through finalization."
+        )
     recovery_config = master_config.rollout_recovery
     if not token_capture_config.enabled and (
         recovery_config.default_granularity is not RecoveryGranularity.SIBLING

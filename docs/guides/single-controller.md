@@ -110,6 +110,10 @@ providing only one component raises an attributable error before training. See
 environment contract and [GDPO](./grpo.md#gdpo-group-reward-decoupled-normalization-policy-optimization-for-multi-reward-rl-optimization)
 for the estimator and weighting semantics.
 
+Token capture is not yet supported with GDPO. Its finalizer currently publishes
+only the scalar `total_reward`, so setup rejects `token_capture.enabled: true`
+rather than silently dropping the named reward components.
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:

@@ -2170,9 +2170,8 @@ def apply_reward_penalties(
         full_result["reward"] = 0.0
         components = full_result.get("reward_components")
         if components:
-            full_result["reward_components"] = {
-                name: 0.0 for name in components
-            }
+            full_result["reward_components"] = {name: 0.0 for name in components}
+
     if not reward_penalty_config or not results:
         return counts
 
