@@ -57,7 +57,13 @@ from nemo_rl.algorithms.single_controller_utils import (
     setup_single_controller,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
+    RolloutCheckpointConfig,
+    TokenCaptureConfig,
     validate_single_controller_config,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    bootstrap_compatibility_identity,
+    ensure_bootstrap_anchor,
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
@@ -79,6 +85,7 @@ class _CheckpointingCustomSampler(WindowedSampler):
     """Custom sampler whose static capability must be validated during setup."""
 
     supports_buffer_checkpoint = True
+    supports_training_claims = True
 
     def __init__(self, buffer: Any) -> None:
         super().__init__(buffer, max_staleness_versions=1)
@@ -88,6 +95,15 @@ class _NonCheckpointingCustomSampler(WindowedSampler):
     """Custom sampler that explicitly opts out of replay recovery."""
 
     supports_buffer_checkpoint = False
+
+    def __init__(self, buffer: Any) -> None:
+        super().__init__(buffer, max_staleness_versions=1)
+
+
+class _CheckpointingNonClaimingCustomSampler(WindowedSampler):
+    """Replay-capable custom sampler that retains legacy local selection."""
+
+    supports_buffer_checkpoint = True
 
     def __init__(self, buffer: Any) -> None:
         super().__init__(buffer, max_staleness_versions=1)
@@ -683,6 +699,220 @@ class TestSetup:
         with pytest.raises(NotImplementedError, match="backend='mooncake_cpu'"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_periodic_checkpointing_requires_trainer_checkpointing(self):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = False
+        mc.checkpointing["save_data_plane"] = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+
+        with pytest.raises(ValueError, match="requires checkpointing.enabled=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_periodic_checkpointing_requires_data_plane_save(self):
+        mc = _make_master_config(
+            sampler_cfg=CustomSamplerConfig(
+                target=f"{__name__}:_NonCheckpointingCustomSampler"
+            )
+        )
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+
+        with (
+            pytest.warns(UserWarning, match="cannot recover completed buffered"),
+            pytest.raises(
+                ValueError, match="requires checkpointing.save_data_plane=true"
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_periodic_checkpointing_requires_token_capture(self):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+
+        with pytest.raises(ValueError, match="requires token_capture.enabled=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_periodic_checkpointing_requires_replay_capable_sampler(self):
+        mc = _make_master_config(
+            sampler_cfg=CustomSamplerConfig(
+                target=f"{__name__}:_NonCheckpointingCustomSampler"
+            )
+        )
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = True
+        mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+
+        with (
+            pytest.warns(UserWarning, match="cannot recover completed buffered"),
+            pytest.raises(ValueError, match="supports replay-buffer recovery"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_periodic_checkpointing_requires_claim_aware_custom_sampler(self):
+        mc = _make_master_config(
+            sampler_cfg=CustomSamplerConfig(
+                target=(f"{__name__}:_CheckpointingNonClaimingCustomSampler")
+            )
+        )
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = True
+        mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+
+        with pytest.raises(ValueError, match="supports training-claim ownership"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_periodic_checkpointing_warns_without_per_step_trainer_anchors(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config(colocated=False, backend="vllm")
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 2,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.logger["log_dir"] = str(tmp_path / "logs")
+        mc.token_capture.enabled = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+        fake_finalizers = [MagicMock(name="finalizer")]
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+
+        with (
+            pytest.warns(UserWarning, match="checkpointing.save_period=2"),
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                return_value=fake_finalizers,
+            ),
+        ):
+            actor_args, _ = setup_single_controller(
+                mc,
+                MagicMock(pad_token_id=0),
+            )
+
+        assert actor_args.finalizer_actors == fake_finalizers
+
+    def test_disabled_periodic_checkpointing_ignores_existing_snapshots(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config()
+        checkpoint_dir = tmp_path / "checkpoints"
+        mc.checkpointing["checkpoint_dir"] = str(checkpoint_dir)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=None,
+            restore_mode="latest",
+        )
+        (checkpoint_dir / "bootstrap" / "rollout_snapshots").mkdir(parents=True)
+
+        with patch.object(sc_setup_mod, "resolve_latest_snapshot") as resolve:
+            actor_args, _ = setup_single_controller(
+                mc,
+                MagicMock(pad_token_id=0),
+            )
+
+        resolve.assert_not_called()
+        assert actor_args.last_checkpoint_path is None
+
+    def test_trainer_checkpoint_restore_preserves_bootstrap_state(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config(colocated=False, backend="vllm")
+        checkpoint_dir = tmp_path / "checkpoints"
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(checkpoint_dir),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 1,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.logger = {"log_dir": str(tmp_path / "logs")}
+        mc.token_capture.enabled = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            restore_mode="trainer_checkpoint",
+        )
+        anchor = ensure_bootstrap_anchor(
+            checkpoint_dir,
+            identity=bootstrap_compatibility_identity(mc),
+        )
+        payload = anchor / "rollout_snapshots" / "snapshot_000001" / "payload"
+        payload.parent.mkdir(parents=True)
+        payload.write_text("preserve me")
+        before = {
+            path.relative_to(anchor): path.read_bytes()
+            for path in anchor.rglob("*")
+            if path.is_file()
+        }
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            pytest.raises(
+                ValueError,
+                match="Existing checkpoint state was not modified",
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        after = {
+            path.relative_to(anchor): path.read_bytes()
+            for path in anchor.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
+        patched_factories["setup_response_data"].assert_not_called()
+
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
@@ -883,6 +1113,12 @@ class TestSetup:
             ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
             ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
+            (
+                "megatron_colocated_min_groups",
+                ValueError,
+                "min_groups_for_streaming_train",
+            ),
+            ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
             (
                 "deferred_routes_without_capture",
@@ -941,6 +1177,18 @@ class TestSetup:
                 colocated=False, backend="megatron", megatron_enabled=True
             )
             mc.async_rl.generation_fleet_health.enabled = True
+        elif invalid_case == "megatron_colocated_min_groups":
+            # The colocated engine stands down once per step, so streaming
+            # below a whole batch is rejected at setup.
+            mc = _make_master_config(
+                colocated=True, backend="megatron", megatron_enabled=True
+            )
+            mc.async_rl.min_groups_for_streaming_train = (
+                mc.grpo.num_prompts_per_step - 1
+            )
+        elif invalid_case == "colocated_vllm":
+            # Colocated generation is rejected for every backend but megatron.
+            mc = _make_master_config(colocated=True)
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=False, backend="sglang")
         elif invalid_case == "prompt_group_recovery_without_capture":
@@ -1536,9 +1784,9 @@ class TestSetup:
         assert metrics.generation_init_reserve_time_s == 3.0
         assert metrics.generation_init_load_time_s is not None
 
-    def _make_gym_megatron_config(self) -> MasterConfig:
+    def _make_gym_megatron_config(self, *, colocated: bool = False) -> MasterConfig:
         mc = _make_master_config(
-            colocated=False, backend="megatron", megatron_enabled=True
+            colocated=colocated, backend="megatron", megatron_enabled=True
         )
         mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
         mc.policy["generation"]["stop_strings"] = None
@@ -1546,6 +1794,7 @@ class TestSetup:
         mc.policy["generation"]["top_k"] = None
         return mc
 
+    @pytest.mark.parametrize("colocated", [True, False])
     @pytest.mark.parametrize(
         ("scenario", "error_match"),
         [
@@ -1557,9 +1806,13 @@ class TestSetup:
         ids=["gym", "gym_served_mismatch", "gym_router_failure", "native"],
     )
     def test_megatron_setup(
-        self, patched_factories, scenario: str, error_match: str | None
+        self,
+        patched_factories,
+        scenario: str,
+        error_match: str | None,
+        colocated: bool,
     ):
-        """Non-colocated Megatron generation setup, gym and native legs.
+        """Megatron generation setup: gym and native legs, colocated or not.
 
         gym: reserve rank-0's URL, spin Gym up on it, build trainer and engine
         in parallel (the engine through _build_generation with the reserved
@@ -1574,17 +1827,20 @@ class TestSetup:
         native: expose_http_server=false and no Gym, so nothing reserves a URL,
         no port holder is created, the cross-check is skipped, and the initial
         refit is left to the actor.
+        colocated: rank 0 lives with the trainer — the reservation targets the
+        shared cluster, the reserved port rides the trainer build, and the
+        engine wraps the trainer's policy instead of a dedicated cluster.
         """
         gym = scenario != "native"
         if gym:
-            mc = self._make_gym_megatron_config()
+            mc = self._make_gym_megatron_config(colocated=colocated)
             patched_factories["setup_response_data"].return_value = (
                 list(range(8)),
                 None,
             )
         else:
             mc = _make_master_config(
-                colocated=False, backend="megatron", megatron_enabled=True
+                colocated=colocated, backend="megatron", megatron_enabled=True
             )
         if scenario == "gym_router_failure":
             mc.async_rl.generation_router.enabled = True
@@ -1655,6 +1911,9 @@ class TestSetup:
         # Reservation + holder lifecycle exist on the gym legs only; every gym
         # leg — success or either failure — reaps the holder exactly once.
         if gym:
+            # Always the inference cluster: when colocated, _build_clusters
+            # returns the train cluster twice, so the two are the same object
+            # in production (the mocked distinction here is not).
             mock_megatron.reserve_http_server_address.assert_called_once_with(
                 inference_cluster,
                 mc.policy,
@@ -1671,19 +1930,34 @@ class TestSetup:
             patched_factories["_build_generation"].assert_not_called()
             return
 
-        # Construction: trainer and generation are independent build tasks; the
-        # dedicated Megatron policy is built by _build_generation with the weight
-        # load skipped and the reserved port adopted (gym) or absent (native).
+        # Construction: colocated builds the trainer first and wraps its
+        # policy, with the reserved port riding the trainer build;
+        # non-colocated builds the dedicated Megatron policy in parallel via
+        # _build_generation, with the weight load skipped and the reserved
+        # port adopted by the engine (gym) or absent (native).
         patched_factories["_build_trainer"].assert_called_once()
-        patched_factories["_build_generation"].assert_called_once()
-        mock_megatron.assert_called_once_with(
-            config=mc.policy,
-            tokenizer=tokenizer,
-            cluster=inference_cluster,
-            reserved_http_server_port=5555 if gym else None,
-            processor=None,
-            skip_weight_load=True,
+        _, trainer_kwargs = patched_factories["_build_trainer"].call_args
+        assert trainer_kwargs["reserved_http_server_port"] == (
+            5555 if colocated and gym else None
         )
+        if colocated:
+            patched_factories["_build_generation"].assert_not_called()
+            mock_megatron.assert_called_once_with(
+                config=mc.policy,
+                tokenizer=tokenizer,
+                policy=patched_factories["fake_policy"],
+                processor=None,
+            )
+        else:
+            patched_factories["_build_generation"].assert_called_once()
+            mock_megatron.assert_called_once_with(
+                config=mc.policy,
+                tokenizer=tokenizer,
+                cluster=inference_cluster,
+                reserved_http_server_port=5555 if gym else None,
+                processor=None,
+                skip_weight_load=True,
+            )
         # Stood down like every other backend; before the first refit this is a
         # cache clear on the non-colocated Megatron workers.
         mock_megatron.return_value.finish_generation.assert_called_once_with()
@@ -1714,7 +1988,7 @@ class TestSetup:
         patched_factories["create_weight_synchronizer"].assert_called_once()
         _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
         assert factory_kwargs["generation_backend"] == "megatron"
-        assert factory_kwargs["colocated"] is False
+        assert factory_kwargs["colocated"] is colocated
         assert factory_kwargs["inference_cluster"] is inference_cluster
         if gym:
             assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
