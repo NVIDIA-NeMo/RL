@@ -87,6 +87,18 @@ class _InstrumentedNemoGymRolloutImpl:
             self._selected_sibling_sealed = asyncio.Event()
         return self._selected_sibling_sealed
 
+    def _record_forwarded_completion(
+        self,
+        *,
+        completion: Any,
+        fields: dict[str, Any],
+    ) -> None:
+        self._append_event(
+            "completion_forwarded",
+            **fields,
+            reward=float(completion.reward),
+        )
+
     async def run_rollout(
         self,
         input_sample: Any,
@@ -153,6 +165,10 @@ class _InstrumentedNemoGymRolloutImpl:
             if selected:
                 if not sealed_in_selected_call:
                     await on_completion(generation_index, completion)
+                    self._record_forwarded_completion(
+                        completion=completion,
+                        fields=completion_fields,
+                    )
                     sealed_in_selected_call = True
                     self._append_event("sibling_sealed", **completion_fields)
                     self._sibling_sealed_event().set()
@@ -176,6 +192,10 @@ class _InstrumentedNemoGymRolloutImpl:
             ):
                 await self._sibling_sealed_event().wait()
             await on_completion(generation_index, completion)
+            self._record_forwarded_completion(
+                completion=completion,
+                fields=completion_fields,
+            )
 
         result = await self._delegate.run_rollout(
             input_sample,
