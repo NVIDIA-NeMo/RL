@@ -572,6 +572,16 @@ data_plane:
     local_buffer_size:    4294967296 # 4 GiB/process
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
     staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
+    use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
+                                     # 8 clients/node is ~8 GiB off the training
+                                     # budget. Must exceed the largest per-sample,
+                                     # per-field payload: below that, GDR reads of
+                                     # CPU-written values fail inside TransferQueue.
+                                     # Lower values split fetches into more
+                                     # serialized groups and cost throughput;
+                                     # higher buys little at linear HBM cost.
+                                     # GDR needs that headroom to pay off.
   # observability:                    # NotRequired
   #   enabled: false
 
