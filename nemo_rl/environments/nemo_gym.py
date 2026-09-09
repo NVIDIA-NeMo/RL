@@ -60,6 +60,7 @@ from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
+NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
 # Must cover every name resolve_routed_experts_dtype can produce.
@@ -615,9 +616,8 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
-        # Current Gym collates data with ``task_source`` rather than a baked-in
-        # ``agent_ref``. ``run_examples`` resolves that routing synchronously and
-        # stamps each input row before returning its result iterator.
+        # Gym resolves task_source to agent_ref synchronously in run_examples().
+        # Build the counter afterward so completion rows use the resolved identity.
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
@@ -1387,6 +1387,27 @@ def spinup_nemo_gym_actor(
         )
 
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-    ray.get(actor._spinup.remote())
-    ray.get(actor.set_tokenizer.remote(tokenizer))
+    try:
+        ray.get(actor._spinup.remote())
+        ray.get(actor.set_tokenizer.remote(tokenizer))
+    except Exception:
+        # _spinup can fail after RunHelper has started some Gym subprocesses.
+        # Ask the actor to reap anything it owns, then force-stop the actor as a
+        # final safety net. Cleanup errors must not hide the startup failure.
+        try:
+            ray.get(
+                actor.shutdown.remote(),
+                timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+            )
+        except Exception as cleanup_error:
+            print(
+                f"Warning: NeMo-Gym actor cleanup after startup failure failed: {cleanup_error}"
+            )
+        try:
+            ray.kill(actor)
+        except Exception as kill_error:
+            print(
+                f"Warning: NeMo-Gym actor kill after startup failure failed: {kill_error}"
+            )
+        raise
     return actor
