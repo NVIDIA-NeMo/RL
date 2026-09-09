@@ -182,6 +182,26 @@ class _FakeAdvEstimator:
         return rewards.detach().unsqueeze(-1).expand_as(mask).clone()
 
 
+class _FakeGeneration:
+    """Unsupported generation backend for this training-pump-only test."""
+
+    def blocks_training(self) -> bool:
+        return False
+
+    def snapshot_step_metrics(self) -> None:
+        pass
+
+    def get_step_metrics(self) -> dict[str, float]:
+        return {}
+
+    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+        del clear_cache
+        return False
+
+    def resume_generation_after_refit(self) -> bool:
+        return False
+
+
 @ray.remote(num_cpus=0)  # pragma: no cover
 class _CallLog:
     """Ordered append-only log the fakes below write to."""
@@ -364,13 +384,7 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         actor_args = SingleControllerActorArgs(
-            # Continuous-serving stub: the pump asks blocks_training() before
-            # every step's trainer GPU work.
-            gen_handle=SimpleNamespace(
-                blocks_training=lambda: False,
-                snapshot_step_metrics=lambda: None,
-                get_step_metrics=lambda: {},
-            ),  # type: ignore[arg-type]
+            gen_handle=_FakeGeneration(),
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,  # type: ignore[arg-type]
