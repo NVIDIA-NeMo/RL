@@ -57,6 +57,7 @@ from nemo_rl.distributed.model_utils import (
 from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
+    TapChannel,
     get_capture_context,
 )
 from nemo_rl.models.megatron.router_replay import (
@@ -225,6 +226,7 @@ def _run_block_draft_forward(
     captured_states: Any,
     data_dict: BatchedDataDict[Any],
     packed_seq_params: Optional[PackedSeqParams] = None,
+    tap_channel: Optional[TapChannel] = None,
 ) -> torch.Tensor:
     """Run the DFlash/DSpark block-draft forward for one microbatch.
 
@@ -310,8 +312,12 @@ def _run_block_draft_forward(
         anchors=anchors,
         anchor_valid=anchor_valid,
         lm_head_weight=get_policy_lm_head_weight(model).detach(),
-        mask_embedding=get_policy_embedding_row(
-            model, draft_model.mask_token_id
+        # Under PP > 1 the embedding lives on the first stage;
+        # TapChannel.begin_pass broadcast this pass's live row here.
+        mask_embedding=(
+            tap_channel.mask_row
+            if tap_channel is not None
+            else get_policy_embedding_row(model, draft_model.mask_token_id)
         ).detach(),
         **method_kwargs,
     )
@@ -343,6 +349,7 @@ def forward_with_post_processing_fn(
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
+    tap_channel: Optional[TapChannel] = None,
     draft_ttt_steps: int = 1,
     draft_aux_layer_indices: Optional[Tuple[int, ...]] = None,
     use_fused_linear_logprobs: bool = False,
@@ -414,7 +421,10 @@ def forward_with_post_processing_fn(
         if configured_aux_layers:
             aux_layer_indices = tuple(int(i) for i in configured_aux_layers)
     capture_context, capture = get_capture_context(
-        model, enable_hidden_capture, aux_layer_indices=aux_layer_indices
+        model,
+        enable_hidden_capture,
+        aux_layer_indices=aux_layer_indices,
+        tap_channel=tap_channel,
     )
     try:
         with capture_context:
@@ -455,7 +465,12 @@ def forward_with_post_processing_fn(
                 "disable megatron_cfg.use_fused_linear_logprobs."
             )
 
+        # PP > 1 source stages push their taps to the draft stage inside
+        # get_captured_states and come back empty; only the draft owner rank
+        # (the one with draft_model attached) runs the draft forward below.
         captured_states = capture.get_captured_states()
+
+    if capture is not None and draft_model is not None:
         if getattr(draft_model, "speculator_type", "eagle3") in (
             "dflash",
             "dspark",
@@ -466,6 +481,7 @@ def forward_with_post_processing_fn(
                 captured_states=captured_states,
                 data_dict=data_dict,
                 packed_seq_params=packed_seq_params,
+                tap_channel=tap_channel,
             )
         else:
             from megatron.core.transformer.multi_token_prediction import roll_tensor
@@ -584,6 +600,7 @@ def megatron_forward_backward(
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
+    tap_channel: Optional[TapChannel] = None,
     draft_ttt_steps: int = 1,
     draft_aux_layer_indices: Optional[Tuple[int, ...]] = None,
     use_fused_linear_logprobs: bool = False,
@@ -626,12 +643,17 @@ def megatron_forward_backward(
         straggler_timer=straggler_timer,
         draft_model=draft_model,
         enable_hidden_capture=enable_hidden_capture,
+        tap_channel=tap_channel,
         draft_ttt_steps=draft_ttt_steps,
         draft_aux_layer_indices=draft_aux_layer_indices,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
     )
+    if tap_channel is not None and enable_hidden_capture:
+        # Outside the schedule: prune writer refs and broadcast this pass's
+        # live mask-embedding row from the first stage to the draft stage.
+        tap_channel.begin_pass(model)
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
         clear_router_replay(model)

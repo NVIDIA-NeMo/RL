@@ -245,6 +245,7 @@ from nemo_rl.models.megatron.draft.utils import (
     build_draft_optimizer_override_provider,
     find_draft_owner_chunk,
     get_attached_draft_model,
+    register_draft_grad_norm_group,
 )
 from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
 from nemo_rl.models.megatron.router_replay import (
@@ -1592,6 +1593,12 @@ def _create_draft_pre_wrap_hook(
         """Optionally preload the base policy, then attach the draft module to the owner chunk."""
         if not draft_cfg["enabled"]:
             return model
+
+        # Register on EVERY rank, not just the draft-owner PP stage: the
+        # optimizer gates each SEPARATE_GRAD_NORM_GROUPS entry on a flag
+        # all-reduce spanning PP (has_grad_norm_group), so a stage-local
+        # tuple desyncs the collective order and deadlocks optimizer.step.
+        register_draft_grad_norm_group()
 
         # Base pretrained checkpoints do not contain draft weights, so load the
         # policy weights before attaching the nested draft module.

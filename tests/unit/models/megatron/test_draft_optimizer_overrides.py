@@ -212,3 +212,43 @@ def test_draft_override_distinctness_guard():
     )
     overrides = distinct_min_lr_provider.build_config_overrides(context)
     assert overrides is not None
+
+
+def test_grad_norm_group_registered_on_non_owner_pp_stage(monkeypatch):
+    """Regression test: PP stages without the draft module must still register.
+
+    has_grad_norm_group gates each SEPARATE_GRAD_NORM_GROUPS entry on a flag
+    all-reduce spanning PP, so a stage-local tuple desyncs the optimizer's
+    collective order and deadlocks step() (seen live as a watchdog timeout on
+    INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP on every last-stage rank).
+    """
+    from types import SimpleNamespace
+
+    from megatron.core.optimizer import optimizer as mcore_optimizer
+
+    from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+
+    monkeypatch.setattr(mcore_optimizer, "SEPARATE_GRAD_NORM_GROUPS", ("mtp",))
+    # A model list with no post-process chunk = a non-last PP stage; the hook
+    # returns before building the draft module.
+    non_owner_model = [SimpleNamespace(post_process=False, language_model=None)]
+
+    hook = _create_draft_pre_wrap_hook(
+        {"draft": {"enabled": True}},
+        None,
+        None,
+        preload_policy_from_pretrained=False,
+    )
+    assert hook(non_owner_model) is non_owner_model
+    assert "draft" in mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS
+
+    # Baseline runs must keep Megatron's stock tuple.
+    monkeypatch.setattr(mcore_optimizer, "SEPARATE_GRAD_NORM_GROUPS", ("mtp",))
+    disabled_hook = _create_draft_pre_wrap_hook(
+        {"draft": {"enabled": False}},
+        None,
+        None,
+        preload_policy_from_pretrained=False,
+    )
+    disabled_hook(non_owner_model)
+    assert "draft" not in mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS

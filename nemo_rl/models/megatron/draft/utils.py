@@ -1194,8 +1194,8 @@ def get_policy_embedding_row(
         embedding_owner = getattr(language_model, "embedding", None)
     if embedding_owner is None:
         raise RuntimeError(
-            "[draft] Block draft training requires the policy embedding on "
-            "this rank (pipeline_model_parallel_size must be 1)."
+            "[draft] The policy embedding does not live on this rank; under "
+            "PP > 1 the mask row is fetched via TapChannel.begin_pass instead."
         )
     device = embedding_owner.word_embeddings.weight.device
     return embedding_owner.word_embeddings(
@@ -1213,8 +1213,11 @@ def register_draft_grad_norm_group() -> None:
     gradient norm (see MegatronOptimizer.clip_grad_norm and the 'mtp'
     precedent in multi_token_prediction.py), so the draft head's large
     early-training gradients do not shrink the policy update through the
-    shared global clip. Only called when a draft model is built, so baseline
-    (no-draft) runs keep Megatron's stock clipping behavior.
+    shared global clip. Must run on every rank when draft training is
+    enabled — including PP stages that never build the draft module — because
+    has_grad_norm_group all-reduces a per-group flag over the grad-stats
+    group (spans PP under the distributed optimizer); baseline (no-draft)
+    runs never call this and keep Megatron's stock clipping behavior.
     """
     from megatron.core.optimizer import optimizer as mcore_optimizer
 
@@ -1390,12 +1393,6 @@ def _build_block_draft_model(
             "policy.draft.speculator_type must be one of "
             f"{SUPPORTED_BLOCK_SPECULATOR_TYPES}, got '{speculator_type}'."
         )
-    if int(model_provider.pipeline_model_parallel_size or 1) != 1:
-        raise ValueError(
-            "policy.draft.speculator_type=dflash/dspark requires "
-            "pipeline_model_parallel_size == 1 (the policy embedding row for "
-            "the mask token must live on the draft owner rank)."
-        )
     if bool(model_provider.sequence_parallel):
         raise ValueError(
             "policy.draft.speculator_type=dflash/dspark requires sequence_parallel == false."
@@ -1463,7 +1460,10 @@ def _build_block_draft_model(
         hidden_dropout=0.0,
         attention_softmax_in_fp32=False,
         tensor_model_parallel_size=model_provider.tensor_model_parallel_size,
-        pipeline_model_parallel_size=model_provider.pipeline_model_parallel_size,
+        # Not the policy's PP size: the draft lives whole on its owner stage,
+        # and TransformerBlock would otherwise split (and assert on) the
+        # draft's few layers across pipeline stages.
+        pipeline_model_parallel_size=1,
         expert_tensor_parallel_size=model_provider.expert_tensor_parallel_size,
         sequence_parallel=model_provider.sequence_parallel,
         use_cpu_initialization=model_provider.use_cpu_initialization,

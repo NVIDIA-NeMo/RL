@@ -3713,6 +3713,8 @@ def grpo_train(
                     metrics["draft_grad_norm"] = train_results[
                         "draft_grad_norm"
                     ].numpy()
+                if "draft_tap_wait_s" in train_results:
+                    metrics["draft_tap_wait_s"] = train_results["draft_tap_wait_s"]
                 if master_config.grpo.use_dynamic_sampling:
                     metrics["filtered_reward"] = rewards.numpy()
                     metrics["reward"] = repeated_batch["total_reward"].numpy()

@@ -894,6 +894,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             aggregated_results["mtp_metrics"] = results[0]["mtp_metrics"]
         if "draft_grad_norm" in results[0]:
             aggregated_results["draft_grad_norm"] = results[0]["draft_grad_norm"]
+        # Each deduped result carries its replica's PP-group max tap wait
+        # (reduced worker-side); the slowest replica is the wait actually
+        # exposed to the step.
+        tap_waits = [r["draft_tap_wait_s"] for r in results if "draft_tap_wait_s" in r]
+        if tap_waits:
+            aggregated_results["draft_tap_wait_s"] = max(tap_waits)
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
