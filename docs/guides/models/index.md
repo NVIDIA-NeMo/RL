@@ -12,12 +12,14 @@ For the full list of supported models, see
 
 - **[GLM](glm/index.md)** — GLM-5.1 and GLM-5.2 GRPO recipes on the Megatron
   backend, colocated and non-colocated with vLLM.
+- **[Gemma](gemma/index.md)** — Gemma 4 text-only DAPO and VLM GRPO recipes on
+  AutoModel, including Context Parallel layouts for the text-only variants.
 - **[Nemotron](nemotron/index.md)** — post-training recipes for Nemotron 3
   Nano, Nano Omni, Super, Ultra, and Nemotron 3.5 Lightning, spanning the
   Megatron and AutoModel backends.
-- **[Qwen](qwen/index.md)** — Qwen3.5 LLM and VLM recipes (dense and MoE) on the
-  Megatron and AutoModel backends, including thinking-mode generation-length
-  guidance.
+- **[Qwen](qwen/index.md)** — Qwen3.5 and Qwen3.8 LLM and VLM recipes (dense and
+  MoE), with backend availability documented per version and thinking-mode
+  generation-length guidance.
 
 Other model-specific guides currently live directly under
 [Guides](../../index.md) (for example, [DeepSeek](../deepseek.md)) and are
@@ -27,6 +29,7 @@ migrated into this hub as their guidance grows.
 :hidden:
 
 glm/index.md
+gemma/index.md
 nemotron/index.md
 qwen/index.md
 ```

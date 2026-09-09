@@ -42,6 +42,7 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_nixl_non_colo
 # manual test instead of registering a guaranteed skip whose green check would
 # imply coverage it did not provide:
 #   uv run --no-sync bash tests/functional/grpo_sglang_nixl_non_colocated_tp2.sh
+run_test env EXPECT=survival uv run --no-sync bash ./tests/functional/grpo_sglang_fault_tolerance_chaos.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

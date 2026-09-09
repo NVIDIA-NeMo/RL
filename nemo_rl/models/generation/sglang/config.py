@@ -99,6 +99,17 @@ class SglangSpecificArgs(TypedDict):
     # Weight precision for rollout/refit.
     quantization: SglangQuantizationConfig
 
+    # Enable serving health checks and refit-time recovery of hung/dead engines.
+    # The exemplar YAML defaults this to False. The tuning fields below are
+    # required when enabled and validated when fault tolerance is initialized.
+    use_fault_tolerance: bool
+    rollout_health_check_interval: NotRequired[int]
+    rollout_health_check_timeout: NotRequired[int]
+    rollout_health_check_first_wait: NotRequired[int]
+    # Nonnegative restart limit per logical engine over the generation object's
+    # lifetime; abort if exhausted. The exemplar YAML recommends 3; 0 disables restarts.
+    rollout_max_restart_attempts: NotRequired[int]
+
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
     # Random seed for the engine; if None, SGLang picks one.

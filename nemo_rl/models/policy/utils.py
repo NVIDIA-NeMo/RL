@@ -56,18 +56,18 @@ except ImportError:
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
-# an automodel factory for loading the huggingface models from correct class
-
-AUTOMODEL_FACTORY: Dict[str, Any] = {
-    # Add an entry here when a model (1) uses HF's standard loading path
-    # (no custom NeMo automodel impl) AND (2) its architecture isn't
-    # loadable via AutoModelForCausalLM (e.g. VLMs using
-    # ForConditionalGeneration / ForImageTextToText). Models with a
-    # custom NeMo automodel impl (e.g. qwen3_5_moe) don't need an entry
-    # — the custom impl intercepts from_pretrained regardless of the
-    # parent AutoModel class. Check MODEL_ARCH_MAPPING in the NeMo
-    # automodel registry to see which architectures have custom impls:
-    # https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
+# Plain Hugging Face classes remain separate from the NeMo AutoModel wrappers so
+# callers that manage distribution can request them when NeMo AutoModel is installed.
+# Add an entry here whenever a model's architecture isn't loadable via
+# AutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /
+# ForImageTextToText). Unlike AUTOMODEL_FACTORY below, this dict is also read on
+# the ``use_nemo_automodel=False`` path (DTensor V1), where no NeMo custom impl
+# intercepts from_pretrained -- so a model that has a custom NeMo automodel impl
+# still needs an entry here when its parent AutoModel class is not
+# AutoModelForCausalLM. Check MODEL_ARCH_MAPPING in the NeMo automodel registry
+# to see which architectures have custom impls:
+# https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
+HF_AUTOMODEL_FACTORY: Dict[str, Any] = {
     "qwen2_5_vl": AutoModelForImageTextToText,
     "qwen2_vl": AutoModelForImageTextToText,
     "qwen2_5_omni": AutoModelForTextToWaveform,
@@ -76,10 +76,13 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
     "internvl": AutoModelForImageTextToText,
     "gemma3": AutoModelForImageTextToText,
     "gemma4": AutoModelForImageTextToText,
+    "gemma4_unified": AutoModelForImageTextToText,
     "smolvlm": AutoModelForImageTextToText,
     "mistral3": AutoModelForImageTextToText,
     "llama4": AutoModelForImageTextToText,
 }
+
+AUTOMODEL_FACTORY: Dict[str, Any] = HF_AUTOMODEL_FACTORY
 
 if NEMO_AUTOMODEL_AVAILABLE:
     AUTOMODEL_FACTORY = {
@@ -93,6 +96,7 @@ if NEMO_AUTOMODEL_AVAILABLE:
         "internvl": NeMoAutoModelForImageTextToText,
         "gemma3": NeMoAutoModelForImageTextToText,
         "gemma4": NeMoAutoModelForImageTextToText,
+        "gemma4_unified": NeMoAutoModelForImageTextToText,
         "smolvlm": NeMoAutoModelForImageTextToText,
         "mistral3": NeMoAutoModelForImageTextToText,
         "llama4": NeMoAutoModelForImageTextToText,
@@ -129,11 +133,21 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
 
 
-def resolve_model_class(model_name: str) -> Any:
-    """Resolve the appropriate model class for a given model name."""
-    if NEMO_AUTOMODEL_AVAILABLE:
+def resolve_model_class(
+    model_name: str,
+    *,
+    use_nemo_automodel: bool = True,
+) -> Any:
+    """Resolve the model class for a model type.
+
+    Args:
+        model_name: Model type to resolve.
+        use_nemo_automodel: Whether to prefer NeMo AutoModel wrappers when they
+            are available.
+    """
+    if use_nemo_automodel and NEMO_AUTOMODEL_AVAILABLE:
         return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
+    return HF_AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -1047,9 +1061,9 @@ def broadcast_hf_buckets_via_distributed_impl(
     ``dist.broadcast`` per tensor over the NCCL group, then waits for the Ray
     refs to confirm engines finished loading the bucket.
 
-    The rollout-engine lock wraps each bucket's broadcast so concurrent SGLang
-    NCCL operations (e.g. health-check pings) cannot collide with the
-    weight-update broadcast.
+    Trainer rank 0 acquires the rollout-engine lock for each bucket to serialize
+    weight-update broadcasts. The generation side does not acquire it; pausing
+    the health monitor keeps serving probes out of the refit phase.
     """
     import time as _time
 

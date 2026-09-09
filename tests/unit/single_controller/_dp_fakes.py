@@ -33,6 +33,8 @@ _BULK_FIELDS = [
     "generation_logprobs",
     "token_mask",
     "sample_mask",
+    "mask_sample",
+    "truncated",
     "prompt_ids_for_adv",
     "total_reward",
 ]

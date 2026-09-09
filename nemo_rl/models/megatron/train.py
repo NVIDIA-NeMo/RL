@@ -18,6 +18,7 @@ from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
+from megatron.core import tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -30,7 +31,11 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
 )
-from megatron.core.utils import StragglerDetector, get_model_config
+from megatron.core.utils import (
+    StragglerDetector,
+    get_model_config,
+    unwrap_model,
+)
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -45,6 +50,7 @@ from nemo_rl.algorithms.loss import (
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -71,6 +77,28 @@ PostProcessingFunction = Union[
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
 ]
+
+
+def _prepare_padding_mask_for_model(
+    model: GPTModel,
+    padding_mask: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Match a CP-local padding mask to the model's sequence-parallel layout."""
+    if padding_mask is None or not get_model_config(model).sequence_parallel:
+        return padding_mask
+
+    core_model = unwrap_model(model)
+    if isinstance(core_model, GPTModel) and core_model.pre_process:
+        return padding_mask
+
+    return (
+        tensor_parallel.scatter_to_sequence_parallel_region(
+            padding_mask.transpose(0, 1).contiguous(),
+            group=get_tensor_model_parallel_group(),
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
 
 
 @contextmanager
@@ -125,6 +153,7 @@ def model_forward(
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
     mtp_loss_mask: Optional[torch.Tensor] = None,
+    padding_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
     media_token_validity_mask: Optional[torch.Tensor] = None,
@@ -141,6 +170,7 @@ def model_forward(
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         mtp_loss_mask: MTP loss mask to exclude prompt tokens from MTP loss (optional)
+        padding_mask: Packed-sequence padding mask for MoE routing (optional)
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
@@ -165,6 +195,9 @@ def model_forward(
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
+    padding_mask = _prepare_padding_mask_for_model(model, padding_mask)
+    if padding_mask is not None:
+        additional_kwargs["padding_mask"] = padding_mask
 
     # Only sent when the model advertises the parameter, so it never reaches a
     # forward that would swallow it into **kwargs and quietly ignore it.
@@ -267,6 +300,7 @@ def forward_with_post_processing_fn(
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
+    padding_mask = processed_mb.padding_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
     original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
@@ -291,6 +325,7 @@ def forward_with_post_processing_fn(
                 packed_seq_params=packed_seq_params,
                 defer_fp32_logits=defer_fp32_logits,
                 mtp_loss_mask=mtp_loss_mask,
+                padding_mask=padding_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 media_token_validity_mask=media_token_validity_mask,
@@ -313,16 +348,35 @@ def forward_with_post_processing_fn(
         from megatron.core.transformer.multi_token_prediction import roll_tensor
 
         captured_states = capture.get_captured_states()
-        shifted_input_embeds = roll_tensor(
-            captured_states.inputs_embeds,
-            shifts=-1,
-            dims=0,
-            cp_group=get_context_parallel_group(),
-        )[0]
+        if packed_seq_params is not None:
+            # Packed layout: rolling the captured embeddings would leak the
+            # next segment's first token across every packing boundary, so
+            # shift the token ids per sequence before packing and re-embed
+            # them instead (one extra embedding lookup; also yields the
+            # correct sequence-parallel layout for free). no_grad matches the
+            # capture hooks, which hand the draft detached embeddings.
+            with torch.no_grad():
+                shifted_input_ids = _pack_input_ids(
+                    data_dict["input_ids"],
+                    packed_seq_params.cu_seqlens_q,
+                    packed_seq_params.cu_seqlens_q_padded,
+                    roll_shift=-1,
+                )
+                shifted_input_embeds = capture.model.embedding(
+                    input_ids=shifted_input_ids, position_ids=position_ids
+                )
+        else:
+            shifted_input_embeds = roll_tensor(
+                captured_states.inputs_embeds,
+                shifts=-1,
+                dims=0,
+                cp_group=get_context_parallel_group(),
+            )[0]
         data_dict["student_logits"] = draft_model(
             hidden_states=captured_states.hidden_states,
             input_embeds=shifted_input_embeds,
             attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
         )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -549,6 +603,26 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
+            if "student_logits" in data_dict:
+                # draft + use_fused_linear_logprobs is rejected at setup in
+                # lm_policy.py (the fused path never materializes the full
+                # next-token logits the teacher needs), so no check here.
+                # Keep the draft head's packed logits out of the policy-loss
+                # data so the per-sequence packing slicers never see them.
+                student_logits = data_dict.pop("student_logits")
+                loss_fn_wrapped = DraftLossWrapper(
+                    loss_fn=loss_fn_wrapped,
+                    prepare_fn=None,
+                    data_dict=data_dict,
+                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=get_context_parallel_group(),
+                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                    d2t=self.d2t,
+                    student_logits=student_logits,
+                )
         else:
             loss_fn_wrapped = partial(
                 wrap_loss_fn_with_input_preparation,

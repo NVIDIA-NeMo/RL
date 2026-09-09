@@ -201,6 +201,33 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
     )
 
 
+_GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS = (
+    "model.embed_vision.",
+    "model.embed_audio.",
+)
+
+
+def _is_gemma4_unified_text_only(model_config: Any) -> bool:
+    """Return whether a vLLM model is a text-only Gemma 4 Unified model."""
+    multimodal_config = getattr(model_config, "multimodal_config", None)
+    return (
+        "Gemma4UnifiedForConditionalGeneration" in model_config.architectures
+        and multimodal_config is not None
+        and multimodal_config.language_model_only
+    )
+
+
+def _filter_gemma4_unified_multimodal_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Drop frozen Gemma 4 Unified vision and audio embedder weights."""
+    return (
+        (key, weight)
+        for key, weight in weights
+        if not key.startswith(_GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS)
+    )
+
+
 def _read_mtp_layer_weights_from_checkpoint(
     model_path: str, mtp_layer_indices: set[int]
 ) -> list[tuple[str, torch.Tensor]]:
@@ -253,6 +280,8 @@ class VllmInternalWorkerExtension:
     # True once the MTP drafter has been served by a one-time disk load (see
     # load_mtp_weights_from_disk); refit then leaves those static weights alone.
     _mtp_drafter_from_disk: bool = False
+    # Each worker logs the Gemma 4 Unified multimodal filtering at most once.
+    _logged_gemma4_unified_drop: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
     _nrl_layerwise_reload_active: bool = False
@@ -311,6 +340,29 @@ class VllmInternalWorkerExtension:
             fp8.load_weights(policy_weights, self.model_runner)
             return
         self._load_full_hf_weights(policy_weights)
+
+    def _prepare_reload_weight_iterator(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Prepare checkpoint-format weights for vLLM's native reload API."""
+        model_config = self.model_runner.vllm_config.model_config
+        if "Gemma3ForConditionalGeneration" in model_config.architectures:
+            weights = (
+                (fix_gemma3_vision_weight_name(name), weight)
+                for name, weight in weights
+            )
+        if _is_gemma4_unified_text_only(model_config):
+            weights = _filter_gemma4_unified_multimodal_weights(weights)
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            return fp8.get_quantized_weight_iterator(
+                weights,
+                self.model_runner,
+                refit_with_reload_api=True,
+            )
+        return weights
 
     def bind_numa(self) -> bool:
         """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
@@ -762,18 +814,31 @@ class VllmInternalWorkerExtension:
         return True
 
     def _load_weights(self, weights):
-        """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
+        """Apply model-specific transforms and load policy and draft weights.
 
-        Applies Gemma3 vision-tower weight name fix if needed, splits policy/draft
-        weights, dispatches policy weights through the configured refit loader,
-        and loads draft weights into the drafter model.
+        Checkpoint-format weights are normalized for the target vLLM model, then
+        routed to the policy model and any supported speculative drafter.
         """
-        if (
-            "Gemma3ForConditionalGeneration"
-            in self.model_runner.vllm_config.model_config.architectures
-        ):
+        model_config = self.model_runner.vllm_config.model_config
+        if "Gemma3ForConditionalGeneration" in model_config.architectures:
             for idx, (key, weight) in enumerate(weights):
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
+
+        if _is_gemma4_unified_text_only(model_config):
+            # HF loads the full unified checkpoint, while text-only vLLM uses
+            # encoder-free multimodal stubs with a different parameter layout.
+            # The recipe freezes these towers and never invokes them, so only
+            # refit the language path and leave the unused vLLM stubs untouched.
+            num_weights = len(weights)
+            weights = list(_filter_gemma4_unified_multimodal_weights(weights))
+            num_dropped = num_weights - len(weights)
+            if num_dropped and not getattr(self, "_logged_gemma4_unified_drop", False):
+                self._logged_gemma4_unified_drop = True
+                logger.info(
+                    "Gemma4 Unified text-only refit dropped %d frozen "
+                    "vision/audio weights",
+                    num_dropped,
+                )
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         self._load_hf_weights(policy_weights)
@@ -929,6 +994,7 @@ class VllmInternalWorkerExtension:
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
+
             with self._weight_update_lifecycle("ipc") as finalize:
                 while True:
                     # Blocking receive with timeout (this is the main operation)
@@ -1027,13 +1093,19 @@ class VllmInternalWorkerExtension:
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
     def update_weights_from_collective(
-        self, refit_timeout_s: float | None = None
+        self,
+        refit_timeout_s: float | None = None,
+        refit_with_reload_api: bool = False,
     ) -> bool:
         """Update the model weights from collective communication.
 
         Guarded for the same reason as the producer side: if a peer rank dies mid-refit
         this blocks in NCCL forever. Note the buffers hold PARTIAL weights once aborted,
         so the caller must not serve from this engine until a later refit completes.
+
+        Args:
+            refit_timeout_s: Refit watchdog timeout in seconds.
+            refit_with_reload_api: Whether to use vLLM's native reload API.
         """
         from nemo_rl.distributed.refit_watchdog import (
             RefitAborted,
@@ -1043,7 +1115,7 @@ class VllmInternalWorkerExtension:
 
         with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
             hold_refit_for_fault_injection()
-            result = self._update_weights_from_collective()
+            result = self._update_weights_from_collective(refit_with_reload_api)
         if guard.fired:
             raise RefitAborted(
                 f"refit receive exceeded {refit_timeout_s}s and was aborted; "
@@ -1051,26 +1123,54 @@ class VllmInternalWorkerExtension:
             )
         return result
 
-    def _update_weights_from_collective(self) -> bool:
+    def _update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
         )
 
         try:
-            native_layerwise_refit = self._uses_native_layerwise_refit("collective")
-            with self._weight_update_lifecycle("collective") as finalize:
-                packed_broadcast_consumer(
+            if refit_with_reload_api:
+                weight_iterator = packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=self._load_weights,
-                    # Double buffering (num_buffers > 1) causes a race condition
-                    # when using native_layerwise_refit: deferred weight_loader
-                    # replays may read a buffer while the other stream refills it.
-                    num_buffers=1 if native_layerwise_refit else None,
+                    post_unpack_func=None,
+                    return_iterator=True,
                 )
-                finalize()
+                assert weight_iterator is not None
+                reload_weight_iterator = self._prepare_reload_weight_iterator(
+                    weight_iterator
+                )
+                try:
+                    self.model_runner.reload_weights(
+                        weights_iterator=reload_weight_iterator
+                    )
+                finally:
+                    iterators_to_close = [reload_weight_iterator]
+                    if reload_weight_iterator is not weight_iterator:
+                        iterators_to_close.append(weight_iterator)
+
+                    for iterator_to_close in iterators_to_close:
+                        close_weight_iterator = getattr(
+                            iterator_to_close, "close", None
+                        )
+                        if close_weight_iterator is not None:
+                            close_weight_iterator()
+            else:
+                native_layerwise_refit = self._uses_native_layerwise_refit("collective")
+                with self._weight_update_lifecycle("collective") as finalize:
+                    packed_broadcast_consumer(
+                        iterator=iter(self.state_dict_info.items()),
+                        group=self.model_update_group,
+                        src=0,
+                        post_unpack_func=self._load_weights,
+                        # Double buffering (num_buffers > 1) causes a race condition
+                        # when using native_layerwise_refit: deferred weight_loader
+                        # replays may read a buffer while the other stream refills it.
+                        num_buffers=1 if native_layerwise_refit else None,
+                    )
+                    finalize()
 
         except Exception as e:
             if self._weight_update_errors_are_fatal():
