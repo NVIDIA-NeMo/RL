@@ -100,10 +100,19 @@ def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
     """Optionally enable vLLM's native OpenTelemetry tracing on the engine.
 
     Requires both ``telemetry.enabled`` and ``telemetry.vllm_native_tracing``
-    (plus an OTLP endpoint). vLLM's OTLP span exporter is gRPC-only, so the
-    endpoint must speak OTLP/gRPC (e.g. a collector on ``:4317`` or a
-    gRPC-capable backend) — it will not reach an ``http/protobuf`` OTLP
-    endpoint. Degrades to a no-op if the installed vLLM lacks these engine args.
+    (plus an OTLP endpoint). vLLM builds its own span exporter and picks the
+    protocol from ``OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`` alone, defaulting to
+    gRPC; it does not consult the generic ``OTEL_EXPORTER_OTLP_PROTOCOL``. So an
+    ``http/protobuf`` endpoint inherited from lens needs that traces-specific
+    var set as well, or vLLM will speak gRPC at an HTTP port.
+
+    Note this only enables tracing in the engine: vLLM's *worker* processes
+    gate on ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` being present in their
+    environment and never read the engine args, so they trace whenever that var
+    reaches them -- which the Ray runtime_env does for the whole cluster. This
+    switch therefore governs engine spans, not every vLLM span.
+
+    Degrades to a no-op if the installed vLLM lacks these engine args.
     """
     # The master switch is re-checked here because _config_to_env() exports
     # every field before init_telemetry_driver's `enabled` check, so

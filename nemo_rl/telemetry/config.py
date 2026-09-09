@@ -77,9 +77,11 @@ class TelemetryConfig(BaseModel, extra="allow"):
     or an OpenTelemetry Collector works."""
 
     vllm_native_tracing: bool = False
-    """Enable vLLM's own OTLP tracing inside generation workers (opt-in). vLLM's
-    exporter is gRPC-only, so this needs a gRPC OTLP endpoint / collector — it
-    does not ride an ``http/protobuf`` OTLP endpoint used by lens.
+    """Enable vLLM's own OTLP tracing inside generation workers (opt-in). vLLM
+    builds its exporter itself and defaults it to gRPC, reading only
+    ``OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`` -- not the generic
+    ``OTEL_EXPORTER_OTLP_PROTOCOL`` lens honours. To ride the same
+    ``http/protobuf`` endpoint as lens, set the traces-specific var too.
 
     vLLM traces per **request**, so this emits one span per rollout -- thousands
     per step, against ~20 for the rest of the run -- and vLLM offers no sampling

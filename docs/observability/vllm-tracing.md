@@ -7,7 +7,7 @@ Generation is where most of an RL step's wall-clock goes, so NeMo-RL instruments
 | What | `rl.vllm.generate` / `rl.vllm.generate_text` spans + token/latency metrics, emitted by NeMo-RL around the vLLM call | vLLM's own internal engine spans (scheduling, prefill/decode, ...) |
 | Where | driver, `nemo_rl/models/generation/vllm/vllm_generation.py` | vLLM engine, enabled in `vllm_worker.py` |
 | Enabled by | `generation` span group (on by default in `per_step`/`all`) | opt-in: `telemetry.vllm_native_tracing: true` |
-| Transport | rides the normal lens OTLP path (`http/protobuf` OK) | **gRPC-only** (needs an OTLP/gRPC endpoint / collector) |
+| Transport | rides the normal lens OTLP path (`http/protobuf` OK) | vLLM's own exporter, **gRPC by default** (`http/protobuf` needs `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`) |
 | Correlation | nested under the rollout span (parent-child) | via shared `nemo.run.id` / resource attributes (not parent-child) |
 
 ## Layer 1 — RL-side generation spans (default)
@@ -28,10 +28,17 @@ telemetry:
   vllm_native_tracing: true
 ```
 
-and point the exporter at a gRPC endpoint:
+and point the exporter at an endpoint. vLLM defaults to gRPC, so a collector on `:4317` needs nothing further:
 
 ```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4317   # gRPC!
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4317   # gRPC
+```
+
+To send vLLM's spans to the same `http/protobuf` endpoint lens uses, name the protocol explicitly — vLLM reads only the traces-specific variable (see Caveat 2 below):
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://<backend-host>:4318
+export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
 ```
 
 Under the hood, `_maybe_enable_vllm_native_tracing()` (in `vllm_worker.py`, called from `_load_model`) sets `otlp_traces_endpoint` on the vLLM engine args. It reads `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` if set, otherwise `OTEL_EXPORTER_OTLP_ENDPOINT`.
@@ -46,13 +53,21 @@ If what you want is engine behaviour in aggregate — token throughput, sequence
 
 `collect_detailed_traces` is deliberately **not** set. vLLM documents it as "possibly costly and or blocking", and it adds per-request timing inside the engine, so it slows generation rather than just adding spans. Pass it through `vllm_kwargs` if you specifically want it.
 
-### Caveat 2 — vLLM's exporter is gRPC-only
+### Caveat 2 — vLLM's exporter picks its protocol separately
 
-vLLM's OTLP span exporter speaks **OTLP/gRPC only**. It needs a gRPC OTLP endpoint — a collector on `:4317` or a gRPC-capable backend. It will **not** ride an `http/protobuf` OTLP endpoint, including a direct-to-backend `http/protobuf` path like the one Layer 1 uses.
+vLLM does not reuse lens's exporter; it builds its own and chooses the protocol from **`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, defaulting to `grpc`**. It supports `grpc` and `http/protobuf`, and raises on anything else.
 
-So to get vLLM's native spans you need a gRPC OTLP receiver in the picture (e.g. an OTel Collector on `:4317` that forwards to your backend). This is why native tracing is left **off** by default when exporting to an `http/protobuf` endpoint with no collector. See [Observability Stack](observability-stack.md).
+The trap is that it reads *only* that traces-specific variable — never the generic `OTEL_EXPORTER_OTLP_PROTOCOL`. So a run configured for a direct-to-backend `http/protobuf` path gets Layer 1 exported over HTTP and Layer 2 attempting **gRPC against the same HTTP port**, whose export failures surface only in the generation worker's own logs. Set `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` alongside it, or put a gRPC OTel Collector on `:4317` in the picture. Note also that vLLM constructs its gRPC exporter with `insecure=True`, so the gRPC path is plaintext. See [Observability Stack](observability-stack.md).
 
-### Caveat 3 — offline generation cannot carry a trace context
+### Caveat 3 — the opt-in governs engine spans, not worker spans
+
+`vllm_native_tracing` sets `otlp_traces_endpoint` on the engine args, which is the only thing that enables vLLM's **request/engine** tracing. vLLM's **worker** processes — `EngineCore`, `DPEngineCoreActor`, and the `multiproc_executor` workers — call `maybe_init_worker_tracer()` unconditionally and gate purely on `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` being present in their environment. They never look at the engine args.
+
+That variable propagates cluster-wide on its own: `init_ray()` snapshots the whole driver environment into the Ray `runtime_env`, and nothing filters `OTEL_*`. So **exporting `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` in a job script turns on vLLM's worker-process tracers even with `vllm_native_tracing: false`** — bringing back the per-request span volume of Caveat 1 that the opt-in exists to keep off.
+
+Prefer setting the generic `OTEL_EXPORTER_OTLP_ENDPOINT` for lens and leaving the traces-specific variable unset; `_maybe_enable_vllm_native_tracing` falls back to the generic one for the endpoint value, and vLLM's own `init_otel_tracer` then exports the traces-specific variable itself for its children. Clearing it inside the worker is not a fix: the OTel SDK prefers the traces-specific variable over the generic one, so that would retarget lens's exporter too.
+
+### Caveat 4 — offline generation cannot carry a trace context
 
 NeMo-RL drives vLLM through the offline `LLM.generate()` API, which does not accept a per-request trace context. So vLLM's native spans **cannot** nest as children of the RL rollout span. Instead they correlate to the RL run through the **shared `nemo.run.id` and resource attributes** that every process in the job carries — you line them up by run, not by parent-child edges in one waterfall.
 
@@ -67,4 +82,4 @@ If the installed vLLM does not support `otlp_traces_endpoint` (older versions), 
 - **Just want to see generation cost per rollout?** Layer 1 — enable the `generation` group. Works over any transport, including a direct-to-backend `http/protobuf` path.
 - **Want engine behaviour over a whole run (token throughput, sequence lengths, finish reasons)?** The `vllm/*` metrics, on by default — no per-request spans, no collector needed. See [Metrics](metrics.md).
 - **Want queue time or preemptions?** Layer 2 — neither is teed as a metric today.
-- **Debugging vLLM engine internals (scheduling, batching, prefill/decode) on a specific step?** Add Layer 2 — but stand up a gRPC OTLP collector first, correlate by `nemo.run.id`, and turn it off again: it emits one span per request (see Caveat 1).
+- **Debugging vLLM engine internals (scheduling, batching, prefill/decode) on a specific step?** Add Layer 2 — but settle the transport first (a gRPC collector, or `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf`), correlate by `nemo.run.id`, and turn it off again: it emits one span per request (see Caveat 1).

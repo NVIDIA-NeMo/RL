@@ -124,7 +124,7 @@ The driver-side vLLM generation path records token and latency metrics through l
 
 These overlap with `rl.vllm.*` on token counts but are not redundant: `gen_ai.*` is derived from the tensors a `generate()` call returns, so it measures what the driver received, while `rl.vllm.*` is the engine's own accounting. When the two disagree, the gap is work the engine did that never reached the driver — the aborted requests, which appear in no returned tensor at all.
 
-These ride the normal `http/protobuf` OTLP path and reach the same backend as everything else. They are distinct from vLLM's **native** engine tracing (opt-in, gRPC-only) — see [vLLM Tracing](vllm-tracing.md).
+These ride the normal `http/protobuf` OTLP path and reach the same backend as everything else. They are distinct from vLLM's **native** engine tracing (opt-in, and exported over vLLM's own gRPC-by-default exporter) — see [vLLM Tracing](vllm-tracing.md).
 
 ## Metric vs span tag vs resource attribute
 
