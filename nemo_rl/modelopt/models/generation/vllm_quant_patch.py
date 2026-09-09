@@ -256,7 +256,6 @@ def _make_nvfp4_moe_input_scales_writable(model: torch.nn.Module) -> None:
 class RealQuantWorker(NixlVllmWorker):
     """vLLM worker with the NVFP4 MoE reload fix missing from vLLM 0.25.1."""
 
-    @torch.inference_mode()
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights=load_dummy_weights)
         model = self.model_runner.model

@@ -329,6 +329,35 @@ def test_real_quant_worker_makes_shared_nvfp4_moe_scales_writable():
     model.experts.w2_input_scale.copy_(torch.arange(4, dtype=torch.float32))
 
 
+def test_real_quant_worker_loads_model_outside_inference_mode(monkeypatch):
+    patch_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    )
+    from nemo_rl.models.generation.vllm.vllm_backend import NixlVllmWorker
+
+    worker = object.__new__(patch_mod.RealQuantWorker)
+    worker.model_runner = types.SimpleNamespace(model=None)
+    inference_modes = []
+
+    def fake_load_model(self, **kwargs):
+        inference_modes.append(torch.is_inference_mode_enabled())
+        self.model_runner.model = torch.nn.Linear(1, 1)
+
+    monkeypatch.setattr(
+        NixlVllmWorker,
+        "load_model",
+        fake_load_model,
+    )
+
+    worker.load_model()
+
+    assert inference_modes == [False]
+    weight = worker.model_runner.model.weight
+    assert not torch.is_inference(weight)
+    with torch.no_grad():
+        weight.copy_(torch.ones_like(weight))
+
+
 def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
