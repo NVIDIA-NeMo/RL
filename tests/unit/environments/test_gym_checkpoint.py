@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
     GymCheckpointCommitResult,
+    GymCheckpointRestoreResult,
     GymCheckpointTopology,
     GymControlCapabilities,
     GymDiscoveredParticipant,
@@ -30,6 +31,7 @@ from nemo_rl.environments.gym_checkpoint import (
     gym_capture_key,
     gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
+    validate_gym_checkpoint_restore_artifacts,
 )
 
 
@@ -146,6 +148,64 @@ def test_topology_fingerprint_excludes_dynamic_checkpoint_phase() -> None:
     )
 
     assert first_topology.fingerprint() == second_topology.fingerprint()
+
+
+@pytest.mark.parametrize(
+    ("agent_features", "model_features", "error"),
+    [
+        (
+            ["agent_continuation_index_v1"],
+            ["external_storage_reference_index_v1"],
+            "completed-result acknowledgement",
+        ),
+        (
+            ["completed_result_acknowledgement"],
+            ["external_storage_reference_index_v1"],
+            "continuation-index support",
+        ),
+        (
+            [
+                "agent_continuation_index_v1",
+                "completed_result_acknowledgement",
+            ],
+            [],
+            "external-storage reference indexes",
+        ),
+    ],
+)
+def test_turn_recovery_capability_guardrails(
+    agent_features: list[str],
+    model_features: list[str],
+    error: str,
+) -> None:
+    model = GymControlCapabilities.model_validate(
+        _capabilities(features=model_features)
+    )
+    agent = GymControlCapabilities.model_validate(
+        _capabilities(
+            component="responses_api_agents",
+            name="agent",
+            admission_states=["accepting"],
+            concurrency_contract="serialized_per_session",
+            instance_role=None,
+            features=agent_features,
+        )
+    )
+    topology = GymCheckpointTopology.from_discovered(
+        [
+            GymDiscoveredParticipant(
+                participant=model.participant("policy-route"),
+                capabilities=model,
+            ),
+            GymDiscoveredParticipant(
+                participant=agent.participant("agent-route"),
+                capabilities=agent,
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        topology.validate_turn_recovery_capabilities()
 
 
 def test_participant_manifest_digest_is_verified_before_publication(tmp_path) -> None:
@@ -329,6 +389,157 @@ def test_model_lineage_staging_keys_are_bound_to_the_tq_snapshot(tmp_path) -> No
     lineage_path.write_text("{}\n")
     with pytest.raises(ValueError, match="lineage digest mismatch"):
         gym_checkpoint_staging_keys(tmp_path, checkpoint)
+
+
+def test_storage_reference_index_avoids_private_lineage_scan(tmp_path) -> None:
+    ledger_dir = tmp_path / "model-ledger" / "policy_model"
+    ledger_dir.mkdir(parents=True)
+    reference_path = ledger_dir / "storage-references.jsonl"
+    rows = [
+        {
+            "schema_version": 1,
+            "capture_key": "group-7_g0",
+            "boundary_model_call_id": "call-1",
+            "kind": "token_capture_staging",
+            "key": "group-7_g0/source-call",
+        },
+        {
+            "schema_version": 1,
+            "capture_key": "group-7_g0",
+            "boundary_model_call_id": "call-1",
+            "kind": "token_capture_staging",
+            "key": "group-7_g0/call-1",
+        },
+    ]
+    reference_payload = b"".join(
+        json.dumps(row, separators=(",", ":")).encode() + b"\n" for row in rows
+    )
+    reference_path.write_bytes(reference_payload)
+    reference = {
+        "schema_version": 1,
+        "relative_path": "model-ledger/policy_model/storage-references.jsonl",
+        "sha256": hashlib.sha256(reference_payload).hexdigest(),
+        "records": len(rows),
+        "bytes": len(reference_payload),
+    }
+    # Deliberately omit Gym's private rollout/file inventory. RL should need
+    # only the digest-bound public sidecar for external TQ ownership.
+    manifest_path = ledger_dir / "manifest.json"
+    manifest_path.write_text("{}")
+    manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    participant = {
+        "server_name": "policy-route",
+        "component": "responses_api_models",
+        "participant_name": "policy_model",
+    }
+    checkpoint = GymCheckpointCommitResult.model_validate(
+        {
+            "checkpoint_id": "snapshot-7",
+            "participants": [
+                {
+                    "participant": participant,
+                    "payload": {
+                        "rollouts": 1,
+                        "rows": 2,
+                        "excluded_tombstoned": 0,
+                        "excluded_inactive": 3,
+                        "manifest_digest": manifest_digest,
+                        "storage_reference_index": reference,
+                    },
+                    "manifest": {
+                        "participant": participant,
+                        "relative_path": "model-ledger/policy_model/manifest.json",
+                        "manifest_digest": manifest_digest,
+                    },
+                }
+            ],
+        }
+    )
+
+    assert gym_checkpoint_staging_keys(tmp_path, checkpoint) == {
+        "group-7_g0/source-call",
+        "group-7_g0/call-1",
+    }
+
+    reference_path.write_text("{}\n")
+    with pytest.raises(ValueError, match="artifact digest mismatch"):
+        gym_checkpoint_staging_keys(tmp_path, checkpoint)
+
+
+def test_restore_must_report_the_committed_artifact_coordinates() -> None:
+    participant = {
+        "server_name": "policy-route",
+        "component": "responses_api_models",
+        "participant_name": "policy_model",
+    }
+    storage_reference = {
+        "schema_version": 1,
+        "relative_path": "model-ledger/policy_model/storage-references.jsonl",
+        "sha256": "d" * 64,
+        "records": 2,
+        "bytes": 128,
+    }
+    committed = GymCheckpointCommitResult.model_validate(
+        {
+            "checkpoint_id": "snapshot-7",
+            "participants": [
+                {
+                    "participant": participant,
+                    "payload": {
+                        "rollouts": 1,
+                        "rows": 2,
+                        "excluded_tombstoned": 0,
+                        "manifest_digest": "a" * 64,
+                        "storage_reference_index": storage_reference,
+                    },
+                    "manifest": {
+                        "participant": participant,
+                        "relative_path": "model-ledger/policy_model/manifest.json",
+                        "manifest_digest": "a" * 64,
+                    },
+                }
+            ],
+        }
+    )
+    restored = GymCheckpointRestoreResult.model_validate(
+        {
+            "checkpoint_id": "restore-7",
+            "participants": [
+                {
+                    "participant": participant,
+                    "payload": {
+                        "rollouts": 1,
+                        "rows": 2,
+                        "checkpoint_id": "snapshot-7",
+                        "tombstones": [],
+                        "source_attempts": [],
+                        "storage_reference_index": storage_reference,
+                    },
+                }
+            ],
+        }
+    )
+
+    validate_gym_checkpoint_restore_artifacts(committed, restored)
+    mismatched = GymCheckpointRestoreResult.model_validate(
+        {
+            "checkpoint_id": "restore-7",
+            "participants": [
+                {
+                    "participant": participant,
+                    "payload": {
+                        "rollouts": 1,
+                        "rows": 2,
+                        "checkpoint_id": "snapshot-7",
+                        "tombstones": [],
+                        "source_attempts": [],
+                    },
+                }
+            ],
+        }
+    )
+    with pytest.raises(ValueError, match="different checkpoint artifact"):
+        validate_gym_checkpoint_restore_artifacts(committed, mismatched)
 
 
 def test_checkpoint_commit_rejects_mismatched_manifest_identity() -> None:

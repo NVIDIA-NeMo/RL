@@ -721,8 +721,9 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
     validates and fingerprints every participant before training starts.
     ``participant_checkpointing_enabled`` adds Gym participant state to each
     periodic snapshot and enables completed-result acknowledgement. It requires
-    discovery so SC can validate the participant topology and acknowledgement
-    feature before training starts.
+    discovery so SC can validate the participant topology, acknowledgement,
+    continuation-index, and external-storage-index capabilities before training
+    starts.
     """
 
     capability_discovery_enabled: bool = False
