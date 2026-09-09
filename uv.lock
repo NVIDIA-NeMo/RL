@@ -4253,7 +4253,7 @@ requires-dist = [
     { name = "urllib3", specifier = ">=2.7.0" },
     { name = "uvicorn" },
     { name = "uvloop" },
-    { name = "vllm", marker = "extra == 'vllm'", git = "https://github.com/TomerBN-Nvidia/vllm.git?branch=super_vl_rl_v0.25.1" },
+    { name = "vllm", marker = "extra == 'vllm'", git = "https://github.com/TomerBN-Nvidia/vllm.git?branch=codex%2Ffix-radio-final-layernorm" },
     { name = "wandb" },
     { name = "yappi", specifier = ">=1.7.6" },
 ]
@@ -4547,7 +4547,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'automodel'", specifier = ">=5.5.0,<5.6.0" },
     { name = "transformers", marker = "extra == 'sglang'", specifier = "==5.6.0" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "vllm", marker = "extra == 'vllm'", git = "https://github.com/TomerBN-Nvidia/vllm.git?branch=super_vl_rl_v0.25.1" },
+    { name = "vllm", marker = "extra == 'vllm'", git = "https://github.com/TomerBN-Nvidia/vllm.git?branch=codex%2Ffix-radio-final-layernorm" },
     { name = "wandb", specifier = ">=0.28.0" },
     { name = "zstandard" },
 ]
@@ -8378,7 +8378,7 @@ wheels = [
 [[package]]
 name = "vllm"
 version = "0.25.1"
-source = { git = "https://github.com/TomerBN-Nvidia/vllm.git?branch=super_vl_rl_v0.25.1#6f11a9c5f95e1259a21c4d416b421fcb598b37bf" }
+source = { git = "https://github.com/TomerBN-Nvidia/vllm.git?branch=codex%2Ffix-radio-final-layernorm#10908b9f6669cd4306ea1ba676472a6c3c4769c2" }
 dependencies = [
     { name = "aiohttp", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "anthropic", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
