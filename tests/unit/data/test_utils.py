@@ -21,6 +21,7 @@ index 0. They are pure Python and require no GPUs / Ray / models.
 """
 
 import os
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import pytest
@@ -29,7 +30,11 @@ import yaml
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.data.datasets import extract_necessary_env_names
-from nemo_rl.data.utils import get_train_dataset_name, load_dataloader_state
+from nemo_rl.data.utils import (
+    get_train_dataset_name,
+    load_dataloader_state,
+    setup_response_data,
+)
 
 # ---------------------------------------------------------------------------
 # Test fixtures / helpers
@@ -134,6 +139,54 @@ def test_extract_necessary_env_names_ignores_missing_or_none_entries():
     }
 
     assert extract_necessary_env_names(data_config) == []
+
+
+def test_setup_response_data_skips_all_validation_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    train_data = SimpleNamespace(
+        task_name="train",
+        dataset=["training row"],
+        val_dataset=["derived validation row"],
+        task_spec=object(),
+        processor=object(),
+        preprocessor=None,
+    )
+
+    def fake_load_response_dataset(config: dict[str, str]) -> SimpleNamespace:
+        calls.append(config["data_path"])
+        return train_data
+
+    class FakeProcessedDataset:
+        def __init__(self, dataset: list[str], *args: Any, **kwargs: Any) -> None:
+            self.dataset = dataset
+
+        def __len__(self) -> int:
+            return len(self.dataset)
+
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.load_response_dataset", fake_load_response_dataset
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.merge_datasets", lambda datasets: datasets[0]
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.AllTaskProcessedDataset", FakeProcessedDataset
+    )
+
+    data_config = {
+        "max_input_seq_length": None,
+        "shuffle": False,
+        "train": {"data_path": "train.jsonl"},
+        "validation": {"data_path": "validation.jsonl"},
+    }
+    _, val_dataset = setup_response_data(
+        None, data_config, env_configs=None, load_validation=False
+    )
+
+    assert calls == ["train.jsonl"]
+    assert val_dataset is None
 
 
 # ---------------------------------------------------------------------------
