@@ -536,6 +536,7 @@ def l0_nemo_gym(scripted_openai_base_url):
         },
         base_urls=[scripted_openai_base_url],
         model_name="scripted-model",
+        generation_backend="vllm",
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
