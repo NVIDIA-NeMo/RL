@@ -66,6 +66,14 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
 
 
+def test_check_nccl_reshard_refit_support_rejects_megatron_etp_with_vllm() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["expert_tensor_parallel_size"] = 2
+
+    with pytest.raises(ValueError, match="expert_tensor_parallel_size must be 1"):
+        check_nccl_reshard_refit_support(config)
+
+
 def test_check_nccl_reshard_refit_support_rejects_reload_api() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"]["refit_with_reload_api"] = True

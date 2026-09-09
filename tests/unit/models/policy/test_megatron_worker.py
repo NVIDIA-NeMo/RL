@@ -611,7 +611,9 @@ def test_megatron_m2n_unstacks_grouped_experts_into_local_weights() -> None:
     for expert in range(2):
         gate_name = f"model.layers.0.mlp.experts.{expert}.gate_proj.weight"
         up_name = f"model.layers.0.mlp.experts.{expert}.up_proj.weight"
-        destination = torch.zeros((4, 2), dtype=torch.bfloat16)
+        destination = torch.nn.Parameter(
+            torch.zeros((4, 2), dtype=torch.bfloat16), requires_grad=False
+        )
         destinations.append(destination)
         tasks.append(
             _make_refit_task(
@@ -638,6 +640,10 @@ def test_megatron_m2n_unstacks_grouped_experts_into_local_weights() -> None:
     worker = object.__new__(MegatronGenerationRefitMixin)
     param_map = worker._build_destination_hf_to_local_param_map(refit_info, tasks)
 
+    orphaned_storage = [destination.data for destination in destinations]
+    for destination in destinations:
+        destination.data = torch.full_like(destination, -1)
+
     gate_spec = param_map.get(grouped_gate)
     gate_ctx = gate_spec.pre(None)
     gate_ctx.buf[0].fill_(1)
@@ -653,6 +659,43 @@ def test_megatron_m2n_unstacks_grouped_experts_into_local_weights() -> None:
     assert torch.equal(destinations[0][2:], torch.full_like(destinations[0][2:], 3))
     assert torch.equal(destinations[1][:2], torch.full_like(destinations[1][:2], 2))
     assert torch.equal(destinations[1][2:], torch.full_like(destinations[1][2:], 4))
+    assert all(torch.count_nonzero(storage).item() == 0 for storage in orphaned_storage)
+
+
+def test_megatron_m2n_resolves_direct_destination_after_parameter_rebind() -> None:
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+
+    gate_name = "model.layers.0.mlp.gate_proj.weight"
+    up_name = "model.layers.0.mlp.up_proj.weight"
+    destination = torch.nn.Parameter(
+        torch.zeros((4, 2), dtype=torch.bfloat16), requires_grad=False
+    )
+    task = _make_refit_task(
+        param_name="decoder.layers.0.mlp.linear_fc1.weight",
+        destination=destination,
+        dependencies=(gate_name, up_name),
+        local_specs=((gate_name, "gate"), (up_name, "up")),
+    )
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {"model.layers.0": [{"name": gate_name}]},
+    }
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    param_map = worker._build_destination_hf_to_local_param_map(refit_info, [task])
+    gate_spec = param_map.get(gate_name)
+    assert gate_spec is not None
+    assert gate_spec.pre is not None
+
+    orphaned_storage = destination.data
+    destination.data = torch.full_like(destination, -1)
+    gate_ctx = gate_spec.pre(gate_spec.base)
+    gate_ctx.buf.fill_(7)
+
+    assert torch.equal(destination[:2], torch.full_like(destination[:2], 7))
+    assert torch.equal(destination[2:], torch.full_like(destination[2:], -1))
+    assert torch.count_nonzero(orphaned_storage).item() == 0
 
 
 @pytest.mark.parametrize(

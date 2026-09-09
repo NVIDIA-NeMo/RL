@@ -1426,7 +1426,7 @@ class MegatronGenerationRefitMixin:
             )
         if not piece.task.is_mxfp8:
             assert piece.destination is not None
-            piece.destination.copy_(tensor)
+            piece.spec.select(piece.destination).copy_(tensor)
             return
 
         pending = self._generation_m2n_pending.setdefault(piece.task.target_id, {})
@@ -1454,7 +1454,7 @@ class MegatronGenerationRefitMixin:
                 raise RuntimeError(
                     f"Duplicate Megatron M-to-N target for {spec.name!r}."
                 )
-            destination = None if task.is_mxfp8 else spec.select(task.destination)
+            destination = None if task.is_mxfp8 else task.destination
             # MXFP8 destinations stage through BF16: the wire payload is logical
             # BF16 by design, and MXFP8Tensor.dtype is optional metadata that is
             # None until the destination's first successful update. Pin the
@@ -1515,6 +1515,14 @@ class MegatronGenerationRefitMixin:
 
             return LocalParamSpec(base=None, pre=pre, post=post)
 
+        def direct_spec(piece: _MegatronBulkRefitPiece) -> LocalParamSpec:
+            assert piece.destination is not None
+
+            def pre(base: torch.Tensor) -> RefitCtx:
+                return RefitCtx(buf=piece.spec.select(base))
+
+            return LocalParamSpec(base=piece.destination, pre=pre)
+
         specs = {}
         for layer_name in refit_info["layer_names"]:
             for param_info in refit_info["per_layer_params"][layer_name]:
@@ -1541,9 +1549,7 @@ class MegatronGenerationRefitMixin:
                         f"No local Megatron destination maps to M-to-N weight {name!r}."
                     )
                 specs[name] = (
-                    staged_spec(piece)
-                    if piece.task.is_mxfp8
-                    else LocalParamSpec(base=piece.destination)
+                    staged_spec(piece) if piece.task.is_mxfp8 else direct_spec(piece)
                 )
 
         return HFToLocalParamMap(specs=specs)

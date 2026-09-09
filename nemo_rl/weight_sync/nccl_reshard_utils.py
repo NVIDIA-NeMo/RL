@@ -815,10 +815,19 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
     # Megatron ETP. The vLLM backend shards experts by index across
     # its TP ranks, so its EP is either 1 (TP-sharded experts) or equal to TP
     # (EP-sharded). PP is not yet supported gen-side.
-    if generation.get("backend") == "vllm":
+    if backend == "vllm":
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
         gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)
+        # Megatron-source ETP has unit coverage but has not been fully tested
+        # end to end with a vLLM destination. Keep it disabled until it has.
+        train_etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
+        if train_etp != 1:
+            violations.append(
+                "policy.megatron_cfg.expert_tensor_parallel_size must be 1 "
+                "for a vLLM destination with nccl_reshard refit "
+                f"(got {train_etp})."
+            )
         if gen_ep != 1 and gen_ep != gen_tp:
             violations.append(
                 "policy.generation.vllm_cfg.expert_parallel_size must be 1 or "

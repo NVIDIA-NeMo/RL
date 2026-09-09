@@ -132,6 +132,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     _INDIVIDUAL_EXPERT_RE,
     HFToLocalParamMap,
     LocalParamSpec,
+    RefitBuilderInterface,
     RefitCtx,
     _extract_layer_name,
     _extract_layer_prefix,
@@ -420,6 +421,7 @@ class MegatronPolicyWorkerImpl(
     PolicyCheckpointEngineMixin,
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
+    RefitBuilderInterface,
 ):
     # Tests and extension classes that bypass __init__ retain the historical
     # training/source behavior unless they explicitly select destination.
@@ -659,7 +661,7 @@ class MegatronPolicyWorkerImpl(
         ):
             # Bridge's generic GPT provider defaults to its training layer spec.
             # Dedicated inference workers need MCore inference linears instead.
-            # A model-specific provider already handles this and returns False.
+            # A model-specific provider already handles this itself.
             _configure_inference_optimized_layer_spec(self.megatron_cfg.model)
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
