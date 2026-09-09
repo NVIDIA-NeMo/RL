@@ -79,6 +79,54 @@ def test_external_vllm_patch_allowlist(monkeypatch):
     assert calls == list(allowed_patches)
 
 
+def test_apply_vllm_patches_allows_compact_routed_experts_patch_failure(monkeypatch):
+    vllm_module = types.ModuleType("vllm")
+    vllm_module.__path__ = []
+    envs_module = types.ModuleType("vllm.envs")
+    envs_module.VLLM_USE_RAY_V2_EXECUTOR_BACKEND = True
+    logger_module = types.ModuleType("vllm.logger")
+    logger_module.init_logger = logging.getLogger
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm.envs", envs_module)
+    monkeypatch.setitem(sys.modules, "vllm.logger", logger_module)
+
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_init_workers_ray",
+        lambda _py_executable, _extra_env_vars: True,
+    )
+    for patch_name in (
+        "_patch_vllm_llama_eagle3_own_lm_head",
+        "_patch_vllm_tool_parser_namespace_tool",
+        "_patch_vllm_ray_executor_v2_tcpstore_port",
+        "_patch_vllm_shm_broadcast_bind_retry",
+        "_patch_vllm_radio_layerscale_loader",
+        "_patch_vllm_nemotron_h_fp32_lm_head",
+    ):
+        monkeypatch.setattr(patches, patch_name, lambda _logger: None)
+
+    calls = []
+
+    def fail_compact_patch(_logger):
+        calls.append("compact")
+        return False
+
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_routed_experts_compact_layers",
+        fail_compact_patch,
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_flashinfer_trtllm_refit_buffers",
+        lambda _logger: calls.append("refit"),
+    )
+
+    patches._apply_vllm_patches("/path/to/python")
+
+    assert calls == ["compact", "refit"]
+
+
 @pytest.fixture
 def patched_tool_parser_source(tmp_path, monkeypatch):
     """The installed tool_parsers/utils.py, unpatched then patched in tmp."""

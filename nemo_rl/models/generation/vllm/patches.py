@@ -1403,7 +1403,6 @@ def _apply_vllm_patches(
     py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
-    require_compact_routed_experts: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
@@ -1453,13 +1452,8 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_nemotron_h_fp32_lm_head(patch_logger)
-    compact_routed_experts_ready = _patch_vllm_routed_experts_compact_layers(
-        patch_logger
-    )
-    if require_compact_routed_experts and not compact_routed_experts_ready:
-        raise RuntimeError(
-            "Router replay requires NeMo-RL's compact routed-experts vLLM "
-            "source patch, but it could not be applied. See the preceding "
-            "vllm_patch error for the installed source path and hash."
-        )
+    # This is a best-effort memory optimization. Router replay also accepts
+    # vLLM's stock full-layer payload, and the patch helper logs why it could
+    # not safely rewrite the installed source when that fallback is needed.
+    _patch_vllm_routed_experts_compact_layers(patch_logger)
     _patch_vllm_flashinfer_trtllm_refit_buffers(patch_logger)
