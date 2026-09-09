@@ -721,10 +721,11 @@ class TestNcclReshardWeightSynchronizer:
 
 
 def _mock_megatron_generation(
-    refit_backend="nccl",
+    refit_backend: str | None = "nccl",
     *,
-    refit_execution_batch_bytes=123,
-    refit_transport="mcore",
+    refit_execution_batch_bytes: int | None = 123,
+    refit_transport: str | None = "mcore",
+    offload_policy_before_refit: bool = False,
     **overrides,
 ):
     gen = _mock_generation(**overrides)
@@ -734,6 +735,7 @@ def _mock_megatron_generation(
         "mcore_generation_config": {
             "refit_backend": refit_backend,
             "refit_execution_batch_bytes": refit_execution_batch_bytes,
+            "offload_policy_before_refit": offload_policy_before_refit,
         },
     }
     gen.uses_native_refit = refit_transport == "mcore"
@@ -784,7 +786,7 @@ class TestMegatronWeightSynchronizer:
         transport.init_communicator.assert_called_once()
         transport.sync_weights.assert_called_once_with(kv_scales={"scale": 1.0})
         gen.suspend_for_refit.assert_called_once()
-        policy.offload_before_refit.assert_called_once()
+        policy.offload_before_refit.assert_not_called()
         assert [
             call.kwargs.get("tags")
             for call in gen.prepare_for_generation.call_args_list
@@ -822,7 +824,7 @@ class TestMegatronWeightSynchronizer:
 
         assert sync.sync_weights() == {}
         gen.suspend_for_refit.assert_called_once()
-        policy.offload_before_refit.assert_called_once()
+        policy.offload_before_refit.assert_not_called()
         policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
         gen.update_weights_from_collective.assert_called_once_with(refit_timeout_s=None)
         gen.resume_after_refit.assert_called_once()
@@ -867,6 +869,32 @@ class TestMegatronWeightSynchronizer:
         gen.suspend_for_refit.assert_not_called()
         policy.swap_weights_via_reshard.assert_not_called()
         assert not sync.is_stale
+
+    @pytest.mark.parametrize("offload_policy_before_refit", [False, True])
+    @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
+    def test_non_colocated_policy_offload_is_configurable(
+        self, mock_ray: MagicMock, offload_policy_before_refit: bool
+    ) -> None:
+        mock_ray.get.side_effect = lambda futures: [True for _ in futures]
+        policy = _mock_megatron_policy()
+        gen = _mock_megatron_generation(
+            offload_policy_before_refit=offload_policy_before_refit
+        )
+        sync = MegatronWeightSynchronizer(
+            policy,
+            gen,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        sync.init_communicator()
+        sync.sync_weights()
+
+        if offload_policy_before_refit:
+            policy.offload_before_refit.assert_called_once_with()
+        else:
+            policy.offload_before_refit.assert_not_called()
 
     @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
     def test_non_colocated_nvshmem_preinits(self, mock_ray):

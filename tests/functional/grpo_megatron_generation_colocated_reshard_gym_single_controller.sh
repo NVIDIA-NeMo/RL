@@ -69,7 +69,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.megatron_cfg.context_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=false \
     policy.generation.backend=megatron \
-    policy.generation.refit_transport=mcore \
+    +policy.generation.refit_transport=mcore \
     policy.generation.mcore_generation_config.expose_http_server=true \
     ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \

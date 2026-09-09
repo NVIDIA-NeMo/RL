@@ -30,9 +30,11 @@ single `ValueError` listing every violation. The current requirements are:
   training backend is not supported yet.).
 * **vLLM or Megatron generation backend** — `policy.generation.backend` must be
   `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
-* Training-side Megatron supports expert tensor parallelism. Custom PP layouts
-  (`pipeline_model_parallel_layout`, virtual PP > 1,
-  embedding/loss pipeline-split accounting) are not supported yet.
+* Training-side Megatron supports expert tensor parallelism when the generation
+  destination is Megatron. A vLLM destination still requires
+  `expert_tensor_parallel_size: 1`. Custom PP layouts
+  (`pipeline_model_parallel_layout`, virtual PP > 1, embedding/loss
+  pipeline-split accounting) are not supported yet.
 * **Generation-side ETP with `inference_optimized` is pinned to 1.** Those MoE
   layers do not implement expert tensor parallelism and raise whenever the
   *resolved* ETP exceeds 1 — and an omitted ETP resolves to TP, not 1. So
