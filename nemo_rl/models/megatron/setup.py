@@ -300,8 +300,10 @@ from nemo_rl.models.megatron.config import (
 )
 from nemo_rl.models.megatron.draft.utils import (
     build_draft_model,
+    build_draft_optimizer_override_provider,
     find_draft_owner_chunk,
     get_attached_draft_model,
+    register_draft_grad_norm_group,
 )
 from nemo_rl.models.megatron.hybridep import (
     configure_hybridep_packed_input_padding,
@@ -1727,6 +1729,12 @@ def _create_draft_pre_wrap_hook(
         if not draft_cfg["enabled"]:
             return model
 
+        # Register on EVERY rank, not just the draft-owner PP stage: the
+        # optimizer gates each SEPARATE_GRAD_NORM_GROUPS entry on a flag
+        # all-reduce spanning PP (has_grad_norm_group), so a stage-local
+        # tuple desyncs the collective order and deadlocks optimizer.step.
+        register_draft_grad_norm_group()
+
         # Base pretrained checkpoints do not contain draft weights, so load the
         # policy weights before attaching the nested draft module.
         if preload_policy_from_pretrained:
@@ -2154,11 +2162,20 @@ def setup_model_and_optimizer(
     )
 
     if load_optimizer:
+        # Draft co-training may give `draft_model.*` params their own LR/WD
+        # param group (policy.draft.{lr,min_lr,weight_decay}); None keeps the
+        # stock megatron-bridge provider and param-group partition.
+        optimizer_config_override_provider = (
+            build_draft_optimizer_override_provider(policy_cfg["draft"])
+            if draft_enabled
+            else None
+        )
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
             scheduler_config=megatron_cfg.scheduler,
             model=model,
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
+            optimizer_config_override_provider=optimizer_config_override_provider,
         )
     else:
         optimizer = None

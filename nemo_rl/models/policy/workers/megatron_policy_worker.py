@@ -50,6 +50,10 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.utils import (
+    compute_block_draft_slot_valid_counts,
+    compute_draft_pass_valid_counts,
+)
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
@@ -72,6 +76,7 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.draft.utils import resolve_draft_aux_layer_ids
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -590,6 +595,22 @@ class MegatronPolicyWorkerImpl(
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
+        # PP > 1 draft co-training: every PP rank joins the tap channel (source
+        # stages write taps one-sided, the draft stage lands them); PP == 1
+        # keeps the rank-local capture path and needs no channel.
+        self.tap_channel = None
+        if (
+            "draft" in self.cfg
+            and self.cfg["draft"]["enabled"]
+            and parallel_state.get_pipeline_model_parallel_world_size() > 1
+        ):
+            from nemo_rl.models.megatron.draft.hidden_capture import (
+                build_tap_channel,
+            )
+
+            self.tap_channel = build_tap_channel(
+                self.model, draft_config=self.cfg["draft"], policy_cfg=self.cfg
+            )
         self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
@@ -877,6 +898,88 @@ class MegatronPolicyWorkerImpl(
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
+                # Draft loss normalization: the draft's valid-token counts
+                # differ from the policy's (TTT per-pass masks shift by d+1;
+                # block slots only cover anchored spans), so it gets its own
+                # global counts, all-reduced over DP only. The loss derives
+                # its gradient denominator (sum_d alpha_d * count_d) and the
+                # per-pass metric denominators from this vector.
+                draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+                raw_ttt_steps = (
+                    self.cfg["draft"].get("ttt_steps", 1) if draft_enabled else 1
+                )
+                draft_ttt_steps = 1 if raw_ttt_steps is None else int(raw_ttt_steps)
+                # Aux-layer ids are resolved rank-independently: under PP only
+                # the last stage owns the draft model, but every stage's
+                # capture must post the same P2P schedule (one send/recv per
+                # id), so each rank derives the list from the shared config.
+                draft_aux_layer_ids = (
+                    resolve_draft_aux_layer_ids(
+                        self.cfg["draft"], self._get_model_config().num_layers
+                    )
+                    if draft_enabled
+                    else None
+                )
+                draft_speculator_type = (
+                    (self.cfg["draft"].get("speculator_type") or "eagle3")
+                    if draft_enabled
+                    else "eagle3"
+                )
+                global_draft_pass_counts = None
+                if draft_enabled and "token_mask" in batch and "sample_mask" in batch:
+                    if draft_speculator_type in ("dflash", "dspark"):
+                        # Deferred import: the dflash module pulls mcore
+                        # transformer pieces only needed on this path.
+                        from nemo_rl.models.megatron.draft.dflash import (
+                            anchors_to_count_map,
+                            sample_block_anchors,
+                        )
+
+                        # Sample block anchors ONCE for the whole local batch
+                        # (deterministic from the batch content, identical on
+                        # every TP rank). They travel through the batch as a
+                        # [B, S] per-position count map: dim 1 must be the
+                        # sequence dim for every batch tensor (dynamic
+                        # batching validates, truncates, and length-bucket
+                        # reorders along it), which a [B, N] position tensor
+                        # cannot survive. The train loop rebuilds per-mb
+                        # block lists from the map. The per-slot counts are
+                        # the block analogue of the per-pass TTT counts.
+                        anchors, anchor_valid = sample_block_anchors(
+                            token_mask=batch["token_mask"],
+                            sample_mask=batch["sample_mask"],
+                            input_ids=batch["input_ids"],
+                            num_anchors=int(self.cfg["draft"]["anchors_per_seq"]),
+                            generation_only=bool(
+                                self.cfg["draft"].get(
+                                    "anchor_from_generation_only", True
+                                )
+                            ),
+                        )
+                        batch["draft_anchor_count_map"] = anchors_to_count_map(
+                            anchors, anchor_valid, batch["token_mask"].shape[1]
+                        )
+                        global_draft_pass_counts = (
+                            compute_block_draft_slot_valid_counts(
+                                batch["token_mask"],
+                                batch["sample_mask"],
+                                anchors,
+                                anchor_valid,
+                                gamma=int(self.cfg["draft"]["gamma"]),
+                            ).to(device=global_valid_toks.device)
+                        )
+                    elif draft_ttt_steps > 1:
+                        global_draft_pass_counts = compute_draft_pass_valid_counts(
+                            batch["token_mask"],
+                            batch["sample_mask"],
+                            ttt_steps=draft_ttt_steps,
+                        ).to(device=global_valid_toks.device)
+                if global_draft_pass_counts is not None:
+                    torch.distributed.all_reduce(
+                        global_draft_pass_counts,
+                        group=parallel_state.get_data_parallel_group(),
+                    )
+
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
                 model_config = self._get_model_config()
@@ -944,7 +1047,6 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -963,10 +1065,14 @@ class MegatronPolicyWorkerImpl(
                             defer_fp32_logits=self.defer_fp32_logits,
                             global_valid_seqs=global_valid_seqs,
                             global_valid_toks=global_valid_toks,
+                            global_draft_pass_counts=global_draft_pass_counts,
                             sampling_params=self.sampling_params,
                             straggler_timer=self.mcore_state.straggler_timer,
                             draft_model=self.draft_model,
                             enable_hidden_capture=draft_enabled,
+                            tap_channel=self.tap_channel,
+                            draft_ttt_steps=draft_ttt_steps,
+                            draft_aux_layer_indices=draft_aux_layer_ids,
                             use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                                 "use_fused_linear_logprobs", False
                             ),
@@ -1134,6 +1240,25 @@ class MegatronPolicyWorkerImpl(
         self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
+        if self.tap_channel is not None:
+            # Only the draft stage accumulates rendezvous wait, but result
+            # collection dedups to one worker per tied group (PP rank 0), so
+            # max-reduce across the PP group to make it visible there.
+            wait = torch.tensor(
+                [
+                    self.tap_channel.pop_rendezvous_wait_s()
+                    if self.tap_channel.is_last_stage
+                    else 0.0
+                ],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            torch.distributed.all_reduce(
+                wait,
+                op=torch.distributed.ReduceOp.MAX,
+                group=parallel_state.get_pipeline_model_parallel_group(),
+            )
+            metrics["draft_tap_wait_s"] = wait.item()
 
         # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
         # samples but each packed sequence spans max_total_sequence_length tokens,
@@ -1576,6 +1701,30 @@ class MegatronPolicyWorkerImpl(
         placeholder_n = torch.tensor(1.0, device="cuda")
 
         draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+        # With TTT enabled the draft's core attention is the multi-pass module,
+        # so the forward MUST run through forward_ttt even here (the plain
+        # single-pass forward would trip its begin_pass guard).
+        raw_ttt_steps = self.cfg["draft"].get("ttt_steps", 1) if draft_enabled else 1
+        draft_ttt_steps = 1 if raw_ttt_steps is None else int(raw_ttt_steps)
+        if draft_ttt_steps > 1:
+            # This path never computes global_draft_pass_counts, and its
+            # placeholder-N contract (loss returns un-normalized sums, one
+            # global 1/N rescale at finish) cannot express the multi-pass
+            # denominator sum_d alpha_d * count_d alongside the policy's
+            # global_valid_toks — the draft gradient would silently mis-scale
+            # by roughly sum_d alpha_d.
+            raise NotImplementedError(
+                "policy.draft.ttt_steps > 1 is not supported on the split "
+                "train-step path (single controller); use the batched train() "
+                "path."
+            )
+        draft_aux_layer_ids = (
+            resolve_draft_aux_layer_ids(
+                self.cfg["draft"], self._get_model_config().num_layers
+            )
+            if draft_enabled
+            else None
+        )
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
             data=data,
@@ -1606,6 +1755,9 @@ class MegatronPolicyWorkerImpl(
                     straggler_timer=self.mcore_state.straggler_timer,
                     draft_model=self.draft_model,
                     enable_hidden_capture=draft_enabled,
+                    tap_channel=self.tap_channel,
+                    draft_ttt_steps=draft_ttt_steps,
+                    draft_aux_layer_indices=draft_aux_layer_ids,
                     use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                         "use_fused_linear_logprobs", False
                     ),
@@ -2476,16 +2628,20 @@ class MegatronPolicyWorkerImpl(
             return broadcast_obj_from_pp_rank(size_in_bytes)
 
         for task in self.refit_conversion_tasks:
-            param_info.append(
-                (
-                    task.param_name,
-                    calculate_size_in_bytes(
-                        task.param_weight,
-                        task.mapping.tp_size,
-                        task.mapping.ep_size if task.mapping.is_expert else 1,
-                    ),
+            try:
+                size_in_bytes = calculate_size_in_bytes(
+                    task.param_weight,
+                    task.mapping.tp_size,
+                    task.mapping.ep_size if task.mapping.is_expert else 1,
                 )
-            )
+            except ValueError as e:
+                # The bare helper error doesn't say WHICH param broke the
+                # one-owner-per-PP-group invariant; that name is the whole
+                # diagnosis (tied embedding vs task-list desync).
+                raise ValueError(
+                    f"refit param info failed for {task.param_name!r}: {e}"
+                ) from e
+            param_info.append((task.param_name, size_in_bytes))
         return param_info
 
     def _iter_params_with_optional_kv_scales(
@@ -2525,12 +2681,38 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in base_iter:
             yield name, tensor
 
-        if include_draft and self.draft_model is not None:
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
+        if include_draft and "draft" in self.cfg and self.cfg["draft"]["enabled"]:
+            from nemo_rl.models.megatron.draft import export_draft_weights_to_hf
 
-            draft_weights = export_eagle_weights_to_hf(
-                self.draft_model,
+            # The draft lives on the last PP stage only, but every rank's
+            # iterator must yield the same key set: the refit metadata and each
+            # vLLM engine's IPC sender are rank-local, so a first-stage sender
+            # that skipped draft.* would leave its paired engine's drafter
+            # silently stale (and the metadata would miss the keys the last
+            # stage sends). Broadcast the exported weights across PP.
+            draft_weights = (
+                [
+                    (name, tensor.detach().to("cuda").contiguous())
+                    for name, tensor in export_draft_weights_to_hf(self.draft_model)
+                ]
+                if self.draft_model is not None
+                else None
             )
+            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+                meta = broadcast_obj_from_pp_rank(
+                    None
+                    if draft_weights is None
+                    else [(n, t.shape, t.dtype) for n, t in draft_weights]
+                )
+                if draft_weights is None:
+                    draft_weights = [
+                        (name, torch.empty(shape, dtype=dtype, device="cuda"))
+                        for name, shape, dtype in meta
+                    ]
+                pp_group = parallel_state.get_pipeline_model_parallel_group()
+                src = torch.distributed.get_process_group_ranks(pp_group)[-1]
+                for _, tensor in draft_weights:
+                    torch.distributed.broadcast(tensor, src=src, group=pp_group)
             for name, tensor in draft_weights:
                 yield f"draft.{name}", tensor
 

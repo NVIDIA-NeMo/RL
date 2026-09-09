@@ -30,6 +30,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     NLLLossFn,
     PreferenceLossDataDict,
     PreferenceLossFn,
+    resolve_block_draft_slot_weights,
 )
 from nemo_rl.algorithms.loss.utils import (
     prepare_loss_input,
@@ -64,5 +65,6 @@ __all__ = [
     "SequencePackingFusionLossWrapper",
     "SequencePackingLossWrapper",
     "DraftLossWrapper",
+    "resolve_block_draft_slot_weights",
     "wrap_loss_fn_with_input_preparation",
 ]

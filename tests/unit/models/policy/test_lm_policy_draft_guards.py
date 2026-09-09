@@ -46,30 +46,17 @@ def _init_policy(config):
     )
 
 
-def test_draft_with_context_parallelism_is_rejected():
-    """Online draft training must reject CP>1 at setup."""
-    with pytest.raises(ValueError, match="context parallelism"):
-        _init_policy(_draft_config(context_parallel_size=2))
-
-
-def test_draft_with_packing_and_pipeline_parallelism_is_rejected():
-    """Packed draft training must reject PP>1: the re-embed of the shifted
-    token ids needs the model embedding, which MCore constructs only on the
-    first pipeline stage while the draft runs on the last."""
-    with pytest.raises(ValueError, match="pipeline parallelism"):
-        _init_policy(_draft_config(pipeline_model_parallel_size=2))
-
-
-def test_draft_without_packing_allows_pipeline_parallelism_past_guard():
-    """PP>1 without packing must not trip the packed-PP guard (it fails later
-    on unrelated config plumbing, not with the guard's ValueError)."""
-    config = _draft_config(
-        pipeline_model_parallel_size=2, sequence_packing_enabled=False
-    )
+def test_draft_with_context_parallelism_requires_packing():
+    """The trunk ring needs the THD zigzag layout, so CP>1 rejects unpacked
+    batches at setup and passes the guard once sequence packing is on."""
+    with pytest.raises(ValueError, match="requires sequence packing"):
+        _init_policy(
+            _draft_config(context_parallel_size=2, sequence_packing_enabled=False)
+        )
     try:
-        _init_policy(config)
+        _init_policy(_draft_config(context_parallel_size=2))
     except ValueError as e:
-        assert "pipeline parallelism" not in str(e)
+        assert "requires sequence packing" not in str(e)
     except Exception:
         # Reaching config plumbing beyond the draft guards is sufficient.
         pass
