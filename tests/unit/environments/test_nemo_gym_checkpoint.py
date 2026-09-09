@@ -346,6 +346,20 @@ def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
 
 
 def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
+    continuation_index = {
+        "schema_version": 1,
+        "relative_path": "agent/instance-test/continuations.jsonl",
+        "sha256": "d" * 64,
+        "records": 2,
+        "bytes": 256,
+    }
+    storage_reference_index = {
+        "schema_version": 1,
+        "relative_path": "model-ledger/policy/storage-references.jsonl",
+        "sha256": "e" * 64,
+        "records": 4,
+        "bytes": 512,
+    }
     env = _checkpoint_env()
     capabilities = {
         "policy": _capability(
@@ -354,8 +368,13 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
             admission_states=["accepting", "draining", "paused"],
             concurrency_contract="stateless",
             instance_role="policy",
+            features=["external_storage_reference_index_v1"],
         ),
-        "agent": _capability("responses_api_agents", "agent"),
+        "agent": _capability(
+            "responses_api_agents",
+            "agent",
+            features=["agent_continuation_index_v1"],
+        ),
         "tools": _capability("resources_servers", "tools"),
     }
 
@@ -370,11 +389,14 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
             "rollouts": 2,
             "rows": 4,
             "excluded_tombstoned": 0,
+            "excluded_inactive": 1,
             "manifest_digest": "a" * 64,
+            "storage_reference_index": storage_reference_index,
         },
         ("agent", "commit"): {
             "records": 2,
             "manifest_digest": "b" * 64,
+            "continuation_index": continuation_index,
         },
         ("tools", "commit"): {
             "sessions": 2,
@@ -386,10 +408,12 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
             "checkpoint_id": "snapshot-7",
             "tombstones": [],
             "source_attempts": [{"rollout_id": "rollout-1", "attempt_index": 0}],
+            "storage_reference_index": storage_reference_index,
         },
         ("agent", "restore"): {
             "records": 2,
             "source_checkpoint_id": "snapshot-7",
+            "continuation_index": continuation_index,
         },
         ("tools", "restore"): {
             "sessions": 2,
@@ -436,8 +460,8 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
     assert len(resumed["participants"]) == 3
     assert len(calls) == 9
     assert [server_name for server_name, _path, _json in calls] == [
-        "policy",
         "agent",
+        "policy",
         "tools",
         "policy",
         "agent",
@@ -446,6 +470,12 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
         "agent",
         "policy",
     ]
+    commit_calls = calls[:3]
+    assert commit_calls[0][2]["include_continuation_index"] is True
+    assert commit_calls[1][2]["continuation_indexes"] == [continuation_index]
+    restore_calls = calls[3:6]
+    assert restore_calls[0][2]["include_storage_reference_index"] is True
+    assert restore_calls[1][2]["include_continuation_index"] is True
 
 
 def test_abort_checkpoint_uses_idempotent_resume_routes() -> None:
