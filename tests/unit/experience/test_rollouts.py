@@ -2520,3 +2520,38 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+def test_reattach_preserves_marker_across_aliased_message_log_views():
+    """Production shape: ``input_message_log`` is a slice of ``message_log``.
+
+    Both views reference the same message dictionary; consuming the
+    rollout-matched marker while processing one view must not leave the other
+    view free to overwrite the repaired media with the static payload.
+    """
+    from nemo_rl.data.multimodal_utils import ROLLOUT_MATCHED_MEDIA_KEY
+    static_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    rollout_matched = PackedTensor(torch.tensor([[9.0]]), dim_to_pack=0)
+    original_logs = [
+        [{"role": "user", "content": "first", "pixel_values": static_image}]
+    ]
+    shared_message = {
+        "role": "user",
+        "content": "first",
+        "pixel_values": rollout_matched,
+        ROLLOUT_MATCHED_MEDIA_KEY: True,
+    }
+    message_log = [shared_message]
+    results = [
+        {
+            "_initial_multimodal_data_omitted": True,
+            "input_message_log": message_log[:1],
+            "message_log": message_log,
+        }
+    ]
+
+    _reattach_original_multimodal_payloads(results, original_logs)
+
+    assert results[0]["input_message_log"][0] is shared_message
+    assert shared_message["pixel_values"] is rollout_matched
+    assert ROLLOUT_MATCHED_MEDIA_KEY not in shared_message
