@@ -238,6 +238,107 @@ def test_compute_teacher_logprobs_mixed_media_and_text_rows_per_teacher():
     assert result.shape == (3, 8)
 
 
+class _RecordingTopkTeacherWorkerGroup(_MockTeacherWorkerGroup):
+    """Capture the batch passed to a teacher's top-k path."""
+
+    def __init__(self, fill_value=1.0, dp_size=4):
+        super().__init__(fill_value=fill_value, dp_size=dp_size)
+        self.received: BatchedDataDict | None = None
+
+    def get_topk_logits(self, data, k, micro_batch_size=None, return_logsumexp=False):
+        self.received = data
+        input_ids = data["input_ids"]
+        B, S = input_ids.shape
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        assert B % dp_size == 0, (
+            f"get_topk_logits received batch_size={B} not divisible by dp_size={dp_size}"
+        )
+        result = BatchedDataDict(
+            {
+                "topk_logits": torch.full((B, S, k), self._fill_value),
+                "topk_indices": torch.arange(k).expand(B, S, k).clone(),
+            }
+        )
+        if return_logsumexp:
+            result["V_logsumexp"] = torch.full((B, S), 10.0 * self._fill_value)
+        return result
+
+
+def test_compute_teacher_topk_selects_multimodal_rows_per_teacher():
+    """Top-k mirrors the logprob path: each teacher gets its own media rows."""
+    vision_twg = _RecordingTopkTeacherWorkerGroup(fill_value=1.0, dp_size=1)
+    text_twg = _RecordingTopkTeacherWorkerGroup(fill_value=2.0, dp_size=1)
+    collector = _make_collector(
+        teacher_worker_groups={"vision": vision_twg, "text": text_twg},
+        alias_to_group_alias={"vision_agent": "vision", "text_agent": "text"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "vision_agent": "/ckpt/vision",
+                "text_agent": "/ckpt/text",
+            },
+        },
+        _has_distillation_teachers=True,
+    )
+
+    result = collector.compute_teacher_topk(
+        torch.randint(0, 100, (4, 8)),
+        [
+            {"name": "vision_agent"},
+            {"name": "text_agent"},
+            {"name": "vision_agent"},
+            {"name": "text_agent"},
+        ],
+        input_lengths=torch.full((4,), 8),
+        k=3,
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([0, None, 2, None]),
+            "imgs_sizes": _row_marked_packed_tensor([10, None, 12, None]),
+        },
+    )
+
+    assert vision_twg.received is not None
+    assert text_twg.received is not None
+    assert _received_row_markers(vision_twg.received["pixel_values"]) == [0.0, 2.0]
+    assert _received_row_markers(vision_twg.received["imgs_sizes"]) == [10.0, 12.0]
+    assert "pixel_values" not in text_twg.received
+    assert "imgs_sizes" not in text_twg.received
+    assert result["topk_logits"].shape == (4, 8, 3)
+    # Rows are stitched back in original order: vision=1.0, text=2.0.
+    torch.testing.assert_close(
+        result["topk_logits"][:, 0, 0].float(), torch.tensor([1.0, 2.0, 1.0, 2.0])
+    )
+
+
+def test_compute_teacher_topk_dp_padding_repeats_multimodal_row():
+    """DP padding repeats the media row paired with the repeated token row."""
+    twg = _RecordingTopkTeacherWorkerGroup(fill_value=3.0, dp_size=4)
+    collector = _make_collector(
+        teacher_worker_groups={"vision": twg},
+        alias_to_group_alias={"vision_agent": "vision"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"vision_agent": "/ckpt/vision"},
+        },
+        _has_distillation_teachers=True,
+    )
+
+    result = collector.compute_teacher_topk(
+        torch.randint(0, 100, (1, 8)),
+        [{"name": "vision_agent"}],
+        k=2,
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([7]),
+            "num_frames": _row_marked_packed_tensor([1]),
+        },
+    )
+
+    assert twg.received is not None
+    assert twg.received["input_ids"].shape[0] == 4
+    assert _received_row_markers(twg.received["pixel_values"]) == [7.0] * 4
+    assert _received_row_markers(twg.received["num_frames"]) == [1.0] * 4
+    assert result["topk_logits"].shape == (1, 8, 2)
+    assert result["V_logsumexp"].shape == (1, 8)
+
+
 def test_compute_teacher_logprobs_routes_to_correct_teacher():
     """Samples are routed to the right teacher and results stitched back."""
     math_twg = _MockTeacherWorkerGroup(fill_value=1.0, dp_size=1)

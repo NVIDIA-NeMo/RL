@@ -1125,6 +1125,42 @@ class AsyncTrajectoryCollector:
                     f"🧹 Released reservation for target weight {target_weight_version}"
                 )
 
+    @staticmethod
+    def _attach_multimodal_rows(
+        sub_data: BatchedDataDict,
+        multimodal_data: Optional[dict[str, Any]],
+        row_indices: list[int],
+    ) -> None:
+        """Copy the multimodal rows for ``row_indices`` into a teacher sub-batch.
+
+        ``row_indices`` must already include any DP-padding repeats so media
+        rows stay paired with the repeated token rows. Keys that are ``None``
+        or carry no logical segments are skipped so text-only groups send no
+        media keys to their teacher.
+
+        Args:
+            sub_data: teacher sub-batch holding ``input_ids`` (and lengths)
+            multimodal_data: batch-level multimodal inputs, row-aligned with
+                the full ``input_ids`` batch; ``None``/empty is a no-op
+            row_indices: full-batch row index for every row of ``sub_data``
+        """
+        if not multimodal_data:
+            return
+        selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
+            row_indices
+        )
+        sub_data.update(
+            {
+                key: value
+                for key, value in selected_multimodal.items()
+                if value is not None
+                and not (
+                    isinstance(value, PackedTensor)
+                    and not any(value.logical_segment_counts_by_row())
+                )
+            }
+        )
+
     def _compute_teacher_logprobs(
         self,
         input_ids: torch.Tensor,
@@ -1202,21 +1238,7 @@ class AsyncTrajectoryCollector:
             sub_data = BatchedDataDict({"input_ids": sub_input_ids})
             if sub_lengths is not None:
                 sub_data["input_lengths"] = sub_lengths
-            if multimodal_data:
-                selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
-                    row_indices
-                )
-                sub_data.update(
-                    {
-                        key: value
-                        for key, value in selected_multimodal.items()
-                        if value is not None
-                        and not (
-                            isinstance(value, PackedTensor)
-                            and not any(value.logical_segment_counts_by_row())
-                        )
-                    }
-                )
+            self._attach_multimodal_rows(sub_data, multimodal_data, row_indices)
 
             # Serialize calls per teacher to prevent NCCL collective desync
             t_lock_start = time.time()
@@ -1257,17 +1279,32 @@ class AsyncTrajectoryCollector:
         return result, total_time
 
     def compute_teacher_topk(
-        self, input_ids, agent_refs, input_lengths=None, k: int = 32
-    ):
+        self,
+        input_ids: torch.Tensor,
+        agent_refs: list[dict[str, Any]],
+        input_lengths: Optional[torch.Tensor] = None,
+        k: int = 32,
+        multimodal_data: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         """Compute teacher top-k logits for a driver-selected batch.
 
         Top-k tensors are large, so this is triggered by the trainer only on
         OPD logging steps instead of being stored in every replay-buffer entry.
+
+        Args:
+            input_ids: [B, S] tokenized input tensor
+            agent_refs: list of B agent reference dicts
+            input_lengths: [B] per-sample lengths (required for sequence packing)
+            k: number of top-k entries per position
+            multimodal_data: batch-level multimodal inputs, row-aligned with
+                ``input_ids`` and sliced per teacher (same contract as
+                :meth:`_compute_teacher_logprobs`)
+
+        Returns:
+            dict with ``topk_logits`` [B, S, k] bf16, ``topk_indices`` [B, S, k]
+            int64 (-1 where padded), ``V_logsumexp`` [B, S] fp32, and
+            ``teacher_topk_time`` in seconds
         """
-        import torch
-
-        from nemo_rl.algorithms.opd import resolve_reference_aliases
-
         k = int(k)
         if k <= 0:
             raise ValueError(f"k must be positive for teacher top-k logging, got {k}")
@@ -1317,6 +1354,7 @@ class AsyncTrajectoryCollector:
             twg = self.teacher_worker_groups[group_key]
             sub_input_ids = input_ids[indices]
             sub_lengths = input_lengths[indices] if input_lengths is not None else None
+            row_indices = list(indices)
 
             dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
             actual_batch_size = sub_input_ids.shape[0]
@@ -1329,10 +1367,13 @@ class AsyncTrajectoryCollector:
                     sub_lengths = torch.cat(
                         [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
                     )
+                # Keep media rows paired with the repeated token row.
+                row_indices.extend([row_indices[-1]] * pad_count)
 
             sub_data = BatchedDataDict({"input_ids": sub_input_ids})
             if sub_lengths is not None:
                 sub_data["input_lengths"] = sub_lengths
+            self._attach_multimodal_rows(sub_data, multimodal_data, row_indices)
 
             t_lock_start = time.time()
             with self._teacher_locks[group_key]:

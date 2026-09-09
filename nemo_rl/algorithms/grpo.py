@@ -2984,6 +2984,9 @@ def _collect_opd_diagnostic_payloads(
                 repeated_batch["agent_ref"],
                 input_lengths=input_lengths.cpu(),
                 k=k,
+                # Same media the student top-k saw; the teacher path slices
+                # it per teacher exactly like _compute_teacher_logprobs.
+                multimodal_data=train_data.get_multimodal_dict(as_tensors=False),
             )
         )
     online, online_metrics = opd_diag._build_opd_topk_stats_payload(
