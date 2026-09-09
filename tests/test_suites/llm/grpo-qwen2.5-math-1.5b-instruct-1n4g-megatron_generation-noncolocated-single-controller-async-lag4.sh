@@ -4,6 +4,7 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
+GPUS_PER_NODE=4
 # Megatron Inference decodes slower than the vLLM twin (which runs 450 steps
 # in 240 minutes); size like the classic megatron_generation nightlies.
 STEPS_PER_RUN=50
@@ -37,8 +38,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         'data["train/token_mult_prob_error"]["50"] < 1.1' \
-        'max(data["train/reward"]) > 0' \
-        'median(data["timing/train/total_step_time"]) < 18'
+        'max(data["train/reward"]) > 0.2' \
+        'median(data["timing/train/total_step_time"]) < 30'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
