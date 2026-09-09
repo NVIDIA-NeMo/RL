@@ -41,10 +41,11 @@ from __future__ import annotations
 import logging
 import zlib
 from bisect import bisect_left
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import monotonic
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any, Callable, Literal, TypedDict
 
 EventStatus = Literal["ok", "error", "timeout"]
@@ -94,10 +95,43 @@ LATENCY_BUCKETS_MS: tuple[float, ...] = (
 _WRITE_OPS = frozenset({"put"})
 _READ_OPS = frozenset({"get", "get_data"})
 
+
+def _comm_volume(by_op: dict[str, Any]) -> dict[str, int]:
+    """Traffic totals derived from ``by_op``, so bytes have one source.
+
+    Distinct from ``bytes_outstanding``, which is occupancy (what is held)
+    rather than traffic (what moved).
+
+    Args:
+        by_op: Per-op stats carrying ``n_bytes``.
+
+    Returns:
+        ``bytes_written``, ``bytes_read``, and their sum.
+    """
+    written = sum(by_op[o]["n_bytes"] for o in _WRITE_OPS if o in by_op)
+    read = sum(by_op[o]["n_bytes"] for o in _READ_OPS if o in by_op)
+    return {
+        "bytes_written": written,
+        "bytes_read": read,
+        "comm_volume_bytes": written + read,
+    }
+
 # A corrupted wire usually corrupts every row of a batch, so the log is
 # capped: the counter in ``HashStats`` carries the magnitude, and the first
 # few lines carry the identity of what broke.
 _MAX_HASH_MISMATCH_LOGS = 20
+
+# The ``HashStats`` counters, named once: they are differenced into
+# ``step/hash/*`` and summed across processes, and the two lists drifting
+# apart would silently drop a counter from one path.
+_HASH_FIELDS = (
+    "rows_recorded",
+    "rows_checked",
+    "rows_unverified",
+    "mismatches",
+    "fields_skipped",
+    "guard_failures",
+)
 
 # Quantiles reported per op, each with the sample count it needs: enough for
 # roughly four observations above the rank, or n >= 4 / (1 - q).
@@ -506,15 +540,7 @@ def _hash_deltas(hv: dict[str, int], prev_hv: dict[str, int]) -> dict[str, float
     if not hv or not (hv.get("rows_recorded") or hv.get("guard_failures")):
         return {}
     deltas: dict[str, float] = {
-        f"step/hash/{name}": hv[name] - prev_hv.get(name, 0)
-        for name in (
-            "rows_checked",
-            "rows_recorded",
-            "rows_unverified",
-            "mismatches",
-            "fields_skipped",
-            "guard_failures",
-        )
+        f"step/hash/{name}": hv[name] - prev_hv.get(name, 0) for name in _HASH_FIELDS
     }
     # Corruption of every row of every field in a step, repeated identically,
     # is not what a broken wire looks like -- it is what a broken guard looks
@@ -720,17 +746,7 @@ def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
         return {}
     merged: dict[str, Any] = {k: 0 for k in _SNAPSHOT_SUM}
     merged.update({k: 0 for k in _SNAPSHOT_MAX})
-    hashes = {
-        k: 0
-        for k in (
-            "rows_recorded",
-            "rows_checked",
-            "rows_unverified",
-            "mismatches",
-            "fields_skipped",
-            "guard_failures",
-        )
-    }
+    hashes = {k: 0 for k in _HASH_FIELDS}
     by_op: dict[str, dict[str, Any]] = {}
 
     for snap in snapshots:
@@ -760,9 +776,7 @@ def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
     merged["hash_verify"] = hashes
     merged["n_processes"] = len(snapshots)
     _derive_op_metrics(by_op, merged["total_wall_ms"])
-    merged["bytes_written"] = sum(by_op[o]["n_bytes"] for o in _WRITE_OPS if o in by_op)
-    merged["bytes_read"] = sum(by_op[o]["n_bytes"] for o in _READ_OPS if o in by_op)
-    merged["comm_volume_bytes"] = merged["bytes_written"] + merged["bytes_read"]
+    merged.update(_comm_volume(by_op))
     return merged
 
 
@@ -789,12 +803,40 @@ def cluster_step_metrics(
         step_time_s: Step wall time, for ``frac_of_step``.
         collect_ms: Wall time the caller spent gathering and merging.
     """
-    wall_ms = merged["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
-    overhead_ms = merged["self_ms"] - prev.get("self_ms", 0.0) + collect_ms
     n_procs = max(merged.get("n_processes", 1), 1)
+    metrics = _step_metrics(merged, prev, step_time_s, n_procs, collect_ms)
+    metrics["now/n_processes"] = n_procs
+    return metrics
+
+
+def _step_metrics(
+    snap: dict[str, Any],
+    prev: dict[str, Any],
+    step_time_s: float,
+    n_procs: int = 1,
+    collect_ms: float = 0.0,
+) -> dict[str, float]:
+    """One step's metrics from two snapshots, cluster-wide or single-process.
+
+    Both callers difference the same counters; only ``n_procs`` (1 off a
+    single client) and ``collect_ms`` (0 when there was no fan-out to pay
+    for) differ, so the arithmetic lives here once.
+
+    Args:
+        snap: This step's snapshot, merged or per-client.
+        prev: The previous one, for differencing.
+        step_time_s: Step wall time, for ``frac_of_step``.
+        n_procs: Processes the snapshot covers.
+        collect_ms: Wall time spent gathering and merging, if any.
+
+    Returns:
+        The flat ``step/`` metric dict, less any caller-specific keys.
+    """
+    wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
+    overhead_ms = snap["self_ms"] - prev.get("self_ms", 0.0) + collect_ms
     # step/ is a delta over this step; now/ is a level at this instant.
     # The unit alone does not distinguish them -- see README.md.
-    metrics = _step_deltas(merged, prev)
+    metrics = _step_deltas(snap, prev)
     metrics.update(
         {
             # The one metric that says whether optimising the data plane is
@@ -808,15 +850,14 @@ def cluster_step_metrics(
             "step/frac_of_step": (
                 (wall_ms / n_procs) / (step_time_s * 1e3) if step_time_s > 0 else 0.0
             ),
-            "now/n_processes": n_procs,
             "step/self/overhead_ms": overhead_ms,
             "step/self/frac": overhead_ms / wall_ms if wall_ms > 0 else 0.0,
         }
     )
     metrics.update(
-        _hash_deltas(merged.get("hash_verify") or {}, prev.get("hash_verify") or {})
+        _hash_deltas(snap.get("hash_verify") or {}, prev.get("hash_verify") or {})
     )
-    metrics.update(_op_series(merged["by_op"], prev.get("by_op", {})))
+    metrics.update(_op_series(snap["by_op"], prev.get("by_op", {})))
     return metrics
 
 
@@ -925,6 +966,55 @@ def breakdown_table(
         )
     ]
     return ["op", *_BREAKDOWN_COLUMNS], rows
+
+
+@contextmanager
+def metrics_never_fail_the_step(step: int) -> Iterator[None]:
+    """Swallow anything the metrics panel raises, and say so.
+
+    Observability is on by default, so a fault here would otherwise take
+    down every step of every recipe -- a panel must never fail training.
+
+    Args:
+        step: Step number, for the warning.
+    """
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
+        logging.getLogger(__name__).warning(
+            "data-plane metrics failed at step %d (%s: %s); training continues",
+            step,
+            type(exc).__name__,
+            exc,
+        )
+
+
+def log_step_metrics(
+    logger: Any, metrics: dict[str, float], step: int, scope: str
+) -> None:
+    """Emit one scope's metrics: charted series, breakdown table, console line.
+
+    The series and the table are derived from one ``metrics`` dict, so they
+    cannot disagree. A backend without a table type has no rows to log.
+
+    Args:
+        logger: Anything with ``log_metrics`` and ``log_table``.
+        metrics: Output of :func:`cluster_step_metrics` or
+            :meth:`MetricsDataPlaneClient.get_step_metrics`.
+        step: Step number to log against.
+        scope: ``"cluster"`` or ``"driver"`` -- names the prefix, because the
+            two differ by roughly the DP degree.
+    """
+    prefix = f"data_plane/{scope}"
+    logger.log_metrics(headline_series(metrics), step, prefix=prefix)
+    columns, rows = breakdown_table(metrics)
+    if rows:
+        logger.log_table(columns, rows, step, f"{prefix}/breakdown")
+    print(
+        f"  • data plane: {metrics['step/wall_s']:.2f}s, "
+        f"{metrics['step/comm_volume_mb']:.1f} MB moved",
+        flush=True,
+    )
 
 
 def log_event(event: DataPlaneEvent) -> None:
@@ -1107,10 +1197,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # Communication volume, derived from by_op so there is one source of
         # truth for bytes. Distinct from ``bytes_outstanding``, which is
         # occupancy (what is held) rather than traffic (what moved).
-        by = out["by_op"]
-        out["bytes_written"] = sum(by[o]["n_bytes"] for o in _WRITE_OPS if o in by)
-        out["bytes_read"] = sum(by[o]["n_bytes"] for o in _READ_OPS if o in by)
-        out["comm_volume_bytes"] = out["bytes_written"] + out["bytes_read"]
+        out.update(_comm_volume(out["by_op"]))
         if reset_step_window:
             for bucket in self._stats.by_op.values():
                 bucket.step_max_ms = 0.0
@@ -1132,28 +1219,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         snap = self.snapshot(reset_step_window=True)
         prev = self._prev_snapshot
         self._prev_snapshot = snap
-
-        wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
-        # Units are not mixed within one chart: durations charted beside the
-        # step clock are seconds, the per-op table is ms throughout, volumes
-        # are always MB. GB was the same problem one dimension over -- a
-        # realistic step moved 0.00017 GB.
-        metrics = _step_deltas(snap, prev)
-        metrics["step/frac_of_step"] = (
-            (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0
-        )
-        metrics.update(
-            _hash_deltas(snap.get("hash_verify") or {}, prev.get("hash_verify") or {})
-        )
-        # The same bill the cluster path reports, under the same name: this
-        # process's wrapper time, minus what the inner client was doing.
-        # There is no fan-out to add here -- a single process gathers
-        # nothing -- so this is the whole of it.
-        self_ms = snap["self_ms"] - prev.get("self_ms", 0.0)
-        metrics["step/self/overhead_ms"] = self_ms
-        metrics["step/self/frac"] = self_ms / wall_ms if wall_ms > 0 else 0.0
-        metrics.update(_op_series(snap["by_op"], prev.get("by_op", {})))
-        return metrics
+        # One process, and no fan-out to charge for: the cluster arithmetic
+        # with n_procs=1 and collect_ms=0 is exactly this path.
+        return _step_metrics(snap, prev, step_time_s)
 
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
         """Attribute put bytes per key so a later ``clear_samples`` can subtract.

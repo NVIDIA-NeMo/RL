@@ -32,7 +32,6 @@ against both entrypoints and diffing the wandb runs.
 from __future__ import annotations
 
 import gc
-import logging
 import os
 import time
 import warnings
@@ -82,10 +81,10 @@ from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
     MetricsDataPlaneClient,
-    breakdown_table,
     cluster_step_metrics,
-    headline_series,
+    log_step_metrics,
     merge_snapshots,
+    metrics_never_fail_the_step,
 )
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -390,19 +389,6 @@ def _compute_seq_logprob_error_metrics(
     return masking_data["sample_mask"], seq_logprob_error_metrics
 
 
-def _log_breakdown(
-    logger: Logger, metrics: dict[str, float], step: int, name: str
-) -> None:
-    """Log the per-op breakdown as a table beside the series.
-
-    A backend without a table type has no rows to log. Failures propagate to
-    the caller, which already guarantees the logging path cannot fail a step.
-    """
-    columns, rows = breakdown_table(metrics)
-    if rows:
-        logger.log_table(columns, rows, step, name)
-
-
 def _log_data_plane_metrics(
     policy: Any, logger: Logger, step: int, total_step_time: float
 ) -> None:
@@ -410,15 +396,8 @@ def _log_data_plane_metrics(
 
     On by default, so this runs every step of every recipe.
     """
-    try:
+    with metrics_never_fail_the_step(step):
         _log_data_plane_metrics_impl(policy, logger, step, total_step_time)
-    except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
-        logging.getLogger(__name__).warning(
-            "data-plane metrics failed at step %d (%s: %s); training continues",
-            step,
-            type(exc).__name__,
-            exc,
-        )
 
 
 def _log_data_plane_metrics_impl(
@@ -460,17 +439,11 @@ def _log_data_plane_metrics_impl(
             merged, prev, total_step_time, collect_ms=collect_ms
         )
         policy._prev_cluster_snapshot = merged
-        logger.log_metrics(headline_series(metrics), step, prefix="data_plane/cluster")
-        _log_breakdown(logger, metrics, step, "data_plane/cluster/breakdown")
+        log_step_metrics(logger, metrics, step, "cluster")
     else:
         # Single process, or the fan-out could not reach the workers.
         metrics = client.get_step_metrics(total_step_time)
-        logger.log_metrics(headline_series(metrics), step, prefix="data_plane/driver")
-        _log_breakdown(logger, metrics, step, "data_plane/driver/breakdown")
-    print(
-        f"  • data plane: {metrics['step/wall_s']:.2f}s, "
-        f"{metrics['step/comm_volume_mb']:.1f} MB moved"
-    )
+        log_step_metrics(logger, metrics, step, "driver")
 
 
 def grpo_train_sync(

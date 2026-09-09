@@ -121,8 +121,8 @@ from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.observability import (
     MetricsDataPlaneClient,
-    breakdown_table,
-    headline_series,
+    log_step_metrics,
+    metrics_never_fail_the_step,
 )
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
@@ -1529,15 +1529,8 @@ class SingleControllerActor:
         On by default, so this runs every step of every recipe. Mirrors
         ``grpo_sync._log_data_plane_metrics``.
         """
-        try:
+        with metrics_never_fail_the_step(self._train_steps):
             self._log_data_plane_metrics_impl(total_step_time)
-        except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
-            logging.getLogger(__name__).warning(
-                "data-plane metrics failed at step %d (%s: %s); training continues",
-                self._train_steps,
-                type(exc).__name__,
-                exc,
-            )
 
     def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
         """Log this step's data-plane cost. No-op unless observability is enabled.
@@ -1560,18 +1553,7 @@ class SingleControllerActor:
             return  # observability disabled -> plain adapter
 
         metrics = self._dp_client.get_step_metrics(total_step_time)
-        step = self._train_steps
-        self._logger.log_metrics(
-            headline_series(metrics), step, prefix="data_plane/driver"
-        )
-        columns, rows = breakdown_table(metrics)
-        if rows:
-            self._logger.log_table(columns, rows, step, "data_plane/driver/breakdown")
-        print(
-            f"  • data plane: {metrics['step/wall_s']:.2f}s, "
-            f"{metrics['step/comm_volume_mb']:.1f} MB moved",
-            flush=True,
-        )
+        log_step_metrics(self._logger, metrics, self._train_steps, "driver")
 
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
