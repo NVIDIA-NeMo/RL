@@ -21,7 +21,6 @@ mkdir -p $EXP_DIR $LOG_DIR
 # prepare_for_generation must build a dedicated inference model and swap
 # weights across differing layouts. A wrong-weights reshard shows up as
 # generation/training logprob disagreement, hence the mult_prob_error gate.
-# Compare raw generation and training logprobs without sampling filters.
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
@@ -35,9 +34,6 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.megatron_cfg.tensor_model_parallel_size=2 \
     policy.generation.backend=megatron \
     policy.generation.refit_transport=mcore \
-    policy.generation.top_k=null \
-    policy.generation.top_p=1.0 \
-    policy.generation.mcore_generation_config.logprobs_mode=raw_logprobs \
     ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
     policy.generation.mcore_generation_config.refit_backend=nccl \
