@@ -75,6 +75,15 @@ def configure_generation_config(
         and 0.0 < temperature < _VLLM_MIN_NON_ZERO_TEMPERATURE
     ):
         config["temperature"] = _VLLM_MIN_NON_ZERO_TEMPERATURE
+    if (
+        config["backend"] != "vllm"
+        and config.get("worker_extension_cls_fqn") is not None
+    ):
+        raise ValueError(
+            "generation.worker_extension_cls_fqn is only supported by the vLLM backend, "
+            f"got backend={config['backend']!r}. Use policy.worker_extension_cls_fqn to "
+            "extend the training worker instead."
+        )
 
     # tokenizer setting
     if "_pad_token_id" in config:
