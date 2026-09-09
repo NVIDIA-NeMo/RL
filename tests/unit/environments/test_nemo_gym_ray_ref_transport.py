@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from nemo_rl.environments.nemo_gym import NemoGym
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -36,6 +39,7 @@ def _full_ref() -> dict:
         "key": ROUTED_EXPERTS_REF_KEY,
         "task_index": 7,
         "rollout_index": 2,
+        "attempt_index": 1,
         "target_weight_version": 4,
         "offset": 0,
         "length": 3,
@@ -44,14 +48,19 @@ def _full_ref() -> dict:
     }
 
 
-def test_prepare_nemo_gym_rows_stamps_rollout_and_target_identity():
+@pytest.mark.parametrize("attempt", [0, 1, 3])
+def test_prepare_nemo_gym_rows_preserves_attempt_and_stamps_identity(
+    attempt: int,
+) -> None:
     rows = [
         {
             NEMO_GYM_TASK_INDEX_KEY: 11,
+            NEMO_GYM_ATTEMPT_INDEX_KEY: attempt,
             "responses_create_params": {},
         },
         {
             NEMO_GYM_TASK_INDEX_KEY: 11,
+            NEMO_GYM_ATTEMPT_INDEX_KEY: attempt,
             "responses_create_params": {},
         },
     ]
@@ -67,6 +76,7 @@ def test_prepare_nemo_gym_rows_stamps_rollout_and_target_identity():
 
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
     assert [row[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] for row in rows] == [27, 27]
+    assert [row[NEMO_GYM_ATTEMPT_INDEX_KEY] for row in rows] == [attempt, attempt]
 
 
 def test_nemo_gym_postprocess_keeps_two_views_of_one_ray_object():

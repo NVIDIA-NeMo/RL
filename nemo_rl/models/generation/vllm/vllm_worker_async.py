@@ -39,6 +39,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -687,6 +688,12 @@ class VllmAsyncGenerationWorkerImpl(
                 default=None,
                 alias=NEMO_GYM_ROLLOUT_INDEX_KEY,
             )
+            nemo_gym_attempt_index: Optional[int] = Field(
+                default=None,
+                alias=NEMO_GYM_ATTEMPT_INDEX_KEY,
+                ge=0,
+                strict=True,
+            )
             nemo_gym_target_weight_version: Optional[int] = Field(
                 default=None,
                 alias=NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
@@ -754,6 +761,7 @@ class VllmAsyncGenerationWorkerImpl(
                         request_id = getattr(final_res, "request_id", None)
                         task_index = request.nemo_gym_task_index
                         rollout_index = request.nemo_gym_rollout_index
+                        attempt_index = request.nemo_gym_attempt_index
                         target_weight_version = request.nemo_gym_target_weight_version
                         # Gym can use the policy engine for auxiliary model calls
                         # (for example, simulator or retrieval requests). Those
@@ -761,6 +769,7 @@ class VllmAsyncGenerationWorkerImpl(
                         if (
                             task_index is None
                             and rollout_index is None
+                            and attempt_index is None
                             and target_weight_version is None
                         ):
                             return response
@@ -770,6 +779,7 @@ class VllmAsyncGenerationWorkerImpl(
                                 ("request_id", request_id),
                                 (NEMO_GYM_TASK_INDEX_KEY, task_index),
                                 (NEMO_GYM_ROLLOUT_INDEX_KEY, rollout_index),
+                                (NEMO_GYM_ATTEMPT_INDEX_KEY, attempt_index),
                                 (
                                     NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
                                     target_weight_version,
@@ -793,6 +803,7 @@ class VllmAsyncGenerationWorkerImpl(
                                 request_id=str(request_id),
                                 task_index=int(task_index),
                                 rollout_index=int(rollout_index),
+                                attempt_index=int(attempt_index),
                                 target_weight_version=int(target_weight_version),
                             )
 

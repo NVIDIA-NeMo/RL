@@ -78,6 +78,7 @@ def test_batched_flatten_preserves_segmented_routed_experts_refs():
         "key": ROUTED_EXPERTS_REF_KEY,
         "task_index": 11,
         "rollout_index": 2,
+        "attempt_index": 1,
         "target_weight_version": 3,
         "offset": 0,
         "length": 3,

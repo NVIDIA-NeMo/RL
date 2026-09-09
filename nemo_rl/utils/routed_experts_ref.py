@@ -48,6 +48,8 @@ _MISSING_ROUTE_SENTINEL = -1
 _REGISTRY_ACTOR_PREFIX = "nrl_routed_experts_registry_"
 _STORE_ACTOR_PREFIX = "nrl_routed_experts_store_"
 
+RoutedExpertsLookupKey = tuple[int, int, int, int, str]
+
 
 def _validate_identifier(value: Any, *, field: str) -> str:
     if not isinstance(value, str) or not value:
@@ -66,12 +68,27 @@ def is_routed_experts_ref(value: Any) -> bool:
     return isinstance(value, dict) and value.get("schema") == ROUTED_EXPERTS_REF_SCHEMA
 
 
-def routed_experts_ref_lookup_key(ref: Mapping[str, Any]) -> tuple[int, int, int, str]:
-    """Return the insert-only actor-local identity for one route object."""
+def routed_experts_ref_lookup_key(ref: Mapping[str, Any]) -> RoutedExpertsLookupKey:
+    """Return the actor-local identity, treating legacy refs as attempt zero.
+
+    The default is for reading older reference data. Live requests and new
+    store inserts must still supply an explicit attempt index.
+    """
+    attempt_index = ref.get("attempt_index", 0)
+    if (
+        isinstance(attempt_index, bool)
+        or not isinstance(attempt_index, int)
+        or attempt_index < 0
+    ):
+        raise ValueError(
+            "routed-experts reference attempt_index must be a non-negative integer, "
+            f"got {attempt_index!r}"
+        )
     return (
         int(ref["target_weight_version"]),
         int(ref["task_index"]),
         int(ref["rollout_index"]),
+        attempt_index,
         str(ref["request_id"]),
     )
 
@@ -292,7 +309,7 @@ def _plan_routed_experts_range_reads(
         OrderedDict()
     )
     source_shapes: dict[
-        tuple[str, str, tuple[int, int, int, str]], tuple[int, int, int]
+        tuple[str, str, RoutedExpertsLookupKey], tuple[int, int, int]
     ] = {}
     requested_rows = 0
     segment_count = 0
@@ -378,13 +395,13 @@ class RoutedExpertsStoreState:
             store_instance_id, field="store_instance_id"
         )
         self._retired_through = -1
-        self._entries: dict[tuple[int, int, int, str], _StoredRouteRef] = {}
-        self._keys_by_target: dict[int, set[tuple[int, int, int, str]]] = {}
+        self._entries: dict[RoutedExpertsLookupKey, _StoredRouteRef] = {}
+        self._keys_by_target: dict[int, set[RoutedExpertsLookupKey]] = {}
 
     def put(
         self,
         *,
-        key: tuple[int, int, int, str],
+        key: RoutedExpertsLookupKey,
         object_ref: Any,
         nbytes: int,
         shape: Sequence[int],
@@ -424,7 +441,7 @@ class RoutedExpertsStoreState:
         self._keys_by_target.setdefault(target_weight_version, set()).add(key)
 
     def get(
-        self, *, key: tuple[int, int, int, str], store_instance_id: str
+        self, *, key: RoutedExpertsLookupKey, store_instance_id: str
     ) -> _StoredRouteRef:
         if store_instance_id != self.store_instance_id:
             raise RuntimeError(
@@ -455,7 +472,7 @@ class RoutedExpertsStoreState:
         )
         total_rows = 0
         placements_by_key: dict[
-            tuple[int, int, int, str], list[tuple[dict[str, Any], int]]
+            RoutedExpertsLookupKey, list[tuple[dict[str, Any], int]]
         ] = {}
         for ref in validated:
             this_layer_topk = (int(ref["shape"][1]), int(ref["shape"][2]))
@@ -568,7 +585,7 @@ def _materialize_normalized_routed_experts(
         _MISSING_ROUTE_SENTINEL,
         dtype=np.int16,
     )
-    resolved: dict[tuple[str, str, tuple[int, int, int, str]], np.ndarray] = {}
+    resolved: dict[tuple[str, str, RoutedExpertsLookupKey], np.ndarray] = {}
     for sample_index, segments in enumerate(batch.refs_by_sample):
         destination_offset = 0
         for segment in segments:
@@ -618,6 +635,10 @@ class RoutedExpertsObjectStore:
         nbytes: int,
     ) -> None:
         ref = validate_routed_experts_ref(ref)
+        if "attempt_index" not in ref:
+            raise ValueError(
+                "Live routed-experts inserts require an explicit attempt_index."
+            )
         if ref["store_instance_id"] != self._state.store_instance_id:
             raise RuntimeError("Routed-experts tag targets a different store instance")
         if len(boxed_object_ref) != 1:
@@ -733,6 +754,7 @@ class RoutedExpertsStoreWriter:
         request_id: str,
         task_index: int,
         rollout_index: int,
+        attempt_index: int,
         target_weight_version: int,
     ) -> dict[str, Any]:
         array = (
@@ -755,6 +777,7 @@ class RoutedExpertsStoreWriter:
                 "key": ROUTED_EXPERTS_REF_KEY,
                 "task_index": int(task_index),
                 "rollout_index": int(rollout_index),
+                "attempt_index": attempt_index,
                 "target_weight_version": int(target_weight_version),
                 "offset": 0,
                 "length": int(array.shape[0]),
