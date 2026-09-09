@@ -94,7 +94,10 @@ mkdir -p \
 
 wandb_run_id="${WANDB_RUN_ID:-$(printf '%s' "${base_name}" | sha256sum | cut -c1-16)}"
 wandb_project="${WANDB_PROJECT:-megatron-omni-v3}"
-wandb_run_name="${WANDB_RUN_NAME:-async_grpo_super35_derisk_sav_caprl}"
+# RUN_ID is already the stable, cluster-qualified experiment identity. Use it
+# as the W&B display name as well so parallel checkpoints are distinguishable
+# while every job-array window resumes the same server-side run.
+wandb_run_name="${WANDB_RUN_NAME:-${run_id}}"
 
 base_mounts="/lustre:/lustre,/scratch:/scratch"
 selective_mounts="${code_dir}/nemo_rl:/opt/nemo-rl/nemo_rl"
