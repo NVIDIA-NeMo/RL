@@ -3074,6 +3074,17 @@ class SingleControllerActor:
                     self._ray_get(self._gen.shard_liveness_ref(shard_idx)),
                     timeout=fleet_cfg.probe_timeout_s,
                 )
+            except NotImplementedError as error:
+                # A backend that cannot be probed is a misconfiguration, not an unhealthy
+                # shard, and the two must not look alike. Recorded as a probe failure it
+                # condemns every shard within unhealthy_threshold ticks and ends the run
+                # as GenerationFleetExhausted -- a healthy fleet reported as a dead one.
+                raise RuntimeError(
+                    f"generation backend {type(self._gen).__name__} does not implement "
+                    "shard_liveness_ref, so async_rl.generation_fleet_health cannot probe "
+                    "it. Turn fleet health off for this backend, or implement the method "
+                    "over the backend's own worker group."
+                ) from error
             except RayActorError as error:
                 # Conclusive, unlike a timeout: Ray only reports this once the actor
                 # process is actually gone. Counting it as one more ambiguous failure

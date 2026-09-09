@@ -282,6 +282,16 @@ class MegatronGeneration(GenerationInterface):
         """The underlying policy's worker group (fleet-health probes read dp_size)."""
         return self._policy.worker_group
 
+    def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
+        """Liveness of the worker leading this shard. The caller need not know the layout.
+
+        Same shape as the vLLM backend's. Declared here because this generation object
+        wraps a Policy, so its workers are AbstractPolicyWorkers and answer ``is_alive``
+        like any other -- the fleet probe needs no knowledge of which of the two it holds.
+        """
+        leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
+        return self.worker_group.workers[leader_idx].is_alive.remote()
+
     def init_collective(
         self,
         ip: str,

@@ -544,6 +544,36 @@ class TestGenerationFleetProbe:
         assert asyncio.run(_main()) == 4
 
 
+class TestABackendThatCannotBeProbed:
+    """An unprobeable backend must not read as a dead fleet.
+
+    The probe asks the backend for liveness by shard index. A backend that does not
+    implement it raises NotImplementedError, which the generic handler below would record
+    as a failed probe -- condemning every shard within unhealthy_threshold ticks and ending
+    the run as GenerationFleetExhausted. A healthy fleet reported as a dead one, with the
+    real cause (fleet health enabled on a backend that cannot support it) nowhere in sight.
+    """
+
+    def test_it_raises_naming_the_backend_instead_of_condemning_shards(self):
+        class _Unprobeable:
+            def shard_liveness_ref(self, shard_idx):
+                raise NotImplementedError
+
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
+        )
+        ctrl = _make_controller(stats=RolloutStats(), inflight=0, stall_timeout_s=600.0)
+        ctrl._gen_fleet = monitor
+        ctrl._gen = _Unprobeable()
+
+        with pytest.raises(RuntimeError, match="does not implement shard_liveness_ref"):
+            asyncio.run(ctrl._probe_generation_fleet())
+
+        assert monitor.serving_shards() == [0, 1], (
+            "no shard may be condemned for the backend's inability to be probed"
+        )
+
+
 class TestEnvHealthCheck:
     def test_a_healthy_environment_passes(self):
         calls = []
