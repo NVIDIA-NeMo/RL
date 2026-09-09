@@ -44,7 +44,7 @@ def _find_servers(server_urls: list[str]) -> dict[str, psutil.Process]:
 
 @ray.remote(num_cpus=0, num_gpus=0)
 def snapshot_server_process_tree(server_url: str) -> ServerProcessTree:
-    """Capture the exact HTTP server and GPU descendants before actor death."""
+    """Capture the exact HTTP server and GPU descendants before fault injection."""
     server = _find_servers([server_url])[server_url]
     return ServerProcessTree(
         url=server_url,
@@ -82,7 +82,7 @@ def wait_for_server_process_tree_exit(
             return
         time.sleep(0.1)
     raise TimeoutError(
-        f"Actor death left server processes {live_pids}; "
+        f"Server teardown left processes {live_pids}; "
         f"{tree.url} still listening: {listening}"
     )
 
