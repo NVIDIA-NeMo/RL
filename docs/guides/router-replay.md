@@ -23,10 +23,45 @@ policy:
     enabled: true
 ```
 
+`policy.router_replay.transport` selects how route data reaches the policy:
+
+- `inline` (the default) carries dense routed-expert indices in the rollout
+  batch. When `data_plane.enabled=true`, this is the existing TransferQueue
+  implementation; there is no separate TQ selector.
+- `ray` carries only an opaque tag through Gym and the RL replay buffer. A
+  source-local actor on the generation node owns a Ray reference to each full
+  routed-expert array. Policy workers retrieve that immutable whole object
+  directly for unsliced single-turn samples. For sliced multi-turn samples,
+  the source actor returns only the logical ranges selected by the policy
+  microbatch, preventing cumulative prompts from making reads quadratic in the
+  number of turns. This path currently requires async GRPO,
+  `env.should_use_nemo_gym=true`, vLLM's async engine, and
+  `data_plane.enabled=false`.
+
+For example, the Ray-reference path is selected with:
+
+```yaml
+data_plane: null
+policy:
+  router_replay:
+    enabled: true
+    transport: ray
+```
+
+Leave `transport` unset (or set it to `inline`) when using TransferQueue. Ray
+reference tags in TransferQueue are not implemented yet and are rejected during
+configuration validation.
+
 When Router Replay is enabled, NeMo RL configures vLLM rollout generation to
 return routed expert indices by setting `enable_return_routed_experts=True` in
 the vLLM kwargs. The generation payload is then carried through the normal
 rollout and policy data path as the `routed_experts` field.
+
+For models that also train MoE-based MTP heads, Router Replay skips MTP
+routers by default. This keeps MTP routers on their native routing decisions
+while replaying vLLM routes only in the decoder layers. Set
+`NRL_ROUTER_REPLAY_EXCLUDE_MTP=0` only when intentionally debugging the legacy
+behavior that replays MTP routers too.
 
 An example recipe is available at:
 
@@ -56,6 +91,7 @@ is intended for correctness debugging, not long training runs.
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
+| `NRL_ROUTER_REPLAY_EXCLUDE_MTP` | `1` | Skip routers under MCore MTP layers. Set to `0` to include MTP routers in replay. |
 | `NRL_ROUTER_REPLAY_VALIDATE` | `0` | Validate replay tensors before Megatron installs them, rejecting partially missing routes, duplicate top-k expert IDs, and out-of-range expert IDs. |
 | `NRL_R3_TRACE` | `0` | Master switch for R3 JSONL trace emission. |
 | `NRL_R3_TRACE_STEPS` | `1` | Number of training steps to trace. |
