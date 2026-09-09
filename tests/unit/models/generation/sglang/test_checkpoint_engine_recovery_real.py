@@ -245,6 +245,16 @@ def _wait_for_dead_slot(gen, index, timeout=DETECT_TIMEOUT):
     return False
 
 
+def _wait_for_server_exit(engine, timeout=CHECK_TIMEOUT):
+    """Shutdown sends process signals; wait for actual exit before probing refit."""
+    deadline = time.monotonic() + timeout
+    while (remaining := deadline - time.monotonic()) > 0:
+        if not ray.get(engine.is_alive.remote(), timeout=remaining):
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def _receiver_agent_names(gen):
     """agent_name per engine, via the (idempotent) prepare metadata."""
     metadata = ray.get(gen.run_checkpoint_engine_method("prepare_checkpoint_engine"))
@@ -288,6 +298,7 @@ def test_crashed_engine_is_rebound_and_receives_current_weights(
             "health monitor did not kill the crashed engine"
         )
     else:
+        assert _wait_for_server_exit(victim), "shutdown did not stop the server"
         assert gen.all_engines[0] is victim, (
             "the paused monitor must leave the dead handle for refit to probe"
         )
