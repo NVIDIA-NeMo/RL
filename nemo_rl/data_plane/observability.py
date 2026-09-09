@@ -41,11 +41,11 @@ from __future__ import annotations
 import logging
 import zlib
 from bisect import bisect_left
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import monotonic
-from collections.abc import Iterator, Sequence
 from typing import Any, Callable, Literal, TypedDict
 
 EventStatus = Literal["ok", "error", "timeout"]
@@ -115,6 +115,7 @@ def _comm_volume(by_op: dict[str, Any]) -> dict[str, int]:
         "bytes_read": read,
         "comm_volume_bytes": written + read,
     }
+
 
 # A corrupted wire usually corrupts every row of a batch, so the log is
 # capped: the counter in ``HashStats`` carries the magnitude, and the first
@@ -275,7 +276,7 @@ def _tensor_bytes(v: torch.Tensor) -> int:
     return buf.nbytes
 
 
-def percentile_from_hist(hist: list[int], q: float) -> float:
+def _percentile_from_hist(hist: list[int], q: float) -> float:
     """Interpolated ``q``-quantile (0-1) from bucket counts.
 
     Linear interpolation inside the containing bucket. A value landing in
@@ -666,7 +667,7 @@ def _clamped_percentiles(hist: list[int], max_ms: float) -> dict[str, float]:
     n = sum(hist)
     ceiling = max_ms if max_ms > 0 else float("inf")
     return {
-        name: min(percentile_from_hist(hist, q), ceiling)
+        name: min(_percentile_from_hist(hist, q), ceiling)
         for q, name, min_samples in _QUANTILES
         if n >= min_samples
     }
@@ -1340,6 +1341,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
             if not isinstance(v, torch.Tensor) or v.ndim < 1:
                 stats.fields_skipped += 1
                 continue
+            # Declared up front: the two branches below bind lambdas with
+            # different capture defaults, and their union is not assignable to
+            # ``_leaf_digests``'s ``row_shape`` parameter without this.
+            row_shape: Callable[[int], tuple[int, ...]]
             if v.is_nested:
                 if v.layout != torch.jagged or v.offsets().numel() - 1 != n_rows:
                     stats.fields_skipped += 1
@@ -1559,7 +1564,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         stats.total_ops += 1
         bucket.n_bytes += n_bytes
         bucket.n_keys += n_keys
-        bytes_f = float(n_bytes)
         if op == "put" and n_keys:
             per_key = n_bytes // n_keys
             stats.last_put_bytes_per_key = per_key
