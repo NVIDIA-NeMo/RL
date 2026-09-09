@@ -70,6 +70,9 @@ def _configure_quant_engine_kwargs(
         "nemo_rl.modelopt.models.generation.vllm_quant_backend." + extension_name
     )
     if real_quant:
+        llm_kwargs["worker_cls"] = (
+            "nemo_rl.modelopt.models.generation.vllm_quant_patch.RealQuantWorker"
+        )
         os.environ.pop("VLLM_QUANT_CFG", None)
         quantization_config = llm_kwargs.get("hf_overrides", {}).get(
             "quantization_config"

@@ -241,6 +241,30 @@ def _fakequant_run_prolog_worker(self) -> None:
                 module.disable()
 
 
+def _make_nvfp4_moe_input_scales_writable(model: torch.nn.Module) -> None:
+    """Backport writable shared NVFP4 MoE scales for vLLM 0.25.1."""
+    scale_names = ("w13_input_scale", "w2_input_scale")
+    for module in model.modules():
+        for name in scale_names:
+            scale = getattr(module, name, None)
+            if not isinstance(scale, torch.nn.Parameter) or 0 not in scale.stride():
+                continue
+
+            scale.data = scale.detach().clone()
+
+
+class RealQuantWorker(NixlVllmWorker):
+    """vLLM worker with the NVFP4 MoE reload fix missing from vLLM 0.25.1."""
+
+    @torch.inference_mode()
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        model = self.model_runner.model
+        if hasattr(model, "unwrap"):
+            model = model.unwrap()
+        _make_nvfp4_moe_input_scales_writable(model)
+
+
 class FakeQuantWorker(NixlVllmWorker):
     @torch.inference_mode()
     def determine_available_memory(self) -> int:

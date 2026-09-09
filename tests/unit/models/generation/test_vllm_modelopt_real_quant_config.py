@@ -301,6 +301,34 @@ def test_fake_quant_worker_inherits_nixl_worker():
     assert issubclass(patch_mod.FakeQuantWorker, NixlVllmWorker)
 
 
+def test_real_quant_worker_makes_shared_nvfp4_moe_scales_writable():
+    patch_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    )
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = torch.nn.Module()
+            self.experts.w13_input_scale = torch.nn.Parameter(
+                torch.tensor(3.0).expand(4), requires_grad=False
+            )
+            self.experts.w2_input_scale = torch.nn.Parameter(
+                torch.tensor(5.0).expand(4), requires_grad=False
+            )
+
+    model = Model()
+    model.experts.w13_input_scale.weight_loader = object()
+
+    patch_mod._make_nvfp4_moe_input_scales_writable(model)
+
+    assert model.experts.w13_input_scale.stride() == (1,)
+    assert model.experts.w2_input_scale.stride() == (1,)
+    assert hasattr(model.experts.w13_input_scale, "weight_loader")
+    model.experts.w13_input_scale.copy_(torch.arange(4, dtype=torch.float32))
+    model.experts.w2_input_scale.copy_(torch.arange(4, dtype=torch.float32))
+
+
 def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
@@ -320,7 +348,9 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     )
 
     assert "VLLM_QUANT_CFG" not in os.environ
-    assert "worker_cls" not in llm_kwargs
+    assert llm_kwargs["worker_cls"] == (
+        "nemo_rl.modelopt.models.generation.vllm_quant_patch.RealQuantWorker"
+    )
     assert "quantization" not in llm_kwargs
     assert llm_kwargs["kv_cache_dtype"] == "auto"
     assert llm_kwargs["hf_overrides"] == {
