@@ -36,12 +36,17 @@ policy:
   microbatch, preventing cumulative prompts from making reads quadratic in the
   number of turns. This path currently requires async GRPO,
   `env.should_use_nemo_gym=true`, vLLM's async engine, and
-  `data_plane.enabled=false`.
+  `data_plane.enabled=false`. It also requires
+  `checkpointing.load_replay_buffer=false`: replay-buffer checkpoints contain
+  only tags, not the Ray-owned route arrays. On a frontier-aligned resume,
+  buffered rollouts are regenerated rather than restoring stale references.
 
 For example, the Ray-reference path is selected with:
 
 ```yaml
 data_plane: null
+checkpointing:
+  load_replay_buffer: false
 policy:
   router_replay:
     enabled: true

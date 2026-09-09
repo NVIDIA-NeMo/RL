@@ -99,6 +99,7 @@ def test_ray_router_replay_rejects_transfer_queue_path():
             data_plane_enabled=True,
             async_grpo_enabled=True,
             nemo_gym_enabled=True,
+            load_replay_buffer=False,
         )
 
     validate_router_replay_transport_path(
@@ -106,6 +107,7 @@ def test_ray_router_replay_rejects_transfer_queue_path():
         data_plane_enabled=False,
         async_grpo_enabled=True,
         nemo_gym_enabled=True,
+        load_replay_buffer=False,
     )
 
 
@@ -132,7 +134,66 @@ def test_ray_router_replay_rejects_non_gym_or_sync_paths(
             data_plane_enabled=False,
             async_grpo_enabled=async_grpo_enabled,
             nemo_gym_enabled=nemo_gym_enabled,
+            load_replay_buffer=False,
         )
+
+
+@pytest.mark.parametrize("load_replay_buffer", [True, None])
+def test_ray_router_replay_rejects_replay_buffer_restore(
+    load_replay_buffer: bool | None,
+) -> None:
+    from nemo_rl.models.megatron.router_replay import (
+        validate_router_replay_transport_path,
+    )
+
+    with pytest.raises(ValueError, match="checkpointing.load_replay_buffer=false"):
+        validate_router_replay_transport_path(
+            {"router_replay": {"enabled": True, "transport": "ray"}},
+            data_plane_enabled=False,
+            async_grpo_enabled=True,
+            nemo_gym_enabled=True,
+            load_replay_buffer=load_replay_buffer,
+        )
+
+
+def test_ray_router_replay_allows_restore_explicitly_disabled() -> None:
+    from nemo_rl.models.megatron.router_replay import (
+        validate_router_replay_transport_path,
+    )
+
+    validate_router_replay_transport_path(
+        {"router_replay": {"enabled": True, "transport": "ray"}},
+        data_plane_enabled=False,
+        async_grpo_enabled=True,
+        nemo_gym_enabled=True,
+        load_replay_buffer=False,
+    )
+
+
+@pytest.mark.parametrize("load_replay_buffer", [True, None, False])
+@pytest.mark.parametrize(
+    "router_replay",
+    [
+        None,
+        {"enabled": False, "transport": "ray"},
+        {"enabled": True},
+        {"enabled": True, "transport": "inline"},
+    ],
+)
+def test_non_ray_router_replay_does_not_restrict_replay_buffer_restore(
+    router_replay: dict | None, load_replay_buffer: bool | None
+) -> None:
+    from nemo_rl.models.megatron.router_replay import (
+        validate_router_replay_transport_path,
+    )
+
+    validate_router_replay_transport_path(
+        {"router_replay": router_replay},
+        data_plane_enabled=False,
+        async_grpo_enabled=True,
+        nemo_gym_enabled=True,
+        load_replay_buffer=load_replay_buffer,
+    )
 
 
 @pytest.mark.mcore

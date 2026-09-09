@@ -573,6 +573,7 @@ def setup(
             grpo_config.async_grpo and grpo_config.async_grpo.enabled
         ),
         nemo_gym_enabled=enable_nemo_gym,
+        load_replay_buffer=checkpointing_config.get("load_replay_buffer"),
     )
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout

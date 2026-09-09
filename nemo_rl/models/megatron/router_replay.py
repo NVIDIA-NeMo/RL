@@ -54,8 +54,9 @@ def validate_router_replay_transport_path(
     data_plane_enabled: bool,
     async_grpo_enabled: bool,
     nemo_gym_enabled: bool,
+    load_replay_buffer: bool | None,
 ) -> None:
-    """Reject router-replay transport/backend combinations not yet implemented."""
+    """Reject incompatible router-replay backend and checkpoint restore settings."""
     ray_transport_enabled = (
         router_replay_enabled(config)
         and router_replay_transport(config) == ROUTED_EXPERTS_REF_TRANSPORT
@@ -81,6 +82,16 @@ def validate_router_replay_transport_path(
             "policy.router_replay.transport=ray currently requires "
             "env.should_use_nemo_gym=true because tags are emitted by the vLLM "
             "Chat Completions endpoint."
+        )
+    # Restore is enabled unless explicitly set to False, including when the
+    # optional field is omitted. Ray tags alone cannot survive a job restart.
+    if load_replay_buffer is not False:
+        raise ValueError(
+            "policy.router_replay.transport=ray requires "
+            "checkpointing.load_replay_buffer=false. Replay-buffer checkpoints "
+            "contain tags for live Ray objects, not the routed-expert arrays, "
+            "so they cannot be restored across restarts. Disable replay-buffer "
+            "restore to regenerate buffered rollouts on a frontier-aligned resume."
         )
 
 
