@@ -233,9 +233,13 @@ sbatch \
 ```
 
 This assigns one GPU to training, one to a TP1 decode engine, and one to a TP1
-prefill engine. The existing Dynamo L1 job runs both the aggregated and P/D
-smokes. These tests verify function only. They do not measure or claim
-performance.
+prefill engine. The Dynamo L1 job runs the two-GPU aggregated smoke. The P/D
+smoke runs in the H100 nightly suite through
+`tests/test_suites/llm/grpo-qwen3-0.6b-1n8g-dtensor2tp1-dynamo-disagg.sh`.
+The nightly suite allocates one eight-GPU node; the recipe uses three GPUs
+and leaves five unused. It requires a container with the pinned Dynamo runtime
+installed at `/opt/dynamo_venv`. Both smokes verify function only and make no
+performance claim.
 
 ## Run SWE1 with W&B
 
