@@ -25,6 +25,7 @@ import pytest
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
     NEMO_GYM_ACTOR_FQN,
+    NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     _detect_invalid_tool_call_and_malformed_thinking,
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
@@ -284,3 +285,88 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
     actor._spinup.remote.assert_called_once_with()
     actor.set_tokenizer.remote.assert_called_once_with(tokenizer)
     assert mock_ray.get.call_args_list == [call("spinup-ref"), call("tokenizer-ref")]
+
+
+@pytest.mark.parametrize("failed_ref", ["spinup-ref", "tokenizer-ref"])
+def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
+    detected_uv_dirs, failed_ref
+):
+    actor = MagicMock()
+    actor._spinup.remote.return_value = "spinup-ref"
+    actor.set_tokenizer.remote.return_value = "tokenizer-ref"
+    actor.shutdown.remote.return_value = "shutdown-ref"
+
+    def get_or_fail(ref, **_kwargs):
+        if ref == failed_ref:
+            raise RuntimeError("startup failed")
+        return None
+
+    with (
+        patch.object(nemo_gym_mod, "make_actor_runtime_env", return_value={}),
+        patch.object(nemo_gym_mod, "NemoGym") as mock_cls,
+        patch.object(nemo_gym_mod, "ray") as mock_ray,
+    ):
+        mock_cls.options.return_value.remote.return_value = actor
+        mock_ray.get.side_effect = get_or_fail
+
+        with pytest.raises(RuntimeError, match="startup failed"):
+            spinup_nemo_gym_actor(
+                _env_configs(num_gpu_nodes=0),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=MagicMock(),
+                enable_router_replay=False,
+                use_fastokens=False,
+            )
+
+    actor.shutdown.remote.assert_called_once_with()
+    mock_ray.kill.assert_called_once_with(actor)
+    assert (
+        call("shutdown-ref", timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S)
+        in mock_ray.get.call_args_list
+    )
+
+
+@pytest.mark.parametrize("cleanup_failure", ["shutdown-remote", "shutdown-get", "kill"])
+def test_spinup_nemo_gym_actor_preserves_startup_error_when_cleanup_fails(
+    detected_uv_dirs, cleanup_failure
+):
+    actor = MagicMock()
+    actor._spinup.remote.return_value = "spinup-ref"
+    actor.shutdown.remote.return_value = "shutdown-ref"
+    startup_error = RuntimeError("startup failed")
+    cleanup_error = RuntimeError("cleanup failed")
+
+    if cleanup_failure == "shutdown-remote":
+        actor.shutdown.remote.side_effect = cleanup_error
+
+    def get_or_fail(ref, **_kwargs):
+        if ref == "spinup-ref":
+            raise startup_error
+        if ref == "shutdown-ref" and cleanup_failure == "shutdown-get":
+            raise cleanup_error
+        return None
+
+    with (
+        patch.object(nemo_gym_mod, "make_actor_runtime_env", return_value={}),
+        patch.object(nemo_gym_mod, "NemoGym") as mock_cls,
+        patch.object(nemo_gym_mod, "ray") as mock_ray,
+    ):
+        mock_cls.options.return_value.remote.return_value = actor
+        mock_ray.get.side_effect = get_or_fail
+        if cleanup_failure == "kill":
+            mock_ray.kill.side_effect = cleanup_error
+
+        with pytest.raises(RuntimeError) as exc_info:
+            spinup_nemo_gym_actor(
+                _env_configs(num_gpu_nodes=0),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=MagicMock(),
+                enable_router_replay=False,
+                use_fastokens=False,
+            )
+
+    assert exc_info.value is startup_error
+    actor.shutdown.remote.assert_called_once_with()
+    mock_ray.kill.assert_called_once_with(actor)
