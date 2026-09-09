@@ -148,12 +148,8 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
             "Gym checkpoint did not exclude any completed/acknowledged lineage; "
             "the test requires one inactive rollout alongside the continuation"
         )
-    continuation_capture_keys = {
-        row["capture_key"] for row in continuation_rows
-    }
-    storage_capture_keys = {
-        row["capture_key"] for row in storage_reference_rows
-    }
+    continuation_capture_keys = {row["capture_key"] for row in continuation_rows}
+    storage_capture_keys = {row["capture_key"] for row in storage_reference_rows}
     if not storage_capture_keys.issubset(continuation_capture_keys):
         raise AssertionError(
             "Gym storage references contain a rollout with no parked continuation"
@@ -217,9 +213,7 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         "last_committed_model_call_id": boundary["last_committed_model_call_id"],
         "resource_state_revisions": boundary["resource_state_revisions"],
         "group_id": group["group_id"],
-        "completed_group_ids": sorted(
-            item["group_id"] for item in replay["groups"]
-        ),
+        "completed_group_ids": sorted(item["group_id"] for item in replay["groups"]),
     }
 
 
