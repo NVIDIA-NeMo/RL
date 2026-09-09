@@ -33,31 +33,46 @@ cd $PROJECT_ROOT
 
 # Follow nemo-gym instructions here to get this data:
 # https://docs.nvidia.com/nemo/gym/0.1.0/tutorials/nemo-rl-grpo/setup.html#training-nemo-rl-grpo-setup
-cd "$GYM_ROOT"
-
-# We need HF_TOKEN to download the data from huggingface
-if [[ ! -f env.yaml ]]; then
-    if [[ -z "${HF_TOKEN:-}" ]]; then
-        echo "[ERROR] HF_TOKEN is not set"
+CUSTOM_TRAIN_PATH=${NEMO_GYM_TRAIN_DATA_PATH:-}
+CUSTOM_VALIDATION_PATH=${NEMO_GYM_VALIDATION_DATA_PATH:-}
+if [[ -n "$CUSTOM_TRAIN_PATH" || -n "$CUSTOM_VALIDATION_PATH" ]]; then
+    if [[ -z "$CUSTOM_TRAIN_PATH" || -z "$CUSTOM_VALIDATION_PATH" ]]; then
+        echo "[ERROR] NEMO_GYM_TRAIN_DATA_PATH and NEMO_GYM_VALIDATION_DATA_PATH must be set together"
         exit 1
     fi
-    echo "hf_token: $HF_TOKEN" >> env.yaml
+    if [[ ! -f "$CUSTOM_TRAIN_PATH" || ! -f "$CUSTOM_VALIDATION_PATH" ]]; then
+        echo "[ERROR] custom NeMo-Gym train or validation data does not exist"
+        exit 1
+    fi
+    TRAIN_PATH=$(realpath "$CUSTOM_TRAIN_PATH")
+    VALIDATION_PATH=$(realpath "$CUSTOM_VALIDATION_PATH")
+else
+    cd "$GYM_ROOT"
+
+    # We need HF_TOKEN to download the data from huggingface
+    if [[ ! -f env.yaml ]]; then
+        if [[ -z "${HF_TOKEN:-}" ]]; then
+            echo "[ERROR] HF_TOKEN is not set"
+            exit 1
+        fi
+        echo "hf_token: $HF_TOKEN" >> env.yaml
+    fi
+
+    uv run ng_prepare_data "+config_paths=[resources_servers/workplace_assistant/configs/workplace_assistant.yaml]" \
+        +output_dirpath=data/workplace_assistant \
+        +mode=train_preparation \
+        +should_download=true \
+        +data_source=huggingface
+    cd -
+
+    # This trimming of the workplace assistant dataset is necessary b/c with all the tools the first prompt is >4000 tokens
+    # which will cause vllm to return nothing on the first prompt and crash RL. Since we want to keep this test short to
+    # smoke test, we trim all but the first tool
+    TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
+    VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
+    jq -c '.responses_create_params.tools |= (.[0:1])' "$GYM_ROOT/data/workplace_assistant/train.jsonl" > $TRAIN_PATH
+    jq -c '.responses_create_params.tools |= (.[0:1])' "$GYM_ROOT/data/workplace_assistant/validation.jsonl" > $VALIDATION_PATH
 fi
-
-uv run ng_prepare_data "+config_paths=[resources_servers/workplace_assistant/configs/workplace_assistant.yaml]" \
-    +output_dirpath=data/workplace_assistant \
-    +mode=train_preparation \
-    +should_download=true \
-    +data_source=huggingface
-cd -
-
-# This trimming of the workplace assistant dataset is necessary b/c with all the tools the first prompt is >4000 tokens
-# which will cause vllm to return nothing on the first prompt and crash RL. Since we want to keep this test short to
-# smoke test, we trim all but the first tool
-TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
-VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
-jq -c '.responses_create_params.tools |= (.[0:1])' "$GYM_ROOT/data/workplace_assistant/train.jsonl" > $TRAIN_PATH
-jq -c '.responses_create_params.tools |= (.[0:1])' "$GYM_ROOT/data/workplace_assistant/validation.jsonl" > $VALIDATION_PATH
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $SC_ENTRYPOINT \
