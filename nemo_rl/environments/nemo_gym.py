@@ -33,6 +33,9 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.multimodal_utils import (
+    NATIVE_MULTIMODAL_KEYS,
+    ROLLOUT_MATCHED_MEDIA_KEY,
+    PackedTensor,
     attach_image_model_inputs_to_message,
     encode_images_in_examples,
     extract_input_image_sources_from_responses_messages,
@@ -41,6 +44,7 @@ from nemo_rl.data.multimodal_utils import (
     uses_image_placeholder,
 )
 from nemo_rl.environments.nemotron_utils import (
+    RolloutGeometryUnderdetermined,
     count_image_placeholder_runs,
     predicted_static_image_num_tokens,
     supports_image_placeholder_run_parity,
@@ -1037,6 +1041,10 @@ Depending on your data shape, you may want to change these values."""
         turn_idx = 0
 
         nemo_rl_message_log = []
+        # Set when a turn's rollout image tiling cannot be reproduced without
+        # inferring geometry from token counts; the whole sample then carries
+        # no media and is flagged for loss masking.
+        media_geometry_failed = False
         seen_token_ids: List[int] = []
         batch_decode_items = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
@@ -1116,7 +1124,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
             nemo_rl_message_log.append(user_message)
 
-            if processor is not None:
+            if processor is not None and not media_geometry_failed:
                 images_this_turn = (
                     per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
                 )
@@ -1143,19 +1151,33 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                             "Refusing to train on misaligned media."
                         )
                     expected_num_tokens = turn_runs[omitted_leading_runs:]
-                _attach_multimodal_data_to_user_message(
-                    user_message,
-                    images=images_this_turn,
-                    processor=processor,
-                    # Read with a default, like _processor above: this method is
-                    # called unbound against lightweight stand-ins that define
-                    # only what they exercise, so a bare attribute access turns
-                    # an unrelated test into an AttributeError.
-                    pad_dynamic_image_shapes=getattr(
-                        self, "_pad_dynamic_image_shapes", False
-                    ),
-                    expected_num_tokens_per_image=expected_num_tokens,
-                )
+                try:
+                    _attach_multimodal_data_to_user_message(
+                        user_message,
+                        images=images_this_turn,
+                        processor=processor,
+                        # Read with a default, like _processor above: this method is
+                        # called unbound against lightweight stand-ins that define
+                        # only what they exercise, so a bare attribute access turns
+                        # an unrelated test into an AttributeError.
+                        pad_dynamic_image_shapes=getattr(
+                            self, "_pad_dynamic_image_shapes", False
+                        ),
+                        expected_num_tokens_per_image=expected_num_tokens,
+                    )
+                except RolloutGeometryUnderdetermined as exc:
+                    # The rollout's tiling for some image on this turn cannot be
+                    # reproduced without guessing geometry. Guessing risks
+                    # training against different pixels than generated the
+                    # rollout, so drop ALL media from this sample instead: the
+                    # per-row media validity mask then treats its placeholder
+                    # ids as ordinary tokens (no Megatron alignment to satisfy)
+                    # and the sample is flagged for loss masking below.
+                    media_geometry_failed = True
+                    print(
+                        "[NemoGym] Dropping media and masking sample: "
+                        f"turn {turn_idx}: {exc}"
+                    )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
             # the call was invalid and never executed — flag it so training can penalize it.
@@ -1242,6 +1264,28 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     container[key], _ = _without_initial_image_sources(
                         container[key], raw_initial_sources
                     )
+
+        if media_geometry_failed:
+            # Strip every media tensor already attached to this sample (partial
+            # media would leave Megatron with fewer projected features than
+            # placeholder tokens), mark each user turn so the driver-side
+            # static reattach does not restore misaligned tensors, and flag the
+            # sample so GRPO masks it from the loss.
+            for message in nemo_rl_message_log:
+                if message.get("role") != "user":
+                    continue
+                for key in [
+                    key
+                    for key, value in message.items()
+                    if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS
+                ]:
+                    del message[key]
+                message[ROLLOUT_MATCHED_MEDIA_KEY] = True
+            instance_config = nemo_gym_result.get("instance_config")
+            if not isinstance(instance_config, dict):
+                instance_config = {}
+                nemo_gym_result["instance_config"] = instance_config
+            instance_config["mask_sample"] = True
 
         result = {
             "message_log": nemo_rl_message_log,

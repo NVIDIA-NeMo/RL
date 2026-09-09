@@ -478,32 +478,16 @@ def predicted_static_image_num_tokens(
     return num_tokens
 
 
-def _closest_aspect_grid(
-    target_patches: int, height: int, width: int, divisor: int
-) -> tuple[int, int]:
-    """Aspect-closest (grid_h, grid_w), both divisible by ``divisor``, whose product is exactly ``target_patches``."""
-    units = divisor * divisor
-    if target_patches <= 0 or target_patches % units:
-        raise ValueError(
-            f"Rollout image placeholder run implies {target_patches} patches, "
-            f"which is not a positive multiple of the pixel-shuffle factor "
-            f"squared ({units}); the rollout tokens do not describe a valid "
-            "image tile."
-        )
-    base = target_patches // units
-    aspect = math.log(max(height, 1) / max(width, 1))
-    best: "tuple[float, int, int] | None" = None
-    for low in range(1, math.isqrt(base) + 1):
-        if base % low:
-            continue
-        high = base // low
-        for h_units, w_units in ((low, high), (high, low)):
-            grid_h, grid_w = h_units * divisor, w_units * divisor
-            score = abs(math.log(grid_h / grid_w) - aspect)
-            if best is None or score < best[0]:
-                best = (score, grid_h, grid_w)
-    assert best is not None
-    return best[1], best[2]
+class RolloutGeometryUnderdetermined(ValueError):
+    """The rollout's image token count cannot be reproduced without guessing.
+
+    A placeholder-run length does not uniquely identify the rollout engine's
+    preprocessing grid (several grids share one product), so when re-running
+    the processor under the rollout's own budget fails to reproduce the count,
+    inferring a grid from the count risks training against different pixels
+    and feature ordering than generated the rollout. Callers must treat the
+    affected sample as unusable media rather than guess.
+    """
 
 
 def _process_single_image_at_num_tokens(
@@ -533,28 +517,25 @@ def _process_single_image_at_num_tokens(
             image_processor.max_model_len = original
 
     processed = run_pinned(image)
-    if _image_num_tokens_from_processed(processed) == [num_tokens]:
+    actual = _image_num_tokens_from_processed(processed)
+    if actual == [num_tokens]:
         return processed
 
-    # Grid rounding is not idempotent for every (size, budget); force the exact
-    # grid by pre-resizing to it. An even grid of exactly num_tokens*ds^2
-    # patches passes _compute_target_patches unchanged under the pinned budget.
-    grid_h, grid_w = _closest_aspect_grid(
-        num_tokens * downsample * downsample, image.height, image.width, downsample
+    # The pinned budget replays the rollout engine's own decision procedure;
+    # when even that does not reproduce the rollout's count, the count alone
+    # cannot recover the geometry: several (grid_h, grid_w) factorizations
+    # share the product num_tokens*ds^2, and picking one that differs from the
+    # rollout's would pass count validation while training on different pixels
+    # and spatial feature ordering. Fail instead of inferring.
+    raise RolloutGeometryUnderdetermined(
+        "Cannot reproduce the rollout's image tiling: the rollout expanded a "
+        f"{image.width}x{image.height} image to {num_tokens} placeholder "
+        f"tokens, but the training processor produced {actual[0]} tokens under "
+        f"the rollout's own budget (downsample={downsample}). The token count "
+        "does not uniquely identify the preprocessing grid, so the geometry "
+        "is not inferred from it; this image's media cannot be matched to the "
+        "rollout without the engine's per-image grid metadata."
     )
-    patch = image_processor.patch_size
-    resized = image.resize((grid_w * patch, grid_h * patch), Image.BICUBIC)
-    processed = run_pinned(resized)
-    actual = _image_num_tokens_from_processed(processed)
-    if actual != [num_tokens]:
-        raise ValueError(
-            "Cannot match the rollout's image tiling: the rollout expanded a "
-            f"{image.width}x{image.height} image to {num_tokens} placeholder "
-            f"tokens, but the training processor produced {actual[0]} tokens "
-            f"even when pinned to a {grid_h}x{grid_w} patch grid. Refusing to "
-            "train on misaligned media."
-        )
-    return processed
 
 
 def reprocess_images_at_rollout_budgets(
