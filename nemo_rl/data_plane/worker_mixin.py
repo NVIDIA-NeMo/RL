@@ -36,10 +36,9 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 import numpy as np
 import torch
 
-FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
-
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -63,6 +62,8 @@ if TYPE_CHECKING:
         DataPlaneClient,
         DataPlaneRuntimeConfig,
     )
+
+FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 
 def _broadcast_batched_data_dict(
@@ -326,6 +327,18 @@ class TQWorkerMixin:
             return
         self._route_fallback_counts = Counter()
         from nemo_rl.data_plane import build_data_plane_client
+
+        # ``LocalDataPlaneConfig`` is the process-local plane: no TQ, no
+        # mooncake, so no GDR to order against a CUDA context.
+        if (
+            not isinstance(cfg, LocalDataPlaneConfig)
+            and cfg["backend"] == "mooncake_cpu"
+            and backend_config(cfg).use_gdr
+            and not torch.cuda.is_initialized()
+        ):
+            raise RuntimeError(
+                "CUDA must be initialized before attaching TransferQueue with GDR"
+            )
 
         # bootstrap=False — the driver already created the named
         # controller actor; this process attaches as a client.

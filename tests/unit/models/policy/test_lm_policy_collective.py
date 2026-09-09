@@ -16,6 +16,25 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 
 
+def test_policy_waits_for_param_sync_before_refit(monkeypatch):
+    calls = []
+    waited_for = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+    monkeypatch.setattr("nemo_rl.models.policy.lm_policy.ray.get", waited_for.append)
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+
+    policy.sync_params_before_refit()
+
+    assert calls == [("sync_params_before_refit", {})]
+    assert waited_for == [["future"]]
+
+
 def test_policy_forwards_nccl_peer_to_workers():
     calls = []
 

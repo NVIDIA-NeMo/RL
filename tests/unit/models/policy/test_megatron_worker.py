@@ -1193,7 +1193,7 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     assert events.index("finalize_async_save") < events.index(("move_model", True))
 
 
-def test_megatron_offload_before_refit_materializes_latest_mxfp8_weights(monkeypatch):
+def test_megatron_sync_params_before_refit_materializes_latest_mxfp8_weights():
     """Refit must see optimizer updates before the next overlapped train forward."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
@@ -1201,37 +1201,34 @@ def test_megatron_offload_before_refit_materializes_latest_mxfp8_weights(monkeyp
 
     events = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = object()
-    worker.optimizer = None
-    worker.optimizer_cpu_offload = False
-    worker.fp8_cfg = None
-    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
     worker._forward_pre_hook_enabled = lambda: True
     worker._disable_forward_pre_hook_until_next_train_step = (
         lambda *, param_sync=False: events.append(("disable_hook", param_sync))
     )
-    worker.move_model = lambda model, device, move_params, move_grads: (
-        events.append(("move_model", move_grads)) or model
-    )
+    MegatronPolicyWorkerImpl.sync_params_before_refit(worker)
 
-    class _AllocatorWakeup:
-        def cuda(self):
-            return self
-
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
-
-    MegatronPolicyWorkerImpl.offload_before_refit(worker)
-
-    assert events[:3] == [
+    assert events == [
         "finalize_async_save",
         ("disable_hook", True),
-        ("move_model", False),
     ]
+
+
+def test_megatron_sync_params_before_refit_is_noop_without_pending_mxfp8_gather():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker.finalize_async_save = MagicMock()
+    worker._disable_forward_pre_hook_until_next_train_step = MagicMock()
+
+    MegatronPolicyWorkerImpl.sync_params_before_refit(worker)
+
+    worker.finalize_async_save.assert_not_called()
+    worker._disable_forward_pre_hook_until_next_train_step.assert_not_called()
 
 
 @pytest.mark.parametrize("offload_optimizer", [False, True])

@@ -3829,15 +3829,10 @@ class MegatronPolicyWorkerImpl(
             f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
         )
 
-    @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
-    def offload_before_refit(self):
-        """Offload optimizer state and buffers that are safe to release."""
-        # An in-flight async checkpoint keeps references to the CUDA tensors in
-        # its sharded state dict until the write is finalized. Offloading swaps
-        # those tensors for CPU storage, so the checkpoint references would keep
-        # the old CUDA storage alive and defeat the offload.
-        self.finalize_async_save()
-
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/sync_params_before_refit")
+    def sync_params_before_refit(self) -> None:
+        """Materialize optimizer updates before a refit reads model parameters."""
         # With MXFP8 overlap, the optimizer updates FP32 master shards and the
         # next parameter all-gather requantizes them into the model weights. A
         # refit happens between optimizer steps, before that next training
@@ -3862,7 +3857,19 @@ class MegatronPolicyWorkerImpl(
             self._uses_mxfp8_overlap_shared_param_buffer()
             and self._forward_pre_hook_enabled()
         ):
+            # An in-flight async checkpoint may still read these tensors, so settle it
+            # before the explicit gather mutates the shared parameter buffer.
+            self.finalize_async_save()
             self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
+
+    @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
+    def offload_before_refit(self):
+        """Offload optimizer state and buffers that are safe to release."""
+        # An in-flight async checkpoint keeps references to the CUDA tensors in
+        # its sharded state dict until the write is finalized. Offloading swaps
+        # those tensors for CPU storage, so the checkpoint references would keep
+        # the old CUDA storage alive and defeat the offload.
+        self.finalize_async_save()
 
         no_grad = torch.no_grad()
         no_grad.__enter__()

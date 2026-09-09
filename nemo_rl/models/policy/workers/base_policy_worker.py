@@ -33,6 +33,12 @@ class AbstractPolicyWorker:
     # Same, for the per-PP-stage group the nccl_reshard transport builds.
     pp_comm_group: Optional[Any] = None
 
+    def sync_params_before_refit(self) -> None:
+        """Materialize optimizer updates before refit when the backend requires it."""
+        # DTensor policy parameters already contain the latest optimizer update.
+        # Megatron overrides this for overlapped MXFP8 parameter all-gather.
+        pass
+
     def init_collective(
         self,
         ip: str,

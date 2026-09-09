@@ -89,6 +89,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
                     train_cluster=train_cluster,
                     inference_cluster=inference_cluster,
                     refit_timeout_s=refit_timeout_s,
+                    sync_policy_params=False,
                 )
             else:
                 self._transport = CollectiveWeightSynchronizer(
@@ -97,6 +98,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
                     train_cluster=train_cluster,
                     inference_cluster=inference_cluster,
                     refit_timeout_s=refit_timeout_s,
+                    sync_policy_params=False,
                 )
         self._stale = True
 
@@ -152,6 +154,8 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             # Tagging the call bypasses the worker's engine-awake early-return, so the reshard
             # copy riding this wake cannot be skipped. Any tag except "weights" works: the worker
             # treats "weights" as the wake-suppressing mid-refit call.
+            with timed_phase("prepare_for_generation/sync_policy_params"):
+                self._policy.sync_params_before_refit()
             with timed_phase("prepare_for_generation/offload_policy"):
                 self._policy.offload_before_refit()
             with timed_phase("prepare_for_generation/prepare_weights"):
@@ -159,8 +163,14 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             self._stale = False
             return {}
 
-        # The engine serves continuously in non-colocated mode; pause it
-        # exactly around the swap.
+        # Materialize optimizer updates before optional policy offload. Delegated
+        # transports skip their own copy of this prerequisite because this wrapper
+        # owns the Megatron generation lifecycle.
+        with timed_phase("prepare_for_generation/sync_policy_params"):
+            self._policy.sync_params_before_refit()
+
+        # The engine serves continuously in non-colocated mode; pause it exactly
+        # around the swap.
         with timed_phase("prepare_for_generation/suspend_for_refit"):
             self._generation.suspend_for_refit()
         if self._generation.cfg["mcore_generation_config"][

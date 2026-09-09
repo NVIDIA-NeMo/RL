@@ -114,6 +114,7 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
                 "vllm_cfg": {"tensor_parallel_size": 1},
             },
         },
+        sync_params_before_refit=lambda: None,
         init_collective=lambda *a, **k: ["train-f"],
         init_nccl_reshard_comm_group=lambda **k: ["train-bulk"],
         prepare_nccl_reshard_refit_info=lambda tp,
