@@ -216,29 +216,34 @@ def test_offloaded_death_is_detected_at_recovery(
     victim = ft_gen.all_engines[0]
     assert ft_gen._health_monitor._pause_event.is_set()
 
+    strategy = _engine_node_strategy(ft_gen)
+    tree = ray.get(
+        snapshot_server_process_tree.options(scheduling_strategy=strategy).remote(
+            ft_gen._engine_urls[0]
+        ),
+        timeout=CHECK_TIMEOUT,
+    )
+    assert len(tree.processes) > 1, "No GPU descendants captured before server death"
     if kill_actor:
-        strategy = _engine_node_strategy(ft_gen)
-        tree = ray.get(
-            snapshot_server_process_tree.options(scheduling_strategy=strategy).remote(
-                ft_gen._engine_urls[0]
-            ),
-            timeout=CHECK_TIMEOUT,
-        )
-        assert len(tree.processes) > 1, "No GPU descendants captured before actor death"
         ray.kill(victim)
         with pytest.raises(RayActorError):
             ray.get(victim.is_alive.remote(), timeout=CHECK_TIMEOUT)
-        ray.get(
-            wait_for_server_process_tree_exit.options(
-                scheduling_strategy=strategy
-            ).remote(tree, timeout=60),
-            timeout=90,
-        )
-        print(f"Actor SIGKILL reaped {tree.url}: processes={tree.processes}")
     else:
+        ray.get(victim.shutdown.remote(), timeout=CHECK_TIMEOUT)
+
+    # shutdown() sends signals through kill_process_tree without waiting for
+    # exit. Establish actual process death before asking the liveness probe
+    # to detect it; the same check proves actor death leaves no GPU orphans.
+    ray.get(
+        wait_for_server_process_tree_exit.options(scheduling_strategy=strategy).remote(
+            tree, timeout=60
+        ),
+        timeout=90,
+    )
+    print(f"Server teardown reaped {tree.url}: processes={tree.processes}")
+    if not kill_actor:
         # The actor remains callable after graceful server shutdown, proving
         # that checking only Ray actor death misses a dead child process.
-        ray.get(victim.shutdown.remote(), timeout=CHECK_TIMEOUT)
         assert ray.get(victim.is_alive.remote(), timeout=CHECK_TIMEOUT) is False
     assert ft_gen.all_engines[0] == victim
 
