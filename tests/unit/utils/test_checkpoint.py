@@ -55,7 +55,8 @@ def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):
     step = 1
     training_info = {"loss": 0.5, "tensor": torch.tensor(0.5), "numpy": np.array(0.5)}
     run_config = MagicMock()
-    run_config.model_dump.return_value = {"model": "test"}
+    expected_config = {"model": "test"}
+    run_config.model_dump.return_value = expected_config
 
     save_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info, run_config)
 
@@ -73,7 +74,8 @@ def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):
     # Check if config was saved
     with open(save_dir / "config.yaml", "r") as f:
         saved_config = yaml.safe_load(f)
-        assert saved_config == run_config.model_dump()
+        assert saved_config == expected_config
+    run_config.model_dump.assert_called_once_with(mode="json")
 
 
 def test_finalize_checkpoint(checkpoint_manager, checkpoint_dir):
