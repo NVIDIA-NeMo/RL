@@ -87,13 +87,14 @@ must continue to use `quantization_ignored_layer_kws`.
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
-```
+```yaml
     policy:
         megatron_cfg:
             fp8_cfg:
                 fp8: "hybrid"               # choices: [hybrid, e4m3]
-                fp8_recipe: "tensorwise"    # choices: [tensorwise, blockwise, mxfp8]
+                fp8_recipe: "tensorwise"    # choices: [tensorwise, blockwise, mxfp8, custom]
                 fp8_param: false            # boolean value
+                fp8_quantizer_factory: null # required for "custom" recipe; importable Python path e.g. package.module.quantizer_factory
 ```
 
 ### Per-module Transformer Engine precision recipes

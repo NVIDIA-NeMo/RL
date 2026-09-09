@@ -279,11 +279,14 @@ policy:
       unified_memory_level: 0
       max_tokens: 16384
       logprobs_mode: processed_logprobs
+      offload_policy_before_refit: false
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+      refit_with_reload_api: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1

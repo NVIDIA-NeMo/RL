@@ -842,12 +842,34 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.policy["generation"]["backend"] = "vllm"
+
+    # Data plane + NeMo-Gym stays rejected: ``grpo_train_sync`` never calls
+    # ``attach_initial_nemo_gym_image_payloads``, so the run would silently
+    # train on the media a Gym dataset omits from ``extra_env_info``.
     master_config.data_plane = {"enabled": True}
-    with pytest.raises(NotImplementedError, match="data_plane.enabled=false"):
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        with pytest.raises(NotImplementedError, match="NeMo-Gym"):
+            _validate_multimodal_dedup_capability(master_config)
+
+    # Data plane without Gym is supported: the wire format carries dedup
+    # (``PackedTensor.to_wire`` emits one row per *logical* row), and the Gym
+    # attach helper is itself gated on ``should_use_nemo_gym``. Rejecting this
+    # blocked every Nemotron-Omni recipe, since all of them set
+    # ``deduplicate_multimodal_data: true``.
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=False):
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.data_plane = {"enabled": False}
     _validate_multimodal_dedup_capability(master_config)
+
+    # And with dedup off, nothing is gated — the guard returns before it looks
+    # at the backend or at NeMo-Gym, so a text-only sync GRPO + Gym run is not
+    # blocked by a multimodal validator.
+    master_config.grpo.deduplicate_multimodal_data = False
+    master_config.policy["generation"]["backend"] = "sglang"
+    master_config.data_plane = {"enabled": True}
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        _validate_multimodal_dedup_capability(master_config)
 
 
 def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
@@ -2986,12 +3008,11 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
     synchronizer.init_communicator.assert_called_once_with()
     spinup_nemo_gym_actor.assert_called_once_with(
-        env_configs=master_config.env,
+        master_config.env,
         base_urls=["http://dynamo-wrapper.example/v1"],
         model_name=master_config.policy["model_name"],
         tokenizer=tokenizer,
         enable_router_replay=False,
-        routed_experts_dtype="int16",
         use_fastokens=False,
     )
 
@@ -3360,12 +3381,11 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
 
     assert result[2] is nemo_gym_actor
     spinup_nemo_gym_actor.assert_called_once_with(
-        env_configs=master_config.env,
+        master_config.env,
         base_urls=["http://trtllm.example/v1"],
         model_name="test-model",
         tokenizer=tokenizer,
         enable_router_replay=False,
-        routed_experts_dtype="int16",
         use_fastokens=False,
     )
 
@@ -3409,7 +3429,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     synchronizer.sync_weights.side_effect = sync_weights
     nemo_gym_actor = object()
 
-    def spinup_nemo_gym_actor(**kwargs):
+    def spinup_nemo_gym_actor(_env_configs, **kwargs):
         assert kwargs["base_urls"] == [reserved_url]
         events.append("gym_started")
         gym_started.set()

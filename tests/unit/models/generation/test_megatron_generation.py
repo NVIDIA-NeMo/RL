@@ -355,6 +355,7 @@ basic_megatron_test_config: PolicyConfig = {
             "num_speculative_tokens": 0,
             "logprobs_mode": "processed_logprobs",
             "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
+            "offload_policy_before_refit": False,
             "parsers": [],
             "expose_http_server": False,
         },
@@ -511,6 +512,12 @@ def test_megatron_policy_generation(
         pytest.skip(
             f"Need {tensor_parallel_size * pipeline_parallel_size} GPUs for "
             f"tp={tensor_parallel_size} pp={pipeline_parallel_size}"
+        )
+
+    if pipeline_parallel_size > 1:
+        pytest.xfail(
+            "FIXME(@cspades/@tdene): MCore async-scheduled generation segfaults with PP>1 "
+            "in dynamic_context.calculate_log_probs_tensors when slicing log_probs."
         )
 
     config = deepcopy(basic_megatron_test_config)
