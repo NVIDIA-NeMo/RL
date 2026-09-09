@@ -28,10 +28,14 @@ module tree and inspect what each consumer was constructed with.
 import asyncio
 import sys
 import types
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import torch
+from pydantic import BaseModel, Field, ValidationError
 
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -56,6 +60,13 @@ def _recorder(slot: str):
 _OnlineRenderer = _recorder("renderer")
 _OpenAIServingChat = _recorder("chat")
 _ServingTokenization = _recorder("tokenize")
+
+
+class _ChatCompletionRequest(BaseModel):
+    messages: list[dict] = Field(default_factory=list)
+    logprobs: bool = False
+    return_tokens_as_token_ids: bool = False
+    top_logprobs: int | None = None
 
 
 class _FakeApp:
@@ -111,7 +122,7 @@ def _install_fake_vllm(monkeypatch):
     )
     module(
         "vllm.entrypoints.openai.chat_completion.protocol",
-        ChatCompletionRequest=placeholder("ChatCompletionRequest"),
+        ChatCompletionRequest=_ChatCompletionRequest,
         ChatCompletionResponse=placeholder("ChatCompletionResponse"),
     )
     module(
@@ -347,3 +358,170 @@ def test_preprocess_chat_leaves_text_only_prompts_without_mm_placeholders(monkey
 
     assert engine_prompt["prompt_token_ids"] == _EXACT_TOKENS
     assert "mm_placeholders" not in engine_prompt
+
+
+# ---------------------------------------------------------------------------
+# Router replay: Gym request identity through the real chat response hook
+# ---------------------------------------------------------------------------
+
+_REPLAY_IDENTITY = {
+    "_ng_task_index": 12,
+    "_ng_rollout_index": 3,
+    "_ng_attempt_index": 0,
+    "_ng_target_weight_version": 19,
+}
+
+
+@pytest.fixture
+def replay_chat(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
+    _install_fake_vllm(monkeypatch)
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "vllm_cfg": {"_routed_experts_transport": "ray"},
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker.llm_async_engine_args = MagicMock(enable_return_routed_experts=True)
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+    worker.routed_experts_dtype = torch.int16
+    writer = MagicMock()
+    monkeypatch.setattr(worker, "_get_routed_experts_store_writer", lambda: writer)
+
+    app = _FakeApp()
+    worker._setup_vllm_openai_api_server(app)
+    request_type = dict(app.routes)["/v1/chat/completions"].__annotations__["request"]
+    response_type = sys.modules[
+        "vllm.entrypoints.openai.chat_completion.protocol"
+    ].ChatCompletionResponse
+    response = response_type()
+    response.choices = [types.SimpleNamespace(index=0, message=types.SimpleNamespace())]
+
+    async def fake_full_generator(
+        self: Any,
+        request: BaseModel,
+        result_generator: AsyncGenerator[types.SimpleNamespace, None],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        async for _ in result_generator:
+            pass
+        return response
+
+    monkeypatch.setattr(
+        _OpenAIServingChat,
+        "chat_completion_full_generator",
+        fake_full_generator,
+        raising=False,
+    )
+    # vLLM has not captured a route for the final generated token yet.
+    routes = torch.arange(2 * 2 * 2, dtype=torch.int16).reshape(2, 2, 2)
+
+    async def generate(fields: dict[str, Any]) -> Any:
+        async def results() -> AsyncGenerator[types.SimpleNamespace, None]:
+            yield types.SimpleNamespace(
+                request_id="request-a",
+                prompt_token_ids=[1, 2],
+                outputs=[
+                    types.SimpleNamespace(index=0, token_ids=[3], routed_experts=routes)
+                ],
+            )
+
+        return await _BUILT["chat"][0].chat_completion_full_generator(
+            request_type.model_validate(fields), results()
+        )
+
+    return types.SimpleNamespace(
+        generate=generate,
+        request_type=request_type,
+        writer=writer,
+        response=response,
+        routes=routes,
+        worker=worker,
+    )
+
+
+@pytest.mark.parametrize("attempt", [0, 1, 5])
+def test_ray_replay_forwards_attempt_to_store_writer(
+    replay_chat: types.SimpleNamespace, attempt: int
+) -> None:
+    fields = _REPLAY_IDENTITY | {"_ng_attempt_index": attempt}
+    assert (
+        replay_chat.request_type.model_validate(fields).nemo_gym_attempt_index
+        == attempt
+    )
+
+    response = asyncio.run(replay_chat.generate(fields))
+
+    args, kwargs = replay_chat.writer.put.call_args
+    assert replay_chat.writer.put.call_count == 1
+    assert args[0].shape == (3, 2, 2)
+    assert torch.equal(args[0][:2], replay_chat.routes)
+    assert kwargs == {
+        "request_id": "request-a",
+        "task_index": 12,
+        "rollout_index": 3,
+        "attempt_index": attempt,
+        "target_weight_version": 19,
+    }
+    assert (
+        response.choices[0].message.routed_experts
+        is replay_chat.writer.put.return_value
+    )
+
+
+@pytest.mark.parametrize("missing_field", list(_REPLAY_IDENTITY))
+def test_ray_replay_rejects_missing_identity(
+    replay_chat: types.SimpleNamespace, missing_field: str
+) -> None:
+    fields = dict(_REPLAY_IDENTITY)
+    del fields[missing_field]
+    with pytest.raises(RuntimeError, match=missing_field):
+        asyncio.run(replay_chat.generate(fields))
+    replay_chat.writer.put.assert_not_called()
+
+
+def test_ray_replay_rejects_null_attempt(replay_chat: types.SimpleNamespace) -> None:
+    with pytest.raises(RuntimeError, match="_ng_attempt_index"):
+        asyncio.run(
+            replay_chat.generate(_REPLAY_IDENTITY | {"_ng_attempt_index": None})
+        )
+    replay_chat.writer.put.assert_not_called()
+
+
+@pytest.mark.parametrize("attempt", [-1, True, False, 1.5, "1"])
+def test_ray_replay_request_rejects_invalid_attempt(
+    replay_chat: types.SimpleNamespace, attempt: Any
+) -> None:
+    with pytest.raises(ValidationError, match="_ng_attempt_index"):
+        replay_chat.request_type.model_validate(
+            _REPLAY_IDENTITY | {"_ng_attempt_index": attempt}
+        )
+
+
+def test_ray_replay_skips_auxiliary_request_without_identity(
+    replay_chat: types.SimpleNamespace,
+) -> None:
+    response = asyncio.run(replay_chat.generate({}))
+    assert response is replay_chat.response
+    assert not hasattr(response.choices[0].message, "routed_experts")
+    replay_chat.writer.put.assert_not_called()
+
+
+def test_ray_replay_attempt_only_is_not_an_auxiliary_request(
+    replay_chat: types.SimpleNamespace,
+) -> None:
+    with pytest.raises(RuntimeError, match="_ng_task_index"):
+        asyncio.run(replay_chat.generate({"_ng_attempt_index": 0}))
+    replay_chat.writer.put.assert_not_called()
+
+
+def test_inline_replay_does_not_require_attempt_metadata(
+    replay_chat: types.SimpleNamespace,
+) -> None:
+    replay_chat.worker.cfg["vllm_cfg"]["_routed_experts_transport"] = "inline"
+    response = asyncio.run(replay_chat.generate({}))
+    assert isinstance(response.choices[0].message.routed_experts, str)
+    replay_chat.writer.put.assert_not_called()

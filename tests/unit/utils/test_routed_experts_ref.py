@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -23,7 +25,9 @@ from nemo_rl.utils.routed_experts_ref import (
     ROUTED_EXPERTS_REF_DTYPE,
     ROUTED_EXPERTS_REF_KEY,
     ROUTED_EXPERTS_REF_SCHEMA,
+    RoutedExpertsObjectStore,
     RoutedExpertsStoreState,
+    RoutedExpertsStoreWriter,
     _assemble_routed_experts_range_results,
     _materialize_normalized_routed_experts_with_ray_transport,
     _normalize_routed_experts_batch,
@@ -33,10 +37,11 @@ from nemo_rl.utils.routed_experts_ref import (
     retire_routed_experts_through,
     routed_experts_ref_lookup_key,
     slice_routed_experts_ref,
+    validate_routed_experts_ref,
 )
 
 
-def _ref(*, target: int = 3, shape: tuple[int, int, int] = (5, 2, 2)):
+def _ref(*, target: int = 3, attempt: int = 0, shape: tuple[int, int, int] = (5, 2, 2)):
     return {
         "schema": ROUTED_EXPERTS_REF_SCHEMA,
         "store": "store-a",
@@ -45,6 +50,7 @@ def _ref(*, target: int = 3, shape: tuple[int, int, int] = (5, 2, 2)):
         "key": ROUTED_EXPERTS_REF_KEY,
         "task_index": 11,
         "rollout_index": 2,
+        "attempt_index": attempt,
         "target_weight_version": target,
         "offset": 0,
         "length": shape[0],
@@ -85,7 +91,7 @@ def test_materialize_refs_resolves_one_full_object_for_multiple_message_slices()
         resolver=resolve,
     )
 
-    assert resolve_calls == [(3, 11, 2, "request-a")]
+    assert resolve_calls == [(3, 11, 2, 0, "request-a")]
     assert materialized.dtype == torch.int16
     assert torch.equal(materialized[0, :5], torch.from_numpy(source))
     assert torch.equal(
@@ -173,6 +179,204 @@ def test_store_state_returns_only_requested_ranges_from_owned_arrays():
     assert packed.nbytes == expected.nbytes
     assert not np.shares_memory(packed, first_source)
     assert not np.shares_memory(packed, second_source)
+
+
+@pytest.mark.parametrize("attempt", [0, 1, 7])
+def test_store_state_rejects_duplicates_within_one_attempt(attempt: int) -> None:
+    state = RoutedExpertsStoreState("instance-a")
+    ref = _ref(attempt=attempt)
+    value = np.zeros(ref["shape"], dtype=np.int16)
+    _put_state(state, ref, value)
+
+    with pytest.raises(RuntimeError, match="Duplicate routed-experts object key"):
+        _put_state(state, ref, value + 1)
+    assert (
+        state.get(
+            key=routed_experts_ref_lookup_key(ref), store_instance_id="instance-a"
+        ).object_ref
+        is value
+    )
+
+
+@pytest.mark.parametrize("legacy_first_slice", [False, True])
+def test_attempts_with_same_request_id_have_independent_reads_and_slices(
+    legacy_first_slice: bool,
+) -> None:
+    state = RoutedExpertsStoreState("instance-a")
+    refs = [_ref(attempt=0, shape=(6, 2, 2)), _ref(attempt=1, shape=(7, 2, 2))]
+    sources = [
+        np.arange(6 * 2 * 2, dtype=np.int16).reshape(6, 2, 2),
+        np.arange(7 * 2 * 2, dtype=np.int16).reshape(7, 2, 2) + 100,
+    ]
+    for ref, source in zip(refs, sources):
+        _put_state(state, ref, source)
+    assert [routed_experts_ref_lookup_key(ref) for ref in refs] == [
+        (3, 11, 2, 0, "request-a"),
+        (3, 11, 2, 1, "request-a"),
+    ]
+    first_ref = dict(refs[0])
+    if legacy_first_slice:
+        del first_ref["attempt_index"]
+    segments = [
+        [
+            slice_routed_experts_ref(first_ref, offset=1, length=2),
+            slice_routed_experts_ref(refs[0], offset=3, length=2),
+        ],
+        [slice_routed_experts_ref(refs[1], offset=2, length=4)],
+    ]
+    resolve_calls = []
+
+    def resolve(ref: dict[str, Any]) -> np.ndarray:
+        key = routed_experts_ref_lookup_key(ref)
+        resolve_calls.append(key)
+        return state.get(key=key, store_instance_id=ref["store_instance_id"]).object_ref
+
+    dense = materialize_routed_experts_refs(
+        segments,
+        input_ids=torch.zeros(2, 5, dtype=torch.long),
+        input_lengths=torch.tensor([4, 4], dtype=torch.int32),
+        resolver=resolve,
+    )
+    assert resolve_calls == [routed_experts_ref_lookup_key(ref) for ref in refs]
+    assert torch.equal(dense[0, :4], torch.from_numpy(sources[0][1:5]))
+    assert torch.equal(dense[1, :4], torch.from_numpy(sources[1][2:6]))
+    assert torch.all(dense[:, 4:] == -1)
+
+    batch = _normalize_routed_experts_batch(
+        segments, batch_size=2, padded_length=5, input_lengths=[4, 4]
+    )
+    groups, stats = _plan_routed_experts_range_reads(batch)
+    assert len(groups) == 1
+    assert stats["range_read_source_objects"] == 2
+    assert stats["full_source_rows_equivalent"] == 13
+    values = state.get_ranges([placement.ref for placement in groups[0].placements])
+    scattered = _assemble_routed_experts_range_results(
+        batch,
+        groups,
+        [
+            {
+                "values": values,
+                "shape": list(values.shape),
+                "dtype": str(values.dtype),
+                "nbytes": int(values.nbytes),
+            }
+        ],
+    )
+    assert np.array_equal(scattered, dense.numpy())
+
+
+def test_store_state_retires_all_attempts_for_target() -> None:
+    state = RoutedExpertsStoreState("instance-a")
+    value = np.zeros((5, 2, 2), dtype=np.int16)
+    refs = [_ref(attempt=attempt) for attempt in (0, 1, 2)]
+    future_ref = _ref(target=4, attempt=1)
+    for ref in [*refs, future_ref]:
+        _put_state(state, ref, value)
+
+    assert state.retire_through(3) == {
+        "retired_through": 3,
+        "retired_objects": 3,
+        "retired_bytes": 3 * value.nbytes,
+        "remaining_objects": 1,
+    }
+    for ref in refs:
+        with pytest.raises(KeyError, match="Missing routed-experts object"):
+            state.get(
+                key=routed_experts_ref_lookup_key(ref), store_instance_id="instance-a"
+            )
+    with pytest.raises(RuntimeError, match="retired target-weight version"):
+        _put_state(state, _ref(attempt=3), value)
+    assert (
+        state.get(
+            key=routed_experts_ref_lookup_key(future_ref),
+            store_instance_id="instance-a",
+        ).object_ref
+        is value
+    )
+
+
+@pytest.mark.parametrize("attempt", [None, -1, True, False, 1.5, "1"])
+def test_validate_ref_rejects_invalid_attempt_index(attempt: Any) -> None:
+    with pytest.raises(
+        ValueError, match="attempt_index must be a non-negative integer"
+    ):
+        validate_routed_experts_ref(_ref() | {"attempt_index": attempt})
+
+
+def test_legacy_ref_without_attempt_matches_explicit_zero() -> None:
+    ref = _ref()
+    del ref["attempt_index"]
+    restored = json.loads(json.dumps(ref))
+
+    assert restored["schema"] == "nemo_rl.routed_experts_ref.v1"
+    assert validate_routed_experts_ref(restored) == ref
+    assert routed_experts_ref_lookup_key(restored) == routed_experts_ref_lookup_key(
+        _ref(attempt=0)
+    )
+    assert routed_experts_ref_lookup_key(restored) != routed_experts_ref_lookup_key(
+        _ref(attempt=1)
+    )
+
+
+def test_store_accepts_legacy_reads_but_rejects_legacy_live_inserts() -> None:
+    store = RoutedExpertsObjectStore.__ray_metadata__.modified_class("instance-a")
+    legacy_ref = _ref()
+    del legacy_ref["attempt_index"]
+    with pytest.raises(ValueError, match="inserts require an explicit attempt_index"):
+        store.put_ref(legacy_ref, [object()], 40)
+
+    zero_object, retry_object = object(), object()
+    store.put_ref(_ref(attempt=0), [zero_object], 40)
+    store.put_ref(_ref(attempt=1), [retry_object], 40)
+    assert store.get_ref(legacy_ref)["object_ref"] is zero_object
+    assert store.get_ref(_ref(attempt=1))["object_ref"] is retry_object
+    assert "attempt_index" not in legacy_ref
+
+
+def test_validate_ref_rejects_unknown_schema() -> None:
+    with pytest.raises(
+        ValueError, match="Expected a routed-experts Ray reference with schema"
+    ):
+        validate_routed_experts_ref(_ref() | {"schema": "unknown"})
+
+
+def test_writer_requires_explicit_attempt() -> None:
+    writer = RoutedExpertsStoreWriter.__new__(RoutedExpertsStoreWriter)
+    with pytest.raises(TypeError, match="attempt_index"):
+        writer.put(
+            torch.zeros(5, 2, 2, dtype=torch.int16),
+            request_id="request-a",
+            task_index=11,
+            rollout_index=2,
+            target_weight_version=3,
+        )
+
+
+@pytest.mark.parametrize("attempt", [0, 2])
+def test_writer_emits_attempt_in_reference(
+    monkeypatch: pytest.MonkeyPatch, attempt: int
+) -> None:
+    writer = RoutedExpertsStoreWriter.__new__(RoutedExpertsStoreWriter)
+    writer.store_name = "store-a"
+    writer.store_instance_id = "instance-a"
+    writer.store = MagicMock()
+    object_ref = object()
+    put = MagicMock(return_value=object_ref)
+    monkeypatch.setattr("nemo_rl.utils.routed_experts_ref.ray.put", put)
+    monkeypatch.setattr("nemo_rl.utils.routed_experts_ref.ray.get", lambda value: value)
+
+    ref = writer.put(
+        torch.zeros(5, 2, 2, dtype=torch.int16),
+        request_id="request-a",
+        task_index=11,
+        rollout_index=2,
+        attempt_index=attempt,
+        target_weight_version=3,
+    )
+
+    assert ref == _ref(attempt=attempt)
+    writer.store.put_ref.remote.assert_called_once_with(ref, [object_ref], 40)
+    assert put.call_count == 1
 
 
 def test_range_plan_and_scatter_preserve_interleaved_store_order():
