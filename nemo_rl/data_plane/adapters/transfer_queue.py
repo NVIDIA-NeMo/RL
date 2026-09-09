@@ -776,6 +776,12 @@ def _from_wire(td: TensorDict) -> TensorDict:
 class TQDataPlaneClient(DataPlaneClient):
     """Adapter façade — maps NeMo-RL calls onto TransferQueue's public API."""
 
+    # Class-level so ``put_samples`` stays readable on an instance built
+    # without ``__init__`` — ``object.__new__`` in tests, or a process that
+    # unpickles a client without running the constructor.
+    _gdr_requested: bool = False
+    _gdr_put_confirmed: bool = False
+
     def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
         """Construct a TQ-backed client.
 
