@@ -79,7 +79,10 @@ from nemo_rl.algorithms.single_controller_utils import (
     RolloutCheckpointConfig,
     setup_single_controller,
 )
-from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    TokenCaptureConfig,
+    validate_single_controller_config,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_DIRNAME,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
@@ -2039,15 +2042,14 @@ class TestMetricName:
     def test_val_metric_rejected_at_validation(self, tmp_path):
         # SC has no validation loop, so a "val:" metric would never be
         # collected and top-k retention would silently no-op. The config
-        # validation rejects it up front instead of warning at every save.
+        # validation (run by setup before the actor exists) rejects it up
+        # front instead of warning at every save.
         mc = _actor_master_config(
             tmp_path, max_num_steps=2, save_period=2, metric_name="val:accuracy"
         )
 
         with pytest.raises(ValueError, match="no validation loop yet"):
-            _run_train_pump(mc, _make_actor_args())
-
-        assert _step_dir_names(tmp_path / "checkpoints") == set()
+            validate_single_controller_config(mc)
 
     def test_train_metric_lands_in_training_info(self, tmp_path):
         mc = _actor_master_config(
@@ -2074,7 +2076,7 @@ class TestMetricName:
         )
 
         with pytest.raises(ValueError, match="is not usable on the SingleController"):
-            _run_train_pump(mc, _make_actor_args())
+            validate_single_controller_config(mc)
 
 
 # ── setup resume-path wiring ─────────────────────────────────────────────────

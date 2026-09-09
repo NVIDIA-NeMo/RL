@@ -151,55 +151,6 @@ def _init_controller(master_config, actor_args):
     )
 
 
-def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
-    monkeypatch.setattr(single_controller, "Logger", lambda _: object())
-    master_config = MasterConfig.model_construct(
-        policy={
-            "train_global_batch_size": 4,
-            "generation": {"colocated": {"enabled": False}},
-        },
-        grpo=GRPOConfig.model_construct(
-            num_prompts_per_step=2,
-            num_generations_per_prompt=4,
-        ),
-        async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
-        logger={},
-        env={},
-    )
-    tq_buffer = _InitBuffer()
-    actor_args = SimpleNamespace(
-        partition_id="rollout_data",
-        dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
-        dataloader=None,
-        weight_synchronizer=None,
-        advantage_estimator=None,
-        loss_fn=None,
-        tq_buffer=tq_buffer,
-        rollout_manager=_InitRolloutManager(tq_buffer),
-        env_handles={},
-        fleet_monitor=None,
-        generation_router=None,
-        train_cluster=None,
-        inference_cluster=None,
-    )
-    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"num_prompts_per_step \* num_generations_per_prompt \(8\) "
-            r"must equal policy.train_global_batch_size \(4\)"
-        ),
-    ):
-        controller_cls(
-            master_config=master_config,
-            actor_args=actor_args,
-            setup_timing_metrics=SetupTimingMetrics(),
-        )
-
-
 def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     monkeypatch,
     capsys: pytest.CaptureFixture[str],

@@ -328,22 +328,20 @@ class TestReadyFirstConfig:
                 id="gated_live_plus_lookahead",
             ),
             # Unordered + evicting: any full buffer is selectable, so one
-            # select's minimum is the floor. The instance-side oracle
-            # deliberately stays None -- setup enforces this bound.
+            # select's minimum is the floor on both sides.
             pytest.param(
                 WindowedSamplerConfig(max_staleness_versions=1),
                 3,
-                None,
+                3,
                 id="windowed_select_minimum",
             ),
-            # Custom logic can impose ordering constraints, so the
-            # fall-through keeps the conservative whole-step floor --
-            # computed without importing the target.
+            # A custom sampler's bound is unknowable without importing the
+            # target, so the config side reports None, like BaseSampler does.
             pytest.param(
                 CustomSamplerConfig(target="not_a_real_module:NotARealClass"),
-                4,
+                None,
                 _SKIP_INSTANCE,
-                id="custom_conservative_default",
+                id="custom_unknown",
             ),
         ],
     )
@@ -357,7 +355,9 @@ class TestReadyFirstConfig:
             == expected
         )
         if instance_expected is not _SKIP_INSTANCE:
-            sampler = create_sampler(FakeBuffer(), cfg)
+            sampler = create_sampler(
+                FakeBuffer(), cfg, min_groups_for_streaming_train=3
+            )
             assert (
                 sampler.required_buffer_capacity(groups_per_step=4) == instance_expected
             )

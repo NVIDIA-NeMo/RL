@@ -95,8 +95,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
-    validate_sampler_buffer_capacity,
-    validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
@@ -250,8 +248,6 @@ class SingleControllerActor:
             actor_args: Pre-built actor args from setup_single_controller.
             setup_timing_metrics: Driver-side setup timings; logged here (Logger isn't cloudpickleable).
         """
-        validate_single_controller_config(master_config)
-
         self._advantage_cfg = AdvantageConfig()
         self._partition_id: str = actor_args.partition_id
 
@@ -380,7 +376,11 @@ class SingleControllerActor:
             else actor_args.save_state.current_step
         )
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
-        self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
+        self._sampler = create_sampler(
+            self._buffer,
+            self._async_cfg.sampler,
+            min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
+        )
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
         if restored_dispatch_index is None:
             # Checkpoints predating exact sampler state reconstruct the original
@@ -413,13 +413,6 @@ class SingleControllerActor:
                 and self._sampler.supports_buffer_checkpoint
             )
         )
-        required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
-        validate_sampler_buffer_capacity(
-            self._async_cfg,
-            required_capacity=required_capacity,
-            sampler_name=type(self._sampler).__name__,
-        )
-
         # ── asyncio state ──────────────────────────────────────────────────
         # Commits and destructive clears use this lock with TQ snapshots. This
         # makes the native snapshot match the controller's metadata-only replay
