@@ -50,11 +50,15 @@ class MegatronGeneration(GenerationInterface):
     def effective_megatron_cfg(config: PolicyConfig) -> dict[str, Any]:
         """The megatron_cfg the generation workers actually run with.
 
-        Colocated generation shares the training model, so the training
-        values apply; non-colocated builds a dedicated policy with
+        Colocated generation uses a dedicated inference-layout model when its
+        resolved layout differs from training, and otherwise shares the training
+        model. Non-colocated generation always builds a dedicated policy from
         mcore_generation_config merged on top. Always returns a fresh dict.
         """
         if config["generation"]["colocated"]["enabled"]:
+            inference_mcfg = dedicated_inference_megatron_cfg(config)
+            if inference_mcfg is not None:
+                return inference_mcfg
             return dict(config["megatron_cfg"])
         return merged_inference_megatron_cfg(config)
 
@@ -64,11 +68,15 @@ class MegatronGeneration(GenerationInterface):
 
         Colocated reshard hosts a second, inference-layout model on the same ranks.
         """
-        layouts = [cls.effective_megatron_cfg(config)]
         if config["generation"]["colocated"]["enabled"]:
+            # Placement must satisfy both the resident training layout and any
+            # dedicated inference layout built on those same ranks.
+            layouts = [dict(config["megatron_cfg"])]
             inference_mcfg = dedicated_inference_megatron_cfg(config)
             if inference_mcfg is not None:
                 layouts.append(inference_mcfg)
+        else:
+            layouts = [cls.effective_megatron_cfg(config)]
         return max(
             max(
                 mcfg["tensor_model_parallel_size"] * mcfg["context_parallel_size"],
@@ -104,7 +112,7 @@ class MegatronGeneration(GenerationInterface):
         ``is_mp_coordinator`` predicate the workers use: tensor-parallel ranks
         are innermost, so the coordinator of each group is the first rank in it.
         """
-        mcore_cfg = config["generation"]["mcore_generation_config"]
+        mcore_cfg = MegatronGeneration.effective_megatron_cfg(config)
         model_parallel_size = (
             mcore_cfg["tensor_model_parallel_size"]
             * mcore_cfg["pipeline_model_parallel_size"]

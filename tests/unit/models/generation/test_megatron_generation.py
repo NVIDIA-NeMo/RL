@@ -1009,14 +1009,20 @@ def test_reserve_http_server_addresses_pins_every_frontend_bundle(
         world_size=lambda: 4,
     )
     config = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": model_parallel_size,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "context_parallel_size": 1,
+        },
         "generation": {
             "colocated": {"enabled": True},
             "mcore_generation_config": {
-                "tensor_model_parallel_size": model_parallel_size,
-                "pipeline_model_parallel_size": 1,
-                "context_parallel_size": 1,
+                # This is an override block, not a complete Megatron config.
+                "expose_http_server": True,
             },
-        }
+        },
     }
 
     urls, rank_to_port, holders = MegatronGeneration.reserve_http_server_addresses(
@@ -1039,3 +1045,29 @@ def test_reserve_http_server_addresses_pins_every_frontend_bundle(
 
     assert urls == [f"http://10.0.0.{i}:4321/v1" for i in range(len(expected_ranks))]
     assert all(port == 4321 for port in rank_to_port.values())
+
+
+def test_frontend_ranks_uses_dedicated_colocated_inference_layout():
+    """A colocated reshard reserves frontends for its serving layout, not training TP."""
+    cluster = SimpleNamespace(world_size=lambda: 2)
+    config = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 2,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "context_parallel_size": 1,
+            "transformer_impl": "transformer_engine",
+            "sequence_parallel": False,
+        },
+        "generation": {
+            "colocated": {"enabled": True},
+            "mcore_generation_config": {
+                "tensor_model_parallel_size": 1,
+                "transformer_impl": "inference_optimized",
+                "sequence_parallel": True,
+            },
+        },
+    }
+
+    assert MegatronGeneration.frontend_ranks(cluster, config) == [0, 1]
