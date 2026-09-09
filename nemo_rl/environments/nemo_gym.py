@@ -42,17 +42,21 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.gym_checkpoint import (
+    GYM_AGENT_CONTINUATION_INDEX_FEATURE,
     GYM_AGENT_COMPLETION_ACK_PATH,
     GYM_AGENT_CHECKPOINT_PREFIX,
     GYM_CHECKPOINT_CAPABILITIES_PATH,
     GYM_CHECKPOINT_CONTROL_PREFIX,
+    GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE,
     GYM_MODEL_ADMISSION_PREFIX,
     GYM_MODEL_CHECKPOINT_PREFIX,
     GYM_RESOURCES_CHECKPOINT_PREFIX,
+    GymAgentCheckpointDirectoryRequest,
     GymAgentCommitResponse,
     GymAgentPrepareResponse,
     GymAgentRestoreResponse,
     GymAgentResumeResponse,
+    GymCheckpointArtifactReference,
     GymCheckpointCommitResult,
     GymCheckpointControlRequest,
     GymCheckpointDirectoryRequest,
@@ -67,6 +71,8 @@ from nemo_rl.environments.gym_checkpoint import (
     GymControlCapabilities,
     GymDiscoveredParticipant,
     GymExecutionIdentity,
+    GymModelCheckpointCommitRequest,
+    GymModelCheckpointRestoreRequest,
     GymModelCommitResponse,
     GymModelPrepareResponse,
     GymModelRestoreResponse,
@@ -1177,13 +1183,23 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_dir: str,
     ) -> dict[str, Any]:
         """Commit every stateful participant into a caller-owned temp directory."""
-        request = GymCheckpointDirectoryRequest(
+        common_request = GymCheckpointDirectoryRequest(
             checkpoint_id=checkpoint_id,
             deadline_ts=deadline_ts,
             checkpoint_dir=checkpoint_dir,
         ).model_dump(mode="json")
         results: list[GymParticipantCommitResult] = []
-        for discovered in self._ordered_checkpoint_participants():
+        continuation_indexes: list[GymCheckpointArtifactReference] = []
+        component_order = {
+            "responses_api_agents": 0,
+            "responses_api_models": 1,
+            "resources_servers": 2,
+        }
+        participants = sorted(
+            self._checkpoint_participants(),
+            key=lambda item: component_order[item.participant.component],
+        )
+        for discovered in participants:
             participant = discovered.participant
             capabilities = discovered.capabilities
             if capabilities.checkpoint_mode != "export_restore":
@@ -1196,6 +1212,17 @@ Depending on your data shape, you may want to change these values."""
             if participant.component == "responses_api_models":
                 if capabilities.instance_role != "policy":
                     continue
+                request = common_request
+                if (
+                    GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
+                    in capabilities.features
+                ):
+                    request = GymModelCheckpointCommitRequest(
+                        checkpoint_id=checkpoint_id,
+                        deadline_ts=deadline_ts,
+                        checkpoint_dir=checkpoint_dir,
+                        continuation_indexes=continuation_indexes,
+                    ).model_dump(mode="json")
                 payload = GymModelCommitResponse.model_validate(
                     await self._control(
                         "POST",
@@ -1205,7 +1232,23 @@ Depending on your data shape, you may want to change these values."""
                         json=request,
                     )
                 )
+                if (
+                    GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
+                    in capabilities.features
+                    and payload.storage_reference_index is None
+                ):
+                    raise RuntimeError(
+                        "Gym policy model advertised external-storage reference "
+                        "indexes but omitted one from checkpoint commit"
+                    )
             elif participant.component == "responses_api_agents":
+                request = common_request
+                if GYM_AGENT_CONTINUATION_INDEX_FEATURE in capabilities.features:
+                    request = GymAgentCheckpointDirectoryRequest(
+                        checkpoint_id=checkpoint_id,
+                        deadline_ts=deadline_ts,
+                        checkpoint_dir=checkpoint_dir,
+                    ).model_dump(mode="json")
                 payload = GymAgentCommitResponse.model_validate(
                     await self._control(
                         "POST",
@@ -1215,7 +1258,15 @@ Depending on your data shape, you may want to change these values."""
                         json=request,
                     )
                 )
+                if GYM_AGENT_CONTINUATION_INDEX_FEATURE in capabilities.features:
+                    if payload.continuation_index is None:
+                        raise RuntimeError(
+                            "Gym agent advertised continuation indexes but "
+                            "omitted one from checkpoint commit"
+                        )
+                    continuation_indexes.append(payload.continuation_index)
             else:
+                request = common_request
                 payload = GymResourcesCommitResponse.model_validate(
                     await self._control(
                         "POST",
@@ -1250,7 +1301,7 @@ Depending on your data shape, you may want to change these values."""
         source_checkpoint_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Restore every stateful participant but leave admission paused."""
-        request = GymCheckpointDirectoryRequest(
+        common_request = GymCheckpointDirectoryRequest(
             checkpoint_id=checkpoint_id,
             deadline_ts=deadline_ts,
             checkpoint_dir=checkpoint_dir,
@@ -1269,6 +1320,16 @@ Depending on your data shape, you may want to change these values."""
             if participant.component == "responses_api_models":
                 if capabilities.instance_role != "policy":
                     continue
+                request = common_request
+                if (
+                    GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
+                    in capabilities.features
+                ):
+                    request = GymModelCheckpointRestoreRequest(
+                        checkpoint_id=checkpoint_id,
+                        deadline_ts=deadline_ts,
+                        checkpoint_dir=checkpoint_dir,
+                    ).model_dump(mode="json")
                 payload = GymModelRestoreResponse.model_validate(
                     await self._control(
                         "POST",
@@ -1279,6 +1340,13 @@ Depending on your data shape, you may want to change these values."""
                     )
                 )
             elif participant.component == "responses_api_agents":
+                request = common_request
+                if GYM_AGENT_CONTINUATION_INDEX_FEATURE in capabilities.features:
+                    request = GymAgentCheckpointDirectoryRequest(
+                        checkpoint_id=checkpoint_id,
+                        deadline_ts=deadline_ts,
+                        checkpoint_dir=checkpoint_dir,
+                    ).model_dump(mode="json")
                 payload = GymAgentRestoreResponse.model_validate(
                     await self._control(
                         "POST",
@@ -1289,6 +1357,7 @@ Depending on your data shape, you may want to change these values."""
                     )
                 )
             else:
+                request = common_request
                 payload = GymResourcesRestoreResponse.model_validate(
                     await self._control(
                         "POST",

@@ -860,6 +860,7 @@ class TestSetup:
                         "num_workers": 1,
                     },
                     "instance_role": "policy",
+                    "features": ["external_storage_reference_index_v1"],
                 },
                 {
                     "participant": {
@@ -876,7 +877,10 @@ class TestSetup:
                         "num_workers": 1,
                     },
                     "instance_role": None,
-                    "features": ["completed_result_acknowledgement"],
+                    "features": [
+                        "agent_continuation_index_v1",
+                        "completed_result_acknowledgement",
+                    ],
                 }
             ],
         }

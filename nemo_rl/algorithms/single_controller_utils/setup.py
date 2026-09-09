@@ -98,9 +98,11 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.gym_checkpoint import (
+    GymCheckpointRestoreResult,
     GymCheckpointTopology,
     gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
+    validate_gym_checkpoint_restore_artifacts,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
@@ -1591,18 +1593,7 @@ def setup_single_controller(
         discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
         gym_checkpoint_topology = GymCheckpointTopology.model_validate(discovered)
         if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
-            unsupported_agents = [
-                contract.participant.participant_name
-                for contract in gym_checkpoint_topology.participants
-                if contract.participant.component == "responses_api_agents"
-                and "completed_result_acknowledgement" not in contract.features
-            ]
-            if unsupported_agents:
-                raise RuntimeError(
-                    "Gym participant checkpointing requires completed-result "
-                    "acknowledgement support from every agent participant; "
-                    f"missing={unsupported_agents!r}"
-                )
+            gym_checkpoint_topology.validate_turn_recovery_capabilities()
         if resolved_snapshot is not None:
             saved_topology_fingerprint = (
                 resolved_snapshot.manifest.gym_topology_fingerprint
@@ -1690,13 +1681,19 @@ def setup_single_controller(
         restore_deadline_ts = (
             time.time() + rollout_checkpoint_cfg.gym.prepare_timeout_s
         )
-        ray.get(
-            awaitable_gym_actor.restore_checkpoint.remote(
-                gym_checkpoint_restore_operation_id,
-                restore_deadline_ts,
-                str(resolved_snapshot.path),
-                saved_gym_checkpoint.checkpoint_id,
+        restored_gym_checkpoint = GymCheckpointRestoreResult.model_validate(
+            ray.get(
+                awaitable_gym_actor.restore_checkpoint.remote(
+                    gym_checkpoint_restore_operation_id,
+                    restore_deadline_ts,
+                    str(resolved_snapshot.path),
+                    saved_gym_checkpoint.checkpoint_id,
+                )
             )
+        )
+        validate_gym_checkpoint_restore_artifacts(
+            saved_gym_checkpoint,
+            restored_gym_checkpoint,
         )
 
     if use_nemo_gym:

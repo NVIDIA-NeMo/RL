@@ -624,7 +624,7 @@ class _FakeGymCheckpointActor:
             raise OSError("Gym checkpoint storage failed")
         path = Path(checkpoint_dir) / "gym" / "agent-manifest.json"
         path.parent.mkdir(parents=True)
-        path.write_text("{}")
+        path.write_text('{"files": {}}')
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         participant = {
             "server_name": "agent-route",

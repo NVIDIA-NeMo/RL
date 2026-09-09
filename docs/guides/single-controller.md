@@ -142,16 +142,24 @@ rollout_checkpointing:
 Single Controller first closes new rollout admission, acknowledges completed
 Gym executions that are already owned by canonical TQ rows, and asks Gym to
 park the remaining work. Gym writes its participant manifests into the
-unpublished snapshot directory. Only then does Single Controller take the
-short data-plane barrier and save TQ plus replay and recovery metadata. The
-outer snapshot publishes atomically after all participant manifest digests
-validate. On failure, Gym is resumed and the previous committed snapshot stays
-authoritative.
+unpublished snapshot directory. Agent participants commit first and return a
+compact continuation index. The policy model uses those roots to package only
+active lineage and returns a digest-bound index of the TQ staging keys those
+continuations require. Only then does Single Controller take the short
+data-plane barrier, verify those keys, and save TQ plus replay and recovery
+metadata. The outer snapshot binds the Gym sidecar coordinates and participant
+manifest digests and publishes atomically. On failure, Gym is resumed and the
+previous committed snapshot stays authoritative.
 
-This mode requires a Gym revision that advertises the checkpoint protocol and
-completed-result acknowledgement feature. It also requires
+This mode requires a Gym revision that advertises completed-result
+acknowledgement, agent continuation indexes, and external-storage reference
+indexes. It also requires
 `token_capture.enabled: true`; NeMo-RL never tells Gym to release a completed
 terminal result until the canonical TQ and replay-buffer commit has succeeded.
+On restore, Gym validates and rehydrates its own artifacts, and NeMo-RL checks
+that Gym reports the same sidecar digests and that every indexed TQ row exists.
+NeMo-RL retains a full-lineage scan only for restoring snapshots created before
+the sidecar contract existed.
 Use `restore_mode: latest`: full trainer checkpoints do not yet contain Gym
 participant state, so startup fails safely if no compatible periodic rollout
 snapshot exists for the selected trainer anchor.

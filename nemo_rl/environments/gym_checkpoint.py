@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Annotated, Any, Literal, Mapping, TypeAlias
+from typing import Annotated, Any, Literal, Mapping, TypeAlias, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
@@ -37,6 +37,10 @@ GYM_AGENT_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/agent-checkpoint
 GYM_AGENT_COMPLETION_ACK_PATH = f"{GYM_AGENT_CHECKPOINT_PREFIX}/acknowledge-completed"
 GYM_RESOURCES_CHECKPOINT_PREFIX = (
     f"{GYM_CHECKPOINT_CONTROL_PREFIX}/resources-checkpoint"
+)
+GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
+GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = (
+    "external_storage_reference_index_v1"
 )
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -248,6 +252,52 @@ class GymCheckpointTopology(_StrictWireModel):
                 f"unexpected={sorted(actual - expected)!r}"
             )
 
+    def validate_turn_recovery_capabilities(self) -> None:
+        """Require the Gym features used by coordinated turn recovery."""
+        missing_acknowledgement: list[str] = []
+        missing_continuation_index: list[str] = []
+        missing_storage_reference_index: list[str] = []
+        for contract in self.participants:
+            if contract.checkpoint_mode != "export_restore":
+                continue
+            if contract.participant.component == "responses_api_agents":
+                if "completed_result_acknowledgement" not in contract.features:
+                    missing_acknowledgement.append(
+                        contract.participant.participant_name
+                    )
+                if GYM_AGENT_CONTINUATION_INDEX_FEATURE not in contract.features:
+                    missing_continuation_index.append(
+                        contract.participant.participant_name
+                    )
+            elif (
+                contract.participant.component == "responses_api_models"
+                and contract.instance_role == "policy"
+                and GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
+                not in contract.features
+            ):
+                missing_storage_reference_index.append(
+                    contract.participant.participant_name
+                )
+
+        if missing_acknowledgement:
+            raise RuntimeError(
+                "Gym participant checkpointing requires completed-result "
+                "acknowledgement support from every stateful agent participant; "
+                f"missing={missing_acknowledgement!r}"
+            )
+        if missing_continuation_index:
+            raise RuntimeError(
+                "Gym participant checkpointing requires continuation-index "
+                "support from every stateful agent participant; "
+                f"missing={missing_continuation_index!r}"
+            )
+        if missing_storage_reference_index:
+            raise RuntimeError(
+                "Gym participant checkpointing requires external-storage "
+                "reference indexes from every stateful policy model; "
+                f"missing={missing_storage_reference_index!r}"
+            )
+
 
 class GymCheckpointControlRequest(_StrictWireModel):
     """Fields shared by all Gym checkpoint control requests."""
@@ -297,6 +347,41 @@ class GymCheckpointDirectoryRequest(GymCheckpointControlRequest):
     """Checkpoint request that reads or writes one shared snapshot directory."""
 
     checkpoint_dir: str = Field(min_length=1)
+
+
+class GymCheckpointArtifactReference(_StrictWireModel):
+    """Digest-bound coordinate for a Gym-owned checkpoint sidecar."""
+
+    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
+    relative_path: str = Field(min_length=1)
+    sha256: Sha256Digest
+    records: NonNegativeInt
+    bytes: NonNegativeInt
+
+    @model_validator(mode="after")
+    def validate_relative_path(self) -> "GymCheckpointArtifactReference":
+        path = Path(self.relative_path)
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            raise ValueError("Gym checkpoint artifact path must be safely relative")
+        return self
+
+
+class GymAgentCheckpointDirectoryRequest(GymCheckpointDirectoryRequest):
+    """Agent commit/restore request opting into continuation coordinates."""
+
+    include_continuation_index: bool = True
+
+
+class GymModelCheckpointCommitRequest(GymCheckpointDirectoryRequest):
+    """Model commit request scoped to agent-owned continuation roots."""
+
+    continuation_indexes: list[GymCheckpointArtifactReference]
+
+
+class GymModelCheckpointRestoreRequest(GymCheckpointDirectoryRequest):
+    """Model restore request asking Gym to return its storage index."""
+
+    include_storage_reference_index: bool = True
 
 
 class GymWorkerAcknowledgements(_StrictWireModel):
@@ -417,12 +502,15 @@ class GymModelCommitResponse(_StrictWireModel):
     rollouts: NonNegativeInt
     rows: NonNegativeInt
     excluded_tombstoned: NonNegativeInt
+    excluded_inactive: NonNegativeInt = 0
     manifest_digest: Sha256Digest
+    storage_reference_index: GymCheckpointArtifactReference | None = None
 
 
 class GymAgentCommitResponse(_StrictWireModel):
     records: NonNegativeInt
     manifest_digest: Sha256Digest
+    continuation_index: GymCheckpointArtifactReference | None = None
 
 
 class GymResourcesCommitResponse(_StrictWireModel):
@@ -517,18 +605,14 @@ def validate_gym_checkpoint_manifests(
             )
 
 
-def gym_checkpoint_staging_keys(
+def _legacy_gym_checkpoint_staging_keys(
     checkpoint_dir: Path,
     checkpoint: GymCheckpointCommitResult,
 ) -> set[str]:
-    """Return TQ staging keys required by committed Gym continuations.
+    """Reconstruct staging ownership from pre-sidecar Gym checkpoints.
 
-    Gym owns token-free call lineage while TQ owns the referenced tensors. RL
-    must treat both as one checkpoint ownership graph; otherwise restore-time
-    orphan cleanup can delete an unfinished turn's staged model calls before
-    the restored agent continues from its boundary. Completed, acknowledged
-    executions are deliberately excluded: their canonical training rows own the
-    durable result and their old model lineage no longer owns staging tensors.
+    This deliberately expensive fallback preserves restore compatibility with
+    snapshots produced before Gym exported a storage-reference index.
     """
     validate_gym_checkpoint_manifests(checkpoint_dir, checkpoint)
     root = checkpoint_dir.resolve()
@@ -716,17 +800,144 @@ def gym_checkpoint_staging_keys(
     return staging_keys
 
 
+class GymExternalStorageReference(_StrictWireModel):
+    """One TQ staging row required by a parked Gym continuation."""
+
+    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
+    capture_key: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
+    boundary_model_call_id: str = Field(min_length=1)
+    kind: Literal["token_capture_staging"] = "token_capture_staging"
+    key: str = Field(min_length=1)
+
+
+_ArtifactRecord = TypeVar("_ArtifactRecord", bound=_StrictWireModel)
+
+
+def _read_jsonl_artifact(
+    checkpoint_dir: Path,
+    reference: GymCheckpointArtifactReference,
+    record_type: type[_ArtifactRecord],
+) -> list[_ArtifactRecord]:
+    """Validate and parse a Gym-owned JSONL sidecar in one pass."""
+    root = checkpoint_dir.resolve()
+    path = (root / reference.relative_path).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise ValueError(
+            "Gym checkpoint artifact escapes the checkpoint directory: "
+            f"{reference.relative_path!r}"
+        ) from error
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Gym checkpoint artifact is missing: {reference.relative_path!r}"
+        )
+
+    digest = hashlib.sha256()
+    byte_count = 0
+    records: list[_ArtifactRecord] = []
+    with path.open("rb") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            digest.update(line)
+            byte_count += len(line)
+            if not line.strip():
+                continue
+            try:
+                records.append(record_type.model_validate_json(line))
+            except Exception as error:
+                raise ValueError(
+                    "invalid Gym checkpoint artifact row: "
+                    f"path={reference.relative_path!r}, line={line_number}"
+                ) from error
+
+    actual_digest = digest.hexdigest()
+    if actual_digest != reference.sha256:
+        raise ValueError(
+            "Gym checkpoint artifact digest mismatch: "
+            f"path={reference.relative_path!r}, expected={reference.sha256}, "
+            f"actual={actual_digest}"
+        )
+    if byte_count != reference.bytes:
+        raise ValueError(
+            "Gym checkpoint artifact byte count mismatch: "
+            f"path={reference.relative_path!r}, expected={reference.bytes}, "
+            f"actual={byte_count}"
+        )
+    if len(records) != reference.records:
+        raise ValueError(
+            "Gym checkpoint artifact record count mismatch: "
+            f"path={reference.relative_path!r}, expected={reference.records}, "
+            f"actual={len(records)}"
+        )
+    return records
+
+
+def gym_checkpoint_staging_keys(
+    checkpoint_dir: Path,
+    checkpoint: GymCheckpointCommitResult,
+) -> set[str]:
+    """Return the TQ staging rows required by committed Gym continuations.
+
+    New checkpoints expose a compact, digest-bound storage-reference index, so
+    RL does not inspect Gym's private agent and model-lineage formats. A legacy
+    full scan is retained solely to restore older committed snapshots.
+    """
+    validate_gym_checkpoint_manifests(checkpoint_dir, checkpoint)
+    model_results = [
+        result
+        for result in checkpoint.participants
+        if result.participant.component == "responses_api_models"
+    ]
+    indexed_results = [
+        result
+        for result in model_results
+        if isinstance(result.payload, GymModelCommitResponse)
+        and result.payload.storage_reference_index is not None
+    ]
+    if not indexed_results:
+        return _legacy_gym_checkpoint_staging_keys(checkpoint_dir, checkpoint)
+    if len(indexed_results) != len(model_results):
+        raise ValueError(
+            "Gym checkpoint mixes indexed and legacy model participants"
+        )
+
+    references_by_key: dict[str, GymExternalStorageReference] = {}
+    for result in indexed_results:
+        payload = result.payload
+        if not isinstance(payload, GymModelCommitResponse):
+            raise TypeError(
+                "Gym model participant returned a non-model checkpoint payload"
+            )
+        reference = payload.storage_reference_index
+        assert reference is not None
+        records = _read_jsonl_artifact(
+            checkpoint_dir,
+            reference,
+            GymExternalStorageReference,
+        )
+        for raw_record in records:
+            if raw_record.key in references_by_key:
+                raise ValueError(
+                    "Gym checkpoint repeats an external storage key: "
+                    f"key={raw_record.key!r}"
+                )
+            references_by_key[raw_record.key] = raw_record
+    return set(references_by_key)
+
+
 class GymModelRestoreResponse(_StrictWireModel):
     rollouts: NonNegativeInt
     rows: NonNegativeInt
     checkpoint_id: str | None = None
     tombstones: list[GymExecutionIdentity]
     source_attempts: list[GymExecutionIdentity]
+    storage_reference_index: GymCheckpointArtifactReference | None = None
 
 
 class GymAgentRestoreResponse(_StrictWireModel):
     records: NonNegativeInt
     source_checkpoint_id: str = Field(min_length=1)
+    continuation_index: GymCheckpointArtifactReference | None = None
 
 
 class GymResourcesRestoreResponse(_StrictWireModel):
@@ -748,6 +959,68 @@ class GymParticipantRestoreResult(_StrictWireModel):
 class GymCheckpointRestoreResult(_StrictWireModel):
     checkpoint_id: str
     participants: list[GymParticipantRestoreResult]
+
+    @model_validator(mode="after")
+    def validate_participants(self) -> "GymCheckpointRestoreResult":
+        identities = [
+            (
+                result.participant.server_name,
+                result.participant.component,
+                result.participant.participant_name,
+            )
+            for result in self.participants
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("Gym checkpoint restore contains duplicate participants")
+        return self
+
+
+def validate_gym_checkpoint_restore_artifacts(
+    committed: GymCheckpointCommitResult,
+    restored: GymCheckpointRestoreResult,
+) -> None:
+    """Require Gym restore to report the exact sidecars saved in the snapshot."""
+
+    def identity_key(
+        participant: GymParticipantIdentity,
+    ) -> tuple[str, str, str]:
+        return (
+            participant.server_name,
+            participant.component,
+            participant.participant_name,
+        )
+
+    restored_by_participant = {
+        identity_key(result.participant): result for result in restored.participants
+    }
+    for committed_result in committed.participants:
+        expected: GymCheckpointArtifactReference | None = None
+        if isinstance(committed_result.payload, GymAgentCommitResponse):
+            expected = committed_result.payload.continuation_index
+        elif isinstance(committed_result.payload, GymModelCommitResponse):
+            expected = committed_result.payload.storage_reference_index
+        if expected is None:
+            continue
+
+        restored_result = restored_by_participant.get(
+            identity_key(committed_result.participant)
+        )
+        if restored_result is None:
+            raise ValueError(
+                "Gym restore omitted a participant with checkpoint artifacts: "
+                f"participant={committed_result.participant!r}"
+            )
+        actual: GymCheckpointArtifactReference | None = None
+        if isinstance(restored_result.payload, GymAgentRestoreResponse):
+            actual = restored_result.payload.continuation_index
+        elif isinstance(restored_result.payload, GymModelRestoreResponse):
+            actual = restored_result.payload.storage_reference_index
+        if actual != expected:
+            raise ValueError(
+                "Gym restore reported a different checkpoint artifact: "
+                f"participant={committed_result.participant!r}, "
+                f"expected={expected!r}, actual={actual!r}"
+            )
 
 
 class GymModelResumeResponse(_StrictWireModel):
