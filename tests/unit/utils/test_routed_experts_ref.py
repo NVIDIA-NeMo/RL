@@ -19,10 +19,10 @@ import pytest
 import torch
 
 from nemo_rl.utils.routed_experts_ref import (
+    ROUTED_EXPERTS_RAY_NAMESPACE,
     ROUTED_EXPERTS_REF_DTYPE,
     ROUTED_EXPERTS_REF_KEY,
     ROUTED_EXPERTS_REF_SCHEMA,
-    ROUTED_EXPERTS_RAY_NAMESPACE,
     RoutedExpertsStoreState,
     _assemble_routed_experts_range_results,
     _materialize_normalized_routed_experts_with_ray_transport,

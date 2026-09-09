@@ -1461,9 +1461,9 @@ class TestMakeProcessedMicrobatchIterator:
 
         input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
         input_lengths = torch.tensor([3, 2])
-        rectangular_routes = torch.arange(
-            2 * 4 * 3 * 2, dtype=torch.int16
-        ).reshape(2, 4, 3, 2)
+        rectangular_routes = torch.arange(2 * 4 * 3 * 2, dtype=torch.int16).reshape(
+            2, 4, 3, 2
+        )
         packed_routes = rectangular_routes[:, :3].reshape(1, 6, 3, 2)
         cp_local_routes = packed_routes[:, ::2]
         data_dict = BatchedDataDict(

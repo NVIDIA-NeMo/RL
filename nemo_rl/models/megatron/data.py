@@ -777,9 +777,7 @@ def _verify_r3_trace_cp_token_alignment(
 
     routed_source_rows = source_rows.to(device=source_routed_experts.device)
     routed_source_cols = source_cols.to(device=source_routed_experts.device)
-    expected_routed = source_routed_experts[
-        routed_source_rows, routed_source_cols
-    ].to(
+    expected_routed = source_routed_experts[routed_source_rows, routed_source_cols].to(
         device=flat_routed.device,
         dtype=flat_routed.dtype,
     )
