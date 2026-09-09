@@ -758,6 +758,9 @@ def _bare_generation_for_recover():
     del gen._recover
     gen.all_engines = ["survivor", None]
     gen.needs_offload = False
+    # This fixture owns no real actors. A delayed destructor must not issue
+    # shutdown RPCs into another test's Ray mocks.
+    gen.shutdown = lambda: True
     return gen
 
 
@@ -999,6 +1002,13 @@ def test_rollback_deregisters_each_logical_engine_before_actor_kill(
         ("kill", 4),
         ("kill", 5),
     ]
-    assert all(call.kwargs == {"timeout": 7.5} for call in get.call_args_list)
+    shutdown_refs = [actor.shutdown.remote.return_value for actor in actors[2:]]
+    shutdown_calls = [
+        call
+        for call in get.call_args_list
+        if any(call.args[0] is ref for ref in shutdown_refs)
+    ]
+    assert len(shutdown_calls) == 4
+    assert all(call.kwargs == {"timeout": 7.5} for call in shutdown_calls)
     assert gen.all_engines == [*actors[:2], None, None, None, None]
     assert gen.num_new_engines == 3
