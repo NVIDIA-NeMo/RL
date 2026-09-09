@@ -498,7 +498,7 @@ def _is_fp8_weight(name, model):
 
 
 def _is_fp8_grouped_moe_expert(name: str, model: Any) -> bool:
-    experts_module = _get_module_from_param_name(model, name)
+    experts_module = get_module_from_param_name(model, name)
     return (
         isinstance(experts_module, RoutedExperts)
         and experts_module.w13_weight.dtype == torch.float8_e4m3fn
