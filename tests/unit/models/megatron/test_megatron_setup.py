@@ -705,6 +705,37 @@ class TestApplyParallelismConfig:
 
 
 @pytest.mark.mcore
+class TestApplyMultimodalConfig:
+    def test_maps_legacy_omni_freeze_controls(self):
+        from nemo_rl.models.megatron.setup import _apply_multimodal_config
+
+        model_cfg = SimpleNamespace(
+            freeze_vision_model=False,
+            freeze_vision_projection=False,
+            freeze_sound_encoder=False,
+            freeze_sound_projection=False,
+            radio_force_cpe_eval_mode=False,
+        )
+        config = {
+            "megatron_cfg": {
+                "freeze_vision_encoder": False,
+                "freeze_vision_projector": False,
+                "freeze_audio_encoder": True,
+                "freeze_audio_projector": True,
+                "radio_force_cpe_eval_mode": True,
+            }
+        }
+
+        _apply_multimodal_config(model_cfg, config)
+
+        assert model_cfg.freeze_vision_model is False
+        assert model_cfg.freeze_vision_projection is False
+        assert model_cfg.freeze_sound_encoder is True
+        assert model_cfg.freeze_sound_projection is True
+        assert model_cfg.radio_force_cpe_eval_mode is True
+
+
+@pytest.mark.mcore
 class TestApplyMoeConfig:
     """Tests for _apply_moe_config function."""
 
@@ -979,7 +1010,7 @@ class TestApplyMoeConfig:
 
         model_cfg = MagicMock()
         config = self._base_moe_cfg(
-            expert_model_parallel_size=144,
+            expert_model_parallel_size=128,
             moe_flex_dispatcher_backend="hybridep",
             moe_hybridep_num_sms=24,
             hybridep_num_ranks_per_nvlink_domain=72,
@@ -997,118 +1028,6 @@ class TestApplyMoeConfig:
         # Bool False path also tested in dedicated test below; here ensure no auto warning fired.
         hybridep_warns = [w for w in caught if "HybridEP" in str(w.message)]
         assert hybridep_warns == []
-
-    def test_hybridep_logs_effective_environment_on_rank_zero(
-        self, monkeypatch, capsys
-    ):
-        """The rank-zero diagnostic reports validated environment topology."""
-        from nemo_rl.models.megatron.setup import _apply_moe_config
-
-        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
-        monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
-        monkeypatch.setenv("NVLINK_DOMAIN_SIZE", "8")
-        monkeypatch.setenv("USE_MNNVL", "0")
-
-        _apply_moe_config(
-            MagicMock(),
-            self._base_moe_cfg(
-                expert_model_parallel_size=32,
-                moe_flex_dispatcher_backend="hybridep",
-            ),
-        )
-
-        output = capsys.readouterr().out
-        assert "[HybridEP topology]" in output
-        assert "ep_size=32" in output
-        assert "ranks_per_domain=8 source=environment" in output
-        assert "nvlink_domain_size=8 source=environment" in output
-        assert "use_mnnvl=0 source=environment" in output
-        assert "combine_chunk_tokens=128 source=environment" in output
-
-    def test_hybridep_typed_config_precedence_is_logged(self, monkeypatch, capsys):
-        """Typed config overrides conflicting rank and MNNVL environment values."""
-        from nemo_rl.models.megatron.setup import _apply_moe_config
-
-        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "16")
-        monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
-        monkeypatch.setenv("NVLINK_DOMAIN_SIZE", "8")
-        monkeypatch.setenv("USE_MNNVL", "1")
-
-        _apply_moe_config(
-            MagicMock(),
-            self._base_moe_cfg(
-                expert_model_parallel_size=32,
-                moe_flex_dispatcher_backend="hybridep",
-                hybridep_num_ranks_per_nvlink_domain=8,
-                hybridep_use_mnnvl=False,
-            ),
-        )
-
-        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "8"
-        assert os.environ["USE_MNNVL"] == "0"
-        output = capsys.readouterr().out
-        assert "ranks_per_domain=8 source=megatron_cfg" in output
-        assert "use_mnnvl=0 source=megatron_cfg" in output
-
-    def test_hybridep_logs_only_on_rank_zero(self, monkeypatch, capsys):
-        """Nonzero ranks do not emit the process-wide topology diagnostic."""
-        from nemo_rl.models.megatron.setup import _apply_moe_config
-
-        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
-        monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
-        monkeypatch.setenv("NVLINK_DOMAIN_SIZE", "8")
-        monkeypatch.setenv("USE_MNNVL", "0")
-        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
-
-        _apply_moe_config(
-            MagicMock(),
-            self._base_moe_cfg(
-                expert_model_parallel_size=32,
-                moe_flex_dispatcher_backend="hybridep",
-            ),
-        )
-
-        assert capsys.readouterr().out == ""
-
-    @pytest.mark.parametrize(
-        ("name", "value", "message"),
-        [
-            (
-                "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN",
-                "0",
-                "must be positive",
-            ),
-            (
-                "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN",
-                "3",
-                "must divide",
-            ),
-            ("NVLINK_DOMAIN_SIZE", "0", "must be positive"),
-            ("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "0", "must be positive"),
-            ("USE_MNNVL", "2", "must be one of"),
-        ],
-    )
-    def test_hybridep_rejects_invalid_topology_environment(
-        self, monkeypatch, name, value, message
-    ):
-        """Invalid HybridEP topology environment values fail before model setup."""
-        from nemo_rl.models.megatron.setup import _apply_moe_config
-
-        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
-        monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
-        monkeypatch.setenv("NVLINK_DOMAIN_SIZE", "8")
-        monkeypatch.setenv("USE_MNNVL", "0")
-        monkeypatch.setenv(name, value)
-
-        with pytest.raises(ValueError, match=message):
-            _apply_moe_config(
-                MagicMock(),
-                self._base_moe_cfg(
-                    expert_model_parallel_size=8,
-                    moe_flex_dispatcher_backend="hybridep",
-                ),
-            )
 
     def test_hybridep_use_mnnvl_explicit_false(self, monkeypatch):
         """hybridep_use_mnnvl=False → USE_MNNVL='0'."""
@@ -4296,3 +4215,90 @@ class TestForceSyncOptimizerFp32FromModel:
                 f"DistributedOptimizer no longer references {name!r}; "
                 "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
             )
+
+
+@pytest.mark.mcore
+class TestForceSyncModelFromOptimizerFp32:
+    """Regression tests for the first forward after a full optimizer resume."""
+
+    @staticmethod
+    def _make_distrib_opt(hdo_cls, model_values=(0.0, 0.0), master_values=(3.0, 4.0)):
+        model_param = torch.tensor(model_values)
+        fp32_master = torch.tensor(master_values)
+
+        class _HDO(hdo_cls):
+            def __init__(self):
+                self.param_to_fp32_param = {model_param: fp32_master}
+
+        model_chunk = MagicMock()
+        distrib_opt = SimpleNamespace(
+            optimizer=_HDO(),
+            model_chunks=[model_chunk],
+        )
+        return SimpleNamespace(
+            distrib_opt=distrib_opt,
+            model_param=model_param,
+            fp32_master=fp32_master,
+            model_chunk=model_chunk,
+        )
+
+    def test_restores_compute_params_and_forces_dp_sync(self, monkeypatch):
+        """Loaded FP32 masters must reach BF16 shards before the first forward."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
+            monkeypatch, _HybridDeviceOptimizer
+        )
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer)
+
+        setup_mod._force_sync_model_from_optimizer_fp32(fake.distrib_opt)
+
+        torch.testing.assert_close(fake.model_param, fake.fp32_master)
+        fake.model_chunk.start_param_sync.assert_called_once_with(force_sync=True)
+
+    def test_handles_chained_optimizers(self, monkeypatch):
+        """Every distributed optimizer in a chain is restored and synchronized."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
+            monkeypatch, _HybridDeviceOptimizer
+        )
+        a = self._make_distrib_opt(
+            _HybridDeviceOptimizer, model_values=(0.0, 0.0), master_values=(1.0, 2.0)
+        )
+        b = self._make_distrib_opt(
+            _HybridDeviceOptimizer, model_values=(0.0, 0.0), master_values=(5.0, 6.0)
+        )
+        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+
+        setup_mod._force_sync_model_from_optimizer_fp32(chained)
+
+        for fake in (a, b):
+            torch.testing.assert_close(fake.model_param, fake.fp32_master)
+            fake.model_chunk.start_param_sync.assert_called_once_with(force_sync=True)
+
+    def test_noop_for_non_hybrid_optimizer(self, monkeypatch):
+        """Other optimizer implementations must remain untouched."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
+            monkeypatch, _HybridDeviceOptimizer
+        )
+        model_chunk = MagicMock()
+        plain_opt = SimpleNamespace(
+            optimizer=object(),
+            model_chunks=[model_chunk],
+        )
+
+        setup_mod._force_sync_model_from_optimizer_fp32(plain_opt)
+
+        model_chunk.start_param_sync.assert_not_called()

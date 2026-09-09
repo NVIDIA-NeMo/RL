@@ -615,9 +615,8 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
-        # Current Gym collates data with ``task_source`` rather than a baked-in
-        # ``agent_ref``. ``run_examples`` resolves that routing synchronously and
-        # stamps each input row before returning its result iterator.
+        # Gym resolves task_source to agent_ref synchronously in run_examples().
+        # Build the counter afterward so completion rows use the resolved identity.
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0

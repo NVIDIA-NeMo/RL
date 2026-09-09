@@ -21,7 +21,7 @@ import time
 import warnings
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar, cast
 
 import torch
 from megatron.bridge import AutoBridge
@@ -222,6 +222,64 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
             "WORKAROUND: force-synced optimizer FP32 copies from BF16 model "
             "params (HybridDeviceOptimizer -- synced GPU shards + CPU clones + "
             "FP32 copies)"
+        )
+
+
+def _force_sync_model_from_optimizer_fp32(optimizer):
+    """Restore BF16 compute weights from loaded HybridDeviceOptimizer masters.
+
+    On a full checkpoint resume, ``HybridDeviceOptimizer.load_state_dict`` restores
+    its FP32 master parameters, but the BF16 parameter shards used by the first
+    forward can still contain the pre-load values. The first optimizer step copies
+    the masters back and masks the problem from subsequent steps, producing a
+    one-step loss/reward discontinuity exactly at the resume boundary.
+
+    Copy each loaded FP32 working parameter back to its BF16 shard and then force a
+    synchronous DP parameter all-gather before any reference-policy or training
+    forward. This is the inverse of ``_force_sync_optimizer_fp32_from_model`` and
+    is only called for a genuine optimizer-state resume.
+    """
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    def _sync_distrib_opt(distrib_opt):
+        try:
+            from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+                HybridDeviceOptimizer,
+            )
+        except ImportError:
+            return False
+        if not isinstance(
+            getattr(distrib_opt, "optimizer", None), HybridDeviceOptimizer
+        ):
+            return False
+
+        hdo = distrib_opt.optimizer
+        param_to_fp32_param = getattr(hdo, "param_to_fp32_param", None)
+        if not param_to_fp32_param:
+            return False
+
+        # HybridDeviceOptimizer's post-load hook has already populated these
+        # FP32 working parameters from the checkpoint's master_param entries.
+        for model_param, fp32_param in param_to_fp32_param.items():
+            model_param.data.copy_(fp32_param.data)
+
+        # The copied parameters are local distributed-optimizer shards. Rebuild
+        # full BF16 compute parameters before the first forward after resume.
+        for model_chunk in getattr(distrib_opt, "model_chunks", []):
+            model_chunk.start_param_sync(force_sync=True)
+        return True
+
+    applied = False
+    if hasattr(optimizer, "chained_optimizers"):
+        for sub_opt in optimizer.chained_optimizers:
+            applied |= _sync_distrib_opt(sub_opt)
+    else:
+        applied = _sync_distrib_opt(optimizer)
+
+    if applied and rank == 0:
+        print(
+            "WORKAROUND: force-synced BF16 model params from loaded optimizer "
+            "FP32 masters (HybridDeviceOptimizer)"
         )
 
 
@@ -748,6 +806,9 @@ def setup_model_config(
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
 
+    # Apply optional multimodal provider settings
+    _apply_multimodal_config(model_cfg, config)
+
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
 
@@ -964,107 +1025,25 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         )
 
 
-def _configure_hybridep_environment(
-    model_cfg: Any, megatron_cfg: dict[str, Any]
-) -> None:
-    """Validate, configure, and report the effective HybridEP topology."""
-    ep_size = int(model_cfg.expert_model_parallel_size)
-
-    if "hybridep_num_ranks_per_nvlink_domain" in megatron_cfg:
-        ranks_text = str(megatron_cfg["hybridep_num_ranks_per_nvlink_domain"])
-        try:
-            ranks_per_domain = int(ranks_text)
-        except (TypeError, ValueError) as exc:
+def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
+    """Map legacy Omni freeze controls onto canonical provider attributes."""
+    field_mapping = {
+        "freeze_vision_encoder": "freeze_vision_model",
+        "freeze_vision_projector": "freeze_vision_projection",
+        "freeze_audio_encoder": "freeze_sound_encoder",
+        "freeze_audio_projector": "freeze_sound_projection",
+        "radio_force_cpe_eval_mode": "radio_force_cpe_eval_mode",
+    }
+    megatron_cfg = cast(dict[str, Any], config["megatron_cfg"])
+    for config_key, provider_attr in field_mapping.items():
+        if config_key not in megatron_cfg:
+            continue
+        if not hasattr(model_cfg, provider_attr):
             raise ValueError(
-                "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="
-                f"{ranks_text!r} must be a positive integer"
-            ) from exc
-        os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(ranks_per_domain)
-        ranks_source = "megatron_cfg"
-    elif "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" in os.environ:
-        ranks_source = "environment"
-    else:
-        ranks_per_domain = min(ep_size, 64)
-        os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(ranks_per_domain)
-        ranks_source = "fallback"
-        warnings.warn(
-            "HybridEP: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN not "
-            f"configured. Auto-setting to {ranks_per_domain}.",
-            stacklevel=2,
-        )
-
-    ranks_text = os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"]
-    try:
-        ranks_per_domain = int(ranks_text)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="
-            f"{ranks_text!r} must be a positive integer"
-        ) from exc
-    if ranks_per_domain < 1:
-        raise ValueError(
-            f"NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN={ranks_text!r} must be positive"
-        )
-    if ep_size % ranks_per_domain != 0:
-        raise ValueError(
-            "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="
-            f"{ranks_text!r} must divide expert_model_parallel_size={ep_size}"
-        )
-
-    if "hybridep_use_mnnvl" in megatron_cfg:
-        os.environ["USE_MNNVL"] = str(int(megatron_cfg["hybridep_use_mnnvl"]))
-        mnnvl_source = "megatron_cfg"
-    elif "USE_MNNVL" in os.environ:
-        mnnvl_source = "environment"
-    else:
-        os.environ["USE_MNNVL"] = str(int(ep_size > 4))
-        mnnvl_source = "fallback"
-        warnings.warn(
-            "HybridEP: USE_MNNVL not configured. "
-            f"Auto-setting to {os.environ['USE_MNNVL']}.",
-            stacklevel=2,
-        )
-
-    def _optional_positive_environment_value(name: str) -> tuple[str, str]:
-        if name not in os.environ:
-            return "unset", "unset"
-        value_text = os.environ[name]
-        try:
-            value = int(value_text)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"{name}={value_text!r} must be a positive integer"
-            ) from exc
-        if value < 1:
-            raise ValueError(f"{name}={value_text!r} must be positive")
-        return str(value), "environment"
-
-    domain_size_text, domain_source = _optional_positive_environment_value(
-        "NVLINK_DOMAIN_SIZE"
-    )
-    chunk_text, chunk_source = _optional_positive_environment_value(
-        "NUM_OF_TOKENS_PER_CHUNK_COMBINE_API"
-    )
-
-    use_mnnvl_text = os.environ["USE_MNNVL"]
-    normalized_mnnvl_values = {"0": "0", "1": "1", "false": "0", "true": "1"}
-    if use_mnnvl_text not in normalized_mnnvl_values:
-        raise ValueError(
-            f"USE_MNNVL={use_mnnvl_text!r} must be one of 0, 1, false, true"
-        )
-    use_mnnvl = normalized_mnnvl_values[use_mnnvl_text]
-    os.environ["USE_MNNVL"] = use_mnnvl
-
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    if rank == 0:
-        print(
-            "[HybridEP topology] "
-            f"ep_size={ep_size} "
-            f"ranks_per_domain={ranks_per_domain} source={ranks_source} "
-            f"nvlink_domain_size={domain_size_text} source={domain_source} "
-            f"use_mnnvl={use_mnnvl} source={mnnvl_source} "
-            f"combine_chunk_tokens={chunk_text} source={chunk_source}"
-        )
+                f"policy.megatron_cfg.{config_key} is only supported by a "
+                f"multimodal provider exposing {provider_attr!r}."
+            )
+        setattr(model_cfg, provider_attr, megatron_cfg[config_key])
 
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1166,8 +1145,39 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         else:
             model_cfg.moe_hybridep_num_sms = num_sms
 
+    # HybridEP environment variables
+    # These are required by DeepEP's hybrid-ep branch for NVLink domain configuration.
+    # Users can set them explicitly via config, or they will be auto-computed with a warning.
     if config["megatron_cfg"].get("moe_flex_dispatcher_backend") == "hybridep":
-        _configure_hybridep_environment(model_cfg, config["megatron_cfg"])
+        ep_size = model_cfg.expert_model_parallel_size
+
+        # NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
+        if "hybridep_num_ranks_per_nvlink_domain" in config["megatron_cfg"]:
+            val = config["megatron_cfg"]["hybridep_num_ranks_per_nvlink_domain"]
+            os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(val)
+        elif "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ:
+            default_val = min(ep_size, 64)
+            os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(default_val)
+            warnings.warn(
+                f"HybridEP: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN not configured. "
+                f"Auto-setting to min(expert_model_parallel_size={ep_size}, 64) = {default_val}. "
+                f"Set 'hybridep_num_ranks_per_nvlink_domain' in megatron_cfg to override.",
+                stacklevel=2,
+            )
+
+        # USE_MNNVL
+        if "hybridep_use_mnnvl" in config["megatron_cfg"]:
+            val = config["megatron_cfg"]["hybridep_use_mnnvl"]
+            os.environ["USE_MNNVL"] = str(int(val))
+        elif "USE_MNNVL" not in os.environ:
+            default_val = int(ep_size > 4)
+            os.environ["USE_MNNVL"] = str(default_val)
+            warnings.warn(
+                f"HybridEP: USE_MNNVL not configured. "
+                f"Auto-setting to int(expert_model_parallel_size={ep_size} > 4) = {default_val}. "
+                f"Set 'hybridep_use_mnnvl' in megatron_cfg to override.",
+                stacklevel=2,
+            )
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
@@ -2200,8 +2210,11 @@ def setup_model_and_optimizer(
         # through BF16 and lose precision, so we must skip the sync there.
         # state.cfg is megatron_cfg (set above), so this reads the value the
         # bridge may have just mutated during load_checkpoint.
-        if optimizer is not None and megatron_cfg.checkpoint.finetune:
-            _force_sync_optimizer_fp32_from_model(optimizer, model)
+        if optimizer is not None:
+            if megatron_cfg.checkpoint.finetune:
+                _force_sync_optimizer_fp32_from_model(optimizer, model)
+            elif resume_checkpoint_exists:
+                _force_sync_model_from_optimizer_fp32(optimizer)
     torch.distributed.barrier()
 
     draft_model = get_attached_draft_model(model)
