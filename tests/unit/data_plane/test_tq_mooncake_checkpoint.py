@@ -19,7 +19,6 @@ import ctypes
 import hashlib
 import json
 import pickle
-import threading
 from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
@@ -193,6 +192,8 @@ def _manager(store: _FakeStore, manager_id: str = "manager-a") -> Any:
         config=config,
         storage_client=client,
         storage_manager_id=manager_id,
+        _checkpoint_participant=None,
+        _checkpoint_workers=[],
         controller_info=SimpleNamespace(
             id="controller-test",
             ip="10.0.0.100",
@@ -203,15 +204,7 @@ def _manager(store: _FakeStore, manager_id: str = "manager-a") -> Any:
 
 def _participant(manager: Any) -> Any:
     participant = checkpoint_plugin._CheckpointParticipant(manager)
-    info = participant.info
-    participant.info = checkpoint_plugin._ParticipantInfo(
-        participant_id=info.participant_id,
-        incarnation=info.incarnation,
-        controller_session=info.controller_session,
-        control_endpoint=f"inproc://{info.participant_id}",
-        segment_name=info.segment_name,
-        transport_endpoint=info.transport_endpoint,
-    )
+    manager._checkpoint_participant = participant
     return participant
 
 
@@ -246,7 +239,7 @@ def _wire_participants(
     monkeypatch.setattr(
         checkpoint_plugin,
         "_live_participants",
-        lambda _manager: [participant.info for participant in participants],
+        lambda _manager: ([participant.info for participant in participants], {}),
     )
     monkeypatch.setattr(
         checkpoint_plugin,
@@ -386,11 +379,13 @@ def test_physical_keys_include_all_produced_fields_and_gdr_chunks() -> None:
     ]
 
 
-def test_distributed_checkpoint_round_trip_over_real_control_sockets(
+def test_distributed_checkpoint_round_trip_over_command_only_rpc(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise real ZMQ fanout with owner-local stores and no coordinator I/O."""
+    """Exercise command routing with owner-local stores and no coordinator I/O."""
+    import ray
+
     payloads = _payloads()
     identities = [("owner-a", "127.0.0.1:12301"), ("owner-b", "127.0.0.1:12302")]
     owners = {
@@ -399,10 +394,27 @@ def test_distributed_checkpoint_round_trip_over_real_control_sockets(
     }
     cluster = _FakeCluster(payloads, owners)
     managers = _managers(cluster, identities)
-    participants = [
-        checkpoint_plugin._CheckpointParticipant(manager) for manager in managers
-    ]
+    participants = [_participant(manager) for manager in managers]
     coordinator = _manager(_FakeStore(cluster, "127.0.0.1:12303"), "coordinator")
+    commands: list[dict[str, Any]] = []
+
+    def command(participant: Any, body: dict[str, Any]) -> dict[str, Any]:
+        # JSON serialization rejects raw bytes/tensors in either direction.
+        json.dumps(body)
+        commands.append(body)
+        response = participant._dispatch(body)
+        json.dumps(response)
+        return response
+
+    coordinator._checkpoint_workers = [
+        SimpleNamespace(
+            mooncake_checkpoint=_RemoteMethod(
+                lambda body, participant=participant: command(participant, body)
+            )
+        )
+        for participant in participants
+    ]
+    monkeypatch.setattr(ray, "get", lambda value, **_kwargs: value)
 
     def unexpected_payload_io(*_args: Any, **_kwargs: Any) -> None:
         pytest.fail("checkpoint coordinator performed payload I/O")
@@ -415,55 +427,45 @@ def test_distributed_checkpoint_round_trip_over_real_control_sockets(
     )
     monkeypatch.setattr(
         checkpoint_plugin,
-        "_live_participants",
-        lambda _manager: [participant.info for participant in participants],
-    )
-    monkeypatch.setattr(
-        checkpoint_plugin,
         "_local_replica_config",
         lambda _manager, segment_name: SimpleNamespace(preferred_segment=segment_name),
     )
-    try:
-        for participant in participants:
-            participant._thread = threading.Thread(target=participant._run, daemon=True)
-            participant._thread.start()
-            assert participant._ready.wait(timeout=5.0)
-            assert participant._error is None
+    checkpoint_dir = _checkpoint_dir(tmp_path)
+    _save_storage_checkpoint(coordinator, str(checkpoint_dir))
 
-        checkpoint_dir = _checkpoint_dir(tmp_path)
-        _save_storage_checkpoint(coordinator, str(checkpoint_dir))
+    assert _saved_payloads(checkpoint_dir) == payloads
+    shard_owners: dict[str, set[str]] = {}
+    for entry in _manifest(checkpoint_dir)["objects"]:
+        assert entry["saved_owner"] == owners[entry["key"]][0]
+        shard_owners.setdefault(entry["shard"], set()).add(entry["saved_owner"])
+    assert len(shard_owners) == 2
+    assert all(len(endpoints) == 1 for endpoints in shard_owners.values())
+    assert sorted(cluster.get_calls) == sorted(
+        (endpoints[0], key) for key, endpoints in owners.items()
+    )
 
-        assert _saved_payloads(checkpoint_dir) == payloads
-        shard_owners: dict[str, set[str]] = {}
-        for entry in _manifest(checkpoint_dir)["objects"]:
-            assert entry["saved_owner"] == owners[entry["key"]][0]
-            shard_owners.setdefault(entry["shard"], set()).add(entry["saved_owner"])
-        assert len(shard_owners) == 2
-        assert all(len(endpoints) == 1 for endpoints in shard_owners.values())
-        assert sorted(cluster.get_calls) == sorted(
-            (endpoints[0], key) for key, endpoints in owners.items()
-        )
+    cluster.objects.clear()
+    cluster.owners.clear()
+    _load_storage_checkpoint(coordinator, str(checkpoint_dir))
 
-        cluster.objects.clear()
-        cluster.owners.clear()
-        _load_storage_checkpoint(coordinator, str(checkpoint_dir))
-
-        assert cluster.objects == payloads
-        assert {endpoint for endpoint, _, _ in cluster.upsert_calls} == {
-            endpoint for _, endpoint in identities
-        }
-        assert all(
-            manager.storage_client._store.registered == {} for manager in managers
-        )
-    finally:
-        for participant in participants:
-            participant.close()
+    assert cluster.objects == payloads
+    assert {endpoint for endpoint, _, _ in cluster.upsert_calls} == {
+        endpoint for _, endpoint in identities
+    }
+    assert all(manager.storage_client._store.registered == {} for manager in managers)
+    assert {body["operation"] for body in commands} == {
+        "DESCRIBE",
+        "SAVE_SHARD",
+        "LOAD_OBJECTS",
+    }
 
 
 def test_participant_timeout_is_fatal_to_the_checkpoint_caller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """SC must not treat uncertain participant writes as a retryable local timeout."""
+    import ray
+
     manager = _manager(_FakeStore(_FakeCluster({}, {}), "127.0.0.1:12301"))
     participant = _participant(manager)
     request = checkpoint_plugin._ParticipantRequest(
@@ -473,65 +475,88 @@ def test_participant_timeout_is_fatal_to_the_checkpoint_caller(
     def timeout(*_args: Any, **_kwargs: Any) -> Any:
         raise TimeoutError("participant still writing")
 
-    monkeypatch.setattr(checkpoint_plugin, "_request_participant", timeout)
+    worker = SimpleNamespace(mooncake_checkpoint=_RemoteMethod(lambda _body: object()))
+    monkeypatch.setattr(ray, "get", timeout)
     with pytest.raises(RuntimeError, match="checkpoint fanout failed") as error:
-        checkpoint_plugin._fanout_requests([request], timeout_s=0.1)
+        checkpoint_plugin._fanout_requests(
+            [request],
+            workers={participant.info.participant_id: worker},
+            local=None,
+            timeout_s=0.1,
+            max_parallel=1,
+        )
     assert isinstance(error.value.__cause__, TimeoutError)
 
 
-def test_live_participants_prunes_a_stale_owner_before_endpoint_deduplication(
+def test_command_fanout_dispatches_local_owner_without_ray(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ray
+
+    manager = _manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.1:12301"))
+    participant = _participant(manager)
+    request = checkpoint_plugin._ParticipantRequest(
+        participant.info, checkpoint_plugin._request_body(manager, "DESCRIBE")
+    )
+
+    def empty_get(values: list[Any], **_kwargs: Any) -> list[Any]:
+        assert values == [], "local participant was routed through Ray"
+        return values
+
+    monkeypatch.setattr(ray, "get", empty_get)
+    responses = checkpoint_plugin._fanout_requests(
+        [request], workers={}, local=participant, timeout_s=1.0, max_parallel=1
+    )
+    assert responses[participant.info.participant_id]["participant"] == asdict(
+        participant.info
+    )
+
+
+def test_command_rejects_a_different_controller_session() -> None:
+    manager = _manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.1:12301"))
+    participant = _participant(manager)
+    body = checkpoint_plugin._request_body(manager, "DESCRIBE")
+    body["controller_session"] = "another-run"
+
+    with pytest.raises(ValueError, match="controller session mismatch"):
+        participant._dispatch(body)
+
+
+def test_live_participants_does_not_silently_drop_an_unavailable_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import ray
 
     manager = _manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.9:12309"))
-    session = checkpoint_plugin._controller_session(manager)
-    endpoint = "10.0.0.1:12301"
-    stale = checkpoint_plugin._ParticipantInfo(
-        participant_id="stale-owner",
-        incarnation="old-incarnation",
-        controller_session=session,
-        control_endpoint="tcp://10.0.0.1:22001",
-        segment_name=endpoint,
-        transport_endpoint=endpoint,
+    manager._checkpoint_workers = [
+        SimpleNamespace(mooncake_checkpoint=_RemoteMethod(lambda _body: object()))
+    ]
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("owner process unavailable")
+
+    monkeypatch.setattr(ray, "get", unavailable)
+    with pytest.raises(RuntimeError):
+        checkpoint_plugin._live_participants(manager)
+
+
+def test_live_participants_includes_local_owner_without_self_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ray
+
+    manager = _manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.9:12309"))
+    local = _participant(manager)
+    remote_manager = _manager(
+        _FakeStore(_FakeCluster({}, {}), "10.0.0.1:12301"), "remote-owner"
     )
-    replacement = checkpoint_plugin._ParticipantInfo(
-        participant_id="replacement-owner",
-        incarnation="new-incarnation",
-        controller_session=session,
-        control_endpoint="tcp://10.0.0.1:22002",
-        segment_name=endpoint,
-        transport_endpoint=endpoint,
-    )
-    unregistered: list[tuple[str, str]] = []
-    registry = SimpleNamespace(
-        participants=_RemoteMethod(
-            lambda controller_session: (
-                [asdict(stale), asdict(replacement)]
-                if controller_session == session
-                else []
-            )
-        ),
-        unregister=_RemoteMethod(
-            lambda participant_id, incarnation: unregistered.append(
-                (participant_id, incarnation)
-            )
-        ),
-    )
-    monkeypatch.setattr(checkpoint_plugin, "_registry_actor", lambda: registry)
+    remote = _participant(remote_manager)
+    worker = SimpleNamespace(mooncake_checkpoint=_RemoteMethod(remote._dispatch))
+    manager._checkpoint_workers = [worker]
     monkeypatch.setattr(ray, "get", lambda value, **_kwargs: value)
-
-    def fanout(requests: list[Any], **kwargs: Any) -> dict[str, Any]:
-        assert kwargs["allow_failures"] is True
-        assert {request.participant for request in requests} == {stale, replacement}
-        return {
-            replacement.participant_id: {"participant": asdict(replacement)},
-        }
-
-    monkeypatch.setattr(checkpoint_plugin, "_fanout_requests", fanout)
-
-    assert checkpoint_plugin._live_participants(manager) == [replacement]
-    assert unregistered == [(stale.participant_id, stale.incarnation)]
+    participants, workers = checkpoint_plugin._live_participants(manager)
+    assert set(participants) == {local.info, remote.info}
+    assert workers == {remote.info.participant_id: worker}
 
 
 def test_live_participants_rejects_duplicate_endpoints_that_are_both_live(
@@ -544,30 +569,21 @@ def test_live_participants_rejects_duplicate_endpoints_that_are_both_live(
     participants = [
         checkpoint_plugin._ParticipantInfo(
             participant_id=f"owner-{index}",
-            incarnation=f"incarnation-{index}",
             controller_session=session,
-            control_endpoint=f"tcp://10.0.0.{index + 1}:22001",
             segment_name="10.0.0.1:12301",
             transport_endpoint="10.0.0.1:12301",
         )
         for index in range(2)
     ]
-    registry = SimpleNamespace(
-        participants=_RemoteMethod(lambda _session: list(map(asdict, participants))),
-        unregister=_RemoteMethod(lambda *_args: None),
-    )
-    monkeypatch.setattr(checkpoint_plugin, "_registry_actor", lambda: registry)
+    manager._checkpoint_workers = [
+        SimpleNamespace(
+            mooncake_checkpoint=_RemoteMethod(
+                lambda _body, info=info: {"ok": True, "participant": asdict(info)}
+            )
+        )
+        for info in participants
+    ]
     monkeypatch.setattr(ray, "get", lambda value, **_kwargs: value)
-    monkeypatch.setattr(
-        checkpoint_plugin,
-        "_fanout_requests",
-        lambda requests, **_kwargs: {
-            request.participant.participant_id: {
-                "participant": asdict(request.participant)
-            }
-            for request in requests
-        },
-    )
 
     with pytest.raises(RuntimeError, match="duplicate endpoints"):
         checkpoint_plugin._live_participants(manager)
@@ -983,8 +999,66 @@ def test_plugin_install_does_not_change_the_normal_put_path(
     )
 
 
-def test_installed_manager_registers_its_actual_segment_and_closes_participant(
+def test_configure_and_command_reuse_the_existing_process_local_manager(
     monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transfer_queue as tq
+    from transfer_queue import interface as tq_interface
+
+    class FakeManager(SimpleNamespace):
+        pass
+
+    setattr(FakeManager, checkpoint_plugin._PLUGIN_MARKER, True)
+    manager = FakeManager(
+        **vars(_manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.1:12301")))
+    )
+    participant = _participant(manager)
+    client = SimpleNamespace(storage_manager=manager)
+    monkeypatch.setattr(tq, "get_client", lambda: client)
+    monkeypatch.setattr(tq_interface, "_TQ_CLIENT", client)
+
+    def unexpected_init(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("checkpoint RPC created another TQ client")
+
+    monkeypatch.setattr(tq, "init", unexpected_init)
+    workers = [object(), object()]
+    checkpoint_plugin.configure_checkpoint_workers(workers)
+    assert list(manager._checkpoint_workers) == workers
+    response = checkpoint_plugin.run_checkpoint_command(
+        checkpoint_plugin._request_body(manager, "DESCRIBE")
+    )
+    assert response["participant"] == asdict(participant.info)
+
+
+def test_command_does_not_initialize_a_client_on_non_owner_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transfer_queue as tq
+    from transfer_queue import interface as tq_interface
+
+    monkeypatch.setattr(tq_interface, "_TQ_CLIENT", None)
+
+    def unexpected_client() -> None:
+        pytest.fail("checkpoint command initialized a client on a non-owner rank")
+
+    monkeypatch.setattr(tq, "get_client", unexpected_client)
+    assert checkpoint_plugin.run_checkpoint_command({"operation": "DESCRIBE"}) is None
+
+
+@pytest.mark.parametrize(
+    ("actor_id", "enabled", "expected_capacity", "owns_segment"),
+    [
+        (None, True, 0, False),
+        ("actor-id", True, 1024, True),
+        (None, False, 1024, False),
+    ],
+)
+def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
+    monkeypatch: pytest.MonkeyPatch,
+    actor_id: str | None,
+    enabled: bool,
+    expected_capacity: int,
+    owns_segment: bool,
 ) -> None:
     import ray
 
@@ -994,45 +1068,18 @@ def test_installed_manager_registers_its_actual_segment_and_closes_participant(
     endpoint = "10.3.0.7:14321"
     cluster = _FakeCluster({}, {})
     store = _FakeStore(cluster, endpoint)
-    registered: list[dict[str, str]] = []
-    unregistered: list[tuple[str, str]] = []
     manager_closes: list[str] = []
+    config = _manager(store).config
+    config["global_segment_size"] = 1024
+    config["checkpoint"]["enabled"] = enabled
 
-    class RemoteMethod:
-        def __init__(self, function: Any) -> None:
-            self.function = function
-
-        def remote(self, *args: Any) -> Any:
-            return self.function(*args)
-
-    registry = SimpleNamespace(
-        register=RemoteMethod(lambda info: registered.append(info) or "registered"),
-        unregister=RemoteMethod(
-            lambda participant_id, incarnation: unregistered.append(
-                (participant_id, incarnation)
-            )
-            or "unregistered"
-        ),
-    )
-
-    def base_init(self: Any, *_args: Any, **_kwargs: Any) -> None:
+    def base_init(self: Any, controller_info: Any, config: dict[str, Any]) -> None:
         fake = _manager(store, "manager-live")
-        self.config = fake.config
+        self.config = config
         self.storage_client = fake.storage_client
+        self.storage_client.global_segment_size = config["global_segment_size"]
         self.storage_manager_id = fake.storage_manager_id
-        self.controller_info = fake.controller_info
-
-    def run_endpoint(self: Any) -> None:
-        info = self.info
-        self.info = checkpoint_plugin._ParticipantInfo(
-            participant_id=info.participant_id,
-            incarnation=info.incarnation,
-            controller_session=info.controller_session,
-            control_endpoint="tcp://10.3.0.7:26321",
-            segment_name=info.segment_name,
-            transport_endpoint=info.transport_endpoint,
-        )
-        self._ready.set()
+        self.controller_info = controller_info
 
     monkeypatch.setattr(mooncake_manager.MooncakeStorageManager, "__init__", base_init)
     monkeypatch.setattr(
@@ -1040,9 +1087,12 @@ def test_installed_manager_registers_its_actual_segment_and_closes_participant(
         "close",
         lambda _self: manager_closes.append("manager"),
     )
-    monkeypatch.setattr(checkpoint_plugin._CheckpointParticipant, "_run", run_endpoint)
-    monkeypatch.setattr(checkpoint_plugin, "_registry_actor", lambda: registry)
-    monkeypatch.setattr(ray, "get", lambda value, **_kwargs: value)
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(get_actor_id=lambda: actor_id),
+    )
     monkeypatch.setitem(
         StorageManagerFactory._registry,
         "MooncakeStore",
@@ -1051,28 +1101,22 @@ def test_installed_manager_registers_its_actual_segment_and_closes_participant(
 
     install_tq_mooncake_checkpoint_plugin()
     manager_type = StorageManagerFactory._registry["MooncakeStore"]
-    manager = manager_type(object(), {})
+    manager = manager_type(_manager(store).controller_info, config)
     participant = manager._checkpoint_participant
-    assert participant is not None
-
-    assert registered == [
-        {
+    assert (participant is not None) is owns_segment
+    assert manager.config["global_segment_size"] == expected_capacity
+    assert config["global_segment_size"] == 1024
+    if enabled:
+        assert manager.config is not config
+    if participant is not None:
+        assert asdict(participant.info) == {
             "participant_id": "manager-live",
-            "incarnation": participant.info.incarnation,
             "controller_session": checkpoint_plugin._controller_session(manager),
-            "control_endpoint": "tcp://10.3.0.7:26321",
             "segment_name": endpoint,
             "transport_endpoint": endpoint,
         }
-    ]
-    assert registered[0]["control_endpoint"] != registered[0]["segment_name"]
 
     manager.close()
-
-    assert unregistered == [
-        (participant.info.participant_id, participant.info.incarnation)
-    ]
-    assert manager._checkpoint_participant is None
     assert manager_closes == ["manager"]
 
 

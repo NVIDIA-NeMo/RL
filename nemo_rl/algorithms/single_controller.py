@@ -123,7 +123,14 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
-from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane import (
+    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+    KVBatchMeta,
+    data_plane_supports_checkpointing,
+)
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
+    configure_checkpoint_workers,
+)
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
@@ -290,6 +297,24 @@ class SingleControllerActor:
         )
         self._dp_client = actor_args.dp_client
         if master_config.data_plane["backend"] == "mooncake_cpu":
+            if data_plane_supports_checkpointing(master_config.data_plane):
+                checkpoint_workers = list(
+                    actor_args.trainer_handle.worker_group.workers
+                )
+                if actor_args.value_handle is not None:
+                    checkpoint_workers.extend(
+                        actor_args.value_handle.worker_group.workers
+                    )
+                for teacher in (actor_args.teacher_worker_groups or {}).values():
+                    checkpoint_workers.extend(teacher.worker_group.workers)
+                if master_config.token_capture.enabled:
+                    checkpoint_workers.extend(
+                        actor_args.gen_handle.worker_group.workers
+                    )
+                checkpoint_workers.extend(actor_args.finalizer_actors)
+                # Reuse existing actor RPCs. This actor's local store is handled
+                # directly: __init__ cannot service an RPC back to itself.
+                configure_checkpoint_workers(checkpoint_workers)
             # actor_args is fully deserialized before __init__, so this process's
             # Mooncake client and memory segment are attached. Teachers were
             # attached during driver setup; restore now sees the full topology.

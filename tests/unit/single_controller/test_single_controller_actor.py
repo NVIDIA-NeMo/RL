@@ -16,6 +16,7 @@
 
 import asyncio
 import math
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -50,8 +51,13 @@ from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROLLOUT_METRICS
 from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorkerImpl,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
@@ -139,8 +145,10 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
     args = dict(
         partition_id="rollout_data",
         dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
+        gen_handle=SimpleNamespace(worker_group=SimpleNamespace(workers=[])),
+        trainer_handle=SimpleNamespace(worker_group=SimpleNamespace(workers=[])),
+        value_handle=None,
+        teacher_worker_groups=None,
         dataloader=None,
         weight_synchronizer=FakeWeightSynchronizer(),
         advantage_estimator=None,
@@ -176,6 +184,7 @@ def test_resumed_mooncake_init_restores_without_partition_registration(
     monkeypatch, tmp_path
 ) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    monkeypatch.setattr(single_controller, "configure_checkpoint_workers", MagicMock())
     checkpoint_path = tmp_path / "step_0"
     data_plane_path = checkpoint_path / DATA_PLANE_CHECKPOINT_DIR
     data_plane_path.mkdir(parents=True)
@@ -208,15 +217,29 @@ def test_resumed_mooncake_init_restores_without_partition_registration(
     assert controller._data_plane_checkpoint_metadata == metadata
 
 
-def test_fresh_mooncake_init_registers_partition(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("checkpoint_enabled", [False, True])
+def test_fresh_mooncake_init_registers_partition(
+    monkeypatch, tmp_path, checkpoint_enabled
+) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    configure = MagicMock()
+    monkeypatch.setattr(single_controller, "configure_checkpoint_workers", configure)
     dp_client = MagicMock(name="dp_client")
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
+    master_config.data_plane["mooncake_cpu"]["checkpoint"]["enabled"] = (
+        checkpoint_enabled
+    )
     actor_args = _actor_args_for_init(dp_client=dp_client)
+    if not checkpoint_enabled:
+        actor_args.trainer_handle = None
 
     controller = _init_controller(master_config, actor_args)
 
+    if checkpoint_enabled:
+        configure.assert_called_once_with([])
+    else:
+        configure.assert_not_called()
     dp_client.load_checkpoint.assert_not_called()
     dp_client.register_partition.assert_called_once()
     assert controller._data_plane_checkpoint_metadata is None
@@ -226,6 +249,7 @@ def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
     monkeypatch, tmp_path
 ) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    monkeypatch.setattr(single_controller, "configure_checkpoint_workers", MagicMock())
     dp_client = MagicMock(name="dp_client")
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
@@ -246,6 +270,86 @@ def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
         master_config.token_capture.staging_partition
     )
     assert staging_call.kwargs["fields"] == list(STAGING_FIELDS)
+
+
+@pytest.mark.parametrize("token_capture", [False, True])
+def test_mooncake_checkpoint_workers_configured_before_restore(
+    monkeypatch, tmp_path, token_capture
+) -> None:
+    configure = MagicMock()
+    monkeypatch.setattr(single_controller, "configure_checkpoint_workers", configure)
+    master_config = _grpo_master_config(tmp_path)
+    master_config.data_plane = _data_plane_config("mooncake_cpu")
+    master_config.token_capture.enabled = token_capture
+    workers = [object() for _ in range(6)]
+
+    def group(members):
+        return SimpleNamespace(worker_group=SimpleNamespace(workers=members))
+
+    actor_args = _actor_args_for_init(
+        dp_client=MagicMock(),
+        trainer_handle=group(workers[:2]),
+        value_handle=group(workers[2:3]),
+        teacher_worker_groups={"teacher": group(workers[3:4])},
+        gen_handle=group(workers[4:5]),
+        finalizer_actors=workers[5:],
+    )
+
+    def stop_after_restore(**kwargs):
+        expected = workers[:4] + (workers[4:5] if token_capture else []) + workers[5:]
+        configure.assert_called_once_with(expected)
+        raise RuntimeError("stop after checkpoint worker configuration")
+
+    monkeypatch.setattr(
+        single_controller,
+        "_maybe_restore_native_data_plane_checkpoint",
+        stop_after_restore,
+    )
+    with pytest.raises(
+        RuntimeError, match="stop after checkpoint worker configuration"
+    ):
+        _init_controller(master_config, actor_args)
+
+
+@pytest.mark.parametrize(
+    "worker_class,module",
+    [
+        (TQWorkerMixin, "nemo_rl.data_plane.worker_mixin"),
+        (
+            RolloutReassemblerActor.__ray_metadata__.modified_class,
+            "nemo_rl.experience.rollout_reassembler_actor",
+        ),
+    ],
+)
+@pytest.mark.parametrize("result", [None, {"shard": "owner-0.bin", "object_count": 2}])
+def test_checkpoint_worker_hooks_delegate_to_local_manager(
+    monkeypatch, worker_class, module, result
+) -> None:
+    command = {"operation": "SAVE_SHARD", "checkpoint_root": "/checkpoint"}
+    run_command = MagicMock(return_value=result)
+    monkeypatch.setattr(f"{module}.run_checkpoint_command", run_command)
+    worker = object.__new__(worker_class)
+
+    assert worker.mooncake_checkpoint(command) is result
+    run_command.assert_called_once_with(command)
+
+
+def test_generation_checkpoint_command_runs_off_actor_event_loop(monkeypatch) -> None:
+    event_loop_thread = threading.get_ident()
+    command = {"operation": "SAVE_SHARD", "checkpoint_root": "/checkpoint"}
+    result = {"shard": "owner-0.bin", "object_count": 2}
+
+    def run_command(body):
+        assert threading.get_ident() != event_loop_thread
+        assert body is command
+        return result
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.run_checkpoint_command",
+        run_command,
+    )
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    assert asyncio.run(worker.mooncake_checkpoint(command)) is result
 
 
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:

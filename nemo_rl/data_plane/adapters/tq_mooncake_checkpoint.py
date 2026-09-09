@@ -13,11 +13,11 @@
 # limitations under the License.
 """Opt-in, owner-distributed Mooncake checkpoints for TransferQueue.
 
-Normal Mooncake PUTs remain memory-only.  At an explicit TQ checkpoint, a
-small Ray registry discovers the already-running Mooncake clients and a local
-ZeroMQ endpoint asks each selected memory owner to copy its own objects to a
-unique Lustre shard.  The TQ storage-manager process coordinates metadata but
-never receives the checkpoint payload.
+Normal Mooncake PUTs remain memory-only. At an explicit TQ checkpoint, the
+controller commands the existing workers through their Ray actor handles.
+Each selected memory owner writes its own objects to a unique filesystem
+shard; only commands and completion metadata cross Ray. No checkpoint actors,
+registry, or additional messaging transport are created.
 
 Restore reverses the process: the current Mooncake clients read size-balanced
 sets of durable objects and upsert them into their own preferred segments
@@ -38,21 +38,16 @@ import json
 import mmap
 import os
 import pickle
-import threading
 import uuid
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-import zmq
+import ray
 
 _PLUGIN_MARKER = "_nemo_rl_mooncake_checkpoint_v3"
-_PROTOCOL = "nemo-rl-tq-mooncake-checkpoint-v1"
-_REGISTRY_NAME = "NeMoRLMooncakeCheckpointRegistry"
-_REGISTRY_NAMESPACE = "transfer_queue"
 _STORAGE_DIR = "mooncake_storage"
 _MANIFEST_FILE = "manifest.json"
 _MANIFEST_VERSION = 3
@@ -64,8 +59,6 @@ _DEFAULT_MAX_PARALLEL = 64
 # failure, retain it until process teardown instead of letting Python unmap
 # memory that Mooncake or the NIC may still reference.
 _QUARANTINED_BUFFERS: list[mmap.mmap] = []
-
-_REGISTRY_ACTOR_CLASS: Any = None
 
 
 def _fsync_directory(path: Path) -> None:
@@ -198,9 +191,7 @@ class _StoredObject:
 @dataclass(frozen=True)
 class _ParticipantInfo:
     participant_id: str
-    incarnation: str
     controller_session: str
-    control_endpoint: str
     segment_name: str
     transport_endpoint: str
 
@@ -210,9 +201,7 @@ class _ParticipantInfo:
             name: value.get(name)
             for name in (
                 "participant_id",
-                "incarnation",
                 "controller_session",
-                "control_endpoint",
                 "segment_name",
                 "transport_endpoint",
             )
@@ -440,42 +429,6 @@ def _complete_memory_replicas(
     return replicas
 
 
-class _MooncakeCheckpointRegistry:
-    """Small named Ray actor containing control endpoints, never payloads."""
-
-    def __init__(self) -> None:
-        self._participants: dict[str, dict[str, str]] = {}
-
-    def register(self, participant: dict[str, str]) -> None:
-        info = _ParticipantInfo.from_mapping(participant)
-        self._participants[info.participant_id] = asdict(info)
-
-    def unregister(self, participant_id: str, incarnation: str) -> None:
-        current = self._participants.get(participant_id)
-        if current is not None and current.get("incarnation") == incarnation:
-            self._participants.pop(participant_id, None)
-
-    def participants(self, controller_session: str) -> list[dict[str, str]]:
-        return [
-            participant
-            for participant in self._participants.values()
-            if participant.get("controller_session") == controller_session
-        ]
-
-
-def _registry_actor() -> Any:
-    import ray
-
-    global _REGISTRY_ACTOR_CLASS
-    if _REGISTRY_ACTOR_CLASS is None:
-        _REGISTRY_ACTOR_CLASS = ray.remote(num_cpus=0)(_MooncakeCheckpointRegistry)
-    return _REGISTRY_ACTOR_CLASS.options(
-        name=_REGISTRY_NAME,
-        namespace=_REGISTRY_NAMESPACE,
-        get_if_exists=True,
-    ).remote()
-
-
 def _controller_session(manager: Any) -> str:
     """Stable identity for one live TQ controller, including its endpoints."""
     info = manager.controller_info
@@ -513,10 +466,8 @@ def _controller_session(manager: Any) -> str:
 
 def _request_body(manager: Any, operation: str, **payload: Any) -> dict[str, Any]:
     return {
-        "protocol": _PROTOCOL,
         "controller_session": _controller_session(manager),
         "operation": operation,
-        "request_id": uuid.uuid4().hex,
         **payload,
     }
 
@@ -526,13 +477,6 @@ def _safe_shard_name(value: Any) -> str:
         raise ValueError(f"Invalid Mooncake checkpoint shard name: {value!r}")
     if not value.startswith("part-") or not value.endswith(".bin"):
         raise ValueError(f"Invalid Mooncake checkpoint shard name: {value!r}")
-    return value
-
-
-def _request_id(body: Mapping[str, Any]) -> str:
-    value = body.get("request_id")
-    if not isinstance(value, str) or not value:
-        raise ValueError("Mooncake checkpoint request has no request_id")
     return value
 
 
@@ -619,143 +563,22 @@ class _CheckpointParticipant:
         if not isinstance(segment_name, str) or not segment_name:
             raise RuntimeError("Mooncake client did not expose its segment name")
 
-        self._stop = threading.Event()
-        self._ready = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._error: BaseException | None = None
-        self._registry: Any = None
         self.info = _ParticipantInfo(
             participant_id=str(manager.storage_manager_id),
-            incarnation=uuid.uuid4().hex,
             controller_session=_controller_session(manager),
-            control_endpoint="",
             segment_name=segment_name,
             # In HTTP/etcd metadata mode Mooncake writes local_hostname into
             # every mounted memory descriptor's transport_endpoint.
             transport_endpoint=segment_name,
         )
 
-    def start_and_register(self) -> None:
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"{self.info.participant_id}-checkpoint",
-            daemon=True,
-        )
-        self._thread.start()
-        if not self._ready.wait(timeout=10.0):
-            self.close()
-            raise RuntimeError("Timed out starting Mooncake checkpoint endpoint")
-        if self._error is not None:
-            error = self._error
-            self.close()
-            raise RuntimeError(
-                "Failed to start Mooncake checkpoint endpoint"
-            ) from error
-
-        import ray
-
-        self._registry = _registry_actor()
-        ray.get(
-            self._registry.register.remote(asdict(self.info)),
-            timeout=30.0,
-        )
-
-    def close(self) -> None:
-        if self._registry is not None:
-            with suppress(Exception):
-                import ray
-
-                ray.get(
-                    self._registry.unregister.remote(
-                        self.info.participant_id, self.info.incarnation
-                    ),
-                    timeout=5.0,
-                )
-            self._registry = None
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=10.0)
-            if self._thread.is_alive():
-                raise RuntimeError(
-                    "Mooncake checkpoint endpoint is still executing; refusing "
-                    "to release its storage client"
-                )
-            self._thread = None
-
-    def _run(self) -> None:
-        context = zmq.Context()
-        socket = context.socket(zmq.ROUTER)
-        try:
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(zmq.SNDHWM, 8)
-            socket.setsockopt(zmq.RCVHWM, 8)
-            socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
-            host = self.info.segment_name.rsplit(":", 1)[0]
-            socket.bind(f"tcp://{host}:*")
-            endpoint = socket.getsockopt_string(zmq.LAST_ENDPOINT)
-            self.info = _ParticipantInfo(
-                participant_id=self.info.participant_id,
-                incarnation=self.info.incarnation,
-                controller_session=self.info.controller_session,
-                control_endpoint=endpoint,
-                segment_name=self.info.segment_name,
-                transport_endpoint=self.info.transport_endpoint,
-            )
-            self._ready.set()
-
-            while not self._stop.is_set():
-                if not socket.poll(100, zmq.POLLIN):
-                    continue
-                frames = socket.recv_multipart()
-                identity = frames[0] if frames else b""
-                request_id = ""
-                try:
-                    if len(frames) != 2:
-                        raise ValueError("Malformed Mooncake checkpoint request")
-                    body = json.loads(frames[1])
-                    if not isinstance(body, Mapping):
-                        raise ValueError("Malformed Mooncake checkpoint request")
-                    request_id = _request_id(body)
-                    response = self._dispatch(body)
-                except Exception as error:
-                    response = {
-                        "ok": False,
-                        "request_id": request_id,
-                        "error": str(error),
-                    }
-                try:
-                    socket.send_multipart(
-                        [
-                            identity,
-                            json.dumps(
-                                response, separators=(",", ":"), sort_keys=True
-                            ).encode(),
-                        ]
-                    )
-                except zmq.ZMQError:
-                    # A coordinator can time out and disconnect while the local
-                    # participant is still completing checkpoint I/O. Keep the
-                    # thread alive for orderly shutdown; the coordinator treats
-                    # the uncertain checkpoint as a fatal failure, not a retry.
-                    continue
-        except Exception as error:
-            self._error = error
-            self._ready.set()
-        finally:
-            socket.close(linger=0)
-            context.term()
-
     def _dispatch(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        if body.get("protocol") != _PROTOCOL:
-            raise ValueError("Unsupported Mooncake checkpoint protocol")
         if body.get("controller_session") != self.info.controller_session:
             raise ValueError("Mooncake checkpoint controller session mismatch")
-        request_id = _request_id(body)
         operation = body.get("operation")
-        if operation == "PING":
+        if operation == "DESCRIBE":
             return {
                 "ok": True,
-                "request_id": request_id,
                 "participant": asdict(self.info),
             }
         if operation == "SAVE_SHARD":
@@ -783,7 +606,6 @@ class _CheckpointParticipant:
             )
 
     def _save_shard(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        request_id = _request_id(body)
         root = self._checkpoint_root(body)
         shard = _safe_shard_name(body.get("shard_name"))
         objects = _parse_stored_objects(body.get("objects"))
@@ -795,7 +617,7 @@ class _CheckpointParticipant:
         target = storage_dir / shard
         if target.exists():
             raise FileExistsError(f"Mooncake checkpoint shard already exists: {target}")
-        partial = storage_dir / f".{shard}.{request_id}.partial"
+        partial = storage_dir / f".{shard}.{uuid.uuid4().hex}.partial"
 
         entries: list[dict[str, Any]] = []
         offset = 0
@@ -820,13 +642,11 @@ class _CheckpointParticipant:
         _fsync_directory(storage_dir)
         return {
             "ok": True,
-            "request_id": request_id,
             "participant_id": self.info.participant_id,
             "objects": entries,
         }
 
     def _load_objects(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        request_id = _request_id(body)
         root = self._checkpoint_root(body)
         values = body.get("objects")
         if not isinstance(values, list):
@@ -858,86 +678,48 @@ class _CheckpointParticipant:
 
         return {
             "ok": True,
-            "request_id": request_id,
             "participant_id": self.info.participant_id,
             "restored_keys": restored,
         }
 
 
-def _request_participant(
-    request: _ParticipantRequest, *, timeout_s: float
-) -> dict[str, Any]:
-    context = zmq.Context()
-    socket = context.socket(zmq.DEALER)
-    try:
-        timeout_ms = max(1, int(timeout_s * 1000))
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.SNDHWM, 2)
-        socket.setsockopt(zmq.RCVHWM, 2)
-        socket.setsockopt(zmq.IMMEDIATE, 1)
-        socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        socket.connect(request.participant.control_endpoint)
-        socket.send(
-            json.dumps(request.body, separators=(",", ":"), sort_keys=True).encode()
-        )
-        if not socket.poll(timeout_ms, zmq.POLLIN):
-            raise TimeoutError(
-                "Timed out waiting for Mooncake checkpoint participant "
-                f"{request.participant.participant_id}"
-            )
-        frames = socket.recv_multipart()
-        if len(frames) != 1:
-            raise RuntimeError("Malformed Mooncake checkpoint participant response")
-        response = json.loads(frames[0])
-        if not isinstance(response, dict):
-            raise RuntimeError("Malformed Mooncake checkpoint participant response")
-        if response.get("request_id") != request.body.get("request_id"):
-            raise RuntimeError("Mooncake checkpoint response ID mismatch")
-        if response.get("ok") is not True:
-            raise RuntimeError(
-                "Mooncake checkpoint participant "
-                f"{request.participant.participant_id} failed: "
-                f"{response.get('error', 'unknown error')}"
-            )
-    finally:
-        socket.close(linger=0)
-        context.term()
-    return response
-
-
 def _fanout_requests(
     requests: list[_ParticipantRequest],
     *,
+    workers: Mapping[str, Any],
+    local: _CheckpointParticipant | None,
     timeout_s: float,
     max_parallel: int = _DEFAULT_MAX_PARALLEL,
-    allow_failures: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Run participant requests concurrently; tests can replace this seam."""
-    if not requests:
-        return {}
+    """Send metadata-only commands to existing actors; never RPC back to self."""
     responses: dict[str, dict[str, Any]] = {}
-    errors: dict[str, Exception] = {}
-    with ThreadPoolExecutor(max_workers=min(max_parallel, len(requests))) as executor:
-        futures = {
-            executor.submit(
-                _request_participant, request, timeout_s=timeout_s
-            ): request.participant.participant_id
-            for request in requests
-        }
-        for future in as_completed(futures):
-            participant_id = futures[future]
-            try:
-                responses[participant_id] = future.result()
-            except Exception as error:
-                errors[participant_id] = error
-    if errors and not allow_failures:
-        detail = "; ".join(
-            f"{participant_id}: {error}"
-            for participant_id, error in sorted(errors.items())
-        )
-        raise RuntimeError(f"Mooncake checkpoint fanout failed: {detail}") from next(
-            iter(errors.values())
-        )
+    try:
+        for start in range(0, len(requests), max_parallel):
+            pending: dict[str, Any] = {}
+            local_requests: list[_ParticipantRequest] = []
+            for request in requests[start : start + max_parallel]:
+                participant_id = request.participant.participant_id
+                if local is not None and participant_id == local.info.participant_id:
+                    local_requests.append(request)
+                else:
+                    pending[participant_id] = workers[
+                        participant_id
+                    ].mooncake_checkpoint.remote(request.body)
+            # Remote I/O runs concurrently with this process's own shard I/O.
+            for request in local_requests:
+                assert local is not None
+                responses[request.participant.participant_id] = local._dispatch(
+                    request.body
+                )
+            results = ray.get(list(pending.values()), timeout=timeout_s)
+            responses.update(zip(pending, results, strict=True))
+    except Exception as error:
+        # An RPC may still be writing after a timeout. Do not let the periodic
+        # checkpoint pump mistake that uncertainty for a retryable local timeout.
+        raise RuntimeError(f"Mooncake checkpoint fanout failed: {error}") from error
+    for response in responses.values():
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise RuntimeError("Malformed Mooncake checkpoint worker response")
     return responses
 
 
@@ -954,68 +736,47 @@ def _require_exact_responses(
         )
 
 
-def _live_participants(manager: Any) -> list[_ParticipantInfo]:
-    """Return responsive existing-client endpoints; tests can replace this seam."""
-    import ray
-
-    local = getattr(manager, "_checkpoint_participant", None)
-    registry = getattr(local, "_registry", None) or _registry_actor()
-    timeout_s = min(_checkpoint_timeout_s(manager.config), 30.0)
-    controller_session = _controller_session(manager)
-    raw_participants = ray.get(
-        registry.participants.remote(controller_session), timeout=timeout_s
-    )
-    if not isinstance(raw_participants, list):
-        raise RuntimeError("Mooncake checkpoint registry returned malformed data")
-
-    participants: list[_ParticipantInfo] = []
-    ids: set[str] = set()
-    for raw in raw_participants:
-        if not isinstance(raw, Mapping):
-            continue
-        participant = _ParticipantInfo.from_mapping(raw)
-        if participant.participant_id in ids:
-            raise RuntimeError(
-                "Mooncake checkpoint registry contains duplicate participant IDs"
-            )
-        ids.add(participant.participant_id)
-        participants.append(participant)
-
-    ping_requests = [
-        _ParticipantRequest(
-            participant,
-            _request_body(manager, "PING"),
+def _live_participants(
+    manager: Any,
+) -> tuple[list[_ParticipantInfo], dict[str, Any]]:
+    """Describe the explicitly supplied workers, plus the calling process."""
+    workers = manager._checkpoint_workers
+    body = _request_body(manager, "DESCRIBE")
+    try:
+        responses = ray.get(
+            [worker.mooncake_checkpoint.remote(body) for worker in workers],
+            timeout=_checkpoint_timeout_s(manager.config),
         )
-        for participant in participants
-    ]
-    responses = _fanout_requests(
-        ping_requests,
-        timeout_s=timeout_s,
-        max_parallel=_checkpoint_max_parallel(manager.config),
-        allow_failures=True,
-    )
-    live = [
-        participant
-        for participant in participants
-        if participant.participant_id in responses
-        and responses[participant.participant_id].get("participant")
-        == asdict(participant)
-    ]
-    stale = [participant for participant in participants if participant not in live]
-    if stale:
-        refs = [
-            registry.unregister.remote(
-                participant.participant_id, participant.incarnation
-            )
-            for participant in stale
-        ]
-        with suppress(Exception):
-            ray.get(refs, timeout=timeout_s)
+    except Exception as error:
+        raise RuntimeError("Mooncake checkpoint worker discovery failed") from error
+    participants: dict[str, _ParticipantInfo] = {}
+    handles: dict[str, Any] = {}
+    local = manager._checkpoint_participant
+    if local is not None:
+        participants[local.info.participant_id] = local.info
+    for worker, response in zip(workers, responses, strict=True):
+        # Some generation ranks do not host token capture or a TQ client.
+        if response is None:
+            continue
+        if not isinstance(response, Mapping) or response.get("ok") is not True:
+            raise RuntimeError("Malformed Mooncake checkpoint worker description")
+        raw = response.get("participant")
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("Missing Mooncake checkpoint worker identity")
+        participant = _ParticipantInfo.from_mapping(raw)
+        if participant.controller_session != body["controller_session"]:
+            raise RuntimeError("Mooncake checkpoint controller session mismatch")
+        existing = participants.get(participant.participant_id)
+        if existing is not None and existing != participant:
+            raise RuntimeError("Conflicting Mooncake checkpoint worker identities")
+        participants[participant.participant_id] = participant
+        handles[participant.participant_id] = worker
+    live = list(participants.values())
     if len({participant.transport_endpoint for participant in live}) != len(live):
         raise RuntimeError(
             "Live Mooncake checkpoint participants have duplicate endpoints"
         )
-    return sorted(live, key=lambda participant: participant.participant_id)
+    return sorted(live, key=lambda participant: participant.participant_id), handles
 
 
 def _owner_assignments(
@@ -1142,7 +903,7 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         )
         return
 
-    participants = _live_participants(manager)
+    participants, workers = _live_participants(manager)
     if not participants:
         raise RuntimeError("No live Mooncake checkpoint participants")
     assignments = _owner_assignments(
@@ -1166,6 +927,8 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         )
     responses = _fanout_requests(
         requests,
+        workers=workers,
+        local=manager._checkpoint_participant,
         timeout_s=_checkpoint_timeout_s(manager.config),
         max_parallel=_checkpoint_max_parallel(manager.config),
     )
@@ -1314,7 +1077,7 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
     else:
         return
 
-    participants = _live_participants(manager)
+    participants, workers = _live_participants(manager)
     if not participants:
         raise RuntimeError("No live Mooncake checkpoint participants")
     assignments = _restore_assignments(entries, participants)
@@ -1338,6 +1101,8 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
     ]
     responses = _fanout_requests(
         requests,
+        workers=workers,
+        local=manager._checkpoint_participant,
         timeout_s=_checkpoint_timeout_s(manager.config),
         max_parallel=_checkpoint_max_parallel(manager.config),
     )
@@ -1368,6 +1133,38 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
             )
 
 
+def configure_checkpoint_workers(workers: list[Any]) -> None:
+    """Bind existing actor handles for this process's checkpoint coordinator.
+
+    Call after all intended owners have attached, before save or restore. Do
+    not include the calling actor: its shard is executed directly, including
+    when restoring inside SingleController's constructor.
+    """
+    # TransferQueue is optional outside this backend.
+    import transfer_queue as tq
+
+    manager = tq.get_client().storage_manager
+    if not getattr(type(manager), _PLUGIN_MARKER, False):
+        raise RuntimeError("Mooncake checkpoint manager is not installed")
+    manager._checkpoint_workers = list(workers)
+
+
+def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Execute an actor command using only its already-attached local store."""
+    # Reading TQ's process-local singleton must not lazily create a client on
+    # generation ranks that do not own token capture.
+    from transfer_queue import interface as tq_interface
+
+    client = tq_interface._TQ_CLIENT
+    if client is None:
+        return None
+    manager = client.storage_manager
+    if not getattr(type(manager), _PLUGIN_MARKER, False):
+        return None
+    participant = manager._checkpoint_participant
+    return None if participant is None else participant._dispatch(body)
+
+
 def install_tq_mooncake_checkpoint_plugin() -> None:
     """Install the explicit-checkpoint storage manager once."""
     from transfer_queue.storage.managers import mooncake_manager
@@ -1381,19 +1178,22 @@ def install_tq_mooncake_checkpoint_plugin() -> None:
         raise RuntimeError("Unexpected TQ MooncakeStore manager registration")
 
     class CheckpointMooncakeStorageManager(mooncake_manager.MooncakeStorageManager):
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
+        def __init__(self, controller_info: Any, config: dict[str, Any]) -> None:
+            if _checkpoint_enabled(config):
+                config = dict(config)
+                if ray.get_runtime_context().get_actor_id() is None:
+                    # A driver/task has no actor command endpoint. It may use
+                    # Mooncake, but must not own otherwise unreachable payload.
+                    # Keep the controller's published config unchanged so actors
+                    # still mount their configured storage capacity.
+                    config["global_segment_size"] = 0
+            super().__init__(controller_info, config)
+            self._checkpoint_workers: list[Any] = []
             self._checkpoint_participant: _CheckpointParticipant | None = None
             if _checkpoint_enabled(self.config):
-                participant = _CheckpointParticipant(self)
-                try:
-                    participant.start_and_register()
-                except BaseException:
-                    participant.close()
-                    with suppress(Exception):
-                        super().close()
-                    raise
-                self._checkpoint_participant = participant
+                _validate_checkpoint_runtime(self)
+                if self.config["global_segment_size"] > 0:
+                    self._checkpoint_participant = _CheckpointParticipant(self)
 
         async def save_checkpoint(self, checkpoint_dir: str) -> None:
             if not _checkpoint_enabled(self.config):
@@ -1407,16 +1207,13 @@ def install_tq_mooncake_checkpoint_plugin() -> None:
                 return
             await asyncio.to_thread(_load_storage_checkpoint, self, checkpoint_dir)
 
-        def close(self) -> None:
-            participant = getattr(self, "_checkpoint_participant", None)
-            if participant is not None:
-                participant.close()
-                self._checkpoint_participant = None
-            super().close()
-
     CheckpointMooncakeStorageManager.__name__ = "CheckpointMooncakeStorageManager"
     setattr(CheckpointMooncakeStorageManager, _PLUGIN_MARKER, True)
     manager_registry["MooncakeStore"] = CheckpointMooncakeStorageManager
 
 
-__all__ = ["install_tq_mooncake_checkpoint_plugin"]
+__all__ = [
+    "configure_checkpoint_workers",
+    "install_tq_mooncake_checkpoint_plugin",
+    "run_checkpoint_command",
+]

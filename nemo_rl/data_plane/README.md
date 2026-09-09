@@ -464,9 +464,8 @@ The distributed format uses manifest version 3. Earlier centralized Mooncake
 checkpoint formats are not accepted by this loader; use fresh checkpoints.
 
 `mooncake_cpu.checkpoint.enabled=true` adds storage save/load support to TQ's
-existing explicit checkpoint API. It does not change the normal data path:
-ordinary PUTs remain in Mooncake memory and perform no checkpoint-related
-Lustre I/O.
+existing explicit checkpoint API. Ordinary PUTs remain in Mooncake memory and
+perform no checkpoint-related filesystem I/O.
 
 On `tq.save_checkpoint(...)`, the plugin enumerates every raw Mooncake object
 key referenced by the TQ controller snapshot and maps it to a live client with
@@ -475,13 +474,24 @@ requests. Each selected client reads only the objects it owns and writes one
 unique packed shard beneath the requested TQ checkpoint directory on the
 shared filesystem. The coordinator commits the offset/size/digest manifest
 only after every owner has flushed, fsynced, and acknowledged its exact shard.
-Payload bytes never pass through the coordinator.
+Other owners' payload bytes never pass through the coordinator; it writes any
+objects it owns directly, just like the other owners.
 
-The plugin discovers clients through a small named Ray registry, but the Ray
-actor stores endpoint metadata only. The shard writer is a ZMQ endpoint hosted
-inside each existing TQ Mooncake-manager process, where it can access that
-process's Mooncake memory directly. This gives checkpointing the same scaling
-shape as SimpleStorage's manager fanout without changing TQ itself.
+SingleController supplies its existing policy/value/teacher, token-capture,
+and finalizer actor handles. Their Ray methods carry checkpoint commands and
+completion metadata only; each method uses its process's existing Mooncake
+store. No checkpoint actors, registry, listener threads, or additional socket
+protocol are created. The calling actor handles its own shard directly, so
+constructor-time restore never waits for an RPC back to itself.
+
+When checkpointing is enabled, non-actor clients (including the driver) mount
+zero storage capacity: they can still PUT/GET through Mooncake, but cannot own
+payload that the controller has no actor endpoint to command. Actors retain
+their configured segment sizes. This removes the driver's segment from the
+available capacity; it does not add storage workers. Other callers of the
+plugin must supply their existing owner handles with
+`configure_checkpoint_workers(...)` before save/load. Unreachable owners fail
+the checkpoint rather than silently falling back to centralized copying.
 
 On `tq.load_checkpoint(...)`, the plugin validates the manifest and controller
 key set, balances the durable objects over the currently connected clients,
@@ -502,8 +512,8 @@ not contain model weights, unfinished generations, vLLM KV cache, or Gym state.
 Restore requires a fresh, empty Mooncake/TQ system. Attach every client that
 contributes Mooncake memory capacity first, keep the saved GDR mode and staging
 size unchanged, call `tq.load_checkpoint` before starting producers, and restart
-from an empty master before retrying a failed load. Release validation must
-exercise this order across a 2-node/16-GPU save, process restart, load, and read.
+from an empty master before retrying a failed load. Multi-node validation must
+exercise save, process restart, load, and read on the intended training topology.
 The first version requires hard-pinned memory replicas with Mooncake offload
 disabled. It supports NeMo-RL's HTTP metadata mode and rejects `P2PHANDSHAKE`,
 whose public Mooncake API does not expose the local transfer endpoint needed for
