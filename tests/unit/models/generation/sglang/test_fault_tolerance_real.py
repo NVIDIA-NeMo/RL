@@ -34,7 +34,6 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
-
 from tests.unit.models.generation.sglang.fault_injection import (
     kill_server_process_tree,
     snapshot_server_process_tree,
