@@ -1669,6 +1669,39 @@ class VllmInternalWorkerExtension:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+        # Finalize THIS inner worker's nsys trace NON-DESTRUCTIVELY. `nsys stop --session`
+        # writes a complete .nsys-rep for the running capture WITHOUT killing the process, so
+        # there is no worker death and therefore no engine fault-tolerance cascade (which would
+        # SIGKILL the sibling workers before nsys could finalize -- leaving unconvertible .qdstrm
+        # and losing all-but-one rank). Runs on EVERY inner worker via
+        # collective_rpc("stop_gpu_profiling"); each stops all locally-visible sessions
+        # (idempotent). Only when nsys profiling is active.
+        import os
+
+        if os.environ.get("NRL_NSYS_WORKER_PATTERNS"):
+            import subprocess
+
+            try:
+                out = subprocess.run(
+                    ["nsys", "sessions", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ).stdout
+                for line in out.splitlines():
+                    parts = line.split()
+                    if parts and parts[0].isdigit():
+                        try:
+                            subprocess.run(
+                                ["nsys", "stop", "--session=" + parts[0]],
+                                capture_output=True,
+                                text=True,
+                                timeout=180,
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
 
 class VllmInternalWorkerExtensionWithCheckpointEngine(

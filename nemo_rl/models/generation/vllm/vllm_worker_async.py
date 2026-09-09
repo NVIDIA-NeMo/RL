@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import os
 import copy
 import gc
 import logging
@@ -224,6 +225,32 @@ class VllmAsyncGenerationWorkerImpl(
 
         self.llm = None
         self.vllm_device_ids = None
+
+    async def start_gpu_profiling(self) -> None:
+        """Start GPU profiling.
+
+        The async engine's collective_rpc is a coroutine; the inherited sync
+        start_gpu_profiling would drop it un-awaited, so the inner TP workers
+        never receive cudaProfilerStart. Await it here so every inner worker starts.
+        """
+        torch.cuda.profiler.start()
+        if self.llm is not None:
+            await self.llm.collective_rpc("start_gpu_profiling", args=tuple())
+
+    async def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling.
+
+        Awaits collective_rpc("stop_gpu_profiling") so cudaProfilerStop reaches every
+        inner worker; the patched VllmInternalWorkerExtension.stop_gpu_profiling then
+        finalizes each inner worker's nsys trace in place via `nsys stop --session`
+        (non-destructive, all ranks). Grace-sleep lets all inner workers finish writing
+        their .nsys-rep before the run tears down.
+        """
+        torch.cuda.profiler.stop()
+        if self.llm is not None:
+            await self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+            if os.environ.get("NRL_NSYS_WORKER_PATTERNS"):
+                await asyncio.sleep(30)
 
     def _return_routed_experts_enabled(self) -> bool:
         engine_args = getattr(self, "llm_async_engine_args", None)
