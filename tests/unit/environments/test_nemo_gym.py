@@ -1792,10 +1792,12 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         nemo_gym_result = {"response": {"output": []}}
         tokenizer = object()
         postprocess_calls = []
+        rollout_semaphore = object()
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples(self, examples, head_server_config, semaphore):
                 del head_server_config
+                assert semaphore is rollout_semaphore
                 content = examples[0]["responses_create_params"]["input"][0]["content"]
                 assert content[0]["video_url"] == video_path.resolve().as_uri()
                 assert content[1]["image_url"].startswith("data:image/png;base64,")
@@ -1809,6 +1811,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             cfg = {}
             rch = _RolloutCollectionHelper()
             head_server_config = object()
+            _rollout_semaphore = rollout_semaphore
 
             def _require_spinup(self):
                 pass
@@ -1820,8 +1823,10 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
                 result_tokenizer,
                 *,
                 include_initial_multimodal_data,
+                log_training_sample,
             ):
                 del self
+                assert log_training_sample is False
                 postprocess_calls.append(
                     (
                         row,

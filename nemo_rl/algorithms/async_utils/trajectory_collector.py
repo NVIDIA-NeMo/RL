@@ -1621,12 +1621,25 @@ class AsyncTrajectoryCollector:
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
+            attempt_batch = repeated_batch
             if use_nemo_gym:
                 # Give every Gym submission a retry identity. This branch retries
-                # the full batch, so stamp the repeated rows immediately before
-                # each submission rather than relying on the source branch's
-                # pending-group-only retry implementation.
-                for row in repeated_batch["extra_env_info"]:
+                # only unfinished prompt groups. Replaying groups that were already
+                # buffered wastes generations and can recreate the proxy overload
+                # that caused the partial stream in the first place.
+                if buffered_group_indices:
+                    pending_row_indices = [
+                        row_index
+                        for group_index in sorted(
+                            expected_group_indices - buffered_group_indices
+                        )
+                        for row_index in range(
+                            group_index * num_generations,
+                            (group_index + 1) * num_generations,
+                        )
+                    ]
+                    attempt_batch = repeated_batch.select_indices(pending_row_indices)
+                for row in attempt_batch["extra_env_info"]:
                     row[NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt - 1
 
             push_tasks: list[asyncio.Task[None]] = []
@@ -1634,7 +1647,7 @@ class AsyncTrajectoryCollector:
             stream_error: Exception | None = None
             try:
                 async for rollout_result in self._iter_rollout_groups(
-                    repeated_batch=repeated_batch,
+                    repeated_batch=attempt_batch,
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,
@@ -1694,7 +1707,8 @@ class AsyncTrajectoryCollector:
                 "❌ NeMo-Gym batch did not complete prompt groups "
                 f"{sorted(pending_group_indices)}; retrying in "
                 f"{retry_delay:.1f}s "
-                f"(attempt {attempt + 1}/{max_attempts})"
+                f"(attempt {attempt + 1}/{max_attempts}); "
+                f"cause={type(last_error).__name__}: {last_error}"
             )
             await asyncio.sleep(retry_delay)
 

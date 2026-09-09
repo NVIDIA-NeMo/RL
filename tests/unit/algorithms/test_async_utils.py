@@ -3016,7 +3016,7 @@ class TestAsyncTrajectoryCollector:
         )
 
         assert rollout_calls == 2
-        assert rollout_call_attempt_indices == [[0, 0, 0, 0], [1, 1, 1, 1]]
+        assert rollout_call_attempt_indices == [[0, 0, 0, 0], [1, 1]]
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
 

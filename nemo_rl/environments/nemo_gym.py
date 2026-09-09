@@ -19,6 +19,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from asyncio import Semaphore
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from copy import deepcopy
@@ -386,6 +387,10 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # Bound the total number of Gym samples concurrently using the shared policy
+    # proxy. This semaphore is actor-wide, so overlapping async rollout batches
+    # cannot each independently admit an unbounded batch.
+    num_samples_in_parallel: NotRequired[int | None]
     # Optional startup gate for externally served Gym dependencies. The actor
     # starts local Gym services first, then waits for every target before it
     # exposes its rollout collection helper to the training driver.
@@ -786,6 +791,14 @@ class NemoGym(EnvironmentInterface):
         # here rather than in _spinup so a second spinup cannot wipe an installed
         # tokenizer and then report that set_tokenizer was never called.
         self._tokenizer: Optional[PreTrainedTokenizerBase] = None
+        num_samples_in_parallel = cfg.get("num_samples_in_parallel")
+        if num_samples_in_parallel is not None and num_samples_in_parallel < 1:
+            raise ValueError("num_samples_in_parallel must be positive when set")
+        self._rollout_semaphore = (
+            Semaphore(num_samples_in_parallel)
+            if num_samples_in_parallel is not None
+            else None
+        )
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -991,7 +1004,9 @@ Depending on your data shape, you may want to change these values."""
 
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
+            examples=nemo_gym_examples,
+            head_server_config=self.head_server_config,
+            semaphore=self._rollout_semaphore,
         )
 
         num_results = 0
@@ -1682,6 +1697,7 @@ def spinup_nemo_gym_actor(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    num_samples_in_parallel = nemo_gym_dict.pop("num_samples_in_parallel", None)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
     # top-level fields, so populate them here instead of leaving the actor to
@@ -1710,6 +1726,7 @@ def spinup_nemo_gym_actor(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        num_samples_in_parallel=num_samples_in_parallel,
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         **multimodal_flags,

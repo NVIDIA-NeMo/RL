@@ -205,6 +205,12 @@ data:
 env:
   should_log_nemo_gym_responses: false
   nemo_gym:
+    # One actor serves overlapping age-1 rollout batches. Bound their aggregate
+    # pressure on the shared policy proxy without changing the rollout batch.
+    # The 16 generation engines each admit 8 sequences. Keeping the HTTP
+    # frontier at that aggregate capacity avoids building a second queue of
+    # live sockets in the single Gym policy proxy.
+    num_samples_in_parallel: 128
     policy_max_input_tokens: ${policy.max_total_sequence_length}
     skip_venv_if_present: true
     pad_dynamic_image_shapes: true
