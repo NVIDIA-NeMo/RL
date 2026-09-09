@@ -321,7 +321,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def hide_tensor_quantizers(self):
-        """Temporarily hide ModelOpt quantizers from DDP module iteration."""
+        """Temporarily hide ModelOpt quantizers from recursive module iteration."""
         from megatron.core.distributed import DistributedDataParallel
 
         if not isinstance(self.model, DistributedDataParallel):
@@ -472,6 +472,16 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         return generation_cfg["backend"] == "vllm" and bool(
             generation_cfg.get("real_quant")
         )
+
+    def _build_refit_conversion_tasks(self) -> list:
+        if not self._use_real_quant_refit():
+            return super()._build_refit_conversion_tasks()
+
+        # ModelOpt exports scales from each owning weight. Its quantizer state
+        # is not an independent HF parameter and must not become a conversion
+        # task when a resumed checkpoint restores quantizers before planning.
+        with self.hide_tensor_quantizers():
+            return super()._build_refit_conversion_tasks()
 
     def _get_modelopt_export_plan(self):
         plan = getattr(self, "_modelopt_export_plan", None)

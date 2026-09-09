@@ -121,28 +121,52 @@ def _make_real_quant_worker():
 
 
 @requires_weight_folding
-def test_hide_tensor_quantizers_hides_quantizer_containers(monkeypatch):
+def test_real_quant_conversion_tasks_exclude_quantizer_state(monkeypatch):
     from megatron.core import distributed
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
 
-    class FakeDistributedDataParallel:
+    class FakeDistributedDataParallel(nn.Module):
         def __init__(self, module):
+            super().__init__()
             self.module = module
 
     model = nn.Module()
+    model.weight = nn.Parameter(torch.ones(1))
     model.quantizers = GroupedQuantizer(TensorQuantizer(), TensorQuantizer())
+    model.quantizers[0].amax = torch.tensor(1.0)
     worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
     worker.model = FakeDistributedDataParallel(model)
+    worker._use_real_quant_refit = lambda: True
     monkeypatch.setattr(
         distributed,
         "DistributedDataParallel",
         FakeDistributedDataParallel,
     )
 
-    assert "quantizers" in dict(model.named_modules())
-    with worker.hide_tensor_quantizers():
-        assert set(dict(model.named_modules())) == {""}
-    assert "quantizers" in dict(model.named_modules())
+    def build_conversion_tasks(_self):
+        return [
+            name
+            for name, _ in (
+                *worker.model.named_parameters(),
+                *worker.model.named_buffers(),
+            )
+        ]
+
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl,
+        "_build_refit_conversion_tasks",
+        build_conversion_tasks,
+    )
+
+    assert worker._build_refit_conversion_tasks() == ["module.weight"]
+    assert worker._build_refit_conversion_tasks() == ["module.weight"]
+    assert "module.quantizers.0._amax" in dict(worker.model.named_buffers())
+
+    worker._use_real_quant_refit = lambda: False
+    assert "module.quantizers.0._amax" in worker._build_refit_conversion_tasks()
 
 
 @requires_weight_folding
