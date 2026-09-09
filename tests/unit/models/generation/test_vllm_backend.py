@@ -1428,7 +1428,7 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
         process_weights_after_loading,
     )
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
-    ext._mtp_drafter_from_disk = False
+    ext._mtp_drafter_weights_from_refit = True
     ext.model_runner.drafter = SimpleNamespace(model=draft_model)
     ext.model_runner.vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -2006,6 +2006,166 @@ def test_load_weights_routes_only_policy_weights_to_mtp_drafter(monkeypatch):
     main_model.load_weights.assert_called_once_with(weights=policy_weights)
     ext._load_draft_weights.assert_called_once_with(draft_weights)
     ext._maybe_refit_mtp_drafter.assert_called_once_with(policy_weights)
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("architecture", "language_model_only", "expected_keys"),
+    [
+        (
+            "Gemma4UnifiedForConditionalGeneration",
+            True,
+            ["model.language_model.layers.0.self_attn.q_proj.weight"],
+        ),
+        (
+            "Gemma4UnifiedForConditionalGeneration",
+            False,
+            [
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.embed_vision.pos_embedding",
+                "model.embed_audio.embedding_projection.weight",
+            ],
+        ),
+        (
+            "Gemma4ForConditionalGeneration",
+            True,
+            [
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.embed_vision.pos_embedding",
+                "model.embed_audio.embedding_projection.weight",
+            ],
+        ),
+    ],
+)
+def test_gemma4_refit_drops_multimodal_weights_only_for_unified_text_generation(
+    monkeypatch, architecture, language_model_only, expected_keys
+):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    loaded = []
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(load_weights=lambda *, weights: loaded.extend(weights)),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=[architecture],
+                multimodal_config=SimpleNamespace(
+                    language_model_only=language_model_only
+                ),
+            )
+        ),
+    )
+    ext._load_draft_weights = MagicMock()
+    ext._maybe_refit_mtp_drafter = MagicMock()
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    weights = [
+        ("model.language_model.layers.0.self_attn.q_proj.weight", "language"),
+        ("model.embed_vision.pos_embedding", "vision"),
+        ("model.embed_audio.embedding_projection.weight", "audio"),
+    ]
+
+    ext._load_weights(weights)
+
+    assert [key for key, _ in loaded] == expected_keys
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("architecture", "language_model_only", "expected_keys"),
+    [
+        (
+            "Gemma4UnifiedForConditionalGeneration",
+            True,
+            ["model.language_model.layers.0.self_attn.q_proj.weight"],
+        ),
+        (
+            "Gemma4UnifiedForConditionalGeneration",
+            False,
+            [
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.embed_vision.pos_embedding",
+                "model.embed_audio.embedding_projection.weight",
+            ],
+        ),
+        (
+            "Gemma4ForConditionalGeneration",
+            True,
+            [
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.embed_vision.pos_embedding",
+                "model.embed_audio.embedding_projection.weight",
+            ],
+        ),
+    ],
+)
+def test_prepare_reload_weight_iterator_filters_only_unified_text_generation(
+    monkeypatch, architecture, language_model_only, expected_keys
+):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=[architecture],
+                multimodal_config=SimpleNamespace(
+                    language_model_only=language_model_only
+                ),
+            )
+        )
+    )
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    weights = iter(
+        [
+            ("model.language_model.layers.0.self_attn.q_proj.weight", "language"),
+            ("model.embed_vision.pos_embedding", "vision"),
+            ("model.embed_audio.embedding_projection.weight", "audio"),
+        ]
+    )
+
+    result = list(ext._prepare_reload_weight_iterator(weights))
+
+    assert [key for key, _ in result] == expected_keys
+
+
+@pytest.mark.vllm
+def test_gemma4_unified_refit_logs_dropped_weights_once(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["Gemma4UnifiedForConditionalGeneration"],
+                multimodal_config=SimpleNamespace(language_model_only=True),
+            )
+        )
+    )
+    ext._load_hf_weights = MagicMock()
+    ext._load_draft_weights = MagicMock()
+    ext._maybe_refit_mtp_drafter = MagicMock()
+    log_info = MagicMock()
+    monkeypatch.setattr(vllm_backend.logger, "info", log_info)
+    weights = [
+        ("model.language_model.layers.0.self_attn.q_proj.weight", "language"),
+        ("model.embed_vision.pos_embedding", "vision"),
+        ("model.embed_audio.embedding_projection.weight", "audio"),
+    ]
+
+    ext._load_weights(weights)
+    ext._load_weights(weights)
+
+    log_info.assert_called_once_with(
+        "Gemma4 Unified text-only refit dropped %d frozen vision/audio weights", 2
+    )
 
 
 @pytest.mark.vllm

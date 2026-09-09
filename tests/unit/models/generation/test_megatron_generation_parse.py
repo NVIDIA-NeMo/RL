@@ -236,6 +236,11 @@ def test_http_server_port_reservation(monkeypatch):
             assert holder._sock.fileno() == -1
             assert reserved_socket.getsockname()[1] == port
 
+            # Still accepting after the holder closed its copy: the port was
+            # never released across the handoff.
+            with socket.create_connection(("127.0.0.1", port), timeout=5):
+                pass
+
             # MCore closes the handed-off fd and gives every frontend replica
             # its own SO_REUSEPORT listener. Such a listener can join the reuse
             # group while this test stub still holds the adopted duplicate.
