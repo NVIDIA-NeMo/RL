@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Annotated, Any, Literal, Mapping, TypeAlias, TypeVar, cast
+from typing import Annotated, Literal, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
@@ -505,13 +505,13 @@ class GymModelCommitResponse(_StrictWireModel):
     excluded_tombstoned: NonNegativeInt
     excluded_inactive: NonNegativeInt = 0
     manifest_digest: Sha256Digest
-    storage_reference_index: GymCheckpointArtifactReference | None = None
+    storage_reference_index: GymCheckpointArtifactReference
 
 
 class GymAgentCommitResponse(_StrictWireModel):
     records: NonNegativeInt
     manifest_digest: Sha256Digest
-    continuation_index: GymCheckpointArtifactReference | None = None
+    continuation_index: GymCheckpointArtifactReference
 
 
 class GymResourcesCommitResponse(_StrictWireModel):
@@ -606,201 +606,6 @@ def validate_gym_checkpoint_manifests(
             )
 
 
-def _legacy_gym_checkpoint_staging_keys(
-    checkpoint_dir: Path,
-    checkpoint: GymCheckpointCommitResult,
-) -> set[str]:
-    """Reconstruct staging ownership from pre-sidecar Gym checkpoints.
-
-    This deliberately expensive fallback preserves restore compatibility with
-    snapshots produced before Gym exported a storage-reference index.
-    """
-    validate_gym_checkpoint_manifests(checkpoint_dir, checkpoint)
-    root = checkpoint_dir.resolve()
-    continuation_model_calls: dict[str, str] = {}
-    for result in checkpoint.participants:
-        if result.participant.component != "responses_api_agents":
-            continue
-        if not isinstance(result.payload, GymAgentCommitResponse):
-            raise TypeError(
-                "Gym agent participant returned a non-agent checkpoint payload"
-            )
-        manifest_path = (root / result.manifest.relative_path).resolve()
-        raw_manifest = json.loads(manifest_path.read_text())
-        if not isinstance(raw_manifest, Mapping):
-            raise TypeError(f"Gym agent manifest must be an object: {manifest_path}")
-        raw_files = raw_manifest.get("files")
-        if not isinstance(raw_files, Mapping):
-            raise TypeError(
-                f"Gym agent manifest files must be an object: {manifest_path}"
-            )
-        if len(raw_files) != result.payload.records:
-            raise ValueError(
-                "Gym agent checkpoint record count does not match its manifest: "
-                f"payload={result.payload.records}, actual={len(raw_files)}"
-            )
-        for name, expected_digest in raw_files.items():
-            if not isinstance(name, str) or not isinstance(expected_digest, str):
-                raise TypeError("Gym agent manifest file entries are malformed")
-            record_path = (manifest_path.parent / name).resolve()
-            try:
-                record_path.relative_to(manifest_path.parent)
-            except ValueError as error:
-                raise ValueError(
-                    f"Gym agent record escapes its manifest directory: {name}"
-                ) from error
-            if not record_path.is_file():
-                raise FileNotFoundError(f"Gym agent record is missing: {record_path}")
-            record_payload = record_path.read_bytes()
-            actual_digest = hashlib.sha256(record_payload).hexdigest()
-            if actual_digest != expected_digest:
-                raise ValueError(
-                    "Gym agent record digest mismatch: "
-                    f"path={record_path}, expected={expected_digest}, "
-                    f"actual={actual_digest}"
-                )
-            record: Any = json.loads(record_payload)
-            if not isinstance(record, Mapping):
-                raise TypeError(f"Gym agent record must be an object: {record_path}")
-            rollout_id = record.get("rollout_id")
-            attempt_index = record.get("attempt_index")
-            last_committed_model_call_id = record.get("last_committed_model_call_id")
-            if (
-                not isinstance(rollout_id, str)
-                or not rollout_id
-                or isinstance(attempt_index, bool)
-                or not isinstance(attempt_index, int)
-                or attempt_index < 0
-                or not isinstance(last_committed_model_call_id, str)
-                or not last_committed_model_call_id
-            ):
-                raise TypeError(
-                    "Gym agent record has invalid execution identity or model-call "
-                    f"boundary: {record_path}"
-                )
-            capture_key = gym_capture_key(rollout_id, attempt_index)
-            if capture_key in continuation_model_calls:
-                raise ValueError(
-                    f"duplicate Gym continuation capture key {capture_key!r}"
-                )
-            continuation_model_calls[capture_key] = last_committed_model_call_id
-
-    staging_keys: set[str] = set()
-    found_capture_keys: set[str] = set()
-    for result in checkpoint.participants:
-        if result.participant.component != "responses_api_models":
-            continue
-        if not isinstance(result.payload, GymModelCommitResponse):
-            raise TypeError(
-                "Gym model participant returned a non-model checkpoint payload"
-            )
-        manifest_path = (root / result.manifest.relative_path).resolve()
-        ledger_root = manifest_path.parent
-        raw_manifest = json.loads(manifest_path.read_text())
-        if not isinstance(raw_manifest, Mapping):
-            raise TypeError(f"Gym model manifest must be an object: {manifest_path}")
-        raw_rollouts = raw_manifest.get("rollouts")
-        if not isinstance(raw_rollouts, Mapping):
-            raise TypeError(
-                f"Gym model manifest rollouts must be an object: {manifest_path}"
-            )
-
-        observed_rows = 0
-        for rollout_id, raw_rollout in raw_rollouts.items():
-            if not isinstance(rollout_id, str) or not isinstance(raw_rollout, Mapping):
-                raise TypeError("Gym model manifest rollout entries are malformed")
-            raw_files = raw_rollout.get("files")
-            if not isinstance(raw_files, Mapping):
-                raise TypeError(
-                    f"Gym model manifest files for {rollout_id!r} must be an object"
-                )
-            rollout_rows = 0
-            for name, expected_digest in raw_files.items():
-                if not isinstance(name, str) or not isinstance(expected_digest, str):
-                    raise TypeError("Gym model manifest file entries are malformed")
-                lineage_path = (ledger_root / name).resolve()
-                try:
-                    lineage_path.relative_to(ledger_root)
-                except ValueError as error:
-                    raise ValueError(
-                        f"Gym lineage path escapes its manifest directory: {name}"
-                    ) from error
-                if not lineage_path.is_file():
-                    raise FileNotFoundError(
-                        f"Gym lineage file is missing: {lineage_path}"
-                    )
-                lineage_payload = lineage_path.read_bytes()
-                actual_digest = hashlib.sha256(lineage_payload).hexdigest()
-                if actual_digest != expected_digest:
-                    raise ValueError(
-                        "Gym lineage digest mismatch: "
-                        f"path={lineage_path}, expected={expected_digest}, "
-                        f"actual={actual_digest}"
-                    )
-                for line_number, line in enumerate(
-                    lineage_payload.splitlines(), start=1
-                ):
-                    if not line.strip():
-                        continue
-                    rollout_rows += 1
-                    row: Any = json.loads(line)
-                    if not isinstance(row, Mapping):
-                        raise TypeError(
-                            "Gym lineage row must be an object: "
-                            f"path={lineage_path}, line={line_number}"
-                        )
-                    if rollout_id not in continuation_model_calls:
-                        continue
-                    raw_staging_keys: list[Any] = []
-                    staging_key = row.get("staging_key")
-                    if staging_key is not None:
-                        raw_staging_keys.append(staging_key)
-                    staging_chain = row.get("staging_chain")
-                    if staging_chain is not None:
-                        if not isinstance(staging_chain, list):
-                            raise TypeError(
-                                "Gym lineage staging_chain must be a list: "
-                                f"path={lineage_path}, line={line_number}"
-                            )
-                        raw_staging_keys.extend(staging_chain)
-                    for owned_staging_key in raw_staging_keys:
-                        if (
-                            not isinstance(owned_staging_key, str)
-                            or not owned_staging_key
-                        ):
-                            raise TypeError(
-                                "Gym lineage staging keys must be non-empty strings: "
-                                f"path={lineage_path}, line={line_number}"
-                            )
-                        # Cumulative staging chains deliberately repeat parent keys
-                        # across later model calls. The ownership inventory is a set.
-                        staging_keys.add(owned_staging_key)
-                    if (
-                        row.get("model_call_id") == continuation_model_calls[rollout_id]
-                        and staging_key is not None
-                    ):
-                        found_capture_keys.add(rollout_id)
-            expected_rows = raw_rollout.get("rows")
-            if expected_rows != rollout_rows:
-                raise ValueError(
-                    f"Gym lineage row count mismatch for {rollout_id!r}: "
-                    f"manifest={expected_rows!r}, actual={rollout_rows}"
-                )
-            observed_rows += rollout_rows
-        if observed_rows != result.payload.rows:
-            raise ValueError(
-                "Gym model checkpoint row count does not match its manifest: "
-                f"payload={result.payload.rows}, actual={observed_rows}"
-            )
-    missing_capture_keys = set(continuation_model_calls) - found_capture_keys
-    if missing_capture_keys:
-        raise ValueError(
-            "Gym agent continuations are missing model lineage: "
-            f"capture_keys={sorted(missing_capture_keys)!r}"
-        )
-    return staging_keys
-
-
 class GymExternalStorageReference(_StrictWireModel):
     """One TQ staging row required by a parked Gym continuation."""
 
@@ -879,9 +684,8 @@ def gym_checkpoint_staging_keys(
 ) -> set[str]:
     """Return the TQ staging rows required by committed Gym continuations.
 
-    New checkpoints expose a compact, digest-bound storage-reference index, so
-    RL does not inspect Gym's private agent and model-lineage formats. A legacy
-    full scan is retained solely to restore older committed snapshots.
+    Gym owns its private agent and model-lineage formats. RL consumes only the
+    required, digest-bound external-storage reference index.
     """
     validate_gym_checkpoint_manifests(checkpoint_dir, checkpoint)
     model_results = [
@@ -889,26 +693,14 @@ def gym_checkpoint_staging_keys(
         for result in checkpoint.participants
         if result.participant.component == "responses_api_models"
     ]
-    indexed_results = [
-        result
-        for result in model_results
-        if isinstance(result.payload, GymModelCommitResponse)
-        and result.payload.storage_reference_index is not None
-    ]
-    if not indexed_results:
-        return _legacy_gym_checkpoint_staging_keys(checkpoint_dir, checkpoint)
-    if len(indexed_results) != len(model_results):
-        raise ValueError("Gym checkpoint mixes indexed and legacy model participants")
-
     references_by_key: dict[str, GymExternalStorageReference] = {}
-    for result in indexed_results:
+    for result in model_results:
         payload = result.payload
         if not isinstance(payload, GymModelCommitResponse):
             raise TypeError(
                 "Gym model participant returned a non-model checkpoint payload"
             )
         reference = payload.storage_reference_index
-        assert reference is not None
         records = _read_jsonl_artifact(
             checkpoint_dir,
             reference,
@@ -930,13 +722,13 @@ class GymModelRestoreResponse(_StrictWireModel):
     checkpoint_id: str | None = None
     tombstones: list[GymExecutionIdentity]
     source_attempts: list[GymExecutionIdentity]
-    storage_reference_index: GymCheckpointArtifactReference | None = None
+    storage_reference_index: GymCheckpointArtifactReference
 
 
 class GymAgentRestoreResponse(_StrictWireModel):
     records: NonNegativeInt
     source_checkpoint_id: str = Field(min_length=1)
-    continuation_index: GymCheckpointArtifactReference | None = None
+    continuation_index: GymCheckpointArtifactReference
 
 
 class GymResourcesRestoreResponse(_StrictWireModel):
@@ -998,7 +790,7 @@ def validate_gym_checkpoint_restore_artifacts(
             expected = committed_result.payload.continuation_index
         elif isinstance(committed_result.payload, GymModelCommitResponse):
             expected = committed_result.payload.storage_reference_index
-        if expected is None:
+        else:
             continue
 
         restored_result = restored_by_participant.get(
