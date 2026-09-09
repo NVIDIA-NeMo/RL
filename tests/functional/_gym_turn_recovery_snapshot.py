@@ -98,7 +98,10 @@ def _matching_recovery_attempt(
     return matches[0]
 
 
-def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
+def inspect_snapshot(
+    snapshot: Path,
+    dataset_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
     """Validate one published cross-system snapshot and select a continuation."""
     manifest = _read_json(snapshot / "manifest.json")
     if manifest.get("base_train_step") != 0:
@@ -121,8 +124,9 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
     model = _participant(gym_checkpoint, "responses_api_models")
     agent = _participant(gym_checkpoint, "responses_api_agents")
     resources = _participant(gym_checkpoint, "resources_servers")
-    for participant in (model, agent, resources):
-        _validate_participant_manifest(snapshot, participant)
+    _validate_participant_manifest(snapshot, model)
+    agent_manifest_path = _validate_participant_manifest(snapshot, agent)
+    resources_manifest_path = _validate_participant_manifest(snapshot, resources)
 
     if model["payload"]["rows"] < 1:
         raise AssertionError("Gym model ledger has no committed turn")
@@ -155,7 +159,6 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
             "Gym storage references contain a rollout with no parked continuation"
         )
 
-    agent_manifest_path = _validate_participant_manifest(snapshot, agent)
     agent_manifest = _read_json(agent_manifest_path)
     agent_dir = agent_manifest_path.parent
     recovery = torch.load(snapshot / "rollout_recovery.pt", weights_only=True)
@@ -203,6 +206,60 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         candidates,
         key=lambda item: (item[0]["rollout_id"], item[0]["attempt_index"]),
     )[0]
+
+    try:
+        prompt_index = int(group["prompt_ref"]["sample_id"])
+        dataset_row = dataset_rows[prompt_index]
+    except (IndexError, KeyError, TypeError, ValueError) as error:
+        raise AssertionError(
+            "selected recovery group does not resolve to its deterministic "
+            "counter dataset row"
+        ) from error
+    initial_count = dataset_row.get("initial_count")
+    expected_count = dataset_row.get("expected_count")
+    if (
+        isinstance(initial_count, bool)
+        or not isinstance(initial_count, int)
+        or isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count <= initial_count
+    ):
+        raise AssertionError("counter test row has invalid initial/expected values")
+
+    resources_manifest = _read_json(resources_manifest_path)
+    resource_snapshots: list[dict[str, Any]] = []
+    for name, expected_digest in resources_manifest.get("files", {}).items():
+        resource_path = resources_manifest_path.parent / name
+        if _digest(resource_path) != expected_digest:
+            raise AssertionError(f"resources state digest mismatch for {resource_path}")
+        resource_record = _read_json(resource_path)
+        if (
+            resource_record.get("rollout_id") == boundary["rollout_id"]
+            and resource_record.get("attempt_index") == boundary["attempt_index"]
+        ):
+            resource_snapshots.append(resource_record)
+    if len(resource_snapshots) != 1:
+        raise AssertionError(
+            "selected Gym continuation did not map to exactly one resources snapshot"
+        )
+    resource_snapshot = resource_snapshots[0]
+    resource_name = resources["participant"]["name"]
+    expected_revision = boundary["resource_state_revisions"].get(resource_name)
+    if resource_snapshot.get("state_revision") != expected_revision:
+        raise AssertionError(
+            "agent boundary and resources snapshot disagree about state revision"
+        )
+    checkpoint_counter = (resource_snapshot.get("state") or {}).get("counter")
+    if (
+        isinstance(checkpoint_counter, bool)
+        or not isinstance(checkpoint_counter, int)
+        or not initial_count < checkpoint_counter <= expected_count
+    ):
+        raise AssertionError(
+            "checkpoint must contain a counter mutation strictly after the initial "
+            "state and no later than the expected terminal state"
+        )
+
     return {
         "snapshot_path": str(snapshot.resolve()),
         "checkpoint_id": gym_checkpoint["checkpoint_id"],
@@ -213,6 +270,10 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         "last_committed_model_call_id": boundary["last_committed_model_call_id"],
         "resource_state_revisions": boundary["resource_state_revisions"],
         "group_id": group["group_id"],
+        "prompt_index": prompt_index,
+        "initial_count": initial_count,
+        "checkpoint_counter": checkpoint_counter,
+        "expected_count": expected_count,
         "completed_group_ids": sorted(item["group_id"] for item in replay["groups"]),
     }
 
@@ -225,12 +286,19 @@ def _published_bootstrap_snapshots(checkpoint_dir: Path) -> list[Path]:
 
 
 def select_snapshot(args: argparse.Namespace) -> None:
+    dataset_rows = [
+        json.loads(line)
+        for line in args.dataset.read_text().splitlines()
+        if line.strip()
+    ]
+    if not dataset_rows or not all(isinstance(row, dict) for row in dataset_rows):
+        raise TypeError("counter dataset must contain JSON objects")
     deadline = time.monotonic() + args.timeout_s
     last_error = "no published bootstrap snapshot"
     while time.monotonic() < deadline:
         for snapshot in _published_bootstrap_snapshots(args.checkpoint_dir):
             try:
-                selected = inspect_snapshot(snapshot)
+                selected = inspect_snapshot(snapshot, dataset_rows)
             except (
                 AssertionError,
                 FileNotFoundError,
@@ -297,6 +365,24 @@ def verify_restore(args: argparse.Namespace) -> None:
         raise AssertionError(
             "restore reused the tombstoned source attempt instead of incrementing it"
         )
+    matching_completions = [
+        event
+        for event in events
+        if event.get("event") == "completion_forwarded"
+        and event.get("rollout_id") == expected_capture_key
+    ]
+    if len(matching_completions) != 1:
+        raise AssertionError(
+            "restored counter continuation did not complete exactly once: "
+            f"matches={matching_completions!r}"
+        )
+    completion = matching_completions[0]
+    if completion.get("reward") != 1.0:
+        raise AssertionError(
+            "restored counter continuation received a failed verifier reward; "
+            "the pre-checkpoint tool mutation may have been replayed: "
+            f"completion={completion!r}"
+        )
     regenerated_completed_groups = [
         event
         for event in events
@@ -319,6 +405,7 @@ def parse_args() -> argparse.Namespace:
     select.add_argument("selection", type=Path)
     select.add_argument("pid", type=int)
     select.add_argument("run_log", type=Path)
+    select.add_argument("dataset", type=Path)
     select.add_argument("timeout_s", type=float)
 
     verify = subparsers.add_parser("verify-restore")

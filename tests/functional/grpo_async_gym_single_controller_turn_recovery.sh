@@ -21,6 +21,7 @@ PHASE2_LOG=$TEST_DIR/phase2.log
 PHASE1_EVENTS=$TEST_DIR/phase1-events.jsonl
 PHASE2_EVENTS=$TEST_DIR/phase2-events.jsonl
 SELECTION_FILE=$TEST_DIR/selected_snapshot.json
+COUNTER_DATA=$TEST_DIR/session_state_mgmt.jsonl
 PHASE1_PID=""
 
 GYM_ROOT=${NEMO_GYM_SOURCE_DIR:-$PROJECT_ROOT/3rdparty/Gym-workspace/Gym}
@@ -43,6 +44,16 @@ export NEMO_GYM_CHECKPOINT_CONTROL_TOKEN=${NEMO_GYM_CHECKPOINT_CONTROL_TOKEN:-fu
 
 rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
+
+# Use a deterministic, stateful environment. A restored rollout receives reward
+# 1 only when its saved counter is continued exactly once; replaying a committed
+# pre-checkpoint increment necessarily makes the positive-only count too large.
+jq -c \
+    '.task_source //= "example_session_state_mgmt_simple_agent"' \
+    "$GYM_ROOT/resources_servers/example_session_state_mgmt/data/example.jsonl" \
+    > "$COUNTER_DATA"
+export NEMO_GYM_TRAIN_DATA_PATH=$COUNTER_DATA
+export NEMO_GYM_VALIDATION_DATA_PATH=$COUNTER_DATA
 
 stop_phase1() {
     if [[ -z "$PHASE1_PID" ]]; then
@@ -86,6 +97,9 @@ COMMON_OVERRIDES=(
     grpo.num_generations_per_prompt="$NUM_GENERATIONS"
     grpo.max_num_steps="$MAX_STEPS"
     policy.train_global_batch_size="$TRAIN_GLOBAL_BATCH_SIZE"
+    policy.generation.temperature=0.0
+    policy.generation.max_new_tokens=128
+    'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/example_session_state_mgmt/configs/example_session_state_mgmt.yaml]'
 )
 
 echo "=== Phase 1: publish one coordinated Gym + TQ turn checkpoint ==="
@@ -93,7 +107,6 @@ command -v setsid >/dev/null
 setsid env \
     SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
     SC_SIBLING_RECOVERY_TEST_EVENTS="$PHASE1_EVENTS" \
-    SC_SIBLING_RECOVERY_BLOCK_TARGET_STEP=0 \
     RUN_CONVERGENCE_CHECKS=0 \
     NEMO_GYM_SOURCE_DIR="$GYM_ROOT" \
     NEMO_GYM_CHECKPOINT_CONTROL_TOKEN="$NEMO_GYM_CHECKPOINT_CONTROL_TOKEN" \
@@ -105,6 +118,7 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
     "$SELECTION_FILE" \
     "$PHASE1_PID" \
     "$BASE_RUN_LOG" \
+    "$COUNTER_DATA" \
     "$SNAPSHOT_TIMEOUT_S"
 
 stop_phase1
