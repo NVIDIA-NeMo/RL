@@ -130,7 +130,13 @@ def test_setup_rejects_fused_linear_logprobs_with_unsupported_sampling(
         "use_fused_linear_logprobs": True,
     }
     master_config.policy["sequence_packing"] = {"enabled": False}
-    master_config.policy["generation"].update(sampling_config)
+    generation_config = master_config.policy["generation"]
+    generation_config.update(sampling_config)
+    # Keep validation sampling aligned so setup reaches the fused-path guard
+    # exercised by this test instead of the earlier train/validation check.
+    generation_config.update(
+        {f"val_{name}": value for name, value in sampling_config.items()}
+    )
     master_config.grpo.val_period = 0
     master_config.grpo.batch_multiplier = 1
     master_config.data.update({"shuffle": False, "num_workers": 0})
