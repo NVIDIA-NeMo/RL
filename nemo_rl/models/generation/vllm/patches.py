@@ -98,10 +98,10 @@ _ROUTED_EXPERTS_CAPTURER_SOURCE = (
 # This blob is shared by the live image's b31cc131 build and uv.lock's
 # 6f11a9c5 source revision, despite other differences between those commits.
 _ROUTED_EXPERTS_CAPTURER_V0251_SHA256 = (
-    "e2e02d6322fd45edc143bdf2553a0fe6e2a010e1da3fbcea0df5887485a211c1"
+    "e2e02d6322fd45edc143bdf2553a0fe6e2a010e1da3fbcea0df5887485a211c1"  # pragma: allowlist secret
 )
 _ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256 = (
-    "7aada566f750ae6c46d214b03f3b012757ea07f81ac3f0c2d6ce15956a4ad25b"
+    "7aada566f750ae6c46d214b03f3b012757ea07f81ac3f0c2d6ce15956a4ad25b"  # pragma: allowlist secret
 )
 
 
