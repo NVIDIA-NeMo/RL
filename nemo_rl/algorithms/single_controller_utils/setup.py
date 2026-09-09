@@ -919,20 +919,13 @@ def _load_opd_full_teacher_lm_heads(
         )
 
     teacher = next(iter(teacher_worker_groups.values()))
-    # TeacherWorkerGroup deep-copies the student policy config and overrides only
-    # `model_name`, so a student `pretrained_checkpoint` rides along. Left in,
-    # validate_model_paths would hand back the *student's* checkpoint, silently
-    # distilling the student into itself. Clear it so resolution keys off the
-    # teacher's model name.
-    #
     # Resolution happens on the student workers, not here: validate_model_paths
     # imports megatron.bridge at module scope, and only the Megatron worker
     # actors get the mcore extra.
-    teacher_path_config = {**teacher.cfg, "pretrained_checkpoint": None}
     results = ray.get(
         trainer.worker_group.run_all_workers_single_data(
             "load_opd_full_teacher_lm_head",
-            teacher_path_config=cast(PolicyConfig, teacher_path_config),
+            teacher_path_config=cast(PolicyConfig, teacher.cfg),
         )
     )
     print(

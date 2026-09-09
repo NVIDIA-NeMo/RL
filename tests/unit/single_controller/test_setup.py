@@ -2303,9 +2303,9 @@ class TestOPDFullValidation:
     def test_rejects_pipeline_parallel_on_the_hidden_state_path(self):
         """Megatron builds output_layer only on the last pipeline stage.
 
-        The teacher LM head loads through a collective spanning the whole
-        student world, so earlier stages would raise while the last stage hangs
-        inside that collective.
+        Resolving the teacher checkpoint iteration goes through Megatron-Bridge's
+        read_train_state, whose broadcast spans the whole student world, so
+        earlier stages would raise while the last stage hangs inside it.
         """
         config = _load_fullvocab_master_config()
         config.policy["megatron_cfg"]["pipeline_model_parallel_size"] = 2
@@ -2339,3 +2339,66 @@ class TestOPDFullValidation:
         assert config.on_policy_distillation.full is not None
         config.on_policy_distillation.full.teacher_payload = "logits"
         _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_a_non_megatron_backend(self):
+        """DTensor has no vocabulary-parallel logit path for the kernels."""
+        config = _load_fullvocab_master_config()
+        config.policy["megatron_cfg"]["enabled"] = False
+        with pytest.raises(ValueError, match="requires the Megatron backend"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+
+class _FakeTeacherGroup:
+    def __init__(self, model_name: str, cfg: dict):
+        self.model_name = model_name
+        self.cfg = cfg
+
+
+def _fake_trainer(result: str = "/resolved/teacher") -> Any:
+    trainer = MagicMock()
+    trainer.worker_group.run_all_workers_single_data.return_value = [result, result]
+    return trainer
+
+
+def test_load_opd_full_teacher_lm_heads_sends_the_teacher_groups_own_config(
+    monkeypatch,
+):
+    """The LM head must be resolved from the teacher, never from the student.
+
+    ``TeacherWorkerGroup`` drops ``pretrained_checkpoint`` from the config it
+    copies, so what arrives here already describes the teacher alone; a config
+    still carrying that key would resolve the student's checkpoint and distill
+    the student into itself with a divergence of exactly zero.
+    """
+    monkeypatch.setattr(sc_setup_mod, "ray", MagicMock(get=lambda futures: futures))
+    teacher_cfg = {"model_name": "Qwen/Qwen3-8B", "megatron_cfg": {"enabled": True}}
+    trainer = _fake_trainer()
+
+    sc_setup_mod._load_opd_full_teacher_lm_heads(
+        trainer, {"default_teacher": _FakeTeacherGroup("Qwen/Qwen3-8B", teacher_cfg)}
+    )
+
+    call = trainer.worker_group.run_all_workers_single_data.call_args
+    assert call.args == ("load_opd_full_teacher_lm_head",)
+    sent = call.kwargs["teacher_path_config"]
+    assert sent["model_name"] == "Qwen/Qwen3-8B"
+    assert "pretrained_checkpoint" not in sent
+
+
+def test_load_opd_full_teacher_lm_heads_rejects_two_teacher_checkpoints(monkeypatch):
+    monkeypatch.setattr(sc_setup_mod, "ray", MagicMock(get=lambda futures: futures))
+    trainer = _fake_trainer()
+
+    with pytest.raises(ValueError, match="exactly one teacher"):
+        sc_setup_mod._load_opd_full_teacher_lm_heads(
+            trainer,
+            {
+                "a": _FakeTeacherGroup(
+                    "Qwen/teacher-a", {"model_name": "Qwen/teacher-a"}
+                ),
+                "b": _FakeTeacherGroup(
+                    "Qwen/teacher-b", {"model_name": "Qwen/teacher-b"}
+                ),
+            },
+        )
+    trainer.worker_group.run_all_workers_single_data.assert_not_called()

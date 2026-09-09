@@ -13,10 +13,11 @@
 # limitations under the License.
 """Full-vocabulary MOPD (``on_policy_distillation.full``) config and loss.
 
-Everything here is CPU-only and process-group free: the divergence kernels
-themselves are covered in ``tests/unit/distributed/test_model_utils.py``, and
-``_opd_full_call`` only masks and normalizes a divergence tensor that
-``prepare_loss_input`` has already produced.
+Everything here is CPU-only, and process-group free except for
+``prepare_opd_full_loss_input``, whose TP collectives are neutralized the way
+``tests/unit/distributed/test_model_utils.py`` does. The divergence kernels
+themselves are covered there, and ``_opd_full_call`` only masks and normalizes a
+divergence tensor that ``prepare_loss_input`` has already produced.
 """
 
 from __future__ import annotations
@@ -26,7 +27,10 @@ import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossInputType, MetricNormalizer
-from nemo_rl.algorithms.loss.utils import reconstruct_opd_full_teacher_logits
+from nemo_rl.algorithms.loss.utils import (
+    prepare_opd_full_loss_input,
+    reconstruct_opd_full_teacher_logits,
+)
 from nemo_rl.algorithms.loss.wrapper import _SEQ_METRIC_MAX, _SEQ_METRIC_MIN
 from nemo_rl.algorithms.opd import (
     OnPolicyDistillationFullConfig,
@@ -35,6 +39,7 @@ from nemo_rl.algorithms.opd import (
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import (
     OPD_FULL_FIELDS,
+    OPD_FULL_HIDDEN_STATES_FIELD,
     OPD_FULL_LOGITS_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_opd_full,
@@ -342,6 +347,50 @@ def test_opd_full_requires_a_differentiable_logprob_for_the_reference_kl():
         )
 
 
+def test_opd_full_reference_kl_gradient_carries_the_score_function_term():
+    """The sampled penalty needs a score-function term the divergence does not.
+
+    Its weight is 1 in the forward pass, so only the gradient and the metric
+    together make a dropped weight visible.
+    """
+    penalty = 0.01
+    next_token_logprobs = torch.tensor(
+        [[-0.5, -1.0, -2.0], [-0.25, -1.5, -3.0]], requires_grad=True
+    )
+    data = _microbatch()
+    data["reference_policy_logprobs"] = torch.tensor(
+        [[0.0, -0.75, -1.25, -2.5], [0.0, -0.5, -2.0, -1.0]]
+    )
+
+    with pytest.warns(UserWarning, match="second KL"):
+        loss_fn = _loss_fn(reference_policy_kl_penalty=penalty, token_level_loss=True)
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=_GLOBAL_VALID_SEQS,
+        global_valid_toks=_GLOBAL_VALID_TOKS,
+        opd_full_divergence=_DIVERGENCE,
+    )
+    loss.backward()
+
+    mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    logr = data["reference_policy_logprobs"][:, 1:] - next_token_logprobs.detach()
+    k3 = torch.exp(logr) - 1.0 - logr
+    # d(k3)/dx = -(exp(r) - 1); the weight adds k3 on top.
+    expected_grad = penalty * mask * (k3 - (torch.exp(logr) - 1.0)) / _GLOBAL_VALID_TOKS
+
+    # The score-function term is ~6e-5 here, which the default atol of 1e-5
+    # would nearly swallow.
+    torch.testing.assert_close(
+        next_token_logprobs.grad, expected_grad, rtol=1e-5, atol=1e-9
+    )
+    # Forward is unweighted: the metric stays the plain k3.
+    assert metrics["kl_penalty"] == pytest.approx(
+        float((k3 * mask).sum() / _GLOBAL_VALID_TOKS), rel=1e-6
+    )
+
+
 def test_opd_full_requires_the_divergence_tensor():
     """Reaching the loss without it means prepare_loss_input silently no-oped."""
     with pytest.raises(ValueError, match="opd_full_divergence"):
@@ -602,3 +651,99 @@ def test_opd_full_filtered_sequences_receive_no_gradient():
     assert divergence.grad is not None
     torch.testing.assert_close(divergence.grad[2], torch.zeros(3))
     assert divergence.grad[0, 0].item() == pytest.approx(1 / 5, rel=1e-5)
+
+
+def test_opd_full_normalizes_by_the_global_counts_not_the_microbatch():
+    """The other fixtures use global counts equal to the microbatch's own.
+
+    A microbatch is one slice of the step, so dividing by its own counts would
+    over-weight small microbatches.
+    """
+    global_valid_seqs = torch.tensor(8.0)
+    global_valid_toks = torch.tensor(20.0)
+
+    loss, metrics = _loss_fn(token_level_loss=True)(
+        data=_microbatch(),
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        opd_full_divergence=_DIVERGENCE,
+    )
+
+    assert loss.item() == pytest.approx((1 + 3 + 2 + 5 + 7) / 20)
+    assert metrics["opd_full_reverse_kl"] == pytest.approx((1 + 3 + 2 + 5 + 7) / 20)
+
+    loss, _ = _loss_fn(token_level_loss=False)(
+        data=_microbatch(),
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        opd_full_divergence=_DIVERGENCE,
+    )
+
+    # seq0 averages to 2.0, seq1 to 6.0; the outer mean divides by the global count.
+    assert loss.item() == pytest.approx((2.0 + 6.0) / 8)
+
+
+# ── prepare_opd_full_loss_input ────────────────────────────────────────────
+# TP=1 limit with the kernels' collectives neutralized, as in test_model_utils.py.
+
+
+@pytest.fixture
+def _single_rank_collectives(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, *a, **kw: None)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional,
+        "all_reduce",
+        lambda tensor, *a, **kw: tensor,
+    )
+    # from_parallel_logits_to_logprobs reads the CP rank off the default group
+    # even at cp_size == 1; there is no process group here.
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+
+
+def test_prepare_opd_full_loss_input_projects_the_payload_and_drops_the_last_position(
+    _single_rank_collectives,
+):
+    """The [B, S-1] divergence pairs position t with token t+1, like LOGPROB.
+
+    Shifting the window by one or forgetting the slice both leave a tensor of a
+    plausible shape; only the closed form at every position catches it.
+    """
+    torch.manual_seed(11)
+    batch_size, seq_len, hidden, vocab = 2, 5, 3, 6
+    student_logits = torch.randn(batch_size, seq_len, vocab, requires_grad=True)
+    lm_head = torch.randn(vocab, hidden)
+    payload = torch.randn(batch_size, seq_len, hidden)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(batch_size, seq_len, dtype=torch.long),
+            OPD_FULL_HIDDEN_STATES_FIELD: payload,
+        }
+    )
+
+    loss_input = prepare_opd_full_loss_input(
+        student_logits,
+        data,
+        _loss_fn(),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=object(),  # opaque: every collective is neutralized
+        context_parallel_group=None,
+        sampling_params=None,
+        chunk_size=None,
+        teacher_output_layer_weight=lm_head,
+    )
+
+    student_log_probs = torch.log_softmax(student_logits.detach(), dim=-1)
+    teacher_log_probs = torch.log_softmax(payload @ lm_head.t(), dim=-1)
+    expected = (student_log_probs.exp() * (student_log_probs - teacher_log_probs)).sum(
+        -1
+    )
+    divergence = loss_input["opd_full_divergence"]
+
+    assert divergence.shape == (batch_size, seq_len - 1)
+    torch.testing.assert_close(divergence, expected[:, :-1], rtol=1e-5, atol=1e-6)
+    # The divergence is the objective, so it must carry the student's gradient.
+    assert divergence.requires_grad
+    # Decomposition off and no reference KL: nothing else is computed.
+    assert loss_input["opd_full_entropy"] is None
+    assert loss_input["opd_full_cross_entropy"] is None
+    assert "next_token_logprobs" not in loss_input

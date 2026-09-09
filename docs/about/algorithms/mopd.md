@@ -184,11 +184,22 @@ Rejected at construction rather than silently ignored:
   `policy.megatron_cfg.pipeline_model_parallel_size: 1` and
   `policy.generation.temperature: 1.0`. The `logits` path has neither
   restriction.
+- `teacher_payload: hidden_states` also requires a teacher whose logits are
+  exactly `output_layer(h)`. Models that transform the logits after that linear
+  — Gemma2 and Gemma4 (`final_logit_softcapping`), MuseGlimmer
+  (`output_multiplier`), and any MuP model (`use_mup`) — are rejected on the
+  teacher worker, because the student's reconstruction cannot reproduce the
+  post-transform and would silently distill toward a distribution the teacher
+  never emits. Use `teacher_payload: logits`, which is exact for these models.
 - `policy.megatron_cfg.use_fused_linear_logprobs: false` and
   `policy.sequence_packing.fuse_loss: false`.
-- The policy-gradient knobs have no code path under this objective and are
-  rejected: ratio clipping, CISPO, importance-sampling correction, truncated
-  importance sampling, and `positive_example_nll_weight`.
+- The policy-gradient and reward-side KL knobs have no code path under this
+  objective and are rejected: `disable_ppo_ratio: false`, `ratio_clip_c`,
+  `use_cispo`, `force_on_policy_ratio`, `sequence_level_importance_ratios`,
+  `use_importance_sampling_correction`, `truncated_importance_sampling_type`,
+  `positive_example_nll_weight`, `use_kl_in_reward`, and
+  `use_on_policy_kl_approximation` (the base MOPD recipe sets this one to
+  `true`, so a derived full-vocabulary recipe must override it to `false`).
 
 ## Running MOPD
 

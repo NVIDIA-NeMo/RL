@@ -919,17 +919,16 @@ def _validate_opd_full_config(
         raise ValueError(
             "on_policy_distillation.full.teacher_payload='hidden_states' does not "
             "support policy.megatron_cfg.pipeline_model_parallel_size > 1 yet. "
-            "Megatron builds output_layer only on the last pipeline stage, but the "
-            "teacher LM head is loaded through a collective that spans the whole "
-            "student world, so earlier stages would fail while the last stage hangs "
-            "in that collective. Use pipeline_model_parallel_size=1, or "
+            "Megatron builds output_layer only on the last pipeline stage, but resolving "
+            "the teacher checkpoint iteration goes through Megatron-Bridge's "
+            "read_train_state, whose broadcast_object_list spans the whole student "
+            "world, so earlier stages would fail while the last stage hangs in that "
+            "broadcast. Use pipeline_model_parallel_size=1, or "
             "teacher_payload='logits', which needs no teacher LM head."
         )
 
     generation_config = policy_config.get("generation")
-    temperature = (
-        1.0 if generation_config is None else generation_config.get("temperature", 1.0)
-    )
+    temperature = 1.0 if generation_config is None else generation_config["temperature"]
     if full_cfg.teacher_payload == "hidden_states" and temperature != 1.0:
         raise ValueError(
             "on_policy_distillation.full.teacher_payload='hidden_states' does not "

@@ -22,6 +22,7 @@ from nemo_rl.data_plane.schema import (
     GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
+    OPD_FULL_HIDDEN_STATES_FIELD,
     TEACHER_LP_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -148,6 +149,68 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     assert captured["cfg"]["router_replay"]["enabled"] is False
     assert teacher.cfg["router_replay"]["enabled"] is False
     assert policy_config["router_replay"]["enabled"] is True
+
+
+def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatch):
+    """Left in, the teacher would load the student's weights and distill itself.
+
+    Resume keeps student weights out of the shared config by passing them as a
+    ``weights_path`` argument; this key arrives through the config instead.
+    """
+    import nemo_rl.distributed.worker_groups as worker_groups
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    captured = {}
+
+    class FakeWorkerBuilder:
+        def __init__(self, worker_path, cfg, **kwargs):
+            del worker_path, kwargs
+            captured["cfg"] = cfg
+
+    class FakeWorkerGroup:
+        def __init__(self, cluster, worker_builder, **kwargs):
+            del cluster, worker_builder, kwargs
+
+    monkeypatch.setattr(worker_groups, "RayWorkerBuilder", FakeWorkerBuilder)
+    monkeypatch.setattr(worker_groups, "RayWorkerGroup", FakeWorkerGroup)
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    policy_config = {
+        "model_name": "/ckpt/student",
+        "pretrained_checkpoint": {"format": "megatron_bridge", "path": "/ckpt/sft"},
+        "megatron_cfg": {"enabled": True},
+        "dtensor_cfg": {"enabled": False},
+        "sequence_packing": {"enabled": False},
+        "dynamic_batching": {"enabled": False},
+    }
+    teacher_config = TeacherConfig(
+        alias="teacher",
+        model_name="/ckpt/teacher",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        num_nodes=1,
+        gpus_per_node=1,
+        precision="bf16",
+        micro_batch_size=1,
+        megatron_cfg_overrides={},
+    )
+
+    teacher = TeacherWorkerGroup(
+        teacher_config,
+        cluster,
+        policy_config,
+        MagicMock(),
+    )
+
+    assert "pretrained_checkpoint" not in captured["cfg"]
+    assert "pretrained_checkpoint" not in teacher.cfg
+    # The student's own config is left alone.
+    assert policy_config["pretrained_checkpoint"]["path"] == "/ckpt/sft"
 
 
 def _disable_opd_full(teacher) -> None:
@@ -445,3 +508,149 @@ def test_teacher_worker_rejects_local_dynamic_batch_planning():
 
     with pytest.raises(RuntimeError, match="driver-provided global"):
         Worker().get_teacher_logprobs_presharded(meta)
+
+
+def test_get_logprobs_from_meta_forwards_the_opd_full_payload_request():
+    """With full-vocabulary MOPD on, every DP rank is told what to emit and where."""
+    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
+
+    class Sharding:
+        def get_axis_size(self, axis):
+            assert axis == "data_parallel"
+            return 1
+
+    worker_group = MagicMock()
+    worker_group.run_all_workers_sharded_data.return_value = "futures"
+    teacher = object.__new__(TeacherWorkerGroup)
+    teacher._opd_full_payload = "hidden_states"
+    teacher._opd_full_payload_dtype = "float16"
+    teacher._opd_full_payload_field = OPD_FULL_HIDDEN_STATES_FIELD
+    teacher.alias = "teacher"
+    teacher.use_sequence_packing = False
+    teacher.use_dynamic_batches = False
+    teacher.sequence_length_pad_multiple = 1
+    teacher.sharding_annotations = Sharding()
+    teacher.worker_group = worker_group
+    teacher._micro_batch_size = 2
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a"],
+        fields=["input_ids", "input_lengths"],
+        sequence_lengths=[3],
+    )
+
+    teacher.get_logprobs_from_meta(meta)
+
+    common_kwargs = worker_group.run_all_workers_sharded_data.call_args.kwargs[
+        "common_kwargs"
+    ]
+    assert common_kwargs == {
+        "micro_batch_size": 2,
+        "opd_full_payload": "hidden_states",
+        "opd_full_payload_dtype": "float16",
+        "opd_full_payload_field": OPD_FULL_HIDDEN_STATES_FIELD,
+    }
+
+
+def _full_payload_worker_class():
+    from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+
+    class Worker(TQWorkerMixin):
+        cfg = {"sequence_packing": {"enabled": False}}
+
+        def __init__(self, payload):
+            self.payload = payload
+            self.logprob_call = None
+            self.full_payload_call = None
+            self.stage_local_writes = []
+            self.written = None
+
+        def _fetch(self, meta):
+            del meta
+            return BatchedDataDict(
+                {
+                    "input_ids": torch.ones(1, 3, dtype=torch.long),
+                    "input_lengths": torch.tensor([3]),
+                }
+            )
+
+        def get_logprobs(self, data, micro_batch_size=None):
+            self.logprob_call = (data, micro_batch_size)
+            return BatchedDataDict({"logprobs": torch.full((1, 3), 0.25)})
+
+        def get_logprobs_with_full_payload(
+            self, *, data, payload, payload_dtype, micro_batch_size=None
+        ):
+            del data
+            self.full_payload_call = (payload, payload_dtype, micro_batch_size)
+            return BatchedDataDict(
+                {
+                    "logprobs": torch.full((1, 3), 0.5),
+                    "teacher_full_payload": self.payload,
+                }
+            )
+
+        def _write_back_stage_local(self, meta, fields):
+            self.stage_local_writes.append((meta, fields))
+
+        def _write_back_result_field(self, meta, result, *, result_key, tq_field):
+            self.written = (meta, result[result_key], tq_field)
+
+    return Worker
+
+
+def _presharded_meta():
+    return KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="teacher_lp:teacher",
+        sample_ids=["a"],
+        fields=["input_ids", "input_lengths"],
+        sequence_lengths=[3],
+        extra_info={MICRO_BATCH_INDICES: [[0]], MICRO_BATCH_LENGTHS: [3]},
+    )
+
+
+def test_teacher_worker_presharded_entrypoint_writes_the_full_payload_from_its_stage():
+    """The payload goes through the stage-local writer; logprobs keep their path."""
+    payload = torch.randn(1, 3, 4)
+    worker = _full_payload_worker_class()(payload)
+    meta = _presharded_meta()
+
+    worker.get_teacher_logprobs_presharded(
+        meta,
+        micro_batch_size=1,
+        opd_full_payload="hidden_states",
+        # Not the config default: the driver's value must win.
+        opd_full_payload_dtype="float16",
+        opd_full_payload_field=OPD_FULL_HIDDEN_STATES_FIELD,
+    )
+
+    # The single forward replaced get_logprobs; it received the payload request.
+    assert worker.logprob_call is None
+    assert worker.full_payload_call == ("hidden_states", "float16", 1)
+    # Sampled-token logprobs still land in the teacher column.
+    assert worker.written is not None
+    assert torch.allclose(worker.written[1], torch.full((1, 3), 0.5))
+    assert worker.written[2] == "teacher_reference_logprobs"
+    # The payload is written from this stage under the configured column.
+    assert len(worker.stage_local_writes) == 1
+    write_meta, fields = worker.stage_local_writes[0]
+    assert write_meta is meta
+    assert list(fields) == [OPD_FULL_HIDDEN_STATES_FIELD]
+    assert torch.equal(fields[OPD_FULL_HIDDEN_STATES_FIELD], payload)
+
+
+def test_teacher_worker_presharded_entrypoint_skips_the_payload_off_the_last_stage():
+    """A stage that produced no payload must not write an empty column."""
+    worker = _full_payload_worker_class()(None)
+
+    worker.get_teacher_logprobs_presharded(
+        _presharded_meta(),
+        opd_full_payload="hidden_states",
+        opd_full_payload_dtype="bfloat16",
+        opd_full_payload_field=OPD_FULL_HIDDEN_STATES_FIELD,
+    )
+
+    assert worker.stage_local_writes == []
+    assert worker.written is not None

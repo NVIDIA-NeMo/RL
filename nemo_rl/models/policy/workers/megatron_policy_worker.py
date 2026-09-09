@@ -705,8 +705,8 @@ class MegatronPolicyWorkerImpl(
         # module, so it stays invisible to checkpoint saving and refit.
         opd_full_cfg = self.cfg.get("on_policy_distillation_full") or {}
         self._opd_full_enabled = bool(opd_full_cfg)
-        self._opd_full_lm_head_lifecycle: str = (
-            opd_full_cfg["teacher_lm_head_lifecycle"] if opd_full_cfg else "offload"
+        self._opd_full_lm_head_lifecycle: Optional[str] = (
+            opd_full_cfg["teacher_lm_head_lifecycle"] if opd_full_cfg else None
         )
         self._opd_full_teacher_lm_head: Optional[torch.Tensor] = None
         self._opd_full_teacher_checkpoint_path: Optional[str] = None
@@ -2093,8 +2093,9 @@ class MegatronPolicyWorkerImpl(
             f"after unwrapping {type(model).__qualname__}. Megatron builds "
             "output_layer only on the last pipeline stage "
             f"(pipeline_model_parallel_size={pipeline_size}); the teacher LM head "
-            "cannot be loaded per-stage because the load is a whole-world "
-            "collective. Use pipeline_model_parallel_size=1 or "
+            "cannot be loaded per-stage because resolving its checkpoint iteration "
+            "(Megatron-Bridge read_train_state) broadcasts over the whole world. "
+            "Use pipeline_model_parallel_size=1 or "
             "on_policy_distillation.full.teacher_payload='logits'."
         )
 
@@ -2108,8 +2109,9 @@ class MegatronPolicyWorkerImpl(
         module needs.
 
         Args:
-            teacher_path_config: Teacher policy config with `pretrained_checkpoint`
-                cleared, so resolution keys off the teacher's own model name.
+            teacher_path_config: The teacher group's own policy config, which
+                carries no `pretrained_checkpoint`, so resolution keys off the
+                teacher's model name.
 
         Returns:
             The resolved Megatron checkpoint root of the teacher.
@@ -2203,7 +2205,33 @@ class MegatronPolicyWorkerImpl(
             A BatchedDataDict with ``logprobs`` ``[B, S]`` on every rank and
             ``teacher_full_payload`` ``[B, S, D]`` on the last pipeline stage
             (``None`` elsewhere).
+
+        Raises:
+            ValueError: If ``payload`` is ``"hidden_states"`` but this teacher
+                transforms its logits after ``output_layer``, which the student's
+                reconstruction cannot reproduce.
         """
+        if payload == "hidden_states":
+            # The student rebuilds teacher logits as output_layer(h) with no
+            # post-transform. A teacher whose forward rescales or softcaps its
+            # logits after the linear (Gemma2/Gemma4 final_logit_softcapping,
+            # MuseGlimmer output_multiplier, MuP) would be silently
+            # mis-reconstructed; the logits payload is exact for those models.
+            model_config = self._get_model_config()
+            if (
+                getattr(model_config, "final_logit_softcapping", None)
+                or getattr(model_config, "output_multiplier", 1.0) != 1.0
+                or getattr(model_config, "use_mup", False)
+            ):
+                raise ValueError(
+                    "on_policy_distillation.full.teacher_payload='hidden_states' "
+                    "reconstructs teacher logits as output_layer(h), but this "
+                    "teacher post-processes its logits after output_layer "
+                    "(final_logit_softcapping / output_multiplier / MuP), so the "
+                    "reconstruction would be silently wrong. Use "
+                    "teacher_payload='logits'."
+                )
+
         self.timer.start("get_logprobs_with_full_payload")
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -2270,9 +2298,12 @@ class MegatronPolicyWorkerImpl(
                         value=0.0,
                     )
                 padded_logprobs.append(logprobs_mb)
-                padded_payloads.append(payload_mb)
+                # Concatenating on the GPU would hold a second copy of the whole
+                # DP shard's payload; release each microbatch as it is copied out.
+                padded_payloads.append(payload_mb.to("cpu"))
+                microbatch_output["teacher_full_payload"] = None
             tensors = {"logprobs": torch.cat(padded_logprobs, dim=0)}
-            teacher_full_payload = torch.cat(padded_payloads, dim=0).to("cpu")
+            teacher_full_payload = torch.cat(padded_payloads, dim=0)
         else:
             tensors = {"logprobs": None}
         logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]

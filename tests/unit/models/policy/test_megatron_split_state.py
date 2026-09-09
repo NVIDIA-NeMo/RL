@@ -159,7 +159,7 @@ def _make_worker(loss_type):
     w._router_replay_enabled = False
     # opd_full off, mirroring __init__ when the config block is absent.
     w._opd_full_enabled = False
-    w._opd_full_lm_head_lifecycle = "offload"
+    w._opd_full_lm_head_lifecycle = None
     w._opd_full_teacher_lm_head = None
     w._opd_full_teacher_checkpoint_path = None
     w.media_placeholder_token_id = None

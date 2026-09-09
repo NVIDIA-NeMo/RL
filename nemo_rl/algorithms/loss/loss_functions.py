@@ -418,7 +418,25 @@ class ClippedPGLossFn(LossFunction):
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
-        """Clipped Policy Gradient RL loss function."""
+        """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
+
+        Which objective runs is fixed at construction by ``opd_full``.
+
+        Args:
+            next_token_logprobs: Sampled-token log-probabilities ``[B, S - 1]``.
+                Required on the policy-gradient branch; on the ``opd_full``
+                branch only when ``reference_policy_kl_penalty`` is non-zero.
+            data: Microbatch with masks, advantages, and prior log-probabilities.
+            global_valid_seqs: Global valid-sequence count for normalization.
+            global_valid_toks: Global valid-token count for normalization.
+            opd_full_divergence: Per-token reverse KL ``[B, S - 1]``, required on
+                the ``opd_full`` branch.
+            opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
+            opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+
+        Returns:
+            Tuple of the scalar loss and its metric dict.
+        """
         assert data is not None, "ClippedPGLossFn requires data"
         assert global_valid_seqs is not None, (
             "ClippedPGLossFn requires global_valid_seqs"
@@ -920,12 +938,23 @@ class ClippedPGLossFn(LossFunction):
                     "next_token_logprobs from prepare_loss_input: the penalty must "
                     "be differentiable through the current policy."
                 )
+            # Unlike the exact divergence above, this penalty is sampled, so its
+            # gradient needs the score-function term through the sampling
+            # probability, as in the policy-gradient branch.
+            # exp(x - x.detach()) is 1 in the forward pass and supplies it.
+            kl_importance_weights = torch.nan_to_num(
+                torch.exp(next_token_logprobs - next_token_logprobs.detach()),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
             kl = self.reference_policy_kl_penalty * calculate_kl(
                 logprobs=next_token_logprobs,
                 logprobs_reference=data["reference_policy_logprobs"][:, 1:],
                 kl_type=self.reference_policy_kl_type,
                 input_clamp_value=self.kl_input_clamp_value,
                 output_clamp_value=self.kl_output_clamp_value,
+                importance_sampling_weights=kl_importance_weights,
             )
             kl = reduce_like_loss(kl)
 

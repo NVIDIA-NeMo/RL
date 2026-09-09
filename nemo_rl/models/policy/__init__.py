@@ -599,7 +599,7 @@ class OnPolicyDistillationFullTransport(TypedDict):
     teacher_payload: Literal["hidden_states", "logits"]
     divergence: Literal["reverse_kl"]
     payload_dtype: Literal["bfloat16", "float16", "float32"]
-    chunk_size: NotRequired[int | None]
+    chunk_size: int | None
     teacher_lm_head_lifecycle: Literal["none", "offload", "evict"]
     validate_decomposition: bool
     payload_field: str

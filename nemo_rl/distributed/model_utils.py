@@ -2433,6 +2433,11 @@ def _chunked_distributed_student_teacher_reduction(
 ) -> torch.Tensor:
     """Reduce ``sum_v p_student(v) * weight_fn(v)`` across TP, chunked over sequence.
 
+    ``weight_fn`` must depend on the student logits only through ``log p_s`` with a
+    constant ``dw/dlog p_s``: the shared backward below assumes exactly that, so a
+    weight like the forward KL (an expectation under the teacher) needs its own
+    kernel rather than a fourth ``weight_fn``.
+
     Args:
         student_vocab_parallel_logits: Student logits ``[B, S, V_local]``.
         teacher_vocab_parallel_logits: Teacher logits ``[B, S, V_local]``, treated

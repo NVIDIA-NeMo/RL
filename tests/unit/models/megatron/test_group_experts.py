@@ -85,7 +85,7 @@ def test_build_hf_to_local_param_map_train_side():
     w = object.__new__(MegatronPolicyWorkerImpl)  # no __init__ / no megatron state
     # opd_full off, mirroring __init__ when the config block is absent.
     w._opd_full_enabled = False
-    w._opd_full_lm_head_lifecycle = "offload"
+    w._opd_full_lm_head_lifecycle = None
     w._opd_full_teacher_lm_head = None
     w._opd_full_teacher_checkpoint_path = None
     prefix = "model.layers.0.mlp.experts"

@@ -1928,3 +1928,67 @@ def test_student_teacher_reduction_normalizes_both_sides_across_tp(monkeypatch):
     )
     # Per chunk: one normalizer SUM for each of the two distributions.
     assert autograd_ops == [torch.distributed.ReduceOp.SUM] * 4
+
+
+def test_student_teacher_backward_reduces_the_normalizer_across_tp(monkeypatch):
+    """``dL/dz = p_s * (w - L)`` needs the GLOBAL ``L`` in backward as well.
+
+    The forward trace above stops at ``inference_only=True``. Backward
+    recomputes both log-softmaxes and ``L`` from the saved shards, so a backward
+    that forgot the SUM all-reduce on ``L`` would be exact at TP=1 and silently
+    wrong at TP>1 -- the same blind spot, one call later.
+    """
+    plain_ops: list[object] = []
+    autograd_ops: list[object] = []
+
+    def fake_all_reduce(tensor, *args, **kwargs):
+        plain_ops.append(kwargs["op"])
+
+    def fake_autograd_all_reduce(tensor, *args, **kwargs):
+        autograd_ops.append(kwargs["op"])
+        return tensor
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional, "all_reduce", fake_autograd_all_reduce
+    )
+
+    torch.manual_seed(7)
+    student = torch.randn(1, 4, 6, requires_grad=True)
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, torch.randn(1, 4, 6), 2, None, False
+    )
+    # Keep only the backward's collectives.
+    plain_ops.clear()
+    autograd_ops.clear()
+
+    reverse_kl.sum().backward()
+
+    # Per chunk: MAX for the student log-softmax, MAX for the teacher's, and the
+    # SUM that turns the shard-local ``L`` into the global one.
+    assert (
+        plain_ops
+        == [
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.SUM,
+        ]
+        * 2
+    )
+    assert autograd_ops == [torch.distributed.ReduceOp.SUM] * 4
+
+
+def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
+    single_rank_collectives,
+):
+    """A log-softmax taken in bf16 is off by ~1e-2; the fp32 path is within 1e-5."""
+    torch.manual_seed(5)
+    student = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+    teacher = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, 2, None, True
+    )
+
+    expected_kl, _, _ = _student_teacher_reference(student, teacher)
+    torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)

@@ -174,6 +174,11 @@ class TeacherWorkerGroup:
         # TQ fetch does not carry routed_experts, so replay must stay off.
         if "router_replay" in cfg:
             cfg["router_replay"]["enabled"] = False
+        # A student `pretrained_checkpoint` rides along on the copied config and
+        # would be loaded as the teacher's own weights. Resume keeps student
+        # weights out of the config for the same reason (`weights_path=None`
+        # below); this key has to be dropped explicitly.
+        cfg.pop("pretrained_checkpoint", None)
         # The teacher uses the plain Megatron worker, so a student-side quant_cfg
         # would be silently ignored. Drop it explicitly and warn instead.
         if cfg.get("quant_cfg") is not None:
