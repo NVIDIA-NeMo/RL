@@ -682,7 +682,13 @@ export RAY_SUB
 # then seed fresh from Lustre.
 # =============================================================================
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
-command -v zstd >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zstd; } 2>/dev/null || true
+# zstd is not in the container image (only libzstd.so), so this apt path runs on
+# every node on every launch, fetching from the public ports.ubuntu.com mirror.
+# It MUST be bounded: an unbounded stall here never returns, the node never
+# reaches 'ray start', and the head spins at N-4/N actors until the job is
+# killed. A *failure* is already handled (tar --zstd extraction below is
+# non-fatal), so timing out degrades to an already-supported path.
+command -v zstd >/dev/null 2>&1 || { timeout 120 apt-get update -qq && timeout 120 apt-get install -y -qq zstd; } || echo "[CACHE SEED] zstd unavailable on \${SLURMD_NODENAME:-\$(hostname)}; tarball seeding will be skipped" >&2
 
 echo "[VLLM PATCH] Pre-applying NeMo RL patches to the generation-worker environment..."
 NRL_VLLM_PY=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
