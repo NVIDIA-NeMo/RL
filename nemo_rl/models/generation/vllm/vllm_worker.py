@@ -485,6 +485,15 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        # vLLM 0.28 (vllm-project/vllm#50411) skips rescale/normalize in the HF image
+        # processor and re-applies them on the GPU in the vision tower's dtype. The
+        # policy side normalizes on the CPU in fp32 through the same HF processor, so
+        # keep generation on that path too: identical pixel preprocessing on both sides
+        # is what the token_mult_prob_error / gen_kl_error checks assume. Upstream has
+        # already shipped one silent-corruption fix for the device path
+        # (vllm-project/vllm#55370, encoder cudagraphs). Users can opt back in via
+        # policy.generation.vllm_kwargs.mm_device_do_normalize=true.
+        vllm_kwargs.setdefault("mm_device_do_normalize", False)
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
