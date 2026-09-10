@@ -28,6 +28,8 @@ generation:
     max_model_len: 8000
     enforce_eager: False
     skip_tokenizer_init: False
+    # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+    refit_with_reload_api: false
     limit_mm_per_prompt:
       audio: 1
   colocated:

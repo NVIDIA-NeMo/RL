@@ -22,15 +22,21 @@ from __future__ import annotations
 
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 import numpy as np
+import ray
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherResourceConfig
+from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
+from nemo_rl.data_plane.column_io import round_up
+from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, TEACHER_LP_FIELDS
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
+    DynamicBatchingArgs,
     SequencePackingArgs,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -114,7 +120,7 @@ class TeacherWorkerGroup:
     - Never initializes an optimizer
     - Never initializes a reference model
     - Loads the checkpoint once at startup
-    - Only exposes get_logprobs()
+    - Exposes logprobs through either the legacy tensor API or TQ metadata API
     """
 
     def __init__(
@@ -163,6 +169,11 @@ class TeacherWorkerGroup:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
         if "draft" in cfg:
             cfg["draft"]["enabled"] = False
+        # Router replay keeps the student's rollout and training logprobs
+        # consistent. A frozen teacher has no training pass, and its text-only
+        # TQ fetch does not carry routed_experts, so replay must stay off.
+        if "router_replay" in cfg:
+            cfg["router_replay"]["enabled"] = False
         # The teacher uses the plain Megatron worker, so a student-side quant_cfg
         # would be silently ignored. Drop it explicitly and warn instead.
         if cfg.get("quant_cfg") is not None:
@@ -240,6 +251,90 @@ class TeacherWorkerGroup:
             microbatch_order = cfg["sequence_packing"].get("microbatch_order")
             if microbatch_order is not None:
                 self.sequence_packing_args["microbatch_order"] = microbatch_order
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args: DynamicBatchingArgs = {
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "sequence_length_round": cfg["dynamic_batching"][
+                    "sequence_length_round"
+                ],
+                "max_tokens_per_microbatch": cfg["dynamic_batching"][
+                    "logprob_mb_tokens"
+                ],
+            }
+
+    def setup_data_plane(self, dp_cfg: DataPlaneConfig) -> None:
+        """Attach every teacher worker to the already-bootstrapped TQ controller."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "setup_data_plane", cfg=dp_cfg
+            )
+        )
+
+    def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
+        """Dispatch a TQ metadata batch; workers fetch and write teacher logprobs."""
+        if not meta.sequence_lengths:
+            raise ValueError(
+                f"Teacher {self.alias!r} requires sequence_lengths in TQ metadata"
+            )
+        sequence_pad_multiple = (
+            1 if self.use_sequence_packing else (self.sequence_length_pad_multiple)
+        )
+        if self.use_dynamic_batches:
+            # The driver rounds dynamic microbatch lengths to this value. Match
+            # that rounding in the stamped fetch width so worker-side narrowing
+            # cannot request more tokens than TQ materialized.
+            sequence_pad_multiple = max(
+                sequence_pad_multiple,
+                int(self.cfg["dynamic_batching"]["sequence_length_round"]),
+            )
+        teacher_meta = replace(
+            meta,
+            task_name=f"teacher_lp:{self.alias}",
+            fields=list(TEACHER_LP_FIELDS),
+            extra_info={
+                **dict(meta.extra_info or {}),
+                GLOBAL_FORWARD_PAD_SEQLEN: round_up(
+                    max(meta.sequence_lengths), sequence_pad_multiple
+                ),
+            },
+        )
+        sequence_packing_args = None
+        dynamic_batching_args = None
+        if self.use_sequence_packing:
+            sequence_packing_args = dict(self.sequence_packing_args)
+            sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+        elif self.use_dynamic_batches:
+            dynamic_batching_args = dict(self.dynamic_batching_args)
+            dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+        dp_metas, _ = shard_meta_for_dp(
+            teacher_meta,
+            dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+            batch_size=None,
+            sequence_packing_args=sequence_packing_args,
+            dynamic_batching_args=dynamic_batching_args,
+        )
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "get_teacher_logprobs_presharded",
+            meta=dp_metas,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={"micro_batch_size": self._micro_batch_size},
+        )
+        self.worker_group.get_all_worker_results(futures)
 
     def get_logprobs(
         self,

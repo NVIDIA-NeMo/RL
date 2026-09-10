@@ -1,0 +1,96 @@
+defaults: ../../vlm_grpo_3B_megatron.yaml
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+  max_num_steps: 4
+  val_period: 0
+  max_val_samples: null
+  val_batch_size: null
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/nemo-rl-omni/nemotron-omni-circle-count-1n4g
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  is_vlm: true
+  train_global_batch_size: 16
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    env_vars:
+      TORCH_CUDA_ARCH_LIST: '10.0'
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 2
+    sequence_parallel: true
+    bias_activation_fusion: false
+    activation_checkpointing: true
+  generation:
+    backend: megatron
+    bad_words: null
+    mcore_generation_config:
+      expose_http_server: true
+      buffer_size_gb: 8
+      num_cuda_graphs: -1
+      max_tokens: ${policy.max_total_sequence_length}
+      transformer_impl: transformer_engine
+      activation_checkpointing: false
+      tensor_model_parallel_size: 2
+      expert_model_parallel_size: 2
+      expert_tensor_parallel_size: 1
+      sequence_parallel: true
+      moe_pad_experts_for_cuda_graph_inference: true
+      image_dynamic_resolution: true
+      logprobs_mode: raw_logprobs
+      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/circle_count/data/example.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/circle_count/data/example.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    is_trajectory_collection: false
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/circle_count/configs/circle_count.yaml
+    circle_count_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+logger:
+  tensorboard_enabled: false
+  wandb:
+    project: nemo-rl-omni
+    name: nemotron-omni-circle-count-1n4g
+cluster:
+  gpus_per_node: 4

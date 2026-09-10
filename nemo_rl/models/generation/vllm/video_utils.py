@@ -24,13 +24,16 @@ import numpy as np
 import torch
 from PIL import Image
 
+from nemo_rl.data.multimodal_utils import (
+    CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
+    CACHED_VIDEO_FRAME_MANIFEST_MIME,
+)
+
 VideoSamplingStyle = Literal["nemotron_vl"]
 
 _TORCHCODEC_END_OF_STREAM_ERROR = (
     "Requested next frame while there are no more frames left to decode."
 )
-_CACHED_VIDEO_FRAME_MANIFEST_MAGIC = b"NEMO_RL_CACHED_VIDEO_FRAMES_V1\n"
-_CACHED_VIDEO_FRAME_MANIFEST_MIME = "video/x-nemo-rl-cached-frames"
 
 
 def _round_video_frame_count(
@@ -197,11 +200,11 @@ def build_cached_video_frame_data_url(
         "frame_paths": resolved_frames,
         "metadata": build_cached_video_frame_metadata(len(resolved_frames)),
     }
-    payload = _CACHED_VIDEO_FRAME_MANIFEST_MAGIC + json.dumps(
+    payload = CACHED_VIDEO_FRAME_MANIFEST_MAGIC + json.dumps(
         manifest, separators=(",", ":")
     ).encode("utf-8")
     encoded = base64.b64encode(payload).decode("ascii")
-    return f"data:{_CACHED_VIDEO_FRAME_MANIFEST_MIME};base64,{encoded}"
+    return f"data:{CACHED_VIDEO_FRAME_MANIFEST_MIME};base64,{encoded}"
 
 
 def _load_cached_video_frame_manifest(
@@ -210,11 +213,11 @@ def _load_cached_video_frame_manifest(
     num_frames: int,
 ) -> tuple[np.ndarray, dict[str, Any]] | None:
     """Load an internal cached-frame manifest passed through vLLM VideoMediaIO."""
-    if not data.startswith(_CACHED_VIDEO_FRAME_MANIFEST_MAGIC):
+    if not data.startswith(CACHED_VIDEO_FRAME_MANIFEST_MAGIC):
         return None
 
     try:
-        manifest = json.loads(data[len(_CACHED_VIDEO_FRAME_MANIFEST_MAGIC) :])
+        manifest = json.loads(data[len(CACHED_VIDEO_FRAME_MANIFEST_MAGIC) :])
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Invalid cached Gym video frame manifest.") from exc
     if not isinstance(manifest, dict):
