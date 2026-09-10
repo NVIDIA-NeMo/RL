@@ -39,10 +39,14 @@ case "${ARM}" in
     ;;
 esac
 case "${TOPOLOGY}" in
-  default|ep32-alltoall|ep32-hybridep) ;;
-  *) echo "TOPOLOGY must be default, ep32-alltoall, or ep32-hybridep" >&2; exit 2 ;;
+  default|hybridep|ep32-alltoall|ep32-hybridep) ;;
+  *) echo "TOPOLOGY must be default, hybridep, ep32-alltoall, or ep32-hybridep" >&2; exit 2 ;;
 esac
-if [[ "${TOPOLOGY}" != default && "${MODEL}:${MODE}" != qwen35:sync ]]; then
+if [[ "${TOPOLOGY}" == hybridep && "${MODEL}:${MODE}" != qwen35:async ]]; then
+  echo "TOPOLOGY=hybridep is only defined for MODEL=qwen35 MODE=async" >&2
+  exit 2
+fi
+if [[ "${TOPOLOGY}" == ep32-* && "${MODEL}:${MODE}" != qwen35:sync ]]; then
   echo "TOPOLOGY=${TOPOLOGY} is only defined for MODEL=qwen35 MODE=sync" >&2
   exit 2
 fi
@@ -154,7 +158,10 @@ case "${MODEL}:${MODE}" in
     LAST_BF16=6
     ;;
   qwen35:async)
-    CONFIG=${EXPERIMENT}/qwen35-async.yaml
+    case "${TOPOLOGY}" in
+      default) CONFIG=${EXPERIMENT}/qwen35-async.yaml ;;
+      hybridep) CONFIG=${EXPERIMENT}/qwen35-async-hybridep.yaml ;;
+    esac
     NUM_NODES=8
     SEGMENT_SIZE=4
     MODEL_CACHE=models--Qwen--Qwen3.5-35B-A3B-Base
