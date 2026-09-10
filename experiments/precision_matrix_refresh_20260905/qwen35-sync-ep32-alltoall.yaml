@@ -1,0 +1,12 @@
+defaults: ./qwen35-sync.yaml
+
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 32
+    expert_tensor_parallel_size: 1
+    moe_token_dispatcher_type: alltoall
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+  segment_size: 8

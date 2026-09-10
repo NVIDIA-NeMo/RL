@@ -1,0 +1,23 @@
+defaults: ./qwen30-common.yaml
+
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 32
+    expert_tensor_parallel_size: 1
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_hybridep_prepad_packed_inputs: true
+  generation:
+    refit_transport: null
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: null
+        gpus_per_node: null
+    vllm_cfg:
+      async_engine: false
+
+cluster:
+  num_nodes: 8
+  segment_size: 8
