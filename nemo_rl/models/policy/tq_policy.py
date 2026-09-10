@@ -47,9 +47,9 @@ from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
+    LP_SEED_FIELDS,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
-    LP_SEED_FIELDS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     fields_with_optional_opd_full,
