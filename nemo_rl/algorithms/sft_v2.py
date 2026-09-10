@@ -412,10 +412,9 @@ def setup_sft_v2(
                 "Energon packing requires sequence_packing enabled with fuse_loss."
             )
         if sequence_packing.get("algorithm") not in {
-            PackingAlgorithm.GREEDY_KNAPSACK.value,
-            PackingAlgorithm.BALANCED_GREEDY_KNAPSACK.value,
+            algorithm.value for algorithm in PackingAlgorithm
         }:
-            raise ValueError("Energon SFT supports only the two knapsack packers.")
+            raise ValueError("Energon SFT requires a supported packing algorithm.")
         if dynamic_batching["enabled"]:
             raise ValueError("Energon packing does not support dynamic batching.")
     # SFTConfig carries validation knobs that default to on (val_period=10,

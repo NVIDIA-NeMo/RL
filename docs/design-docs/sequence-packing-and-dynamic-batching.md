@@ -89,8 +89,8 @@ We have the policy backends perform the actual packing because implementations c
 #### 2. Packing Algorithms (`nemo_rl/data/packing/algorithms.py`)
 
 Six packing algorithms are implemented. Modified First Fit Decreasing is the
-default recommendation for NeMo-RL-owned packing; Energon-owned SFT packing uses
-one of the two knapsack algorithms.
+default recommendation, and Energon-owned SFT packing supports all six through
+the same interface.
 
 ##### Concatenative Packer 
 - Sequential concatenation until bin capacity is reached
