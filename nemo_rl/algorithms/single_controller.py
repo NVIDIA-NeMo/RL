@@ -3709,6 +3709,7 @@ class SingleControllerActor:
             await self._save_checkpoint_impl(
                 step_metrics,
                 is_policy_training_step=is_policy_training_step,
+                is_final_checkpoint=is_final_checkpoint,
             )
 
     async def _save_checkpoint_impl(
@@ -3716,6 +3717,7 @@ class SingleControllerActor:
         step_metrics: dict[str, Any],
         *,
         is_policy_training_step: bool,
+        is_final_checkpoint: bool,
     ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
