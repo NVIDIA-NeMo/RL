@@ -867,6 +867,99 @@ class TestDTensorLoraParamsGenerator:
         assert all(tensor.dtype == torch.bfloat16 for tensor in tensors.values())
         assert all(tensor.is_contiguous() for tensor in tensors.values())
 
+    def test_adapts_grouped_internal_factors_to_hf_pairs(self):
+        from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import (
+            NemotronV3StateDictAdapter,
+        )
+
+        class GroupedFactorizedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([nn.Module()])
+                self.model.layers[0].mixer = nn.Module()
+                self.model.layers[0].mixer.experts = nn.Module()
+                experts = self.model.layers[0].mixer.experts
+                experts.lora_gate_and_up_A = nn.Parameter(torch.randn(2, 4, 2))
+                experts.lora_gate_and_up_B = nn.Parameter(torch.randn(2, 2, 6))
+                experts.lora_down_A = nn.Parameter(torch.randn(2, 6, 2))
+                experts.lora_down_B = nn.Parameter(torch.randn(2, 2, 4))
+                self.state_dict_adapter = NemotronV3StateDictAdapter(
+                    config=MagicMock(),
+                    moe_config=SimpleNamespace(
+                        n_routed_experts=2,
+                        moe_inter_dim=6,
+                        expert_activation="relu2",
+                    ),
+                    backend=MagicMock(),
+                )
+
+        model = GroupedFactorizedModel()
+
+        tensors = dict(dtensor_lora_params_generator(model, torch.bfloat16))
+
+        assert set(tensors) == {
+            f"backbone.layers.0.mixer.experts.{expert_id}.{projection}.lora_{factor}.weight"
+            for expert_id in range(2)
+            for projection in ("up_proj", "down_proj")
+            for factor in ("A", "B")
+        }
+        experts = model.model.layers[0].mixer.experts
+        for expert_id in range(2):
+            prefix = f"backbone.layers.0.mixer.experts.{expert_id}"
+            expected = {
+                f"{prefix}.up_proj.lora_A.weight": experts.lora_gate_and_up_A[
+                    expert_id
+                ].T,
+                f"{prefix}.up_proj.lora_B.weight": experts.lora_gate_and_up_B[
+                    expert_id
+                ].T,
+                f"{prefix}.down_proj.lora_A.weight": experts.lora_down_A[expert_id].T,
+                f"{prefix}.down_proj.lora_B.weight": experts.lora_down_B[expert_id].T,
+            }
+            for name, expected_tensor in expected.items():
+                torch.testing.assert_close(
+                    tensors[name], expected_tensor.to(torch.bfloat16)
+                )
+
+            trainer_up_delta = (
+                experts.lora_gate_and_up_A[expert_id]
+                @ experts.lora_gate_and_up_B[expert_id]
+            )
+            # nn.Linear stores the transposed weight, so the PEFT/vLLM
+            # update B @ A must equal the transpose of Automodel's A @ B.
+            vllm_up_weight_delta = (
+                experts.lora_gate_and_up_B[expert_id].T
+                @ experts.lora_gate_and_up_A[expert_id].T
+            )
+            torch.testing.assert_close(
+                vllm_up_weight_delta,
+                trainer_up_delta.T,
+            )
+
+            trainer_down_delta = (
+                experts.lora_down_A[expert_id] @ experts.lora_down_B[expert_id]
+            )
+            vllm_down_weight_delta = (
+                experts.lora_down_B[expert_id].T @ experts.lora_down_A[expert_id].T
+            )
+            torch.testing.assert_close(
+                vllm_down_weight_delta,
+                trainer_down_delta.T,
+            )
+        assert all(tensor.dtype == torch.bfloat16 for tensor in tensors.values())
+        assert all(tensor.is_contiguous() for tensor in tensors.values())
+
+        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker.model = model
+        worker.dtype = torch.bfloat16
+        worker.lora_refit_mode = "native"
+        refit_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
+
+        assert refit_info == {
+            name: (tensor.shape, tensor.dtype) for name, tensor in tensors.items()
+        }
+
     def test_rejects_incomplete_factor_pair(self):
         model = self.FactorizedModel(incomplete=True)
 
@@ -877,7 +970,7 @@ class TestDTensorLoraParamsGenerator:
         model = self.FactorizedModel()
         model.layer.base.weight.requires_grad_(True)
 
-        with pytest.raises(RuntimeError, match="other trainable parameters"):
+        with pytest.raises(RuntimeError, match="only LoRA A/B tensors"):
             list(dtensor_lora_params_generator(model, torch.bfloat16))
 
     def test_rejects_dynamically_updated_router_buffer(self):

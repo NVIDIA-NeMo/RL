@@ -1548,7 +1548,10 @@ def test_install_native_lora_replaces_and_activates_stable_adapter(monkeypatch):
     model = SimpleNamespace(hf_to_vllm_mapper=weights_mapper)
     adapter_manager = MagicMock()
     adapter_manager.model = model
-    adapter_manager.modules = {"model.layer": object()}
+    adapter_manager.modules = {
+        "model.experts": object(),
+        "model.layer": object(),
+    }
     adapter_manager.packed_modules = {}
     adapter_manager.is_pooling_model = False
     adapter_manager.add_adapter.return_value = True
@@ -1570,9 +1573,12 @@ def test_install_native_lora_replaces_and_activates_stable_adapter(monkeypatch):
     peft_helper = MagicMock()
     lora = SimpleNamespace(
         loras={
+            "model.experts.base_layer": SimpleNamespace(
+                lora_a=torch.ones(2, 4), lora_b=torch.ones(4, 2)
+            ),
             "model.layer": SimpleNamespace(
                 lora_a=torch.ones(2, 4), lora_b=torch.ones(4, 2)
-            )
+            ),
         }
     )
     from_dict = MagicMock(return_value=peft_helper)
@@ -1582,6 +1588,8 @@ def test_install_native_lora_replaces_and_activates_stable_adapter(monkeypatch):
     synchronize = MagicMock()
     monkeypatch.setattr(vllm_backend.torch.cuda, "synchronize", synchronize)
     tensors = {
+        "model.experts.base_layer.lora_A.weight": torch.ones(2, 4),
+        "model.experts.base_layer.lora_B.weight": torch.ones(4, 2),
         "model.layer.lora_A.weight": torch.ones(2, 4),
         "model.layer.lora_B.weight": torch.ones(4, 2),
     }

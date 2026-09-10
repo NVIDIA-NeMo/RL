@@ -422,14 +422,6 @@ def configure_vllm_lora_refit(policy_config: Mapping[str, Any]) -> None:
             "vLLM currently accepts one adapter rank and scaling factor."
         )
 
-    automodel_kwargs = dtensor_config.get("automodel_kwargs")
-    if automodel_kwargs is None or not automodel_kwargs.get("force_hf"):
-        raise ValueError(
-            "Native LoRA refit currently requires "
-            "policy.dtensor_cfg.automodel_kwargs.force_hf=true so trainer LoRA "
-            "tensor names follow the Hugging Face schema consumed by vLLM."
-        )
-
     if generation_config.get("refit_transport") is not None:
         raise ValueError(
             "Native LoRA refit currently supports only the topology-default "

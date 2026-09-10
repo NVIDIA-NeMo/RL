@@ -96,10 +96,10 @@ def _refit_tensor_dtype(
     return default_dtype
 
 
-def _native_lora_factor_names(
+def _native_lora_trainable_names(
     model: nn.Module, state_dict: Mapping[str, torch.Tensor]
 ) -> frozenset[str]:
-    """Validate and return the complete factorized adapter tensor names."""
+    """Validate and return source tensors for native LoRA refit."""
     dynamic_router_modules = sorted(
         name
         for name, module in model.named_modules()
@@ -112,59 +112,81 @@ def _native_lora_factor_names(
             f"{dynamic_router_modules[:8]}. Use merged refit for this policy."
         )
 
-    state_names = set(state_dict)
-    lora_a_modules = {
-        name.removesuffix(".lora_A.weight")
-        for name in state_names
-        if name.endswith(".lora_A.weight")
-    }
-    lora_b_modules = {
-        name.removesuffix(".lora_B.weight")
-        for name in state_names
-        if name.endswith(".lora_B.weight")
-    }
-    if not lora_a_modules and not lora_b_modules:
-        raise RuntimeError("Native LoRA refit found no LoRA A/B tensors.")
-
-    incomplete_modules = lora_a_modules ^ lora_b_modules
-    if incomplete_modules:
-        raise RuntimeError(
-            "Native LoRA refit requires complete A/B pairs; incomplete modules: "
-            f"{sorted(incomplete_modules)[:8]}"
-        )
-
-    factor_names = {
-        name
-        for name in state_names
-        if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight")
-    }
-    unexpected_trainable = sorted(
-        name
-        for name, parameter in model.named_parameters()
-        if parameter.requires_grad and name not in factor_names
+    trainable_names = frozenset(
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
     )
-    if unexpected_trainable:
+    if not trainable_names:
+        raise RuntimeError("Native LoRA refit found no trainable LoRA tensors.")
+
+    missing_state = sorted(trainable_names - set(state_dict))
+    if missing_state:
         raise RuntimeError(
-            "Native LoRA refit synchronizes only LoRA A/B tensors, but found "
-            "other trainable parameters: "
-            f"{unexpected_trainable[:8]}. Use merged refit for this policy."
+            "Native LoRA refit could not find trainable parameters in the model "
+            f"state dict: {missing_state[:8]}."
         )
-    return frozenset(factor_names)
+    return trainable_names
 
 
 def dtensor_lora_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Yield factorized LoRA A/B tensors for vLLM's native adapter runtime."""
+    """Yield HF-adapted LoRA A/B tensors for vLLM's native adapter runtime."""
     state_dict = model.state_dict()
-    factor_names = _native_lora_factor_names(model, state_dict)
+    trainable_names = _native_lora_trainable_names(model, state_dict)
+    factor_kinds_by_module: dict[str, set[str]] = {}
+    emitted_names: set[str] = set()
+
     for name, tensor in state_dict.items():
-        if name not in factor_names:
+        if name not in trainable_names:
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-        yield (
-            name,
-            full_tensor.to(target_dtype, non_blocking=True).contiguous(),
+        # vLLM consumes conventional per-expert PEFT factors. Requesting the
+        # adapter's v4-compatible export also normalizes grouped-MoE factor
+        # orientation instead of emitting Transformers v5 ParamWrapper tensors
+        # whose A/B layout follows the grouped parameter storage.
+        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
+            model, name, full_tensor, v4_compatible=True
+        )
+        if not adapted_fqn_tensors:
+            raise RuntimeError(
+                "Native LoRA refit state-dict adapter dropped trainable tensor "
+                f"{name!r}."
+            )
+
+        for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
+            if adapted_fqn.endswith(".lora_A.weight"):
+                module_name = adapted_fqn.removesuffix(".lora_A.weight")
+                factor_kind = "A"
+            elif adapted_fqn.endswith(".lora_B.weight"):
+                module_name = adapted_fqn.removesuffix(".lora_B.weight")
+                factor_kind = "B"
+            else:
+                raise RuntimeError(
+                    "Native LoRA refit synchronizes only LoRA A/B tensors, but "
+                    f"trainable parameter {name!r} converted to {adapted_fqn!r}. "
+                    "Use merged refit for this policy."
+                )
+            if adapted_fqn in emitted_names:
+                raise RuntimeError(
+                    "Native LoRA refit state-dict adapter emitted duplicate tensor "
+                    f"name {adapted_fqn!r}."
+                )
+            emitted_names.add(adapted_fqn)
+            factor_kinds_by_module.setdefault(module_name, set()).add(factor_kind)
+            yield (
+                adapted_fqn,
+                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+            )
+
+    incomplete_modules = sorted(
+        module_name
+        for module_name, factor_kinds in factor_kinds_by_module.items()
+        if factor_kinds != {"A", "B"}
+    )
+    if incomplete_modules:
+        raise RuntimeError(
+            "Native LoRA refit requires complete A/B pairs after HF state-dict "
+            f"adaptation; incomplete modules: {incomplete_modules[:8]}"
         )
 
 
@@ -252,16 +274,21 @@ def _maybe_merge_lora_weight(
 
 
 def _maybe_adapt_tensor_to_hf(
-    model_part: nn.Module, fqn: str, tensor: torch.Tensor, quantization: bool = False
+    model_part: nn.Module,
+    fqn: str,
+    tensor: torch.Tensor,
+    quantization: bool = False,
+    v4_compatible: bool = False,
 ) -> list[tuple[str, torch.Tensor]]:
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
-        return adapter.convert_single_tensor_to_hf(
-            fqn,
-            tensor,
-            exclude_key_regex=r".*_extra_state.*",
-            quantization=quantization,
-        )
+        adapter_kwargs = {
+            "exclude_key_regex": r".*_extra_state.*",
+            "quantization": quantization,
+        }
+        if v4_compatible:
+            adapter_kwargs["v4_compatible"] = True
+        return adapter.convert_single_tensor_to_hf(fqn, tensor, **adapter_kwargs)
     return [(fqn, tensor)]
 
 
@@ -1152,12 +1179,11 @@ class DTensorPolicyWorkerV2Impl(
     ) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         if self.lora_refit_mode == "native":
-            state_dict = self.model.state_dict()
-            factor_names = _native_lora_factor_names(self.model, state_dict)
             return {
-                name: (tensor.shape, self.dtype)
-                for name, tensor in state_dict.items()
-                if name in factor_names
+                name: (tensor.shape, tensor.dtype)
+                for name, tensor in dtensor_lora_params_generator(
+                    self.model, self.dtype
+                )
             }
 
         del refit_payload_mode

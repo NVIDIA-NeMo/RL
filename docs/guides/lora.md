@@ -61,8 +61,6 @@ LoRA settings live under `policy.dtensor_cfg.lora_cfg`:
 policy:
   dtensor_cfg:
     _v2: true                   # LoRA requires DTensor v2
-    automodel_kwargs:
-      force_hf: true            # Required for native vLLM LoRA refit
     lora_cfg:
       enabled: False            # Set to True to enable LoRA fine-tuning
       target_modules: []        # List of module names to apply LoRA
@@ -181,8 +179,7 @@ GRPO supports LoRA on both backends. Enable the DTensor adapter with:
 
 ```bash
 uv run examples/run_grpo.py \
-  policy.dtensor_cfg.lora_cfg.enabled=true \
-  policy.dtensor_cfg.automodel_kwargs.force_hf=true
+  policy.dtensor_cfg.lora_cfg.enabled=true
 ```
 
 For DTensor v2 training with synchronous vLLM generation, **native LoRA refit is the
@@ -191,11 +188,19 @@ adapter, and selects it on every generation request. The base model is loaded on
 not overwritten during adapter updates.
 
 Native refit currently supports the topology-default transport (colocated CUDA IPC or
-non-colocated NCCL), BF16/FP16 rollout policies, and the Hugging Face Automodel path
-(`policy.dtensor_cfg.automodel_kwargs.force_hf=true`). It fails at setup for unsupported
-combinations such as asynchronous vLLM, speculative decoding, quantized rollout models,
-custom refit transports, or Megatron LoRA. Models with dynamically updated MoE router
-bias fail before their first native refit rather than silently omitting that mutable state.
+non-colocated NCCL) and BF16/FP16 rollout policies. It exports the trainer's LoRA tensors
+through the model's Automodel state-dict adapter when one is present, so custom model
+layouts such as grouped MoE are converted to conventional per-expert HF/PEFT factors
+with the orientation consumed by vLLM. It fails at setup for unsupported combinations
+such as asynchronous vLLM, speculative
+decoding, quantized rollout models, custom refit transports, or Megatron LoRA. Models
+with dynamically updated MoE router bias fail before their first native refit rather than
+silently omitting that mutable state.
+
+Individual recipes may still set `automodel_kwargs.force_hf=true` for model-specific
+training or parallelization compatibility. That setting is independent of native refit;
+native refit itself accepts either HF-native LoRA names or names converted by a custom
+Automodel state-dict adapter.
 
 The previous full-weight behavior remains available as an explicit compatibility or
 performance opt-in:

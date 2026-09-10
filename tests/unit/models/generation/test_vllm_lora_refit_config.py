@@ -70,6 +70,15 @@ def test_native_lora_refit_materializes_vllm_adapter_config() -> None:
     }
 
 
+def test_native_lora_refit_does_not_require_force_hf() -> None:
+    policy_config = _native_policy_config()
+    policy_config["dtensor_cfg"]["automodel_kwargs"]["force_hf"] = False
+
+    configure_vllm_lora_refit(policy_config)
+
+    assert policy_config["generation"]["vllm_kwargs"]["enable_lora"] is True
+
+
 def test_native_lora_refit_allows_explicitly_disabled_speculative_decoding() -> None:
     policy_config = _native_policy_config()
     policy_config["generation"]["vllm_kwargs"]["speculative_config"] = {
@@ -132,12 +141,6 @@ def test_native_default_is_a_noop_when_lora_is_disabled() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (
-            lambda cfg: cfg["dtensor_cfg"]["automodel_kwargs"].update(
-                {"force_hf": False}
-            ),
-            "force_hf=true",
-        ),
         (
             lambda cfg: cfg["dtensor_cfg"].update({"_v2": False}),
             "_v2=true",
