@@ -929,16 +929,17 @@ def test_hash_fingerprints_released_on_clear():
     client.close()
 
 
-def test_hash_fingerprints_follow_the_sample_when_another_process_clears(
-    monkeypatch,
+@pytest.mark.parametrize("verify_tensor_hash", [False, True])
+def test_accounting_follows_the_sample_when_another_process_clears(
+    monkeypatch, verify_tensor_hash
 ):
     """GenWorker and the value actor put through their own clients and never
-    call ``clear_samples``, so their fingerprints are released by reconciling
-    against the partition's live keys — a row dropped by SC must not be
-    retained here, and a row still live must be."""
-    monkeypatch.setattr(observability, "_HASH_RECONCILE_ROWS", 4)
+    call ``clear_samples``, so their accounting is released by reconciling
+    against the partition's live keys. Parametrised over the guard because the
+    leak is in the byte/key accounting, which is on by default."""
+    monkeypatch.setattr(observability, "_RECONCILE_ROWS", 4)
     inner = NoOpDataPlaneClient()
-    writer = _client(inner, verify_tensor_hash=True)
+    writer = _client(inner, verify_tensor_hash=verify_tensor_hash)
     writer.put_samples(
         sample_ids=_ids(4, prefix="gone"), partition_id="p", fields=_hash_fields()
     )
@@ -948,19 +949,17 @@ def test_hash_fingerprints_follow_the_sample_when_another_process_clears(
 
     # Another process clears half the partition; the writer never sees the call.
     inner.clear_samples(sample_ids=_ids(4, prefix="gone"), partition_id="p")
-    assert set(writer._hash_by_partition["p"]) == set(_ids(4, prefix="gone")) | set(
+    assert writer._keys_by_partition["p"] == set(_ids(4, prefix="gone")) | set(
         _ids(4, prefix="live")
     )
 
     writer.put_samples(
         sample_ids=_ids(4, prefix="next"), partition_id="p", fields=_hash_fields()
     )
-    assert set(writer._hash_by_partition["p"]) == set(_ids(4, prefix="live")) | set(
-        _ids(4, prefix="next")
-    )
-    assert writer._keys_by_partition["p"] == set(_ids(4, prefix="live")) | set(
-        _ids(4, prefix="next")
-    )
+    still_live = set(_ids(4, prefix="live")) | set(_ids(4, prefix="next"))
+    assert writer._keys_by_partition["p"] == still_live
+    if verify_tensor_hash:
+        assert set(writer._hash_by_partition["p"]) == still_live
     writer.close()
 
 

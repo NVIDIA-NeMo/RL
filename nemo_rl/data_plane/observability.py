@@ -122,10 +122,10 @@ def _comm_volume(by_op: dict[str, Any]) -> dict[str, int]:
 # few lines carry the identity of what broke.
 _MAX_HASH_MISMATCH_LOGS = 20
 
-# Rows a client may accumulate between reconciliations of its fingerprint
-# store against the partition's live keys. One metadata call per this many
-# rows recorded, so a client that clears normally never makes one.
-_HASH_RECONCILE_ROWS = 1 << 14
+# Rows a client may write between reconciliations of its live-key accounting
+# against the partition. One metadata call per this many rows put, so a client
+# that clears its own writes never makes one.
+_RECONCILE_ROWS = 1 << 14
 
 # The ``HashStats`` counters, named once: they are differenced into
 # ``step/hash/*`` and summed across processes, and the two lists drifting
@@ -1151,16 +1151,16 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._verify_tensor_hash = verify_tensor_hash
         self._stats = DataPlaneStats()
         # Live bytes and live keys per partition. Populated on successful
-        # ``put_samples``, released on successful ``clear_samples``. Bounded
-        # by the live key population, not by cumulative traffic.
+        # ``put_samples``, released on successful ``clear_samples`` -- or, for
+        # a process that never issues one, by ``_release_cleared_samples``.
+        # Bounded by the live key population, not by cumulative traffic.
         self._bytes_by_partition: dict[str, int] = {}
         self._keys_by_partition: dict[str, set[str]] = {}
-        # partition -> sample_id -> field -> wire-in fingerprint. Released by
-        # ``clear_samples``, and for the writers that never issue one by
-        # ``_release_cleared_samples``; either way a fingerprint outlives its
-        # sample by no more than one reconciliation.
+        self._rows_since_reconcile = 0
+        self._reconcile_failure_logged = False
+        # partition -> sample_id -> field -> wire-in fingerprint. Same
+        # lifetime as the two above: ``_record_clear`` releases all three.
         self._hash_by_partition: dict[str, dict[str, dict[str, int]]] = {}
-        self._hash_rows_since_reconcile = 0
         self._hash_mismatches_logged = 0
         # Set by ``_emit`` to the inner client's wall time for the op just
         # run, so the wrapping methods can subtract it and bill the rest to
@@ -1259,6 +1259,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._stats.bytes_outstanding += n_bytes
         if self._stats.bytes_outstanding > self._stats.peak_bytes_outstanding:
             self._stats.peak_bytes_outstanding = self._stats.bytes_outstanding
+        self._rows_since_reconcile += len(keys)
+        if self._rows_since_reconcile >= _RECONCILE_ROWS:
+            # Re-armed before the call, not after: a listing that fails on one
+            # put fails on the next, so re-arming after would retry it on every
+            # put for the rest of the run.
+            self._rows_since_reconcile = 0
+            self._release_cleared_samples(partition_id)
 
     def _record_clear(self, partition_id: str, keys: list[str] | None) -> None:
         """Reverse the put accounting for ``keys``.
@@ -1300,6 +1307,40 @@ class MetricsDataPlaneClient(DataPlaneClient):
             freed = total * removed // (len(live) + removed) if removed else 0
             self._bytes_by_partition[partition_id] = total - freed
         self._stats.bytes_outstanding -= freed
+
+    def _release_cleared_samples(self, partition_id: str) -> None:
+        """Reverse the put accounting for samples another process cleared.
+
+        ``_record_clear`` only fires in the process that issues the clear,
+        which on the SC path is only ever SC: GenWorker and the value actor
+        put through their own clients and never clear, so their accounting
+        would keep every uid they ever wrote. ``list_sample_ids`` is
+        metadata-only and documented for reconciliation; diffing against it
+        ties the accounting to the sample's real lifetime.
+
+        The stale uids go through ``_record_clear`` so all three stores are
+        released by the one rule a real clear uses.
+        """
+        try:
+            live = set(self._inner.list_sample_ids(partition_id))
+        except Exception as exc:  # noqa: BLE001 - accounting must not fail a put
+            # The put itself already succeeded; only the release is lost, and
+            # the next window retries it. Logged once because whatever makes
+            # the listing raise makes it raise every window.
+            if not self._reconcile_failure_logged:
+                self._reconcile_failure_logged = True
+                logger.warning(
+                    "data-plane accounting could not reconcile partition %s "
+                    "(%s: %s). Transfers are unaffected; bytes_outstanding "
+                    "and n_keys_outstanding may over-report on this process.",
+                    partition_id,
+                    type(exc).__name__,
+                    exc,
+                )
+            return
+        stale = self._keys_by_partition.get(partition_id, set()) - live
+        if stale:
+            self._record_clear(partition_id, list(stale))
 
     def _bill_self(self, entered: float) -> None:
         """Charge this wrapper for the time it spent that was not the RPC.
@@ -1427,29 +1468,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
             for name, per_row in digests.items():
                 per_field[name] = per_row[row]
         self._stats.hash_verify.rows_recorded += len(sample_ids)
-        self._hash_rows_since_reconcile += len(sample_ids)
-        if self._hash_rows_since_reconcile >= _HASH_RECONCILE_ROWS:
-            # Re-armed before the call, not after: ``_record_hashes`` swallows
-            # whatever this raises, and a listing that fails on one put fails
-            # on the next, so re-arming after would retry it on every put.
-            self._hash_rows_since_reconcile = 0
-            self._release_cleared_samples(partition_id)
-
-    def _release_cleared_samples(self, partition_id: str) -> None:
-        """Release the accounting for samples the partition no longer holds.
-
-        ``clear_samples`` releases it in the process that issues it, which on
-        the SC path is only ever SC: GenWorker and the value actor put through
-        their own clients and never clear. Reconciling against
-        ``list_sample_ids`` -- metadata-only, and documented for exactly this
-        -- ties their rows to the sample's real lifetime instead. It runs
-        ``_record_clear`` rather than dropping the fingerprints alone, so the
-        byte and key accounting follows the same uids.
-        """
-        live = set(self._inner.list_sample_ids(partition_id))
-        stale = self._hash_by_partition[partition_id].keys() - live
-        if stale:
-            self._record_clear(partition_id, list(stale))
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
         """Compare wire-out fingerprints against what was written. Never raises."""
