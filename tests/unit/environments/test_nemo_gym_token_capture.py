@@ -402,13 +402,24 @@ def test_postprocess_passes_the_scored_response_to_attribution() -> None:
 
 
 @pytest.mark.parametrize("builder", ["per_request", "prefix_merging"])
+@pytest.mark.parametrize(
+    "row,rollout_id",
+    [
+        ({"_ng_rollout_id": "r1"}, "r1"),
+        ({"_ng_task_index": "group", "_ng_rollout_index": 0}, "group-0"),
+        ({"_ng_rollout_id": "r1", "_ng_attempt_index": 2}, "r1-a2"),
+        (
+            {"_ng_task_index": "group", "_ng_rollout_index": 1, "_ng_attempt_index": 2},
+            "group-1-a2",
+        ),
+    ],
+)
 def test_local_all_traces_finalizer_preserves_branches_and_compaction(
-    tmp_path, builder
+    tmp_path, builder, row, rollout_id
 ):
     """Exercise the actual Gym store, public schema and RL actor handoff."""
     from types import SimpleNamespace
 
-    from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
     from nemo_gym.token_id_capture.records import (
         ParentResolutionStatus,
         TokenEntry,
@@ -425,7 +436,7 @@ def test_local_all_traces_finalizer_preserves_branches_and_compaction(
         ("compact", [5, 6], [15], None),
     ]:
         entry = TokenEntry(
-            rollout_id="r1",
+            rollout_id=rollout_id,
             model_call_id=call,
             model="policy",
             prompt_token_ids=prompt,
@@ -463,15 +474,21 @@ def test_local_all_traces_finalizer_preserves_branches_and_compaction(
             }
         ],
     }
-    original_result = {"reward": 0.75, "response": deepcopy(original_response)}
+    original_result = {
+        "reward": 0.75,
+        "response": deepcopy(original_response),
+        "_ng_rollout_id": "stale-agent-id",
+        "_ng_attempt_index": 99,
+    }
     result = asyncio.run(
         env._postprocess_all_gym_traces(
-            {ROLLOUT_ID_KEY_NAME: "r1"},
+            row,
             original_result,
             SimpleNamespace(pad_token_id=0),
         )
     )
     public = TrainingTraceBatch.model_validate(result["full_result"]["training_traces"])
+    assert public.rollout_id == result["gym_rollout_id"] == rollout_id
     assert len(public.traces) == (4 if builder == "per_request" else 3)
     assert len(result["gym_training_traces"]) == len(public.traces)
     assert sum(sum(trace.loss_mask) for trace in result["gym_training_traces"]) == 6
@@ -480,3 +497,114 @@ def test_local_all_traces_finalizer_preserves_branches_and_compaction(
     assert {
         span.model_call_id for trace in public.traces for span in trace.sampled_spans
     } == {"a", "b", "c", "compact"}
+
+
+@pytest.mark.parametrize("already_flagged", [False, True])
+def test_no_model_calls_with_normal_dispatch_identity_becomes_inert(
+    tmp_path, already_flagged
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
+
+    from nemo_rl.experience.rollouts import _prepare_nemo_gym_rows
+
+    env = _capture_env()
+    env._require_spinup = Mock()
+    env._tokenizer = SimpleNamespace(pad_token_id=0)
+    env._token_capture_enabled = False
+    env.head_server_config = None
+    env.cfg = {
+        "initial_global_config_dict": {
+            "token_id_capture": {
+                "enabled": True,
+                "all_agents": True,
+                "dir": str(tmp_path),
+                "delivery": "all_traces",
+                "builder": "per_request",
+            }
+        }
+    }
+    dispatched_ids = []
+
+    async def complete(row):
+        return row, {
+            "reward": 0.0,
+            "response": {"output": []},
+            "mask_sample": already_flagged,
+        }
+
+    def run_examples(*, examples, head_server_config):
+        # Observe the exact row the real actor sends to Gym, before any model call.
+        for row in examples:
+            assert row.get("_ng_rollout_id")
+            dispatched_ids.append(maybe_rollout_id_from_run_body(row))
+        return [complete(row) for row in examples]
+
+    env.rch = SimpleNamespace(run_examples=run_examples)
+
+    async def collect(rows):
+        return [item async for item in env.run_rollouts(rows, "test")]
+
+    results = []
+    for batch_index in range(3):
+        rows = [
+            {"responses_create_params": {}, "agent_ref": {"name": "test"}}
+            for _ in range(2)
+        ]
+        # Task numbering can restart; synchronous rows may also omit it entirely.
+        if batch_index == 0:
+            rows[0]["_ng_rollout_id"] = "supplied"
+            rows[0]["_ng_attempt_index"] = 2
+        else:
+            for row in rows:
+                row["_ng_task_index"] = 0
+        _prepare_nemo_gym_rows(
+            rows,
+            {"max_new_tokens": 16},
+            SimpleNamespace(temperature=0.7, top_p=0.95),
+            num_generations=2,
+        )
+        with pytest.warns(UserWarning, match="capture contains no token records"):
+            collected = asyncio.run(collect(rows))
+        if batch_index == 0:
+            assert rows[0]["_ng_rollout_id"] == "supplied"
+        for _, _, result, _ in collected:
+            assert result["gym_training_traces"] == []
+            assert result["gym_metrics_message_log"] == []
+            assert result["message_log"][0]["role"] == "user"
+            assert result["message_log"][0]["token_ids"].tolist() == [0, 0]
+            assert result["full_result"]["mask_sample"] is True
+            assert (
+                result["full_result"]["_ng_token_capture"]["error"]
+                == "capture contains no token records"
+            )
+            results.append(result)
+    assert dispatched_ids[0] == "supplied-a2"
+    assert len(set(dispatched_ids)) == 6
+    assert [result["gym_rollout_id"] for result in results] == dispatched_ids
+
+
+@pytest.mark.parametrize("row", [{}, {"_ng_rollout_id": "invalid/path"}])
+def test_flagged_rollout_without_valid_correlation_still_fails(tmp_path, row):
+    from types import SimpleNamespace
+
+    env = _capture_env()
+    env.cfg = {
+        "initial_global_config_dict": {
+            "token_id_capture": {
+                "enabled": True,
+                "all_agents": True,
+                "dir": str(tmp_path),
+                "delivery": "all_traces",
+                "builder": "per_request",
+            }
+        }
+    }
+    with pytest.raises(ValueError):
+        asyncio.run(
+            env._postprocess_all_gym_traces(
+                row, {"mask_sample": True}, SimpleNamespace(pad_token_id=0)
+            )
+        )
