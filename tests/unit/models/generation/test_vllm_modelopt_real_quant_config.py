@@ -1130,9 +1130,15 @@ def test_modelopt_moe_manifest_requires_complete_w4a4_family(monkeypatch):
         )
 
 
-def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
+def test_real_quant_load_weights_expands_non_gated_experts_per_expert(
     monkeypatch,
 ):
+    """Non-gated fused W13 payloads must be split into per-expert 2-D shards.
+
+    A batched ``[E, N, K]`` tensor trips vLLM 0.26's
+    ``RoutedExperts.load_weights`` fused gate/up branch, which keys off
+    ``dim() == 3`` alone and chunks a dimension that was never fused.
+    """
     backend = _import_vllm_quant_backend(monkeypatch)
 
     class ModelOptNvFp4FusedMoE:
@@ -1168,10 +1174,12 @@ def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
     extension.prepare_refit_info(state_dict_info)
     extension._nrl_w13_num_shards_by_prefix = {prefix: 1}
     _patch_real_quant_load(monkeypatch, backend, batched_forwarded)
+    w13_block_scale = torch.arange(8).reshape(2, 4, 1)
     assert (
         extension._load_weights(
             [
                 (f"{prefix}.experts.w13_weight", w13_weight),
+                (f"{prefix}.experts.w13_weight_scale", w13_block_scale),
                 (f"{prefix}.experts.w13_weight_scale_2", w13_scale_2),
             ]
         )
@@ -1179,12 +1187,21 @@ def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
     )
     assert [name for name, _ in batched_forwarded] == [
         f"{prefix}.experts.0.up_proj.weight",
+        f"{prefix}.experts.1.up_proj.weight",
+        f"{prefix}.experts.0.up_proj.weight_scale",
+        f"{prefix}.experts.1.up_proj.weight_scale",
         f"{prefix}.experts.0.up_proj.weight_scale_2",
         f"{prefix}.experts.1.up_proj.weight_scale_2",
     ]
-    assert batched_forwarded[0][1] is w13_weight
-    torch.testing.assert_close(batched_forwarded[1][1], w13_scale_2[0, 0])
-    torch.testing.assert_close(batched_forwarded[2][1], w13_scale_2[1, 0])
+    # Every per-expert shard is 2-D, so vLLM's fused-3D branch is never taken.
+    for _, forwarded in batched_forwarded[:4]:
+        assert forwarded.ndim == 2
+    torch.testing.assert_close(batched_forwarded[0][1], w13_weight[0])
+    torch.testing.assert_close(batched_forwarded[1][1], w13_weight[1])
+    torch.testing.assert_close(batched_forwarded[2][1], w13_block_scale[0])
+    torch.testing.assert_close(batched_forwarded[3][1], w13_block_scale[1])
+    torch.testing.assert_close(batched_forwarded[4][1], w13_scale_2[0, 0])
+    torch.testing.assert_close(batched_forwarded[5][1], w13_scale_2[1, 0])
 
     extension = _make_real_quant_extension(
         backend,
@@ -2780,3 +2797,172 @@ def test_registered_w4a16_moe_preserves_kernel_during_reload(monkeypatch):
     assert torch.all(layer.w13_weight_scale >= 0)
     assert torch.all(layer.w2_weight_scale >= 0)
     assert fake_vllm.events == [("native_process_moe", 80)]
+
+
+class _FakeQuantizer(torch.nn.Module):
+    """Stand-in for ModelOpt's TensorQuantizer: owns a nested ``_amax`` buffer."""
+
+    def __init__(self, amax: float = -1.0):
+        super().__init__()
+        self.register_buffer("_amax", torch.tensor(amax))
+
+
+class _FakeRoutedExperts(torch.nn.Module):
+    """Stand-in for vLLM's RoutedExperts after ModelOpt MoE fakequant."""
+
+    def __init__(self):
+        super().__init__()
+        self.w13_weight = torch.nn.Parameter(torch.zeros(1, 4, 2))
+        self.w2_weight = torch.nn.Parameter(torch.zeros(1, 2, 4))
+        self.w13_input_quantizer = _FakeQuantizer()
+        self.w2_input_quantizer = _FakeQuantizer()
+
+
+class _FakeLinear(torch.nn.Module):
+    """Stand-in for a quantized vLLM LinearBase, which resolves dotted names."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+        self.input_quantizer = _FakeQuantizer()
+
+
+class _FakeQuantModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = _FakeRoutedExperts()
+        self.in_proj = _FakeLinear()
+
+
+def _amax_loader_context(monkeypatch, model):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = backend.VllmQuantInternalWorkerExtension
+    # The amax helpers only touch the model, so an uninitialized instance is
+    # enough and avoids standing up a vLLM worker.
+    worker = object.__new__(extension)
+    return worker._attach_input_quantizer_amax_loaders(model)
+
+
+def test_moe_amax_alias_bridges_vllms_single_level_routed_experts_getattr(
+    monkeypatch,
+):
+    """RoutedExperts.load_weights resolves ``w13_input_quantizer._amax`` by a
+    single ``getattr``; without an alias that raises and the refit dies."""
+    model = _FakeQuantModel()
+    experts = model.experts
+    buffers_before = [name for name, _ in model.named_buffers()]
+    state_dict_before = list(model.state_dict().keys())
+
+    with pytest.raises(AttributeError):
+        getattr(experts, "w13_input_quantizer._amax")
+
+    with _amax_loader_context(monkeypatch, model):
+        assert (
+            getattr(experts, "w13_input_quantizer._amax")
+            is experts.w13_input_quantizer._amax
+        )
+        assert (
+            getattr(experts, "w2_input_quantizer._amax")
+            is experts.w2_input_quantizer._amax
+        )
+        # The alias is not a buffer, so refit-time introspection is unaffected.
+        assert [name for name, _ in model.named_buffers()] == buffers_before
+        assert list(model.state_dict().keys()) == state_dict_before
+
+    assert not hasattr(experts, "w13_input_quantizer._amax")
+    assert not hasattr(experts, "w2_input_quantizer._amax")
+    assert [name for name, _ in model.named_buffers()] == buffers_before
+
+
+def test_moe_amax_alias_is_not_installed_on_plain_linear_quantizers(monkeypatch):
+    """LinearBase.load_weights rpartitions the name itself, so aliasing every
+    quantizer would add entries nothing ever reads."""
+    model = _FakeQuantModel()
+
+    with _amax_loader_context(monkeypatch, model):
+        assert not hasattr(model.in_proj, "input_quantizer._amax")
+        assert hasattr(model.experts, "w13_input_quantizer._amax")
+
+
+def test_moe_amax_alias_writes_through_and_keeps_the_cross_expert_max(monkeypatch):
+    """The alias is the same tensor, so the loader's ``max()`` fan-in over the
+    experts sharing one quantizer still lands in the real buffer."""
+    model = _FakeQuantModel()
+    experts = model.experts
+
+    with _amax_loader_context(monkeypatch, model):
+        for incoming in (torch.tensor(3.0), torch.tensor(1.5)):
+            param = getattr(experts, "w13_input_quantizer._amax")
+            param.weight_loader(param, incoming)
+
+    assert float(experts.w13_input_quantizer._amax) == 3.0
+
+
+def test_moe_amax_alias_is_removed_when_loading_raises(monkeypatch):
+    model = _FakeQuantModel()
+
+    with pytest.raises(RuntimeError):
+        with _amax_loader_context(monkeypatch, model):
+            raise RuntimeError("weight load failed")
+
+    assert not hasattr(model.experts, "w13_input_quantizer._amax")
+    assert not hasattr(model.experts.w13_input_quantizer._amax, "weight_loader")
+
+
+def _resolve_like_vllm_routed_experts(experts, layer_name, expert_name, mapping):
+    """Replay vLLM 0.26 ``RoutedExperts.load_weights``'s target resolution.
+
+    Mirrors ``routed_experts.py`` (v0.26.0) lines 873-887 exactly, including the
+    single-level ``getattr`` that this alias exists to satisfy.
+    """
+    qual_name = f"{layer_name}.{expert_name}"
+    for param_name, weight_name, _expert_id, _shard_id in mapping:
+        if weight_name not in qual_name:
+            continue
+        weight_name = qual_name.replace(weight_name, param_name)
+        param_name = weight_name.removeprefix(f"{layer_name}.")
+        return getattr(experts, param_name)
+    raise AssertionError(f"no expert mapping matched {qual_name}")
+
+
+def test_moe_amax_alias_satisfies_vllms_routed_experts_lookup(monkeypatch):
+    """End-to-end shape of the refit failure this alias fixes.
+
+    Nemotron-H builds its experts with ``ckpt_names=("up_proj", "down_proj",
+    "")``, so ``get_expert_mapping`` emits per-expert entries carrying the
+    expert id and a trailing dot. Feeding the amax keys the Megatron side
+    exports through that mapping is what produces the two-level
+    ``w13_input_quantizer._amax`` name.
+    """
+    layer_name = "model.layers.1.mixer.experts"
+    mapping = [("experts.w13_", f"experts.{e}.up_proj.", e, "w1") for e in range(2)] + [
+        ("experts.w2_", f"experts.{e}.down_proj.", e, "w2") for e in range(2)
+    ]
+    # ``layer_name`` already ends in ``experts``, so what reaches
+    # ``RoutedExperts.load_weights`` is the name relative to it.
+    exported = [
+        (f"{e}.{proj}.input_quantizer._amax", torch.tensor(value))
+        for e, proj, value in (
+            (0, "up_proj", 2.0),
+            (1, "up_proj", 6.0),
+            (0, "down_proj", 1.0),
+            (1, "down_proj", 0.25),
+        )
+    ]
+
+    model = _FakeQuantModel()
+    experts = model.experts
+
+    with pytest.raises(AttributeError, match="w13_input_quantizer._amax"):
+        _resolve_like_vllm_routed_experts(experts, layer_name, exported[0][0], mapping)
+
+    with _amax_loader_context(monkeypatch, model):
+        for expert_name, loaded_weight in exported:
+            param = _resolve_like_vllm_routed_experts(
+                experts, layer_name, expert_name, mapping
+            )
+            param.weight_loader(param, loaded_weight)
+
+    # Every expert folds into the one quantizer its shard belongs to.
+    assert float(experts.w13_input_quantizer._amax) == 6.0
+    assert float(experts.w2_input_quantizer._amax) == 1.0
