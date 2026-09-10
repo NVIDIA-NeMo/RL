@@ -1498,3 +1498,56 @@ class TestPrepareForLpInference:
         w.finish_train_step()
         assert self._grad_offload_calls(w) == []
         assert sentinel.call_count == 1
+
+    def test_reference_swap_does_not_reset_open_mxfp8_shared_buffer_step(
+        self, mock_module_symbols
+    ):
+        w = self._worker()
+        w._uses_mxfp8_overlap_shared_param_buffer.return_value = True
+        w.should_disable_forward_pre_hook = True
+        w.reference_state_dict = {}
+        w.model.state_dict.return_value = {}
+        w._apply_state_dict_to_model = MagicMock()
+        w.disable_forward_pre_hook = MagicMock(
+            side_effect=lambda param_sync=True: (
+                w.model.zero_grad_buffer() if param_sync else None
+            )
+        )
+        w.enable_forward_pre_hook = MagicMock()
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        with patch("torch.randn"):
+            w.prepare_for_lp_inference(keep_train_buffers=True)
+        with w.use_reference_model():
+            pass
+        w.train_microbatch(_fake_batch())
+        w.finish_train_step()
+
+        w.model.zero_grad_buffer.assert_called_once_with()
+        w.disable_forward_pre_hook.assert_called_once_with(param_sync=False)
+        w.optimizer._copy_main_params_to_param_buffer.assert_not_called()
+        w.enable_forward_pre_hook.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        ("uses_shared_buffer", "step_is_open"),
+        [(False, True), (True, False)],
+    )
+    def test_reference_swap_keeps_param_sync_outside_open_shared_buffer_step(
+        self, mock_module_symbols, uses_shared_buffer, step_is_open
+    ):
+        w = self._worker()
+        w._uses_mxfp8_overlap_shared_param_buffer.return_value = uses_shared_buffer
+        w.should_disable_forward_pre_hook = True
+        w.reference_state_dict = {}
+        w.model.state_dict.return_value = {}
+        w._apply_state_dict_to_model = MagicMock()
+        w.disable_forward_pre_hook = MagicMock()
+        w.enable_forward_pre_hook = MagicMock()
+        w._train_step_state = {} if step_is_open else None
+
+        with w.use_reference_model():
+            pass
+
+        w.disable_forward_pre_hook.assert_called_once_with(param_sync=True)
+        w.enable_forward_pre_hook.assert_called_once_with()

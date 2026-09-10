@@ -2139,7 +2139,11 @@ class MegatronPolicyWorkerImpl(
         """
         ## disable overlap param gather when swapping weights
         if self.should_disable_forward_pre_hook:
-            self.disable_forward_pre_hook()
+            shared_buffer_step_open = (
+                self._uses_mxfp8_overlap_shared_param_buffer()
+                and getattr(self, "_train_step_state", None) is not None
+            )
+            self.disable_forward_pre_hook(param_sync=not shared_buffer_step_open)
 
         with torch.no_grad():
             # Save original references
