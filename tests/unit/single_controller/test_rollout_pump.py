@@ -45,13 +45,14 @@ from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
+    RolloutRecoveryConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
-    RolloutRecoveryLedgerState,
+    RolloutRecoveryState,
 )
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
@@ -931,7 +932,7 @@ def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
 
         checkpoint_entered = asyncio.Event()
 
-        async def checkpoint_snapshot() -> RolloutRecoveryLedgerState:
+        async def checkpoint_snapshot() -> RolloutRecoveryState:
             async with barrier.checkpoint():
                 checkpoint_entered.set()
                 return ledger.state_dict()
@@ -1142,6 +1143,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         def __init__(self) -> None:
             self.generated = 0
             self.two_generated = asyncio.Event()
+            self.stats = SimpleNamespace(committed=0)
 
         async def generate_for_finalization(
             self,
@@ -1161,9 +1163,13 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         release_finalizers = asyncio.Event()
         finalizers_started = 0
 
-        async def _delayed_finalize(request: Any) -> bool:
+        async def _delayed_finalize(
+            request: Any,
+            *,
+            target_step: int | None = None,
+        ) -> bool:
             nonlocal finalizers_started
-            del request
+            del request, target_step
             finalizers_started += 1
             await release_finalizers.wait()
             return True
@@ -1215,6 +1221,131 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
 
         # Successful commits transfer both buffer permits to the train pump.
         assert ctrl._buffer_capacity._value == 0
+        assert ctrl._rollout_exhausted.is_set()
+
+    asyncio.run(_main())
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_actor_finalization_discards_recovery_ledger_ownership(
+    committed: bool,
+) -> None:
+    class _RecoveryCaptureManager:
+        def __init__(self) -> None:
+            self.recovery_ledger = RolloutRecoveryLedger()
+            self.stats = SimpleNamespace(committed=0)
+
+        def reserve_prompt_group(
+            self,
+            cut: DataPlaneMutationCut,
+            prompt: Any,
+            *,
+            target_step: int | None,
+            admitted: bool,
+            admission_id: str,
+        ) -> str:
+            return self.recovery_ledger.reserve_group(
+                cut,
+                prompt_id=str(prompt["idx"]),
+                prompt_payload=prompt,
+                expected_generations=1,
+                target_step=target_step,
+                start_weight_version=0,
+                admitted=admitted,
+                admission_id=admission_id,
+            ).group_id
+
+        def mark_prompt_group_admitted(
+            self,
+            cut: DataPlaneMutationCut,
+            group_id: str,
+            *,
+            target_step: int | None,
+        ) -> None:
+            self.recovery_ledger.mark_group_admitted(
+                cut,
+                group_id,
+                target_step=target_step,
+                start_weight_version=0,
+            )
+
+        def discard_prompt_group(
+            self,
+            cut: DataPlaneMutationCut,
+            group_id: str,
+        ) -> None:
+            self.recovery_ledger.discard_group(cut, group_id)
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]],
+            lineage_group_id: str,
+        ) -> Any:
+            del prompt, target_step, inflight_registry
+            assert self.recovery_ledger.get_group(lineage_group_id)
+            return SimpleNamespace(group_id=lineage_group_id)
+
+    async def _main() -> None:
+        manager = _RecoveryCaptureManager()
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1,
+            diagnostics=False,
+            rollout_failure=_failure_cfg(),
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._rollout_manager = manager
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "idx": [7],
+                    "message_log": [[{"role": "user", "content": "prompt"}]],
+                }
+            )
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+        ctrl._sampler_stamps_target_steps = False
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._rollout_recovery_enabled = True
+
+        async def _finalize(
+            request: Any,
+        ) -> Any:
+            async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+                manager.recovery_ledger.discard_group(cut, request.group_id)
+            if not committed:
+                return None
+            return SimpleNamespace(valid_row_count=1, total_row_count=1)
+
+        ctrl._finalize_with_actor = _finalize
+
+        await ctrl._rollout_pump()
+
+        assert manager.recovery_ledger.groups() == []
+        assert manager.stats.committed == int(committed)
+        # A committed group transfers its permit to the train pump; a dropped
+        # group returns it immediately because no canonical replay row owns it.
+        assert ctrl._buffer_capacity._value == (0 if committed else 1)
         assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
@@ -1299,6 +1430,7 @@ def test_rollout_pump_writes_expected_tq_data(
         task_to_env=task_to_env,
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
+        rollout_recovery_config=RolloutRecoveryConfig(),
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
         use_nemo_gym=False,

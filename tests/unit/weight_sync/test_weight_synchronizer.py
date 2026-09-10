@@ -782,9 +782,18 @@ class TestNcclReshardWeightSynchronizer:
 # ---------------------------------------------------------------------------
 
 
-def _mock_megatron_generation(refit_backend="nccl", **overrides):
+def _mock_megatron_generation(
+    refit_backend: str = "nccl",
+    offload_policy_before_refit: bool = False,
+    **overrides,
+):
     gen = _mock_generation(**overrides)
-    gen.cfg = {"mcore_generation_config": {"refit_backend": refit_backend}}
+    gen.cfg = {
+        "mcore_generation_config": {
+            "refit_backend": refit_backend,
+            "offload_policy_before_refit": offload_policy_before_refit,
+        }
+    }
     gen.suspend_for_refit.return_value = None
     gen.resume_after_refit.return_value = None
     gen.preinit_nvshmem_collective.return_value = [MagicMock()]
@@ -843,7 +852,7 @@ class TestMegatronWeightSynchronizer:
 
         assert sync.sync_weights() == {}
         gen.suspend_for_refit.assert_called_once()
-        policy.offload_before_refit.assert_called_once()
+        policy.offload_before_refit.assert_not_called()
         policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
         gen.update_weights_from_collective.assert_called_once()
         gen.resume_after_refit.assert_called_once()
@@ -853,6 +862,32 @@ class TestMegatronWeightSynchronizer:
         # no nvshmem preinit on the nccl backend
         policy.preinit_nvshmem.assert_not_called()
         assert not sync.is_stale
+
+    @pytest.mark.parametrize("offload_policy_before_refit", [False, True])
+    @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
+    def test_non_colocated_policy_offload_is_configurable(
+        self, mock_ray: MagicMock, offload_policy_before_refit: bool
+    ) -> None:
+        mock_ray.get.side_effect = lambda futures: [True for _ in futures]
+        policy = _mock_megatron_policy()
+        gen = _mock_megatron_generation(
+            offload_policy_before_refit=offload_policy_before_refit
+        )
+        sync = MegatronWeightSynchronizer(
+            policy,
+            gen,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        sync.init_communicator()
+        sync.sync_weights()
+
+        if offload_policy_before_refit:
+            policy.offload_before_refit.assert_called_once_with()
+        else:
+            policy.offload_before_refit.assert_not_called()
 
     @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
     def test_non_colocated_nvshmem_preinits(self, mock_ray):

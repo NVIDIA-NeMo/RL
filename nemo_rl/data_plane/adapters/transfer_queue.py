@@ -27,6 +27,7 @@ import glob
 import importlib
 import ipaddress
 import json
+import logging
 import os
 import resource
 import socket
@@ -54,6 +55,8 @@ from nemo_rl.data_plane.interfaces import (
     backend_config,
     data_plane_supports_checkpointing,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -479,6 +482,12 @@ def _patch_scalar_field_schema() -> None:
     _md._nrl_scalar_schema_patched = True
 
 
+# Installed at import, not from the constructor: a process can unpickle a client
+# without ever running __init__, so import is the earliest point that covers
+# every user of this module.
+_patch_scalar_field_schema()
+
+
 def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     """Reuse RDMA-registered host buffers for mooncake tensor GETs and PUTs.
 
@@ -652,10 +661,10 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         _existing_path = os.environ.get("PATH", "")
         if _moon_pkg not in _existing_path.split(os.pathsep):
             os.environ["PATH"] = _moon_pkg + os.pathsep + _existing_path
-        # Per-process MC_TCP_BIND_ADDRESS / KV-path promotion already
-        # set by TQDataPlaneClient.__init__ (runs on every process,
-        # including this driver). _init_tq only needs local_ip below
-        # for the metadata/master server URLs (driver-bound).
+        # Per-process MC_TCP_BIND_ADDRESS already set by
+        # TQDataPlaneClient.__init__; the scalar schema patch is installed
+        # at module import. _init_tq only needs local_ip below for the
+        # metadata/master server URLs (driver-bound).
         local_ip = _get_local_node_ip()
         if not local_ip:
             raise RuntimeError(
@@ -678,6 +687,8 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
                     **_mooncake_transport_config(),
+                    "use_gdr": bool(mooncake_cfg.use_gdr),
+                    "gdr_staging_buffer_mb": int(mooncake_cfg.gdr_staging_buffer_mb),
                 },
             },
         }
@@ -765,6 +776,12 @@ def _from_wire(td: TensorDict) -> TensorDict:
 class TQDataPlaneClient(DataPlaneClient):
     """Adapter façade — maps NeMo-RL calls onto TransferQueue's public API."""
 
+    # Class-level so ``put_samples`` stays readable on an instance built
+    # without ``__init__`` — ``object.__new__`` in tests, or a process that
+    # unpickles a client without running the constructor.
+    _gdr_requested: bool = False
+    _gdr_put_confirmed: bool = False
+
     def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
         """Construct a TQ-backed client.
 
@@ -778,15 +795,12 @@ class TQDataPlaneClient(DataPlaneClient):
         """
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
-        # env vars and they can't be changed. Two per-process knobs are
+        # env vars and they can't be changed. MC_TCP_BIND_ADDRESS is
         # needed in EVERY process that builds a TQ client (driver,
-        # SyncRolloutActor, every MegatronPolicyWorker rank):
-        #   1. MC_TCP_BIND_ADDRESS — Mooncake engine.so writes this into
-        #      desc.ip_or_host_name, the address peers receive from the
-        #      metadata service. Without it, getifaddrs()[0] picks usb0
-        #      (169.254.x APIPA) and peers fail to connect.
-        #   2. KV-path 1D promotion — works around TQ's
-        #      extract_field_schema schema/data mismatch for 1D fields.
+        # SyncRolloutActor, every MegatronPolicyWorker rank): Mooncake
+        # engine.so writes it into desc.ip_or_host_name, the address peers
+        # receive from the metadata service. Without it, getifaddrs()[0]
+        # picks usb0 (169.254.x APIPA) and peers fail to connect.
         # The cluster-wide MC_* knobs are NOT among them; they are set
         # once on the driver, before this module is importable — see
         # nemo_rl.data_plane.adapters.transfer_queue_env.
@@ -814,13 +828,12 @@ class TQDataPlaneClient(DataPlaneClient):
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
-        # Fix TQ's 1-D field schema at the source rather than reshaping the
-        # payload around it: the schema now reports the ``()`` sample shape
-        # the stored rows actually have. Applied on every backend and in
-        # every process that builds a client, before ``_init_tq`` /
-        # ``_connect_existing``, so no put can land under the old schema.
-        # Self-verifying — see :func:`_assert_tq_stores_scalar_rows_0d`.
-        _patch_scalar_field_schema()
+        # GDR is a mooncake_cpu-only transport knob, so key it off the backend
+        # directly rather than off any incidental per-backend flag.
+        self._gdr_requested = self._backend == "mooncake_cpu" and bool(
+            backend_config(cfg).use_gdr
+        )
+        self._gdr_put_confirmed = False
 
         if bootstrap:
             _init_tq(cfg)
@@ -1036,6 +1049,31 @@ class TQDataPlaneClient(DataPlaneClient):
             wire_fields = detached_fields
             field_names = [str(key) for key in detached_fields.keys()]
 
+        confirm_gdr_put = bool(
+            self._gdr_requested
+            and not self._gdr_put_confirmed
+            and torch.cuda.is_initialized()
+            and wire_fields is not None
+            and any(
+                isinstance(wire_fields.get(key), torch.Tensor)
+                for key in wire_fields.keys()
+            )
+        )
+        if confirm_gdr_put:
+            # Checked before the put, not after: TQ fixes GDR eligibility when
+            # the client attaches, so this is decidable up front — and once
+            # `kv_batch_put` returns, the rows are already durable and the
+            # controller has been notified, so raising then would strand them.
+            tq_client = tq.get_client()
+            storage_manager = getattr(tq_client, "storage_manager", None)
+            storage_client = getattr(storage_manager, "storage_client", None)
+            gdr_staging = getattr(storage_client, "_gdr_staging", None)
+            if not getattr(storage_client, "use_gdr", False) or gdr_staging is None:
+                raise RuntimeError(
+                    "GDR was requested for a CUDA-initialized TransferQueue "
+                    "client, but TransferQueue selected CPU RDMA for tensor PUTs"
+                )
+
         self._mark_data_operation_started()
         # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_batch_put(
@@ -1044,6 +1082,11 @@ class TQDataPlaneClient(DataPlaneClient):
             fields=wire_fields,
             tags=user_tags,
         )
+        if confirm_gdr_put:
+            LOGGER.info(
+                "TransferQueue GDR tensor PUT active (partition=%s)", partition_id
+            )
+            self._gdr_put_confirmed = True
 
         return KVBatchMeta(
             partition_id=partition_id,

@@ -20,7 +20,7 @@ import asyncio
 import threading
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -76,7 +76,9 @@ class _DataPlaneClient:
 def _request() -> ReassemblyRequest:
     return ReassemblyRequest(
         group_id="group",
+        prompt_idx=17,
         rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
         receipts=(
             {
                 "manifest": [
@@ -88,7 +90,6 @@ def _request() -> ReassemblyRequest:
         rewards=(1.0,),
         mask_sample=(False,),
         fallback_weight_version=3,
-        prompt_idx=0,
     )
 
 
@@ -101,14 +102,20 @@ def _controller(actor: object) -> Any:
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
     ctrl._finalizer_metrics_by_group = {}
+    ctrl._rollout_recovery_ledger = MagicMock()
+    ctrl._rollout_recovery_ledger.__contains__.return_value = False
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging")
+        token_capture=SimpleNamespace(staging_partition="staging"),
+        grpo=SimpleNamespace(num_prompts_per_step=1),
     )
+    ctrl._trainer_version = 3
+    ctrl._train_steps = 3
     return ctrl
 
 
@@ -141,6 +148,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
     assert ctrl._active_finalizers == 0
     assert ctrl._finalizer_unknown_outcomes == 0
     ctrl._buffer.commit_finalized.assert_awaited_once_with(
+        ANY,
         "group",
         meta,
         3,
@@ -252,7 +260,11 @@ def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() 
     )
     ctrl = _controller(SimpleNamespace())
 
-    asyncio.run(ctrl._cleanup_consumed_metas([meta]))
+    async def _cleanup() -> None:
+        async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+            await ctrl._cleanup_consumed_metas_unlocked(cut, [meta])
+
+    asyncio.run(_cleanup())
 
     assert ctrl._dp_client.clear_calls == [
         {

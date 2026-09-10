@@ -39,6 +39,12 @@ single `ValueError` listing every violation. The current requirements are:
   `vllm_cfg.precision=fp8` and `vllm_cfg.is_mx=true`; the generation ranks
   quantize each received BF16 shard before installing it. Blockwise-FP8 train →
   MXFP8 gen is not supported.
+* BF16 FlashInfer TRTLLM MoE is supported through vLLM's native
+  layerwise-reload path. Its grouped expert weights must use expert-parallel
+  destination sharding with linear expert placement; tensor-sharded expert
+  destinations and round-robin placement are rejected. This path does not
+  support an FP8 KV cache or a co-trained MTP drafter; setup rejects both
+  combinations.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`. 
 * Generation-side, PP > 1 is not supported. 
@@ -67,18 +73,22 @@ nccl-reshard-refit implementation:
   Two FFN-named groups are explicitly excluded and ride the misc path instead:
   shared-expert weights (`*.shared_expert.*`, which fuse differently on the vLLM
   side) and co-trained MTP drafter weights (which vLLM keeps in a separate
-  drafter module updated through `load_weights`). MTP weights are recognized two
-  ways: bare-`mtp.`-prefix HF names (NemotronH, Qwen3.5) via
+  drafter module updated through `load_weights`). Co-trained MTP is not supported
+  with BF16 FlashInfer TRTLLM; this routing applies to other supported backend
+  combinations. MTP weights are recognized two ways: bare-`mtp.`-prefix HF names
+  (NemotronH, Qwen3.5) via
   `is_nccl_reshard_param()`, and DeepSeek-style MTP exported as trailing
   `model.layers.N` indices via provenance — the Megatron-side name carries an
   `mtp.` module segment (bare for LM bridges, `language_model.mtp.*` for the VL
   and EXAONE bridges), so the worker excludes those HF layers when building the
   metadata (`_collect_mtp_hf_layer_names()`).
 * **Misc path** — everything else (embeddings, attention projections, layernorms, the
-  MoE router, `lm_head`, FP8 `_scale_inv` siblings, FP8 KV-cache scales, …). These ride
-  a packed broadcast (conventional `packed_tensor.py` implementation) over the shared
-  `model_update_group` and are loaded on the generation side through the backend's
-  regular `load_weights` machinery.
+  MoE router, `lm_head`, FP8 `_scale_inv` siblings, FP8 KV-cache scales, …). FP8
+  KV-cache scales are supported only by backend combinations that allow an FP8 KV
+  cache; BF16 FlashInfer TRTLLM rejects that configuration at setup. These tensors
+  ride a packed broadcast (conventional `packed_tensor.py` implementation) over the
+  shared `model_update_group` and are loaded on the generation side through the
+  backend's regular `load_weights` machinery.
 
 The feature is integrated into the `nemo_rl/weight_sync/` framework:
 `create_weight_synchronizer(..., nccl_reshard_refit=True)` returns a
@@ -92,8 +102,8 @@ training starts:
 
 1. **`init_collective()`** — creates the `model_update_group`, a NCCL group spanning all
    training and generation ranks. The bulk path does not use it; it carries the misc
-   packed-broadcast (and FP8 KV-cache scales), identical to the conventional collective
-   transport.
+   packed-broadcast, including FP8 KV-cache scales for backend combinations that support
+   them, identical to the conventional collective transport.
 2. **`init_nccl_reshard_comm_group()`** — creates the bulk-path communicator(s): **one
    NCCL group per training PP stage**, each spanning that stage's training ranks plus
    *all* generation ranks (non-PP is simply `pp_size == 1`, a single group over
@@ -135,10 +145,11 @@ realized **locally**:
   (sent as-is); grouped MoE experts get a `pre` hook that stacks this rank's per-expert
   views into a `[num_local_experts, ...]` tensor fresh at each refit.
 * On the **generation side**, a direct parameter's `base` is the live vLLM parameter
-  (received into in place); a parameter that is a slice of a fused vLLM tensor (dense
-  `gate_up_proj`, grouped-expert `w13`/`w2`) gets a `pre` hook that allocates a receive
-  buffer for its region and a `post` hook that copies the received shard back into the
-  fused parameter.
+  (received into in place). Conventional fused parameters use `pre`/`post` hooks to
+  receive a component and copy it into the appropriate local region. BF16
+  FlashInfer TRTLLM grouped experts instead receive into canonical EP-local staging
+  tensors; `post` loads each logical expert with its global expert ID through vLLM's
+  native weight loader.
 
 ### Execution Flow: Refit Time
 
@@ -159,7 +170,9 @@ Every training step (with in-flight weight updates, concurrently with generation
   are distributed across `NRL_REFIT_NUM_STREAMS` CUDA streams so different stages'
   reshards overlap. For each parameter it runs `pre` (receive-buffer allocation), calls
   `xferdtensor(None, ..., dst, ..., group, stream)`, then `post` (copy back into the
-  fused parameter).
+  fused parameter or load staged TRTLLM experts). After every transfer completes, the
+  TRTLLM path finalizes vLLM's native layerwise reload once to restore the packed runtime
+  layout.
 
 ### The Misc Path
 
@@ -198,10 +211,11 @@ generation side maps those HF names onto whatever its own storage layout is.
   `nccl_reshard_refit()` send loop; the misc packed-broadcast producer.
 * **Generation side** (`vllm_backend.py`): building `hf_to_local_param_map` — mapping HF
   names onto vLLM's fused parameters (`qkv_proj`, `gate_up_proj`, grouped-expert
-  `w13_weight`/`w2_weight`) with `pre`/`post` hooks for the slice regions, which is
-  deliberately **shape-driven** so the same code handles generation TP and generation
-  EP; the comm bootstrap methods; the `nccl_reshard_refit()` receive loop; the misc
-  consumer feeding `load_weights`.
+  `w13_weight`/`w2_weight`) with `pre`/`post` hooks for slice regions or canonical
+  TRTLLM staging, which is deliberately **shape-driven** so the same code handles
+  supported generation parallelism; the comm bootstrap methods; the
+  `nccl_reshard_refit()` receive loop; the misc consumer feeding `load_weights`; and
+  backend-specific finalization after all weights arrive.
 
 **To extend to a new backend**, the only piece with genuinely new logic is
 `build_hf_to_local_param_map`. Everything else is boilerplate that follows a fixed
@@ -210,9 +224,10 @@ contract and can be copied from the existing backend almost verbatim.
 **The one backend-specific implementation — `build_hf_to_local_param_map`:** resolve
 each bulk HF name to your local storage as a `LocalParamSpec` — `base` for tensors
 sent/received as-is, and `pre`/`post` hooks wherever your layout requires staging
-(fused/merged tensors, layout conversions, grouped-expert stacking). This is the *only*
-place your backend's parameter layout is encoded; all cross-mesh byte movement is
-already handled by the shared metadata and `xferdtensor`.
+(fused/merged tensors, layout conversions, grouped-expert stacking). Backends that
+rebuild runtime storage may also need one transport-level finalizer after all specs have
+run. These are the only places the backend's parameter layout is encoded; all cross-mesh
+byte movement is already handled by the shared metadata and `xferdtensor`.
 
 (A new *training* backend additionally has to produce the HF-named metadata — names,
 global shapes, dtypes, and the parallelism description the agnostic builder consumes —

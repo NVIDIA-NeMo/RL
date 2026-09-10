@@ -207,9 +207,60 @@ def _unquantized_flashinfer_trtllm_modules(
     ]
 
 
+def _reload_target_module_ids(
+    reload_targets: Sequence[torch.nn.Module],
+) -> set[int]:
+    """Return every module covered by the native reload targets."""
+    return {id(module) for target in reload_targets for module in target.modules()}
+
+
+def _process_mxfp8_modules_after_native_reload(
+    model: torch.nn.Module, reloaded_module_ids: set[int]
+) -> None:
+    """Rebuild MXFP8 layouts outside the partial native reload."""
+    try:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8FusedMoE,
+            ModelOptMxFp8LinearMethod,
+        )
+    except ImportError:
+        return
+
+    mxfp8_methods = (ModelOptMxFp8FusedMoE, ModelOptMxFp8LinearMethod)
+    for module in model.modules():
+        if id(module) in reloaded_module_ids:
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, mxfp8_methods):
+            quant_method.process_weights_after_loading(module)
+
+
 def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
     """Return whether a model realized the unquantized TRTLLM MoE backend."""
     return bool(_unquantized_flashinfer_trtllm_modules(model))
+
+
+def _local_shard_slices(param_info: dict[str, Any], rank: int) -> tuple[slice, ...]:
+    """Return this destination rank's slices in an HF-global tensor."""
+    from nemo_rl.weight_sync.xferdtensor_python import _compute_shard_slices
+
+    dst_mesh = param_info["dst_mesh_info"]
+    mesh_tensor = getattr(dst_mesh, "mesh", None)
+    if mesh_tensor is None:
+        mesh_tensor = getattr(dst_mesh, "_mesh", None)
+    if mesh_tensor is None:
+        raise ValueError("Destination DeviceMesh does not expose mesh ranks.")
+    coordinates = (mesh_tensor == rank).nonzero(as_tuple=False)
+    if coordinates.numel() == 0:
+        raise ValueError(f"Rank {rank} is absent from the destination mesh")
+    return tuple(
+        _compute_shard_slices(
+            param_info["global_shape"],
+            list(mesh_tensor.shape),
+            coordinates[0].tolist(),
+            param_info["dst_placements"],
+        )
+    )
 
 
 class _IPCWeightManifest:
@@ -276,6 +327,33 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
     )
 
 
+_GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS = (
+    "model.embed_vision.",
+    "model.embed_audio.",
+)
+
+
+def _is_gemma4_unified_text_only(model_config: Any) -> bool:
+    """Return whether a vLLM model is a text-only Gemma 4 Unified model."""
+    multimodal_config = getattr(model_config, "multimodal_config", None)
+    return (
+        "Gemma4UnifiedForConditionalGeneration" in model_config.architectures
+        and multimodal_config is not None
+        and multimodal_config.language_model_only
+    )
+
+
+def _filter_gemma4_unified_multimodal_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Drop frozen Gemma 4 Unified vision and audio embedder weights."""
+    return (
+        (key, weight)
+        for key, weight in weights
+        if not key.startswith(_GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS)
+    )
+
+
 def _read_mtp_layer_weights_from_checkpoint(
     model_path: str, mtp_layer_indices: set[int]
 ) -> list[tuple[str, torch.Tensor]]:
@@ -306,7 +384,11 @@ def _read_mtp_layer_weights_from_checkpoint(
     shard_to_names: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
         match = layer_re.search(name)
-        if match is not None and int(match.group(1)) in mtp_layer_indices:
+        is_mtp_namespace = "mtp" in name.split(".")
+        is_trailing_mtp_layer = (
+            match is not None and int(match.group(1)) in mtp_layer_indices
+        )
+        if is_mtp_namespace or is_trailing_mtp_layer:
             shard_to_names.setdefault(shard, []).append(name)
 
     weights: list[tuple[str, torch.Tensor]] = []
@@ -328,6 +410,8 @@ class VllmInternalWorkerExtension:
     # False for a checkpoint-loaded static MTP drafter; True only when the
     # trainer exports MTP weights in every policy refit stream.
     _mtp_drafter_weights_from_refit: bool = True
+    # Each worker logs the Gemma 4 Unified multimodal filtering at most once.
+    _logged_gemma4_unified_drop: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
     _nrl_layerwise_reload_active: bool = False
@@ -349,19 +433,26 @@ class VllmInternalWorkerExtension:
         return params
 
     def _load_full_hf_weights(
-        self, policy_weights: list[tuple[str, torch.Tensor]]
-    ) -> None:
-        """Load HF weights and detach any deferred reload tensors from transport storage."""
-        if not getattr(self, "_nrl_layerwise_reload_active", False):
-            self.model_runner.model.load_weights(weights=policy_weights)
-            return
+        self, policy_weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str] | None:
+        """Load HF weights and detach any deferred reload tensors from transport storage.
 
-        source_storage_ptrs = {
-            tensor.untyped_storage().data_ptr() for _, tensor in policy_weights
-        }
+        Returns the set of weight names vLLM reported as loaded, or ``None``
+        when the model's ``load_weights`` does not report one.
+        """
+        if not getattr(self, "_nrl_layerwise_reload_active", False):
+            return self.model_runner.model.load_weights(weights=policy_weights)
+
+        source_storage_ptrs: set[int] = set()
+
+        def track_source_storage() -> Iterator[tuple[str, torch.Tensor]]:
+            for name, tensor in policy_weights:
+                source_storage_ptrs.add(tensor.untyped_storage().data_ptr())
+                yield name, tensor
+
         load_error: Exception | None = None
         try:
-            self.model_runner.model.load_weights(weights=policy_weights)
+            return self.model_runner.model.load_weights(weights=track_source_storage())
         except Exception as error:
             load_error = error
             raise
@@ -386,7 +477,11 @@ class VllmInternalWorkerExtension:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.load_weights(policy_weights, self.model_runner)
+            fp8.load_weights(
+                policy_weights,
+                self.model_runner,
+                model_load_weights=self._load_full_hf_weights,
+            )
             return
         self._load_full_hf_weights(policy_weights)
 
@@ -394,14 +489,14 @@ class VllmInternalWorkerExtension:
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
         """Prepare checkpoint-format weights for vLLM's native reload API."""
-        if (
-            "Gemma3ForConditionalGeneration"
-            in self.model_runner.vllm_config.model_config.architectures
-        ):
+        model_config = self.model_runner.vllm_config.model_config
+        if "Gemma3ForConditionalGeneration" in model_config.architectures:
             weights = (
                 (fix_gemma3_vision_weight_name(name), weight)
                 for name, weight in weights
             )
+        if _is_gemma4_unified_text_only(model_config):
+            weights = _filter_gemma4_unified_multimodal_weights(weights)
 
         from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -548,6 +643,16 @@ class VllmInternalWorkerExtension:
             release_within(
                 previous.abort, RELEASE_GRACE_S, "a previous reshard bulk communicator"
             )
+
+        refit_info = getattr(self, "nccl_reshard_refit_info", None)
+        if (
+            refit_info is not None
+            and self._uses_unquantized_flashinfer_trtllm()
+            and not native_mxfp8_param_names(refit_info, strict=True)
+        ):
+            # TRTLLM expert destinations depend on this worker's rank in each
+            # per-PP-stage group, so they cannot be mapped during prepare.
+            self.hf_to_local_param_map = self.build_hf_to_local_param_map(refit_info)
 
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
@@ -866,18 +971,31 @@ class VllmInternalWorkerExtension:
         return True
 
     def _load_weights(self, weights):
-        """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
+        """Apply model-specific transforms and load policy and draft weights.
 
-        Applies Gemma3 vision-tower weight name fix if needed, splits policy/draft
-        weights, dispatches policy weights through the configured refit loader,
-        and loads draft weights into the drafter model.
+        Checkpoint-format weights are normalized for the target vLLM model, then
+        routed to the policy model and any supported speculative drafter.
         """
-        if (
-            "Gemma3ForConditionalGeneration"
-            in self.model_runner.vllm_config.model_config.architectures
-        ):
+        model_config = self.model_runner.vllm_config.model_config
+        if "Gemma3ForConditionalGeneration" in model_config.architectures:
             for idx, (key, weight) in enumerate(weights):
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
+
+        if _is_gemma4_unified_text_only(model_config):
+            # HF loads the full unified checkpoint, while text-only vLLM uses
+            # encoder-free multimodal stubs with a different parameter layout.
+            # The recipe freezes these towers and never invokes them, so only
+            # refit the language path and leave the unused vLLM stubs untouched.
+            num_weights = len(weights)
+            weights = list(_filter_gemma4_unified_multimodal_weights(weights))
+            num_dropped = num_weights - len(weights)
+            if num_dropped and not getattr(self, "_logged_gemma4_unified_drop", False):
+                self._logged_gemma4_unified_drop = True
+                logger.info(
+                    "Gemma4 Unified text-only refit dropped %d frozen "
+                    "vision/audio weights",
+                    num_dropped,
+                )
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         self._load_hf_weights(policy_weights)
@@ -927,9 +1045,24 @@ class VllmInternalWorkerExtension:
         # is unaffected, and so is a fully-unquantized one.
         return _model_uses_unquantized_flashinfer_trtllm(model)
 
+    def _unquantized_flashinfer_trtllm_param_ids(self) -> set[int]:
+        """Return parameters owned by realized unquantized TRTLLM MoE modules."""
+        if not self._supports_unquantized_flashinfer_trtllm_refit():
+            return set()
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None)
+        if model is None:
+            return set()
+
+        return {
+            id(param)
+            for module in _unquantized_flashinfer_trtllm_modules(model)
+            for param in module.parameters(recurse=False)
+        }
+
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         """Return whether this transport needs vLLM's layerwise lifecycle."""
-        return transport in ("ipc", "collective") and (
+        return transport in ("ipc", "collective", "nccl_reshard") and (
             self._uses_unquantized_flashinfer_trtllm()
         )
 
@@ -940,18 +1073,16 @@ class VllmInternalWorkerExtension:
         if not self._uses_unquantized_flashinfer_trtllm():
             return
 
-        if transport == "nccl_reshard":
-            # nccl_reshard writes MoE weights itself and only runs vLLM's
-            # targeted reload for the native components, so anything the
-            # reload lifecycle would have refreshed as a side effect has to be
-            # rejected here rather than silently kept stale.
-            if self._uses_fp8_kv_cache():
-                raise RuntimeError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit does not "
-                    "support an FP8 KV cache because its static scales are "
-                    "outside the targeted MoE reload lifecycle"
-                )
+        if transport in ("ipc", "collective", "nccl_reshard") and (
+            self._uses_fp8_kv_cache()
+        ):
+            raise RuntimeError(
+                "BF16 FlashInfer TRTLLM partial refit does not support an "
+                "FP8 KV cache because its static scales are outside the "
+                "targeted reload lifecycle"
+            )
 
+        if transport == "nccl_reshard":
             realized_placements = set()
             for module in _unquantized_flashinfer_trtllm_modules(
                 self.model_runner.model
@@ -1021,10 +1152,19 @@ class VllmInternalWorkerExtension:
             )
 
             model = self.model_runner.model
+            # Restore only the realized BF16 TRTLLM modules. MXFP8 modules own
+            # checkpoint-scale parameters created after vLLM recorded reload
+            # metadata, so restoring the whole mixed model would delete those
+            # parameters. Their layouts are rebuilt separately after transfer.
+            reload_targets = _unquantized_flashinfer_trtllm_modules(model)
+            reloaded_module_ids = _reload_target_module_ids(reload_targets)
 
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
+                    _process_mxfp8_modules_after_native_reload(
+                        model, reloaded_module_ids
+                    )
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
@@ -1032,7 +1172,8 @@ class VllmInternalWorkerExtension:
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     with torch.device(self.device):
-                        initialize_layerwise_reload(model)
+                        for reload_target in reload_targets:
+                            initialize_layerwise_reload(reload_target)
                     self._nrl_layerwise_reload_active = True
                     yield finalize
             except Exception as error:
@@ -1310,7 +1451,12 @@ class VllmInternalWorkerExtension:
         return self._get_sparse_delta_applier().finish_sparse_delta_refit()
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
-        """Restore metadata and preflight the selected destination route."""
+        """Restore metadata and preflight the selected destination route.
+
+        Legacy mappings are cached ahead of refit when their communicator
+        ranks are available. Native MXFP8 mappings are rebuilt per update
+        after the adapter activates the current checkpoint tensors.
+        """
         # Runs here, in the once-per-run setup, rather than inside the refit:
         # the conditions it rejects are properties of how the engine was built,
         # so raising at the first weight transfer would only mean discovering
@@ -1321,7 +1467,9 @@ class VllmInternalWorkerExtension:
             restore_refit_info_placements,
         )
 
-        self.nccl_reshard_refit_info = restore_refit_info_placements(refit_info)
+        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
+            restore_refit_info_placements(refit_info)
+        )
         if native_mxfp8_param_names(self.nccl_reshard_refit_info, strict=True):
             self._validate_native_speculative_refit()
             adapter = self._get_nccl_reshard_refit_adapter()
@@ -1329,6 +1477,10 @@ class VllmInternalWorkerExtension:
             adapter.prepare(self.nccl_reshard_refit_info)
             # Active checkpoint tensors replace runtime tensors at begin_update,
             # so the concrete map is intentionally rebuilt for every native refit.
+            self.hf_to_local_param_map = HFToLocalParamMap()
+        elif self._uses_unquantized_flashinfer_trtllm() and not self.pp_comm_groups:
+            # The TRTLLM expert map needs the per-PP-stage communicator ranks,
+            # which init_nccl_reshard_comm_group establishes after prepare.
             self.hf_to_local_param_map = HFToLocalParamMap()
         else:
             self.hf_to_local_param_map = self.build_hf_to_local_param_map(
@@ -1406,9 +1558,11 @@ class VllmInternalWorkerExtension:
         Wraps the ``(vllm_param, merged_slice)`` resolution from
         ``_build_hf_to_gen_backend_mapping`` into ``LocalParamSpec``s:
         - direct (slice ``None``): ``base`` is the live vLLM param; receive in place.
-        - merged (dense ``gate_up_proj`` / grouped-expert ``w13``): ``pre`` allocs a
-          recv buffer for this component's ``region`` slice, ``post`` copies it back
-          (region recomputed each refit to track live storage).
+        - merged (dense ``gate_up_proj`` / grouped-expert ``w13``): ``pre`` allocates
+          a receive buffer for this component's ``region`` slice, and ``post`` copies
+          it back (the region is recomputed each refit to track live storage).
+        - TRTLLM grouped experts: ``pre`` allocates canonical EP-local BF16 storage,
+          and ``post`` sends each expert through vLLM's native weight loader.
         """
 
         def _merged_param_spec(vllm_param, merged_slice):
@@ -1420,6 +1574,123 @@ class VllmInternalWorkerExtension:
                 ctx.extra["region"].copy_(ctx.buf)
 
             return LocalParamSpec(base=vllm_param, pre=pre, post=post)
+
+        def _trtllm_grouped_expert_spec(
+            param_info: dict[str, Any],
+            vllm_param: torch.Tensor,
+        ) -> LocalParamSpec:
+            from torch.distributed._tensor import Shard
+
+            unsupported_shards = [
+                placement.dim
+                for placement in param_info["dst_placements"]
+                if isinstance(placement, Shard) and placement.dim != 0
+            ]
+            if unsupported_shards:
+                raise ValueError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
+                    "expert-parallel destination shards; unsupported tensor shard "
+                    f"dimensions {unsupported_shards} for {param_info['name']!r}"
+                )
+
+            dst_mesh = param_info["dst_mesh_info"]
+            mesh_tensor = getattr(dst_mesh, "mesh", None)
+            if mesh_tensor is None:
+                mesh_tensor = getattr(dst_mesh, "_mesh", None)
+            if mesh_tensor is None:
+                raise ValueError(
+                    "Destination DeviceMesh does not expose mesh ranks for "
+                    f"{param_info['name']!r}"
+                )
+            ep_size = 1
+            for mesh_dim, placement in enumerate(param_info["dst_placements"]):
+                if isinstance(placement, Shard) and placement.dim == 0:
+                    ep_size *= int(mesh_tensor.shape[mesh_dim])
+            num_global_experts = int(param_info["global_shape"][0])
+            # The staged expert range uses torch.chunk semantics while vLLM
+            # places experts with a balanced split; the two agree only when
+            # the expert count divides evenly, so reject the uneven case
+            # instead of silently loading experts onto the wrong ranks.
+            if ep_size > 0 and num_global_experts % ep_size != 0:
+                raise ValueError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
+                    "the global expert count to divide evenly across EP ranks; "
+                    f"got {num_global_experts} experts over {ep_size} ranks for "
+                    f"{param_info['name']!r}"
+                )
+
+            pp_stage = param_info.get("pp_stage", 0)
+            pp_comm_groups = self.pp_comm_groups
+            if pp_comm_groups is None:
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit mapping was built "
+                    "before the per-PP-stage groups were initialized"
+                )
+            if pp_stage not in pp_comm_groups:
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit has no "
+                    f"communicator for PP stage {pp_stage}"
+                )
+            rank = pp_comm_groups[pp_stage].rank
+            local_slices = _local_shard_slices(param_info, rank)
+            local_shape = tuple(
+                global_size
+                if shard_slice.start is None
+                else shard_slice.stop - shard_slice.start
+                for global_size, shard_slice in zip(
+                    param_info["global_shape"], local_slices, strict=True
+                )
+            )
+            expert_start = 0 if local_slices[0].start is None else local_slices[0].start
+            grouped_proj = param_info["grouped_expert_proj"]
+            expert_prefix = param_info["name"].rsplit(f".{grouped_proj}.weight", 1)[0]
+            registered_vllm_name = vllm_names_by_id.get(id(vllm_param))
+            if registered_vllm_name is None:
+                raise ValueError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit resolved an "
+                    f"unregistered vLLM parameter for {param_info['name']!r}"
+                )
+            expected_loaded_names = {
+                registered_vllm_name,
+                registered_vllm_name.replace(".routed_experts.", "."),
+            }
+            dtype_value = param_info.get("dtype")
+            dtype = _STR_TO_DTYPE.get(str(dtype_value))
+            if dtype is None:
+                raise ValueError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit got an "
+                    f"unsupported wire dtype {dtype_value!r} for "
+                    f"{param_info['name']!r}"
+                )
+
+            def pre(_base: None) -> RefitCtx:
+                return RefitCtx(
+                    buf=torch.empty(local_shape, dtype=dtype, device=self.device)
+                )
+
+            def post(ctx: RefitCtx) -> None:
+                weights = [
+                    (
+                        f"{expert_prefix}.{expert_start + local_idx}."
+                        f"{grouped_proj}.weight",
+                        expert_weight,
+                    )
+                    for local_idx, expert_weight in enumerate(ctx.buf.unbind(0))
+                ]
+                loaded_names = self._load_full_hf_weights(weights)
+                # AutoWeightsLoader reports the fused destination parameter,
+                # not each per-expert HF source name.
+                if loaded_names is not None and expected_loaded_names.isdisjoint(
+                    loaded_names
+                ):
+                    raise RuntimeError(
+                        "BF16 FlashInfer TRTLLM nccl_reshard refit failed to "
+                        "load fused expert destination; expected one of "
+                        f"{sorted(expected_loaded_names)!r}, "
+                        f"vLLM reported {sorted(loaded_names)!r}"
+                    )
+
+            return LocalParamSpec(base=None, pre=pre, post=post)
 
         def _bf16_to_mxfp8_receiver_quant_spec(
             value_param: torch.Tensor,
@@ -1471,10 +1742,18 @@ class VllmInternalWorkerExtension:
         vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
         vllm_params = dict(self.model_runner.model.named_parameters())
         vllm_names_by_id = {id(param): name for name, param in vllm_params.items()}
+        unquantized_trtllm_param_ids = self._unquantized_flashinfer_trtllm_param_ids()
         for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
+            param_info = param_info_by_name[hf_name]
             if hf_name in native_names:
                 continue
-            wire_dtype_value = param_info_by_name[hf_name].get("dtype")
+            if id(vllm_param) in unquantized_trtllm_param_ids and param_info.get(
+                "grouped_expert_proj"
+            ):
+                specs[hf_name] = _trtllm_grouped_expert_spec(param_info, vllm_param)
+                continue
+
+            wire_dtype_value = param_info.get("dtype")
             wire_dtype = (
                 wire_dtype_value
                 if isinstance(wire_dtype_value, torch.dtype)
@@ -1705,9 +1984,9 @@ class VllmInternalWorkerExtension:
         Both communicator families are handed to the watchdog -- the per-PP-stage bulk
         groups and the shared model_update_group -- because the transfer uses them in
         sequence and a hang can be in either.
-
-        Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
-        built once in ``prepare_nccl_reshard_refit_info``) provides the dst buffer:
+        Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``, built
+        during prepare or after PP communicator setup for TRTLLM experts) provides
+        the dst buffer:
         for a direct param xferdtensor receives straight into the live vLLM
         param (no hooks); for a merged param (dense gate_up_proj, grouped w13)
         ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
@@ -1725,7 +2004,14 @@ class VllmInternalWorkerExtension:
         ]
         with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
             hold_refit_for_fault_injection()
-            result = self._nccl_reshard_refit()
+            native_names = native_mxfp8_param_names(
+                self.nccl_reshard_refit_info, strict=True
+            )
+            if native_names:
+                result = self._nccl_reshard_refit_impl()
+            else:
+                with self._weight_update_lifecycle("nccl_reshard") as finalize:
+                    result = self._nccl_reshard_refit_impl(finalize)
         if guard.fired:
             raise RefitAborted(
                 f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "
@@ -1734,8 +2020,19 @@ class VllmInternalWorkerExtension:
             )
         return result
 
-    def _nccl_reshard_refit(self) -> bool:
-        """Receive ordered parameter components through NCCL Reshard."""
+    def _nccl_reshard_refit_impl(
+        self, finalize: WeightUpdateFinalizer | None = None
+    ) -> bool:
+        """Receive ordered parameter components through NCCL Reshard.
+
+        Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
+        built during prepare or at update time) provides the destination buffer:
+        for a direct param xferdtensor receives straight into the live vLLM
+        param (no hooks); for a merged param (dense gate_up_proj, grouped w13)
+        ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
+        slice back into the live merged param. TRTLLM grouped experts instead
+        receive into canonical local tensors and load through vLLM's native path.
+        """
         import os
         import time
         from collections import OrderedDict
@@ -1897,11 +2194,14 @@ class VllmInternalWorkerExtension:
             torch.cuda.empty_cache()
             return True
 
-        with self._weight_update_lifecycle("nccl_reshard") as finalize:
-            _receive_bulk_components()
-            _receive_misc()
-            finalize()
-            torch.cuda.empty_cache()
+        if finalize is None:
+            raise RuntimeError(
+                "legacy NCCL reshard refit requires a transport finalizer"
+            )
+        _receive_bulk_components()
+        _receive_misc()
+        finalize()
+        torch.cuda.empty_cache()
         return True
 
     def _receive_and_load_misc_params(self) -> None:
