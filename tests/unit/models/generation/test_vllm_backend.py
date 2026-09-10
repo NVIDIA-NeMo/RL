@@ -243,7 +243,7 @@ def test_refresh_hpc_modules_after_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_invalidate_glm_kda_weight_cache(monkeypatch):
+def test_invalidate_glm_weight_caches(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     class FakeGlm5NextLinearAttention(torch.nn.Module):
@@ -251,18 +251,35 @@ def test_invalidate_glm_kda_weight_cache(monkeypatch):
             super().__init__()
             self._merged_conv_weight = torch.ones(1)
 
+    class FakeGlm5NextIndexer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._wp_fp32 = torch.ones(1)
+
     fake_kda_module = ModuleType("vllm.models.glm5next.nvidia.kda")
     fake_kda_module.Glm5NextLinearAttention = FakeGlm5NextLinearAttention
+    fake_attention_module = ModuleType("vllm.models.glm5next.nvidia.attention")
+    fake_attention_module.Indexer = FakeGlm5NextIndexer
     monkeypatch.setitem(sys.modules, "vllm.models.glm5next.nvidia.kda", fake_kda_module)
+    monkeypatch.setitem(
+        sys.modules, "vllm.models.glm5next.nvidia.attention", fake_attention_module
+    )
 
     kda = FakeGlm5NextLinearAttention()
+    indexer = FakeGlm5NextIndexer()
     unrelated = torch.nn.Module()
     unrelated._merged_conv_weight = torch.ones(1)
-    model = torch.nn.Sequential(kda, unrelated)
+    unrelated._wp_fp32 = torch.ones(1)
+    model = torch.nn.Sequential(kda, indexer, unrelated)
 
-    assert vllm_backend._invalidate_glm_kda_weight_cache(model) == 1
+    assert vllm_backend._invalidate_glm_weight_caches(model) == {
+        "kda": 1,
+        "indexer": 1,
+    }
     assert kda._merged_conv_weight is None
+    assert indexer._wp_fp32 is None
     assert torch.equal(unrelated._merged_conv_weight, torch.ones(1))
+    assert torch.equal(unrelated._wp_fp32, torch.ones(1))
 
 
 class _DeferredReloadLayer(torch.nn.Module):
@@ -335,8 +352,8 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     )
     monkeypatch.setattr(
         vllm_backend,
-        "_invalidate_glm_kda_weight_cache",
-        lambda reload_model: call_order.append(("glm_kda", reload_model)),
+        "_invalidate_glm_weight_caches",
+        lambda reload_model: call_order.append(("glm", reload_model)),
     )
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
@@ -357,7 +374,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         "load",
         ("finalize", model, model_config),
         ("hpc", model),
-        ("glm_kda", model),
+        ("glm", model),
         "mtp",
         "config_exit",
     ]
@@ -392,9 +409,9 @@ def test_unquantized_nccl_reshard_keeps_existing_refit_lifecycle(monkeypatch):
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
         process,
     )
-    invalidate_glm_kda = MagicMock()
+    invalidate_glm = MagicMock()
     monkeypatch.setattr(
-        vllm_backend, "_invalidate_glm_kda_weight_cache", invalidate_glm_kda
+        vllm_backend, "_invalidate_glm_weight_caches", invalidate_glm
     )
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
@@ -407,7 +424,7 @@ def test_unquantized_nccl_reshard_keeps_existing_refit_lifecycle(monkeypatch):
         finalize()
 
     process.assert_called_once_with(model, model_config, ext.device)
-    invalidate_glm_kda.assert_called_once_with(model)
+    invalidate_glm.assert_called_once_with(model)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
     ext._maybe_process_fp8_kv_cache.assert_called_once_with()
 
@@ -551,9 +568,9 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
         process,
     )
-    invalidate_glm_kda = MagicMock()
+    invalidate_glm = MagicMock()
     monkeypatch.setattr(
-        vllm_backend, "_invalidate_glm_kda_weight_cache", invalidate_glm_kda
+        vllm_backend, "_invalidate_glm_weight_caches", invalidate_glm
     )
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
@@ -564,7 +581,7 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
         finalize()
 
     process.assert_called_once_with(model, model_config, ext.device)
-    invalidate_glm_kda.assert_called_once_with(model)
+    invalidate_glm.assert_called_once_with(model)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
     ext._maybe_process_fp8_kv_cache.assert_called_once_with()
 

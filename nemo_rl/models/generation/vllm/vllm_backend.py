@@ -111,28 +111,38 @@ def _refresh_hpc_modules_after_layerwise_reload(model: torch.nn.Module) -> None:
             module.process_weights_after_loading(model)
 
 
-def _invalidate_glm_kda_weight_cache(model: torch.nn.Module) -> int:
-    """Invalidate GLM KDA convolution weights derived before a refit.
+def _invalidate_glm_weight_caches(model: torch.nn.Module) -> dict[str, int]:
+    """Invalidate GLM tensors lazily derived from weights before a refit.
 
     GLM-5.3's KDA layer lazily merges its q/k/v convolution parameters on the
     first forward. vLLM's refit paths replace those parameters without clearing
-    the merged tensor, so the next rollout can otherwise reuse stale weights.
+    the merged tensor. Its DSA indexer similarly caches an FP32 view of the
+    ``weights_proj`` shard. Clear both so the next rollout derives them from the
+    newly refit parameters instead of reusing warmup or previous-step weights.
     """
     # Import only while inspecting a constructed model because older vLLM
     # releases do not provide the GLM-5.3 implementation.
     try:
+        from vllm.models.glm5next.nvidia.attention import Indexer
         from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
     except ImportError:
-        return 0
+        return {"kda": 0, "indexer": 0}
 
-    invalidated = 0
+    invalidated = {"kda": 0, "indexer": 0}
     for module in model.modules():
         if isinstance(module, Glm5NextLinearAttention):
             module._merged_conv_weight = None
-            invalidated += 1
+            invalidated["kda"] += 1
+        elif isinstance(module, Indexer):
+            module._wp_fp32 = None
+            invalidated["indexer"] += 1
 
-    if invalidated:
-        logger.info("Invalidated %d GLM KDA convolution weight caches", invalidated)
+    if any(invalidated.values()):
+        logger.info(
+            "Invalidated %d GLM KDA convolution and %d DSA indexer weight caches",
+            invalidated["kda"],
+            invalidated["indexer"],
+        )
     return invalidated
 
 
@@ -921,7 +931,7 @@ class VllmInternalWorkerExtension:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
                     _refresh_hpc_modules_after_layerwise_reload(model)
-                    _invalidate_glm_kda_weight_cache(model)
+                    _invalidate_glm_weight_caches(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
 
@@ -949,7 +959,7 @@ class VllmInternalWorkerExtension:
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device
                 )
-            _invalidate_glm_kda_weight_cache(self.model_runner.model)
+            _invalidate_glm_weight_caches(self.model_runner.model)
             self._maybe_process_mtp_drafter_after_loading()
 
         yield finalize
