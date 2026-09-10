@@ -5406,6 +5406,16 @@ def async_grpo_train(
                     and policy_generation.wake_carries_weight_updates()
                 )
 
+                should_run_validation = (
+                    val_period > 0
+                    and (step + 1) >= val_start_at
+                    and (step + 1) % val_period == 0
+                ) or (val_at_end and is_last_step)
+                if should_run_validation:
+                    # Stop dispatch before refit wakes the collector. This also
+                    # separates the training and validation payload metrics.
+                    ray.get(trajectory_collector.pause.remote())
+
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 if defer_wake_for_save:
                     # Wake-deferral (checkpoint scheduling, which the backend
@@ -5473,17 +5483,9 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
-                should_run_validation = (
-                    val_period > 0
-                    and (step + 1) >= val_start_at
-                    and (step + 1) % val_period == 0
-                ) or (val_at_end and is_last_step)
 
                 payload_metrics: dict[str, int | float] = {}
                 if should_run_validation:
-                    # Stop new dispatch before separating the training and
-                    # validation payload-metric intervals.
-                    ray.get(trajectory_collector.pause.remote())
                     if master_config.grpo.debug_payload_metrics:
                         payload_metrics = merge_multimodal_payload_metrics(
                             [
