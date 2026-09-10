@@ -856,16 +856,25 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        scheduler_step_samples: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
         Args:
+            scheduler_step_samples: Megatron-only logical sample increment when
+                physical rows differ from the configured logical batch size.
+                None preserves the existing global-batch scheduler increment.
             check_dim_skip_keys: Keys whose tensors are not student-sequence-aligned at
                 dim 1 and must be excluded from the worker's sequence-dim
                 pre-flight check. Used by cross-tokenizer distillation to
                 pass through teacher / alignment auxiliaries that ride on
                 the same data dict.
         """
+        if scheduler_step_samples is not None:
+            if scheduler_step_samples <= 0 or not self.cfg["megatron_cfg"]["enabled"]:
+                raise ValueError(
+                    "scheduler_step_samples requires a positive logical batch size and Megatron"
+                )
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
@@ -905,6 +914,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
                     "check_dim_skip_keys": check_dim_skip_keys,
+                    **(
+                        {"scheduler_step_samples": scheduler_step_samples}
+                        if scheduler_step_samples is not None
+                        else {}
+                    ),
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)

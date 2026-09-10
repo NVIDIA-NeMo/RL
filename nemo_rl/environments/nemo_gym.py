@@ -39,6 +39,11 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.gym_traces import (
+    gym_masked_message_log,
+    gym_trace_message_log,
+    parse_gym_training_traces,
+)
 from nemo_rl.environments.nemo_gym_multimodal import (
     _index_per_turn_images,
     _is_trainable_output_item,
@@ -649,6 +654,15 @@ Depending on your data shape, you may want to change these values."""
                     nemo_rl_result = await self._postprocess_receipt_mode(
                         nemo_gym_row, nemo_gym_result
                     )
+                elif (
+                    (self.cfg.get("initial_global_config_dict") or {}).get(
+                        "token_id_capture"
+                    )
+                    or {}
+                ).get("delivery") == "all_traces":
+                    nemo_rl_result = await self._postprocess_all_gym_traces(
+                        nemo_gym_row, nemo_gym_result, tokenizer
+                    )
                 else:
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
                         nemo_gym_row,
@@ -695,6 +709,59 @@ Depending on your data shape, you may want to change these values."""
                 nemo_rl_result,
                 timing_metrics,
             )
+
+    async def _postprocess_all_gym_traces(
+        self,
+        nemo_gym_row: dict,
+        nemo_gym_result: dict,
+        tokenizer: PreTrainedTokenizerBase,
+    ) -> dict:
+        """Finalize the local Gym capture and preserve every owned training trace."""
+        # Gym is installed in the actor environment, not the trainer environment.
+        from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
+        from nemo_gym.token_id_capture.config import TokenIdCaptureConfig
+        from nemo_gym.token_id_capture.delivery import finalize_rollout_token_capture
+        from nemo_gym.token_id_capture.store import TokenCaptureStore
+
+        capture_config = TokenIdCaptureConfig.model_validate(
+            self.cfg["initial_global_config_dict"]
+        )
+        rollout_id = nemo_gym_row.get(ROLLOUT_ID_KEY_NAME)
+        if not rollout_id:
+            raise ValueError("Gym all_traces result is missing its capture rollout ID")
+        nemo_gym_result[ROLLOUT_ID_KEY_NAME] = rollout_id
+        store = TokenCaptureStore(capture_config.resolved_dir())
+        await finalize_rollout_token_capture(
+            nemo_gym_result,
+            store,
+            builder=capture_config.token_id_capture.builder,
+            delivery=capture_config.token_id_capture.delivery,
+        )
+        envelope = nemo_gym_result.get("training_traces")
+        if envelope is None:
+            if not nemo_gym_result.get("mask_sample"):
+                raise ValueError(
+                    "Gym all_traces delivery returned no training envelope"
+                )
+            traces = []
+        else:
+            traces = parse_gym_training_traces(envelope)
+            if envelope["rollout_id"] != rollout_id:
+                raise ValueError("Gym trace envelope belongs to a different rollout")
+        logs = [gym_trace_message_log(trace) for trace in traces]
+        # The existing logical rollout protocol needs a representative prompt.
+        # Training expands gym_training_traces before flattening any sequence.
+        message_log = (
+            logs[0] if logs else gym_masked_message_log(tokenizer.pad_token_id)
+        )
+        return {
+            "message_log": message_log,
+            "input_message_log": message_log[:1],
+            "gym_training_traces": traces,
+            "gym_rollout_id": rollout_id,
+            "gym_metrics_message_log": [message for log in logs for message in log],
+            "full_result": nemo_gym_result,
+        }
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict

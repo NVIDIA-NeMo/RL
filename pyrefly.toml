@@ -167,6 +167,7 @@ project-includes = [
   "nemo_rl/environments/code_jaccard_environment.py",
   "nemo_rl/environments/games/sliding_puzzle.py",
   "nemo_rl/environments/interfaces.py",
+  "nemo_rl/environments/gym_traces.py",
   "nemo_rl/environments/math_environment.py",
   "nemo_rl/environments/metrics.py",
   "nemo_rl/environments/nemo_gym_multimodal.py",

@@ -85,6 +85,7 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.gym_traces import prepare_gym_trace_batch
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
@@ -306,6 +307,8 @@ _REWARD_PENALTY_FLAGS = (
 
 
 class GRPOConfig(BaseModel, extra="allow"):
+    # Train all Gym-owned traces per logical rollout (synchronous Megatron only).
+    gym_multi_trace: bool = False
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
     max_num_epochs: int = 1
@@ -449,6 +452,100 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 
 
+def _validate_gym_multi_trace_capability(master_config: MasterConfig) -> None:
+    """Fail before worker allocation for unsupported trace-training paths."""
+    grpo = master_config.grpo
+    gym = master_config.env.get("nemo_gym") or {}
+    capture = gym.get("token_id_capture") or {}
+    if not grpo.gym_multi_trace:
+        if capture.get("delivery") == "all_traces":
+            raise ValueError(
+                "Gym all_traces delivery requires grpo.gym_multi_trace=true"
+            )
+        return
+    if not master_config.env.get("should_use_nemo_gym"):
+        raise ValueError("gym_multi_trace requires env.should_use_nemo_gym=true")
+    if not capture.get("enabled") or capture.get("delivery") != "all_traces":
+        raise ValueError(
+            "gym_multi_trace requires enabled Gym token_id_capture with delivery=all_traces"
+        )
+    if not capture.get("all_agents"):
+        raise ValueError("gym_multi_trace requires token_id_capture.all_agents=true")
+    if (
+        capture.get("sink")
+        or capture.get("external_staging")
+        or (master_config.data_plane or {}).get("enabled")
+    ):
+        raise NotImplementedError(
+            "gym_multi_trace requires local capture and data_plane.enabled=false; staged/TQ capture is unsupported"
+        )
+    if grpo.async_grpo is not None and grpo.async_grpo.enabled:
+        raise NotImplementedError(
+            "gym_multi_trace currently supports synchronous GRPO only"
+        )
+    policy = master_config.policy
+    if not (policy.get("megatron_cfg") or {}).get("enabled"):
+        raise NotImplementedError(
+            "gym_multi_trace currently supports the Megatron policy only"
+        )
+    if policy.get("is_vlm") or router_replay_enabled(policy):
+        raise NotImplementedError(
+            "gym_multi_trace does not support multimodal or router-replay payloads"
+        )
+    if (
+        grpo.adv_estimator.name != "grpo"
+        or master_config.on_policy_distillation is not None
+    ):
+        raise NotImplementedError(
+            "gym_multi_trace requires the standard GRPO advantage estimator"
+        )
+    if (
+        not master_config.loss_fn.token_level_loss
+        or master_config.loss_fn.sequence_level_importance_ratios
+    ):
+        raise NotImplementedError(
+            "gym_multi_trace requires token-level loss and token-level importance ratios"
+        )
+    if (
+        grpo.use_dynamic_sampling
+        or grpo.overlong_filtering
+        or grpo.reward_shaping.enabled
+    ):
+        raise NotImplementedError(
+            "gym_multi_trace does not support dynamic sampling or episode-length filtering/shaping; trace lengths are filtered independently"
+        )
+    if grpo.seq_logprob_error_threshold is not None:
+        raise NotImplementedError(
+            "gym_multi_trace does not yet support post-advantage sequence error masking"
+        )
+    if (
+        grpo.invalid_tool_call_advantage is not None
+        or grpo.malformed_thinking_advantage is not None
+    ):
+        raise NotImplementedError(
+            "gym_multi_trace does not support message-level advantage penalties"
+        )
+    if any(
+        master_config.reward_penalties.model_dump()[flag]
+        for flag in _REWARD_PENALTY_FLAGS
+    ):
+        raise NotImplementedError(
+            "gym_multi_trace does not support legacy response-based reward penalties"
+        )
+    effort = _get_effort_config(master_config)
+    if effort is not None and effort.low_weight and effort.low_string:
+        raise NotImplementedError(
+            "gym_multi_trace does not support legacy response-length effort shaping"
+        )
+    if master_config.env.get("should_mask_flagged_samples") is False:
+        raise ValueError("gym_multi_trace requires masking invalid Gym rollouts")
+    logical_gbs = grpo.num_prompts_per_step * grpo.num_generations_per_prompt
+    if policy["train_global_batch_size"] != logical_gbs:
+        raise ValueError(
+            "gym_multi_trace requires train_global_batch_size to equal the logical rollout count per step"
+        )
+
+
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
     """Reject configurations whose media transfer path is not qualified."""
     if not master_config.grpo.deduplicate_multimodal_data:
@@ -554,6 +651,7 @@ def setup(
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
+    _validate_gym_multi_trace_capability(master_config)
 
     # Extract individual configs for easier access
     policy_config = master_config.policy
@@ -3086,6 +3184,13 @@ def grpo_train(
                             enabled=master_config.grpo.debug_payload_metrics,
                         )
                     )
+                    if master_config.grpo.gym_multi_trace:
+                        # Stable input-example groups survive harness prompt rewrites.
+                        repeated_batch["gym_task_group_id"] = torch.arange(
+                            batch.size
+                        ).repeat_interleave(
+                            master_config.grpo.num_generations_per_prompt
+                        )
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -3207,7 +3312,13 @@ def grpo_train(
                                 master_config.grpo.debug_payload_metrics
                             ),
                         )
-                        input_ids = nemo_gym_rollout_result.input_ids
+                        input_ids = (
+                            nemo_gym_rollout_result.final_batch[
+                                "gym_task_group_id"
+                            ].unsqueeze(-1)
+                            if master_config.grpo.gym_multi_trace
+                            else nemo_gym_rollout_result.input_ids
+                        )
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
@@ -3397,6 +3508,29 @@ def grpo_train(
                     num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
 
+                    trace_batch = None
+                    if master_config.grpo.gym_multi_trace:
+                        trace_batch = prepare_gym_trace_batch(
+                            repeated_batch,
+                            estimator=adv_estimator,
+                            pad_token_id=tokenizer.pad_token_id,
+                            max_sequence_length=master_config.policy[
+                                "max_total_sequence_length"
+                            ],
+                            row_multiple=policy.data_parallel_size
+                            * master_config.policy["train_micro_batch_size"],
+                        )
+                        repeated_batch = trace_batch.batch
+                        metrics.update(
+                            {
+                                "gym/logical_rollouts": trace_batch.logical_count,
+                                "gym/physical_rows": trace_batch.physical_count,
+                                "gym/padding_rows": trace_batch.padding_count,
+                                "gym/overlong_traces": trace_batch.overlong_trace_count,
+                                "gym/invalid_rollouts": trace_batch.invalid_rollout_count,
+                            }
+                        )
+
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
                     )
@@ -3531,7 +3665,11 @@ def grpo_train(
                 else:
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
-                        rewards=rewards,
+                        rewards=(
+                            rewards[trace_batch.logical_indices]
+                            if trace_batch is not None
+                            else rewards
+                        ),
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
                     seq_logprob_error_metrics = seq_error_result
@@ -3555,14 +3693,21 @@ def grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
-                        rewards=rewards,
-                        mask=mask,
-                        repeated_batch=repeated_batch,
-                        logprobs_policy=train_data["prev_logprobs"],
-                        logprobs_reference=train_data.get("reference_policy_logprobs"),
-                    )
+                    if trace_batch is not None:
+                        train_data["advantages"] = trace_batch.advantages.unsqueeze(
+                            -1
+                        ).expand_as(mask)
+                    else:
+                        train_data["advantages"] = adv_estimator.compute_advantage(
+                            prompt_ids=prompt_ids_for_adv,
+                            rewards=rewards,
+                            mask=mask,
+                            repeated_batch=repeated_batch,
+                            logprobs_policy=train_data["prev_logprobs"],
+                            logprobs_reference=train_data.get(
+                                "reference_policy_logprobs"
+                            ),
+                        )
                     del prompt_ids_for_adv
 
                     # Log rewards and advantages information
@@ -3602,11 +3747,22 @@ def grpo_train(
                         **{"rl.iteration": total_steps + 1},
                     ),
                 ):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if trace_batch is not None:
+                        # All physical rows form one optimizer update. The scheduler
+                        # advances by logical rollouts, independent of trace counts.
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                            gbs=train_data.size,
+                            scheduler_step_samples=trace_batch.logical_count,
+                        )
+                    else:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -3913,7 +4069,22 @@ def grpo_train(
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
                 log_data["content"] = flat_messages["content"]
-                log_data["rewards"] = rewards.tolist()
+                log_data["rewards"] = (
+                    repeated_batch["total_reward"].tolist()
+                    if trace_batch is not None
+                    else rewards.tolist()
+                )
+                if trace_batch is not None:
+                    for key in (
+                        "gym_task_group_id",
+                        "gym_logical_index",
+                        "gym_rollout_id",
+                        "gym_trace_id",
+                    ):
+                        value = repeated_batch[key]
+                        log_data[key] = (
+                            value.tolist() if isinstance(value, torch.Tensor) else value
+                        )
                 if master_config.grpo.use_dynamic_sampling:
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()

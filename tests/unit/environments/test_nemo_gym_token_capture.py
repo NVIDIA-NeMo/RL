@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import hashlib
 from unittest.mock import AsyncMock
 
@@ -398,3 +399,84 @@ def test_postprocess_passes_the_scored_response_to_attribution() -> None:
     receipt = result["receipt"]
     assert receipt["terminal_model_call_id"] == "c2"
     assert receipt["terminal_selection"] == "response_id"
+
+
+@pytest.mark.parametrize("builder", ["per_request", "prefix_merging"])
+def test_local_all_traces_finalizer_preserves_branches_and_compaction(
+    tmp_path, builder
+):
+    """Exercise the actual Gym store, public schema and RL actor handoff."""
+    from types import SimpleNamespace
+
+    from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
+    from nemo_gym.token_id_capture.records import (
+        ParentResolutionStatus,
+        TokenEntry,
+        stamp_lineage,
+    )
+    from nemo_gym.token_id_capture.store import TokenCaptureStore
+    from nemo_gym.token_id_capture.training_traces import TrainingTraceBatch
+
+    store = TokenCaptureStore(tmp_path)
+    for call, prompt, generated, parent in [
+        ("a", [1, 2], [10, 11], None),
+        ("b", [1, 2, 10, 11, 3], [12], "a"),
+        ("c", [1, 2, 10, 11, 4], [13, 14], "a"),
+        ("compact", [5, 6], [15], None),
+    ]:
+        entry = TokenEntry(
+            rollout_id="r1",
+            model_call_id=call,
+            model="policy",
+            prompt_token_ids=prompt,
+            generation_token_ids=generated,
+            generation_log_probs=[-token / 100 for token in generated],
+            response_id=f"response-{call}",
+        )
+        store.append(
+            stamp_lineage(
+                entry,
+                parent,
+                parent_resolution=ParentResolutionStatus.RESOLVED
+                if parent
+                else ParentResolutionStatus.ROOT,
+            )
+        )
+    env = _capture_env()
+    env.cfg = {
+        "initial_global_config_dict": {
+            "token_id_capture": {
+                "enabled": True,
+                "all_agents": True,
+                "dir": str(tmp_path),
+                "delivery": "all_traces",
+                "builder": builder,
+            }
+        }
+    }
+    original_response = {
+        "id": "response-c",
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "scored answer"}],
+            }
+        ],
+    }
+    original_result = {"reward": 0.75, "response": deepcopy(original_response)}
+    result = asyncio.run(
+        env._postprocess_all_gym_traces(
+            {ROLLOUT_ID_KEY_NAME: "r1"},
+            original_result,
+            SimpleNamespace(pad_token_id=0),
+        )
+    )
+    public = TrainingTraceBatch.model_validate(result["full_result"]["training_traces"])
+    assert len(public.traces) == (4 if builder == "per_request" else 3)
+    assert len(result["gym_training_traces"]) == len(public.traces)
+    assert sum(sum(trace.loss_mask) for trace in result["gym_training_traces"]) == 6
+    assert result["full_result"]["reward"] == 0.75
+    assert result["full_result"]["response"] == original_response
+    assert {
+        span.model_call_id for trace in public.traces for span in trace.sampled_spans
+    } == {"a", "b", "c", "compact"}

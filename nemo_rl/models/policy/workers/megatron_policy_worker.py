@@ -816,8 +816,12 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        scheduler_step_samples: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
+
+        ``scheduler_step_samples`` optionally preserves the logical rollout
+        clock when a batch expands into several independently conditioned rows.
 
         ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
         workers (cross-tokenizer ride-along tensors whose dim 1 is not the
@@ -828,6 +832,8 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        if scheduler_step_samples is not None and scheduler_step_samples <= 0:
+            raise ValueError("scheduler_step_samples must be positive")
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -1106,7 +1112,11 @@ class MegatronPolicyWorkerImpl(
             # samples: NeMo init scales lr_warmup_steps by gbs internally, so
             # passing increment=gbs cancels that scaling and one tick == one
             # train() call regardless of batch size.
-            self.scheduler.step(increment=gbs)
+            self.scheduler.step(
+                increment=gbs
+                if scheduler_step_samples is None
+                else scheduler_step_samples
+            )
 
         # Aggregate metrics across all microbatches
         mb_metrics, global_loss = aggregate_training_statistics(
