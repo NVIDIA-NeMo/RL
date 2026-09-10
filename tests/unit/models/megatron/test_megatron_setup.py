@@ -880,12 +880,38 @@ class TestApplyMoeConfig:
         config = self._base_moe_cfg(
             expert_model_parallel_size=8,
             moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_prepad_packed_inputs=False,
         )
+        config["sequence_packing"] = {"enabled": True}
 
         validate_megatron_config(megatron_cfg, config)
 
         megatron_cfg.validate.assert_called_once_with()
         assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is True
+
+    @pytest.mark.parametrize("prepad_packed_inputs", [None, False])
+    def test_hybridep_packed_inputs_require_a_padding_owner(
+        self, prepad_packed_inputs
+    ):
+        from nemo_rl.models.megatron.setup import validate_megatron_config
+
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=False,
+        )
+        megatron_cfg = SimpleNamespace(model=model_cfg)
+        megatron_cfg.validate = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+        )
+        if prepad_packed_inputs is not None:
+            config["megatron_cfg"]["moe_hybridep_prepad_packed_inputs"] = (
+                prepad_packed_inputs
+            )
+        config["sequence_packing"] = {"enabled": True}
+
+        with pytest.raises(ValueError, match="requires input-length alignment"):
+            validate_megatron_config(megatron_cfg, config)
 
     def test_hybridep_input_prepadding_requires_flex_dispatcher(self, monkeypatch):
         from nemo_rl.models.megatron.setup import _apply_moe_config
