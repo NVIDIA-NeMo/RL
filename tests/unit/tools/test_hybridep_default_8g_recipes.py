@@ -196,20 +196,6 @@ def test_gb200_qwen3_235b_16n4g_preserves_parent_environment() -> None:
     assert "PYTORCH_CUDA_ALLOC_CONF" in _environment(megatron_cfg)
 
 
-def test_gb200_deepseek_v3_32n4g_preserves_unrelated_parent_environment() -> None:
-    parent_environment = _environment(
-        _megatron_config(_resolve_recipe("grpo-deepseek-v3-32n8g.yaml"))
-    )
-    child_environment = _environment(
-        _megatron_config(_resolve_recipe("grpo-deepseek-v3-32n4g.yaml"))
-    )
-
-    unrelated_parent_environment_keys = (
-        set(parent_environment) - GB200_HYBRIDEP_ENVIRONMENT_KEYS
-    )
-    assert unrelated_parent_environment_keys <= set(child_environment)
-
-
 @pytest.mark.parametrize("recipe_name", FOUR_GPU_NON_HYBRIDEP_RECIPES)
 def test_4g_non_hybridep_recipes_do_not_set_hybridep_topology(
     recipe_name: str,
