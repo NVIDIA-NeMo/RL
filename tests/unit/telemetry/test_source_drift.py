@@ -474,6 +474,67 @@ def test_every_context_accepting_method_is_dispatched_with_a_carrier():
     )
 
 
+def test_every_presharded_entrypoint_is_wired_for_context():
+    """The guard above cannot see an entrypoint that is wired on *neither* side.
+
+    It starts from the set of decorated methods, so a presharded entrypoint that
+    is neither decorated nor dispatched with a carrier is not a finding -- it is
+    invisible. That is the state the three split-API lifecycle calls
+    (``begin`` / ``finish`` / ``abort``) shipped in while the microbatch call
+    between them was wired, which split one logical train step across two
+    traces: mcore's ``megatron.microbatch.*`` spans nested under the driver's
+    step, while the ``megatron.grad_sync.*`` spans that ``finish`` reaches
+    through ``finalize_model_grads`` re-rooted into a detached trace per rank
+    per step.
+
+    The presharded family is the right unit to require this of because every
+    member is a worker entrypoint reached only by driver dispatch, so there is
+    no case where one legitimately wants its own trace.
+    """
+    presharded = _presharded_entrypoints()
+    assert presharded, "found no presharded entrypoints -- has the matcher gone stale?"
+    indirect = _indirect_dispatchers()
+    decorated = _context_accepting_methods()
+
+    dispatched: dict[str, str] = {}
+    uncarried: dict[str, str] = {}
+    for source in _python_sources(_REPO / "nemo_rl"):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            targets = _dispatch_targets(node, presharded, indirect)
+            where = f"{source.relative_to(_REPO).as_posix()}:{node.lineno}"
+            for target, sends_carrier in targets:
+                dispatched[target] = where
+                if not sends_carrier:
+                    uncarried[target] = where
+
+    assert not uncarried, (
+        "presharded entrypoints dispatched without a trace carrier, so their "
+        f"worker spans start a new trace: {uncarried}"
+    )
+    undecorated = {
+        name: where for name, where in dispatched.items() if name not in decorated
+    }
+    assert not undecorated, (
+        "presharded entrypoints missing @accepts_trace_context, so the carrier "
+        f"their dispatch site sends is discarded: {undecorated}"
+    )
+    assert dispatched, "found no presharded dispatches -- has the matcher gone stale?"
+
+
+def _presharded_entrypoints() -> set[str]:
+    """Every ``*_presharded`` worker entrypoint defined under ``nemo_rl/``."""
+    names: set[str] = set()
+    for source in _python_sources(_REPO / "nemo_rl"):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ) and node.name.endswith("_presharded"):
+                names.add(node.name)
+    return names
+
+
 def _context_accepting_methods() -> set[str]:
     """Every method under ``nemo_rl/`` carrying ``@accepts_trace_context``."""
     decorated: set[str] = set()

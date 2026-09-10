@@ -418,8 +418,11 @@ def trace_context_kwargs() -> dict[str, Any]:
     forwards ``**kwargs`` -- spread this at the call site::
 
         self.worker_group.run_all_workers_single_data(
-            "get_logprobs_presharded", meta, **trace_context_kwargs()
+            "begin_train_step_presharded", loss_fn=loss_fn, **trace_context_kwargs()
         )
+
+    Every argument goes by keyword: ``run_all_workers_single_data`` asserts it
+    was given none positionally.
 
     Empty rather than a ``None`` carrier so a run with no recording span calls
     the method with exactly its original signature, which keeps an undecorated

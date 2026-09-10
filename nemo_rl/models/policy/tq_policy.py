@@ -493,6 +493,7 @@ class TQPolicy(TQDriverMixin, Policy):
             loss_fn=loss_fn,
             gbs=batch_size,
             mbs=micro_batch_size,
+            **trace_context_kwargs(),
         )
         ray.get(futures)
 
@@ -649,6 +650,7 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         futures = self.worker_group.run_all_workers_single_data(
             "finish_train_step_presharded",
+            **trace_context_kwargs(),
         )
         results = ray.get(futures)
         # Filter to DP-replica leaders only. ``run_all_workers_single_data``
@@ -671,6 +673,7 @@ class TQPolicy(TQDriverMixin, Policy):
         """Drop partial step state on every worker. No optimizer.step."""
         futures = self.worker_group.run_all_workers_single_data(
             "abort_train_step_presharded",
+            **trace_context_kwargs(),
         )
         ray.get(futures)
 
