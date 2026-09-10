@@ -49,6 +49,11 @@ class Eagle3DraftConfig(BaseModel, extra="allow"):
     loss_weight: float = 0.1
     num_layers: int | None = None
     aux_layer_indices: list[int] | None = None
+    # Tokens per FP32 vocab tile in the streaming soft-CE. Mirrors
+    # DEFAULT_DRAFT_TOKEN_CHUNK_SIZE in nemo_rl/algorithms/loss/draft.py, which
+    # is not imported here: the loss package pulls in nemo_rl.models.* and would
+    # make this module circular.
+    token_chunk_size: Annotated[int, Field(gt=0)] = 4096
     optimizer: DraftOptimizerConfig | None = None
 
     @model_validator(mode="after")

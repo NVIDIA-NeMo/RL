@@ -300,6 +300,7 @@ class Eagle3Speculator:
     ) -> DraftLossStats:
         loss_fn = DraftCrossEntropyLossFn(
             vocab_parallel_group=vocab_parallel_group,
+            token_chunk_size=self.config.token_chunk_size,
         )
         loss_input, prepared_data = prepare_fn(
             logits=target_logits,

@@ -49,6 +49,7 @@ from nemo_rl.algorithms.loss import (
     prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
+from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
@@ -667,6 +668,11 @@ class LossPostProcessor:
                     cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                     d2t=self.d2t,
                     student_logits=student_logits,
+                    token_chunk_size=getattr(
+                        self.cfg["draft"],
+                        "token_chunk_size",
+                        DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+                    ),
                 )
         else:
             loss_fn_wrapped = partial(
@@ -690,6 +696,11 @@ class LossPostProcessor:
                 defer_normalization=self.defer_draft_normalization,
                 draft_provider=self.draft_provider,
                 draft_normalization_counts=self.draft_normalization_counts,
+                token_chunk_size=getattr(
+                    self.cfg["draft"],
+                    "token_chunk_size",
+                    DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+                ),
             )
 
         loss_fn_wrapped = partial(

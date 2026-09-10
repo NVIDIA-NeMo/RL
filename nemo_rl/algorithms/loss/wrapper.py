@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional, TypeVar
 import torch
 import torch.distributed
 
+from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -262,6 +263,7 @@ class DraftLossWrapper:
         defer_normalization: bool = False,
         draft_provider: Any | None = None,
         draft_normalization_counts: torch.Tensor | None = None,
+        token_chunk_size: int = DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
@@ -285,6 +287,7 @@ class DraftLossWrapper:
             raise ValueError("prepare_fn is required in unpacked mode.")
         self.draft_loss_fn = DraftCrossEntropyLossFn(
             vocab_parallel_group=vocab_parallel_group,
+            token_chunk_size=token_chunk_size,
         )
 
     def _packed_draft_loss(
