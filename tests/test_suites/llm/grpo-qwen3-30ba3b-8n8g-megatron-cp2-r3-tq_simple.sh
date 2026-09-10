@@ -34,11 +34,13 @@ uv run examples/run_grpo.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # The wire guard only counts; assert it found nothing.
+    # The wire guard only counts; assert it found nothing -- and that it
+# looked, since mismatches==0 also holds when nothing was compared.
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.02' \
         'max(data.get("data_plane/cluster/step/hash/mismatches", data.get("data_plane/driver/step/hash/mismatches", {}))) == 0' \
-        'max(data.get("data_plane/cluster/step/hash/guard_failures", data.get("data_plane/driver/step/hash/guard_failures", {}))) == 0'
+        'max(data.get("data_plane/cluster/step/hash/guard_failures", data.get("data_plane/driver/step/hash/guard_failures", {}))) == 0' \
+    'max(data.get("data_plane/cluster/step/hash/rows_checked", data.get("data_plane/driver/step/hash/rows_checked", {}))) > 0'
 
     rm -rf "$CKPT_DIR"
 fi

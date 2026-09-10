@@ -50,7 +50,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.02' \
         'max(data.get("data_plane/cluster/step/hash/mismatches", data.get("data_plane/driver/step/hash/mismatches", {}))) == 0' \
-        'max(data.get("data_plane/cluster/step/hash/guard_failures", data.get("data_plane/driver/step/hash/guard_failures", {}))) == 0'
+        'max(data.get("data_plane/cluster/step/hash/guard_failures", data.get("data_plane/driver/step/hash/guard_failures", {}))) == 0' \
+    'max(data.get("data_plane/cluster/step/hash/rows_checked", data.get("data_plane/driver/step/hash/rows_checked", {}))) > 0'
 
     uv run tools/check_r3_trace.py "$NRL_R3_TRACE_DIR" \
         --require-forward-verify \
