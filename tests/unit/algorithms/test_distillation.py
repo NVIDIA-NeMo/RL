@@ -906,7 +906,11 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     with (
         patch("nemo_rl.algorithms.distillation.Logger") as mock_logger,
         patch("nemo_rl.algorithms.distillation.CheckpointManager") as mock_checkpointer,
-        patch("nemo_rl.algorithms.distillation.StatefulDataLoader"),
+        patch(
+            "nemo_rl.algorithms.distillation.StatefulDataLoader",
+            # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+            **{"return_value.__len__.return_value": 10},
+        ),
         pytest.raises(
             AssertionError,
             match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
@@ -1035,7 +1039,12 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
         patch.object(distil_mod, "Logger"),
         patch.object(distil_mod, "CheckpointManager") as mock_ckpt_mgr,
-        patch.object(distil_mod, "StatefulDataLoader"),
+        patch.object(
+            distil_mod,
+            "StatefulDataLoader",
+            # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+            **{"return_value.__len__.return_value": 10},
+        ),
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
         patch.object(
@@ -1181,7 +1190,12 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
         patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
         patch.object(distil_mod, "Logger"),
         patch.object(distil_mod, "CheckpointManager") as mock_ckpt_mgr,
-        patch.object(distil_mod, "StatefulDataLoader"),
+        patch.object(
+            distil_mod,
+            "StatefulDataLoader",
+            # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+            **{"return_value.__len__.return_value": 10},
+        ),
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
         patch.object(
@@ -1364,7 +1378,11 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     with (
         patch("nemo_rl.algorithms.distillation.Logger") as mock_logger,
         patch("nemo_rl.algorithms.distillation.CheckpointManager") as mock_checkpointer,
-        patch("nemo_rl.algorithms.distillation.StatefulDataLoader"),
+        patch(
+            "nemo_rl.algorithms.distillation.StatefulDataLoader",
+            # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+            **{"return_value.__len__.return_value": 10},
+        ),
         pytest.raises(
             AssertionError,
             match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",

@@ -554,7 +554,7 @@ def patched_ppo_factories():
             sc_setup_mod,
             "setup_response_data",
             return_value=(list(range(8)), None, {"math": MagicMock()}, {}),
-        ),
+        ) as mock_response,
         patch.object(sc_setup_mod, "StatefulDataLoader", return_value=fake_dataloader),
         patch.object(
             sc_setup_mod,
@@ -590,6 +590,8 @@ def patched_ppo_factories():
             "_build_value": mock_value,
             "policy": fake_policy,
             "value": fake_value,
+            "dataloader": fake_dataloader,
+            "setup_response_data": mock_response,
         }
 
 
@@ -797,3 +799,31 @@ class TestTrainClusterSizesForTheCritic:
         else:
             # The critic never lands on the inference cluster.
             assert inference.kwargs["max_colocated_worker_groups"] == 1
+
+
+def test_ppo_setup_rejects_empty_train_dataloader(patched_ppo_factories):
+    """#921 guard: the PPO path fails setup before building any worker group."""
+    patched_ppo_factories["dataloader"].__len__ = MagicMock(return_value=0)
+
+    with pytest.raises(ValueError, match="zero batches") as excinfo:
+        setup_single_controller(
+            _ppo_master_config(), tokenizer=MagicMock(pad_token_id=0)
+        )
+
+    assert "num_prompts_per_step" in str(excinfo.value)
+    patched_ppo_factories["_build_trainer"].assert_not_called()
+
+
+def test_ppo_setup_accepts_dataset_equal_to_batch_size(patched_ppo_factories):
+    """A dataset exactly num_prompts_per_step long yields one batch and passes."""
+    patched_ppo_factories["setup_response_data"].return_value = (
+        list(range(4)),  # default num_prompts_per_step
+        None,
+        {"math": MagicMock()},
+        {},
+    )
+    patched_ppo_factories["dataloader"].__len__ = MagicMock(return_value=1)
+
+    setup_single_controller(_ppo_master_config(), tokenizer=MagicMock(pad_token_id=0))
+
+    patched_ppo_factories["_build_value"].assert_called_once()
