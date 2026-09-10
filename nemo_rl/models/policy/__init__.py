@@ -101,6 +101,13 @@ class LoRAConfig(TypedDict):
     dropout_position: Literal["pre", "post"]
     lora_A_init: str
     use_triton: NotRequired[bool]
+    # Warm start: path to a PEFT adapter checkpoint (a directory containing
+    # adapter_model.safetensors + adapter_config.json, e.g. a previous run's
+    # step_*/policy/weights or step_*/policy/weights/model directory) whose
+    # adapter weights initialize this run's LoRA modules. Ignored when resuming
+    # from a NeMo RL training checkpoint (resumed weights take precedence for
+    # the policy; the reference policy still anchors to the restored adapters).
+    restore_from: NotRequired[str | None]
 
 
 class AutomodelBackendConfig(TypedDict):
@@ -242,6 +249,14 @@ class MegatronPeftConfig(TypedDict):
     lora_B_init_method: str
     a2a_experimental: bool
     lora_dtype: str | None
+    # Warm start: path to a native Megatron-Bridge PEFT checkpoint (an
+    # iter_XXXXXXX directory, or a checkpoint root resolving to one) whose
+    # adapter weights initialize this run's LoRA modules. The donor checkpoint
+    # must have been saved with a matching peft configuration (dim and alpha
+    # are validated against its run_config.yaml). Ignored when resuming from a
+    # NeMo RL training checkpoint (resumed weights take precedence for the
+    # policy; the reference policy still anchors to the restored adapters).
+    restore_from: NotRequired[str | None]
 
 
 class MegatronOptimizerConfig(TypedDict):
@@ -634,3 +649,9 @@ class PolicyConfig(TypedDict):
     disable_modelopt_layer_spec: NotRequired[bool]
 
     is_vlm: NotRequired[bool]
+
+    # FQN of a worker extension class to use instead of the resolved default
+    # policy worker. Must be a subclass of the resolved worker and cannot be
+    # combined with quant_cfg. Its runtime environment must already be in
+    # ACTOR_ENVIRONMENT_REGISTRY.
+    worker_extension_cls_fqn: NotRequired[str | None]
