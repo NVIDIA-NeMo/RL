@@ -103,8 +103,12 @@ def _broadcast_batched_data_dict(
                         (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
                     )
                 elif isinstance(v, PackedTensor):
-                    metadata, packed_payloads[k] = v.broadcast_parts(bcast_device)
-                    descriptor.append((k, "packed_tensor", metadata))
+                    header, shapes, dtype, source_device, packed_payloads[k] = (
+                        v.broadcast_parts(bcast_device)
+                    )
+                    descriptor.append(
+                        (k, "packed_tensor", header, shapes, dtype, source_device)
+                    )
                 elif (
                     v is None
                     or isinstance(v, (str, int, float, bool))
@@ -178,15 +182,13 @@ def _broadcast_batched_data_dict(
             ):
                 out[key] = tensor.to(src_device)
         elif kind == "packed_tensor":
-            metadata = entry[2]
+            header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
                 tensor = packed_payloads[key]
             else:
-                dtype = getattr(torch, metadata["dtype"].split(".")[-1])
+                dtype = getattr(torch, dtype_str.split(".")[-1])
                 numel = sum(
-                    torch.Size(shape).numel()
-                    for shape in metadata["shapes"]
-                    if shape is not None
+                    torch.Size(shape).numel() for shape in shapes if shape is not None
                 )
                 tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
             if tensor.numel():
@@ -198,12 +200,9 @@ def _broadcast_batched_data_dict(
                     torch.distributed.broadcast(tensor, src=src, group=group)
             packed_payloads.pop(key, None)
             if not is_leader:
-                if (
-                    torch.device(metadata["source_device"]).type
-                    != torch.device(bcast_device).type
-                ):
-                    tensor = tensor.to(metadata["source_device"])
-                out[key] = PackedTensor.from_broadcast_parts(metadata, tensor)
+                if torch.device(source_device).type != torch.device(bcast_device).type:
+                    tensor = tensor.to(source_device)
+                out[key] = header.rebuild_from_broadcast_parts(shapes, tensor)
         else:
             if not is_leader:
                 out[key] = entry[2]
