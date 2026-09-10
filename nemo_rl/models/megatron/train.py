@@ -670,7 +670,9 @@ class LossPostProcessor:
             cfg: Policy(-like) config; supplies sequence_packing / logprob_chunk_size.
             num_microbatches: Microbatch count, used to counteract Megatron's
                 per-microbatch loss averaging.
-            cp_normalize: Whether to divide the loss by the context-parallel size.
+            cp_normalize: Whether to divide the POLICY loss by the context-parallel
+                size (compensates the CP logprob all-gather; the rank-local
+                draft losses are exempt, see ``__call__``).
             sampling_params: Optional temperature / top-k/p for logprob losses.
             draft_model: Optional EAGLE draft model for distillation.
             prepare_fn: Optional override for the default ``prepare_loss_input``.
@@ -839,17 +841,6 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if has_draft_logits:
-                # The draft loss wraps AROUND the packing wrapper: the policy
-                # part iterates subsequences, the draft part runs once over
-                # the whole packed row (per-pass teacher roll + coord-gathered
-                # masks; see DraftCrossEntropyLossFn's packed mode).
-                loss_fn_wrapped = self._wrap_with_draft_loss(
-                    loss_fn_wrapped,
-                    prepare_loss_input_wrapped,
-                    data_dict,
-                    global_draft_pass_counts,
-                )
         else:
             loss_fn_wrapped = partial(
                 wrap_loss_fn_with_input_preparation,
@@ -859,13 +850,38 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if has_draft_logits:
-                loss_fn_wrapped = self._wrap_with_draft_loss(
-                    loss_fn_wrapped,
-                    prepare_loss_input_wrapped,
-                    data_dict,
-                    global_draft_pass_counts,
-                )
+
+        if self.cp_normalize:
+            # Policy loss only. Under CP every rank evaluates the FULL-sequence
+            # policy loss (from_parallel_logits_to_logprobs all-gathers the
+            # logprobs, and that all-gather's backward hands each local logit
+            # cp_size copies of its gradient), hence the 1/cp_size. The draft
+            # losses are rank-local numerators over a global denominator and
+            # reach the global gradient through the dp_cp grad all-reduce
+            # alone, so they must be added AFTER this division: dividing them
+            # too shrinks the draft gradient by cp_size while the draft
+            # metrics (explicitly CP-reduced) keep looking right.
+            cp_size = get_context_parallel_world_size()
+            policy_loss_fn = loss_fn_wrapped
+
+            def _div_policy_loss_by_cp_size(*args, **kwargs):
+                loss, metrics = policy_loss_fn(*args, **kwargs)
+                return loss / cp_size, metrics
+
+            loss_fn_wrapped = _div_policy_loss_by_cp_size
+
+        if has_draft_logits:
+            # The draft loss wraps AROUND the (packing-wrapped, CP-normalized)
+            # policy loss: with packing the policy part iterates subsequences
+            # while the draft part runs once over the whole packed row
+            # (per-pass teacher roll + coord-gathered masks; see
+            # DraftCrossEntropyLossFn's packed mode).
+            loss_fn_wrapped = self._wrap_with_draft_loss(
+                loss_fn_wrapped,
+                prepare_loss_input_wrapped,
+                data_dict,
+                global_draft_pass_counts,
+            )
 
         loss_fn_wrapped = partial(
             loss_fn_wrapped,
@@ -873,16 +889,6 @@ class LossPostProcessor:
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
         )
-
-        if self.cp_normalize:
-            cp_size = get_context_parallel_world_size()
-            prev_loss_fn = loss_fn_wrapped
-
-            def _div_by_cp_size(*args, **kwargs):
-                loss, metrics = prev_loss_fn(*args, **kwargs)
-                return loss / cp_size, metrics
-
-            loss_fn_wrapped = _div_by_cp_size
 
         # Counteract Megatron's default loss averaging in schedules.py,
         # which applies (* cp_size / num_microbatches) to the loss.

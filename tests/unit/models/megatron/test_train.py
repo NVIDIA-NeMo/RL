@@ -32,6 +32,7 @@ import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 pytestmark = pytest.mark.mcore
 
@@ -1309,6 +1310,58 @@ class TestLossPostProcessor:
 
         # Loss should be scaled by num_microbatches / (cp_size * cp_size) = 4 / (2 * 2) = 1.0
         assert torch.isclose(loss, torch.tensor(1.0))
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=2
+    )
+    @patch("nemo_rl.models.megatron.train.prepare_loss_input")
+    @patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
+    def test_cp_normalize_divides_policy_loss_only(
+        self,
+        mock_draft_loss_cls,
+        mock_prepare_loss_input,
+        mock_cp_size,
+        mock_cp_grp,
+        mock_tp_grp,
+        mock_tp_rank,
+    ):
+        """The 1/cp_size compensates the policy logprob all-gather; the rank-local draft loss must not see it."""
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+        mock_prepare_loss_input.side_effect = lambda logits, data, loss_fn, **_: (
+            {},
+            data,
+        )
+        mock_draft_loss_cls.return_value = MagicMock(
+            return_value=(torch.tensor(2.0), {"draft_loss_pass_1": 2.0})
+        )
+
+        policy_loss_fn = MagicMock(return_value=(torch.tensor(8.0), {}))
+        policy_loss_fn.input_type = LossInputType.LOGIT
+        cfg = {"sequence_packing": {"enabled": False}, "draft": {"loss_weight": 1.0}}
+        processor = LossPostProcessor(
+            loss_fn=policy_loss_fn, cfg=cfg, num_microbatches=1, cp_normalize=True
+        )
+
+        wrapped_fn = processor(
+            data_dict=BatchedDataDict({"student_logits": torch.zeros(1, 3, 5)}),
+            global_valid_seqs=torch.tensor(1),
+            global_valid_toks=torch.tensor(3),
+        )
+        loss, metrics = wrapped_fn(torch.zeros(1, 3, 5))
+
+        # (policy / cp + draft) * num_microbatches / cp: only the policy term is
+        # divided; the trailing factor cancels mcore's own cp / num_microbatches.
+        # Dividing the combined loss instead would give (8 + 2) / 2 / 2 = 2.5.
+        assert torch.isclose(loss, torch.tensor((8.0 / 2 + 2.0) / 2))
+        assert metrics["draft_loss"] == 2.0
 
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
