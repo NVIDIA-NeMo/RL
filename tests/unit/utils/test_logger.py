@@ -30,7 +30,9 @@ from nemo_rl.utils.logger import (
     MLflowLogger,
     RayGpuMonitorLogger,
     SwanlabLogger,
+    TELEMETRY_WALL_TIME_METRIC,
     TensorboardLogger,
+    WANDB_CALLER_STEP_METRIC,
     WandbLogger,
     flatten_dict,
     log_container_init_timing,
@@ -426,7 +428,9 @@ class TestWandbLogger:
 
         # W&B's internal row step is implicit; the caller step is a custom axis.
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with({**metrics, "nemo_rl/step": step})
+        mock_run.log.assert_called_once_with(
+            {**metrics, WANDB_CALLER_STEP_METRIC: step}
+        )
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix(self, mock_wandb):
@@ -444,7 +448,7 @@ class TestWandbLogger:
         expected_metrics = {
             "train/loss": 0.5,
             "train/accuracy": 0.8,
-            "nemo_rl/step": step,
+            WANDB_CALLER_STEP_METRIC: step,
         }
         mock_run.log.assert_called_once_with(expected_metrics)
 
@@ -506,10 +510,10 @@ class TestWandbLogger:
         logger.log_metrics({"loss": 1.0}, step=1, prefix="train")
         logger.log_metrics({"seconds": 5.0}, step=1, prefix="timing/train")
         logger.log_metrics(
-            {"telemetry/wall_time_seconds": 30.0, "tokens_per_second": 10.0},
+            {TELEMETRY_WALL_TIME_METRIC: 30.0, "tokens_per_second": 10.0},
             step=1,
             prefix="rollout/throughput",
-            step_metric="telemetry/wall_time_seconds",
+            step_metric=TELEMETRY_WALL_TIME_METRIC,
         )
         logger.log_metrics(
             {"tokens_per_second": 20.0},
@@ -523,7 +527,7 @@ class TestWandbLogger:
         assert mock_run.log.call_args_list == [
             call(
                 {
-                    "telemetry/wall_time_seconds": 30.0,
+                    TELEMETRY_WALL_TIME_METRIC: 30.0,
                     "rollout/throughput/tokens_per_second": 10.0,
                 }
             ),
@@ -532,10 +536,10 @@ class TestWandbLogger:
                     "train/loss": 1.0,
                     "timing/train/seconds": 5.0,
                     "performance/tokens_per_second": 20.0,
-                    "nemo_rl/step": 1,
+                    WANDB_CALLER_STEP_METRIC: 1,
                 }
             ),
-            call({"train/loss": 0.5, "nemo_rl/step": 2}),
+            call({"train/loss": 0.5, WANDB_CALLER_STEP_METRIC: 2}),
         ]
         assert all("step" not in kwargs for _, kwargs in mock_run.log.call_args_list)
 
@@ -597,7 +601,7 @@ class TestWandbLogger:
         logger = WandbLogger({})
         logger.define_metric(
             "rollout/throughput/*",
-            step_metric="telemetry/wall_time_seconds",
+            step_metric=TELEMETRY_WALL_TIME_METRIC,
         )
 
         with pytest.raises(ValueError, match="is missing from the logged event"):
@@ -612,12 +616,12 @@ class TestWandbLogger:
         logger.define_metric("rollout/*", step_metric="rollout/step")
         logger.define_metric(
             "rollout/throughput/*",
-            step_metric="telemetry/wall_time_seconds",
+            step_metric=TELEMETRY_WALL_TIME_METRIC,
         )
 
         logger.log_metrics(
             {
-                "telemetry/wall_time_seconds": 30.0,
+                TELEMETRY_WALL_TIME_METRIC: 30.0,
                 "rollout/throughput/tokens_per_second": 10.0,
             },
             step=0,
@@ -626,7 +630,7 @@ class TestWandbLogger:
         mock_run = mock_wandb.init.return_value
         mock_run.define_metric.assert_any_call(
             "rollout/throughput/tokens_per_second",
-            step_metric="telemetry/wall_time_seconds",
+            step_metric=TELEMETRY_WALL_TIME_METRIC,
         )
 
     @patch("nemo_rl.utils.logger.wandb")
@@ -635,7 +639,7 @@ class TestWandbLogger:
         WandbLogger({})
 
         mock_run = mock_wandb.init.return_value
-        assert call("*", step_metric="nemo_rl/step") not in (
+        assert call("*", step_metric=WANDB_CALLER_STEP_METRIC) not in (
             mock_run.define_metric.call_args_list
         )
 
@@ -651,7 +655,9 @@ class TestWandbLogger:
         callback()
 
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with({"train/loss": 0.5, "nemo_rl/step": 7})
+        mock_run.log.assert_called_once_with(
+            {"train/loss": 0.5, WANDB_CALLER_STEP_METRIC: 7}
+        )
         mock_run.finish.assert_called_once_with()
 
     @patch("nemo_rl.utils.logger.wandb")
@@ -664,7 +670,37 @@ class TestWandbLogger:
         mock_run.log.assert_not_called()
         logger.finish()
 
-        mock_run.log.assert_called_once_with({"train/loss": 0.5, "nemo_rl/step": 7})
+        mock_run.log.assert_called_once_with(
+            {"train/loss": 0.5, WANDB_CALLER_STEP_METRIC: 7}
+        )
+        mock_run.finish.assert_called_once_with()
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_finish_flushes_histogram_and_plot_with_pending_trainer_row(
+        self, mock_wandb
+    ) -> None:
+        """Typed W&B values join the final scalar row instead of being lost."""
+        histogram_value = MagicMock(name="histogram_value")
+        plot_value = MagicMock(name="plot_value")
+        mock_wandb.Histogram.return_value = histogram_value
+        logger = WandbLogger({})
+
+        logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
+        logger.log_histogram([1.0, 2.0], step=7, name="train/reward_histogram")
+        logger.log_plot(plot_value, step=7, name="train/reward_plot")
+
+        mock_run = mock_wandb.init.return_value
+        mock_run.log.assert_not_called()
+        logger.finish()
+
+        mock_run.log.assert_called_once_with(
+            {
+                "train/loss": 0.5,
+                "train/reward_histogram": histogram_value,
+                "train/reward_plot": plot_value,
+                WANDB_CALLER_STEP_METRIC: 7,
+            }
+        )
         mock_run.finish.assert_called_once_with()
 
     @patch("nemo_rl.utils.logger.wandb")
@@ -2019,12 +2055,12 @@ class TestLogger:
 
         logger.define_metric(
             "rollout/throughput/*",
-            step_metric="telemetry/wall_time_seconds",
+            step_metric=TELEMETRY_WALL_TIME_METRIC,
         )
 
         mock_wandb_logger.return_value.define_metric.assert_called_once_with(
             "rollout/throughput/*",
-            step_metric="telemetry/wall_time_seconds",
+            step_metric=TELEMETRY_WALL_TIME_METRIC,
         )
         assert not mock_tb_logger.return_value.define_metric.called
 

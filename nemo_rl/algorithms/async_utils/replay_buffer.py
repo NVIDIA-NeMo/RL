@@ -36,6 +36,8 @@ from typing import (
     NotRequired,
     Optional,
     TypedDict,
+    cast,
+    get_args,
 )
 
 import ray
@@ -76,16 +78,9 @@ CheckpointMutationKind = Literal[
     "sample_clears",
     "sibling_seals",
 ]
-CHECKPOINT_MUTATION_KINDS: tuple[CheckpointMutationKind, ...] = (
-    "advantage_writeback",
-    "group_commits",
-    "group_removals",
-    "prompt_reservations",
-    "recovery_restore",
-    "recovery_retries",
-    "sample_clears",
-    "sibling_seals",
-    "other",
+CHECKPOINT_MUTATION_KINDS = cast(
+    tuple[CheckpointMutationKind, ...],
+    get_args(CheckpointMutationKind),
 )
 
 
@@ -298,6 +293,11 @@ class DataPlaneCheckpointBarrier:
         self, kind: CheckpointMutationKind = "other"
     ) -> AsyncIterator[DataPlaneMutationCut]:
         """Yield one task-local live cut after any active checkpoint exits."""
+        if kind not in CHECKPOINT_MUTATION_KINDS:
+            raise ValueError(
+                f"unknown checkpoint mutation kind {kind!r}; expected one of "
+                f"{CHECKPOINT_MUTATION_KINDS!r}"
+            )
         async with self._condition:
             task = self._current_task()
             wait_started: Optional[float] = None

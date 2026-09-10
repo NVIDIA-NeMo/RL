@@ -461,7 +461,7 @@ class TestGenerateAndPushFlow:
         assert start_v == 0
         assert end_v == 0
         assert len(mgr.recovery_ledger) == 0
-        assert mgr.telemetry_snapshot()["canonical_groups_finalized"] == 1
+        assert mgr.telemetry_snapshot()["committed_groups"] == 1
 
     def test_publication_and_recovery_telemetry_are_cumulative(self):
         mgr = _make_manager(_FakeBuffer(), _FakeImpl())
@@ -470,11 +470,48 @@ class TestGenerateAndPushFlow:
         mgr.record_recovery_siblings(reused=3, redispatched=1)
 
         assert mgr.telemetry_snapshot() == {
-            "canonical_groups_finalized": 1,
-            "canonical_output_tokens": 42,
+            "committed_groups": 1,
+            "committed_output_tokens": 42,
             "recovery_siblings_reused": 3,
-            "recovery_siblings_redispatched": 1,
+            "recovery_siblings_rerun": 1,
         }
+
+    @pytest.mark.parametrize(
+        ("mean_output_tokens", "expected_output_tokens"),
+        [(3.75, 8), (-2.0, 0)],
+        ids=["rounded-group-total", "negative-total-clamped"],
+    )
+    def test_non_capture_commit_estimates_committed_output_tokens(
+        self,
+        mean_output_tokens: float,
+        expected_output_tokens: int,
+    ) -> None:
+        """The legacy path rounds its per-sample mean and clamps bad totals."""
+        completions = [
+            Completion(
+                message_log=[],
+                env_extras=None,
+                truncated=False,
+                reward=0.0,
+            )
+            for _ in range(2)
+        ]
+        record = PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info=None,
+            metadata={},
+            completions=completions,
+            rollout_metrics={"mean_gen_tokens_per_sample": mean_output_tokens},
+        )
+        mgr = _make_manager(_FakeBuffer(), _FakeImpl(record=record))
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert (
+            mgr.telemetry_snapshot()["committed_output_tokens"]
+            == expected_output_tokens
+        )
 
     def test_ledger_hands_ownership_to_canonical_buffer_on_commit(self):
         buf = _FakeBuffer()

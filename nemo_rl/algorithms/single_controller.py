@@ -63,7 +63,6 @@ from typing import (
     Any,
     Awaitable,
     Callable,
-    Literal,
     Optional,
     Union,
     cast,
@@ -107,9 +106,13 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     is_ppo_run,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
+    ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
     BootstrapCompatibilityIdentity,
+    RolloutCheckpointAttemptOutcome,
+    RolloutCheckpointAttemptReason,
     RolloutSnapshotManifest,
     commit_snapshot,
     ensure_bootstrap_anchor,
@@ -157,7 +160,7 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
-from nemo_rl.utils.logger import Logger
+from nemo_rl.utils.logger import Logger, TELEMETRY_WALL_TIME_METRIC
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 if TYPE_CHECKING:
@@ -166,30 +169,9 @@ if TYPE_CHECKING:
 
 Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 
-_TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
-_TELEMETRY_PREFIXES = (
-    "timing/rollout_checkpoint",
-    "timing/rollout_recovery",
-    "rollout/checkpoint_outcome",
-    "rollout/throughput",
-)
-
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
-
-_MAX_CONSECUTIVE_ROLLOUT_CHECKPOINT_FAILURES = 3
-
-RolloutCheckpointAttemptReason = Literal[
-    "completed",
-    "invariant_error",
-    "io_error",
-    "missing_trainer_anchor",
-    "no_data_plane_mutations",
-    "optimizer_commit_in_progress",
-    "timeout",
-    "trainer_state_changed",
-]
 
 
 @dataclass(frozen=True)
@@ -410,19 +392,6 @@ class SingleControllerActor:
             setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
         )
         self._timer = Timer()
-        self._telemetry_started_at = time.monotonic()
-        self._telemetry_sample_index = 0
-        try:
-            for prefix in _TELEMETRY_PREFIXES:
-                self._logger.define_metric(
-                    f"{prefix}/*", step_metric=_TELEMETRY_WALL_TIME_METRIC
-                )
-        except Exception as error:
-            warnings.warn(
-                "Failed to define rollout benchmark telemetry series: "
-                f"{type(error).__name__}: {error}",
-                stacklevel=2,
-            )
         self._throughput_sample_time: Optional[float] = None
         self._throughput_generation_tokens_by_worker: Optional[dict[int, int]] = None
         self._throughput_rollout_counters: Optional[dict[str, int]] = None
@@ -449,8 +418,8 @@ class SingleControllerActor:
         self._data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = (
             actor_args.data_plane_checkpoint_metadata
         )
-        self._rollout_checkpoint_load_metrics = getattr(
-            actor_args, "rollout_checkpoint_load_metrics", None
+        self._rollout_checkpoint_load_metrics = (
+            actor_args.rollout_checkpoint_load_metrics
         )
         self._consumed_samples: int = actor_args.save_state.consumed_samples
         self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
@@ -633,6 +602,7 @@ class SingleControllerActor:
             restored_replay_groups=restored_replay_groups
         )
         await self._maybe_restore_replacement_reserve()
+        self._validate_restored_sampler_cursor()
         recovery_prepare_seconds = time.monotonic() - recovery_prepare_started
         self._log_rollout_restore_metrics(
             replay_metadata_load_seconds=replay_restore_seconds,
@@ -645,11 +615,8 @@ class SingleControllerActor:
         train_task = asyncio.create_task(self._train_pump())
         watchdog_task = asyncio.create_task(self._stall_watchdog_pump())
         tasks = [rollout_task, train_task, watchdog_task]
-        rollout_checkpoint_cfg = getattr(
-            self._master_config, "rollout_checkpointing", None
-        )
-        telemetry_interval_s = getattr(
-            rollout_checkpoint_cfg, "telemetry_interval_s", None
+        telemetry_interval_s = (
+            self._master_config.rollout_checkpointing.telemetry_interval_s
         )
         if telemetry_interval_s is not None:
             await self._log_rollout_throughput_metrics(emit=False)
@@ -761,18 +728,17 @@ class SingleControllerActor:
     ) -> None:
         """Log benchmark telemetry on an axis independent of trainer steps."""
         try:
-            self._telemetry_sample_index += 1
+            wall_time_ns = time.time_ns()
             event_metrics = dict(metrics)
             event_metrics["train_step"] = float(step)
-            event_metrics["sample_index"] = float(self._telemetry_sample_index)
-            event_metrics[_TELEMETRY_WALL_TIME_METRIC] = (
-                time.monotonic() - self._telemetry_started_at
-            )
+            event_metrics[TELEMETRY_WALL_TIME_METRIC] = wall_time_ns / 1_000_000_000
             self._logger.log_metrics(
                 event_metrics,
-                step=self._telemetry_sample_index,
+                # W&B uses the custom wall-time axis and ignores this value.
+                # Other backends still need a restart-stable integer event step.
+                step=wall_time_ns,
                 prefix=prefix,
-                step_metric=_TELEMETRY_WALL_TIME_METRIC,
+                step_metric=TELEMETRY_WALL_TIME_METRIC,
             )
         except Exception as error:
             warnings.warn(
@@ -808,7 +774,7 @@ class SingleControllerActor:
             for key, value in load_metrics.items()
             if key.endswith("_seconds") and key != "total_load_seconds"
         )
-        load_metrics["groups_reused"] = float(restored_replay_groups)
+        load_metrics["groups_complete_restored"] = float(restored_replay_groups)
         self._log_telemetry_metrics(
             load_metrics,
             step=self._train_steps,
@@ -1018,6 +984,43 @@ class SingleControllerActor:
                 flush=True,
             )
 
+    def _validate_restored_sampler_cursor(self) -> None:
+        """Require the sampler cursor to cover every restored target step."""
+        restored_target_steps = [
+            target_step
+            for target_step in self._buffer.target_step_list
+            if target_step is not None
+        ]
+        restored_target_steps.extend(
+            group.target_step
+            for group in self._rollout_manager.recovery_ledger.groups()
+            if group.target_step is not None
+        )
+        if not restored_target_steps:
+            return
+
+        max_target_step = max(restored_target_steps)
+        if self._sampler.dispatch_index < max_target_step:
+            raise RuntimeError(
+                "restored sampler cursor is older than restored rollout work: "
+                f"dispatch_index={self._sampler.dispatch_index}, "
+                f"max_target_step={max_target_step}. Refusing to continue because "
+                "a new admission could collide with restored work and discard prompts."
+            )
+
+    def _require_unoccupied_target_step(self, target_step: Optional[int]) -> None:
+        """Reject a sampler admission that collides with existing buffer ownership."""
+        if target_step is None:
+            return
+        buffered = self._buffer.count_for_target_step(target_step)
+        if buffered:
+            raise RuntimeError(
+                f"sampler admitted target_step={target_step}, but the replay buffer "
+                f"already contains {buffered} group(s) for that step. The sampler "
+                "cursor and rollout ownership are inconsistent; refusing to discard "
+                "reserved prompts."
+            )
+
     async def _rehydrate_rollout_recovery_prompts(
         self,
         cut: DataPlaneMutationCut,
@@ -1110,13 +1113,11 @@ class SingleControllerActor:
     async def _admit_reserved_prompt_groups(
         self,
         group_ids: list[str],
-    ) -> tuple[Optional[int], list[str], int]:
-        """Commit one admission and atomically reconcile restored canonical groups.
+    ) -> Optional[int]:
+        """Commit one admission and mark every reserved group as admitted.
 
         Returns:
-            The target-step stamp, IDs that still require rollout dispatch, and the
-            number of already-canonical groups that replaced reservations in this
-            admission.
+            The target-step stamp assigned to every group.
         """
         if not group_ids:
             raise ValueError("sampler admission requires at least one prompt group")
@@ -1124,9 +1125,10 @@ class SingleControllerActor:
         def _commit(
             cut: DataPlaneMutationCut,
             target_step: Optional[int],
-        ) -> tuple[Optional[int], list[str], int]:
+        ) -> Optional[int]:
             if target_step is not None:
                 self._sampler_stamps_target_steps = True
+            self._require_unoccupied_target_step(target_step)
             for group_id in group_ids:
                 self._rollout_manager.mark_prompt_group_admitted(
                     cut,
@@ -1134,16 +1136,7 @@ class SingleControllerActor:
                     target_step=target_step,
                 )
 
-            buffered = 0
-            dispatch_group_ids = group_ids
-            if target_step is not None:
-                buffered = self._buffer.count_for_target_step(target_step)
-                if buffered:
-                    dispatch_count = max(0, len(group_ids) - buffered)
-                    dispatch_group_ids = group_ids[:dispatch_count]
-                    for group_id in group_ids[dispatch_count:]:
-                        self._rollout_manager.discard_prompt_group(cut, group_id)
-            return target_step, dispatch_group_ids, buffered
+            return target_step
 
         if isinstance(self._sampler, TransactionalAdmissionSampler):
             await self._sampler.wait_until_admissible(
@@ -1207,7 +1200,6 @@ class SingleControllerActor:
         # opening the sampler gate. Launch them before waiting to re-admit RESERVED
         # groups, or restore can deadlock with the trainer waiting for recovered work
         # that this method has not launched yet.
-        redispatched = 0
         for group in groups_to_recover:
             if group.phase is PromptGroupPhase.ADMITTED:
                 await launch(
@@ -1218,7 +1210,6 @@ class SingleControllerActor:
                 reused = len(group.sealed_generation_indices)
                 reused_siblings += reused
                 redispatched_siblings += group.expected_generations - reused
-                redispatched += 1
 
         # A checkpoint may land after dataloader ownership is recorded but before
         # sampler admission commits. Re-admit each original dataloader batch once and
@@ -1230,10 +1221,8 @@ class SingleControllerActor:
                     group.group_id
                 )
         for group_ids in reserved_admissions.values():
-            _, dispatch_group_ids, _ = await self._admit_reserved_prompt_groups(
-                group_ids
-            )
-            for group_id in dispatch_group_ids:
+            await self._admit_reserved_prompt_groups(group_ids)
+            for group_id in group_ids:
                 group = recovery_ledger.get_group(group_id)
                 await launch(
                     group.prompt_payload,
@@ -1243,7 +1232,6 @@ class SingleControllerActor:
                 reused = len(group.sealed_generation_indices)
                 reused_siblings += reused
                 redispatched_siblings += group.expected_generations - reused
-                redispatched += 1
 
         self._rollout_manager.record_recovery_siblings(
             reused=reused_siblings,
@@ -1252,17 +1240,16 @@ class SingleControllerActor:
         self._log_telemetry_metrics(
             {
                 "redispatch_schedule_seconds": time.monotonic() - recovery_started,
-                "groups_considered": float(len(groups_to_recover)),
-                "groups_redispatched": float(redispatched),
+                "groups_unfinished_found": float(len(groups_to_recover)),
                 "siblings_reused": float(reused_siblings),
-                "siblings_redispatched": float(redispatched_siblings),
+                "siblings_rerun": float(redispatched_siblings),
             },
             step=self._train_steps,
             prefix="timing/rollout_recovery",
         )
 
         print(
-            f"📦 Redispatched {redispatched} unfinished rollout "
+            f"📦 Redispatched {len(groups_to_recover)} unfinished rollout "
             "group(s) before new dataloader work",
             flush=True,
         )
@@ -2120,18 +2107,8 @@ class SingleControllerActor:
                         )
                         if target_step is not None:
                             self._sampler_stamps_target_steps = True
-                        num_prompts = prompt_batch.size
-                        if target_step is not None:
-                            buffered = self._buffer.count_for_target_step(target_step)
-                            if buffered:
-                                num_prompts = max(0, prompt_batch.size - buffered)
-                                print(
-                                    f"  target_step={target_step}: {buffered} group(s) "
-                                    f"already buffered; dispatching {num_prompts} of "
-                                    f"{prompt_batch.size} prompt(s), dropping the rest",
-                                    flush=True,
-                                )
-                        for prompt_idx in range(num_prompts):
+                        self._require_unoccupied_target_step(target_step)
+                        for prompt_idx in range(prompt_batch.size):
                             prompt: DatumSpec = {  # type: ignore
                                 k: v[prompt_idx] for k, v in prompt_batch.items()
                             }
@@ -2166,29 +2143,9 @@ class SingleControllerActor:
                             )
                             prompt_dispatches.append((prompt, group_id))
 
-                    (
-                        target_step,
-                        dispatch_group_ids,
-                        buffered,
-                    ) = await self._admit_reserved_prompt_groups(
+                    target_step = await self._admit_reserved_prompt_groups(
                         [group_id for _, group_id in prompt_dispatches]
                     )
-
-                    if target_step is not None:
-                        if buffered:
-                            print(
-                                f"  target_step={target_step}: {buffered} group(s) "
-                                f"already buffered; dispatching "
-                                f"{len(dispatch_group_ids)} of "
-                                f"{len(prompt_dispatches)} prompt(s), dropping the rest",
-                                flush=True,
-                            )
-                            dispatch_group_id_set = set(dispatch_group_ids)
-                            prompt_dispatches = [
-                                (prompt, group_id)
-                                for prompt, group_id in prompt_dispatches
-                                if group_id in dispatch_group_id_set
-                            ]
 
                     for prompt, group_id in prompt_dispatches:
                         await _launch(prompt, target_step, group_id)
@@ -2296,23 +2253,12 @@ class SingleControllerActor:
                             admission_id=admission_id,
                         )
                         prompt_dispatches.append((prompt, group_id))
-                (
-                    target_step,
-                    dispatch_group_ids,
-                    buffered,
-                ) = await self._admit_reserved_prompt_groups(
+                target_step = await self._admit_reserved_prompt_groups(
                     [group_id for _, group_id in prompt_dispatches]
                 )
-                dispatch_group_id_set = set(dispatch_group_ids)
-                prompt_dispatches = [
-                    (prompt, group_id)
-                    for prompt, group_id in prompt_dispatches
-                    if group_id in dispatch_group_id_set
-                ]
                 print(
                     f"  dataloader exhausted; training on {len(prompt_dispatches)} "
-                    f"pooled spare(s) as target_step={target_step}"
-                    + (f" ({buffered} group(s) already buffered)" if buffered else ""),
+                    f"pooled spare(s) as target_step={target_step}",
                     flush=True,
                 )
                 for prompt, group_id in prompt_dispatches:
@@ -3991,7 +3937,7 @@ class SingleControllerActor:
     def _log_rollout_checkpoint_outcome(
         self,
         *,
-        outcome: Literal["completed", "failed", "skipped"],
+        outcome: RolloutCheckpointAttemptOutcome,
         reason: RolloutCheckpointAttemptReason,
         attempt_duration_seconds: float,
     ) -> None:
@@ -3999,14 +3945,18 @@ class SingleControllerActor:
         metrics = {
             "attempt": 1.0,
             "attempt_duration_seconds": attempt_duration_seconds,
-            "completed": float(outcome == "completed"),
-            "skipped": float(outcome == "skipped"),
-            "failed": float(outcome == "failed"),
             "configured_interval_seconds": float(
                 self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
                 or 0.0
             ),
-            f"reason_{reason}": 1.0,
+            **{
+                f"reason_{candidate}": float(reason == candidate)
+                for candidate in ROLLOUT_CHECKPOINT_ATTEMPT_REASONS
+            },
+            **{
+                candidate: float(outcome == candidate)
+                for candidate in ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES
+            },
         }
         completed_at = time.monotonic()
         if outcome == "completed":
@@ -4065,7 +4015,10 @@ class SingleControllerActor:
                     f"{type(error).__name__}: {error}",
                     flush=True,
                 )
-                if consecutive_failures >= _MAX_CONSECUTIVE_ROLLOUT_CHECKPOINT_FAILURES:
+                if (
+                    consecutive_failures
+                    >= self._master_config.rollout_checkpointing.max_consecutive_failures
+                ):
                     raise RuntimeError(
                         "periodic rollout checkpoint failed "
                         f"{consecutive_failures} consecutive times"
@@ -4216,13 +4169,12 @@ class SingleControllerActor:
             elapsed = now - previous_time
             if elapsed > 0:
                 metrics["sample_elapsed_seconds"] = elapsed
-                metrics["canonical_groups_per_second"] = (
-                    counters["canonical_groups_finalized"]
-                    - previous_counters["canonical_groups_finalized"]
+                metrics["committed_groups_per_second"] = (
+                    counters["committed_groups"] - previous_counters["committed_groups"]
                 ) / elapsed
-                metrics["canonical_output_tokens_per_second"] = (
-                    counters["canonical_output_tokens"]
-                    - previous_counters["canonical_output_tokens"]
+                metrics["committed_output_tokens_per_second"] = (
+                    counters["committed_output_tokens"]
+                    - previous_counters["committed_output_tokens"]
                 ) / elapsed
                 if generated_by_worker is not None and previous_generated is not None:
                     current_workers = set(generated_by_worker)
@@ -4252,7 +4204,8 @@ class SingleControllerActor:
                 step=self._train_steps,
                 prefix="rollout/throughput",
             )
-            print(f"rollout_throughput_metrics={metrics}", flush=True)
+            if self._async_cfg.diagnostics:
+                print(f"rollout_throughput_metrics={metrics}", flush=True)
 
     async def _save_checkpoint(
         self,

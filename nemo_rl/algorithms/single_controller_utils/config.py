@@ -745,10 +745,16 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     ``telemetry_interval_s=None`` disables the independent wall-clock sampler
     for rollout/checkpoint benchmark metrics. It does not enable checkpointing
     and may be configured without ``snapshot_attempt_interval_s``.
+
+    ``max_consecutive_failures`` controls how many consecutive retryable
+    periodic-checkpoint failures are tolerated before the controller aborts the
+    run. A successful or skipped attempt resets the counter; checkpoint
+    invariant failures still fail immediately.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
     telemetry_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    max_consecutive_failures: Annotated[int, Field(ge=1)] = 3
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)

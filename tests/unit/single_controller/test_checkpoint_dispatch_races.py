@@ -90,8 +90,6 @@ def _with_mutation_cut(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
 def _init_recovery_telemetry(controller: Any, *, train_steps: int = 0) -> None:
     """Initialize constructor-owned telemetry state for hand-built controllers."""
     controller._train_steps = train_steps
-    controller._telemetry_sample_index = 0
-    controller._telemetry_started_at = 0.0
     controller._logger = MagicMock()
 
 
@@ -973,6 +971,11 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         assert sampler.dispatch_index == 7
         assert controller._batch_shortfall == {6: 1}
         assert controller._sampler_stamps_target_steps is True
+        recovery_metrics = controller._logger.log_metrics.call_args.args[0]
+        assert recovery_metrics["groups_unfinished_found"] == 1.0
+        assert recovery_metrics["siblings_reused"] == 0.0
+        assert recovery_metrics["siblings_rerun"] == 2.0
+        assert "groups_redispatched" not in recovery_metrics
 
     asyncio.run(exercise())
 
@@ -1344,7 +1347,7 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
 
         async def block_admission(
             group_ids: list[str],
-        ) -> tuple[int, list[str], int]:
+        ) -> int:
             admission_started.set()
             await release_admission.wait()
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
@@ -1354,7 +1357,7 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
                         group_id,
                         target_step=7,
                     )
-            return 7, group_ids, 0
+            return 7
 
         async def launch(
             prompt: DatumSpec,

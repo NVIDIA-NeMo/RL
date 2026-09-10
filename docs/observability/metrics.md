@@ -18,10 +18,25 @@ Independent event streams use their own custom axes and do not carry
 `nemo_rl/step`. In particular, Single-Controller rollout benchmark series under
 `rollout/throughput/*`, `timing/rollout_checkpoint/*`,
 `timing/rollout_recovery/*`, and `rollout/checkpoint_outcome/*` use
-`telemetry/wall_time_seconds`. This lets those series continue through a long
-or paused trainer step without changing the meaning of the trainer-step axis.
+`telemetry/wall_time_seconds`, recorded as Unix wall-clock time. This lets those
+series continue through a long or paused trainer step and across process restart
+without changing the meaning of the trainer-step axis.
 
 ## Single-Controller rollout recovery metrics
+
+Wall-clock rollout telemetry sampling is disabled by default. Enable it without
+changing the checkpoint cadence by setting, for example:
+
+```yaml
+rollout_checkpointing:
+  telemetry_interval_s: 30.0
+```
+
+This records one throughput and controller-pressure sample every 30 seconds.
+Set the value back to `null` to disable the sampler. Detailed per-interval
+metric dictionaries are printed to the controller log only when
+`async_rl.diagnostics: true`; configured metric backends receive them either
+way.
 
 The rollout checkpoint benchmark focuses on the following questions:
 
@@ -33,13 +48,19 @@ The rollout checkpoint benchmark focuses on the following questions:
 
 | Prefix | Important fields | Meaning |
 |---|---|---|
-| `rollout/throughput` | `generation_output_tokens_per_second`, `canonical_output_tokens_per_second`, `canonical_groups_per_second` | Raw backend decoding throughput compared with finalized token and group throughput available for training. The raw metric is absent when the backend does not expose compatible cumulative counters. |
+| `rollout/throughput` | `generation_output_tokens_per_second`, `committed_output_tokens_per_second`, `committed_groups_per_second` | Raw backend decoding throughput compared with output committed for training. The raw metric is absent when the backend does not expose compatible cumulative counters. With token capture, committed tokens are counted exactly from valid staged rows; without token capture, they are estimated by multiplying the reported per-sample mean by the number of completions, so compare like-for-like runs. |
 | `rollout/throughput` | `checkpoint_blocked_mutations`, `checkpoint_mutation_wait_seconds_p95`, `checkpoint_mutation_wait_seconds_max` | Number and latency of live data-plane mutations delayed by an exclusive checkpoint. |
 | `timing/rollout_checkpoint` | `total_save_seconds`, `tq_save_seconds`, `barrier_wait_seconds`, `exclusive_hold_seconds`, `sidecar_save_seconds`, `snapshot_commit_seconds` | End-to-end save latency and its storage, fencing, controller-sidecar, and atomic-publication components. |
 | `timing/rollout_checkpoint` | `snapshot_rows`, `replay_rows`, `staging_rows`, `replay_groups`, `ledger_groups`, `controller_sidecar_bytes` | Logical volume captured by the snapshot. `controller_sidecar_bytes` excludes the native TQ payload because the current TQ checkpoint API does not report bytes written. NeMo-RL deliberately does not recursively scan the shared checkpoint directory because that scan would perturb the benchmark. |
 | `rollout/checkpoint_outcome` | `completed`, `skipped`, `failed`, `reason_*`, `seconds_since_previous_success`, `seconds_since_last_success` | Result, actionable reason, and effective cadence of every scheduled checkpoint attempt. |
 | `timing/rollout_recovery` | `snapshot_resolution_seconds`, `dataloader_load_seconds`, `tq_load_seconds`, `replay_metadata_load_seconds`, `recovery_prepare_seconds`, `total_load_seconds` | Rollout-state restore latency. `total_load_seconds` is the sum of these non-overlapping restore phases. |
-| `timing/rollout_recovery` | `groups_reused`, `groups_redispatched`, `siblings_reused`, `siblings_redispatched`, `redispatch_schedule_seconds` | Completed groups restored without generation and unfinished sibling work preserved or repeated after restart. |
+| `timing/rollout_recovery` | `groups_complete_restored`, `groups_unfinished_found`, `siblings_reused`, `siblings_rerun`, `redispatch_schedule_seconds` | Training-ready groups restored without generation, unfinished groups found for redispatch, and sibling work preserved or rerun after restart. |
+
+Recovery counters describe work reconstructed at restore time, not a promise
+that every restored group will eventually train. After recovery, the configured
+sampler may still evict a restored group under its normal staleness rules (for
+example, when a `windowed` sampler finds that the group's policy version has
+fallen outside its valid window).
 
 `barrier_wait_seconds` and mutation wait latency measure opposite sides of the
 same fence. The former is how long the checkpoint waits for already-running

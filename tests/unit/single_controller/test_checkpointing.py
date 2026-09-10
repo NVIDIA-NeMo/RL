@@ -39,7 +39,6 @@ import hashlib
 import json
 import os
 import threading
-import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -110,6 +109,7 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
@@ -496,10 +496,10 @@ class _FakeRolloutManager:
         self.recovery_ledger = RolloutRecoveryLedger()
         self._events = events
         self.telemetry = {
-            "canonical_groups_finalized": 0,
-            "canonical_output_tokens": 0,
+            "committed_groups": 0,
+            "committed_output_tokens": 0,
             "recovery_siblings_reused": 0,
-            "recovery_siblings_redispatched": 0,
+            "recovery_siblings_rerun": 0,
         }
 
     def set_data_plane_checkpoint_barrier(self, barrier: Any) -> None:
@@ -520,12 +520,12 @@ class _FakeRolloutManager:
         return dict(self.telemetry)
 
     def record_canonical_publication(self, output_tokens: int) -> None:
-        self.telemetry["canonical_groups_finalized"] += 1
-        self.telemetry["canonical_output_tokens"] += output_tokens
+        self.telemetry["committed_groups"] += 1
+        self.telemetry["committed_output_tokens"] += output_tokens
 
     def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
         self.telemetry["recovery_siblings_reused"] += reused
-        self.telemetry["recovery_siblings_redispatched"] += redispatched
+        self.telemetry["recovery_siblings_rerun"] += redispatched
 
 
 class _FakeTQBuffer:
@@ -943,6 +943,45 @@ def _training_info(ckpt_dir: Path, step: int) -> dict[str, Any]:
 
 
 class TestCounterRestore:
+    @pytest.mark.parametrize(
+        ("buffer_target_steps", "recovery_target_steps"),
+        [([8], []), ([], [8])],
+    )
+    def test_rejects_sampler_cursor_older_than_restored_work(
+        self,
+        buffer_target_steps: list[int],
+        recovery_target_steps: list[int],
+    ) -> None:
+        actor = object.__new__(_ACTOR_CLS)
+        actor._buffer = SimpleNamespace(target_step_list=buffer_target_steps)
+        actor._rollout_manager = SimpleNamespace(
+            recovery_ledger=SimpleNamespace(
+                groups=lambda: [
+                    SimpleNamespace(target_step=target_step)
+                    for target_step in recovery_target_steps
+                ]
+            )
+        )
+        actor._sampler = SimpleNamespace(dispatch_index=7)
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"dispatch_index=7, max_target_step=8",
+        ):
+            actor._validate_restored_sampler_cursor()
+
+    def test_accepts_sampler_cursor_covering_restored_work(self) -> None:
+        actor = object.__new__(_ACTOR_CLS)
+        actor._buffer = SimpleNamespace(target_step_list=[None, 7])
+        actor._rollout_manager = SimpleNamespace(
+            recovery_ledger=SimpleNamespace(
+                groups=lambda: [SimpleNamespace(target_step=8)]
+            )
+        )
+        actor._sampler = SimpleNamespace(dispatch_index=8)
+
+        actor._validate_restored_sampler_cursor()
+
     def test_restore_from_step_n(self, tmp_path):
         save_state = _initial_grpo_save_state()
         save_state.current_step = 7
@@ -1308,6 +1347,7 @@ class TestPeriodicRolloutCheckpoint:
             {"snapshot_attempt_interval_s": 0},
             {"interval_s": 1},
             {"keep_latest_k": 0},
+            {"max_consecutive_failures": 0},
             {"unknown_option": True},
         ],
     )
@@ -1361,11 +1401,17 @@ class TestPeriodicRolloutCheckpoint:
     def test_logs_snapshot_phase_durations(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
-        actor._telemetry_started_at = 0.0
+        wall_time_ns = 1_750_000_000_000_000_000
         try:
-            with patch(
-                "nemo_rl.algorithms.single_controller.time.monotonic",
-                new=_SteppingClock(),
+            with (
+                patch(
+                    "nemo_rl.algorithms.single_controller.time.monotonic",
+                    new=_SteppingClock(),
+                ),
+                patch(
+                    "nemo_rl.algorithms.single_controller.time.time_ns",
+                    return_value=wall_time_ns,
+                ),
             ):
                 result = asyncio.run(actor._save_rollout_checkpoint(force=True))
                 assert result.saved
@@ -1383,10 +1429,12 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["snapshot_rows"] == (
             logged["replay_rows"] + logged["staging_rows"]
         )
+        assert logged[TELEMETRY_WALL_TIME_METRIC] == 1_750_000_000.0
+        assert "sample_index" not in logged
         assert actor._logger.log_metrics.call_args.kwargs == {
-            "step": 1,
+            "step": wall_time_ns,
             "prefix": "timing/rollout_checkpoint",
-            "step_metric": "telemetry/wall_time_seconds",
+            "step_metric": TELEMETRY_WALL_TIME_METRIC,
         }
 
     def test_logs_checkpoint_outcome_reason_and_effective_cadence(
@@ -1394,7 +1442,6 @@ class TestPeriodicRolloutCheckpoint:
     ) -> None:
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
-        actor._telemetry_started_at = 0.0
         try:
             with patch(
                 "nemo_rl.algorithms.single_controller.time.monotonic",
@@ -1410,19 +1457,53 @@ class TestPeriodicRolloutCheckpoint:
                     reason="no_data_plane_mutations",
                     attempt_duration_seconds=0.1,
                 )
+                actor._log_rollout_checkpoint_outcome(
+                    outcome="completed",
+                    reason="completed",
+                    attempt_duration_seconds=1.0,
+                )
         finally:
             actor._checkpointer.shutdown()
 
-        first, second = actor._logger.log_metrics.call_args_list
+        first, second, third = actor._logger.log_metrics.call_args_list
+        outcome_keys = {"completed", "failed", "skipped"}
+        reason_keys = {
+            "reason_completed",
+            "reason_invariant_error",
+            "reason_io_error",
+            "reason_missing_trainer_anchor",
+            "reason_no_data_plane_mutations",
+            "reason_optimizer_commit_in_progress",
+            "reason_timeout",
+            "reason_trainer_state_changed",
+        }
+        assert {
+            key for key in first.args[0] if key.startswith("reason_")
+        } == reason_keys
+        assert {
+            key for key in second.args[0] if key.startswith("reason_")
+        } == reason_keys
+        assert {
+            key for key in third.args[0] if key.startswith("reason_")
+        } == reason_keys
+        assert sum(first.args[0][key] for key in reason_keys) == 1.0
+        assert sum(second.args[0][key] for key in reason_keys) == 1.0
+        assert sum(third.args[0][key] for key in reason_keys) == 1.0
+        assert sum(first.args[0][key] for key in outcome_keys) == 1.0
+        assert sum(second.args[0][key] for key in outcome_keys) == 1.0
+        assert sum(third.args[0][key] for key in outcome_keys) == 1.0
         assert first.args[0]["reason_completed"] == 1.0
+        assert first.args[0]["reason_no_data_plane_mutations"] == 0.0
         assert "seconds_since_last_success" not in first.args[0]
+        assert second.args[0]["reason_completed"] == 0.0
         assert second.args[0]["reason_no_data_plane_mutations"] == 1.0
-        assert second.args[0]["seconds_since_last_success"] == pytest.approx(2.0)
+        assert second.args[0]["seconds_since_last_success"] == pytest.approx(1.0)
+        assert third.args[0]["seconds_since_previous_success"] == pytest.approx(2.0)
+        assert "seconds_since_last_success" not in third.args[0]
 
     def test_logs_restore_phase_total_and_reused_groups(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
-        actor._telemetry_started_at = time.monotonic()
         actor._rollout_checkpoint_load_metrics = {
             "snapshot_resolution_seconds": 0.5,
             "dataloader_load_seconds": 1.0,
@@ -1440,28 +1521,32 @@ class TestPeriodicRolloutCheckpoint:
 
         logged = actor._logger.log_metrics.call_args.args[0]
         assert logged["total_load_seconds"] == 15.5
-        assert logged["groups_reused"] == 5.0
+        assert logged["groups_complete_restored"] == 5.0
         assert actor._logger.log_metrics.call_args.kwargs["prefix"] == (
             "timing/rollout_recovery"
         )
 
-    def test_logs_raw_and_canonical_rollout_throughput(self, tmp_path: Path) -> None:
+    def test_logs_raw_and_canonical_rollout_throughput(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
-        actor._telemetry_started_at = 0.0
+        capsys.readouterr()
         snapshots = iter(
             [
                 {
-                    "canonical_groups_finalized": 0,
-                    "canonical_output_tokens": 0,
+                    "committed_groups": 0,
+                    "committed_output_tokens": 0,
                     "recovery_siblings_reused": 0,
-                    "recovery_siblings_redispatched": 0,
+                    "recovery_siblings_rerun": 0,
                 },
                 {
-                    "canonical_groups_finalized": 2,
-                    "canonical_output_tokens": 40,
+                    "committed_groups": 2,
+                    "committed_output_tokens": 40,
                     "recovery_siblings_reused": 1,
-                    "recovery_siblings_redispatched": 3,
+                    "recovery_siblings_rerun": 3,
                 },
             ]
         )
@@ -1498,21 +1583,69 @@ class TestPeriodicRolloutCheckpoint:
 
         logged = actor._logger.log_metrics.call_args.args[0]
         assert logged["generation_output_tokens_per_second"] == pytest.approx(20.0)
-        assert logged["canonical_output_tokens_per_second"] == pytest.approx(4.0)
-        assert logged["canonical_groups_per_second"] == pytest.approx(0.2)
+        assert logged["committed_output_tokens_per_second"] == pytest.approx(4.0)
+        assert logged["committed_groups_per_second"] == pytest.approx(0.2)
         assert logged["vllm_requests_running"] == 3
         assert logged["vllm_requests_waiting"] == 4
         assert logged["vllm_kv_cache_usage_mean"] == pytest.approx(0.6)
         assert logged["group_completion_seconds_p50"] == pytest.approx(2.0)
         assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
         assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)
+        assert "rollout_throughput_metrics=" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "second_generation_tokens",
+        [
+            {0: [90], 1: [150]},
+            {0: [150], 2: [50]},
+        ],
+        ids=["counter-decreased", "worker-set-changed"],
+    )
+    def test_generation_counter_discontinuity_suppresses_invalid_rate(
+        self,
+        tmp_path: Path,
+        second_generation_tokens: dict[int, list[int]],
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._rollout_manager.telemetry_snapshot = lambda: {
+            "committed_groups": 0,
+            "committed_output_tokens": 0,
+            "recovery_siblings_reused": 0,
+            "recovery_siblings_rerun": 0,
+        }
+        generation_snapshots = iter(
+            [
+                {"generation_tokens": {0: [100], 1: [100]}},
+                {"generation_tokens": second_generation_tokens},
+            ]
+        )
+        actor._gen = SimpleNamespace(
+            drain_latest_logger_metrics=lambda: next(generation_snapshots)
+        )
+
+        async def sample_twice() -> None:
+            await actor._log_rollout_throughput_metrics(emit=False)
+            await actor._log_rollout_throughput_metrics()
+
+        try:
+            with patch(
+                "nemo_rl.algorithms.single_controller.time.monotonic",
+                new=_SteppingClock(start=10.0, step=10.0),
+            ):
+                asyncio.run(sample_twice())
+        finally:
+            actor._checkpointer.shutdown()
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["generation_counter_discontinuity"] == 1.0
+        assert "generation_output_tokens_per_second" not in logged
 
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
     ):
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
-        actor._telemetry_started_at = time.monotonic()
         claimed_meta = KVBatchMeta(
             partition_id=_PARTITION_ID,
             task_name=None,
@@ -1628,6 +1761,7 @@ class TestPeriodicRolloutCheckpoint:
     ):
         actor = self._actor(tmp_path)
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
+        actor._master_config.rollout_checkpointing.max_consecutive_failures = 2
         actor._train_steps = 1
 
         async def _main() -> None:
@@ -1638,7 +1772,7 @@ class TestPeriodicRolloutCheckpoint:
             actor._save_rollout_checkpoint = _failing_save
             with pytest.raises(
                 RuntimeError,
-                match="periodic rollout checkpoint failed 3 consecutive times",
+                match="periodic rollout checkpoint failed 2 consecutive times",
             ):
                 await asyncio.wait_for(
                     actor._rollout_checkpoint_pump(),
@@ -1651,12 +1785,11 @@ class TestPeriodicRolloutCheckpoint:
             actor._checkpointer.shutdown()
 
         output = capsys.readouterr().out
-        assert output.count("Periodic rollout checkpoint failed") == 3
+        assert output.count("Periodic rollout checkpoint failed") == 2
 
     def test_periodic_pump_does_not_retry_invariant_failure(self, tmp_path: Path):
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
-        actor._telemetry_started_at = time.monotonic()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         calls = 0
 

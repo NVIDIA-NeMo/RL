@@ -137,6 +137,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
         bootstrap_identity=None,
+        rollout_checkpoint_load_metrics=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)

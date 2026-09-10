@@ -55,7 +55,8 @@ _rich_logging_configured = False
 # Metric axes are registered by exact name when a key is first logged. A
 # catch-all ``*`` definition is intentionally avoided because wandb-core does
 # not deterministically resolve overlapping glob definitions.
-_WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
+WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
+TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
 
 class WandbConfig(TypedDict):
@@ -237,11 +238,11 @@ class WandbLogger(LoggerInterface):
         self._log_lock = threading.Lock()
         self._metric_step_patterns: dict[str, Optional[str]] = {}
         self._defined_metric_axes: dict[str, Optional[str]] = {
-            _WANDB_CALLER_STEP_METRIC: None
+            WANDB_CALLER_STEP_METRIC: None
         }
         self._pending_step: Optional[int] = None
         self._pending_metrics: dict[str, Any] = {}
-        self.run.define_metric(_WANDB_CALLER_STEP_METRIC, hidden=True)
+        self.run.define_metric(WANDB_CALLER_STEP_METRIC, hidden=True)
         # Most training entrypoints run W&B in the driver process and do not
         # own an explicit logger teardown today. Register after wandb.init so
         # our Python-side row buffer drains before W&B's own atexit handlers.
@@ -497,7 +498,7 @@ class WandbLogger(LoggerInterface):
         if self._pending_step is None:
             return
         event_metrics = dict(self._pending_metrics)
-        event_metrics[_WANDB_CALLER_STEP_METRIC] = self._pending_step
+        event_metrics[WANDB_CALLER_STEP_METRIC] = self._pending_step
         self.run.log(event_metrics)
         self._pending_step = None
         self._pending_metrics = {}
@@ -518,7 +519,7 @@ class WandbLogger(LoggerInterface):
         for metric_name in metrics:
             self._define_exact_metric_locked(
                 metric_name,
-                step_metric=_WANDB_CALLER_STEP_METRIC,
+                step_metric=WANDB_CALLER_STEP_METRIC,
             )
         self._pending_metrics.update(metrics)
         if step_finished:

@@ -1678,12 +1678,12 @@ class RolloutManager:
             yield cut
 
     def telemetry_snapshot(self) -> dict[str, int]:
-        """Return cumulative canonical-publication and recovery counters."""
+        """Return cumulative committed-publication and recovery counters."""
         return {
-            "canonical_groups_finalized": self._canonical_groups_finalized,
-            "canonical_output_tokens": self._canonical_output_tokens,
+            "committed_groups": self._canonical_groups_finalized,
+            "committed_output_tokens": self._canonical_output_tokens,
             "recovery_siblings_reused": self._recovery_siblings_reused,
-            "recovery_siblings_redispatched": self._recovery_siblings_redispatched,
+            "recovery_siblings_rerun": self._recovery_siblings_redispatched,
         }
 
     def record_canonical_publication(self, output_tokens: int) -> None:
