@@ -14,7 +14,9 @@
 
 import copy
 import math
+from collections.abc import Sequence
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -22,6 +24,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoConfig
+
+from nemo_rl.data.multimodal_utils import (
+    _image_num_tokens_from_processed,
+    uses_image_placeholder,
+)
 
 NEMOTRON_VIDEO_PROCESSOR_NAMES = frozenset(
     {
@@ -358,3 +365,211 @@ def process_nemotron_video_frames(
         "pixel_values": torch.stack(pixel_values),
         "imgs_sizes": torch.tensor(image_sizes, dtype=torch.int32),
     }
+
+
+# --- Rollout/train image-tiling parity helpers (Nemotron placeholder-style
+# processors). The rollout engine expands each image to <img><image>*N</img>;
+# these helpers read those runs back as the authoritative per-image budgets
+# and force the training-side processor to reproduce them exactly.
+
+
+def get_image_placeholder_token_ids(processor: Any) -> "tuple[int, int, int] | None":
+    """(image_token_id, image_start_id, image_end_id), or None if unavailable."""
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None or not uses_image_placeholder(processor):
+        return None
+    tokens = [
+        getattr(processor, "image_token", "<image>"),
+        getattr(processor, "image_start_token", "<img>"),
+        getattr(processor, "image_end_token", "</img>"),
+    ]
+    ids = tokenizer.convert_tokens_to_ids(tokens)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if any(i is None or (unk_id is not None and i == unk_id) for i in ids):
+        return None
+    return int(ids[0]), int(ids[1]), int(ids[2])
+
+
+def supports_image_placeholder_run_parity(processor: Any) -> bool:
+    """Whether rollout tokens can be parsed into per-image placeholder runs."""
+    return get_image_placeholder_token_ids(processor) is not None
+
+
+def count_image_placeholder_runs(
+    token_ids: "Sequence[int] | torch.Tensor", processor: Any
+) -> list[int]:
+    """Per-image placeholder run lengths from rollout token ids, in order.
+
+    The rollout engine (and this processor) expand each image to
+    ``<img><image>*N</img>``; each run's N is the exact number of projected
+    media features the model expects for that image.
+    """
+    placeholder_ids = get_image_placeholder_token_ids(processor)
+    if placeholder_ids is None:
+        raise ValueError(
+            f"{type(processor).__name__} does not expose image placeholder "
+            "tokens; cannot count image placeholder runs."
+        )
+    image_id, start_id, end_id = placeholder_ids
+    if isinstance(token_ids, torch.Tensor):
+        token_ids = token_ids.tolist()
+    runs: list[int] = []
+    current: "int | None" = None
+    for token in token_ids:
+        if token == start_id:
+            if current is not None:
+                raise ValueError("Nested <img> region in rollout tokens.")
+            current = 0
+        elif token == end_id:
+            if current is None:
+                raise ValueError("Unmatched </img> in rollout tokens.")
+            runs.append(current)
+            current = None
+        elif token == image_id:
+            if current is None:
+                raise ValueError(
+                    "Image placeholder token outside an <img>...</img> region "
+                    "in rollout tokens."
+                )
+            current += 1
+    if current is not None:
+        raise ValueError("Unterminated <img> region in rollout tokens.")
+    return runs
+
+
+def predicted_static_image_num_tokens(
+    processor: Any, image_sizes: list[tuple[int, int]]
+) -> "list[int] | None":
+    """Predict per-image token counts of the processor's static image path.
+
+    Mirrors the budget selection in the checkpoint's image processor
+    ``_preprocess`` (image path) and reuses its own ``_compute_target_patches``
+    for the grid math, so it costs no pixel work. Returns None when the
+    processor does not expose the needed hooks (callers must then assume the
+    static output is unverified and attach rollout-matched media themselves).
+    """
+    image_processor = getattr(processor, "image_processor", None)
+    required = (
+        "max_model_len",
+        "min_num_patches",
+        "max_num_patches",
+        "_compute_target_patches",
+    )
+    if image_processor is None or not all(
+        hasattr(image_processor, name) for name in required
+    ):
+        return None
+    downsample = getattr(image_processor, "_downsample_factor", None)
+    if not downsample:
+        ratio = getattr(image_processor, "downsample_ratio", None)
+        if not ratio:
+            return None
+        downsample = int(round(1.0 / ratio))
+    budget = (image_processor.max_model_len - 4) * downsample**2
+    budget = max(budget, image_processor.min_num_patches * len(image_sizes))
+    max_patches = image_processor.max_num_patches
+    max_budget = max_patches if (max_patches and max_patches > 0) else float("inf")
+    per_image_budget = max(min(budget, max_budget), image_processor.min_num_patches)
+    num_tokens = []
+    for width, height in image_sizes:
+        shim = SimpleNamespace(width=width, height=height)
+        grid_w, grid_h = image_processor._compute_target_patches(shim, per_image_budget)
+        num_tokens.append((grid_w * grid_h) // downsample**2)
+    return num_tokens
+
+
+class RolloutGeometryUnderdetermined(ValueError):
+    """The rollout's image token count cannot be reproduced without guessing.
+
+    A placeholder-run length does not uniquely identify the rollout engine's
+    preprocessing grid (several grids share one product), so when re-running
+    the processor under the rollout's own budget fails to reproduce the count,
+    inferring a grid from the count risks training against different pixels
+    and feature ordering than generated the rollout. Callers must treat the
+    affected sample as unusable media rather than guess.
+    """
+
+
+def _process_single_image_at_num_tokens(
+    processor: Any, image: Image.Image, num_tokens: int
+) -> dict[str, Any]:
+    """Run the processor on one image, pinned to an exact media token count."""
+    image_processor = processor.image_processor
+    image_token = getattr(processor, "image_token", "<image>")
+    downsample = getattr(image_processor, "_downsample_factor", None) or int(
+        round(1.0 / image_processor.downsample_ratio)
+    )
+
+    def run_pinned(single_image: Image.Image) -> dict[str, Any]:
+        # The image-path per-image budget is clamp((max_model_len-4)*ds^2, ...),
+        # so max_model_len = num_tokens + 4 requests exactly num_tokens*ds^2
+        # patches. Instance mutation is the only knob: the wrapper's
+        # ImagesKwargs silently ignore unknown kwargs. Both attach call sites
+        # run this on a single thread with no awaits in between (same pattern
+        # as the processor's own _is_video_mode flag).
+        original = image_processor.max_model_len
+        try:
+            image_processor.max_model_len = num_tokens + 4
+            return dict(
+                processor(text=image_token, images=[single_image], return_tensors=None)
+            )
+        finally:
+            image_processor.max_model_len = original
+
+    processed = run_pinned(image)
+    actual = _image_num_tokens_from_processed(processed)
+    if actual == [num_tokens]:
+        return processed
+
+    # The pinned budget replays the rollout engine's own decision procedure;
+    # when even that does not reproduce the rollout's count, the count alone
+    # cannot recover the geometry: several (grid_h, grid_w) factorizations
+    # share the product num_tokens*ds^2, and picking one that differs from the
+    # rollout's would pass count validation while training on different pixels
+    # and spatial feature ordering. Fail instead of inferring.
+    raise RolloutGeometryUnderdetermined(
+        "Cannot reproduce the rollout's image tiling: the rollout expanded a "
+        f"{image.width}x{image.height} image to {num_tokens} placeholder "
+        f"tokens, but the training processor produced {actual[0]} tokens under "
+        f"the rollout's own budget (downsample={downsample}). The token count "
+        "does not uniquely identify the preprocessing grid, so the geometry "
+        "is not inferred from it; this image's media cannot be matched to the "
+        "rollout without the engine's per-image grid metadata."
+    )
+
+
+def reprocess_images_at_rollout_budgets(
+    processor: Any, images: list[Image.Image], expected_num_tokens: list[int]
+) -> dict[str, Any]:
+    """Re-run the processor per image at the rollout's exact per-image budget."""
+    parts = [
+        _process_single_image_at_num_tokens(processor, image, count)
+        for image, count in zip(images, expected_num_tokens, strict=True)
+    ]
+    pixel_values: list[torch.Tensor] = []
+    imgs_sizes: list[list[int]] = []
+    input_ids: list[torch.Tensor] = []
+    for part in parts:
+        tile = part["pixel_values"]
+        if isinstance(tile, list):
+            tile = torch.as_tensor(tile[0])
+        else:
+            tile = torch.as_tensor(tile)
+            if tile.ndim == 4:
+                tile = tile[0]
+        pixel_values.append(tile)
+        imgs_sizes.extend(
+            [int(h), int(w)]
+            for h, w in torch.as_tensor(part["imgs_sizes"]).reshape(-1, 2).tolist()
+        )
+        input_ids.append(torch.as_tensor(part["input_ids"]).reshape(1, -1))
+    merged: dict[str, Any] = {
+        "input_ids": torch.cat(input_ids, dim=1),
+        "imgs_sizes": torch.tensor(imgs_sizes, dtype=torch.long),
+        "num_tokens": list(expected_num_tokens),
+        "num_patches": [1] * len(images),
+    }
+    merged["pixel_values"] = (
+        pixel_values[0].unsqueeze(0) if len(pixel_values) == 1 else pixel_values
+    )
+    return merged
