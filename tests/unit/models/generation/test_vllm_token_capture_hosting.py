@@ -338,8 +338,7 @@ def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:
 
 
 def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
-    """The admission dict is read once and never mutated: the resolved prefix
-    reaches the request via the adapter and begin_call via its keyword."""
+    """The resolved prefix reaches both the engine request and capture admission."""
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
@@ -366,7 +365,7 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     # enter_prefix is the production writer of the request field.
     assert request.required_prefix_token_ids == prefix
     call, prompt = worker._capture_calls[id(request)]
-    assert call.prefix_token_ids == prefix
+    assert call.admission.required_prefix_token_ids == prefix
     assert prompt == [10, 11, 12, 20]
 
 
@@ -412,7 +411,7 @@ def test_staging_chain_cache_fetches_only_uncached_suffix():
 
 
 def test_staging_chain_prefix_length_mismatch_is_rejected_by_begin_call():
-    """prev_len enforcement lives in Gym's begin_call, not in the worker."""
+    """The worker validates a fetched prefix before constructing ActiveCall."""
     worker = _worker_with_capture(_MemorySink())
     worker._staging_source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": []})
     request = _staging_chain_request(prev_len=3)
@@ -434,7 +433,7 @@ def test_staging_chain_admission_requires_the_resolved_prefix_keyword():
     worker = _worker_with_capture(_MemorySink())
     request = _staging_chain_request()
 
-    with pytest.raises(CaptureError, match="pass the resolved prefix_token_ids"):
+    with pytest.raises(CaptureError, match="requires resolved prefix_token_ids"):
         VllmAsyncGenerationWorkerImpl._begin_request_capture(
             worker, request, [10, 11, 12, 20]
         )

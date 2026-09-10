@@ -43,7 +43,10 @@ import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
-from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.data_plane.tq_token_sink import (
+    TQTokenSink,
+    TQTokenSource,
+)
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
@@ -175,9 +178,11 @@ class RolloutReassembler:
             return rejected("missing_receipt", [])
         try:
             parsed = RolloutReceipt.model_validate(receipt)
-        except ValueError as error:
+            staging_keys = [record.staging_key for record in parsed.manifest]
+        except KeyError as error:
+            return rejected(f"missing_staging_row:{error}", [])
+        except (TypeError, ValueError) as error:
             return rejected(f"invalid_receipt:{error}", [])
-        staging_keys = [record.staging_key for record in parsed.manifest]
         if parsed.rollout_id != rollout_id:
             return rejected(f"identity_mismatch:{parsed.rollout_id}", staging_keys)
         if parsed.failure_reason is not None:
@@ -414,7 +419,7 @@ class RolloutReassembler:
             record
             for receipt in receipts
             if isinstance(receipt, dict)
-            for record in (receipt.get("manifest") or [])
+            for record in receipt.get("manifest") or []
             if isinstance(record, dict)
         ]
         if manifest_rows:

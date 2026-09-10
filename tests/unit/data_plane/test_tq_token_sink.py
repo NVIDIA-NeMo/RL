@@ -24,6 +24,8 @@ protocol edges the kit does not cover (missing keys, stage failure shape).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
@@ -37,6 +39,8 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     STAGING_FIELDS,
+    TQMegatronPromptPreparer,
+    TQMegatronTokenStager,
     TQTokenSink,
     TQTokenSource,
 )
@@ -218,3 +222,159 @@ def test_fetch_prefix_token_ids_rejects_duplicates(tq_client, staging_partition)
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
     with pytest.raises(KeyError, match="duplicates"):
         source.fetch_prefix_token_ids(["r/c", "r/c"])
+
+
+def test_megatron_stager_writes_canonical_row_and_returns_coords(
+    tq_client, staging_partition
+):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    payload = SimpleNamespace(
+        prompt_token_ids=[10, 11],
+        generated_token_ids=[12, 13],
+        generated_log_probs=[-0.25, -0.5],
+    )
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+
+    result = stager.stage(
+        "minf-response-1",
+        payload,
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        request_metadata={"ng_capture": admission.model_dump(mode="json")},
+    )
+
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["staging_key"] == "minf-r0/c1"
+    assert coords["weight_version"] == 7
+    assert coords["disposition"] == "staged"
+    [snapshot] = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
+        ["minf-r0/c1"]
+    )
+    assert snapshot.token_ids_delta == [10, 11, 12, 13]
+    assert snapshot.token_mask_delta == [0.0, 0.0, 1.0, 1.0]
+    assert snapshot.generation_log_probs_delta == [0.0, 0.0, -0.25, -0.5]
+
+
+def test_megatron_prompt_preparer_fetches_and_splices_staging_chain(
+    tq_client, staging_partition
+):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    root = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+    root_result = stager.stage(
+        "minf-response-1",
+        SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[12, 99],
+            generated_log_probs=[-0.25, -0.5],
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        request_metadata={"ng_capture": root.model_dump(mode="json")},
+    )
+    assert root_result is not None
+    root_coords = root_result.response_metadata["ng_commit_coords"]
+    child = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=4,
+        mode="token_in",
+        staging_chain=[root_coords["staging_key"]],
+        parent_chain_hash=root_coords["chain_hash"],
+    )
+    preparer = TQMegatronPromptPreparer(
+        TQTokenSource(tq_client, staging_partition=staging_partition)
+    )
+
+    prompt, metadata = preparer.prepare_prompt(
+        [80, 81, 99, 20, 21],
+        request_metadata={
+            "ng_capture": child.model_dump(mode="json"),
+            "ng_prompt_suffix_token_ids": [99, 20, 21],
+            "ng_prefix_boundary_token_id": 99,
+        },
+    )
+
+    assert prompt == [10, 11, 12, 99, 20, 21]
+    assert metadata is not None
+    assert metadata["ng_capture"]["required_prefix_token_ids"] == [10, 11, 12, 99]
+
+
+def test_megatron_prompt_preparer_splices_direct_capture_prefix(
+    tq_client, staging_partition
+):
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=4,
+        mode="token_in",
+        required_prefix_token_ids=[10, 11, 12, 99],
+    )
+    preparer = TQMegatronPromptPreparer(
+        TQTokenSource(tq_client, staging_partition=staging_partition)
+    )
+
+    prompt, metadata = preparer.prepare_prompt(
+        [80, 81, 99, 20, 21],
+        request_metadata={
+            "ng_capture": admission.model_dump(mode="json"),
+            "ng_prompt_suffix_token_ids": [99, 20, 21],
+            "ng_prefix_boundary_token_id": 99,
+        },
+    )
+
+    assert prompt == [10, 11, 12, 99, 20, 21]
+    assert metadata is not None
+    assert metadata["ng_capture"]["required_prefix_token_ids"] == [10, 11, 12, 99]
+
+
+def test_megatron_stager_declines_requests_without_capture_metadata(
+    tq_client, staging_partition
+):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    result = stager.stage(
+        "ordinary-request",
+        SimpleNamespace(
+            prompt_token_ids=[10],
+            generated_token_ids=[11],
+            generated_log_probs=[-0.1],
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+    )
+    assert result is None
+
+
+def test_megatron_stager_declines_mixed_policy_epochs(tq_client, staging_partition):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+    result = stager.stage(
+        "minf-response-1",
+        SimpleNamespace(
+            prompt_token_ids=[10],
+            generated_token_ids=[11],
+            generated_log_probs=[-0.1],
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7), (1, 8)]),
+        request_metadata={"ng_capture": admission.model_dump(mode="json")},
+    )
+    assert result is None
