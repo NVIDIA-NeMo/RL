@@ -1787,9 +1787,11 @@ class TestGenerateForFinalizationFlow:
             raise ValueError("bad prompt")
 
         mgr = _make_capture_manager(
-            buf, on_run=fail,
+            buf,
+            on_run=fail,
             retry_policy=RolloutRetryPolicy.single_attempt(
-                max_data_attempts=2, max_skipped_prompts=1,
+                max_data_attempts=2,
+                max_skipped_prompts=1,
             ),
         )
 
@@ -1799,11 +1801,18 @@ class TestGenerateForFinalizationFlow:
             if lineage_owned:
                 async with mgr._recovery_mutation() as cut:
                     group_id = mgr.reserve_prompt_group(
-                        cut, sample, target_step=3, admitted=True,
+                        cut,
+                        sample,
+                        target_step=3,
+                        admitted=True,
                     )
-            assert await mgr.generate_for_finalization(
-                sample, lineage_group_id=group_id,
-            ) is None
+            assert (
+                await mgr.generate_for_finalization(
+                    sample,
+                    lineage_group_id=group_id,
+                )
+                is None
+            )
             assert calls == 2
             assert not buf._slots
             assert len(mgr.recovery_ledger) == int(lineage_owned)
@@ -1827,12 +1836,17 @@ class TestGenerateForFinalizationFlow:
                 raise error
 
         mgr = _make_capture_manager(
-            _FakeCaptureBuffer(), on_run=attempt,
+            _FakeCaptureBuffer(),
+            on_run=attempt,
             retry_policy=RolloutRetryPolicy.single_attempt(
-                max_data_attempts=2, max_infra_attempts=2, backoff_base_s=0,
+                max_data_attempts=2,
+                max_infra_attempts=2,
+                backoff_base_s=0,
             ),
         )
-        assert _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0})) is not None
+        assert (
+            _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0})) is not None
+        )
         assert mgr.stats.data_retries_by_reason == {"ValueError": 1}
         assert mgr.stats.redispatches_by_reason == {"GenerationUnavailable": 1}
         assert mgr.stats.data_failures_by_reason == {}
@@ -1851,9 +1865,12 @@ class TestGenerateForFinalizationFlow:
             raise GenerationUnavailable("lost")
 
         mgr = _make_capture_manager(
-            BrokenBuffer(), on_run=fail,
+            BrokenBuffer(),
+            on_run=fail,
             retry_policy=RolloutRetryPolicy.single_attempt(
-                max_data_attempts=3, max_infra_attempts=3, backoff_base_s=0,
+                max_data_attempts=3,
+                max_infra_attempts=3,
+                backoff_base_s=0,
                 max_skipped_prompts=5,
             ),
         )
@@ -1862,7 +1879,6 @@ class TestGenerateForFinalizationFlow:
         assert calls == 1
         assert mgr.stats.redispatches_by_reason == {}
         assert mgr.stats.data_retries_by_reason == {}
-
 
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()

@@ -50,6 +50,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
+from nemo_rl.experience.rollout_reassembler_pool import RolloutReassemblerPool
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutRecoveryState,
@@ -102,7 +103,7 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     # Empty means the legacy (non-token-capture) dispatch path.
-    ctrl._finalizer_actors = []
+    ctrl._reassembler_pool = RolloutReassemblerPool([])
     ctrl._replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
 
@@ -196,7 +197,7 @@ def test_rollout_pump_stamps_target_steps(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
-    ctrl._finalizer_actors = []
+    ctrl._reassembler_pool = RolloutReassemblerPool([])
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
     ctrl._sampler = make_sampler(buffer)
@@ -1019,7 +1020,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = manager
-        ctrl._finalizer_actors = []
+        ctrl._reassembler_pool = RolloutReassemblerPool([])
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
@@ -1109,7 +1110,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = _NeverCalledRolloutManager()
-        ctrl._finalizer_actors = []
+        ctrl._reassembler_pool = RolloutReassemblerPool([])
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
@@ -1188,7 +1189,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = manager
         _init_pump_ledgers(ctrl)
-        ctrl._finalizer_actors = [object()]
+        ctrl._reassembler_pool = RolloutReassemblerPool([object()])
         ctrl._finalize_with_actor = _delayed_finalize
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
@@ -1325,7 +1326,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         ctrl._sampler_stamps_target_steps = False
         ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         _init_pump_ledgers(ctrl)
-        ctrl._finalizer_actors = [object()]
+        ctrl._reassembler_pool = RolloutReassemblerPool([object()])
         ctrl._rollout_recovery_enabled = True
 
         async def _finalize(
@@ -1452,7 +1453,7 @@ def test_rollout_pump_writes_expected_tq_data(
         partition_id=_PARTITION_ID,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
-        finalizer_actors=[],
+        reassembler_actors=[],
     )
     ctrl = SingleControllerActor.remote(
         master_config=master_config,
@@ -1534,3 +1535,86 @@ def test_rollout_pump_writes_expected_tq_data(
             "num_assistant_messages",
             "num_routed_experts_backfilled",
         }
+
+
+@pytest.mark.parametrize("recovery_enabled", [False, True])
+@pytest.mark.parametrize("replace", [False, True])
+def test_capture_skip_uses_replacement_policy_and_releases_ownership(
+    recovery_enabled, replace
+):
+    class CaptureManager:
+        def __init__(self):
+            self.recovery_ledger = RolloutRecoveryLedger()
+            self.stats = SimpleNamespace(committed=0)
+            self.prompts_seen = []
+
+        def reserve_prompt_group(
+            self, cut, prompt, *, target_step, admitted=True, admission_id=None
+        ):
+            return self.recovery_ledger.reserve_group(
+                cut,
+                prompt_id=prompt["message_log"][0]["content"],
+                prompt_payload=prompt,
+                expected_generations=1,
+                target_step=target_step,
+                start_weight_version=0,
+                admitted=admitted,
+                admission_id=admission_id,
+            ).group_id
+
+        def mark_prompt_group_admitted(self, cut, group_id, *, target_step):
+            self.recovery_ledger.mark_group_admitted(
+                cut,
+                group_id,
+                target_step=target_step,
+                start_weight_version=0,
+            )
+
+        def discard_prompt_group(self, cut, group_id):
+            self.recovery_ledger.discard_group(cut, group_id)
+
+        async def discard_recovery_group(self, cut, group_id):
+            self.discard_prompt_group(cut, group_id)
+
+        async def generate_for_finalization(
+            self, prompt, *, target_step, inflight_registry, lineage_group_id=None
+        ):
+            content = prompt["message_log"][0]["content"]
+            self.prompts_seen.append(content)
+            if lineage_group_id is not None:
+                assert self.recovery_ledger.get_group(lineage_group_id)
+            if content == "bad":
+                return None
+            return SimpleNamespace(group_id=lineage_group_id)
+
+    async def scenario():
+        manager = CaptureManager()
+        ctrl = _pump_controller(
+            manager,
+            [_batch("bad"), _batch("spare")],
+            on_dropped_prompt="replace" if replace else "shrink",
+        )
+        ctrl._master_config.token_capture = SimpleNamespace(
+            min_valid_fraction_per_group=None,
+        )
+        ctrl._reassembler_pool = RolloutReassemblerPool([object()])
+        ctrl._rollout_recovery_enabled = recovery_enabled
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+
+        async def finalize(request):
+            if request.group_id is not None:
+                async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+                    manager.discard_prompt_group(cut, request.group_id)
+            return SimpleNamespace(valid_row_count=1, total_row_count=1)
+
+        ctrl._finalize_with_actor = finalize
+        await ctrl._rollout_pump()
+        assert manager.prompts_seen == ["bad", "spare"]
+        assert ctrl._batch_shortfall == ({} if replace else {0: 1})
+        assert ctrl._batch_replacements == ({0: 1} if replace else {})
+        assert len(manager.recovery_ledger) == 0
+        assert manager.stats.committed == 1
+        assert ctrl._inflight_rollouts == 0
+        assert ctrl._buffer_capacity._value == 3
+
+    asyncio.run(scenario())

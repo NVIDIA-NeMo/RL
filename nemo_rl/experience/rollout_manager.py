@@ -2056,22 +2056,21 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
-                if isinstance(error, _CaptureCleanupError) or _contains_post_write_enrichment_error(error):
+                if isinstance(
+                    error, _CaptureCleanupError
+                ) or _contains_post_write_enrichment_error(error):
                     raise
 
-                if (
-                    owns_recovery_group
-                    and (
-                        (
-                            classify_rollout_failure(error) is FailureClass.INFRA
-                            and retry.infra_attempts + 1
-                            >= self._retry_policy.max_infra_attempts
-                        )
-                        or (
-                            classify_rollout_failure(error) is FailureClass.DATA
-                            and retry.data_attempts + 1
-                            >= self._retry_policy.max_data_attempts
-                        )
+                if owns_recovery_group and (
+                    (
+                        classify_rollout_failure(error) is FailureClass.INFRA
+                        and retry.infra_attempts + 1
+                        >= self._retry_policy.max_infra_attempts
+                    )
+                    or (
+                        classify_rollout_failure(error) is FailureClass.DATA
+                        and retry.data_attempts + 1
+                        >= self._retry_policy.max_data_attempts
                     )
                 ):
                     # An independent caller has no controller to release its lineage.

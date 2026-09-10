@@ -131,6 +131,7 @@ from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.experience.rollout_reassembler_pool import RolloutReassemblerPool
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -308,13 +309,7 @@ class SingleControllerActor:
         # therefore degrades to the documented off state rather than to a broken one.
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
         self._generation_router = getattr(actor_args, "generation_router", None)
-        self._finalizer_actors = list(actor_args.finalizer_actors)
-        self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
-        for actor in self._finalizer_actors:
-            self._available_finalizers.put_nowait(actor)
-        self._active_finalizers = 0
-        self._finalizer_waiters = 0
-        self._finalizer_unknown_outcomes = 0
+        self._reassembler_pool = RolloutReassemblerPool(actor_args.reassembler_actors)
         self._finalizer_metrics_by_group: dict[str, dict[str, float]] = {}
         teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
         if teacher_worker_groups:
@@ -603,11 +598,7 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            for actor in self._finalizer_actors:
-                try:
-                    ray.kill(actor, no_restart=True)
-                except Exception as error:
-                    print(f"finalizer actor termination failed: {error}", flush=True)
+            self._reassembler_pool.shutdown()
             try:
                 self._weight_synchronizer.shutdown()
             except Exception as e:  # teardown must not mask the original failure
@@ -630,10 +621,10 @@ class SingleControllerActor:
             "inflight_rollouts": self._inflight_rollouts,
             "rollout_permitted": self._rollout_permitted.is_set(),
             "epoch": self._current_epoch,
-            "active_finalizers": self._active_finalizers,
-            "finalizer_waiters": self._finalizer_waiters,
-            "finalizer_queue_depth": self._available_finalizers.qsize(),
-            "finalizer_unknown_outcomes": self._finalizer_unknown_outcomes,
+            "active_finalizers": self._reassembler_pool.active,
+            "finalizer_waiters": self._reassembler_pool.waiters,
+            "finalizer_queue_depth": self._reassembler_pool.available_count,
+            "finalizer_unknown_outcomes": self._reassembler_pool.unknown_outcomes,
         }
 
     # ── internal helpers ───────────────────────────────────────────────────
@@ -1356,25 +1347,12 @@ class SingleControllerActor:
         valid-row fraction is no longer a finalizer-side drop -- the caller
         decides that, since only the caller can source a replacement.
         """
-        self._finalizer_waiters += 1
-        queue_depth = max(
-            0,
-            self._finalizer_waiters - self._available_finalizers.qsize(),
-        )
-        queue_start = time.perf_counter()
         try:
-            actor = await self._available_finalizers.get()
+            lease = await self._reassembler_pool.acquire()
         except asyncio.CancelledError:
             await self._cleanup_known_finalization_request(request)
             raise
-        finally:
-            self._finalizer_waiters -= 1
-        queue_wait_ms = (time.perf_counter() - queue_start) * 1000.0
-        self._active_finalizers += 1
-        active_actor_count = self._active_finalizers
         finalize_start = time.perf_counter()
-        rpc_submitted = False
-        actor_reusable = False
         try:
             # The actor publishes canonical rows before returning metadata. Keep
             # the remote write, local replay-index update, and lineage hand-off in
@@ -1387,10 +1365,9 @@ class SingleControllerActor:
                 ledger = self._rollout_recovery_ledger
                 ledger.mark_finalization_started(cut, request.group_id)
                 try:
-                    rpc_submitted = True
-                    finalized = await actor.finalize.remote(request)
+                    lease.rpc_submitted = True
+                    finalized = await lease.actor.finalize.remote(request)
                 except BaseException:
-                    self._finalizer_unknown_outcomes += 1
                     ledger.mark_finalization_unknown(cut, request.group_id)
                     print(
                         "FATAL: finalizer actor RPC failed after submission; canonical "
@@ -1400,7 +1377,7 @@ class SingleControllerActor:
                     )
                     raise
                 else:
-                    actor_reusable = True
+                    lease.outcome_known = True
 
                 if finalized.dropped:
                     try:
@@ -1459,18 +1436,16 @@ class SingleControllerActor:
                     ledger.discard_group(cut, request.group_id)
                     committed = True
         finally:
-            self._active_finalizers -= 1
-            if actor_reusable or not rpc_submitted:
-                self._available_finalizers.put_nowait(actor)
+            self._reassembler_pool.release(lease)
         finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
         if not committed:
             return None
         finalized.metrics.update(
             {
-                "finalize/queue_wait_ms": queue_wait_ms,
+                "finalize/queue_wait_ms": lease.queue_wait_ms,
                 "finalize/total_ms": finalize_total_ms,
-                "finalize/queue_depth": float(queue_depth),
-                "finalize/active_actor_count": float(active_actor_count),
+                "finalize/queue_depth": float(lease.queue_depth),
+                "finalize/active_actor_count": float(lease.active_actor_count),
             }
         )
         self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
@@ -1587,7 +1562,7 @@ class SingleControllerActor:
             generation_permit_released = False
             inflight_count_released = False
             try:
-                if self._finalizer_actors:
+                if self._reassembler_pool:
                     # Token-capture path: run capture generation, release the
                     # generation permits as soon as the tokens are staged, then
                     # hand the metadata-only request to the finalizer actor pool.
@@ -1614,23 +1589,54 @@ class SingleControllerActor:
                                 sem.release()
                                 generation_permit_released = True
                             if request is None:
-                                # Dropped within the infra budget: nothing was
-                                # committed, so the train pump will never release
-                                # this permit, and the step it was stamped for
-                                # must be allowed to close short.
-                                if (
-                                    self._rollout_recovery_enabled
-                                    and lineage_group_id is not None
-                                ):
+                                # Capture exhausted a tolerated retry budget. Transfer
+                                # the retained lineage to a spare or credit shortfall
+                                # in one checkpoint-atomic controller decision.
+                                if self._rollout_recovery_enabled:
+                                    assert lineage_group_id is not None
                                     async with (
-                                        self._data_plane_checkpoint_barrier.mutation()
-                                    ) as cut:
+                                        self._data_plane_checkpoint_barrier.mutation() as cut
+                                    ):
+                                        replacement = self._take_replacement(
+                                            target_step, replacements
+                                        )
                                         await self._rollout_manager.discard_recovery_group(
                                             cut, lineage_group_id
                                         )
-                                self._buffer_capacity.release()
-                                self._credit_shortfall(target_step)
-                                return
+                                        if replacement is not None:
+                                            lender_step = self._promote_into_step(
+                                                target_step
+                                            )
+                                            if lender_step is not None:
+                                                target_step = lender_step
+                                            lineage_group_id = self._rollout_manager.reserve_prompt_group(
+                                                cut,
+                                                replacement,
+                                                target_step=target_step,
+                                            )
+                                        else:
+                                            self._credit_shortfall(target_step)
+                                else:
+                                    replacement = self._take_replacement(
+                                        target_step, replacements
+                                    )
+                                if replacement is None:
+                                    self._buffer_capacity.release()
+                                    if not self._rollout_recovery_enabled:
+                                        self._credit_shortfall(target_step)
+                                    return
+                                replacements += 1
+                                prompt = replacement
+                                if not self._rollout_recovery_enabled:
+                                    lender_step = self._promote_into_step(target_step)
+                                    if lender_step is not None:
+                                        target_step = lender_step
+                                await self._rollout_permitted.wait()
+                                await sem.acquire()
+                                self._inflight_rollouts += 1
+                                inflight_count_released = False
+                                generation_permit_released = False
+                                continue
                             finalized = await self._finalize_with_actor(request)
                             if finalized is None:
                                 # Finalizer dropped the group as a structural
