@@ -309,6 +309,13 @@ def _meta_tensor_alloc_context():
         torch.zeros_like = real_zeros_like
 
 
+def _reserved_http_server_port_for_rank(
+    reserved_http_server_ports: Optional[dict[int, int]], rank: int
+) -> Optional[int]:
+    """Return this worker rank's reserved frontend port, if one was assigned."""
+    return (reserved_http_server_ports or {}).get(rank)
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
@@ -443,7 +450,7 @@ class MegatronPolicyWorkerImpl(
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
-        reserved_http_server_port: Optional[int] = None,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -484,10 +491,10 @@ class MegatronPolicyWorkerImpl(
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
         # Store the reserved HTTP server port for inference server initialization.
-        # Megatron-LLM's inference server lives on Rank 0 only.
-        # TODO: Multiple inference servers for each MP coordinator.
-        self._reserved_http_server_port = (
-            reserved_http_server_port if self.rank == 0 else None
+        # Megatron-LLM's hosts an inference server on every MP coordinator rank,
+        # effectively one per DP rank.
+        self._reserved_http_server_port = _reserved_http_server_port_for_rank(
+            reserved_http_server_ports, self.rank
         )
 
         # Step 1: Setup distributed
