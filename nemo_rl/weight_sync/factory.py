@@ -38,6 +38,23 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
+def resolve_refit_timeout_s(
+    generation: Any, refit_timeout_s: Optional[float] = None
+) -> Optional[float]:
+    """Resolve and validate a refit deadline from an explicit or generation value."""
+    if refit_timeout_s is None:
+        refit_timeout_s = generation.cfg.get("refit_timeout_s")
+    if refit_timeout_s is None:
+        return None
+    if isinstance(refit_timeout_s, bool) or not isinstance(
+        refit_timeout_s, (int, float)
+    ):
+        raise ValueError("refit_timeout_s must be a number")
+    if refit_timeout_s <= 0:
+        raise ValueError("refit_timeout_s must be > 0")
+    return float(refit_timeout_s)
+
+
 def create_weight_synchronizer(
     policy: Any,
     generation: Any,
@@ -84,6 +101,7 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
+    refit_timeout_s = resolve_refit_timeout_s(generation, refit_timeout_s)
     checkpoint_engine_config = checkpoint_engine_refit_config(generation.cfg)
     if checkpoint_engine_config is not None:
         if colocated:
