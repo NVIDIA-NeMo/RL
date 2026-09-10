@@ -1479,6 +1479,7 @@ class TestPrepareForLpInference:
         reloaded without restoring that shared storage first."""
         w = self._worker()
         w._uses_mxfp8_overlap_shared_param_buffer.return_value = True
+        w._materialize_model_params_for_read = MagicMock()
 
         with patch("torch.randn"):
             w.prepare_for_lp_inference(keep_train_buffers=False)
@@ -1487,7 +1488,8 @@ class TestPrepareForLpInference:
         assert first.args[1] == "cuda"
         assert first.kwargs == {"move_grads": True}
         assert self._grad_offload_calls(w) == []
-        w.optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
+        w._materialize_model_params_for_read.assert_called_once_with()
+        w.optimizer.prepare_model_params_for_param_sync.assert_not_called()
 
     def test_keeps_buffers_across_an_open_step(self, mock_module_symbols):
         """The sequence the streaming pump actually produces: open a step, run a
@@ -1519,6 +1521,7 @@ class TestPrepareForLpInference:
             )
         )
         w.enable_forward_pre_hook = MagicMock()
+        w._materialize_model_params_for_read = MagicMock()
 
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
@@ -1530,6 +1533,7 @@ class TestPrepareForLpInference:
         w.finish_train_step()
 
         w.model.zero_grad_buffer.assert_called_once_with()
+        w._materialize_model_params_for_read.assert_not_called()
         w.disable_forward_pre_hook.assert_called_once_with(param_sync=False)
         w.optimizer._copy_main_params_to_param_buffer.assert_not_called()
         w.enable_forward_pre_hook.assert_called_once_with()
