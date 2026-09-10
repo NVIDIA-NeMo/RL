@@ -20,6 +20,7 @@ import threading as _threading
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncGenerator
+from traceback import format_exc
 from typing import Any, Optional, cast
 
 import ray
@@ -1661,6 +1662,8 @@ class AsyncTrajectoryCollector:
                         )
                     )
             except Exception as error:
+                from traceback import format_exc
+                print(f"Hit exception during rollouts: {format_exc()}")
                 stream_error = error
 
             push_results = await asyncio.gather(*push_tasks, return_exceptions=True)
