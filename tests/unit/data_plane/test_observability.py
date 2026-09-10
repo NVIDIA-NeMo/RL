@@ -29,6 +29,7 @@ import pytest
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict
 
+from nemo_rl.data_plane import observability
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import (
     _QUANTILES,
@@ -926,6 +927,41 @@ def test_hash_fingerprints_released_on_clear():
     client.clear_samples(sample_ids=ids, partition_id="p")
     assert client._hash_by_partition == {}
     client.close()
+
+
+def test_hash_fingerprints_follow_the_sample_when_another_process_clears(
+    monkeypatch,
+):
+    """GenWorker and the value actor put through their own clients and never
+    call ``clear_samples``, so their fingerprints are released by reconciling
+    against the partition's live keys — a row dropped by SC must not be
+    retained here, and a row still live must be."""
+    monkeypatch.setattr(observability, "_HASH_RECONCILE_ROWS", 4)
+    inner = NoOpDataPlaneClient()
+    writer = _client(inner, verify_tensor_hash=True)
+    writer.put_samples(
+        sample_ids=_ids(4, prefix="gone"), partition_id="p", fields=_hash_fields()
+    )
+    writer.put_samples(
+        sample_ids=_ids(4, prefix="live"), partition_id="p", fields=_hash_fields()
+    )
+
+    # Another process clears half the partition; the writer never sees the call.
+    inner.clear_samples(sample_ids=_ids(4, prefix="gone"), partition_id="p")
+    assert set(writer._hash_by_partition["p"]) == set(_ids(4, prefix="gone")) | set(
+        _ids(4, prefix="live")
+    )
+
+    writer.put_samples(
+        sample_ids=_ids(4, prefix="next"), partition_id="p", fields=_hash_fields()
+    )
+    assert set(writer._hash_by_partition["p"]) == set(_ids(4, prefix="live")) | set(
+        _ids(4, prefix="next")
+    )
+    assert writer._keys_by_partition["p"] == set(_ids(4, prefix="live")) | set(
+        _ids(4, prefix="next")
+    )
+    writer.close()
 
 
 def test_hash_fingerprint_covers_jagged_fields():

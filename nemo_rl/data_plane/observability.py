@@ -122,6 +122,11 @@ def _comm_volume(by_op: dict[str, Any]) -> dict[str, int]:
 # few lines carry the identity of what broke.
 _MAX_HASH_MISMATCH_LOGS = 20
 
+# Rows a client may accumulate between reconciliations of its fingerprint
+# store against the partition's live keys. One metadata call per this many
+# rows recorded, so a client that clears normally never makes one.
+_HASH_RECONCILE_ROWS = 1 << 14
+
 # The ``HashStats`` counters, named once: they are differenced into
 # ``step/hash/*`` and summed across processes, and the two lists drifting
 # apart would silently drop a counter from one path.
@@ -1150,10 +1155,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # by the live key population, not by cumulative traffic.
         self._bytes_by_partition: dict[str, int] = {}
         self._keys_by_partition: dict[str, set[str]] = {}
-        # partition -> sample_id -> field -> wire-in fingerprint. Same
-        # lifetime as ``_bytes_by_partition``: cleared by ``clear_samples``,
-        # so it is bounded by the live key population.
+        # partition -> sample_id -> field -> wire-in fingerprint. Released by
+        # ``clear_samples``, and for the writers that never issue one by
+        # ``_release_cleared_samples``; either way a fingerprint outlives its
+        # sample by no more than one reconciliation.
         self._hash_by_partition: dict[str, dict[str, dict[str, int]]] = {}
+        self._hash_rows_since_reconcile = 0
         self._hash_mismatches_logged = 0
         # Set by ``_emit`` to the inner client's wall time for the op just
         # run, so the wrapping methods can subtract it and bill the rest to
@@ -1420,6 +1427,29 @@ class MetricsDataPlaneClient(DataPlaneClient):
             for name, per_row in digests.items():
                 per_field[name] = per_row[row]
         self._stats.hash_verify.rows_recorded += len(sample_ids)
+        self._hash_rows_since_reconcile += len(sample_ids)
+        if self._hash_rows_since_reconcile >= _HASH_RECONCILE_ROWS:
+            # Re-armed before the call, not after: ``_record_hashes`` swallows
+            # whatever this raises, and a listing that fails on one put fails
+            # on the next, so re-arming after would retry it on every put.
+            self._hash_rows_since_reconcile = 0
+            self._release_cleared_samples(partition_id)
+
+    def _release_cleared_samples(self, partition_id: str) -> None:
+        """Release the accounting for samples the partition no longer holds.
+
+        ``clear_samples`` releases it in the process that issues it, which on
+        the SC path is only ever SC: GenWorker and the value actor put through
+        their own clients and never clear. Reconciling against
+        ``list_sample_ids`` -- metadata-only, and documented for exactly this
+        -- ties their rows to the sample's real lifetime instead. It runs
+        ``_record_clear`` rather than dropping the fingerprints alone, so the
+        byte and key accounting follows the same uids.
+        """
+        live = set(self._inner.list_sample_ids(partition_id))
+        stale = self._hash_by_partition[partition_id].keys() - live
+        if stale:
+            self._record_clear(partition_id, list(stale))
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
         """Compare wire-out fingerprints against what was written. Never raises."""
