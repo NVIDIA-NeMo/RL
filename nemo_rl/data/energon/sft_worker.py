@@ -66,6 +66,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         max_sequence_length: int,
         placement_fingerprint: str,
         packing_algorithm: str | None,
+        max_sequences_per_bin: int | None,
         sequence_length_pad_multiple: int,
         only_unmask_final: bool,
         restored_state: Optional[dict[str, Any]] = None,
@@ -91,6 +92,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             logical_world_size=logical_world_size,
             placement_fingerprint=placement_fingerprint,
             packing_algorithm=packing_algorithm,
+            max_sequences_per_bin=max_sequences_per_bin,
             sequence_length_pad_multiple=sequence_length_pad_multiple,
             only_unmask_final=only_unmask_final,
         )

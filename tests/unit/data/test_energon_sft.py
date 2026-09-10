@@ -271,6 +271,16 @@ def test_qwen_adapter_returns_tokenized_message_log_with_model_inputs():
     )
 
 
+def test_adapter_uses_truncated_length_for_packing() -> None:
+    encoded = _adapter(_FakeQwenProcessor(), max_sequence_length=16).encode(_sample())
+
+    assert encoded.length == sum(
+        len(message["token_ids"]) for message in encoded.message_log
+    )
+    assert encoded.packing_cost == encoded.length
+    assert encoded.packing_cost < 16
+
+
 def test_hf_and_energon_backends_agree_on_the_same_conversation():
     """Both backends feed prepare_sft_batch; the prepared tensors must match.
 
@@ -385,11 +395,7 @@ def test_task_encoder_runs_split_encode_and_batch_lifecycle_methods():
 
     assert encoder.encode_batch(batch) is batch
     assert batch["source_ids"] == ["sample-0"]
-    # Stage 1 does not override select_samples_to_pack, so this falls through to
-    # Energon's base implementation.
-    with pytest.raises(
-        NotImplementedError, match="Packing only effective when overridden"
-    ):
+    with pytest.raises(RuntimeError, match="packing is not configured"):
         encoder.select_samples_to_pack([preencoded])
 
 
@@ -455,7 +461,7 @@ def test_rejected_restore_names_the_settings_that_changed():
         ).load_state_dict(state)
 
 
-def test_energon_config_disables_sequence_packing():
+def test_energon_config_validates_sequence_packing():
     config = EnergonLoaderConfig(model_family="qwen")
     assert config.model_family == "qwen"
     assert config.packing_buffer_size is None
@@ -469,10 +475,15 @@ def test_energon_config_disables_sequence_packing():
         path="/data/prepared", split="train", virtual_epoch_length=10
     )
     assert source.virtual_epoch_length == 10
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig(model_family="qwen", packing_buffer_size=10)
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig(model_family="qwen", max_samples_per_sequence=2)
+    packed = EnergonLoaderConfig(
+        model_family="qwen", packing_buffer_size=10, max_samples_per_sequence=2
+    )
+    assert packed.packing_buffer_size == 10
+    assert packed.max_samples_per_sequence == 2
+    for field in ("packing_buffer_size", "max_samples_per_sequence"):
+        for value in (0, -1):
+            with pytest.raises(ValueError):
+                EnergonLoaderConfig(model_family="qwen", **{field: value})
     with pytest.raises(ValueError):
         EnergonLoaderConfig.model_validate({})
     with pytest.raises(ValueError):
@@ -485,6 +496,9 @@ def _identity(
     batch_size: int = 8,
     shuffle: bool | None = True,
     logical_rank: int = 0,
+    packing_algorithm: str | None = None,
+    max_sequences_per_bin: int | None = None,
+    only_unmask_final: bool = False,
 ) -> dict:
     config = loader_config or EnergonLoaderConfig(model_family="qwen")
     return _loader_identity(
@@ -502,6 +516,10 @@ def _identity(
             "logical_rank": logical_rank,
             "logical_world_size": 2,
         },
+        packing_algorithm=packing_algorithm,
+        max_sequences_per_bin=max_sequences_per_bin,
+        sequence_length_pad_multiple=1,
+        only_unmask_final=only_unmask_final,
     )
 
 
@@ -542,6 +560,27 @@ def test_identity_refuses_a_changed_batch_size_or_shuffle():
         assert _identity_fingerprint(changed) != _identity_fingerprint(baseline)
 
 
+def test_identity_pins_packing_semantics():
+    baseline = _identity(
+        packing_algorithm="greedy_knapsack",
+        max_sequences_per_bin=4,
+    )
+
+    for changed in (
+        _identity(
+            packing_algorithm="balanced_greedy_knapsack",
+            max_sequences_per_bin=4,
+        ),
+        _identity(packing_algorithm="greedy_knapsack", max_sequences_per_bin=2),
+        _identity(
+            packing_algorithm="greedy_knapsack",
+            max_sequences_per_bin=4,
+            only_unmask_final=True,
+        ),
+    ):
+        assert _identity_fingerprint(changed) != _identity_fingerprint(baseline)
+
+
 def test_train_loader_rejects_shuffle_false():
     # get_train_dataset shards by slice and Energon asserts a single slice
     # iterator when it does not shuffle over epochs, so shuffle=false is not a
@@ -560,6 +599,10 @@ def test_train_loader_rejects_shuffle_false():
             logical_rank=0,
             logical_world_size=1,
             placement_fingerprint="same-placement",
+            packing_algorithm=None,
+            max_sequences_per_bin=None,
+            sequence_length_pad_multiple=1,
+            only_unmask_final=False,
         )
 
 

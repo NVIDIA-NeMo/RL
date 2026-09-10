@@ -1,4 +1,16 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Energon-owned selection and materialization of multimodal SFT packs."""
 
@@ -99,6 +111,14 @@ def prepare_packed_sft_batch(
         add_loss_mask_to_message_log(
             logs, roles_to_train_on=["assistant"], only_unmask_final=only_unmask_final
         )
+        templates = {
+            key: value
+            for log in logs
+            for message in log
+            for key, value in message.items()
+            if key not in {"token_ids", "token_loss_mask"}
+            and isinstance(value, torch.Tensor)
+        }
         lengths: list[int] = []
         combined: list[dict[str, Any]] = []
         token_dtype = torch.long
@@ -111,13 +131,6 @@ def prepare_packed_sft_batch(
             token_dtype = tokens.dtype
             length = tokens.shape[0]
             lengths.append(length)
-            templates = {
-                key: value
-                for message in log
-                for key, value in message.items()
-                if key not in {"token_ids", "token_loss_mask"}
-                and isinstance(value, torch.Tensor)
-            }
             for message in log:
                 message["token_loss_mask"] = (
                     message["token_loss_mask"] * sample.loss_multiplier
@@ -152,15 +165,20 @@ def prepare_packed_sft_batch(
             combined.extend(log)
         tail = capacity - sum(pack.source_padded_lengths)
         if tail:
-            combined.append(
+            tail_message = {
+                "role": "padding",
+                "token_ids": torch.full(
+                    (tail,), tokenizer.pad_token_id, dtype=token_dtype
+                ),
+                "token_loss_mask": torch.zeros(tail, dtype=torch.float32),
+            }
+            tail_message.update(
                 {
-                    "role": "padding",
-                    "token_ids": torch.full(
-                        (tail,), tokenizer.pad_token_id, dtype=token_dtype
-                    ),
-                    "token_loss_mask": torch.zeros(tail, dtype=torch.float32),
+                    key: torch.zeros((tail, *value.shape[1:]), dtype=value.dtype)
+                    for key, value in templates.items()
                 }
             )
+            combined.append(tail_message)
         packed_logs.append(combined)
         boundaries.append(
             torch.tensor(

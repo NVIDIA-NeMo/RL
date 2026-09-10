@@ -288,7 +288,9 @@ def _loader_identity(
     shuffle: bool | None,
     topology: dict[str, Any],
     packing_algorithm: str | None,
+    max_sequences_per_bin: int | None,
     sequence_length_pad_multiple: int,
+    only_unmask_final: bool,
 ) -> dict[str, Any]:
     """Describe what a restored loader must still agree with."""
     identity = {
@@ -317,7 +319,9 @@ def _loader_identity(
     if packing_algorithm is not None:
         identity.update(
             packing_algorithm=packing_algorithm,
+            max_sequences_per_bin=max_sequences_per_bin,
             sequence_length_pad_multiple=sequence_length_pad_multiple,
+            only_unmask_final=only_unmask_final,
         )
     return identity
 
@@ -348,6 +352,7 @@ def _task_encoder(
     adapter: Any,
     include_source_ids: bool,
     packing_algorithm: str | None,
+    max_sequences_per_bin: int | None,
     max_sequence_length: int,
     sequence_length_pad_multiple: int,
     tokenizer: Any,
@@ -371,7 +376,7 @@ def _task_encoder(
         get_packer(
             packing_algorithm,
             max_sequence_length,
-            max_sequences_per_bin=loader_config.max_samples_per_sequence,
+            max_sequences_per_bin=max_sequences_per_bin,
         )
         if loader_config.packing_buffer_size is not None
         and packing_algorithm is not None
@@ -403,9 +408,10 @@ def build_energon_sft_loader(
     logical_rank: int,
     logical_world_size: int,
     placement_fingerprint: str,
-    packing_algorithm: str | None = None,
-    sequence_length_pad_multiple: int = 1,
-    only_unmask_final: bool = False,
+    packing_algorithm: str | None,
+    max_sequences_per_bin: int | None,
+    sequence_length_pad_multiple: int,
+    only_unmask_final: bool,
 ) -> EnergonSFTDataLoader:
     """Build one loader for an explicit logical data shard and split."""
     if "energon" not in data_config:
@@ -434,6 +440,7 @@ def build_energon_sft_loader(
         adapter=adapter,
         include_source_ids=True,
         packing_algorithm=packing_algorithm,
+        max_sequences_per_bin=max_sequences_per_bin,
         max_sequence_length=max_sequence_length,
         sequence_length_pad_multiple=sequence_length_pad_multiple,
         tokenizer=processor.tokenizer,
@@ -507,7 +514,9 @@ def build_energon_sft_loader(
                 logical_world_size=logical_world_size,
             ),
             packing_algorithm=packing_algorithm,
+            max_sequences_per_bin=max_sequences_per_bin,
             sequence_length_pad_multiple=sequence_length_pad_multiple,
+            only_unmask_final=only_unmask_final,
         ),
     )
 
