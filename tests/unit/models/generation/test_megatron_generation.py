@@ -355,6 +355,7 @@ basic_megatron_test_config: PolicyConfig = {
             "num_speculative_tokens": 0,
             "logprobs_mode": "processed_logprobs",
             "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
+            "offload_policy_before_refit": False,
             "parsers": [],
             "expose_http_server": False,
         },
