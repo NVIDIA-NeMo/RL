@@ -55,9 +55,9 @@ _UNREGISTER_ATTEMPTS = 3
 _DEFAULT_TIMEOUT_S = 1800.0
 _DEFAULT_MAX_PARALLEL = 64
 
-# An mmap must outlive its Mooncake registration. On a persistent unregister
-# failure, retain it until process teardown instead of letting Python unmap
-# memory that Mooncake or the NIC may still reference.
+# An mmap must outlive its Mooncake registration. On registration errors or a
+# persistent unregister failure, retain it until process teardown instead of
+# letting Python unmap memory that Mooncake or the NIC may still reference.
 _QUARANTINED_BUFFERS: list[mmap.mmap] = []
 
 
@@ -315,6 +315,9 @@ def _registered_buffer(
         )
         raise
     if result != 0:
+        # A failed multi-NIC registration may still retain native registrations.
+        buffer.quarantined = True
+        _QUARANTINED_BUFFERS.append(buffer.payload)
         raise RuntimeError(f"Mooncake buffer registration failed for {label}: {result}")
     try:
         yield buffer.pointer
@@ -1084,11 +1087,7 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         raise RuntimeError("No live Mooncake checkpoint participants")
     assignments = _restore_assignments(entries, participants)
     by_id = {participant.participant_id: participant for participant in participants}
-    expected_restore_endpoints = {
-        entry.key: by_id[participant_id].transport_endpoint
-        for participant_id, assigned in assignments.items()
-        for entry in assigned
-    }
+    current_endpoints = {participant.transport_endpoint for participant in participants}
     requests = [
         _ParticipantRequest(
             by_id[participant_id],
@@ -1126,12 +1125,12 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
     for entry in entries:
         replicas = _complete_memory_replicas(descriptors.get(entry.key))
         if not any(
-            endpoint == expected_restore_endpoints[entry.key] and size == entry.size
+            endpoint in current_endpoints and size == entry.size
             for endpoint, size in replicas
         ):
             raise RuntimeError(
                 f"Restored Mooncake key {entry.key!r} has no COMPLETE memory "
-                "replica on its assigned checkpoint participant"
+                "replica on a current checkpoint participant"
             )
 
 

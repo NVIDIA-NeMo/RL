@@ -307,7 +307,8 @@ def test_train_pump_drives_mcore_training_step(
         )
         adv_est = _FakeAdvEstimator()
         # Rollout manager stub — recovery is disabled for this native rollout test,
-        # but SC still binds the shared data-plane checkpoint barrier at startup.
+        # but SC still binds the shared data-plane checkpoint barrier at startup; the
+        # pump additionally publishes versions and resumes request-deadline clocks.
         rollout_manager = SimpleNamespace(
             _tq_buffer=None,
             recovery_ledger=None,
@@ -315,6 +316,8 @@ def test_train_pump_drives_mcore_training_step(
             set_weight_version=lambda v: ray.get(
                 log.record.remote("set_weight_version", {"version": int(v)})
             ),
+            suspend_request_deadlines=lambda: None,
+            resume_request_deadlines=lambda: None,
         )
 
         master_config = MasterConfig.model_construct(
@@ -366,7 +369,13 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         actor_args = SingleControllerActorArgs(
-            gen_handle=None,
+            # Continuous-serving stub: the pump asks blocks_training() before
+            # every step's trainer GPU work.
+            gen_handle=SimpleNamespace(
+                blocks_training=lambda: False,
+                snapshot_step_metrics=lambda: None,
+                get_step_metrics=lambda: {},
+            ),  # type: ignore[arg-type]
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,  # type: ignore[arg-type]

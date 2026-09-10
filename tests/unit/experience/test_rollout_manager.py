@@ -128,6 +128,7 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
         decode=lambda *_args, **_kwargs: "answer",
     )
     manager._timeouts = SimpleNamespace(generation_s=10.0)
+    manager._deadline_registry = None
     pixel_values = PackedTensor(torch.ones(2, 3, 4, 4), dim_to_pack=0)
     imgs_sizes = PackedTensor(torch.tensor([[4, 4], [4, 4]]), dim_to_pack=0)
     message_log = [
@@ -744,6 +745,24 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
     reward_penalty_config = {"penalize_empty_final_answer": True}
     manager = RolloutManager(**common, reward_penalty_config=reward_penalty_config)
     assert manager._impl._reward_penalty_config is reward_penalty_config
+
+
+@pytest.mark.parametrize("use_nemo_gym", [False, True], ids=["native", "nemo_gym"])
+def test_rollout_manager_hands_its_deadline_registry_to_the_impl(use_nemo_gym):
+    """The controller suspends deadlines through the manager, so the impl must arm
+    its request deadlines on the manager's own registry rather than a private one."""
+    manager = RolloutManager(
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=1,
+        rollout_recovery_config=RolloutRecoveryConfig(),
+        policy_generation=object(),
+        generation_config={"stop_strings": None, "stop_token_ids": None, "top_k": None},
+        use_nemo_gym=use_nemo_gym,
+    )
+
+    assert manager._impl._deadline_registry is manager._request_deadlines
 
 
 def test_rollout_manager_forwards_log_full_result_tables():

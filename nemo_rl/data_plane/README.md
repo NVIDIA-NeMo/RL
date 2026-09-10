@@ -437,6 +437,8 @@ data_plane:
     local_buffer_size:    4294967296   # 4 GiB/process
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
     staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
+    use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024         # persistent MiB per active GDR client
   # observability:                     # NotRequired
   #   enabled: false
 ```
@@ -450,8 +452,22 @@ with no warning either way.
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
   and small runs.
-- **`mooncake_cpu`** — Mooncake transfer engine; higher throughput at
-  scale. Required for multi-node clusters with large bulk volume.
+- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine. By default,
+  tensors transfer through registered CPU staging. Set
+  `mooncake_cpu.use_gdr: true` to let CUDA-initialized clients use
+  TransferQueue's GDR staging path. CPU-only clients, such as a
+  SingleController producer, continue to use CPU RDMA. GDR changes the
+  client-side tensor transfer and staging path; queued objects still reside in
+  Mooncake-managed host-memory segments.
+
+The CPU host staging pool's `staging_buffer_size` is independent of the GDR
+buffer. `gdr_staging_buffer_mb` is the persistent GPU staging capacity per
+active CUDA client and defaults to 1024 MiB. Transfers through that per-client
+buffer are serialized. Aggregate fetches may exceed the buffer and are split
+into groups. In the mixed CPU-producer/GDR-receiver flow used by
+SingleController, however, each individual tensor must currently fit because
+the CPU PUT path does not create the chunk metadata required by an oversized
+GDR GET.
 
 ### Experimental Mooncake storage checkpoints
 
@@ -462,9 +478,8 @@ The existing `checkpointing.enabled=true` and
 `checkpointing.save_data_plane=true` settings enable Mooncake storage save/load
 support through TQ's existing explicit checkpoint API. Resuming a checkpoint
 also prepares this storage mode, even when saving new checkpoints is disabled.
-No additional Mooncake-specific checkpoint setting is needed.
-Ordinary PUTs remain in Mooncake memory and
-perform no checkpoint-related filesystem I/O.
+No additional Mooncake-specific checkpoint setting is needed. Ordinary PUTs
+remain in Mooncake memory and perform no checkpoint-related filesystem I/O.
 
 On `tq.save_checkpoint(...)`, the plugin enumerates every raw Mooncake object
 key referenced by the TQ controller snapshot and maps it to a live client with
@@ -476,12 +491,13 @@ only after every owner has flushed, fsynced, and acknowledged its exact shard.
 Other owners' payload bytes never pass through the coordinator; it writes any
 objects it owns directly, just like the other owners.
 
-SingleController supplies its existing policy/value/teacher, token-capture,
-and finalizer actor handles. Their Ray methods carry checkpoint commands and
-completion metadata only; each method uses its process's existing Mooncake
-store. No checkpoint actors, registry, listener threads, or additional socket
-protocol are created. The calling actor handles its own shard directly, so
-constructor-time restore never waits for an RPC back to itself.
+SingleController supplies its existing policy/value/teacher, generation
+DP-leader (when token capture is enabled), and finalizer actor handles. Their
+Ray methods carry checkpoint commands and completion metadata only; each method
+uses its process's existing Mooncake store. No checkpoint actors, registry,
+listener threads, or additional socket protocol are created. The calling actor
+handles its own shard directly, so constructor-time restore never waits for an
+RPC back to itself.
 
 For runs that save or resume checkpoints, non-actor clients (including the driver) mount
 zero storage capacity: they can still PUT/GET through Mooncake, but cannot own
@@ -494,12 +510,14 @@ the checkpoint rather than silently falling back to centralized copying.
 
 On `tq.load_checkpoint(...)`, the plugin validates the manifest and controller
 key set, balances the durable objects over the currently connected clients,
-and asks those clients to read and verify their assigned Lustre slices. Each
-client upserts into its current preferred Mooncake segment; saved process and
-segment identities are provenance only and are not reused after restart. TQ
-restores controller metadata only after every object has a complete live
-memory replica. No separate Mooncake `storage_root` is configured; the
-explicit TQ checkpoint destination is the persistent location.
+and asks those clients to read and verify their assigned slices on the shared
+filesystem. Each client requests its own Mooncake segment as the preferred
+destination, but Mooncake may place an object on another current participant
+when that segment lacks capacity. Saved process and segment identities are
+provenance only and are not reused after restart. TQ restores controller
+metadata only after every object has a complete, correctly sized memory replica
+on a current checkpoint participant. No separate Mooncake `storage_root` is
+configured; the explicit TQ checkpoint destination is the persistent location.
 
 This module supplies storage capability only. A caller such as Single
 Controller remains responsible for choosing the checkpoint boundary and must

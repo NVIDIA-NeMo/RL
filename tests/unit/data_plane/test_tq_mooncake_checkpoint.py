@@ -752,9 +752,11 @@ def test_owner_distributed_checkpoint_round_trip_uses_current_participants(
     )
 
 
-def test_restore_rejects_an_object_not_placed_on_its_assigned_participant(
+@pytest.mark.parametrize("owner_is_participant", [True, False])
+def test_restore_accepts_only_current_participant_placement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    owner_is_participant: bool,
 ) -> None:
     checkpoint_dir, _, _, _ = _save_distributed_checkpoint(monkeypatch, tmp_path)
     endpoint_a = "10.1.0.1:13301"
@@ -763,12 +765,26 @@ def test_restore_rejects_an_object_not_placed_on_its_assigned_participant(
     managers = _managers(
         restored_cluster,
         [("current-a", endpoint_a), ("current-b", endpoint_b)],
-        store_options={"current-a": {"owner_override": endpoint_b}},
+        store_options={
+            "current-a": {
+                "owner_override": endpoint_b
+                if owner_is_participant
+                else "10.9.9.9:19999"
+            }
+        },
     )
     _wire_participants(monkeypatch, [_participant(manager) for manager in managers])
 
-    with pytest.raises(RuntimeError, match="assigned checkpoint participant"):
+    if not owner_is_participant:
+        with pytest.raises(RuntimeError, match="current checkpoint participant"):
+            _load_storage_checkpoint(managers[0], str(checkpoint_dir))
+    else:
         _load_storage_checkpoint(managers[0], str(checkpoint_dir))
+        assert restored_cluster.objects == _payloads()
+        assert any(
+            endpoint == endpoint_a and restored_cluster.owners[key] == (endpoint_b,)
+            for endpoint, key, _ in restored_cluster.upsert_calls
+        )
 
 
 def test_save_rejects_an_object_without_a_live_memory_owner(
@@ -872,6 +888,36 @@ def test_save_rejects_a_short_owner_get_and_unregisters_the_buffer(
 
     assert all(manager.storage_client._store.registered == {} for manager in managers)
     assert not (checkpoint_dir / "mooncake_storage" / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("raises", [False, True], ids=["error-code", "exception"])
+def test_partial_registration_keeps_the_mapping_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    quarantined_buffers: list[Any],
+    raises: bool,
+) -> None:
+    store = _FakeStore(_FakeCluster({}, {}), "10.0.0.1:12301")
+    buffer = checkpoint_plugin._CheckpointBuffer.allocate(16)
+
+    def partially_register(pointer: int, size: int) -> int:
+        store.registered[pointer] = size
+        if raises:
+            raise RuntimeError("registration failed after the first NIC")
+        return -1
+
+    monkeypatch.setattr(store, "register_buffer", partially_register)
+    try:
+        with pytest.raises(RuntimeError, match="registration failed"):
+            with checkpoint_plugin._registered_buffer(
+                store, buffer, size=16, label="partial registration"
+            ):
+                pytest.fail("checkpoint I/O must not run after registration fails")
+    finally:
+        buffer.close()
+
+    assert quarantined_buffers == [buffer.payload]
+    assert not buffer.payload.closed
+    assert store.registered == {buffer.pointer: 16}
 
 
 def test_save_quarantines_a_buffer_when_unregister_fails(
@@ -1062,7 +1108,6 @@ def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
     owns_segment: bool,
 ) -> None:
     import ray
-
     from transfer_queue.storage.managers import mooncake_manager
     from transfer_queue.storage.managers.base import StorageManagerFactory
 
