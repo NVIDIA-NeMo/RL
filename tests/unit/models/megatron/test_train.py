@@ -39,6 +39,88 @@ pytestmark = pytest.mark.mcore
 class TestModelForward:
     """Tests for model_forward function."""
 
+    @pytest.mark.parametrize("embedding_type", ["rope", "yarn", "none"])
+    @pytest.mark.parametrize("training", [False, True])
+    def test_packed_hybrid_mtp_placeholder_positions(self, embedding_type, training):
+        """Both logprob and training forwards use IDs matching the CP-local input."""
+        from nemo_rl.models.megatron import train
+
+        core_model = train.HybridModel.__new__(train.HybridModel)
+        torch.nn.Module.__init__(core_model)
+        core_model.mtp_process = True
+        core_model.position_embedding_type = embedding_type
+        core_model.embedding = SimpleNamespace(add_position_embedding=False)
+        core_model.train(training)
+        model = MagicMock(return_value=torch.randn(1, 6, 10))
+        data = MagicMock()
+        data.get_multimodal_dict.return_value = {}
+        # The caller already packed and CP-sharded this tensor.
+        input_ids = torch.tensor([[5, 9, 7, 3, 0, 0]], dtype=torch.long)
+        packed = MagicMock()
+
+        with patch.object(train, "unwrap_model", return_value=core_model):
+            output = train.model_forward(
+                model, data, input_ids, None, None, packed_seq_params=packed
+            )
+
+        positions = model.call_args.kwargs["position_ids"]
+        assert positions.shape == input_ids.shape
+        assert positions.dtype == input_ids.dtype
+        assert positions.device == input_ids.device
+        assert torch.count_nonzero(positions).item() == 0
+        assert model.call_args.kwargs["input_ids"] is input_ids
+        assert model.call_args.kwargs["packed_seq_params"] is packed
+        assert output is model.return_value
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "existing",
+            "unpacked",
+            "no_mtp",
+            "absolute",
+            "other",
+            "subclass",
+            "multimodal",
+        ],
+    )
+    def test_placeholder_positions_leave_other_paths_unchanged(self, case):
+        from nemo_rl.models.megatron import train
+
+        class OtherHybridModel(train.HybridModel):
+            pass
+
+        model_cls = OtherHybridModel if case == "subclass" else train.HybridModel
+        core_model = model_cls.__new__(model_cls)
+        torch.nn.Module.__init__(core_model)
+        core_model.mtp_process = case != "no_mtp"
+        core_model.position_embedding_type = (
+            "learned_absolute" if case == "absolute" else "rope"
+        )
+        core_model.embedding = SimpleNamespace(
+            add_position_embedding=case == "absolute"
+        )
+        if case == "other":
+            core_model = torch.nn.Identity()
+        input_ids = torch.tensor([[2, 4, 6]])
+        positions = (
+            torch.tensor([[0, 1, 2]]) if case in ("existing", "multimodal") else None
+        )
+        packed = None if case == "unpacked" else MagicMock()
+        model = MagicMock(return_value=torch.randn(1, 3, 10))
+        data = MagicMock()
+        data.get_multimodal_dict.return_value = (
+            {"pixel_values": torch.ones(1)} if case == "multimodal" else {}
+        )
+
+        with patch.object(train, "unwrap_model", return_value=core_model):
+            train.model_forward(
+                model, data, input_ids, positions, None, packed_seq_params=packed
+            )
+
+        expected = None if case == "multimodal" else positions
+        assert model.call_args.kwargs["position_ids"] is expected
+
     def test_model_forward_basic(self):
         """Test basic model_forward without multimodal data."""
         from nemo_rl.models.megatron.train import model_forward
