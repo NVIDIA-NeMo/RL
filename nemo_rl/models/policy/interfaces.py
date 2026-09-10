@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import Any, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -24,9 +24,17 @@ from nemo_rl.utils.timer import Timer
 
 
 class LogprobOutputSpec(TypedDict):
-    """logprobs: Tensor of log probabilities."""
+    """logprobs: Tensor of log probabilities.
+
+    token_mask: Optional. Present only when top-k/top-p filtering is enabled. The input
+    data["token_mask"] AND-ed with the finite-position mask returned by
+    mask_out_neg_inf_logprobs. Callers (e.g. GRPO) MUST write this back into
+    train_data["token_mask"] so the loss skips positions where the training-policy
+    logits gave -inf for the vLLM-sampled token (top-k/top-p mismatch).
+    """
 
     logprobs: torch.Tensor
+    token_mask: NotRequired[torch.Tensor]
 
 
 class ReferenceLogprobOutputSpec(TypedDict):
