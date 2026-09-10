@@ -500,6 +500,13 @@ class TestTrainMicrobatch:
             is model_slices_context_parallel_inputs
         )
         assert kwargs["mtp_enabled"] is True
+        # model_forward needs the same flag to keep position_ids on multimodal
+        # batches for caller-packed models, so it must reach the forward too.
+        mfb_kwargs = mock_module_symbols["mfb"].call_args.kwargs
+        assert (
+            mfb_kwargs["model_slices_context_parallel_inputs"]
+            is model_slices_context_parallel_inputs
+        )
 
     def test_passes_placeholder_n_one_to_loss(self, mock_module_symbols):
         """The N=1 trick: loss must be called with global_valid_*=1 so it

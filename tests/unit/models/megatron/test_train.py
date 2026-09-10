@@ -248,8 +248,18 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["fp32_output"] is False
 
-    def test_model_forward_clears_position_ids_for_multimodal(self):
-        """Test model_forward sets position_ids to None for multimodal data."""
+    @pytest.mark.parametrize(
+        ("model_slices_context_parallel_inputs", "keeps_position_ids"),
+        [
+            pytest.param(False, False, id="vlm-derives-own-positions"),
+            pytest.param(True, True, id="caller-packed-model-keeps-positions"),
+        ],
+    )
+    def test_model_forward_position_ids_for_multimodal(
+        self, model_slices_context_parallel_inputs, keeps_position_ids
+    ):
+        """Multimodal batches drop caller position_ids unless the model consumes
+        caller-packed inputs (Nemotron Omni), whose MTP block needs them."""
         from nemo_rl.models.megatron.train import model_forward
 
         mock_model = MagicMock()
@@ -259,17 +269,22 @@ class TestModelForward:
         mock_data_dict.get_multimodal_dict.return_value = {
             "images": torch.randn(1, 3, 224, 224)
         }
+        position_ids = torch.tensor([[0, 1, 2]])
 
         model_forward(
             model=mock_model,
             data_dict=mock_data_dict,
             input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
-            position_ids=torch.tensor([[0, 1, 2]]),
+            position_ids=position_ids,
             attention_mask=torch.ones(1, 3),
+            model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
         )
 
         call_kwargs = mock_model.call_args[1]
-        assert call_kwargs["position_ids"] is None
+        if keeps_position_ids:
+            assert call_kwargs["position_ids"] is position_ids
+        else:
+            assert call_kwargs["position_ids"] is None
 
 
 class TestApplyTemperatureScaling:
