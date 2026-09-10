@@ -14,7 +14,7 @@
 
 import os
 import warnings
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
@@ -264,9 +264,30 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         quantization_ignore_patterns = [
             pattern.strip() for pattern in quantization_ignore_patterns
         ]
+
+    num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
+    num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = (
+        get_text_config()
+        if callable(get_text_config)
+        else getattr(config, "text_config", config)
+    )
+    num_hidden_layers = text_config.num_hidden_layers
+    for field_name, value in (
+        ("num_first_layers_in_bf16", num_first_layers_in_bf16),
+        ("num_last_layers_in_bf16", num_last_layers_in_bf16),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{field_name} must be an integer")
+        if not 0 <= value <= num_hidden_layers:
+            raise ValueError(
+                f"{field_name} must be between 0 and {num_hidden_layers}, got {value}"
+            )
+
     fp8_config_kwargs = {
-        "num_first_layers_in_bf16": vllm_cfg.get("num_first_layers_in_bf16", 0),
-        "num_last_layers_in_bf16": vllm_cfg.get("num_last_layers_in_bf16", 0),
+        "num_first_layers_in_bf16": num_first_layers_in_bf16,
+        "num_last_layers_in_bf16": num_last_layers_in_bf16,
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
@@ -301,15 +322,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         monkey_patch_vllm_ray_executor(global_fp8_config)
 
     # create fp8 kwargs for vllm's LLM(...)
-    num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
-    num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
     if global_fp8_config.is_mx:
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [name for name, _ in model.named_parameters()]
 
         bf16_params = []
@@ -321,8 +340,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             layers = [
                 l
                 for l in range(
-                    config.num_hidden_layers - num_last_layers_in_bf16,
-                    config.num_hidden_layers,
+                    num_hidden_layers - num_last_layers_in_bf16,
+                    num_hidden_layers,
                 )
             ]
             bf16_params.extend(_get_params_in_layers(param_names, layers))
@@ -338,7 +357,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         )
     if quantization_ignored_layer_kws:
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [
             f"model.{name}".removesuffix(".weight").replace(
                 "model.backbone.", "backbone."
@@ -607,15 +626,17 @@ def get_quantized_weight_iterator(
 
 
 def load_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], model_runner: Any
+    weights: Iterable[tuple[str, torch.Tensor]],
+    model_runner: Any,
+    *,
+    model_load_weights: Callable[..., object] | None = None,
 ) -> None:
     """Quantize weights for the legacy direct model-loading path."""
-    # Finally load the weights into vllm
-    model_runner.model.load_weights(
+    if model_load_weights is None:
+        model_load_weights = model_runner.model.load_weights
+    model_load_weights(
         get_quantized_weight_iterator(
-            weights,
-            model_runner,
-            refit_with_reload_api=False,
+            weights, model_runner, refit_with_reload_api=False
         )
     )
 
