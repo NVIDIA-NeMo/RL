@@ -251,11 +251,18 @@ def _skip_prev_logprobs(master_config: Any) -> bool:
     """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
 
     Mirrors the predicate in ``grpo_train``: ``force_on_policy_ratio`` with no
-    ``seq_logprob_error_threshold`` skips the student logprob pass.
+    ``seq_logprob_error_threshold`` skips the student logprob pass. GRPO can
+    also evaluate that threshold in the training loss without this pass.
     """
     force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
     seq_logprob_error_threshold = master_config.grpo.seq_logprob_error_threshold
-    return bool(force_on_policy_ratio and seq_logprob_error_threshold is None)
+    return bool(
+        force_on_policy_ratio
+        and (
+            seq_logprob_error_threshold is None
+            or master_config.grpo.seq_logprob_error_in_loss
+        )
+    )
 
 
 def assert_prev_logprobs_available(master_config: Any) -> None:

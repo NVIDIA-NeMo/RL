@@ -29,7 +29,11 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.utils import (
+    calculate_kl,
+    compute_seq_logprob_errors,
+    masked_mean,
+)
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
     build_exact_token_map,
@@ -172,8 +176,8 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- On-policy ---
     # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
     use_on_policy_kl_approximation: bool = False
-    # If True, force the ratio to 1.0 for truly on-policy behavior,
-    # eliminating any importance sampling effects.
+    # If True, force the PPO ratio to 1.0 while preserving its gradient.
+    # Generation-to-trainer importance sampling remains independently enabled.
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
@@ -251,7 +255,21 @@ class ClippedPGLossFn(LossFunction):
         cfg: ClippedPGLossConfig,
         use_fused_linear_logprobs: bool = False,
         opd_full: Optional["OnPolicyDistillationFullConfig"] = None,
+        *,
+        seq_logprob_error_threshold: float | None = None,
     ):
+        # Populated by GRPO setup only for the opt-in single-forward path.
+        # The worker must rescale accumulated gradients to the surviving-token
+        # count before clipping/stepping; a per-microbatch denominator is wrong.
+        self.seq_logprob_error_threshold = seq_logprob_error_threshold
+        if seq_logprob_error_threshold is not None:
+            if not cfg.force_on_policy_ratio or not cfg.token_level_loss:
+                raise ValueError(
+                    "In-loss sequence filtering requires force_on_policy_ratio "
+                    "and token_level_loss"
+                )
+            if cfg.positive_example_nll_weight != 0:
+                raise ValueError("In-loss sequence filtering does not support NLL")
         # When True, the model forward is patched to return precomputed next-token
         # logprobs (via chunked linear CE fusion) instead of full logits. This is
         # consumed by prepare_loss_input, which short-circuits the logits->logprobs
@@ -385,6 +403,9 @@ class ClippedPGLossFn(LossFunction):
             ),
             # Raw count — the downstream per-microbatch sum IS the value.
             "num_valid_samples": MetricNormalizer.NONE,
+            "seq_logprob_error_valid_tokens": MetricNormalizer.NONE,
+            "seq_logprob_error_valid_seqs": MetricNormalizer.NONE,
+            "num_masked_seqs_by_logprob_error": MetricNormalizer.NONE,
             # Normalized by the microbatch's own correct-token count, not a
             # global factor — already a per-microbatch mean.
             "positive_nll_loss": MetricNormalizer.NONE,
@@ -492,6 +513,38 @@ class ClippedPGLossFn(LossFunction):
         # This avoids computing prev_logprobs upstream
         if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
+
+        seq_error_metrics = {}
+        if self.seq_logprob_error_threshold is not None:
+            errors, _ = compute_seq_logprob_errors(
+                policy_logprobs=curr_logprobs.detach(),
+                generation_logprobs=generation_logprobs,
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+            )
+            filtered_sample_mask = sample_mask * (
+                errors <= self.seq_logprob_error_threshold
+            ).to(sample_mask.dtype)
+            seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
+                (sample_mask - filtered_sample_mask).sum().item()
+            )
+            sample_mask = filtered_sample_mask
+            mask = token_mask * sample_mask.unsqueeze(-1)
+            seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
+            seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
+            # A rejected nonfinite logprob must not poison a zero-weight loss.
+            curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
+            prev_logprobs = curr_logprobs.detach()
+            generation_logprobs = torch.where(mask.bool(), generation_logprobs, 0.0)
+            if self.reference_policy_kl_penalty != 0:
+                curr_logprobs_unfiltered = torch.where(
+                    mask.bool(),
+                    data.get("curr_logprobs_unfiltered", next_token_logprobs),
+                    0.0,
+                )
+                reference_policy_logprobs = torch.where(
+                    mask.bool(), data["reference_policy_logprobs"][:, 1:], 0.0
+                )
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -875,6 +928,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
+                **seq_error_metrics,
                 "positive_nll_loss": nll_loss.item(),
             },
         )

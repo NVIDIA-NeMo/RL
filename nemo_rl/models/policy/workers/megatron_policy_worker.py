@@ -50,7 +50,8 @@ from megatron.core.utils import get_model_config, unwrap_model
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, rescale_loss_metrics
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
@@ -974,6 +975,66 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
+    def _normalize_in_loss_seq_filter(
+        self,
+        loss_fn: ClippedPGLossFn,
+        losses_reduced: list[dict[str, Any]],
+        *,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        eval_mode: bool,
+    ) -> tuple[list[dict[str, Any]], torch.Tensor, torch.Tensor]:
+        """Normalize one complete optimizer batch after in-loss filtering.
+
+        Forward/backward used the pre-filter global count. All microbatches
+        have now finished, so sum survivor counts over DP, broadcast them to
+        every PP stage, and correct gradients before the optimizer clips them.
+        CP/TP replicas must not be counted as additional samples.
+        """
+        metrics = losses_reduced
+        counts = torch.tensor(
+            [
+                sum(m["seq_logprob_error_valid_seqs"] for m in metrics),
+                sum(m["seq_logprob_error_valid_tokens"] for m in metrics),
+            ],
+            dtype=torch.float64,
+            device=global_valid_toks.device,
+        )
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            torch.distributed.all_reduce(
+                counts, group=parallel_state.get_data_parallel_group()
+            )
+        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+            torch.distributed.broadcast(
+                counts,
+                src=parallel_state.get_pipeline_model_parallel_last_rank(),
+                group=parallel_state.get_pipeline_model_parallel_group(),
+            )
+        kept_seqs, kept_toks = counts.unbind()
+        if kept_toks.item() == 0 and not eval_mode:
+            raise RuntimeError(
+                "No valid response tokens remain after in-loss sequence-logprob "
+                "filtering; refusing an empty optimizer update. Check "
+                "grpo.seq_logprob_error_threshold."
+            )
+        token_factor = float((global_valid_toks / kept_toks.clamp(min=1)).item())
+        sequence_factor = float((global_valid_seqs / kept_seqs.clamp(min=1)).item())
+        if not eval_mode:
+            # Finish any overlap on the comm stream before touching the reduced
+            # gradient buffers (including distributed-optimizer gradient shards).
+            torch.cuda.synchronize()
+            self.model.scale_gradients(token_factor)
+        metrics = [
+            rescale_loss_metrics(
+                m,
+                loss_fn.metric_normalizations,
+                token_factor=token_factor,
+                sequence_factor=sequence_factor,
+            )
+            for m in metrics
+        ]
+        return metrics, kept_seqs, kept_toks
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -1101,6 +1162,7 @@ class MegatronPolicyWorkerImpl(
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
+                losses_reduced: list[dict[str, Any]] = []
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero. For MXFP8 overlap eval, the param and
                     # grad buffers are shared and pre-hooks are disabled above.
@@ -1169,6 +1231,22 @@ class MegatronPolicyWorkerImpl(
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     torch.cuda.empty_cache()
+
+                if (
+                    isinstance(loss_fn, ClippedPGLossFn)
+                    and loss_fn.seq_logprob_error_threshold is not None
+                ):
+                    (
+                        losses_reduced,
+                        global_valid_seqs,
+                        global_valid_toks,
+                    ) = self._normalize_in_loss_seq_filter(
+                        loss_fn,
+                        losses_reduced,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        eval_mode=eval_mode,
+                    )
 
                 # Update parameters.
                 if not eval_mode:

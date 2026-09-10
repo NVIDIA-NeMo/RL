@@ -58,6 +58,25 @@ class LossInputType(enum.Enum):
     DRAFT = "draft"
 
 
+def rescale_loss_metrics(
+    metrics: dict[str, Any],
+    normalizers: dict[str, MetricNormalizer],
+    *,
+    token_factor: float,
+    sequence_factor: float,
+) -> dict[str, Any]:
+    """Change global loss denominators while preserving raw counts and extrema."""
+    factors = {
+        MetricNormalizer.TOKENS: token_factor,
+        MetricNormalizer.SEQUENCES: sequence_factor,
+        MetricNormalizer.NONE: 1.0,
+    }
+    return {
+        key: value * factors[normalizers[key]] if key in normalizers else value
+        for key, value in metrics.items()
+    }
+
+
 class LossFunction(Protocol):
     """Signature for loss functions used in reinforcement learning algorithms.
 

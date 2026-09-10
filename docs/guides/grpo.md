@@ -557,6 +557,53 @@ By multiplying the first term of the loss function by the importance weights $\f
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
 
+#### Single-forward sequence-logprob filtering
+
+For non-streaming Megatron GRPO, enable `grpo.seq_logprob_error_in_loss`
+to apply the absolute sequence-logprob error threshold inside the training
+loss. This avoids the standalone policy-logprob forward even when
+`grpo.seq_logprob_error_threshold` is set:
+
+```yaml
+grpo:
+  seq_logprob_error_threshold: 2.0
+  seq_logprob_error_in_loss: true
+  skip_reference_policy_logprobs_calculation: true
+loss_fn:
+  force_on_policy_ratio: true
+  token_level_loss: true
+  reference_policy_kl_penalty: 0.0
+```
+
+The default is `false`, retaining the existing pre-training check. This mode
+requires the `grpo` advantage estimator and one optimizer update per rollout
+batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous
+and legacy asynchronous training, including synchronous data-plane training,
+sequence packing, and gradient accumulation. SingleController is rejected
+because its advantage baselines depend on the earlier filtering decision.
+DTensor, KL-in-reward, MTP, draft training, positive-example NLL, and distillation
+are not supported by this mode. A reference-model forward is still needed if
+reference KL is enabled; the example disables it.
+
+The loss computes the same mean `exp(abs(policy_logprob - generation_logprob))`
+over valid response tokens, using detached logprobs from the training forward.
+Rejected sequences contribute zero loss but are still processed by the batched
+forward/backward. The worker sums survivor counts over every microbatch and DP
+rank, then rescales accumulated gradients before gradient clipping and the
+optimizer step. Thus the denominator excludes threshold-rejected tokens,
+regardless of how sequences were packed. Existing `seq-mask-tis` remains active:
+TIS-only failures still count in that denominator. An optimizer batch with no
+surviving response tokens raises an error before the optimizer or scheduler
+updates.
+
+Loss-local filtering does not alter the rollout tensors or reward-group
+advantages. Because it evaluates the training forward rather than a separate
+inference forward, FP8 scale history, packing, and other numerical differences
+can change which sequences pass. Bitwise equivalence is not expected. The
+training metrics report `num_masked_seqs_by_logprob_error`,
+`seq_logprob_error_valid_tokens`, and `seq_logprob_error_valid_seqs`; separate-pass
+sequence-error summary metrics are omitted rather than reported as placeholders.
+
 #### Overlong Filtering
 
 This feature is controlled by the parameter `overlong_filtering`. It filters out sequences that exceed a predefined maximum length, helping maintain computational efficiency and model stability. When `overlong_filtering=True`, samples that reach `max_total_sequence_length` without producing an end-of-text token are excluded from loss computation. This reduces noise from penalizing generations that may be high-quality but exceed the sequence length limit.
