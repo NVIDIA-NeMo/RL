@@ -281,7 +281,17 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     and falls through to ``get_open_port()`` — straight back to ``VLLM_PORT``.
     That is exactly the port the MessageQueue takes. See RL-1104.
 
-    Returns without raising when the snippet is missing, but logs at warning
+    vLLM 0.29 fixes the race upstream (vllm-project/vllm#53666, #50969): the
+    rank-0 actor now binds the TCPStore itself, on a kernel-assigned port, and
+    *holds* that socket (``self._dist_init_store = store``) until
+    ``init_process_group`` reuses it, so there is no probe/bind window for the
+    MessageQueue to land in. That is not the TOCTOU pattern the reserved band
+    guards against (the port is never released between selection and use), and
+    ``_select_tcpstore_port`` no longer exists to patch. When that upstream
+    marker is present this function logs at info level and leaves the file
+    alone.
+
+    Returns without raising when neither form is found, but logs at warning
     level so a silent no-op is visible in worker logs.
     """
     try:
@@ -293,6 +303,9 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
         )
         return
 
+    # vLLM >= 0.29: RayWorkerV2.create_dist_init_method binds and keeps the
+    # TCPStore before publishing its port (vllm-project/vllm#50969).
+    upstream_fix_marker = "self._dist_init_store = store"
     marker = "start_port=envs.VLLM_PORT + 32"
     old_snippet = (
         "        if local_dp_rank is None:\n            return get_open_port()\n"
@@ -325,6 +338,12 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if marker in content:
             logger.info("vLLM RayExecutorV2 TCPStore port patch already applied.")
+            return
+        if upstream_fix_marker in content:
+            logger.info(
+                "vLLM binds the RayExecutorV2 TCPStore before publishing its port "
+                "(vllm-project/vllm#50969); NeMo-RL TCPStore port patch not needed."
+            )
             return
 
         if old_snippet not in content:
