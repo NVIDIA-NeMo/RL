@@ -1452,28 +1452,42 @@ class TestApplyPrecisionConfig:
         assert len(warning_records) == 0
         mock_load_recipe.assert_called_once_with(str(recipe_file))
 
-    def test_fp8_configuration(self):
+    @pytest.mark.parametrize(
+        ("fp8_recipe", "fp8_quantizer_factory"),
+        [
+            ("default", None),
+            ("custom", "test_quantizers.create_quantizers"),
+        ],
+        ids=["factory-absent", "factory-present"],
+    )
+    def test_fp8_configuration(
+        self, fp8_recipe: str, fp8_quantizer_factory: str | None
+    ) -> None:
         """Test FP8 configuration."""
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
         model_cfg = MagicMock()
+        fp8_cfg = {
+            "enabled": True,
+            "fp8": "e4m3",
+            "fp8_recipe": fp8_recipe,
+            "fp8_param": False,
+        }
+        if fp8_quantizer_factory is not None:
+            fp8_cfg["fp8_quantizer_factory"] = fp8_quantizer_factory
         config = {
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
-                "fp8_cfg": {
-                    "enabled": True,
-                    "fp8": "e4m3",
-                    "fp8_recipe": "default",
-                    "fp8_param": False,
-                },
+                "fp8_cfg": fp8_cfg,
             }
         }
 
         _apply_precision_config(model_cfg, config, torch.bfloat16)
 
         assert model_cfg.fp8 == "e4m3"
-        assert model_cfg.fp8_recipe == "default"
+        assert model_cfg.fp8_recipe == fp8_recipe
         assert model_cfg.fp8_param is False
+        assert model_cfg.fp8_quantizer_factory == fp8_quantizer_factory
 
     def test_fp4_configuration_uses_nvfp4_parameter_defaults(self):
         """Apply NVFP4 defaults without repeating them in the recipe."""
@@ -2029,48 +2043,6 @@ class TestApplyPerformanceConfig:
             _apply_performance_config(model_cfg, config)
 
         assert "activation_func must be set" in str(exc_info.value)
-
-    @pytest.mark.parametrize(
-        ("fp8_recipe", "fp8_quantizer_factory"),
-        [
-            ("default", None),
-            ("custom", "test_quantizers.create_quantizers"),
-        ],
-        ids=["factory-absent", "factory-present"],
-    )
-    def test_fp8_configuration(
-        self, fp8_recipe: str, fp8_quantizer_factory: str | None
-    ) -> None:
-        """Test FP8 configuration."""
-        from nemo_rl.models.megatron.setup import _apply_performance_config
-
-        model_cfg = MagicMock()
-        model_cfg.gated_linear_unit = True
-        fp8_cfg = {
-            "enabled": True,
-            "fp8": "e4m3",
-            "fp8_recipe": fp8_recipe,
-            "fp8_param": False,
-        }
-        if fp8_quantizer_factory is not None:
-            fp8_cfg["fp8_quantizer_factory"] = fp8_quantizer_factory
-        config = {
-            "megatron_cfg": {
-                "activation_checkpointing": False,
-                "apply_rope_fusion": False,
-                "bias_activation_fusion": False,
-                "gradient_accumulation_fusion": False,
-                "use_fused_weighted_squared_relu": False,
-                "fp8_cfg": fp8_cfg,
-            }
-        }
-
-        _apply_performance_config(model_cfg, config)
-
-        assert model_cfg.fp8 == "e4m3"
-        assert model_cfg.fp8_recipe == fp8_recipe
-        assert model_cfg.fp8_param is False
-        assert model_cfg.fp8_quantizer_factory == fp8_quantizer_factory
 
     def test_fine_grained_activation_offloading_enabled(self):
         """Test happy path: enabled with non-empty offload_modules list."""
