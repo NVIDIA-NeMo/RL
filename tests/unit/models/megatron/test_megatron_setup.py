@@ -889,17 +889,22 @@ class TestApplyMoeConfig:
         megatron_cfg.validate.assert_called_once_with()
         assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is True
 
+    @pytest.mark.parametrize(
+        "padding_attr",
+        [
+            "moe_hybridep_pad_uneven_dispatch_inputs",
+            "moe_hybridep_pad_variable_tokens",
+        ],
+    )
     @pytest.mark.parametrize("prepad_packed_inputs", [None, False])
     def test_hybridep_packed_inputs_fall_back_to_dispatch_padding(
-        self, prepad_packed_inputs
+        self, prepad_packed_inputs, padding_attr
     ):
         from nemo_rl.models.megatron.hybridep import (
             configure_hybridep_packed_input_padding,
         )
 
-        model_cfg = SimpleNamespace(
-            moe_hybridep_pad_uneven_dispatch_inputs=False,
-        )
+        model_cfg = SimpleNamespace(**{padding_attr: False})
         config = self._base_moe_cfg(
             expert_model_parallel_size=8,
             moe_flex_dispatcher_backend="hybridep",
@@ -912,7 +917,7 @@ class TestApplyMoeConfig:
 
         configure_hybridep_packed_input_padding(model_cfg, config)
 
-        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is True
+        assert getattr(model_cfg, padding_attr) is True
 
     def test_hybridep_packed_inputs_require_mcore_padding_support(self):
         from nemo_rl.models.megatron.hybridep import (
@@ -929,6 +934,19 @@ class TestApplyMoeConfig:
 
         with pytest.raises(RuntimeError, match="does not support uneven-input padding"):
             configure_hybridep_packed_input_padding(model_cfg, config)
+
+    def test_hybridep_padding_owner_updates_all_supported_fields(self):
+        from nemo_rl.models.megatron.hybridep import set_hybridep_dispatch_padding
+
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=True,
+            moe_hybridep_pad_variable_tokens=True,
+        )
+
+        set_hybridep_dispatch_padding(model_cfg, enabled=False)
+
+        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is False
+        assert model_cfg.moe_hybridep_pad_variable_tokens is False
 
     def test_hybridep_input_prepadding_requires_flex_dispatcher(self, monkeypatch):
         from nemo_rl.models.megatron.setup import _apply_moe_config

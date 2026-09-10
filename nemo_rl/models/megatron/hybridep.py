@@ -25,11 +25,32 @@ from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 
 
+_HYBRIDEP_DISPATCH_PADDING_FIELDS = (
+    "moe_hybridep_pad_uneven_dispatch_inputs",
+    "moe_hybridep_pad_variable_tokens",
+)
+
+
 def uses_hybridep_flex_dispatcher(megatron_cfg: Mapping[str, object]) -> bool:
     return (
         megatron_cfg.get("moe_token_dispatcher_type") == "flex"
         and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
     )
+
+
+def set_hybridep_dispatch_padding(model_cfg: Any, *, enabled: bool) -> None:
+    supported_fields = [
+        field
+        for field in _HYBRIDEP_DISPATCH_PADDING_FIELDS
+        if hasattr(model_cfg, field)
+    ]
+    if enabled and not supported_fields:
+        raise RuntimeError(
+            "This Megatron-Core version does not support uneven-input padding "
+            "for HybridEP packed sequences."
+        )
+    for field in supported_fields:
+        setattr(model_cfg, field, enabled)
 
 
 def configure_hybridep_packed_input_padding(
@@ -66,13 +87,7 @@ def configure_hybridep_packed_input_padding(
     if not (sequence_packing_enabled and uses_hybridep_flex_dispatcher(megatron_cfg)):
         return
 
-    padding_attr = "moe_hybridep_pad_uneven_dispatch_inputs"
-    if not hasattr(model_cfg, padding_attr):
-        raise RuntimeError(
-            "This Megatron-Core version does not support uneven-input padding "
-            "for HybridEP packed sequences."
-        )
-    setattr(model_cfg, padding_attr, True)
+    set_hybridep_dispatch_padding(model_cfg, enabled=True)
 
 
 def _get_hybridep_aligned_seq_len(
