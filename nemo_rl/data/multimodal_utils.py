@@ -22,7 +22,7 @@ from collections.abc import Sequence
 from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, TypedDict, Union
 
 import requests
 import torch
@@ -348,6 +348,18 @@ def _shared_preprocess_spec(
     return first
 
 
+class PackedTensorBroadcastMetadata(TypedDict):
+    dtype: str
+    source_device: str
+    shapes: list[Optional[tuple[int, ...]]]
+    dim_to_pack: int
+    preprocess_mode: Optional[str]
+    preprocess_kwargs: dict[str, Any]
+    row_offsets: Optional[list[int]]
+    segment_indices: Optional[list[int]]
+    segment_provenance: Optional[list[bytes]]
+
+
 class PackedTensor:
     """A logical batch of rows backed by packable tensor segments.
 
@@ -469,6 +481,79 @@ class PackedTensor:
         self.__dict__.setdefault("_row_offsets", None)
         self.__dict__.setdefault("_segment_indices", None)
         self.__dict__.setdefault("_segment_provenance", None)
+
+    def broadcast_parts(
+        self, device: Any
+    ) -> tuple[PackedTensorBroadcastMetadata, torch.Tensor]:
+        """Coalesce physical segments for a tensor-native replica broadcast."""
+        tensors = [tensor for tensor in self.tensors if tensor is not None]
+        dtype = tensors[0].dtype if tensors else torch.uint8
+        source_device = tensors[0].device if tensors else torch.device(device)
+        if any(tensor.dtype != dtype for tensor in tensors):
+            raise TypeError("PackedTensor segments must have one dtype for broadcast.")
+        if any(tensor.device != source_device for tensor in tensors):
+            raise TypeError(
+                "PackedTensor segments must be on one device for broadcast."
+            )
+        payload = (
+            torch.cat([tensor.to(device).contiguous().view(-1) for tensor in tensors])
+            if tensors
+            else torch.empty(0, dtype=dtype, device=device)
+        )
+        metadata: PackedTensorBroadcastMetadata = {
+            "dtype": str(dtype),
+            "source_device": str(source_device),
+            "shapes": [
+                None if tensor is None else tuple(tensor.shape)
+                for tensor in self.tensors
+            ],
+            "dim_to_pack": self.dim_to_pack,
+            "preprocess_mode": self.preprocess_mode,
+            "preprocess_kwargs": dict(self.preprocess_kwargs),
+            "row_offsets": (
+                None if self._row_offsets is None else list(self._row_offsets)
+            ),
+            "segment_indices": (
+                None if self._segment_indices is None else list(self._segment_indices)
+            ),
+            "segment_provenance": (
+                None
+                if self._segment_provenance is None
+                else list(self._segment_provenance)
+            ),
+        }
+        return metadata, payload
+
+    @classmethod
+    def from_broadcast_parts(
+        cls, metadata: PackedTensorBroadcastMetadata, payload: torch.Tensor
+    ) -> "PackedTensor":
+        """Rebuild a PackedTensor from :meth:`broadcast_parts` output."""
+        tensors: list[Optional[torch.Tensor]] = []
+        offset: int = 0
+        for shape in metadata["shapes"]:
+            if shape is None:
+                tensors.append(None)
+                continue
+            numel: int = 1
+            for dimension in shape:
+                numel *= dimension
+            tensors.append(payload.narrow(0, offset, numel).view(shape))
+            offset += numel
+        if offset != payload.numel():
+            raise ValueError(
+                f"PackedTensor broadcast metadata describes {offset} elements, "
+                f"but the payload has {payload.numel()}."
+            )
+        return cls(
+            tensors,
+            metadata["dim_to_pack"],
+            preprocess_mode=metadata["preprocess_mode"],
+            preprocess_kwargs=metadata["preprocess_kwargs"],
+            _row_offsets=metadata["row_offsets"],
+            _segment_indices=metadata["segment_indices"],
+            _segment_provenance=metadata["segment_provenance"],
+        )
 
     @property
     def _preprocess_spec(self) -> dict[str, Any]:
