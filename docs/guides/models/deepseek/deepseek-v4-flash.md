@@ -5,8 +5,10 @@ AutoModel training backend and vLLM generation.
 
 > [!IMPORTANT]
 > **Status: Functionally Ready.** The reference recipe has been validated with
-> an end-to-end multi-node run. Its smoke test is manual-only because it
-> requires a 16-node H100 allocation. This is not a long-run convergence claim.
+> an end-to-end colocated run on 16 H100 nodes. Its five-step smoke test is
+> registered in the recurring nightly suite. This is not a long-run convergence
+> claim; see [Known Limitations](#known-limitations) for precision alignment and
+> hardware coverage.
 
 ## Support Status
 
@@ -31,6 +33,8 @@ AutoModel training backend and vLLM generation.
 - **Sequence length**: 1,024 prompt tokens plus up to 2,048 response tokens,
   for a maximum total sequence length of 3,072.
 - **Reference allocation**: 16 nodes with 8 H100 GPUs per node.
+- **Deployment**: Colocated training and generation on the same GPUs. Only
+  this deployment on H100 has been tested.
 - **MTP**: Disabled by setting `num_nextn_predict_layers: 0`.
 
 Recipe YAML files under `examples/configs/recipes/` are the source of truth for
@@ -79,8 +83,8 @@ The reference recipe enables W&B logging. If W&B is not configured, pass
 
 The associated
 [`grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.sh`](../../../../tests/test_suites/llm/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.sh)
-test runs two training steps. It is disabled in the recurring test suite and is
-intended for manual validation on a matching allocation.
+test runs five training steps and is registered as a recurring nightly
+functional test in [`nightly.txt`](../../../../tests/test_suites/nightly.txt).
 
 ### 3. Launch
 
@@ -119,6 +123,8 @@ dimensions instead of changing `cluster.num_nodes` alone.
 - Generation uses DeepGEMM with UE8M0 power-of-two scales. Keep
   `VLLM_USE_DEEP_GEMM_E8M0=1`, `use_deep_gemm: true`, and
   `pow2_weight_scaling_factors: true` aligned.
+- `policy.generation.vllm_kwargs.attention_config.backend: FLASHMLA_SPARSE_DSV4`
+  pins the validated FlashMLA sparse attention backend.
 - The policy tokenizer uses `chat_template: deepseek_v4`, while vLLM uses
   `tokenizer_mode: deepseek_v4`. The reference recipe disables thinking mode.
 - The recipe sets `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0` and enables eager
@@ -138,10 +144,26 @@ training and validation metrics through training step 50.
   `DeepSeek-V4-Flash-Base` with the AutoModel training backend and vLLM
   generation. DeepSeek V4 Pro, Megatron training, and SGLang generation are not
   covered by this guide.
+- **Hardware and deployment coverage**: Only colocated training and generation
+  on H100 GPUs have been tested. Non-colocated deployments and Blackwell GPUs
+  have not been validated. On Blackwell, DeepGEMM with E8M0 scales has a
+  potential refit issue: changes to the FP8 scale layout can leave the MoE
+  kernel referencing stale scales.
 - Training uses dequantized BF16 weights, while generation uses refitted FP8
-  weights. Without training-side fake quantization, the two paths are not
-  numerically identical.
+  weights. This numerical precision mismatch causes significant train/inference
+  inconsistency. The current recipe does not include training-side
+  quantization-aware training (QAT) to reduce this mismatch.
 - MTP is disabled in the reference configuration.
-- The reference smoke test requires 128 H100 GPUs and is not part of recurring
-  CI.
 - Long-run convergence has not been documented for this recipe.
+
+The separate
+[`deepseek-v4-support` development branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4-support)
+includes QAT through training-side FP8 fake quantization. It reduces the
+train/inference mismatch and has enabled stable training beyond 100 steps.
+See the [development branch guide](https://github.com/NVIDIA-NeMo/RL/blob/deepseek-v4-support/docs/guides/deepseek-v4.md)
+for its recipes and validation results.
+These results apply to that development branch, not the current recipe. The
+branch uses an older NeMo-RL codebase and a customized AutoModel dependency,
+so its changes cannot be merged directly into `main`. We plan to upstream the
+relevant changes incrementally into NeMo-RL `main` and the upstream dependency
+frameworks, including AutoModel.

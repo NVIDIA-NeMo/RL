@@ -1049,15 +1049,19 @@ class VllmInternalWorkerExtension:
         self, transport: UnsupportedNativeRefitTransport
     ) -> None:
         """Reject transports that cannot run the native layerwise lifecycle."""
-        if not self._uses_unquantized_flashinfer_trtllm():
-            return
-
         label = transport.replace("_", "-")
-        raise RuntimeError(
-            f"{label} refit does not support the unquantized FlashInfer "
-            "TRTLLM MoE backend yet because it bypasses vLLM's native "
-            "layerwise reload lifecycle"
-        )
+        if self._uses_unquantized_flashinfer_trtllm():
+            raise RuntimeError(
+                f"{label} refit does not support the unquantized FlashInfer "
+                "TRTLLM MoE backend yet because it bypasses vLLM's native "
+                "layerwise reload lifecycle"
+            )
+        if self._uses_deepseek_v4_fp8_refit():
+            raise RuntimeError(
+                f"{label} refit does not support DeepSeek V4 FP8 because it "
+                "bypasses the model's prepare/finalize refit hooks. Use IPC "
+                "or collective refit with refit_with_reload_api=False."
+            )
 
     @contextmanager
     def _weight_update_lifecycle(
@@ -1303,6 +1307,14 @@ class VllmInternalWorkerExtension:
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
         )
+
+        if refit_with_reload_api and self._uses_deepseek_v4_fp8_refit():
+            raise RuntimeError(
+                "DeepSeek V4 FP8 does not support refit_with_reload_api=True "
+                "because it bypasses the model's prepare/finalize refit hooks. "
+                "Set refit_with_reload_api=False to use the supported "
+                "collective refit lifecycle."
+            )
 
         try:
             if refit_with_reload_api:

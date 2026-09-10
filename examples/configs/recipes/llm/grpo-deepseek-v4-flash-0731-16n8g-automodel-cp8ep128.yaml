@@ -103,6 +103,8 @@ policy:
       enforce_eager: true
     vllm_kwargs:
       tokenizer_mode: deepseek_v4
+      attention_config:
+        backend: FLASHMLA_SPARSE_DSV4
 data:
   max_input_seq_length: 1024
   train:

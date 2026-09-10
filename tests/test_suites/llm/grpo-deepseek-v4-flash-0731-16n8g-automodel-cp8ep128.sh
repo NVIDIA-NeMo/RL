@@ -30,11 +30,17 @@ uv run examples/run_grpo.py \
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Only run metrics if the target step is reached
-if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run tests/check_metrics.py "$JSON_METRICS" \
-        'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'mean(data["train/gen_kl_error"]) < 0.01'
-    # Clean up checkpoint directory after successful run to save space.
-    rm -rf "$CKPT_DIR"
+MAX_RECORDED_STEP=$(jq -r '(."train/loss" // {} | keys | map(tonumber) | max) // 0' "$JSON_METRICS")
+if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then
+    echo "[ERROR] Expected train/loss through step $MAX_STEPS, got $MAX_RECORDED_STEP"
+    exit 1
 fi
+
+uv run tests/check_metrics.py "$JSON_METRICS" \
+    'all_finite(data["train/loss"])' \
+    'all_finite(data["train/token_mult_prob_error"])' \
+    'all_finite(data["train/gen_kl_error"])' \
+    'median(data["train/token_mult_prob_error"]) < 1.1' \
+    'mean(data["train/gen_kl_error"]) < 0.01'
+# Clean up checkpoint directory after successful run to save space.
+rm -rf "$CKPT_DIR"

@@ -1900,6 +1900,115 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
     assert method.moe_quant_config is quant_config
 
 
+def test_deepseek_v4_two_refits_preserve_kernel_fp32_scale_references(
+    fp8_module, monkeypatch
+):
+    """Keep real vLLM configs current across two compatible FP32-scale refits."""
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+    from vllm.model_executor.model_loader import reload as vllm_reload
+    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+
+    class Experts(torch.nn.Module):
+        pass
+
+    # Preserve dtype/shape like the H100 FP32-scale path. Returning distinct
+    # storage ensures the test requires copy-back into the kernel's references.
+    def convert(*, w13, w2, w13_scale, w2_scale, **_kwargs):
+        return w13.clone(), w2.clone(), w13_scale * 2, w2_scale * 2
+
+    kernels = []
+
+    def make_kernel(*, moe_quant_config, **_kwargs):
+        kernel = types.SimpleNamespace(
+            fused_experts=types.SimpleNamespace(quant_config=moe_quant_config)
+        )
+        kernels.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", Experts)
+    # Fix backend selection and conversion so CI hardware cannot select a
+    # different scale layout. Keep the real method constructor/config builder.
+    monkeypatch.setattr(
+        vllm_fp8,
+        "select_fp8_moe_backend",
+        lambda **_kwargs: (Fp8MoeBackend.DEEPGEMM, object()),
+    )
+    # Install the same postprocessing override used by NeMo-RL at runtime.
+    monkeypatch.setattr(
+        vllm_fp8.Fp8MoEMethod,
+        "process_weights_after_loading",
+        fp8_module.process_weights_after_loading_moe,
+    )
+    monkeypatch.setattr(vllm_fp8, "convert_to_fp8_moe_kernel_format", convert)
+    monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
+    layer = Experts()
+    shapes = {
+        "w13_weight": (2, 4, 4),
+        "w2_weight": (2, 4, 2),
+        "w13_weight_scale_inv": (2, 2, 2),
+        "w2_weight_scale_inv": (2, 2, 1),
+    }
+    for name, shape in shapes.items():
+        dtype = torch.float32 if "scale" in name else torch.float8_e4m3fn
+        param = torch.nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
+        param.weight_loader = default_weight_loader
+        layer.register_parameter(name, param)
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    layer._expert_routing_tables = lambda: None
+    layer.moe_config = types.SimpleNamespace(has_bias=False)
+    layer.quant_method = method = vllm_fp8.Fp8MoEMethod(
+        vllm_fp8.Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[2, 2]),
+        layer,
+    )
+    model = torch.nn.Sequential(layer)
+    vllm_reload.record_metadata_for_reloading(model)
+    method.process_weights_after_loading(layer)
+    kernel = method.moe_kernel
+    kernel_config = kernel.fused_experts.quant_config
+    params = dict(layer.named_parameters())
+    pointers = {name: param.data_ptr() for name, param in params.items()}
+    original_skip = set(SKIP_TENSORS)
+
+    for round_value in (1.0, 3.0):
+        previous_config = method.moe_quant_config
+        added = deepseek_v4_fp8.prepare_refit(model)
+        try:
+            vllm_reload.initialize_layerwise_reload(model)
+            for name, param in layer.named_parameters():
+                param.weight_loader(param, torch.full_like(param, round_value))
+            vllm_reload.finalize_layerwise_reload(model, types.SimpleNamespace())
+            deepseek_v4_fp8.finalize_refit(model)
+        finally:
+            deepseek_v4_fp8.restore_refit(added)
+
+        assert set(SKIP_TENSORS) == original_skip
+        assert method.moe_kernel is kernel
+        assert len(kernels) == 1
+        # Check the config retained by the original kernel, not just the new
+        # method.moe_quant_config assigned by postprocessing on each refit.
+        assert kernel.fused_experts.quant_config is kernel_config
+        assert method.moe_quant_config is not previous_config
+        for config in (method.moe_quant_config, kernel_config):
+            assert config.w1_scale is layer.w13_weight_scale_inv
+            assert config.w2_scale is layer.w2_weight_scale_inv
+            for scale in (config.w1_scale, config.w2_scale):
+                assert scale.dtype == torch.float32
+                torch.testing.assert_close(
+                    scale, torch.full_like(scale, round_value * 2)
+                )
+        for name, param in layer.named_parameters():
+            assert param is params[name]
+            assert param.data_ptr() == pointers[name]
+            assert param.weight_loader is default_weight_loader
+            expected = round_value * 2 if "scale" in name else round_value
+            torch.testing.assert_close(param.float(), torch.full(param.shape, expected))
+
+
 def _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model=False):
     """Fake model mirroring vLLM's MoERunner -> RoutedExperts layout at
     ``layers.0.mlp.experts``, with expert weights in ``experts_dtype``.

@@ -14,11 +14,96 @@
 
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 pytestmark = pytest.mark.vllm
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v3"])
+@pytest.mark.parametrize("fp8_enabled", [False, True])
+def test_collective_reload_api_guard(monkeypatch, model_type, fp8_enabled):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(model_type=model_type)
+    ext.model_runner = SimpleNamespace(
+        model=model, vllm_config=object(), reload_weights=Mock()
+    )
+    ext.state_dict_info = {}
+    ext.model_update_group = object()
+    ext._prepare_reload_weight_iterator = lambda weights: weights
+    receiver = Mock(return_value=iter([]))
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: fp8_enabled)
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", receiver)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+
+    if model_type == "deepseek_v4" and fp8_enabled:
+        with pytest.raises(RuntimeError, match="Set refit_with_reload_api=False"):
+            ext._update_weights_from_collective(refit_with_reload_api=True)
+        receiver.assert_not_called()
+        ext.model_runner.reload_weights.assert_not_called()
+    else:
+        assert ext._update_weights_from_collective(refit_with_reload_api=True)
+        receiver.assert_called_once()
+        ext.model_runner.reload_weights.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v3"])
+@pytest.mark.parametrize("fp8_enabled", [False, True])
+async def test_checkpoint_engine_refit_guard(monkeypatch, model_type, fp8_enabled):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        vllm_backend.VllmInternalWorkerExtensionWithCheckpointEngine
+    )
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(model_type=model_type)
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext._uses_unquantized_flashinfer_trtllm = lambda: False
+    ext._maybe_process_fp8_kv_cache = lambda: None
+
+    async def empty_batches():
+        if False:
+            yield
+
+    receiver = Mock(side_effect=empty_batches)
+    ext.checkpoint_engine = SimpleNamespace(receive_weight_batches=receiver)
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: fp8_enabled)
+
+    if model_type == "deepseek_v4" and fp8_enabled:
+        with pytest.raises(RuntimeError, match="checkpoint-engine.*DeepSeek V4 FP8"):
+            await ext._update_weights_from_checkpoint_engine_async()
+        receiver.assert_not_called()
+    else:
+        assert await ext._update_weights_from_checkpoint_engine_async()
+        receiver.assert_called_once()
+
+
+@pytest.mark.parametrize("transport", ["ipc", "collective"])
+def test_deepseek_v4_fp8_selects_supported_native_refit(monkeypatch, transport):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(model_type="deepseek_v4")
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext._uses_unquantized_flashinfer_trtllm = lambda: False
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+
+    assert ext._uses_native_layerwise_refit(transport)
+    ext._validate_native_layerwise_refit(transport)
 
 
 def test_weight_update_lifecycle_uses_layerwise_reload_for_deepseek_v4_fp8(
