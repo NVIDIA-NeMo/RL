@@ -648,6 +648,22 @@ on every put and re-checks it on every get, so a tensor that changes between
 wire-in and wire-out is reported (`hash/mismatches`) instead of being trained
 on silently.
 
+**The reading travels with the row.** Each field is mirrored by a
+`<field>_hash` column -- one `int64` per row, written by the same put and
+declared alongside the field by `register_partition`, which is why the
+partition's field list is twice what the caller passed. The reader fetches
+the mirror with the field, re-folds, compares, and strips the mirror before
+the caller sees it. Holding the reading in the putting process instead would
+only ever verify a same-process round trip, and the transfer worth checking
+is not one: the rollout actor writes what the policy workers read.
+
+A mirror is per *top-level field*, not per leaf, because `select_fields`
+names top-level fields -- a multimodal `images` reduces its leaves to a
+single `images_hash`, folded in sorted leaf order with `* 31 +` so two
+identical leaves cannot cancel. A column of `0` is the writer saying it could
+not fold that field; the reader counts those rows `hash/rows_unverified`
+rather than comparing against it.
+
 One granularity: every row carries its own digest, formed from two parts.
 
 ```
@@ -663,9 +679,10 @@ One granularity: every row carries its own digest, formed from two parts.
 | the seed's shape | length (a zero pad or a truncation) and trailing-dim layout | yes |
 | — | a permutation *within* one row | **no** — see below |
 
-The shape never travels and is never compared: only one integer per row is
-stored. A shape change makes the seed differ, which makes the digest differ,
-which surfaces as an ordinary mismatch.
+The shape never travels and is never compared: one integer per row per field
+is stored, and that is the whole reading. A shape change makes the seed
+differ, which makes the digest differ, which surfaces as an ordinary
+mismatch.
 
 The seed's shape is the *row's*, not the leaf's, and both layouts must agree
 on it — a dense `(N, L, D)` and the jagged form whose values are `(total, D)`
@@ -723,11 +740,14 @@ its own digest. Known limits, measured rather than assumed:
   alarms this check has produced had exactly that shape, and both were its
   own bookkeeping. Per-sample lines carry the row index and the row length
   so the next one is adjudicable from a single log line.
-- Only rows this process wrote can be checked. A consumer-side client
-  reports them under `hash/rows_unverified` rather than counting them
-  clean, and `hash/fields_skipped` reports any leaf it could not compare
-  — watch that one, since a guard that quietly stops covering a field still
-  reports zero mismatches.
+- Rows written before the guard was switched on carry no mirror, and a read
+  whose batch contains one falls back to a plain fetch and abstains on the
+  whole batch — `hash/rows_unverified` and `hash/guard_failures` both move.
+  Within a run every writer shares one `verify_tensor_hash`, so this is the
+  resume-across-a-config-change case, not a steady-state one.
+- `hash/fields_skipped` reports any leaf the fold could not attribute per
+  row — watch that one, since a guard that quietly stops covering a field
+  still reports zero mismatches.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
