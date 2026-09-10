@@ -160,7 +160,7 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
-from nemo_rl.utils.logger import Logger, TELEMETRY_WALL_TIME_METRIC
+from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 if TYPE_CHECKING:

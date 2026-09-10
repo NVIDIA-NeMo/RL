@@ -26,13 +26,13 @@ import pytest
 import torch
 
 from nemo_rl.utils.logger import (
+    TELEMETRY_WALL_TIME_METRIC,
+    WANDB_CALLER_STEP_METRIC,
     Logger,
     MLflowLogger,
     RayGpuMonitorLogger,
     SwanlabLogger,
-    TELEMETRY_WALL_TIME_METRIC,
     TensorboardLogger,
-    WANDB_CALLER_STEP_METRIC,
     WandbLogger,
     flatten_dict,
     log_container_init_timing,
