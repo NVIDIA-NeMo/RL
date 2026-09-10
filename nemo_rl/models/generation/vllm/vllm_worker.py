@@ -313,7 +313,10 @@ class BaseVllmGenerationWorker:
                 # That is fixed by offsetting the TCPStore search, deliberately
                 # *not* by dropping VLLM_PORT: an unset VLLM_PORT sends vLLM to
                 # kernel-ephemeral ports, which is the TOCTOU contention this port
-                # layout exists to avoid (#2380, #3103).
+                # layout exists to avoid (#2380, #3103). vLLM >= 0.29 binds and
+                # holds the TCPStore before publishing its port (vllm#50969), so
+                # that patch is a no-op there; this layout still governs the
+                # MessageQueue and API-server ports.
                 engine_index_on_node = 0
             elif mp_size == 1:
                 engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node
