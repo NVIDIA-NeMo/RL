@@ -37,6 +37,8 @@ import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
+    from transformers import AutoProcessor
+
     from nemo_rl.models.policy.tq_policy import TQPolicy
 
 import numpy as np
@@ -50,12 +52,12 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _clip_grpo_advantages,
     _create_advantage_estimator,
+    _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
-    _should_use_nemo_gym,
     _validation_early_stop_message,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
@@ -69,18 +71,19 @@ from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
-    log_generation_metrics_to_wandb,
+    log_generation_metrics,
     print_performance_metrics,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import Logger, print_message_log_samples
@@ -266,7 +269,7 @@ def validate_sync(
     total_lengths: list[float] = []
     all_message_logs: list[list[dict[str, str]]] = []
     additional_metrics: dict[str, Any] = {}
-    capture_extras = _should_use_nemo_gym(master_config)
+    capture_extras = should_use_nemo_gym(master_config)
 
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
@@ -380,7 +383,7 @@ def _compute_seq_logprob_error_metrics(
 
 def grpo_train_sync(
     policy: ColocatablePolicyInterface,
-    policy_generation: Optional[GenerationInterface],
+    policy_generation: GenerationInterface,
     wrapped_dataloader,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer,
@@ -391,6 +394,19 @@ def grpo_train_sync(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    # Unused here, and present only so the shared VLM launcher can pass one
+    # fixed kwarg set to whichever trainer ``select_sync_trainer`` returns.
+    # ``grpo_train``'s sole use of it is
+    # ``attach_initial_nemo_gym_image_payloads``, gated on
+    # ``grpo.deduplicate_multimodal_data`` *and* ``should_use_nemo_gym`` — the
+    # combination ``setup()`` rejects via
+    # ``_validate_multimodal_dedup_capability``. Non-Gym dedup runs never call
+    # that helper, so they need no processor here either.
+    #
+    # TODO: replace this parity kwarg with a ``ProcessorInterface`` both
+    # trainers consume, rather than threading ``Optional[AutoProcessor]``
+    # through every signature — ``grpo.py`` repeats it at seven sites.
+    processor: Optional["AutoProcessor"] = None,
 ) -> None:
     """Run GRPO training algorithm — TransferQueue-mediated.
 
@@ -415,15 +431,13 @@ def grpo_train_sync(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    NEED_REFIT = not (
-        isinstance(policy_generation, MegatronGeneration)
-        and master_config.policy["generation"]["colocated"]["enabled"]
+    # Skip a redundant iter-1 refit when setup() already synced weights
+    # (synchronizer not stale, fresh run). The redundant refit resets
+    # vLLM CUDA-graph / KV-cache state and yields a step-1
+    # token_mult_prob_error spike that converges by step 3.
+    POLICY_GENERATION_STALE = _initial_policy_generation_stale(
+        policy_generation, grpo_save_state.total_steps
     )
-    # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
-    if policy_generation is None:
-        policy_generation = policy  # type: ignore
-        NEED_REFIT = False
-    POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
     if master_config.grpo.skip_reference_policy_logprobs_calculation:
@@ -511,7 +525,7 @@ def grpo_train_sync(
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
-        if NEED_REFIT and POLICY_GENERATION_STALE:
+        if POLICY_GENERATION_STALE:
             refit_policy_generation(policy, policy_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
         else:
@@ -580,16 +594,24 @@ def grpo_train_sync(
                 )
 
             maybe_gpu_profile_step(policy, total_steps + 1)
-            if policy != policy_generation:
-                maybe_gpu_profile_step(policy_generation, total_steps + 1)
+            maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
                 print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
+                    # ``share_immutable_media`` must be passed here exactly as
+                    # ``grpo_train`` passes it (grpo.py). Without it
+                    # ``_prepare_multimodal_sharing`` never runs, so
+                    # ``deduplicate_multimodal_data`` becomes a silent no-op on
+                    # this trainer and the deepcopy below makes G independent
+                    # copies of every image in driver RAM.
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
-                            master_config.grpo.num_generations_per_prompt
+                            master_config.grpo.num_generations_per_prompt,
+                            share_immutable_media=(
+                                master_config.grpo.deduplicate_multimodal_data
+                            ),
                         )
                     )
 
@@ -599,7 +621,7 @@ def grpo_train_sync(
                     flush=True,
                 )
                 with timer.time("prepare_for_generation/total"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if POLICY_GENERATION_STALE:
                         if sync_kv_scales and kv_scales_cache is None:
                             # KV-scale calibration uses message_log of the
                             # current step's PROMPTS (pre-generation), which
@@ -960,9 +982,14 @@ def grpo_train_sync(
                         # (logprobs/advantages/masks) and wire-only message
                         # log bulk fields are skipped by virtue of not being
                         # in DP_CALIB_INPUT_FIELDS.
+                        # VLM extras cannot be named in
+                        # ``DP_CALIB_INPUT_FIELDS``: the rollout writes
+                        # pixel_values / image_grid_thw / … individually and
+                        # which of them exist is per-processor, so the static
+                        # list alone would calibrate image-blind.
                         _calib_fields = [
                             f for f in (meta.fields or []) if f in DP_CALIB_INPUT_FIELDS
-                        ]
+                        ] + present_multimodal_fields(meta)
                         calibration_data = policy.read_from_dataplane(
                             meta,
                             select_fields=_calib_fields,
@@ -1011,7 +1038,7 @@ def grpo_train_sync(
                     and (total_steps + 1) % val_period == 0
                 ) or (val_at_end and is_last_step):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             policy,
                             policy_generation,
@@ -1279,10 +1306,12 @@ def grpo_train_sync(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
-            if master_config.policy["generation"].get("vllm_cfg", {}).get(
-                "enable_vllm_metrics_logger", False
-            ) and master_config.logger.get("wandb_enabled", False):
-                log_generation_metrics_to_wandb(
+            if (
+                master_config.policy["generation"]
+                .get("vllm_cfg", {})
+                .get("enable_vllm_metrics_logger", False)
+            ):
+                log_generation_metrics(
                     generation_logger_metrics,
                     total_steps + 1,
                     master_config.policy["generation"]["vllm_cfg"][
@@ -1290,19 +1319,6 @@ def grpo_train_sync(
                     ],
                     logger,
                 )
-
-            if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("async_engine", False)
-            ):
-                for metric_name in metrics.keys():
-                    if metric_name.startswith("histogram/"):
-                        logger.log_histogram(
-                            metrics[metric_name],
-                            total_steps + 1,
-                            f"generation_metrics/{metric_name}",
-                        )
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
@@ -1346,7 +1362,13 @@ def grpo_train_sync(
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(
-                train_results, metrics, timing_metrics, master_config
+                train_results,
+                metrics,
+                timing_metrics,
+                master_config,
+                num_prompts_per_step=master_config.grpo.num_prompts_per_step,
+                num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
+                is_async_rl=False,
             )
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")

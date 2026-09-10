@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Optional
 
 import ray
@@ -25,7 +25,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
     """Weight synchronization for the Megatron generation backend, both colocation modes.
 
     Colocated is the degenerate path: generation either aliases the training
-    weights outright (dual-mode) or re-partitions them into the worker's
+    weights outright (reshardless) or re-partitions them into the worker's
     dedicated inference model inside ``prepare_for_generation`` (when the
     configured inference layout/impl differs) — a genuine parallelism-changing
     transfer, but one the worker performs internally on wake. Sync therefore
@@ -97,25 +97,39 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> Optional[dict[str, float]]:
+        def timed_phase(name: str) -> AbstractContextManager[None]:
+            return timer.time(name) if timer is not None else nullcontext()
+
         if self._colocated:
-            # The wake below carries any configured reshard; the loop already
-            # slept the engine before training (or it has not started yet),
-            # so no suspend is needed.
-            self._policy.offload_before_refit()
-            self._generation.prepare_for_generation()
+            # The wake below carries any configured reshard; the loop already slept the engine
+            # before training, so no suspend is needed.
+            # Tagging the call bypasses the worker's engine-awake early-return, so the reshard
+            # copy riding this wake cannot be skipped. Any tag except "weights" works: the worker
+            # treats "weights" as the wake-suppressing mid-refit call.
+            with timed_phase("prepare_for_generation/offload_policy"):
+                self._policy.offload_before_refit()
+            with timed_phase("prepare_for_generation/prepare_weights"):
+                self._generation.prepare_for_generation(tags=["colocated_refit"])
             self._stale = False
             return {}
 
         # The engine serves continuously in non-colocated mode; pause it
         # exactly around the swap.
-        self._generation.suspend_for_refit()
-        self._policy.offload_before_refit()
-        self._generation.prepare_for_generation(tags=["weights"])
+        with timed_phase("prepare_for_generation/suspend_for_refit"):
+            self._generation.suspend_for_refit()
+        if self._generation.cfg["mcore_generation_config"][
+            "offload_policy_before_refit"
+        ]:
+            with timed_phase("prepare_for_generation/offload_policy"):
+                self._policy.offload_before_refit()
+        with timed_phase("prepare_for_generation/prepare_weights"):
+            self._generation.prepare_for_generation(tags=["weights"])
 
         if self._refit_backend == "nvshmem":
-            futures_train = self._policy.preinit_nvshmem()
-            futures_inference = self._generation.preinit_nvshmem_collective()
-            ray.get(futures_train + futures_inference)
+            with timed_phase("prepare_for_generation/preinit_nvshmem"):
+                futures_train = self._policy.preinit_nvshmem()
+                futures_inference = self._generation.preinit_nvshmem_collective()
+                ray.get(futures_train + futures_inference)
 
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
@@ -135,8 +149,10 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
                     "backend.\n"
                 )
 
-        self._generation.prepare_for_generation(tags=["kv_cache"])
-        self._generation.resume_after_refit()
+        with timed_phase("prepare_for_generation/prepare_kv_cache"):
+            self._generation.prepare_for_generation(tags=["kv_cache"])
+        with timed_phase("prepare_for_generation/resume_after_refit"):
+            self._generation.resume_after_refit()
         self._stale = False
         return {}
 

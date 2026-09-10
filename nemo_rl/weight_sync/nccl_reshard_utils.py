@@ -91,10 +91,9 @@ class LocalParamSpec:
         post: ``RefitCtx -> None``; runs after xferdtensor
             e.g., copy back the received buffer into the merged param.
 
-    TODO: A layout that block-permutes the *assembled* param (e.g. FlashInfer
-    TRTLLM w13) would need a group-level finalize run once after all components
-    land — a future loop-level addition, not a per-param field. ``pre``/``post``
-    covers today's backends (Triton, FlashInfer CUTLASS, Megatron).
+    Layout-specific backends can receive into canonical storage in ``pre``, load
+    each logical component in ``post``, and use a transport-level finalizer after
+    all components land. FlashInfer TRTLLM uses this path for grouped experts.
     """
 
     base: Any
@@ -559,8 +558,14 @@ def _extract_layer_name(param_name: str) -> str:
     return param_name.split(".")[0]
 
 
-def check_nccl_reshard_refit_support(master_config: dict) -> None:
+def check_nccl_reshard_refit_support(master_config: Any) -> None:
     """Validate ``master_config`` against every precondition of nccl_reshard_refit.
+
+    Typed ``Any`` because the annotation was ``dict`` and the body reads
+    ``master_config.policy`` -- attribute access a plain dict does not support. Both
+    callers pass a MasterConfig object (grpo's and the single-controller's are different
+    classes), so there is no one concrete type to name here; what is required is an object
+    exposing ``.policy`` as a mapping.
 
     Collects all violations and raises a single ``ValueError`` listing them, so
     a user fixing their config can address everything in one pass rather than
@@ -608,6 +613,14 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             "policy.generation.vllm_kwargs.enable_eplb must be False "
             "(nccl_reshard_refit fixes the expert->rank mapping at setup; "
             "dynamic expert load balancing can change ownership afterwards)."
+        )
+
+    if vllm_cfg.get("refit_with_reload_api"):
+        violations.append(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+            "explicitly unsupported with refit_transport='nccl_reshard' "
+            "(nccl_reshard_refit is its own refit path and does not use "
+            "vLLM's reload_weights API)."
         )
 
     # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
@@ -669,11 +682,12 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         # Precision compatibility (train ↔ gen).  Supported combinations:
         #   BF16 train  ↔ BF16 gen   (default, tested)
         #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
-        # BF16→FP8 (train-side quant on the fly) is not implemented; FP8→BF16
-        # has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
+        #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
+        # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
+        trainer_precision = policy.get("precision")
         gen_precision = vllm_cfg.get("precision", None)
 
         # The refit byte-copies weights train -> gen, so gen dtype must match
@@ -691,17 +705,35 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             )
 
         if gen_precision == "fp8":
-            if not fp8_param:
+            if fp8_param:
+                if vllm_cfg.get("is_mx"):
+                    violations.append(
+                        "policy.generation.vllm_cfg.is_mx=True does not support "
+                        "blockwise-FP8 storage from "
+                        "policy.megatron_cfg.fp8_cfg.fp8_param; use BF16 training "
+                        "storage for receiver-side MXFP8 quantization."
+                    )
+                elif fp8_recipe != "blockwise":
+                    violations.append(
+                        "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
+                        f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
+                        "don't produce export-ready scale_inv tensors."
+                    )
+            elif vllm_cfg.get("is_mx"):
+                # Policy precision uses the canonical NeMo-RL spelling; unlike
+                # vLLM precision, it does not accept "bf16", "auto", or None.
+                if trainer_precision != "bfloat16":
+                    violations.append(
+                        "policy.generation.vllm_cfg.is_mx=True with "
+                        "policy.megatron_cfg.fp8_cfg.fp8_param=False requires "
+                        "policy.precision='bfloat16' for receiver-side MXFP8 "
+                        f"quantization (got {trainer_precision!r})."
+                    )
+            else:
                 violations.append(
                     "policy.generation.vllm_cfg.precision='fp8' requires "
-                    "policy.megatron_cfg.fp8_cfg.fp8_param=True "
-                    "(BF16→FP8 train-side quantization is not implemented yet)."
-                )
-            elif fp8_recipe != "blockwise":
-                violations.append(
-                    "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
-                    f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
-                    "don't produce export-ready scale_inv tensors."
+                    "policy.megatron_cfg.fp8_cfg.fp8_param=True, or "
+                    "is_mx=True for BF16-to-MXFP8 refit."
                 )
         elif fp8_param:
             violations.append(

@@ -2,7 +2,10 @@
 # Excluded unit tests for FAST CI mode (Lfast).
 # Source this file and append "${EXCLUDED_UNIT_TESTS[@]}" to pytest args.
 # Supports: --ignore=<path>, --ignore-glob=<pattern>, --deselect=<node_id>
-# All paths are relative to tests/ (run_unit.sh cwd).
+# --ignore/--ignore-glob paths are relative to tests/ (run_unit.sh cwd).
+# --deselect node IDs are relative to the pytest rootdir (the repo root), so
+# they start with "tests/". A node ID without that prefix matches nothing and
+# is ignored silently.
 #
 # Principles:
 #   - Run ALL cheap tests (<1s, pure math/mocks/tensor ops)
@@ -24,9 +27,6 @@ EXCLUDED_UNIT_TESTS=(
     --deselect=tests/unit/algorithms/test_grpo.py::test_calculate_rewards_multiple_tasks
     --deselect=tests/unit/algorithms/test_grpo.py::test_calculate_rewards_missing_environment
     --deselect=tests/unit/algorithms/test_grpo.py::test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node
-    --deselect=tests/unit/algorithms/test_grpo.py::test_refit_policy_generation_sglang_colocated_http
-    --deselect=tests/unit/algorithms/test_grpo.py::test_refit_policy_generation_sglang_non_colocated_raises
-
     # test_utils.py — exclude only HF gated tokenizer tests
     --deselect=tests/unit/algorithms/test_utils.py::test_get_tokenizer_no_chat_template
     --deselect=tests/unit/algorithms/test_utils.py::test_get_tokenizer_default_chat_template
@@ -37,8 +37,10 @@ EXCLUDED_UNIT_TESTS=(
     # DISTRIBUTED
     ###########################################################################
 
-    # test_virtual_cluster.py — Ray cluster infrastructure tests (~58s each)
-    --ignore=unit/distributed/test_virtual_cluster.py
+    # test_virtual_cluster.py — exclude only the two tests over 1s; the rest are
+    # pure regex/set/mock checks (<1s), including the router-band guards.
+    --deselect=tests/unit/distributed/test_virtual_cluster.py::test_mcore_py_executable
+    --deselect=tests/unit/distributed/test_virtual_cluster.py::test_create_sorted_bundle_indices_for_unified_pg
 
     # test_worker_groups.py — exclude 2D sharding variants (require complex Ray setup)
     --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_single_data_2d_sharding_no_filter

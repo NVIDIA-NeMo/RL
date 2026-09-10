@@ -224,7 +224,11 @@ jobs:
           h100_functional_test_scripts=$(jq -c \
             '[.functional[] | select((ascii_downcase | contains("gb200")) | not)]' \
             <<< "$test_plan")
-          gb200_functional_test_scripts=$(jq -c '.functional' <<< "$test_plan")
+          # The managed Dynamo runtime is currently amd64-only and is not
+          # installed in the arm64 GB200 image.
+          gb200_functional_test_scripts=$(jq -c \
+            '[.functional[] | select(. != "L1_Functional_Tests_Dynamo")]' \
+            <<< "$test_plan")
 
           unit_test_count=$(jq 'length' <<< "$unit_test_scripts")
           h100_functional_test_count=$(jq 'length' <<< "$h100_functional_test_scripts")
@@ -280,11 +284,20 @@ jobs:
           fi
           echo "image_tag=$IMAGE_TAG" | tee -a "$GITHUB_OUTPUT"
 
+  ephemeral-runner-routing:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@4fe957d4ea5816af1d67fae130bbab4b434c10b3 # v1.9.2
+    with:
+      lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
+      legacy_label: ${{ vars.NON_NVIDIA_H100_RUNNER }}
+      run_id: ${{ github.run_id }}
+      run_attempt: ${{ github.run_attempt }}
+
   org-member-pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
+    needs: [ephemeral-runner-routing]
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
     with:
       default_runner_prefix: ${{ vars.DEFAULT_H100_RUNNER }}
-      non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_H100_RUNNER }}
+      non_nvidia_runner_prefix: ${{ needs.ephemeral-runner-routing.outputs.runner_label_base }}
       default_test_data_path: ${{ vars.DEFAULT_H100_TEST_DATA_PATH }}
       non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_H100_TEST_DATA_PATH }}
       default_registry: ${{ vars.DEFAULT_H100_CONTAINER_REGISTRY }}
@@ -542,7 +555,7 @@ jobs:
       dockerfile: docker/Dockerfile
       platform: linux/amd64
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
-      runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+      runner: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
       target: release
       build-contexts: |
         nemo-rl=.
@@ -553,6 +566,7 @@ jobs:
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
         MAX_JOBS=4
+        BUILD_DYNAMO=1
         TRTLLM_BUILD_JOBS=24
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 
@@ -612,7 +626,7 @@ jobs:
         vars.UV_BUILD_CACHE == 'enabled' &&
         needs.build-container.result == 'success'
       }}
-    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+    runs-on: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
     env:
       REGISTRY: ${{ needs.org-member-pre-flight.outputs.registry }}
       IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
@@ -675,7 +689,7 @@ jobs:
       matrix:
         include:
           - script: Docs_Tests
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+            runner: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
     needs: [pre-flight, build-container, org-member-pre-flight, cicd-wait-in-queue]
     if: >-
       ${{
@@ -737,7 +751,7 @@ jobs:
       }}
 
 
-    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+    runs-on: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
     name: ${{ matrix.script }}
     steps:
       - name: Checkout
@@ -747,7 +761,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          runner: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
           script: ${{ matrix.script }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
@@ -856,7 +870,7 @@ jobs:
       matrix:
         script: ${{ fromJSON(needs.pre-flight.outputs.h100_functional_test_scripts) }}
     needs: [pre-flight, prepare-megatron-lock, build-container, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
-    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+    runs-on: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
     if: >-
       ${{
         always() &&
@@ -890,7 +904,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          runner: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
@@ -974,7 +988,7 @@ jobs:
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
       }}
-    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+    runs-on: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
     name: fast_${{ matrix.script }}
     steps:
       - name: Checkout
@@ -984,7 +998,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          runner: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
           script: ${{ matrix.script }}
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}

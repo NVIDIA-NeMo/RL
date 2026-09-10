@@ -16,12 +16,44 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.models.generation.trtllm import TrtllmConfig
 from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def resolve_generation_class(
+    generation_config: GenerationConfig,
+) -> type[GenerationInterface]:
+    """Map `generation_config` to its GenerationInterface class."""
+    backend = generation_config["backend"]
+    if backend == "vllm":
+        from nemo_rl.models.generation.vllm import VllmGeneration
+
+        return VllmGeneration
+    if backend == "sglang":
+        from nemo_rl.models.generation.sglang.sglang_generation import (
+            SGLangGeneration,
+        )
+
+        return SGLangGeneration
+    if backend == "megatron":
+        from nemo_rl.models.generation.megatron.megatron_generation import (
+            MegatronGeneration,
+        )
+
+        return MegatronGeneration
+    if backend == "trtllm":
+        from nemo_rl.models.generation.trtllm import TrtllmGeneration
+
+        return TrtllmGeneration
+    if backend == "dynamo":
+        from nemo_rl.models.generation.dynamo import DynamoGeneration
+
+        return DynamoGeneration
+    raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
 def configure_generation_config(
@@ -32,6 +64,16 @@ def configure_generation_config(
     trains_mtp: bool = False,
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
+    if (
+        config["backend"] != "vllm"
+        and config.get("worker_extension_cls_fqn") is not None
+    ):
+        raise ValueError(
+            "generation.worker_extension_cls_fqn is only supported by the vLLM backend, "
+            f"got backend={config['backend']!r}. Use policy.worker_extension_cls_fqn to "
+            "extend the training worker instead."
+        )
+
     # tokenizer setting
     if "_pad_token_id" in config:
         warnings.warn(
@@ -43,7 +85,11 @@ def configure_generation_config(
     if config["stop_token_ids"] is None:
         config["stop_token_ids"] = [tokenizer.eos_token_id]
 
-    # vllm setting
+    # vLLM setting shared by the standard and managed Dynamo backends.
+    if config["backend"] in ("vllm", "dynamo"):
+        vllm_backed_config = cast(VllmConfig, config)
+        vllm_backed_config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
         if config.get("real_quant"):
@@ -64,11 +110,8 @@ def configure_generation_config(
                 )
 
         # set load_format
-        config["vllm_cfg"]["load_format"] = (
-            "auto"
-            if is_eval or config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
-            else "dummy"
-        )
+        if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
+            config["vllm_cfg"]["load_format"] = "auto"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
         if speculative_config and not is_eval and not has_refit_draft_weights:
             # Speculative decoding needs real draft weights at startup, since the
@@ -86,6 +129,7 @@ def configure_generation_config(
         # MTP draft weights arrive via refit if the trainer trains the MTP layer.
         # If the trainer does not train the MTP layer, the weights need to be
         # loaded from the checkpoint.
+        config["_draft_weights_from_refit"] = has_refit_draft_weights
         config["_mtp_weights_from_refit"] = trains_mtp
 
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.

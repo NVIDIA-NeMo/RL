@@ -50,6 +50,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 def _valid_nccl_reshard_config() -> SimpleNamespace:
     return SimpleNamespace(
         policy={
+            "precision": "bfloat16",
             "generation": {
                 "backend": "vllm",
                 "colocated": {"enabled": False},
@@ -63,6 +64,90 @@ def _valid_nccl_reshard_config() -> SimpleNamespace:
 
 def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
+
+
+def test_check_nccl_reshard_refit_support_rejects_reload_api() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["refit_with_reload_api"] = True
+
+    with pytest.raises(ValueError, match="explicitly unsupported"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["backend"] = "sglang"
+    config.policy["generation"].pop("vllm_cfg")
+
+    with pytest.raises(ValueError) as exc_info:
+        check_nccl_reshard_refit_support(config)
+
+    assert "policy.generation.backend must be 'vllm'" in str(exc_info.value)
+
+
+def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("trainer_precision", ["float16", "float32", "bf16", None])
+def test_check_nccl_reshard_refit_support_rejects_non_bf16_to_mxfp8(
+    trainer_precision: str | None,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = trainer_precision
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+
+    with pytest.raises(ValueError, match="requires policy.precision='bfloat16'"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_keeps_matching_blockwise_fp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8", None])
+def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
+    fp8_recipe: str | None,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": fp8_recipe,
+    }
+
+    with pytest.raises(ValueError, match="fp8_recipe must be 'blockwise'"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_bf16_to_blockwise_fp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+
+    with pytest.raises(ValueError, match="is_mx=True for BF16-to-MXFP8 refit"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    with pytest.raises(ValueError, match="does not support blockwise-FP8 storage"):
+        check_nccl_reshard_refit_support(config)
 
 
 @pytest.mark.parametrize(
@@ -201,6 +286,7 @@ def test_get_tp_shard_dim(name, expected):
         ("model.layers.0.mlp.down_proj.weight", True),
         ("model.layers.0.mlp.experts.3.gate_proj.weight", True),
         ("model.language_model.layers.7.mlp.experts.3.up_proj.weight", True),
+        ("model.layers.0.mlp.experts.3.up_proj.weight_scale_inv", False),
         # shared experts are FFN-named but fuse differently -> misc
         ("model.layers.0.mlp.shared_expert.gate_proj.weight", False),
         ("model.language_model.layers.1.mlp.shared_expert.down_proj.weight", False),
@@ -334,6 +420,45 @@ def test_group_expert_params_collapses_to_grouped_hf_entries():
     assert (
         "grouped_expert_proj" not in grouped["model.layers.0.self_attn.q_proj.weight"]
     )
+
+
+def test_group_expert_params_canonicalizes_qwen35_grouped_slabs():
+    base = "model.language_model.layers.0.mlp.experts"
+    metadata = {
+        f"{base}.gate_up_proj": {
+            "shape": [256, 1024, 2048],
+            "dtype": "torch.bfloat16",
+        },
+        f"{base}.down_proj": {
+            "shape": [256, 2048, 512],
+            "dtype": "torch.bfloat16",
+        },
+        "model.visual.proj.weight": {
+            "shape": [2048, 2048],
+            "dtype": "torch.bfloat16",
+        },
+    }
+
+    grouped = group_expert_params_in_metadata(metadata)
+
+    assert grouped[f"{base}.gate_proj.weight"] == {
+        "shape": [256, 512, 2048],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "gate_proj",
+    }
+    assert grouped[f"{base}.up_proj.weight"] == {
+        "shape": [256, 512, 2048],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "up_proj",
+    }
+    assert grouped[f"{base}.down_proj.weight"] == {
+        "shape": [256, 2048, 512],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "down_proj",
+    }
+    assert f"{base}.gate_up_proj" not in grouped
+    assert f"{base}.down_proj" not in grouped
+    assert grouped["model.visual.proj.weight"] == metadata["model.visual.proj.weight"]
 
 
 def test_group_expert_params_no_experts_is_identity():
