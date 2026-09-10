@@ -157,6 +157,11 @@ def _make_worker(loss_type):
     w.dtype = torch.float32
     w._is_reward_model = False
     w._router_replay_enabled = False
+    # opd_full off, mirroring __init__ when the config block is absent.
+    w._opd_full_enabled = False
+    w._opd_full_lm_head_lifecycle = None
+    w._opd_full_teacher_lm_head = None
+    w._opd_full_teacher_checkpoint_path = None
     w.media_placeholder_token_id = None
     # Model-capability flags __init__ derives from self.model, which
     # object.__new__ skips. train_microbatch passes all three straight through
