@@ -2274,6 +2274,7 @@ class SingleControllerActor:
             target_step = await self._sampler.admit(
                 trainer_version_fn=lambda: self._trainer_version
             )
+            self._require_unoccupied_target_step(target_step)
             print(
                 f"  dataloader exhausted; training on {len(step_prompts)} pooled "
                 f"spare(s) as target_step={target_step}",

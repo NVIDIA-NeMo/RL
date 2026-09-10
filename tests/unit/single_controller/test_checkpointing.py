@@ -546,6 +546,9 @@ class _FakeTQBuffer:
             "manifest_digest": "fake-manifest-digest",
             "groups": [],
         }
+        self.target_step_list = [
+            group["target_step"] for group in self._metadata_state["groups"]
+        ]
         self.load_return = load_return
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
@@ -616,6 +619,10 @@ class _FakeTQBuffer:
                 "expected_manifest_digest": expected_manifest_digest,
             }
         )
+        self._metadata_state = state
+        self.target_step_list = [
+            group["target_step"] for group in self._metadata_state["groups"]
+        ]
         return self.load_return
 
 
@@ -2933,6 +2940,8 @@ class TestReplayBufferPersistence:
             data_plane_checkpoint=True,
         )
         buffer = _FakeTQBuffer(load_return=2)
+        save_state = _matching_save_state()
+        save_state.sampler_dispatch_index = 1
 
         actor, result = _run_actor_run(
             mc,
@@ -2941,6 +2950,7 @@ class TestReplayBufferPersistence:
                 dp_client=_FakeDPClient(sample_ids=sample_ids),
                 last_checkpoint_path=str(ckpt_dir),
                 data_plane_checkpoint_metadata=tq_metadata,
+                save_state=save_state,
             ),
         )
 

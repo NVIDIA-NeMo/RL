@@ -312,6 +312,28 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
     ctrl._rollout_manager.discard_prompt_group.assert_not_called()
 
 
+def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
+    """The ordinary spare-pool admission enforces the same cursor invariant."""
+    buffer = _RecordingBuffer([0])
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=1)
+    ctrl._buffer = buffer
+    ctrl._replacement_reserve = deque([{"idx": 0}])
+    ctrl._rollout_recovery_enabled = False
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._trainer_version = 0
+    launched: list[Any] = []
+
+    async def launch(*args: Any) -> None:
+        launched.append(args)
+
+    with pytest.raises(RuntimeError, match="already contains 1 group"):
+        asyncio.run(ctrl._drain_reserve_into_steps(launch))
+
+    assert launched == []
+
+
 class _SkippingRolloutManager:
     """Every prompt is given up on within budget, so nothing is ever committed."""
 
