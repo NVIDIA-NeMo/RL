@@ -54,12 +54,19 @@ class _Remote:
 class _FakeRouter:
     """Stands in for the GenerationRouterActor handle."""
 
-    def __init__(self, *, failures=None, push_error=None):
+    def __init__(self, *, failures=None, successes=None, push_error=None):
         self.pushes: list[list[str]] = []
-        self._failures = dict(failures or {})
+        # (successes, failures) per url, as the real drain hands them over. Accepting the
+        # old failures-only shape keeps every existing caller readable.
+        self._outcomes = {
+            url: ((successes or {}).get(url, 0), n)
+            for url, n in (failures or {}).items()
+        }
+        for url, n in (successes or {}).items():
+            self._outcomes.setdefault(url, (n, 0))
         self._push_error = push_error
         self.set_serving_backends = _Remote(self._set_serving_backends)
-        self.drain_backend_failures = _Remote(self._drain)
+        self.drain_backend_outcomes = _Remote(self._drain)
         self.metrics = _Remote(lambda: {"router/requests_total": 1.0})
 
     def _set_serving_backends(self, urls):
@@ -68,7 +75,7 @@ class _FakeRouter:
         self.pushes.append(list(urls))
 
     def _drain(self):
-        drained, self._failures = self._failures, {}
+        drained, self._outcomes = self._outcomes, {}
         return drained
 
 
@@ -160,6 +167,51 @@ class TestFailureDrain:
         ctrl = _controller(router=router, unhealthy_threshold=3)
         asyncio.run(ctrl._drain_router_failures())
         assert ctrl._gen_fleet.state_of(1) is ShardState.DEAD
+
+    def test_a_success_in_the_window_clears_the_streak(self):
+        """consecutive_reported_failures is a STREAK, and nothing on this path cleared it.
+
+        report_success has exactly one caller, on the native adapter, so a router run made
+        the count monotonic. The reviewer's breaking case, reproduced exactly: three
+        transport blips days apart against unhealthy_threshold=3, each in a window that
+        also served thousands of requests. Without a success signal the streak walks
+        1, 2, 3 and condemns a shard that was healthy throughout.
+        """
+        url = _urls(3)[1]
+        ctrl = _controller(router=_FakeRouter(), unhealthy_threshold=3)
+
+        for _ in range(3):
+            ctrl._generation_router = _FakeRouter(
+                failures={url: 1}, successes={url: 5000}
+            )
+            asyncio.run(ctrl._drain_router_failures())
+
+        assert ctrl._gen_fleet.state_of(1) is not ShardState.DEAD, (
+            "three isolated blips among 15000 successes must not add up to a condemnation"
+        )
+
+    def test_a_wedged_shard_is_still_condemned_on_time(self):
+        """It produces no successes, so its timing must be unchanged."""
+        router = _FakeRouter(failures={_urls(3)[1]: 3})
+        ctrl = _controller(router=router, unhealthy_threshold=3)
+        asyncio.run(ctrl._drain_router_failures())
+        assert ctrl._gen_fleet.state_of(1) is ShardState.DEAD
+
+    def test_successes_are_applied_before_failures_in_the_same_window(self):
+        """Otherwise the failure lands on a streak the success should already have cleared.
+
+        Two failures with a success alongside them, against a threshold of 3: applied
+        success-first the streak ends at 2. Applied failures-first it would carry the
+        earlier blip and reach the threshold.
+        """
+        url = _urls(3)[1]
+        ctrl = _controller(router=_FakeRouter(failures={url: 1}), unhealthy_threshold=3)
+        asyncio.run(ctrl._drain_router_failures())
+
+        ctrl._generation_router = _FakeRouter(failures={url: 2}, successes={url: 10})
+        asyncio.run(ctrl._drain_router_failures())
+
+        assert ctrl._gen_fleet.state_of(1) is not ShardState.DEAD
 
     def test_an_unknown_backend_url_is_skipped(self):
         """The router may still hold a URL the ledger no longer tracks."""

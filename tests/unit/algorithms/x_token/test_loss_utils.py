@@ -25,6 +25,7 @@ import os
 import traceback
 from dataclasses import fields
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -45,6 +46,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     get_topk_projection,
     localize_alignment,
     parse_projection_file,
+    prepare_xtoken_cross_tokenizer_loss_input,
     slice_sparse_projection_cols,
     valid_chunk_mask,
 )
@@ -98,6 +100,90 @@ class TestAlignmentFromFlatBatch:
         ab = alignment_from_flat_batch(flat)
         assert ab.pair_valid is flat["alignment_pair_valid"]
         assert ab.num_chunks is flat["alignment_num_chunks"]
+
+
+def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
+    """Automodel layout restoration precedes contiguous x-token localization."""
+    cp_group = object()
+    local_logits = torch.randn(1, 3, 2)
+    full_student_logits = torch.arange(12, dtype=torch.float32).reshape(1, 6, 2)
+    teacher_logits = torch.randn(1, 2, 4)
+    cp_sharder = MagicMock()
+    cp_sharder.gather_token_tensor.return_value = full_student_logits
+    teacher_ipc = [{"opaque": "handle"}]
+    data = {
+        "input_ids": torch.arange(6).unsqueeze(0),
+        "token_mask": torch.ones(1, 6),
+        "sample_mask": torch.ones(1),
+        "teacher_0_full_logits_ipc": teacher_ipc,
+        "alignment_0_student_chunk_id": torch.tensor([[10, 11, 12, 13, 14, 15]]),
+        "alignment_0_teacher_chunk_id": torch.tensor([[20, 21, 22, 23]]),
+        "alignment_0_pair_valid": torch.ones(1, 2, dtype=torch.bool),
+        "alignment_0_pair_is_correct": torch.ones(1, 2, dtype=torch.bool),
+    }
+
+    with (
+        patch("torch.cuda.current_device", return_value=0),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=1),
+        patch(
+            "nemo_rl.algorithms.x_token.loss_utils."
+            "rebuild_teacher_full_logits_from_ipc",
+            return_value=teacher_logits,
+        ) as rebuild_teacher,
+    ):
+        student_logits, teachers, aligns, tp_group, returned_cp_group = (
+            prepare_xtoken_cross_tokenizer_loss_input(
+                local_logits,
+                data,
+                projection_matrix_paths=["projection.pt"],
+                context_parallel_group=cp_group,
+                cp_sharder=cp_sharder,
+            )
+        )
+
+    torch.testing.assert_close(student_logits, full_student_logits[:, 3:6])
+    assert teachers[0] is teacher_logits
+    assert tp_group is None
+    assert returned_cp_group is cp_group
+    torch.testing.assert_close(aligns[0].student_input_ids, data["input_ids"][:, 3:6])
+    torch.testing.assert_close(aligns[0].student_token_mask, data["token_mask"][:, 3:6])
+    torch.testing.assert_close(aligns[0].student_chunk_id, torch.tensor([[14, 15, -1]]))
+    torch.testing.assert_close(aligns[0].teacher_chunk_id, torch.tensor([[23, -1]]))
+    cp_sharder.gather_token_tensor.assert_called_once_with(
+        local_logits, seq_dim=1, trim=True
+    )
+    rebuild_teacher.assert_called_once_with(teacher_ipc, cp_group=cp_group, device=0)
+
+
+def test_automodel_cp_layout_rejects_non_divisible_student_sequence():
+    cp_group = object()
+    local_logits = torch.randn(1, 3, 2)
+    cp_sharder = MagicMock()
+    cp_sharder.gather_token_tensor.return_value = torch.randn(1, 5, 2)
+
+    with (
+        patch("torch.cuda.current_device", return_value=0),
+        patch("torch.distributed.get_world_size", return_value=2),
+        pytest.raises(
+            ValueError,
+            match=(
+                "X-token student sequence length must be divisible by the student "
+                "context parallel size"
+            ),
+        ),
+    ):
+        prepare_xtoken_cross_tokenizer_loss_input(
+            local_logits,
+            {},
+            projection_matrix_paths=[],
+            context_parallel_group=cp_group,
+            cp_sharder=cp_sharder,
+        )
+
+    cp_sharder.gather_token_tensor.assert_called_once_with(
+        local_logits, seq_dim=1, trim=True
+    )
 
 
 # ---------------------------------------------------------------------------
