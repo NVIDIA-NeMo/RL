@@ -122,6 +122,23 @@ def _comm_volume(by_op: dict[str, Any]) -> dict[str, int]:
 # few lines carry the identity of what broke.
 _MAX_HASH_MISMATCH_LOGS = 20
 
+# The wire-in digest rides beside the field it describes, as ``<field>_hash``.
+# Holding it in the putting process only ever verified a same-process round
+# trip; the rollout actor writes what the policy workers read, and that read
+# is the one worth checking.
+_HASH_SUFFIX = "_hash"
+_U64 = 1 << 64
+
+
+def _hash_field(name: str) -> str:
+    return f"{name}{_HASH_SUFFIX}"
+
+
+def _as_i64(value: int) -> int:
+    """Wrap a uint64 digest into the signed range ``torch.int64`` accepts."""
+    value &= _U64 - 1
+    return value - _U64 if value >= _U64 >> 1 else value
+
 # Rows a client may write between reconciliations of its live-key accounting
 # against the partition. One metadata call per this many rows put, so a client
 # that clears its own writes never makes one.
@@ -225,6 +242,28 @@ def _leaf_digests(
     return digests
 
 
+def _field_digests(
+    leaf_digests: dict[str, list[int]], n_rows: int
+) -> dict[str, list[int]]:
+    """Leaf digests folded to one digest per *top-level* field.
+
+    ``select_fields`` names top-level fields, so the mirror has to be per
+    field rather than per leaf: a multimodal ``images`` arrives as several
+    leaves and must reduce to a single ``images_hash`` that the reader can
+    recompute from the same leaves.
+
+    Sorted leaf order because dict order need not survive a round trip, and
+    ``* 31 +`` rather than an XOR so two identical leaves do not cancel --
+    the defect the row fold already has, which must not be repeated here.
+    """
+    out: dict[str, list[int]] = {}
+    for name, per_row in sorted(leaf_digests.items()):
+        acc = out.setdefault(name.split(".", 1)[0], [0] * n_rows)
+        for row in range(n_rows):
+            acc[row] = _as_i64(acc[row] * 31 + per_row[row])
+    return out
+
+
 def _as_list(sample_ids: Any) -> Any:
     """Materialize ``sample_ids`` once; ``None`` passes through.
 
@@ -234,26 +273,6 @@ def _as_list(sample_ids: Any) -> Any:
     if sample_ids is None or isinstance(sample_ids, list):
         return sample_ids
     return list(sample_ids)
-
-
-def _pop_partition_keys(
-    store: dict[str, dict[str, Any]], partition_id: str, keys: list[str] | None
-) -> list[Any]:
-    """Drop ``keys`` from ``store[partition_id]``, returning what was removed.
-
-    ``keys=None`` drops the whole partition. Shared by the byte accounting
-    and the fingerprint store so their teardown cannot drift apart.
-    """
-    partition = store.get(partition_id)
-    if partition is None:
-        return []
-    if keys is None:
-        del store[partition_id]
-        return list(partition.values())
-    removed = [partition.pop(key) for key in keys if key in partition]
-    if not partition:
-        del store[partition_id]
-    return removed
 
 
 def _tensor_bytes(v: torch.Tensor) -> int:
@@ -1157,9 +1176,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._bytes_by_partition: dict[str, int] = {}
         self._keys_by_partition: dict[str, set[str]] = {}
         self._rows_since_reconcile = 0
-        # partition -> sample_id -> field -> wire-in fingerprint. Same
-        # lifetime as the two above: ``_record_clear`` releases all three.
-        self._hash_by_partition: dict[str, dict[str, dict[str, int]]] = {}
         self._hash_mismatches_logged = 0
         # Set by ``_emit`` to the inner client's wall time for the op just
         # run, so the wrapping methods can subtract it and bill the rest to
@@ -1281,8 +1297,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
             partition_id: Partition the keys were dropped from.
             keys: Uids dropped; ``None`` means the whole partition was cleared.
         """
-        if self._verify_tensor_hash:
-            _pop_partition_keys(self._hash_by_partition, partition_id, keys)
         live = self._keys_by_partition.get(partition_id)
         if live is None:
             return
@@ -1432,28 +1446,40 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 exc,
             )
 
-    def _record_hashes(
-        self, partition_id: str, sample_ids: list[str], fields: TensorDict | None
-    ) -> None:
-        """Store wire-in fingerprints for a successful put. Never raises."""
+    def _stamp_hashes(
+        self, sample_ids: list[str], fields: TensorDict | None
+    ) -> TensorDict | None:
+        """Return ``fields`` with a ``<field>_hash`` column beside each field.
+
+        Never raises: a guard that cannot fold must not stop the put, so the
+        original ``fields`` goes on the wire unstamped and the batch reads as
+        unverified on the far side.
+        """
         try:
-            self._record_hashes_impl(partition_id, sample_ids, fields)
+            return self._stamp_hashes_impl(sample_ids, fields)
         except Exception as exc:  # noqa: BLE001 - a debug check must never fail a transfer
             self._hash_guard_failed("put", exc)
+            return fields
 
-    def _record_hashes_impl(
-        self, partition_id: str, sample_ids: list[str], fields: TensorDict | None
-    ) -> None:
-        """Store wire-in fingerprints for a successful put."""
-        digests = self._row_fingerprints(fields, sample_ids)
-        if not digests:
-            return
-        partition_hashes = self._hash_by_partition.setdefault(partition_id, {})
-        for row, sample_id in enumerate(sample_ids):
-            per_field = partition_hashes.setdefault(sample_id, {})
-            for name, per_row in digests.items():
-                per_field[name] = per_row[row]
+    def _stamp_hashes_impl(
+        self, sample_ids: list[str], fields: TensorDict | None
+    ) -> TensorDict | None:
+        if fields is None:
+            return fields
+        digests = _field_digests(
+            self._row_fingerprints(fields, sample_ids), len(sample_ids)
+        )
+        stamped = fields.copy()
+        # Every top-level field gets a column, including the ones the fold
+        # could not attribute per row -- those carry 0, which the reader takes
+        # as "no reading". A column that is sometimes absent would make the
+        # reader's fetch fail on a partition it has no business failing on.
+        unfolded = [0] * len(sample_ids)
+        for name in fields.keys():
+            column = digests.get(name, unfolded)
+            stamped[_hash_field(name)] = torch.tensor(column, dtype=torch.int64)
         self._stats.hash_verify.rows_recorded += len(sample_ids)
+        return stamped
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
         """Compare wire-out fingerprints against what was written. Never raises."""
@@ -1467,31 +1493,43 @@ class MetricsDataPlaneClient(DataPlaneClient):
     ) -> None:
         """Compare wire-out fingerprints against what was written.
 
-        Every field is comparable now. The old two-tier classification --
-        which fields could be compared, which were a shard of a batch-scoped
-        put, which had been written uniform and read back ragged -- existed
-        entirely to work around a digest that only meant something against
-        the exact batch it was folded over. A per-row hash reconciles against
-        any grouping, so a shard read is checked rather than abstained on.
+        The wire-in reading arrives with the row, so a shard read by a process
+        that never wrote it reconciles the same as a same-process round trip.
+        The mirror columns are stripped here: the caller asked for ``tokens``
+        and must never see ``tokens_hash``.
         """
         if not isinstance(out, TensorDict):
             return
-        digests = self._row_fingerprints(out, sample_ids)
+        expected_by_field: dict[str, list[int]] = {}
+        for key in list(out.keys()):
+            if isinstance(key, str) and key.endswith(_HASH_SUFFIX):
+                expected_by_field[key[: -len(_HASH_SUFFIX)]] = out.get(key).tolist()
+                del out[key]
+        digests = _field_digests(
+            self._row_fingerprints(out, sample_ids), len(sample_ids)
+        )
         if not digests:
             return
-        partition_hashes = self._hash_by_partition.get(partition_id, {})
         stats = self._stats.hash_verify
         for row, sample_id in enumerate(sample_ids):
-            per_field = partition_hashes.get(sample_id)
-            if not per_field:
-                # Written by another process (rollout actor, policy worker):
-                # this client has no wire-in reading to compare against.
+            # ``0`` is the writer saying it could not fold that field, so it is
+            # an abstention rather than a reading. A real digest of 0 is
+            # possible and goes unchecked; at one row in 2^64 that is cheaper
+            # than a false alarm on every asymmetric fold.
+            comparable = [
+                (name, per_row)
+                for name, per_row in digests.items()
+                if expected_by_field.get(name, [0] * len(sample_ids))[row] != 0
+            ]
+            if not comparable:
+                # Written without the mirror: a put that predates the guard,
+                # or a field the fold could not attribute per row.
                 stats.rows_unverified += 1
                 continue
             stats.rows_checked += 1
-            for name, per_row in digests.items():
-                expected = per_field.get(name)
-                if expected is None or expected == per_row[row]:
+            for name, per_row in comparable:
+                expected = expected_by_field[name][row]
+                if expected == per_row[row]:
                     continue
                 stats.mismatches += 1
                 if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
@@ -1614,6 +1652,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
         grpo_group_size=None,
         enums=None,
     ):
+        if self._verify_tensor_hash:
+            clash = [f for f in fields if f.endswith(_HASH_SUFFIX)]
+            if clash:
+                raise ValueError(
+                    f"partition {partition_id!r} declares {clash}, which the "
+                    f"wire guard's mirror columns would shadow. Rename them or "
+                    f"set observability.verify_tensor_hash=false."
+                )
+            fields = list(fields) + [_hash_field(f) for f in fields]
         self._run(
             "register",
             partition_id,
@@ -1654,10 +1701,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
     def get_data(self, meta, select_fields=None):
         entered = monotonic()
+        fetch = select_fields if select_fields is not None else meta.fields
+        if self._verify_tensor_hash and fetch is not None:
+            fetch = list(fetch) + [_hash_field(f) for f in fetch]
         out = self._run(
             "get_data",
             meta.partition_id,
-            lambda: self._inner.get_data(meta, select_fields=select_fields),
+            lambda: self._inner.get_data(meta, select_fields=fetch),
             n_keys=len(meta.sample_ids),
         )
         if self._verify_tensor_hash:
@@ -1678,37 +1728,41 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # Materialize once: ``_run`` consumes its lambda and we also need
         # to attribute bytes per sample after success.
         sample_ids_list = _as_list(sample_ids)
+        # Folded before ``_run``, not after: the digest travels in the payload
+        # now, so it has to exist before the RPC. The fold still lands outside
+        # the op's ``wall_ms`` -- ``_bill_self`` charges it to ``self_ms``.
+        payload = fields
+        if self._verify_tensor_hash:
+            payload = self._stamp_hashes(sample_ids_list, fields)
         out = self._run(
             "put",
             partition_id,
             lambda: self._inner.put_samples(
                 sample_ids_list,
                 partition_id,
-                fields=fields,
+                fields=payload,
                 tags=tags,
             ),
             n_keys=len(sample_ids_list),
             n_bytes=n_bytes,
         )
         self._record_put(partition_id, sample_ids_list, n_bytes)
-        # Fingerprinted after ``_run`` rather than inside it: ``fields`` is
-        # the caller's TensorDict and the RPC does not mutate it, so hashing
-        # here keeps the check's own cost out of the op's ``wall_ms``.
-        if self._verify_tensor_hash:
-            self._record_hashes(partition_id, sample_ids_list, fields)
         self._bill_self(entered)
         return out
 
     def get_samples(self, sample_ids, partition_id, select_fields):
         entered = monotonic()
         sample_ids_list = _as_list(sample_ids)
+        fetch = list(select_fields)
+        if self._verify_tensor_hash:
+            fetch += [_hash_field(f) for f in select_fields]
         out = self._run(
             "get",
             partition_id,
             lambda: self._inner.get_samples(
                 sample_ids_list,
                 partition_id,
-                select_fields=select_fields,
+                select_fields=fetch,
             ),
             n_keys=len(sample_ids_list),
         )
