@@ -1165,8 +1165,8 @@ def test_uniform_write_read_back_inside_a_ragged_batch_is_clean():
     """The false positive this once cost: a shard written with uniform rows,
     read back inside a batch whose *other* rows are ragged. Nothing diverged,
     and because a digest describes only its own row, the mixed batch needs no
-    special handling — the rows this process wrote are compared, the rows it
-    did not are counted unverified."""
+    special handling — every row is compared against the reading it arrived
+    with, whichever process wrote it."""
     inner = _JaggedEcho()
     client = _client(inner, verify_tensor_hash=True)
     ids = _ids(4)
@@ -1175,15 +1175,16 @@ def test_uniform_write_read_back_inside_a_ragged_batch_is_clean():
     )
     # a later writer adds rows of a different length to the same partition
     other = _ids(2, "v")
-    inner.rows[("p", other[0])] = {"ids": torch.randint(0, 32000, (3,))}
-    inner.rows[("p", other[1])] = {"ids": torch.randint(0, 32000, (9,))}
+    MetricsDataPlaneClient(inner, verify_tensor_hash=True).put_samples(
+        sample_ids=other, partition_id="p", fields=_jagged_ids([3, 9], seed=1)
+    )
     client.get_samples(sample_ids=ids + other, partition_id="p", select_fields=["ids"])
 
     hv = client.snapshot()["hash_verify"]
     assert hv["mismatches"] == 0, "no row changed; nothing diverged"
     assert hv["fields_skipped"] == 0, "and every field stayed comparable"
-    assert hv["rows_checked"] == 4, "the four this process wrote"
-    assert hv["rows_unverified"] == 2, "the two it did not"
+    assert hv["rows_checked"] == 6, "including the two this process did not write"
+    assert hv["rows_unverified"] == 0
     client.close()
 
 
