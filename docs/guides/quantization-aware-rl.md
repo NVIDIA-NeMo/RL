@@ -26,6 +26,7 @@ The following table records prior recipe campaigns and the validation level reac
 | QA-GRPO | W4A16 | `NVFP4_MLP_WEIGHT_ONLY_CFG` | ✅ Smoke tested on MoE | `examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml` |
 | QA-GRPO real quantization rollout | W4A16 | `W4A16_NVFP4_CFG` with `policy.generation.real_quant: true` | ✅ Native-loader 10-step functional run | `examples/modelopt/qa_grpo_qwen2_5_0p5b_megatron_real_quant.yaml` |
 | QA-GRPO real quantization rollout | Mixed MXFP8/W4A16 | `examples/modelopt/quant_configs/mxfp8_attention_nvfp4_mlp.yaml` with `policy.generation.real_quant: true` | ✅ Completed 150-step native-loader run | `examples/modelopt/qa_grpo_qwen3_8b_mixed_real_quant.yaml` |
+| QA-GRPO real quantization rollout | Grouped-MoE W4A4 | `examples/modelopt/quant_configs/nvfp4_experts.yaml` with `policy.generation.real_quant: true` | ✅ Two-step Qwen3.5 native-loader run | `examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml` with real-quant overrides |
 | QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml` with `policy.generation.real_quant: true` | Historical convergence; native-loader revalidation pending | `examples/configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml` |
 | QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml` with `policy.generation.real_quant: true` | Historical hybrid MoE/Mamba convergence; native-loader revalidation pending | `examples/configs/recipes/llm/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real.yaml` |
 | QA-GRPO real quantization rollout | W4A4 | `examples/modelopt/quant_configs/nvfp4_experts.yaml` with `policy.generation.real_quant: true` | Historical 300-step Qwen3-30B-A3B run; native-loader revalidation pending | `examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.yaml` |
@@ -160,7 +161,7 @@ policy:
     real_quant: true
 ```
 
-ModelOpt derives the canonical configuration from `policy.quant_cfg`, and vLLM selects the corresponding native method. NeMo RL does not infer W4A4, W4A16, or another format from recipe names. Unsupported formats or fused-layer combinations fail during setup or native loading.
+ModelOpt derives the canonical configuration from `policy.quant_cfg`, and vLLM selects the corresponding native method. NeMo RL does not infer W4A4, W4A16, or another format from recipe names, and it does not translate unsupported schemas. Depending on vLLM, an unsupported format or fused-layer combination may be rejected or may select an unquantized fallback. Inspect representative native methods before treating a recipe as qualified.
 
 For Nano3 W4A16 real-quant rollout, use the Nano3 weight-only policy recipe. The recipe itself selects supported tensors and leaves sensitive paths in BF16:
 
@@ -337,7 +338,7 @@ Generation-specific parameters are added under `policy.generation`:
 | Parameter | Description |
 |---|---|
 | `quant_cfg` | ModelOpt recipe used only for simulated/fake-quant vLLM generation. Set it to `null` for real-quant rollout. |
-| `real_quant` | When `true`, vLLM uses native ModelOpt real-quant kernels and receives packed weights and deployment scales during refit. `policy.quant_cfg` selects the format; unsupported formats fail during setup. When unset or `false`, vLLM uses fake-quantized generation. |
+| `real_quant` | When `true`, vLLM receives ModelOpt-packed weights and deployment scales during refit. `policy.quant_cfg` selects the format. Verify that the pinned vLLM selects the intended native method; unsupported schemas may be rejected or may fall back to an unquantized method. When unset or `false`, vLLM uses fake-quantized generation. |
 | `real_quant_export_cpu_offload` | Boolean required for real-quant rollout. When `true`, packed export tensors are copied to CPU before refit. Set to `false` only for colocated CUDA-IPC refit without an explicit `refit_transport`; this avoids the CPU round trip at the cost of transient GPU memory. |
 
 ## Megatron Checkpoint Directory

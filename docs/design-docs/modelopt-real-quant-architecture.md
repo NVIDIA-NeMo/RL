@@ -22,7 +22,8 @@ This design builds on:
 
 ## Canonical Contract
 
-The online path emits the same artifacts as ModelOpt Hugging Face export:
+The online path emits loader-equivalent artifacts using ModelOpt Hugging Face
+packing semantics:
 
 - canonical Hugging Face parameter names;
 - packed weight tensors;
@@ -31,6 +32,11 @@ The online path emits the same artifacts as ModelOpt Hugging Face export:
 
 The sidecar schema is open-ended. NeMo RL and Megatron-Bridge do not maintain a
 format-specific list of scale names or packing rules.
+
+Dense tensors use the ordinary ModelOpt Hugging Face representation. For a
+grouped Hugging Face MoE mapping, online refit may use canonical per-expert
+names accepted by the native loader while offline export retains one grouped
+tensor.
 
 | Component | Responsibility |
 |---|---|
@@ -89,8 +95,10 @@ The architecture is format-neutral. Runtime support is the intersection of:
 2. canonical ModelOpt formats accepted by the pinned vLLM version.
 
 This permits mixed real-quant and unquantized leaves, and mixed real-quant
-formats when vLLM supports the complete fused-layer combination. Unsupported
-formats fail rather than being translated or silently loaded as BF16.
+formats when vLLM supports the complete fused-layer combination. NeMo RL does
+not translate unsupported schemas. vLLM may reject an unsupported combination
+or select an unquantized fallback, so native-method inspection is required
+before a schema is considered qualified.
 
 NVFP4 W4A4 and W4A16 are supported recipe examples, not downstream mode
 branches. See [Quantization-Aware RL](../guides/quantization-aware-rl.md) for
