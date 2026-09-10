@@ -46,6 +46,7 @@ from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
 )
+from nemo_rl.environments.nemo_gym_checkpoint import NemoGymCheckpointCoordinator
 from nemo_rl.environments.nemo_gym_multimodal import (
     _extract_static_video_messages,
     _inject_vllm_mm_processor_kwargs,
@@ -110,6 +111,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             head_server_config = object()
             _token_capture_enabled = False
             _tokenizer = object()
+            _checkpoint = NemoGymCheckpointCoordinator("test")
 
             def _require_spinup(self):
                 pass
@@ -169,6 +171,7 @@ def test_token_capture_forwards_logical_id_and_attempt_unchanged() -> None:
         head_server_config = object()
         _token_capture_enabled = True
         _tokenizer = object()
+        _checkpoint = NemoGymCheckpointCoordinator("test")
 
         def _require_spinup(self):
             pass
@@ -1340,7 +1343,16 @@ def test_run_rollouts_requires_an_installed_tokenizer():
     assert gym._tokenizer is None
     gym.rh = object()  # satisfies _require_spinup
 
-    stream = gym.run_rollouts([{"_rowidx": 0}], "")
+    stream = gym.run_rollouts(
+        [
+            {
+                "_rowidx": 0,
+                "_ng_rollout_id": "rollout-0",
+                "_ng_attempt_index": 0,
+            }
+        ],
+        "",
+    )
     with pytest.raises(RuntimeError, match="set_tokenizer must be called"):
         asyncio.run(stream.__anext__())
 
@@ -1735,6 +1747,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
+            _checkpoint = NemoGymCheckpointCoordinator("test")
 
             def _require_spinup(self):
                 pass
@@ -1857,6 +1870,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             _tokenizer = _Tokenizer()
             _processor = None
             _token_capture_enabled = False
+            _checkpoint = NemoGymCheckpointCoordinator("test")
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result

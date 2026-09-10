@@ -14,12 +14,14 @@
 import asyncio
 import math
 import os
+import secrets
 import subprocess
 import sys
+import time
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict, cast
 
 import ray
 import torch
@@ -39,6 +41,12 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_checkpoint import (
+    CHECKPOINT_CONTROL_TOKEN_ENV,
+    CHECKPOINT_OPERATION_TIMEOUT_S,
+    ExecutionIdentity,
+    NemoGymCheckpointCoordinator,
+)
 from nemo_rl.environments.nemo_gym_multimodal import (
     _index_per_turn_images,
     _is_trainable_output_item,
@@ -334,6 +342,8 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        self._checkpoint_control_token = secrets.token_urlsafe(32)
+        self._checkpoint = NemoGymCheckpointCoordinator(self._checkpoint_control_token)
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -349,6 +359,9 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
+        self._server_client: Any = None
+        self._control_headers: Dict[str, str] = {}
+        self._control_timeout_s = 60.0
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -390,7 +403,7 @@ class NemoGym(EnvironmentInterface):
         self._require_spinup()
         self.rh.poll()
 
-    def _spinup(self) -> None:
+    async def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
 
         Deferred from __init__ so the actor can be created cheaply (and
@@ -472,14 +485,17 @@ Depending on your data shape, you may want to change these values."""
         # Ledger-authoritative token capture: enable external staging in the
         # policy model server (via the policy_model global-config override
         # block the env yamls already use) and disable the legacy token echo.
-        token_capture = self.cfg.get("token_capture") or None
+        token_capture = cast(
+            Dict[str, Any] | None,
+            self.cfg.get("token_capture") or None,
+        )
         self._token_capture_enabled = bool(
             token_capture and token_capture.get("enabled")
         )
         self._server_client = None
-        self._control_headers: Dict[str, str] = {}
+        self._control_headers = {}
         self._control_timeout_s = 60.0
-        if self._token_capture_enabled:
+        if token_capture is not None and self._token_capture_enabled:
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
                 .setdefault("responses_api_models", {})
@@ -512,6 +528,10 @@ Depending on your data shape, you may want to change these values."""
                 token_capture.get("control_timeout_s") or 60.0
             )
 
+        # Gym resolves this credential independently inside each serving
+        # process. Keep it out of serialized global config and install it
+        # before RunHelper copies the actor environment to subprocesses.
+        os.environ[CHECKPOINT_CONTROL_TOKEN_ENV] = self._checkpoint_control_token
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
@@ -520,6 +540,10 @@ Depending on your data shape, you may want to change these values."""
                 initial_global_config_dict=DictConfig(initial_global_config_dict),
                 skip_load_from_cli=True,
             )
+        )
+        await self._checkpoint.discover(
+            self.rh._server_client.global_config_dict,
+            deadline_ts=time.time() + CHECKPOINT_OPERATION_TIMEOUT_S,
         )
 
         # Setup for rollout collection
@@ -552,6 +576,48 @@ Depending on your data shape, you may want to change these values."""
         value, so it still pays per task.
         """
         self._tokenizer = tokenizer
+
+    async def prepare_checkpoint(
+        self,
+        checkpoint_id: str,
+        deadline_ts: float,
+    ) -> dict[str, Any]:
+        """Prepare and leave the Gym rollout fleet paused."""
+        self._require_spinup()
+        return await self._checkpoint.prepare(checkpoint_id, deadline_ts)
+
+    async def commit_checkpoint(
+        self,
+        checkpoint_id: str,
+        checkpoint_dir: str,
+    ) -> dict[str, Any]:
+        """Commit Gym state and leave all participants paused."""
+        self._require_spinup()
+        return await self._checkpoint.commit(checkpoint_id, checkpoint_dir)
+
+    async def restore_checkpoint(
+        self,
+        checkpoint_id: str,
+        checkpoint_dir: str,
+    ) -> dict[str, Any]:
+        """Restore Gym state and leave all participants paused."""
+        self._require_spinup()
+        return await self._checkpoint.restore(checkpoint_id, checkpoint_dir)
+
+    async def resume(self, checkpoint_id: str) -> dict[str, Any]:
+        """Resume dependencies, agents, and actor dispatch in that order."""
+        self._require_spinup()
+        return await self._checkpoint.resume(checkpoint_id)
+
+    async def abort_checkpoint(self, checkpoint_id: str) -> dict[str, Any]:
+        """Abort the active transaction and reopen prepared participants."""
+        self._require_spinup()
+        return await self._checkpoint.abort(checkpoint_id)
+
+    def checkpoint_status(self, checkpoint_id: str) -> dict[str, Any]:
+        """Return bounded actor-local checkpoint status."""
+        self._require_spinup()
+        return self._checkpoint.status(checkpoint_id)
 
     # ── ledger control plane (token-capture mode) ───────────────────────────
 
@@ -605,22 +671,14 @@ Depending on your data shape, you may want to change these values."""
                 "NemoGym.set_tokenizer must be called before run_rollouts"
             )
         tokenizer = self._tokenizer
-
+        execution_identities = [
+            ExecutionIdentity.from_row(row) for row in nemo_gym_examples
+        ]
         for row in nemo_gym_examples:
             logical_rollout_id = row.get(NEMO_GYM_ROLLOUT_ID_KEY)
             attempt_index = row.get(NEMO_GYM_ATTEMPT_INDEX_KEY)
-            if not isinstance(logical_rollout_id, str) or not logical_rollout_id:
-                raise ValueError(
-                    f"{NEMO_GYM_ROLLOUT_ID_KEY} must be a non-empty string"
-                )
-            if (
-                isinstance(attempt_index, bool)
-                or not isinstance(attempt_index, int)
-                or attempt_index < 0
-            ):
-                raise ValueError(
-                    f"{NEMO_GYM_ATTEMPT_INDEX_KEY} must be a non-negative integer"
-                )
+            assert isinstance(logical_rollout_id, str)
+            assert isinstance(attempt_index, int)
             expected_capture_id = nemo_gym_capture_key(
                 logical_rollout_id, attempt_index
             )
@@ -628,6 +686,14 @@ Depending on your data shape, you may want to change these values."""
                 raise ValueError(
                     f"{NEMO_GYM_CAPTURE_ID_KEY} must equal {expected_capture_id!r}"
                 )
+        registered_identities: list[ExecutionIdentity] = []
+        try:
+            for row in nemo_gym_examples:
+                registered_identities.append(self._checkpoint.registry.register(row))
+        except (RuntimeError, ValueError):
+            for identity in registered_identities:
+                self._checkpoint.registry.release(identity)
+            raise
 
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
@@ -653,6 +719,8 @@ Depending on your data shape, you may want to change these values."""
                 try:
                     nemo_gym_row, nemo_gym_result = await task
                 except Exception as error:
+                    for identity in execution_identities:
+                        self._checkpoint.registry.release(identity)
                     if hasattr(error, "response_content"):
                         print(
                             "EXCEPTION RESULT",
@@ -666,6 +734,8 @@ Depending on your data shape, you may want to change these values."""
                         # the whole point. The status and message are already in `detail`.
                         raise typed from None
                     raise
+            identity = ExecutionIdentity.from_row(nemo_gym_row)
+            self._checkpoint.registry.mark_terminal(identity)
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 if self._token_capture_enabled:
@@ -690,11 +760,16 @@ Depending on your data shape, you may want to change these values."""
             if num_results == len(nemo_gym_examples):
                 timer.stop("_run_rollouts_total")
                 timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
+                total_time = cast(
+                    float,
+                    timing_metrics.pop("_run_rollouts_total"),
+                )
+                postprocess_time = cast(
+                    float,
+                    timing_metrics[f"{timer_prefix}/postprocess_results"],
+                )
                 timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
+                    100 * postprocess_time / total_time
                 )
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
@@ -716,12 +791,18 @@ Depending on your data shape, you may want to change these values."""
             # task_source is resolved to agent_ref inside this Ray actor, after
             # the caller's row was serialized. Return the resolved ref explicitly
             # so the caller can hydrate its own row copy before postprocessing.
-            yield (
-                nemo_gym_row["_rowidx"],
-                nemo_gym_row["agent_ref"],
-                nemo_rl_result,
-                timing_metrics,
-            )
+            try:
+                yield (
+                    nemo_gym_row["_rowidx"],
+                    nemo_gym_row["agent_ref"],
+                    nemo_rl_result,
+                    timing_metrics,
+                )
+            finally:
+                await self._checkpoint.release(
+                    identity,
+                    agent_name=nemo_gym_row["agent_ref"]["name"],
+                )
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
@@ -1162,7 +1243,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         container[key], raw_initial_sources
                     )
 
-        result = {
+        result: dict[str, Any] = {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
@@ -1321,7 +1402,7 @@ def build_nemo_gym_config(
         remaining ``env_configs["nemo_gym"]`` keys under
         ``initial_global_config_dict``. The caller's ``env_configs`` is not mutated.
     """
-    nemo_gym_dict = dict(env_configs["nemo_gym"])
+    nemo_gym_dict: dict[str, Any] = dict(env_configs["nemo_gym"])
 
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
