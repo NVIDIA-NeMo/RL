@@ -499,6 +499,13 @@ step/percent_of_dataplane/by_op/put                 42.1   within it, put is the
 
 `by_op` sums to 100 by construction.
 
+**7% is not 7% of the step spent exclusively in the data plane.** The
+numerator is data-plane wall time and the denominator is the step's, but on
+the async and single-controller paths a transfer overlaps compute -- the same
+reason `wall_ms` is aggregate process-time rather than elapsed time (below).
+Read `frac_of_step` as "how much data-plane work a step carries", not as time
+the step would get back if the data plane were free.
+
 `volume_mb` counts *transfers*, not data size, and two things follow from
 that. A byte written and later read is counted on both sides. And every
 reporting process is summed, so four ranks each fetching their own shard
