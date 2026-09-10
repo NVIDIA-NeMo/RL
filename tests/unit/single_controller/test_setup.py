@@ -226,6 +226,41 @@ def _save_state(
     return state
 
 
+@pytest.mark.parametrize(
+    ("backend", "expected", "unexpected"),
+    [
+        (
+            "megatron",
+            "MegatronPolicyWorker environment",
+            "VllmAsyncGenerationWorker environment",
+        ),
+        (
+            "vllm",
+            "VllmAsyncGenerationWorker environment",
+            "MegatronPolicyWorker environment",
+        ),
+    ],
+)
+def test_missing_nemo_gym_remediation_is_backend_specific(
+    backend: str, expected: str, unexpected: str
+) -> None:
+    import_error = ModuleNotFoundError("No module named 'nemo_gym'")
+
+    with pytest.raises(RuntimeError, match=expected) as exc_info:
+        sc_setup_mod._raise_missing_nemo_gym_error(import_error, backend)
+
+    assert unexpected not in str(exc_info.value)
+    assert exc_info.value.__cause__ is import_error
+    assert "NRL_FORCE_REBUILD_VENVS=true" in str(exc_info.value)
+    assert "$NEMO_RL_VENV_DIR" in str(exc_info.value)
+    worker_module = (
+        "nemo_rl.models.policy.workers.megatron_policy_worker"
+        if backend == "megatron"
+        else "nemo_rl.models.generation.vllm.vllm_worker_async"
+    )
+    assert worker_module in str(exc_info.value)
+
+
 @pytest.fixture
 def patched_factories():
     """Patch every external factory setup calls.
@@ -1643,7 +1678,7 @@ class TestSetup:
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
-            ),
+            ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
@@ -1665,6 +1700,10 @@ class TestSetup:
         partition_calls = actor_args.dp_client.register_partition.call_args_list
         assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
         assert WIRE_MULTIMODAL_FIELDS.isdisjoint(partition_calls[1].kwargs["fields"])
+        assert mc.token_capture.generation_backend == "vllm"
+        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+            "vllm"
+        )
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""

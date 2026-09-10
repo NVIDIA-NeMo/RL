@@ -19,7 +19,7 @@ import os
 import threading
 import time
 import warnings
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import requests
 import torch
@@ -78,6 +78,9 @@ from nemo_rl.models.megatron.memory_saver import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
+if TYPE_CHECKING:
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
+
 
 class MegatronGenerationMixin:
     """Engine lifecycle, coordinator, HTTP server, and finish-generation machinery.
@@ -121,6 +124,9 @@ class MegatronGenerationMixin:
         )
         self._inference_loop = None
         self._inference_thread = None
+        self._token_capture_enabled = False
+        self._request_payload_stager = None
+        self._request_prompt_preparer = None
 
     def _get_megatron_inference_wrapper_cls(self) -> Optional[type]:
         """Resolve the configured Megatron inference wrapper, if any.
@@ -757,6 +763,69 @@ class MegatronGenerationMixin:
     def report_dp_openai_server_base_url(self) -> Optional[str]:
         """Return this worker's OpenAI server base URL (None if not the leader)."""
         return self.base_url
+
+    def setup_token_capture(
+        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+    ) -> bool:
+        """Install canonical TQ capture on each MInf model-parallel leader."""
+        engine = self.dynamic_inference_engine
+        if engine is None:
+            raise RuntimeError(
+                "Megatron token capture requires an initialized inference engine"
+            )
+        missing = [
+            name
+            for name in ("payload_stager", "prompt_preparer")
+            if not hasattr(engine, name)
+        ]
+        if missing:
+            raise RuntimeError(
+                "Megatron token capture requires MInf RequestPayloadStager, request "
+                f"metadata, and prompt preparation support; missing {', '.join(missing)}"
+            )
+        self._token_capture_enabled = True
+        if not engine.is_mp_coordinator:
+            return False
+
+        from nemo_rl.data_plane import build_data_plane_client
+        from nemo_rl.data_plane.tq_token_sink import (
+            TQMegatronPromptPreparer,
+            TQMegatronTokenStager,
+            TQTokenSink,
+            TQTokenSource,
+        )
+
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        prompt_preparer = TQMegatronPromptPreparer(
+            TQTokenSource(dp_client, staging_partition=staging_partition)
+        )
+        engine.prompt_preparer = prompt_preparer
+        self._request_prompt_preparer = prompt_preparer
+        stager = TQMegatronTokenStager(
+            TQTokenSink(dp_client, staging_partition=staging_partition)
+        )
+        engine.payload_stager = stager
+        self._request_payload_stager = stager
+        return True
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Stamp subsequent MInf requests with the trainer weight version."""
+        if type(version) is not int or version < 0:
+            raise ValueError(
+                f"rollout weight version must be a non-negative int, got {version!r}"
+            )
+        if not self._token_capture_enabled:
+            raise RuntimeError("Megatron token capture is not initialized")
+        if torch.distributed.get_rank() != 0:
+            return
+        if self.inference_client is None:
+            raise RuntimeError("Megatron token capture is not initialized")
+        setter = getattr(self.inference_client, "set_generation_epoch", None)
+        if not callable(setter):
+            raise RuntimeError(
+                "Megatron token capture requires InferenceClient.set_generation_epoch"
+            )
+        setter(version)
 
     def _build_sampling_params(
         self,

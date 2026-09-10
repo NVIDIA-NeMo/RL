@@ -936,6 +936,27 @@ def _load_opd_full_teacher_lm_heads(
     )
 
 
+def _raise_missing_nemo_gym_error(error: Exception, backend: str) -> None:
+    """Raise backend-specific remediation for a missing Gym capture extra."""
+    # Worker venvs are cached by actor class name (nemo_rl/utils/venvs.py), so a
+    # venv prebuilt before token capture predates the nemo_gym extra and is reused.
+    if backend == "megatron":
+        raise RuntimeError(
+            "Megatron token capture requires nemo_gym in the "
+            "MegatronPolicyWorker environment, but the cached worker venv "
+            "predates it. Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
+            "delete $NEMO_RL_VENV_DIR/nemo_rl.models.policy.workers."
+            "megatron_policy_worker.MegatronPolicyWorker and rerun."
+        ) from error
+    raise RuntimeError(
+        "vLLM token capture requires nemo_gym in the "
+        "VllmAsyncGenerationWorker environment, but the cached worker venv "
+        "predates it. Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
+        "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
+        "vllm_worker_async.VllmAsyncGenerationWorker and rerun."
+    ) from error
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1134,22 +1155,51 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] != "vllm":
+        if generation_config["backend"] not in ("vllm", "megatron"):
             raise NotImplementedError(
-                "token_capture.enabled supports the vllm backend only; got "
+                "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
-        if not vllm_cfg["async_engine"]:
+        if (
+            generation_config["backend"] == "vllm"
+            and not generation_config["vllm_cfg"]["async_engine"]
+        ):
             raise ValueError(
                 "token_capture.enabled requires "
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
                 "host is the worker's in-process HTTP server)"
             )
+        # The capture host imports nemo_gym inside the serving worker process
+        # (TQTokenSink / TQMegatronTokenStager), so that worker's venv must
+        # carry the nemo_gym extra regardless of backend.
+        from nemo_rl.distributed.ray_actor_environment_registry import (
+            ACTOR_ENVIRONMENT_REGISTRY,
+        )
+        from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+        if generation_config["backend"] == "megatron":
+            if not generation_config["mcore_generation_config"]["expose_http_server"]:
+                raise ValueError(
+                    "Megatron token capture requires policy.generation."
+                    "mcore_generation_config.expose_http_server=true"
+                )
+            if router_replay_enabled(master_config.policy):
+                raise NotImplementedError(
+                    "Megatron token capture does not yet support router replay: "
+                    "the canonical MInf stager does not yet normalize routed experts"
+                )
+            ACTOR_ENVIRONMENT_REGISTRY[
+                "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            ] = PY_EXECUTABLES.MCORE_GYM
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[
+                "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+            ] = PY_EXECUTABLES.VLLM_GYM
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
-        # per-run control-plane bearer token and the process-shared capture
-        # directory used by every Gym worker.
+        # per-run control-plane bearer token, the process-shared capture
+        # directory used by every Gym worker, and the capture-host backend.
+        token_capture_cfg.generation_backend = generation_config["backend"]
         if token_capture_cfg.control_auth_token is None:
             # Deferred import: only needed on the capture path.
             import secrets
@@ -1792,10 +1842,15 @@ def setup_single_controller(
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
-        # Host Gym's capture core in every vLLM DP leader (in-worker DP
-        # client + TQTokenSink + the single install_capture call), and give
-        # workers the initial weight version to stamp on captured calls.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        # Both active backends stage canonical Gym rows in serving workers.
+        try:
+            generation.setup_token_capture(
+                dp_config, token_capture_cfg.staging_partition
+            )
+        except Exception as error:
+            if "No module named 'nemo_gym'" in str(error):
+                _raise_missing_nemo_gym_error(error, generation_config["backend"])
+            raise
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:

@@ -533,9 +533,9 @@ class VllmAsyncGenerationWorkerImpl(
         ``ng_capture`` context.
 
         ``prefix_token_ids`` is the prefix resolved by
-        :meth:`_resolve_admission_prefix`; Gym's ``begin_call`` checks it
-        against the admission (length == ``prev_len``, equal to an inline
-        prefix) and requires it for a ``staging_chain`` admission.
+        :meth:`_resolve_admission_prefix`. For a ``staging_chain`` admission,
+        replace the empty wire placeholder with those resolved IDs before
+        passing the admission to Gym's capture API.
         """
         capture = self.token_capture
         if capture is None:
@@ -544,9 +544,29 @@ class VllmAsyncGenerationWorkerImpl(
             admission = self._capture_admission(request)
             if admission is None:
                 return
+        if admission.mode == "token_in":
+            if prefix_token_ids is None:
+                if admission.staging_chain:
+                    # Deferred: nemo_gym is optional outside Gym capture runs.
+                    from nemo_gym.token_id_capture.staging.capture import CaptureError
+
+                    raise CaptureError(
+                        "staging_chain admission requires resolved prefix_token_ids"
+                    )
+                prefix_token_ids = list(admission.required_prefix_token_ids)
+            if len(prefix_token_ids) != admission.prev_len:
+                # Deferred: nemo_gym is optional outside Gym capture runs.
+                from nemo_gym.token_id_capture.staging.capture import CaptureError
+
+                raise CaptureError(
+                    f"resolved prefix length {len(prefix_token_ids)} does not equal "
+                    f"prev_len {admission.prev_len}"
+                )
+            admission = admission.model_copy(
+                update={"required_prefix_token_ids": list(prefix_token_ids)}
+            )
         call = capture.begin_call(
             admission,
-            prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
         self._capture_calls[id(request)] = (call, list(prompt_token_ids))

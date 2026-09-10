@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import threading
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
@@ -39,8 +41,12 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MegatronGeneration(GenerationInterface):
@@ -388,6 +394,29 @@ class MegatronGeneration(GenerationInterface):
         )
         ray.get(futures)
         return True
+
+    def setup_token_capture(
+        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+    ) -> None:
+        """Install MInf's canonical prompt and completion capture hooks."""
+        if not self.cfg["mcore_generation_config"]["expose_http_server"]:
+            raise ValueError(
+                "Megatron token capture requires mcore_generation_config."
+                "expose_http_server=true"
+            )
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "setup_token_capture",
+            dp_cfg=dp_cfg,
+            staging_partition=staging_partition,
+        )
+        ray.get(futures)
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the policy epoch stamped by MInf on subsequent requests."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "set_rollout_weight_version", version=version
+        )
+        ray.get(futures)
 
     def blocks_training(self) -> bool:
         """Whether the engine must stand down before a training step.

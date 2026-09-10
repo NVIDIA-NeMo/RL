@@ -89,6 +89,13 @@ class PY_EXECUTABLES:
     # nemo_gym import would fail.
     VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
 
+    # Megatron workers hosting Gym token capture (token_capture.enabled with
+    # backend=megatron): the TQ stager/preparer import nemo_gym inside the
+    # MegatronPolicyWorker process, so its venv must carry the extra too.
+    MCORE_GYM = (
+        f"uv run --locked --extra mcore --extra nemo_gym --directory {git_root}"
+    )
+
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
