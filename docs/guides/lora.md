@@ -188,13 +188,20 @@ adapter, and selects it on every generation request. The base model is loaded on
 not overwritten during adapter updates.
 
 Native refit currently supports the topology-default transport (colocated CUDA IPC or
-non-colocated NCCL) and matching BF16/FP16 trainer and rollout precision. It exports
-custom model layouts through the model's Automodel state-dict adapter when one is
-present. It fails at setup for unsupported combinations such as asynchronous vLLM,
-vLLM's exposed HTTP server (NeMo Gym), speculative decoding, quantized rollout models,
-custom refit transports, DoRA, `moe_rank_scaling`, or Megatron LoRA. Models with
-dynamically updated MoE router bias fail before their first native refit rather than
-silently omitting that mutable state.
+non-colocated NCCL) and matching BF16/FP16 trainer and rollout precision. It exports the
+trainer's LoRA tensors through the model's Automodel state-dict adapter when one is
+present, so custom model layouts such as grouped MoE are converted to conventional
+per-expert HF/PEFT factors with the orientation consumed by vLLM. It fails at setup for
+unsupported combinations such as asynchronous vLLM, vLLM's exposed HTTP server (NeMo
+Gym), speculative decoding, quantized rollout models, custom refit transports, DoRA,
+`moe_rank_scaling`, or Megatron LoRA. Models with dynamically updated MoE router bias
+fail before their first native refit rather than silently omitting that mutable state.
+
+Individual recipes may still set
+`policy.automodel_cfg.automodel_kwargs.force_hf=true` for model-specific training or
+parallelization compatibility. That setting is independent of native refit; native refit
+itself accepts either HF-native LoRA names or names converted by a custom Automodel
+state-dict adapter.
 
 The previous full-weight behavior remains available as an explicit compatibility or
 performance opt-in:
