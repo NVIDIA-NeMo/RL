@@ -1,0 +1,153 @@
+digraph token_capture_flow {
+  graph [
+    rankdir=TB,
+    bgcolor="#fbfbfd",
+    pad="0.35",
+    nodesep="0.55",
+    ranksep="0.62",
+    fontname="Helvetica",
+    labelloc="t",
+    label="Token capture custody — vLLM ↔ Megatron function map",
+    fontsize=24
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fillcolor="white",
+    color="#475569",
+    fontname="Helvetica",
+    fontsize=10,
+    margin="0.16,0.11"
+  ];
+  edge [color="#475569", fontname="Helvetica", fontsize=9];
+
+  gym_admit [
+    color="#2563eb",
+    fillcolor="#dbeafe",
+    label="SHARED — Gym request admission\nresolve_parent() → CaptureAdmission\n_apply_external_capture() → request.ng_capture"
+  ];
+
+  vllm_prepare [
+    group="left",
+    color="#7c3aed",
+    fillcolor="#ede9fe",
+    label="vLLM — prompt preparation\nNeMoRLOpenAIServingMixin.preprocess_chat()\n_resolve_admission_prefix() → TQTokenSource.fetch_prefix_token_ids()\nreplace_prefix_tokens() → exact prompt_token_ids"
+  ];
+  megatron_prepare [
+    group="right",
+    color="#ea580c",
+    fillcolor="#ffedd5",
+    label="Megatron — equivalent prompt preparation\nchat_completions() → ng_prompt_suffix_token_ids\nDynamicInferenceEngine._prepare_submit_request_message()\nTQMegatronPromptPreparer.prepare_prompt() → exact prompt_token_ids"
+  ];
+
+  vllm_admit [
+    group="left",
+    color="#7c3aed",
+    fillcolor="#ede9fe",
+    label="vLLM — retain capture state before generation\nVllmAsyncGenerationWorkerImpl._begin_request_capture()\n_capture_calls[id(request)] = (ActiveCall, exact prompt_token_ids)"
+  ];
+  megatron_admit [
+    group="right",
+    color="#ea580c",
+    fillcolor="#ffedd5",
+    label="Megatron — carry capture state through generation\nInferenceClient.add_request_with_id(..., request_metadata=...)\nCaptureAdmission and exact prompt remain on the engine request"
+  ];
+
+  vllm_generate [
+    group="left",
+    color="#7c3aed",
+    fillcolor="#ede9fe",
+    label="vLLM — generation\nOpenAIServingChat.create_chat_completion()\n→ generated token IDs and logprobs"
+  ];
+  megatron_generate [
+    group="right",
+    color="#ea580c",
+    fillcolor="#ffedd5",
+    label="Megatron — generation\nDynamicInferenceEngine\n→ OffloadedRequestPayload + FinishedRequestRecord(policy_epoch)"
+  ];
+
+  vllm_capture [
+    group="left",
+    color="#7c3aed",
+    fillcolor="#ede9fe",
+    label="vLLM — canonicalize and stage\n_finish_request_capture()\nRolloutTokenCapture.complete_call_from_response()\n→ TQTokenSink.stage()"
+  ];
+  megatron_capture [
+    group="right",
+    color="#ea580c",
+    fillcolor="#ffedd5",
+    label="Megatron — canonicalize and stage\nDynamicInferenceEngine._serialize_finished_request_record()\nTQMegatronTokenStager.stage() → RolloutTokenCapture.complete_call()\n→ TQTokenSink.stage()"
+  ];
+
+  tq_staging [
+    shape=cylinder,
+    color="#0f766e",
+    fillcolor="#99f6e4",
+    penwidth=2,
+    label="SHARED — TQ staging partition\nStagedCallRecord under staging_key(rollout_id, model_call_id)\ntoken_ids_delta · token_mask_delta · generation_logprobs_delta\nidentity · lengths · weight_version · digests · chain hashes · optional extras"
+  ];
+
+  vllm_coords [
+    group="left",
+    color="#7c3aed",
+    fillcolor="#ede9fe",
+    label="vLLM — return acknowledgement\n_finish_request_capture()\n→ response.ng_commit_coords"
+  ];
+  megatron_coords [
+    group="right",
+    color="#ea580c",
+    fillcolor="#ffedd5",
+    label="Megatron — return acknowledgement\nMegatronPayloadStageResult.response_metadata\n→ payload_stage_metadata → response.ng_commit_coords"
+  ];
+
+  gym_commit [
+    color="#2563eb",
+    fillcolor="#dbeafe",
+    label="SHARED — Gym response finalization\n_finalize_external_capture() verifies CommitCoords\nlineage_store.record() writes token-free CallRecord\n_strip_capture_transport_fields() → clean agent response"
+  ];
+
+  capture_failure [
+    color="#b91c1c",
+    fillcolor="#fee2e2",
+    label="SHARED FAILURE PATH\n_finalize_external_capture() → lineage_store.record_failure()\nNo CallRecord; finalization rejects/masks the rollout"
+  ];
+
+  receipt [
+    color="#2563eb",
+    fillcolor="#dbeafe",
+    label="SHARED — rollout end\nNemoGym._assemble_receipt()\n→ token-free RolloutReceipt.manifest"
+  ];
+
+  finalizer [
+    color="#0369a1",
+    fillcolor="#e0f2fe",
+    label="SHARED — replay construction\nRolloutReassembler.finalize_rollout()\nTQTokenSource.fetch_for_finalization()\nverify_and_linearize() → canonical GRPO sample"
+  ];
+
+  gym_admit -> vllm_prepare [label="vLLM"];
+  gym_admit -> megatron_prepare [label="Megatron"];
+  vllm_prepare -> vllm_admit;
+  megatron_prepare -> megatron_admit;
+  vllm_admit -> vllm_generate;
+  megatron_admit -> megatron_generate;
+  vllm_generate -> vllm_capture;
+  megatron_generate -> megatron_capture;
+  vllm_capture -> tq_staging [label="stage and wait"];
+  megatron_capture -> tq_staging [label="stage and wait"];
+  tq_staging -> vllm_coords;
+  tq_staging -> megatron_coords;
+  vllm_coords -> gym_commit;
+  megatron_coords -> gym_commit;
+  vllm_capture -> capture_failure [style=dashed, color="#b91c1c"];
+  megatron_capture -> capture_failure [style=dashed, color="#b91c1c"];
+  gym_commit -> receipt;
+  capture_failure -> receipt [style=dashed, color="#b91c1c"];
+  receipt -> finalizer;
+  finalizer -> tq_staging [label="fetch by staging_key", dir=back];
+  { rank=same; vllm_prepare; megatron_prepare; }
+  { rank=same; vllm_admit; megatron_admit; }
+  { rank=same; vllm_generate; megatron_generate; }
+  { rank=same; vllm_capture; megatron_capture; }
+  { rank=same; vllm_coords; megatron_coords; }
+}

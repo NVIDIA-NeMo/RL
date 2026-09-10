@@ -13,13 +13,10 @@
 # limitations under the License.
 """TransferQueue implementations of NeMo-Gym's token staging protocols.
 
-``TQTokenSink``/``TQTokenSource`` are NeMo-RL's providers for the
-ledger-authoritative capture design:
-the sink is the worker-side write of one model call's token delta to the
-``rollout_staging`` partition — the design's only heavy token hop — and the
-source is the finalizer's read-back of those rows by staging key. This module
-is the only hot-path file that knows tokens live in TQ; Gym sees opaque
-staging keys.
+``TQStagingStore`` is NeMo RL's single keyed-row transport for token custody.
+Both vLLM and MInf write canonical Gym call deltas through ``TQTokenSink``.
+This module is the only hot-path file that knows tokens live in TQ; Gym sees
+opaque staging keys.
 
 Each staged row carries three jagged columns (``token_ids_delta``,
 ``token_mask_delta``, ``generation_logprobs_delta``), the complete receipt
@@ -139,6 +136,49 @@ def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
     return method(**kwargs)
 
 
+class TQStagingStore:
+    """Shared keyed-row transport for all token-capture TQ codecs."""
+
+    def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
+        self._dp_client = dp_client
+        self._staging_partition = staging_partition
+
+    def put(
+        self,
+        key: str,
+        field_dict: dict[str, torch.Tensor],
+        *,
+        tags: dict[str, Any] | None = None,
+    ) -> None:
+        _call_dp(
+            self._dp_client,
+            "put_samples",
+            sample_ids=[key],
+            partition_id=self._staging_partition,
+            fields=TensorDict(field_dict, batch_size=[1]),
+            tags=[tags or {}],
+        )
+
+    def get(self, keys: list[str], *, select_fields: list[str]) -> TensorDict:
+        return _call_dp(
+            self._dp_client,
+            "get_samples",
+            sample_ids=list(keys),
+            partition_id=self._staging_partition,
+            select_fields=list(select_fields),
+        )
+
+    def clear(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        _call_dp(
+            self._dp_client,
+            "clear_samples",
+            sample_ids=list(keys),
+            partition_id=self._staging_partition,
+        )
+
+
 class TQTokenSink:
     """Gym ``StagingSink`` over ``DataPlaneClient.put_samples``.
 
@@ -154,8 +194,7 @@ class TQTokenSink:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
-        self._dp_client = dp_client
-        self._staging_partition = staging_partition
+        self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
 
     def stage(self, record: StagedCallRecord) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
@@ -267,7 +306,6 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
-            fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
                     "rollout_id": record.rollout_id,
@@ -281,14 +319,7 @@ class TQTokenSink:
                     "schema_version": record.schema_version,
                 }
             ]
-            _call_dp(
-                self._dp_client,
-                "put_samples",
-                sample_ids=[key],
-                partition_id=self._staging_partition,
-                fields=fields,
-                tags=tags,
-            )
+            self._store.put(key, field_dict, tags=tags[0])
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
             # The reason string is dropped downstream (_failed_coords carries
             # only the disposition) — this log line is the only place the
@@ -306,13 +337,195 @@ class TQTokenSink:
 
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""
-        if not staging_keys:
-            return
-        _call_dp(
-            self._dp_client,
-            "clear_samples",
-            sample_ids=list(staging_keys),
-            partition_id=self._staging_partition,
+        self._store.clear(staging_keys)
+
+
+@dataclass(frozen=True)
+class MegatronPayloadStageResult:
+    """Structural MInf staging acknowledgement returned to the engine."""
+
+    response_metadata: dict[str, Any]
+
+
+class TQMegatronPromptPreparer:
+    """Resolve a Gym-authorized staged prefix before MInf admits a request."""
+
+    def __init__(self, source: TQTokenSource) -> None:
+        self._source = source
+
+    def prepare_prompt(
+        self,
+        prompt: str | list[int] | torch.Tensor,
+        *,
+        request_metadata: dict[str, Any] | None = None,
+    ) -> tuple[str | list[int] | torch.Tensor, dict[str, Any] | None]:
+        """Fetch a chained prefix, splice it into the prompt, and update admission."""
+        if request_metadata is None:
+            return prompt, None
+        capture_payload = request_metadata.get("ng_capture")
+        if capture_payload is None:
+            return prompt, request_metadata
+
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+        admission = CaptureAdmission.model_validate(capture_payload)
+        if admission.mode == "text":
+            return prompt, request_metadata
+        if not isinstance(prompt, list):
+            raise TypeError("MInf token-in capture requires a token-id list prompt")
+
+        prefix_token_ids = list(admission.required_prefix_token_ids)
+        if admission.staging_chain:
+            prefix_token_ids = self._source.fetch_prefix_token_ids(
+                list(admission.staging_chain)
+            )
+        if len(prefix_token_ids) != admission.prev_len:
+            raise ValueError(
+                "MInf capture prefix length mismatch: "
+                f"expected {admission.prev_len}, got {len(prefix_token_ids)}"
+            )
+
+        updated_metadata = dict(request_metadata)
+        updated_admission = admission.model_copy(
+            update={"required_prefix_token_ids": prefix_token_ids}
+        )
+        updated_metadata["ng_capture"] = updated_admission.model_dump(mode="json")
+
+        suffix_token_ids = updated_metadata.get("ng_prompt_suffix_token_ids")
+        boundary_token_id = updated_metadata.get("ng_prefix_boundary_token_id")
+        if suffix_token_ids is not None or boundary_token_id is not None:
+            if not isinstance(suffix_token_ids, list) or any(
+                type(token_id) is not int for token_id in suffix_token_ids
+            ):
+                raise ValueError(
+                    "MInf capture request carries no valid prompt suffix tokens"
+                )
+            if type(boundary_token_id) is not int:
+                raise ValueError(
+                    "MInf capture request carries no valid prefix boundary token"
+                )
+            prompt_prefix = prefix_token_ids
+            if prompt_prefix and prompt_prefix[-1] == boundary_token_id:
+                prompt_prefix = prompt_prefix[:-1]
+            prompt = prompt_prefix + suffix_token_ids
+        elif admission.staging_chain:
+            raise ValueError(
+                "MInf staged-prefix request carries no prompt splice metadata"
+            )
+        elif prompt[: admission.prev_len] != prefix_token_ids:
+            raise ValueError(
+                "MInf generation prompt does not begin with the authorized token prefix"
+            )
+
+        if prompt[: admission.prev_len] != prefix_token_ids:
+            raise ValueError("MInf failed to apply the authorized token prefix")
+        return prompt, updated_metadata
+
+
+class TQMegatronTokenStager:
+    """Canonicalize one admitted MInf completion through Gym's capture core.
+
+    MInf owns the exact prompt/output material and its per-request policy epoch.
+    Gym owns the lineage admission carried opaquely as ``ng_capture``. This
+    adapter joins them before the response leaves MInf, writes the same
+    canonical TQ row as vLLM, and returns lightweight commit coordinates.
+    """
+
+    def __init__(self, sink: TQTokenSink) -> None:
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+
+        self._capture = RolloutTokenCapture(
+            sink=sink,
+            # MInf passes the authoritative version explicitly for every call.
+            weight_version_fn=lambda: 0,
+        )
+
+    @staticmethod
+    def _weight_version(finished_metadata: Any) -> int:
+        policy_epoch = getattr(finished_metadata, "policy_epoch", None)
+        if not isinstance(policy_epoch, list) or not policy_epoch:
+            raise ValueError("MInf captured request carries no policy_epoch boundaries")
+        try:
+            versions = {int(boundary[1]) for boundary in policy_epoch}
+        except (IndexError, TypeError, ValueError) as error:
+            raise ValueError(
+                "MInf captured request carries invalid policy_epoch metadata"
+            ) from error
+        if len(versions) != 1:
+            raise ValueError(
+                f"MInf captured request spans policy epochs {sorted(versions)}"
+            )
+        (version,) = versions
+        if version < 0:
+            raise ValueError(
+                f"MInf captured request has negative policy epoch {version}"
+            )
+        return version
+
+    def stage(
+        self,
+        uid: str,
+        payload: Any,
+        *,
+        finished_metadata: Any,
+        request_metadata: dict[str, Any] | None = None,
+    ) -> MegatronPayloadStageResult | None:
+        """Stage an admitted request, or decline ordinary non-capture traffic."""
+        if not isinstance(uid, str) or not uid:
+            raise ValueError("MInf request UID must be a non-empty string")
+        capture_payload = (request_metadata or {}).get("ng_capture")
+        if capture_payload is None:
+            return None
+        try:
+            return self._stage_admitted(
+                payload,
+                capture_payload=capture_payload,
+                finished_metadata=finished_metadata,
+            )
+        except Exception:  # noqa: BLE001 — capture failure must not fail generation
+            logging.getLogger(__name__).exception(
+                "MInf canonical token capture failed for request %s", uid
+            )
+            return None
+
+    def _stage_admitted(
+        self,
+        payload: Any,
+        *,
+        capture_payload: Any,
+        finished_metadata: Any,
+    ) -> MegatronPayloadStageResult:
+        """Validate and stage traffic that carries a Gym capture admission."""
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+        admission = CaptureAdmission.model_validate(capture_payload)
+        prompt_token_ids = getattr(payload, "prompt_token_ids", None)
+        generated_token_ids = getattr(payload, "generated_token_ids", None)
+        generated_log_probs = getattr(payload, "generated_log_probs", None)
+        if prompt_token_ids is None:
+            raise ValueError("MInf offloaded payload carries no prompt_token_ids")
+        if generated_token_ids is None:
+            raise ValueError("MInf offloaded payload carries no generated_token_ids")
+        if generated_log_probs is None:
+            raise ValueError("MInf offloaded payload carries no generated_log_probs")
+
+        call = self._capture.begin_call(
+            admission,
+            weight_version=self._weight_version(finished_metadata),
+        )
+        coords = self._capture.complete_call(
+            call,
+            prompt_token_ids=[int(token_id) for token_id in prompt_token_ids],
+            generated_token_ids=[int(token_id) for token_id in generated_token_ids],
+            generated_logprobs=[float(value) for value in generated_log_probs],
+        )
+        return MegatronPayloadStageResult(
+            response_metadata={
+                "ng_commit_coords": coords.model_dump(mode="json"),
+            }
         )
 
 
@@ -331,7 +544,7 @@ class TQTokenSource:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
-        self._dp_client = dp_client
+        self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
@@ -345,11 +558,8 @@ class TQTokenSource:
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("prefix fetch: staging_keys contains duplicates")
         try:
-            rows = _call_dp(
-                self._dp_client,
-                "get_samples",
-                sample_ids=list(staging_keys),
-                partition_id=self._staging_partition,
+            rows = self._store.get(
+                staging_keys,
                 select_fields=["token_ids_delta"],
             )
         except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
