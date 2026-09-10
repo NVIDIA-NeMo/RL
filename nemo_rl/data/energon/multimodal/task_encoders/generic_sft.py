@@ -233,6 +233,7 @@ class HFMultimodalSFTProcessorAdapter:
                 for key, value in list(message.items()):
                     if isinstance(value, PackedTensor):
                         message[key] = PackedTensor.empty_like(value)
+            length = sum(len(message["token_ids"]) for message in message_log)
             loss_multiplier = 0.0
 
         # group_key is the adapter fingerprint alone. Keying on the tensor names
@@ -293,6 +294,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
     ) -> tuple[tuple[Any, ...], None]:
         return sample.group_key, None
 
+    @stateless
     def select_samples_to_pack(
         self, samples: list[EncodedSFTSample]
     ) -> list[list[EncodedSFTSample]]:
@@ -304,6 +306,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
             sequence_length_pad_multiple=self.sequence_length_pad_multiple,
         )
 
+    @stateless
     def pack_selected_samples(self, samples: list[EncodedSFTSample]) -> PackedSFTSample:
         if self.packer is None:
             raise RuntimeError("Energon packing is not configured.")

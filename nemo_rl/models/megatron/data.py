@@ -382,8 +382,29 @@ def _prepacked_boundary(
     return value.to(device=device, dtype=torch.int32)
 
 
+def _slice_prepacked_for_cp(value: torch.Tensor, padded: torch.Tensor) -> torch.Tensor:
+    """Apply Megatron's per-source zigzag CP slicing to a packed row."""
+    if value.ndim < 2 or value.shape[:2] != (1, int(padded[-1])):
+        raise ValueError(
+            "Prepacked token-aligned tensors must have shape [1, pack length, ...]."
+        )
+    cp_rank = get_context_parallel_rank()
+    cp_size = get_context_parallel_world_size()
+    return torch.cat(
+        [
+            _get_tokens_on_this_cp_rank(
+                value[:, int(start) : int(end)], cp_rank, cp_size, seq_dim=1
+            )
+            for start, end in zip(padded[:-1], padded[1:])
+        ],
+        dim=1,
+    ).contiguous()
+
+
 def _prepare_prepacked(
     data: BatchedDataDict[Any],
+    *,
+    model_slices_context_parallel_inputs: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, PackedSeqParams, torch.Tensor]:
     input_ids = data["input_ids"]
     if not torch.is_tensor(input_ids) or input_ids.shape[0] != 1:
@@ -402,8 +423,19 @@ def _prepare_prepacked(
         or bool((source_lengths > padded_lengths).any())
     ):
         raise ValueError("Invalid prepacked source boundaries.")
-    if get_context_parallel_world_size() != 1:
-        raise NotImplementedError("Energon-owned packing currently requires CP=1.")
+    cp_size = get_context_parallel_world_size()
+    if cp_size > 1 and bool((padded_lengths % (2 * cp_size) != 0).any()):
+        raise ValueError(
+            "Every prepacked padded source length must be divisible by 2 * "
+            f"context_parallel_size ({2 * cp_size})."
+        )
+    local_input_ids = _slice_prepacked_for_cp(input_ids, padded)
+    input_ids_cp_sharded = (
+        input_ids if model_slices_context_parallel_inputs else local_input_ids
+    )
+    # Keep physical boundaries in cu_seqlens_q as well as cu_seqlens_q_padded.
+    # MTP loss rolling still has consumers that use cu_seqlens_q as the wrap
+    # boundary, so logical boundaries can roll into padding or the next source.
     params = PackedSeqParams(
         cu_seqlens_q=padded,
         cu_seqlens_kv=padded,
@@ -413,9 +445,9 @@ def _prepare_prepacked(
         max_seqlen_kv=int(padded_lengths.max()),
         pad_between_seqs=False,
         qkv_format="thd",
-        total_tokens=input_ids.shape[1],
+        total_tokens=input_ids_cp_sharded.shape[1],
     )
-    return input_ids, input_ids, params, padded
+    return input_ids, input_ids_cp_sharded, params, padded
 
 
 def process_microbatch(
@@ -492,7 +524,24 @@ def process_microbatch(
                     input_ids_cp_sharded,
                     packed_seq_params,
                     cu_seqlens_padded,
-                ) = _prepare_prepacked(data_dict)
+                ) = _prepare_prepacked(
+                    data_dict,
+                    model_slices_context_parallel_inputs=(
+                        model_slices_context_parallel_inputs
+                    ),
+                )
+                if "mtp_loss_mask" in data_dict:
+                    mtp_loss_mask = data_dict["mtp_loss_mask"]
+                    if not model_slices_context_parallel_inputs:
+                        mtp_loss_mask = _slice_prepacked_for_cp(
+                            mtp_loss_mask, cu_seqlens_padded
+                        )
+                if "media_token_validity_mask" in data_dict:
+                    media_token_validity_mask = data_dict["media_token_validity_mask"]
+                    if not model_slices_context_parallel_inputs:
+                        media_token_validity_mask = _slice_prepacked_for_cp(
+                            media_token_validity_mask, cu_seqlens_padded
+                        )
                 position_ids = None
                 attention_mask = None
             elif delegate_pack_to_model:
