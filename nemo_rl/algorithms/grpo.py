@@ -625,6 +625,19 @@ def setup(
         "grpo.val_num_generations_per_prompt > 1"
     )
 
+    # opd_full is implemented only on the SingleController runtime, which has its
+    # own setup(). This entry point never reads on_policy_distillation.full, so
+    # accepting it would silently train the sampled-token top-k objective while
+    # the user believes they configured the full-vocabulary reverse KL.
+    if opd_module.get_opd_full_config(master_config) is not None:
+        raise ValueError(
+            "on_policy_distillation.full is only implemented on the "
+            "SingleController runtime (examples/run_grpo_single_controller.py). "
+            "This entry point never reads it, so leaving it enabled here would "
+            "silently train the sampled-token top-k objective instead of the "
+            "full-vocabulary reverse KL."
+        )
+
     # Set seed for all random number generators
     set_seed(grpo_config.seed)
 
