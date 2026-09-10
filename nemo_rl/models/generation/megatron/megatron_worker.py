@@ -15,13 +15,11 @@
 import asyncio
 import gc
 import importlib
-import threading
-import time
 import warnings
 from typing import Any, AsyncGenerator, Optional
 
-import requests
 import torch
+from megatron.core.inference.apis import MegatronAsyncLLM, ServeConfig
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
@@ -51,7 +49,7 @@ from megatron.core.transformer.utils import (
     set_model_config_attribute,
     toggle_cuda_graphs,
 )
-from megatron.core.utils import unwrap_model
+from megatron.core.utils import get_attr_wrapped_model, unwrap_model
 
 from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -294,9 +292,6 @@ class MegatronGenerationMixin:
         if self._inference_engine_initialized:
             return
 
-        from megatron.core.inference.apis import MegatronAsyncLLM
-        from megatron.core.utils import get_attr_wrapped_model
-
         inference_wrapper_cls = self._get_megatron_inference_wrapper_cls()
         inference_model, media_model = self._inference_model_and_media_parts(
             inference_wrapper_cls
@@ -435,6 +430,7 @@ class MegatronGenerationMixin:
             inference_config=inference_config,
             use_coordinator=True,
             inference_wrapper_cls=engine_wrapper_cls,
+            loop_factory=asyncio.SelectorEventLoop,
         )
 
         self._inference_engine_initialized = True
@@ -469,8 +465,6 @@ class MegatronGenerationMixin:
 
     def _setup_openai_api_server(self) -> str:
         """Start the OpenAI-compatible HTTP server on this worker."""
-        from megatron.core.inference.apis import ServeConfig
-
         from nemo_rl.distributed.virtual_cluster import (
             _get_free_port_local,
             _get_node_ip_local,
@@ -495,27 +489,10 @@ class MegatronGenerationMixin:
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
             sock=reserved_socket,
+            loop_factory=asyncio.SelectorEventLoop,
         )
         self.llm.run_sync(self.llm.serve(serve_config, blocking=False))
-
-        base_url = f"http://{ip}:{server_port}/v1"
-        max_wait_time = 300
-        start_time = time.time()
-        with requests.Session() as session:
-            while True:
-                if time.time() - start_time > max_wait_time:
-                    raise TimeoutError(
-                        f"[Megatron HTTP] Rank {self.rank} OpenAI server failed "
-                        f"to start within {max_wait_time}s"
-                    )
-                try:
-                    response = session.get(f"{base_url}/health", timeout=10)
-                    if response.status_code == 200:
-                        break
-                except requests.RequestException:
-                    pass
-                time.sleep(2)
-        return base_url
+        return f"http://{ip}:{server_port}/v1"
 
     def _maybe_start_openai_api_server(self) -> None:
         """Start the OpenAI HTTP server on rank 0 when configured to expose it."""
@@ -531,17 +508,18 @@ class MegatronGenerationMixin:
             self.base_url = None
 
     def shutdown_inference_engine(self) -> None:
-        """Stop the engine and tear down the coordinator + HTTP server."""
+        """Stop the engine, coordinator and HTTP server (teardown only, best-effort)."""
         if self.llm is None:
             return
-        t = threading.Thread(
-            target=asyncio.run, args=(self.llm.shutdown(),), name="mcore-llm-shutdown"
-        )
-        t.start()
-        t.join()
-        self.llm = None
-        self._inference_engine_initialized = False
-        self._inference_engine_asleep = True
+        try:
+            # close() is the sync teardown usable from Ray's actor loop;
+            self.llm.close()
+        except Exception as e:
+            print(
+                f"[Rank {self.rank}] inference engine shutdown failed: {e!r}",
+                flush=True,
+            )
+        self._init_inference_engine_state()
 
     def finish_generation(self, *, release_gpu: bool = True) -> None:
         """Wind down a generation cycle.
