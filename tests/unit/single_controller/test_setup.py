@@ -499,12 +499,14 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
             None,
             weights_path=None,
             optimizer_path=None,
+            checkpointing=True,
         )
 
     assert (
         mock_policy.call_args.kwargs["init_reference_model"]
         is expected_init_reference_model
     )
+    assert mock_policy.call_args.kwargs["checkpointing"] is True
 
 
 def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
@@ -693,11 +695,11 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
 
-    def test_rejects_mooncake_data_plane_checkpointing_without_opt_in(self):
+    def test_rejects_unknown_backend_data_plane_checkpointing(self):
         mc = _make_master_config()
-        mc.data_plane["backend"] = "mooncake_cpu"
+        mc.data_plane["backend"] = "future_backend"
         mc.checkpointing["save_data_plane"] = True
-        with pytest.raises(NotImplementedError, match="backend='mooncake_cpu'"):
+        with pytest.raises(NotImplementedError, match="backend='future_backend'"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_periodic_checkpointing_requires_trainer_checkpointing(self):
@@ -914,16 +916,24 @@ class TestSetup:
         assert after == before
         patched_factories["setup_response_data"].assert_not_called()
 
-    def test_accepts_explicit_mooncake_data_plane_checkpointing(
-        self, patched_factories
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("save_data_plane", [False, True])
+    def test_mooncake_checkpoint_mode_follows_existing_settings(
+        self, patched_factories, enabled, save_data_plane
     ):
-        mc = _make_master_config()
+        mc = _make_master_config(
+            sampler_cfg=CustomSamplerConfig(
+                target=f"{__name__}:_NonCheckpointingCustomSampler"
+            )
+        )
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.data_plane["mooncake_cpu"] = {"checkpoint": {"enabled": True}}
-        mc.checkpointing["save_data_plane"] = True
+        mc.checkpointing.update(enabled=enabled, save_data_plane=save_data_plane)
 
         actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+        assert patched_factories["_build_trainer"].call_args.kwargs[
+            "checkpointing"
+        ] is (enabled and save_data_plane)
         assert (
             actor_args.dp_client
             is patched_factories["build_data_plane_client"].return_value
@@ -945,7 +955,7 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    def test_checkpointing_error_explains_mooncake_incompatibility(self):
+    def test_mooncake_checkpointing_requires_only_the_shared_data_plane_setting(self):
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = False
@@ -955,7 +965,8 @@ class TestSetup:
         with pytest.raises(
             ValueError,
             match=(
-                "backend='mooncake_cpu'.*backend='simple'.*checkpointing.enabled=false"
+                "replay-checkpoint-capable sampler requires "
+                "checkpointing.save_data_plane=true"
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -2049,8 +2060,9 @@ class TestNativeTQRecoverySetup:
         assert events == ["load", "build"]
         assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
 
+    @pytest.mark.parametrize("save_enabled", [False, True])
     def test_mooncake_setup_defers_restore_and_warmup_decision_to_actor(
-        self, tmp_path, patched_factories
+        self, tmp_path, patched_factories, save_enabled
     ):
         checkpoint_path = tmp_path / "step_3"
         (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
@@ -2072,14 +2084,17 @@ class TestNativeTQRecoverySetup:
         checkpointer.get_resume_paths.return_value = (None, None)
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.data_plane["mooncake_cpu"] = {"checkpoint": {"enabled": True}}
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = True
+        mc.checkpointing["enabled"] = save_enabled
+        mc.checkpointing["save_data_plane"] = save_enabled
 
         with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert events == ["build"]
+        assert (
+            patched_factories["_build_trainer"].call_args.kwargs["checkpointing"]
+            is True
+        )
         policy.load_data_plane_checkpoint.assert_not_called()
         dp_client.register_partition.assert_not_called()
         assert actor_args.last_checkpoint_path == str(checkpoint_path)
@@ -2103,7 +2118,6 @@ class TestNativeTQRecoverySetup:
 
         mc = _make_master_config(colocated=False, backend="vllm")
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.data_plane["mooncake_cpu"] = {"checkpoint": {"enabled": True}}
         mc.checkpointing.update(
             {
                 "checkpoint_dir": str(tmp_path / "checkpoints"),

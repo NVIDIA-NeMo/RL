@@ -47,14 +47,14 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
 )
-from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROLLOUT_METRICS
 from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
@@ -71,8 +71,6 @@ def _data_plane_config(backend: str = "simple") -> dict[str, Any]:
         "impl": "transfer_queue",
         "backend": backend,
     }
-    if backend == "mooncake_cpu":
-        config["mooncake_cpu"] = {"checkpoint": {"enabled": True}}
     return config
 
 
@@ -213,13 +211,17 @@ def test_resumed_mooncake_init_restores_without_partition_registration(
     controller = _init_controller(master_config, actor_args)
 
     dp_client.load_checkpoint.assert_called_once_with(data_plane_path)
+    single_controller.configure_checkpoint_workers.assert_called_once_with([])
     dp_client.register_partition.assert_not_called()
     assert controller._data_plane_checkpoint_metadata == metadata
 
 
-@pytest.mark.parametrize("checkpoint_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("checkpoint_enabled", "save_data_plane"),
+    [(False, False), (False, True), (True, True)],
+)
 def test_fresh_mooncake_init_registers_partition(
-    monkeypatch, tmp_path, checkpoint_enabled
+    monkeypatch, tmp_path, checkpoint_enabled, save_data_plane
 ) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
     configure = MagicMock()
@@ -227,9 +229,8 @@ def test_fresh_mooncake_init_registers_partition(
     dp_client = MagicMock(name="dp_client")
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
-    master_config.data_plane["mooncake_cpu"]["checkpoint"]["enabled"] = (
-        checkpoint_enabled
-    )
+    master_config.checkpointing["enabled"] = checkpoint_enabled
+    master_config.checkpointing["save_data_plane"] = save_data_plane
     actor_args = _actor_args_for_init(dp_client=dp_client)
     if not checkpoint_enabled:
         actor_args.trainer_handle = None
@@ -281,6 +282,7 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
     master_config.token_capture.enabled = token_capture
+    master_config.checkpointing.update(enabled=True, save_data_plane=True)
     workers = [object() for _ in range(6)]
 
     def group(members):

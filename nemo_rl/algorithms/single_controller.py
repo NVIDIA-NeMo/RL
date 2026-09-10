@@ -126,7 +126,6 @@ from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     KVBatchMeta,
-    data_plane_supports_checkpointing,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
@@ -297,7 +296,10 @@ class SingleControllerActor:
         )
         self._dp_client = actor_args.dp_client
         if master_config.data_plane["backend"] == "mooncake_cpu":
-            if data_plane_supports_checkpointing(master_config.data_plane):
+            if actor_args.last_checkpoint_path is not None or (
+                master_config.checkpointing["enabled"]
+                and master_config.checkpointing.get("save_data_plane")
+            ):
                 checkpoint_workers = list(
                     actor_args.trainer_handle.worker_group.workers
                 )

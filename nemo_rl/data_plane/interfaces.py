@@ -61,28 +61,6 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
     num_storage_units: int
 
 
-class MooncakeCheckpointConfig(BaseModel, extra="allow"):
-    """Opt in to explicit TQ storage checkpoints for Mooncake.
-
-    Normal PUTs remain memory-only. Payload transfer to durable storage starts
-    only when the caller invokes ``tq.save_checkpoint``.
-    """
-
-    enabled: bool = False
-
-
-class MooncakeOffloadConfig(BaseModel, extra="allow"):
-    """TQ Mooncake eviction/offload settings.
-
-    Owner-distributed checkpoints require the referenced objects to remain in
-    client memory until an explicit save completes, so that mode is compatible
-    only with ``enabled=False``.  The nested model still mirrors TQ's config
-    shape instead of hiding the setting from NeMo-RL.
-    """
-
-    enabled: bool = False
-
-
 class MooncakeCpuConfig(BaseModel, extra="allow"):
     """Sizing and RDMA knobs for ``backend="mooncake_cpu"``. Ignored otherwise.
 
@@ -113,13 +91,6 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
-    # ``None`` preserves TQ's auto policy: hard-pin unless offload is enabled.
-    # Checkpoint participants verify the resolved live client setting is True.
-    hard_pin: bool | None = None
-    offload: MooncakeOffloadConfig = Field(default_factory=MooncakeOffloadConfig)
-    checkpoint: MooncakeCheckpointConfig = Field(
-        default_factory=MooncakeCheckpointConfig
-    )
 
 
 class DataPlaneConfig(TypedDict):
@@ -160,23 +131,19 @@ class DataPlaneConfig(TypedDict):
     observability: NotRequired["ObservabilityConfig"]
 
 
-_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple"})
+_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu"})
 
 
 def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
     """Return whether the configured backend supports complete save/load.
 
-    Simple always supports native TQ checkpoints. Mooncake supports them only
-    when its explicit checkpoint plugin is enabled; normal Mooncake operation
-    remains memory-only. An unrecognized future backend defaults to
+    Simple and Mooncake support native TQ checkpoints. The existing
+    checkpointing settings decide whether a run saves data-plane state;
+    normal PUTs remain memory-only. An unrecognized future backend defaults to
     unsupported until its storage payload and controller metadata are both
     known to round-trip through a checkpoint.
     """
-    if cfg["backend"] in _CHECKPOINTABLE_BACKENDS:
-        return True
-    if cfg["backend"] == "mooncake_cpu":
-        return bool(backend_config(cfg).checkpoint.enabled)
-    return False
+    return cfg["backend"] in _CHECKPOINTABLE_BACKENDS
 
 
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {

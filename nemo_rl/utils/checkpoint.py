@@ -171,7 +171,7 @@ class CheckpointingConfig(TypedDict):
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
     save_data_plane (bool): Whether SingleController checkpoints include the
         native TQ snapshot and replay-buffer metadata. Supported by the simple
-        backend and by Mooncake when its explicit checkpoint plugin is enabled.
+        and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
     load_replay_buffer (bool): Whether async GRPO restores replay-buffer state
         when resuming from a checkpoint. Defaults to True. When False the
         buffer starts empty and a frontier-aligned resume regenerates the

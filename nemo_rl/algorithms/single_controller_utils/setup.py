@@ -647,6 +647,7 @@ def _build_trainer(
     *,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
+    checkpointing: bool,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
@@ -657,6 +658,7 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
+        checkpointing: Whether data-plane checkpoint save or restore is needed.
 
     Returns:
         A tuple of (TQPolicy trainer, wall time spent in this call).
@@ -674,6 +676,7 @@ def _build_trainer(
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
+        checkpointing=checkpointing,
     )
     return trainer, time.perf_counter() - t0
 
@@ -1362,6 +1365,13 @@ def setup_single_controller(
             processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
+            checkpointing=bool(
+                recovery_checkpoint_path is not None
+                or (
+                    master_config.checkpointing["enabled"]
+                    and master_config.checkpointing.get("save_data_plane")
+                )
+            ),
         )
         if not is_ppo_run(master_config):
             return trainer, None, time_metrics

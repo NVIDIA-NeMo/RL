@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Opt-in, owner-distributed Mooncake checkpoints for TransferQueue.
+"""Owner-distributed Mooncake checkpoints for TransferQueue.
 
 Normal Mooncake PUTs remain memory-only. At an explicit TQ checkpoint, the
 controller commands the existing workers through their Ray actor handles.
@@ -80,6 +80,8 @@ def _checkpoint_settings(config: Any) -> Mapping[str, Any]:
 
 
 def _checkpoint_enabled(config: Any) -> bool:
+    # Internal TQ runtime mode, derived at bootstrap from NeMo-RL's existing
+    # checkpointing settings and selected resume path.
     return _checkpoint_settings(config).get("enabled") is True
 
 

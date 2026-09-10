@@ -603,7 +603,7 @@ def _connect_existing() -> None:
     tq.init()
 
 
-def _init_tq(cfg: DataPlaneConfig) -> None:
+def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
 
@@ -683,13 +683,19 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
-                    "hard_pin": mooncake_cfg.hard_pin,
-                    "offload": mooncake_cfg.offload.model_dump(),
-                    "checkpoint": mooncake_cfg.checkpoint.model_dump(),
+                    # Runtime mode derived from the existing trainer settings,
+                    # not a second user-facing checkpoint switch.
+                    "checkpoint": {"enabled": checkpointing},
                     **_mooncake_transport_config(),
                 },
             },
         }
+        if checkpointing:
+            # Establish owner-local checkpoint requirements before any client
+            # attaches. Non-checkpointing jobs keep TQ's storage defaults.
+            overlay["backend"]["MooncakeStore"].update(
+                hard_pin=True, offload={"enabled": False}
+            )
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
@@ -774,7 +780,13 @@ def _from_wire(td: TensorDict) -> TensorDict:
 class TQDataPlaneClient(DataPlaneClient):
     """Adapter façade — maps NeMo-RL calls onto TransferQueue's public API."""
 
-    def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
+    def __init__(
+        self,
+        cfg: DataPlaneConfig,
+        *,
+        bootstrap: bool = True,
+        checkpointing: bool = False,
+    ) -> None:
         """Construct a TQ-backed client.
 
         Args:
@@ -784,6 +796,8 @@ class TQDataPlaneClient(DataPlaneClient):
                 already-running named controller actor in the Ray
                 cluster — ``cfg`` is then only consulted for client-side
                 knobs (poll interval).
+            checkpointing: Whether the caller will save or restore data-plane
+                state. Used only at bootstrap; workers inherit the mode from TQ.
         """
         # Ray serializes this driver-built client into the SingleController
         # actor; retain the config so process-local hooks can be reinstalled.
@@ -821,17 +835,18 @@ class TQDataPlaneClient(DataPlaneClient):
             mooncake_cfg = backend_config(cfg)
             if mooncake_cfg.reuse_registered_buffers:
                 _patch_mooncake_staging_buffers(mooncake_cfg.staging_buffer_size)
-            if mooncake_cfg.checkpoint.enabled:
-                from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
-                    install_tq_mooncake_checkpoint_plugin,
-                )
+            # Install before attaching; TQ's controller supplies the resolved
+            # checkpoint mode to each process-local storage manager.
+            from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
+                install_tq_mooncake_checkpoint_plugin,
+            )
 
-                install_tq_mooncake_checkpoint_plugin()
+            install_tq_mooncake_checkpoint_plugin()
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
         if bootstrap:
-            _init_tq(cfg)
+            _init_tq(cfg, checkpointing=checkpointing)
         else:
             _connect_existing()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]

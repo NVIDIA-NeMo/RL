@@ -49,7 +49,7 @@ def _cfg(backend: str, **extra) -> dict:
     ("backend", "expected"),
     [
         ("simple", True),
-        ("mooncake_cpu", False),
+        ("mooncake_cpu", True),
         ("future_backend", False),
     ],
 )
@@ -57,14 +57,6 @@ def test_checkpointing_capability_defaults_to_unsupported(
     backend: str, expected: bool
 ) -> None:
     assert data_plane_supports_checkpointing(_cfg(backend)) is expected
-
-
-def test_mooncake_checkpointing_capability_requires_explicit_opt_in() -> None:
-    cfg = _cfg(
-        "mooncake_cpu",
-        mooncake_cpu={"checkpoint": {"enabled": True}},
-    )
-    assert data_plane_supports_checkpointing(cfg) is True
 
 
 def test_nested_block_is_used() -> None:
@@ -105,39 +97,14 @@ def test_partial_nested_block_keeps_other_defaults() -> None:
     assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
 
 
-def test_mooncake_checkpoint_is_an_explicit_opt_in() -> None:
-    assert backend_config(_cfg("mooncake_cpu")).checkpoint.enabled is False
-
-    resolved = backend_config(
-        _cfg(
-            "mooncake_cpu",
-            mooncake_cpu={"checkpoint": {"enabled": True}},
-        )
+def test_mooncake_has_no_backend_specific_checkpoint_knobs() -> None:
+    assert {"checkpoint", "hard_pin", "offload"}.isdisjoint(
+        MooncakeCpuConfig.model_fields
     )
-    assert resolved.checkpoint.enabled is True
 
 
-def test_mooncake_checkpoint_placement_settings_are_resolved() -> None:
-    defaults = backend_config(_cfg("mooncake_cpu"))
-    assert defaults.hard_pin is None
-    assert defaults.offload.enabled is False
-
-    resolved = backend_config(
-        _cfg(
-            "mooncake_cpu",
-            mooncake_cpu={
-                "hard_pin": True,
-                "offload": {"enabled": False},
-                "checkpoint": {"enabled": True},
-            },
-        )
-    )
-    assert resolved.hard_pin is True
-    assert resolved.offload.enabled is False
-    assert resolved.checkpoint.enabled is True
-
-
-def test_mooncake_checkpoint_placement_settings_reach_tq(monkeypatch) -> None:
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_mooncake_checkpoint_mode_is_internal(monkeypatch, checkpointing) -> None:
     from nemo_rl.data_plane.adapters import transfer_queue as adapter
 
     captured = {}
@@ -154,23 +121,14 @@ def test_mooncake_checkpoint_placement_settings_reach_tq(monkeypatch) -> None:
         lambda *, conf: captured.setdefault("conf", conf),
     )
 
-    adapter._init_tq(
-        _cfg(
-            "mooncake_cpu",
-            mooncake_cpu={
-                "hard_pin": True,
-                "offload": {"enabled": False},
-                "checkpoint": {"enabled": True},
-            },
-        )
-    )
+    adapter._init_tq(_cfg("mooncake_cpu"), checkpointing=checkpointing)
 
     conf = OmegaConf.to_container(captured["conf"], resolve=True)
     mooncake = conf["backend"]["MooncakeStore"]
-    assert mooncake["hard_pin"] is True
+    assert mooncake["hard_pin"] is (True if checkpointing else None)
     # TQ merges its own offload defaults into the resolved backend config.
     assert mooncake["offload"]["enabled"] is False
-    assert mooncake["checkpoint"] == {"enabled": True}
+    assert mooncake["checkpoint"] == {"enabled": checkpointing}
 
 
 def test_simple_backend_nested_block_is_used() -> None:

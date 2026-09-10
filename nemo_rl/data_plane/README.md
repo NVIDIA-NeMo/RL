@@ -437,11 +437,6 @@ data_plane:
     local_buffer_size:    4294967296   # 4 GiB/process
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
     staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
-    hard_pin: null                       # null = TQ auto policy; checkpoint jobs set true
-    offload:
-      enabled: false                     # owner-distributed checkpoints require false
-    checkpoint:
-      enabled: false                    # explicit save/load support; normal PUTs stay memory-only
   # observability:                     # NotRequired
   #   enabled: false
 ```
@@ -463,8 +458,12 @@ Backend choice:
 The distributed format uses manifest version 3. Earlier centralized Mooncake
 checkpoint formats are not accepted by this loader; use fresh checkpoints.
 
-`mooncake_cpu.checkpoint.enabled=true` adds storage save/load support to TQ's
-existing explicit checkpoint API. Ordinary PUTs remain in Mooncake memory and
+The existing `checkpointing.enabled=true` and
+`checkpointing.save_data_plane=true` settings enable Mooncake storage save/load
+support through TQ's existing explicit checkpoint API. Resuming a checkpoint
+also prepares this storage mode, even when saving new checkpoints is disabled.
+No additional Mooncake-specific checkpoint setting is needed.
+Ordinary PUTs remain in Mooncake memory and
 perform no checkpoint-related filesystem I/O.
 
 On `tq.save_checkpoint(...)`, the plugin enumerates every raw Mooncake object
@@ -484,7 +483,7 @@ store. No checkpoint actors, registry, listener threads, or additional socket
 protocol are created. The calling actor handles its own shard directly, so
 constructor-time restore never waits for an RPC back to itself.
 
-When checkpointing is enabled, non-actor clients (including the driver) mount
+For runs that save or resume checkpoints, non-actor clients (including the driver) mount
 zero storage capacity: they can still PUT/GET through Mooncake, but cannot own
 payload that the controller has no actor endpoint to command. Actors retain
 their configured segment sizes. This removes the driver's segment from the
@@ -514,8 +513,11 @@ contributes Mooncake memory capacity first, keep the saved GDR mode and staging
 size unchanged, call `tq.load_checkpoint` before starting producers, and restart
 from an empty master before retrying a failed load. Multi-node validation must
 exercise save, process restart, load, and read on the intended training topology.
-The first version requires hard-pinned memory replicas with Mooncake offload
-disabled. It supports NeMo-RL's HTTP metadata mode and rejects `P2PHANDSHAKE`,
+The adapter internally enables hard-pinned memory replicas and disables Mooncake
+offload for runs that save or resume checkpoints; these are not additional user
+configuration knobs. Workers inherit this storage mode from TQ's controller.
+Other jobs keep TQ's storage defaults. This version supports NeMo-RL's HTTP
+metadata mode and rejects `P2PHANDSHAKE`,
 whose public Mooncake API does not expose the local transfer endpoint needed for
 exact owner matching.
 
