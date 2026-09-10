@@ -86,12 +86,19 @@ def _valid_setup_config(
         "backend": "energon",
         "validation": None,
         "max_input_seq_length": 128,
+        "energon": SimpleNamespace(packing_buffer_size=None),
     }
     data.update(data_overrides or {})
     policy = {
-        "megatron_cfg": {"enabled": True},
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 1,
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+        },
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
+        "make_sequence_length_divisible_by": 1,
     }
     for section, values in (policy_overrides or {}).items():
         policy[section].update(values)
@@ -220,11 +227,11 @@ def test_checkpoint_metric_rejects_a_metric_no_step_produces() -> None:
         ),
         (
             {"policy_overrides": {"sequence_packing": {"enabled": True}}},
-            "fixed NeMo-RL batching",
+            "fixed batching",
         ),
         (
             {"policy_overrides": {"dynamic_batching": {"enabled": True}}},
-            "fixed NeMo-RL batching",
+            "fixed batching",
         ),
         ({"sft_overrides": {"val_period": 10}}, "has no validation loop"),
         (
@@ -256,6 +263,50 @@ def test_setup_rejects_a_validation_checkpoint_metric() -> None:
             _valid_setup_config(metric_name="val:val_loss"),
             MagicMock(),
         )
+
+
+@pytest.mark.parametrize(
+    ("megatron_overrides", "policy_multiple", "message"),
+    [
+        ({"context_parallel_size": 2}, 2, "multiple of 4"),
+        (
+            {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+            },
+            1,
+            "HybridEP",
+        ),
+        (
+            {"fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"}},
+            1,
+            "FP8 packed-token alignment",
+        ),
+    ],
+)
+def test_setup_rejects_unsupported_energon_packing_layouts(
+    megatron_overrides: dict[str, Any], policy_multiple: int, message: str
+) -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(
+        data_overrides={
+            "max_input_seq_length": 130,
+            "energon": SimpleNamespace(packing_buffer_size=64),
+        },
+        policy_overrides={
+            "megatron_cfg": megatron_overrides,
+            "sequence_packing": {
+                "enabled": True,
+                "fuse_loss": True,
+                "algorithm": "greedy_knapsack",
+            },
+        },
+    )
+    config.policy["make_sequence_length_divisible_by"] = policy_multiple
+
+    with pytest.raises(ValueError, match=message):
+        setup_sft_v2(config, MagicMock())
 
 
 def test_restore_rejects_changed_placement() -> None:

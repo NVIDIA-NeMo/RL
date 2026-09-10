@@ -30,7 +30,6 @@ from nemo_rl.data.energon.multimodal.packing import (  # noqa: E402
 from nemo_rl.data.energon.multimodal.types import EncodedSFTSample  # noqa: E402
 from nemo_rl.data.multimodal_utils import PackedTensor  # noqa: E402
 from nemo_rl.data.packing import GreedyKnapsackPacker  # noqa: E402
-from nemo_rl.models.megatron.data import _prepacked_boundary  # noqa: E402
 
 
 class _Tokenizer:
@@ -89,23 +88,47 @@ def test_preparation_builds_model_ready_pack_and_jagged_boundaries() -> None:
         sequence_length_pad_multiple=4,
     )
 
+    second_pack = pack_selected_samples(
+        [_sample("s2", 4)],
+        pack_capacity=12,
+        sequence_length_pad_multiple=4,
+    )
+    prepared = prepare_packed_sft_batch(
+        [packed, second_pack], tokenizer=_Tokenizer(), only_unmask_final=False
+    )
+
+    assert prepared["input_ids"][0].tolist() == [1, 2, 3, 4, 5, 0, 0, 0, 1, 2, 3, 0]
+    assert prepared["token_mask"][0].tolist() == [0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0]
+    assert prepared["input_lengths"].tolist() == [12, 12]
+    assert prepared["source_ids"] == [["s0", "s1"], ["s2"]]
+    assert isinstance(prepared["cu_seqlens"], PackedTensor)
+    assert isinstance(prepared["cu_seqlens_padded"], PackedTensor)
+    first = prepared.slice(0, 1)
+    assert first["cu_seqlens"].as_tensor().tolist() == [0, 5, 8]
+    assert first["cu_seqlens_padded"].as_tensor().tolist() == [0, 8, 12]
+    sliced = prepared.slice(1, 2)
+    assert sliced["cu_seqlens"].as_tensor().tolist() == [0, 4]
+    assert sliced["cu_seqlens_padded"].as_tensor().tolist() == [0, 12]
+
+
+def test_preparation_backfills_multimodal_token_fields() -> None:
+    text_sample = _sample("text", 4)
+    multimodal_sample = _sample("image", 4)
+    for message in multimodal_sample.message_log:
+        message["mm_token_type_ids"] = torch.ones_like(message["token_ids"])
+    packed = pack_selected_samples(
+        [text_sample, multimodal_sample],
+        pack_capacity=12,
+        sequence_length_pad_multiple=1,
+    )
+
     prepared = prepare_packed_sft_batch(
         [packed], tokenizer=_Tokenizer(), only_unmask_final=False
     )
 
-    assert prepared["input_ids"].tolist() == [[1, 2, 3, 4, 5, 0, 0, 0, 1, 2, 3, 0]]
-    assert prepared["token_mask"].tolist() == [[0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0]]
-    assert prepared["input_lengths"].tolist() == [12]
-    assert prepared["source_ids"] == [["s0", "s1"]]
-    assert "packed_schema_version" not in prepared
-    assert isinstance(prepared["cu_seqlens"], PackedTensor)
-    assert isinstance(prepared["cu_seqlens_padded"], PackedTensor)
-    assert prepared["cu_seqlens"].as_tensor().tolist() == [0, 5, 8]
-    assert prepared["cu_seqlens_padded"].as_tensor().tolist() == [0, 8, 12]
-    assert torch.equal(
-        _prepacked_boundary(prepared.slice(0, 1), "cu_seqlens", torch.device("cpu")),
-        torch.tensor([0, 5, 8], dtype=torch.int32),
-    )
+    assert prepared["mm_token_type_ids"].tolist() == [
+        [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0]
+    ]
 
 
 def test_physical_pack_rejects_incompatible_or_over_capacity_sources() -> None:

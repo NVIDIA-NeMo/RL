@@ -40,6 +40,7 @@ from nemo_rl.data.energon.topology import (
     DataLoaderPlacementPlan,
     resolve_topology_mapper,
 )
+from nemo_rl.data.packing import PackingAlgorithm
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig
 from nemo_rl.distributed.named_sharding import REPLICATED_AXES
 from nemo_rl.distributed.virtual_cluster import (
@@ -199,6 +200,11 @@ class SFTSingleControllerActor:
             "packing_algorithm": config.policy["sequence_packing"]["algorithm"]
             if config.data["energon"].packing_buffer_size is not None
             else None,
+            # This caps sources per physical pack. Energon's similarly named
+            # max_samples_per_sequence instead controls sequential shard reads.
+            "max_sequences_per_bin": config.policy["sequence_packing"].get(
+                "max_sequences_per_bin"
+            ),
             "sequence_length_pad_multiple": config.policy[
                 "make_sequence_length_divisible_by"
             ],
@@ -406,8 +412,8 @@ def setup_sft_v2(
                 "Energon packing requires sequence_packing enabled with fuse_loss."
             )
         if sequence_packing.get("algorithm") not in {
-            "greedy_knapsack",
-            "balanced_greedy_knapsack",
+            PackingAlgorithm.GREEDY_KNAPSACK.value,
+            PackingAlgorithm.BALANCED_GREEDY_KNAPSACK.value,
         }:
             raise ValueError("Energon SFT supports only the two knapsack packers.")
         if dynamic_batching["enabled"]:
@@ -440,6 +446,43 @@ def setup_sft_v2(
     max_sequence_length = master_config.data["max_input_seq_length"]
     if max_sequence_length is None:
         raise ValueError("SFTv2 requires data.max_input_seq_length.")
+    if energon_packing:
+        megatron_cfg = master_config.policy["megatron_cfg"]
+        if (
+            megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+            and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+        ):
+            raise ValueError("Energon packing does not support HybridEP flex dispatch.")
+
+        cp_size = megatron_cfg["context_parallel_size"]
+        tp_size = megatron_cfg["tensor_model_parallel_size"]
+        pad_multiple = master_config.policy["make_sequence_length_divisible_by"]
+        parallel_multiple = (2 * cp_size if cp_size > 1 else 1) * (
+            tp_size if tp_size > 1 and megatron_cfg["sequence_parallel"] else 1
+        )
+        if pad_multiple % parallel_multiple != 0:
+            raise ValueError(
+                "Energon packing requires make_sequence_length_divisible_by to "
+                f"be a multiple of {parallel_multiple}."
+            )
+        if max_sequence_length % pad_multiple != 0:
+            raise ValueError(
+                "Energon packing requires max_input_seq_length to be divisible by "
+                "make_sequence_length_divisible_by."
+            )
+
+        fp8_cfg = megatron_cfg.get("fp8_cfg") or {}
+        if fp8_cfg.get("enabled", False):
+            fp8_multiple = {
+                "blockwise": 128,
+                "mxfp8": 32,
+            }.get(fp8_cfg["fp8_recipe"], 16)
+            fp8_multiple *= parallel_multiple
+            if max_sequence_length % fp8_multiple != 0:
+                raise ValueError(
+                    "Energon packing requires max_input_seq_length to be divisible "
+                    f"by the FP8 packed-token alignment ({fp8_multiple})."
+                )
 
     processor = None
     tokenizer = tokenizer_or_processor
