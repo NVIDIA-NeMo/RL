@@ -29,7 +29,7 @@ from nemo_rl.data.energon.multimodal.packing import (  # noqa: E402
 )
 from nemo_rl.data.energon.multimodal.types import EncodedSFTSample  # noqa: E402
 from nemo_rl.data.multimodal_utils import PackedTensor  # noqa: E402
-from nemo_rl.data.packing import GreedyKnapsackPacker  # noqa: E402
+from nemo_rl.data.packing import PackingAlgorithm, get_packer  # noqa: E402
 
 
 class _Tokenizer:
@@ -62,7 +62,10 @@ def _sample(
     )
 
 
-def test_selection_uses_aligned_costs_and_keeps_groups_separate() -> None:
+@pytest.mark.parametrize("algorithm", list(PackingAlgorithm))
+def test_selection_uses_aligned_costs_and_keeps_groups_separate(
+    algorithm: PackingAlgorithm,
+) -> None:
     samples = [
         _sample("s0", 5),
         _sample("s1", 3),
@@ -71,13 +74,13 @@ def test_selection_uses_aligned_costs_and_keeps_groups_separate() -> None:
 
     selected = select_samples_to_pack(
         samples,
-        packer=GreedyKnapsackPacker(12),
+        packer=get_packer(algorithm, 12),
         sequence_length_pad_multiple=4,
     )
 
-    assert [[sample.sample_key for sample in pack] for pack in selected] == [
-        ["s0", "s1"],
-        ["s2"],
+    assert [{sample.sample_key for sample in pack} for pack in selected] == [
+        {"s0", "s1"},
+        {"s2"},
     ]
 
 
