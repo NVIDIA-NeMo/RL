@@ -18,7 +18,7 @@ import math
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional, cast
 
 from pydantic import (
     BaseModel,
@@ -59,7 +59,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
@@ -849,6 +849,110 @@ def validate_sampler_buffer_capacity(
         )
 
 
+def _validate_opd_full_config(
+    master_config: MasterConfig, opd_config: OnPolicyDistillationConfig
+) -> None:
+    """Validate the full-vocabulary MOPD block against the rest of the run.
+
+    Args:
+        master_config: Full SingleController config, already known to have OPD on.
+        opd_config: The resolved ``on_policy_distillation`` block.
+
+    Raises:
+        ValueError: If ``opd_full`` is enabled with an unsupported backend, an
+            incompatible logprob path, a fused packing path that never reaches
+            the opd_full branch, more than one teacher checkpoint, a student
+            pipeline-parallel size the teacher LM-head load cannot support, or a
+            sampling temperature the hidden-state payload cannot honor.
+    """
+    full_cfg = opd_module.get_opd_full_config(master_config)
+    if full_cfg is None:
+        return
+
+    policy_config = master_config.policy
+    if not policy_config.get("megatron_cfg", {}).get("enabled", False):
+        raise ValueError(
+            "on_policy_distillation.full requires the Megatron backend: the "
+            "teacher payload and the distributed reverse-KL kernels both run on "
+            "the vocabulary-parallel logit path."
+        )
+    # Narrowed by the check above: megatron_cfg.enabled true means this is a
+    # MegatronConfig, so its parallelism fields can be read directly.
+    megatron_cfg = cast(MegatronConfig, policy_config["megatron_cfg"])
+    if megatron_cfg.get("use_fused_linear_logprobs", False):
+        raise ValueError(
+            "on_policy_distillation.full is incompatible with "
+            "megatron_cfg.use_fused_linear_logprobs: the fused forward bypasses "
+            "output_layer, so the teacher hidden-state hook never fires and the "
+            "student never exposes full-vocabulary logits."
+        )
+
+    sequence_packing_config = policy_config.get("sequence_packing", {})
+    if sequence_packing_config.get("enabled", False) and sequence_packing_config.get(
+        "fuse_loss", False
+    ):
+        raise ValueError(
+            "on_policy_distillation.full is incompatible with "
+            "policy.sequence_packing.fuse_loss: the fused packing path routes "
+            "through prepare_packed_loss_input, which only supports "
+            "LossInputType.LOGPROB and never reaches the opd_full branch. "
+            "Without this check the run fails inside the first training forward, "
+            "after the whole cluster and every teacher have already come up. "
+            "Set sequence_packing.fuse_loss=false."
+        )
+
+    unique_teacher_checkpoints = sorted(
+        set(opd_config.teacher_model_by_agent_name.values())
+    )
+    if len(unique_teacher_checkpoints) != 1:
+        raise ValueError(
+            "on_policy_distillation.full currently supports exactly one unique "
+            f"teacher checkpoint, got {len(unique_teacher_checkpoints)}: "
+            f"{unique_teacher_checkpoints}. Multi-teacher full-vocabulary "
+            "distillation needs one LM head and one payload column per teacher."
+        )
+
+    if (
+        full_cfg.teacher_payload == "hidden_states"
+        and megatron_cfg["pipeline_model_parallel_size"] > 1
+    ):
+        raise ValueError(
+            "on_policy_distillation.full.teacher_payload='hidden_states' does not "
+            "support policy.megatron_cfg.pipeline_model_parallel_size > 1 yet. "
+            "Megatron builds output_layer only on the last pipeline stage, but resolving "
+            "the teacher checkpoint iteration goes through Megatron-Bridge's "
+            "read_train_state, whose broadcast_object_list spans the whole student "
+            "world, so earlier stages would fail while the last stage hangs in that "
+            "broadcast. Use pipeline_model_parallel_size=1, or "
+            "teacher_payload='logits', which needs no teacher LM head."
+        )
+
+    generation_config = policy_config.get("generation")
+    temperature = 1.0 if generation_config is None else generation_config["temperature"]
+    if full_cfg.teacher_payload == "hidden_states" and temperature != 1.0:
+        raise ValueError(
+            "on_policy_distillation.full.teacher_payload='hidden_states' does not "
+            f"support policy.generation.temperature != 1.0 (got {temperature}). "
+            "Temperature scaling divides the training logits in place, but the "
+            "capture hook reads output_layer's input, which is upstream of that "
+            "division -- so the student would be scaled while the teacher logits "
+            "reconstructed from its hidden states would not, silently optimizing a "
+            "mismatched objective. Use teacher_payload='logits', where both sides "
+            "come from the same scaled tensor."
+        )
+
+    if full_cfg.teacher_payload == "logits":
+        # The logits payload is vocab_size wide, so a production-scale run would
+        # move tens of GB per teacher batch. Advisory, not an error: a small
+        # vocabulary or a short-sequence cross-check is a legitimate use.
+        print(
+            "  ! on_policy_distillation.full.teacher_payload='logits' transports "
+            "the full vocabulary per token. This is a numerical-reference path; "
+            "prefer 'hidden_states' for production runs.",
+            flush=True,
+        )
+
+
 def _validate_failure_settings(
     async_config: AsyncRLConfig,
     num_prompts_per_step: int,
@@ -1370,6 +1474,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "at least one teacher mapping."
             )
         opd_module.assert_prev_logprobs_available(master_config)
+        _validate_opd_full_config(master_config, opd_config)
 
     if (
         reference_policy_kl_penalty == 0

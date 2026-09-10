@@ -586,6 +586,25 @@ class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
 
 
+class OnPolicyDistillationFullTransport(TypedDict):
+    """Resolved full-vocabulary MOPD settings carried to the policy workers.
+
+    A ``model_dump`` of ``OnPolicyDistillationFullConfig`` plus the resolved
+    ``payload_field``. That BaseModel remains the authoritative schema and the
+    only place defaults are declared, so readers must take these keys as
+    required rather than supplying their own fallbacks.
+    """
+
+    enabled: bool
+    teacher_payload: Literal["hidden_states", "logits"]
+    divergence: Literal["reverse_kl"]
+    payload_dtype: Literal["bfloat16", "float16", "float32"]
+    chunk_size: int | None
+    teacher_lm_head_lifecycle: Literal["none", "offload", "evict"]
+    validate_decomposition: bool
+    payload_field: str
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -607,6 +626,9 @@ class PolicyConfig(TypedDict):
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    # Resolved once by the driver and carried to the student workers and (via
+    # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
+    on_policy_distillation_full: NotRequired[OnPolicyDistillationFullTransport]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
