@@ -243,6 +243,7 @@ def create_dcp_checkpoint(
     policy.save_checkpoint(
         dcp_checkpoint_path, checkpointing_cfg=config["checkpointing"]
     )
+    policy.finalize_async_save()
 
     if not check_file_exists(dcp_checkpoint_path):
         raise FileNotFoundError(

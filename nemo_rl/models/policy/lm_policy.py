@@ -31,6 +31,7 @@ from nemo_rl.distributed.batched_data_dict import (
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
@@ -53,7 +54,7 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
-    get_default_hf_config,
+    get_hf_config,
     get_theoretical_tflops,
 )
 from nemo_rl.utils.multimodal_payload_metrics import (
@@ -105,6 +106,35 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         reserved_http_server_port: Optional[int] = None,
     ):
         self.debug_payload_metrics = False
+        configured_extension_fqn = config.get("worker_extension_cls_fqn")
+        if (
+            configured_extension_fqn is not None
+            and worker_extension_cls_fqn is not None
+            and configured_extension_fqn != worker_extension_cls_fqn
+        ):
+            raise ValueError(
+                "worker_extension_cls_fqn was set to different values in the "
+                "policy config and Policy constructor"
+            )
+        extension_fqn = (
+            configured_extension_fqn
+            if configured_extension_fqn is not None
+            else worker_extension_cls_fqn
+        )
+        # Only the config-supplied FQN is mutually exclusive with quant_cfg: a config
+        # author cannot know which worker quant_cfg resolves to, so silently replacing
+        # it would be a footgun. The constructor argument is exempt because callers
+        # passing it already see the resolved class name and are expected to subclass
+        # it, which has always been supported alongside quantization.
+        if configured_extension_fqn is not None and config.get("quant_cfg") is not None:
+            raise ValueError(
+                "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
+                "a custom policy worker cannot be combined with ModelOpt quantization"
+            )
+        if extension_fqn is not None:
+            # Validate registration before allocating workers or placement groups.
+            get_actor_python_env(extension_fqn)
+
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
@@ -134,12 +164,44 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
-        if draft_enabled and bool(
-            config.get("sequence_packing", {}).get("enabled", False)
-        ):
+        if draft_enabled and config["megatron_cfg"]["context_parallel_size"] > 1:
+            # Sequence packing itself is supported with the draft; CP is not:
+            # the hidden-state capture and the per-segment shifts assume each
+            # packed sequence lives whole on one rank.
             raise ValueError(
-                "policy.draft.enabled=true does not support sequence packing yet. "
-                "Disable policy.sequence_packing.enabled or policy.draft."
+                "policy.draft.enabled=true does not support context parallelism "
+                "yet. Set policy.megatron_cfg.context_parallel_size=1 or disable "
+                "policy.draft."
+            )
+        if (
+            draft_enabled
+            # sequence_packing is NotRequired in PolicyConfig, so tolerate its
+            # absence; the parallel sizes are required megatron_cfg keys.
+            and bool(config.get("sequence_packing", {}).get("enabled", False))
+            and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+        ):
+            # The packed draft path re-embeds the per-segment-shifted token ids
+            # via the model's embedding, which MCore constructs only on the
+            # first pipeline stage while the draft runs on the last.
+            raise ValueError(
+                "policy.draft.enabled=true with sequence packing does not "
+                "support pipeline parallelism yet. Set "
+                "policy.megatron_cfg.pipeline_model_parallel_size=1, or disable "
+                "policy.sequence_packing or policy.draft."
+            )
+        if draft_enabled and bool(
+            # use_fused_linear_logprobs is NotRequired in MegatronConfig.
+            config["megatron_cfg"].get("use_fused_linear_logprobs", False)
+        ):
+            # The fused path returns per-token logprobs and never materializes
+            # the full next-token logits the draft's teacher distribution
+            # needs, in either the packed or the unpacked layout.
+            raise ValueError(
+                "policy.draft.enabled=true is not supported with "
+                "policy.megatron_cfg.use_fused_linear_logprobs=true: draft "
+                "training needs the full next-token logits for the teacher, "
+                "which the fused path never materializes. Disable one of the "
+                "two."
             )
         if megatron_enable:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
@@ -205,11 +267,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
         # If a worker extension class is provided, use it instead of the default worker builder class
-        if worker_extension_cls_fqn is not None:
+        if extension_fqn is not None:
             print(
-                f"Using worker extension class: {worker_extension_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
+                f"Using worker extension class: {extension_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
             )
-            worker_builder_cls_fqn = worker_extension_cls_fqn
+            worker_builder_cls_fqn = extension_fqn
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
@@ -345,7 +407,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # initialize FLOPs tracker
         try:
             self.flops_tracker = FLOPTracker.from_config(
-                config["model_name"], get_default_hf_config(config["model_name"])
+                config["model_name"],
+                get_hf_config(
+                    config["model_name"],
+                    **(config.get("hf_config_overrides") or {}),
+                ),
             )
         except ValueError as e:
             self.flops_tracker = None
@@ -363,6 +429,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             microbatch_order = config["sequence_packing"].get("microbatch_order")
             if microbatch_order is not None:
                 self.sequence_packing_args["microbatch_order"] = microbatch_order
+            if pair_grouping_key := config["sequence_packing"].get("pair_grouping_key"):
+                self.sequence_packing_args["pair_grouping_key"] = pair_grouping_key
+            if (
+                max_sequences_per_bin := config["sequence_packing"].get(
+                    "max_sequences_per_bin"
+                )
+            ) is not None:
+                self.sequence_packing_args["max_sequences_per_bin"] = (
+                    max_sequences_per_bin
+                )
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )
@@ -1167,6 +1243,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
@@ -1175,6 +1252,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
         )
@@ -1223,11 +1301,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         return results[0]
 
-    def nccl_reshard_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
+    def nccl_reshard_refit(
+        self, kv_scales=None, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Transfer weights to gen workers via nccl_reshard (xferdtensor)."""
         futures = self.worker_group.run_all_workers_single_data(
             "nccl_reshard_refit",
             kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
         )
         return futures
 
