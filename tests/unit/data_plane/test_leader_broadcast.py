@@ -91,7 +91,7 @@ def _packed(rows):
     return PackedTensor(
         [r.clone() if r is not None else None for r in rows],
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="pad_to_max_shape",
     )
 
 
@@ -148,7 +148,9 @@ def _all_empty_body(rank: int):
             {
                 "input_ids": torch.arange(8, dtype=torch.long).reshape(2, 4),
                 "pixel_values": PackedTensor(
-                    [None, None], dim_to_pack=0, pad_to_max_shape=True
+                    [None, None],
+                    dim_to_pack=0,
+                    preprocess_mode="pad_to_max_shape",
                 ),
             }
         )
@@ -165,7 +167,8 @@ def _all_empty_body(rank: int):
     assert isinstance(packed, PackedTensor), type(packed).__name__
     assert packed.logical_segment_counts_by_row() == [0, 0]
     assert packed.as_tensor() is None
-    assert packed.pad_to_max_shape is True
+    assert packed.preprocess_mode == "pad_to_max_shape"
+    assert packed.preprocess_kwargs == {}
 
 
 def _unsupported_type_body(rank: int):
