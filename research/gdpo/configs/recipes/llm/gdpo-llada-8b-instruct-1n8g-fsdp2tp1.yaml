@@ -1,0 +1,17 @@
+defaults: ../../gdpo_llada_8b.yaml
+grpo:
+  max_num_steps: 200
+  val_period: 20
+  val_at_start: true
+checkpointing:
+  checkpoint_dir: results/gdpo-llada-8b-instruct-1n8g-fsdp2tp1
+policy:
+  tokenizer:
+    name: GSAI-ML/LLaDA-8B-Instruct
+logger:
+  log_dir: logs/gdpo-llada-8b-instruct-1n8g-fsdp2tp1
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: gdpo-llada-8b-instruct-1n8g-fsdp2tp1

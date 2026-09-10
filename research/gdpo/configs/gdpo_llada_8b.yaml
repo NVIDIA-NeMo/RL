@@ -1,0 +1,135 @@
+# GDPO for masked diffusion language models.
+#
+# Implements the training setup of GDPO (https://arxiv.org/abs/2510.08554):
+# sequences are scored by an ELBO estimated with Semi-deterministic Monte Carlo
+# (SDMC) instead of an autoregressive product of next-token probabilities, and
+# the policy ratio is taken at the sequence level.
+#
+# Not to be confused with `grpo.adv_estimator.name = "gdpo"`, which is the
+# unrelated multi-reward estimator from https://arxiv.org/abs/2601.05242.
+defaults: "../../../examples/configs/grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 6
+  # Reuse each rollout batch for the 12 policy updates used by official GDPO.
+  num_iterations: 12
+  # The ELBO is a noisy estimate of the sequence likelihood, so dividing the
+  # group advantage by its standard deviation amplifies estimator noise on
+  # low-variance groups. GDPO follows Dr.GRPO in leaving advantages unnormalized.
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+
+loss_fn:
+  # GSPO-shaped objective: one importance ratio per sequence, from the
+  # length-normalized ELBO difference, rather than one ratio per token.
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+  # A dLLM's rollouts are produced by the denoising sampler on the training
+  # weights, so there is no inference-engine likelihood gap to correct for.
+  use_importance_sampling_correction: false
+  # dLLMs score token i at position i; there is no next-token shift to undo.
+  position_aligned_logprobs: true
+  reference_policy_kl_penalty: 0.0
+  # GDPO trains with epsilon 0.5, i.e. clamp(ratio, 0.5, 1.5). That is far
+  # looser than a token-level GRPO clip because the ratio here is one
+  # length-normalized number per sequence, not one per token.
+  ratio_clip_min: 0.5
+  ratio_clip_max: 0.5
+
+policy:
+  model_name: "GSAI-ML/LLaDA-8B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+  # One rollout step produces 32 * 6 = 192 sequences. NeMo RL requires the
+  # training data size to be a multiple of the global batch size.
+  train_global_batch_size: 192
+  train_micro_batch_size: 1
+  # Each likelihood costs several forwards, so keep scoring microbatches small.
+  # Per-sequence seeds keep old, reference, and current ELBO masks identical
+  # even when scoring uses a different microbatch partition.
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  precision: "bfloat16"
+
+  masked_diffusion:
+    # Switches the policy from next-token logprobs to the SDMC ELBO.
+    enabled: true
+    # Read from the model config (LLaDA publishes `mask_token_id`) when unset.
+    # 126336 for LLaDA-8B, 156895 for LLaDA2.0.
+    mask_id: null
+    # False for masked diffusion LMs, which are trained position-aligned.
+    shift_targets: false
+    likelihood:
+      type: "sdmc"
+      # Each likelihood costs quadrature points * mc_samples forwards.
+      quadrature: "gauss-3"
+      mc_samples: 1
+      p_mask_prompt: 0.0
+
+  dtensor_cfg:
+    enabled: true
+    tensor_parallel_size: 1
+    # Context parallelism shards the sequence, but the ELBO masks positions
+    # across the whole sequence.
+    context_parallel_size: 1
+    activation_checkpointing: true
+    # GDPO fine-tunes LoRA adapters (r=128, alpha=64) rather than full weights.
+    # This is what makes an 8B dLLM trainable at this batch size: the ELBO keeps
+    # `quadrature * mc_samples` forward activations alive for the backward pass.
+    lora_cfg:
+      enabled: true
+      # Automodel matches target patterns against fully qualified module names.
+      target_modules:
+        ["*.q_proj", "*.k_proj", "*.v_proj", "*.o_proj", "*.up_proj", "*.down_proj", "*.gate_proj"]
+      exclude_modules: []
+      match_all_linear: false
+      dim: 128
+      alpha: 64
+      dropout: 0.05
+      dropout_position: "pre"
+      # PEFT's default A initialization is Kaiming uniform.
+      lora_A_init: "uniform"
+
+  # Both reorder or reuse tokens in ways that assume a causal factorization.
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+
+  # official: max_grad_norm 0.2
+  max_grad_norm: 0.2
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 3.0e-7
+      weight_decay: 0.1
+      betas: [0.9, 0.99]
+      eps: 1e-8
+
+  generation:
+    # Masked diffusion models decode a fixed-width canvas and keep no KV cache,
+    # so rollouts run in the training workers rather than in vLLM/SGLang/TRT-LLM.
+    backend: "automodel"
+    colocated:
+      enabled: true
+    max_new_tokens: 256
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    denoise_cfg:
+      type: "block"
+      block_length: 32
+      diffusion_steps: 128
+      cfg_scale: 0.0
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
