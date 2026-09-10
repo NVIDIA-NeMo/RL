@@ -796,6 +796,27 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     },
                     status_code=400,
                 )
+            except ValueError as e:
+                # The same overflow can also surface as a plain ValueError from
+                # the engine-side length check (e.g. "Input length (N) exceeds
+                # model's maximum context length (M)" after prefix-token
+                # replacement resizes the prompt). Without this clause it
+                # escapes as an opaque HTTP 500 ("Internal Server Error" body),
+                # which the Gym client blindly retries 3x and can never map to
+                # its graceful finish_reason="length" handling. Convert to the
+                # same 400 contract as VLLMValidationError above.
+                if "maximum context length" not in str(e):
+                    raise
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
