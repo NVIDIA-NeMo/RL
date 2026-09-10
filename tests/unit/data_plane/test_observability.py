@@ -852,11 +852,14 @@ def test_guard_failure_is_absorbed_counted_and_charted(caplog, monkeypatch):
         client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
 
     hv = client.snapshot()["hash_verify"]
-    assert hv["guard_failures"] == 2, "put and get each failed once"
+    # Three, not two: the put cannot stamp, so the read's mirror columns are
+    # absent and the read falls back, and the fold the fallback's check then
+    # attempts raises too. Every one of them is a batch that went unchecked.
+    assert hv["guard_failures"] == 3, "the put, the mirror-less read, its check"
     assert hv["rows_recorded"] == 0 and hv["rows_checked"] == 0, "nothing checked"
     assert caplog.text.count("hash guard failed") == 1, "logged once, not per call"
     # and it is a series, not just a counter -- the gate cannot key on rows
-    assert client.get_step_metrics(1.0)["step/hash/guard_failures"] == 2
+    assert client.get_step_metrics(1.0)["step/hash/guard_failures"] == 3
     client.close()
 
 
