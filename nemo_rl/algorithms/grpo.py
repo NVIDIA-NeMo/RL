@@ -507,6 +507,13 @@ def _validate_gym_multi_trace_capability(master_config: MasterConfig) -> None:
             "gym_multi_trace requires token-level loss and token-level importance ratios"
         )
     if (
+        master_config.loss_fn.use_importance_sampling_correction
+        and master_config.loss_fn.truncated_importance_sampling_type == "seq-mask-tis"
+    ):
+        raise NotImplementedError(
+            "gym_multi_trace does not support seq-mask-tis: sequence-level masks depend on physical trace boundaries"
+        )
+    if (
         grpo.use_dynamic_sampling
         or grpo.overlong_filtering
         or grpo.reward_shaping.enabled
@@ -3519,6 +3526,12 @@ def grpo_train(
                             ],
                             row_multiple=policy.data_parallel_size
                             * master_config.policy["train_micro_batch_size"],
+                        )
+                        baseline_for_log, _ = calculate_baseline_and_std_per_prompt(
+                            repeated_batch["gym_task_group_id"].unsqueeze(-1),
+                            rewards,
+                            trace_batch.logical_valid_mask,
+                            leave_one_out_baseline=adv_estimator.use_leave_one_out_baseline,
                         )
                         repeated_batch = trace_batch.batch
                         metrics.update(

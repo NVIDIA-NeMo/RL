@@ -84,7 +84,9 @@ This initial path requires synchronous GRPO, a text-only Megatron policy, and
 token-level loss and importance ratios. Setup rejects asynchronous/TQ/staged
 capture, custom capture sinks, router replay, multimodal models, alternative
 advantage estimators, dynamic sampling, legacy episode-length filtering/shaping,
-message-level penalties, and post-advantage sequence-logprob-error masking.
+message-level penalties, active `seq-mask-tis` importance correction, and
+post-advantage sequence-logprob-error masking. Sequence-level correction masks
+depend on physical trace boundaries and cannot preserve split/merged equivalence.
 `train_global_batch_size` must equal the logical rollout count per step.
 Use `data_plane: null` or a complete disabled data-plane configuration.
 

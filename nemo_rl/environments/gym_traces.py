@@ -168,6 +168,7 @@ class GymTraceBatch:
     padding_count: int
     overlong_trace_count: int
     invalid_rollout_count: int
+    logical_valid_mask: torch.Tensor
 
 
 def prepare_gym_trace_batch(
@@ -264,4 +265,5 @@ def prepare_gym_trace_batch(
         padding_count,
         overlong_count,
         int((valid_rollouts == 0).sum()),
+        valid_rollouts,
     )

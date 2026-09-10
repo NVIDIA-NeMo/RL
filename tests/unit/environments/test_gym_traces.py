@@ -17,6 +17,7 @@ from nemo_rl.algorithms.grpo import (
     add_grpo_token_loss_masks_and_generation_logprobs,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.gym_traces import (
@@ -150,6 +151,7 @@ def test_task_groups_and_masked_rollouts_vote_before_expansion():
     assert prepared.advantages[:5].tolist() == [0, 0, 0, 1, -1]
     assert prepared.batch["loss_multiplier"].tolist() == [1, 1, 0, 1, 1, 0, 0, 0]
     assert prepared.invalid_rollout_count == 1
+    assert prepared.logical_valid_mask.tolist() == [1, 0, 1, 1]
 
 
 def test_overlong_trace_masks_only_its_row_and_empty_rollout_is_inert():
@@ -168,6 +170,43 @@ def test_overlong_trace_masks_only_its_row_and_empty_rollout_is_inert():
     assert prepared.batch["gym_rollout_id"] == ["a", "a", "masked-1", ""]
     assert prepared.advantages[1].item() == 0
     assert _flatten(prepared)["input_lengths"].max().item() <= 3
+
+
+@pytest.mark.parametrize("leave_one_out", [False, True])
+def test_baseline_diagnostics_use_the_same_logical_validity_as_advantages(
+    leave_one_out,
+):
+    envelopes = [
+        _envelope("valid-a", [_row("short", [1, 2], [("call", 1, 2)])]),
+        _envelope("valid-b", [_row("short", [1, 3], [("call", 1, 2)])]),
+        _envelope("overlong", [_row("long", [1, 2, 3, 4], [("call", 1, 4)])]),
+        None,
+    ]
+    logical_batch = _batch(envelopes, rewards=[1, 0, 100, 99], groups=[7, 7, 7, 7])
+    prepared = prepare_gym_trace_batch(
+        logical_batch,
+        estimator=GRPOAdvantageEstimator(
+            AdvEstimatorConfig(
+                normalize_rewards=False, use_leave_one_out_baseline=leave_one_out
+            ),
+            ClippedPGLossConfig(),
+        ),
+        pad_token_id=0,
+        max_sequence_length=3,
+        row_multiple=4,
+    )
+    assert prepared.logical_valid_mask.tolist() == [1, 1, 0, 0]
+    baseline, _ = calculate_baseline_and_std_per_prompt(
+        logical_batch["gym_task_group_id"].unsqueeze(-1),
+        logical_batch["total_reward"],
+        prepared.logical_valid_mask,
+        leave_one_out_baseline=leave_one_out,
+    )
+    # Invalid rewards cannot influence the surviving rollouts or their diagnostics.
+    assert baseline[:2].tolist() == ([0.0, 1.0] if leave_one_out else [0.5, 0.5])
+    torch.testing.assert_close(
+        prepared.advantages[:2], logical_batch["total_reward"][:2] - baseline[:2]
+    )
 
 
 @pytest.mark.parametrize(
@@ -295,6 +334,18 @@ def test_unsupported_configs_fail_before_worker_setup(configure):
     configure(config)
     with pytest.raises((NotImplementedError, ValueError)):
         _validate_gym_multi_trace_capability(config)
+
+
+def test_sequence_mask_tis_is_rejected_only_when_correction_is_enabled():
+    config = _config()
+    config.loss_fn.truncated_importance_sampling_type = "seq-mask-tis"
+    config.loss_fn.truncated_importance_sampling_ratio = 1.1
+    config.loss_fn.truncated_importance_sampling_ratio_min = 0.9
+    config.loss_fn.use_importance_sampling_correction = True
+    with pytest.raises(NotImplementedError, match="seq-mask-tis"):
+        _validate_gym_multi_trace_capability(config)
+    config.loss_fn.use_importance_sampling_correction = False
+    _validate_gym_multi_trace_capability(config)
 
 
 def test_both_sides_must_opt_in():
