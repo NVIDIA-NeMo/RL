@@ -218,3 +218,90 @@ def test_fetch_prefix_token_ids_rejects_duplicates(tq_client, staging_partition)
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
     with pytest.raises(KeyError, match="duplicates"):
         source.fetch_prefix_token_ids(["r/c", "r/c"])
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "malformed", "unready", "reordered", "reordered_partial"]
+)
+def test_group_fetch_isolates_bad_rows(tq_client, staging_partition, damage):
+    """Partial results and all-or-nothing readiness cannot poison siblings."""
+    import torch
+
+    from nemo_rl.data_plane.tq_token_sink import FetchedStagedCall
+
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    records = [
+        build_fixture_artifacts("single_call", rollout_id=f"isolated_{i}")[0][0]
+        for i in range(3)
+    ]
+    keys = [record.staging_key for record in records]
+    for index, record in enumerate(records):
+        if damage not in ("missing", "reordered_partial") or index != 1:
+            assert sink.stage(record).ok
+    calls = []
+
+    class DamagedClient:
+        def get_samples(self, **kwargs):
+            requested = kwargs["sample_ids"]
+            calls.append(list(requested))
+            if damage == "unready" and keys[1] in requested:
+                raise ValueError("Some fields are not ready in all the requested keys!")
+            if damage in ("reordered", "reordered_partial"):
+                kwargs["sample_ids"] = list(reversed(requested))
+            rows = tq_client.get_samples(**kwargs)
+            if damage == "malformed" and keys[1] in requested:
+                values = rows["capture_mode"].clone()
+                values[requested.index(keys[1])] = torch.tensor(99)
+                rows["capture_mode"] = values
+            return rows
+
+    result = TQTokenSource(
+        DamagedClient(), staging_partition=staging_partition
+    ).fetch_for_group(keys)
+    assert set(result.calls) == set(keys)
+    assert isinstance(result.calls[keys[0]], FetchedStagedCall)
+    assert isinstance(result.calls[keys[2]], FetchedStagedCall)
+    if damage == "reordered":
+        assert isinstance(result.calls[keys[1]], FetchedStagedCall)
+    else:
+        assert isinstance(result.calls[keys[1]], (KeyError, ValueError))
+    assert len(calls) <= 2 * len(keys) - 1
+    for key, item in result.calls.items():
+        if isinstance(item, FetchedStagedCall):
+            assert item.snapshot.staging_key == key
+
+
+def test_group_fetch_deduplicates_keys_and_times_only_reads(
+    tq_client, staging_partition, monkeypatch
+):
+    import nemo_rl.data_plane.tq_token_sink as module
+
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    record = build_fixture_artifacts("single_call")[0][0]
+    assert sink.stage(record).ok
+    clock = [0.0]
+    calls = []
+    decode = module._row_to_base_snapshot
+
+    class TimedClient:
+        def get_samples(self, **kwargs):
+            calls.append(kwargs)
+            clock[0] += 0.010
+            return tq_client.get_samples(**kwargs)
+
+    def timed_decode(row):
+        clock[0] += 0.050
+        return decode(row)
+
+    monkeypatch.setattr(module.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(module, "_row_to_base_snapshot", timed_decode)
+    source = TQTokenSource(TimedClient(), staging_partition=staging_partition)
+    result = source.fetch_for_group([record.staging_key] * 2)
+    assert len(calls) == 1
+    assert calls[0]["sample_ids"] == [record.staging_key]
+    assert result.fetch_ms == pytest.approx(10)
+    assert clock[0] == pytest.approx(0.060)
+    empty = source.fetch_for_group([])
+    assert empty.calls == {}
+    assert empty.fetch_ms == 0
+    assert len(calls) == 1

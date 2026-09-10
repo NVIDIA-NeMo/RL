@@ -36,7 +36,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -128,6 +129,16 @@ class FetchedStagedCall:
     snapshot: StagedCallBaseSnapshot
     routed_len: int
     fragment: RouteFragment | None = None
+
+
+@dataclass
+class StagedGroupFetch:
+    """Per-key results and time spent waiting on data-plane reads only."""
+
+    calls: dict[str, FetchedStagedCall | KeyError | TypeError | ValueError] = field(
+        default_factory=dict
+    )
+    fetch_ms: float = 0.0
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -319,15 +330,10 @@ class TQTokenSink:
 class TQTokenSource:
     """Gym ``StagingSource`` over ``DataPlaneClient.get_samples``.
 
-    All requested rows are fetched in a single batched ``get_samples`` call
-    (TQ returns jagged delta columns as nested tensors; ``_from_wire``
-    preserves the raggedness), in the order requested. A missing or
-    unreadable row raises ``KeyError`` per the protocol — the finalizer maps
-    that to a placeholder, never a silent skip. TQ's field-readiness check
-    is all-or-nothing across a batch, so the extras fallback is batch-level:
-    extras-free runs land in the base schema exactly like the old per-key
-    probe, but a batch with *mixed* extras presence degrades every row to
-    the base schema (worker feature-gating makes presence uniform per run).
+    Healthy requests use one base-column read and, in direct mode, one
+    payload read restricted to rows whose encoding declares routes. The Gym
+    interface raises on missing or unreadable rows. Group finalization uses
+    ``fetch_for_group`` to isolate failures by staging key.
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
@@ -377,45 +383,46 @@ class TQTokenSource:
     ) -> list[FetchedStagedCall]:
         """Fetch digest-covered base columns, plus route payloads when requested.
 
-        Deferred mode (the default) never selects ``routed_experts`` — route
-        bytes stay in TQ for the policy worker. Direct mode passes
-        ``include_route_fragments=True`` to pull the payloads in the same
-        batched read and receives them as ``RouteFragment`` values beside the
-        base snapshots, never inside them.
+        Deferred mode never selects ``routed_experts``. Direct mode first
+        reads the base columns, then selects payloads only for keys whose
+        encoding declares routes, so mixed route presence is supported.
         """
+        return self._fetch_for_finalization(
+            staging_keys, include_route_fragments=include_route_fragments
+        )
+
+    def _read_finalization_rows(
+        self,
+        staging_keys: list[str],
+        select_fields: list[str],
+        timings: StagedGroupFetch | None,
+    ) -> TensorDict:
+        started = time.perf_counter()
+        try:
+            return _call_dp(
+                self._dp_client,
+                "get_samples",
+                sample_ids=staging_keys,
+                partition_id=self._staging_partition,
+                select_fields=select_fields,
+            )
+        finally:
+            if timings is not None:
+                timings.fetch_ms += (time.perf_counter() - started) * 1000.0
+
+    def _fetch_for_finalization(
+        self,
+        staging_keys: list[str],
+        *,
+        include_route_fragments: bool,
+        timings: StagedGroupFetch | None = None,
+    ) -> list[FetchedStagedCall]:
         if not staging_keys:
             return []
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("finalization staging request contains duplicate keys")
         try:
-            if include_route_fragments:
-                # Route payloads are optional per run (feature-gated at the
-                # worker); fall back to the base schema so extras-free rows
-                # keep fetching.
-                try:
-                    rows = _call_dp(
-                        self._dp_client,
-                        "get_samples",
-                        sample_ids=list(staging_keys),
-                        partition_id=self._staging_partition,
-                        select_fields=STAGING_FIELDS + [ROUTED_EXPERTS_FIELD],
-                    )
-                except Exception:  # noqa: BLE001 — field-not-present probe
-                    rows = _call_dp(
-                        self._dp_client,
-                        "get_samples",
-                        sample_ids=list(staging_keys),
-                        partition_id=self._staging_partition,
-                        select_fields=STAGING_FIELDS,
-                    )
-            else:
-                rows = _call_dp(
-                    self._dp_client,
-                    "get_samples",
-                    sample_ids=list(staging_keys),
-                    partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS,
-                )
+            rows = self._read_finalization_rows(staging_keys, STAGING_FIELDS, timings)
         except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
             raise KeyError(
                 f"staged rows for {len(staging_keys)} keys could not be "
@@ -446,12 +453,85 @@ class TQTokenSource:
                     staging_key=key,
                     snapshot=snapshot,
                     routed_len=_row_scalar_int(row, ROUTED_LEN_FIELD),
-                    fragment=(
-                        _row_to_route_fragment(row) if include_route_fragments else None
-                    ),
                 )
             )
+        if include_route_fragments:
+            route_indices = [
+                index
+                for index in range(n_rows)
+                if _row_scalar_int(
+                    _select_row(rows, index), ROUTED_EXPERTS_ENCODING_FIELD
+                )
+                != ROUTE_ENCODING_NONE
+            ]
+            if route_indices:
+                route_keys = [staging_keys[index] for index in route_indices]
+                try:
+                    route_rows = self._read_finalization_rows(
+                        route_keys,
+                        ["rollout_id_utf8", "model_call_id_utf8", ROUTED_EXPERTS_FIELD],
+                        timings,
+                    )
+                except Exception as error:  # noqa: BLE001 — Gym source maps misses to KeyError
+                    raise KeyError(
+                        f"staged route payloads could not be fetched: {error}"
+                    ) from error
+                if not route_rows.batch_size or int(route_rows.batch_size[0]) != len(
+                    route_keys
+                ):
+                    raise KeyError("staged route payloads missing")
+                for route_index, base_index in enumerate(route_indices):
+                    route_row = _select_row(route_rows, route_index)
+                    base_row = _select_row(rows, base_index)
+                    if any(
+                        _row_text(route_row, name) != _row_text(base_row, name)
+                        for name in ("rollout_id_utf8", "model_call_id_utf8")
+                    ):
+                        raise KeyError("staged route payload identity mismatch")
+                    base_row[ROUTED_EXPERTS_FIELD] = route_row[ROUTED_EXPERTS_FIELD]
+                    fetched[base_index] = replace(
+                        fetched[base_index], fragment=_row_to_route_fragment(base_row)
+                    )
         return fetched
+
+    def fetch_for_group(
+        self,
+        staging_keys: list[str],
+        *,
+        include_route_fragments: bool = False,
+    ) -> StagedGroupFetch:
+        """Fetch a key union while isolating unreadable rows from siblings.
+
+        TQ omits missing keys and rejects an entire read for unready fields.
+        Its TensorDict does not carry the resolved key list. Strict identity
+        and cardinality checks therefore precede mapping results to keys;
+        failed batches are bisected until each failure has one owner. Extra
+        reads occur only on the failure path, with at most 2*N-1 batch
+        attempts (up to two data-plane reads per attempt in direct mode).
+        """
+        result = StagedGroupFetch()
+
+        def fetch_batch(keys: list[str]) -> None:
+            if not keys:
+                return
+            try:
+                fetched = self._fetch_for_finalization(
+                    keys,
+                    include_route_fragments=include_route_fragments,
+                    timings=result,
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                if len(keys) == 1:
+                    result.calls[keys[0]] = error
+                else:
+                    middle = len(keys) // 2
+                    fetch_batch(keys[:middle])
+                    fetch_batch(keys[middle:])
+            else:
+                result.calls.update((item.staging_key, item) for item in fetched)
+
+        fetch_batch(list(dict.fromkeys(staging_keys)))
+        return result
 
 
 def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
@@ -463,13 +543,13 @@ def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
     dense component, which is exactly the jagged-row payload.
     """
     row: dict[str, torch.Tensor] = {}
-    for field in rows.keys():
-        value = rows.get(field)
+    for column in rows.keys():
+        value = rows.get(column)
         if not isinstance(value, torch.Tensor):
             raise TypeError(
-                f"staging field {field!r} must be a tensor, got {type(value).__name__}"
+                f"staging field {column!r} must be a tensor, got {type(value).__name__}"
             )
-        row[str(field)] = value[index].unsqueeze(0)
+        row[str(column)] = value[index].unsqueeze(0)
     return row
 
 

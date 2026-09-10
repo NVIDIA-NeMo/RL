@@ -153,3 +153,38 @@ def test_every_forbidden_key_is_rejected(key) -> None:
     """Removing an entry from the denylist should fail loudly."""
     with pytest.raises(TypeError, match="forbidden heavy field"):
         assert_metadata_only({key: [1, 2, 3]})
+
+
+@pytest.mark.parametrize("num_workers", [1, 3])
+def test_reassembler_pool_prefers_local_node_with_soft_affinity(
+    monkeypatch, num_workers
+):
+    import nemo_rl.experience.rollout_reassembler_actor as module
+
+    actor = MagicMock()
+    context = MagicMock()
+    context.get_node_id.return_value = "a" * 56
+    monkeypatch.setattr(module, "RolloutReassemblerActor", actor)
+    monkeypatch.setattr(module.ray, "get_runtime_context", lambda: context)
+    dp_config, config = MagicMock(), MagicMock()
+    result = module.create_rollout_reassembler_actors(
+        dp_config, config, num_workers=num_workers
+    )
+    strategy = actor.options.call_args.kwargs["scheduling_strategy"]
+    assert strategy.node_id == "a" * 56
+    assert strategy.soft is True
+    assert strategy._spill_on_unavailable is True
+    assert len(result) == num_workers
+    assert actor.options.return_value.remote.call_count == num_workers
+    actor.options.return_value.remote.assert_called_with(dp_config, config)
+
+
+def test_reassembler_pool_rejects_invalid_size_before_ray_initialization(monkeypatch):
+    import nemo_rl.experience.rollout_reassembler_actor as module
+
+    context = MagicMock(side_effect=AssertionError("must validate size first"))
+    monkeypatch.setattr(module.ray, "get_runtime_context", context)
+    with pytest.raises(ValueError, match="must be positive"):
+        module.create_rollout_reassembler_actors(
+            MagicMock(), MagicMock(), num_workers=0
+        )
