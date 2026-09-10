@@ -2884,12 +2884,7 @@ class TestLoadInitialLoraAdapterEndToEnd:
         manager.save_checkpoint(
             model=donor,
             weights_path=weights_path,
-            checkpointing_cfg={
-                "enabled": True,
-                "model_save_format": "safetensors",
-                "is_peft": True,
-            },
-            lora_enabled=True,
+            is_final_checkpoint=False,
             peft_config=peft_config,
         )
 
@@ -2957,12 +2952,7 @@ class TestLoadInitialLoraAdapterEndToEnd:
         manager.save_checkpoint(
             model=donor,
             weights_path=weights_path,
-            checkpointing_cfg={
-                "enabled": True,
-                "model_save_format": "safetensors",
-                "is_peft": True,
-            },
-            lora_enabled=True,
+            is_final_checkpoint=False,
             peft_config=donor_peft_config,
         )
 
