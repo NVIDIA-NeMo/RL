@@ -248,6 +248,11 @@ Without an Energon packing buffer, SFTv2 currently requires fixed batching.
 Dynamic batching and HybridEP flex dispatch are not supported with
 Energon-owned packs.
 
+With Energon-owned packing, each `sample_mask` entry represents one physical
+pack, so `num_valid_samples` counts non-empty packs rather than source
+conversations. NLL loss scaling is unchanged because it is normalized by
+`global_valid_toks`.
+
 Training dataloader checkpoints include the Energon worker state plus a fingerprint of the source, loader, and processor settings. Restore must occur before the first iteration, and a changed fingerprint fails instead of silently continuing with a different stream. SFTv2 accepts a single train source; use an Energon metadataset to blend prepared sources.
 
 ### OpenAI Format Datasets (with Tool Calling Support)
