@@ -15,6 +15,7 @@
 from pathlib import Path
 from typing import Any
 
+import pytest
 from omegaconf import OmegaConf
 
 from nemo_rl.utils.config import (
@@ -24,11 +25,15 @@ from nemo_rl.utils.config import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 RECIPE_NAME = "grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.yaml"
+TEXT_RECIPE_NAMES = (
+    RECIPE_NAME,
+    "grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml",
+)
 
 
-def _load_recipe() -> dict[str, Any]:
+def _load_recipe(recipe_name: str = RECIPE_NAME) -> dict[str, Any]:
     register_omegaconf_resolvers()
-    recipe_path = PROJECT_ROOT / "examples/configs/recipes/llm" / RECIPE_NAME
+    recipe_path = PROJECT_ROOT / "examples/configs/recipes/llm" / recipe_name
     recipe = OmegaConf.to_container(
         load_config_with_inheritance(recipe_path), resolve=True
     )
@@ -71,8 +76,11 @@ def test_qwen35_bf16_trtllm_recipe_uses_supported_expert_layout() -> None:
     }
 
 
-def test_qwen35_bf16_trtllm_recipe_freezes_unused_vision_modules() -> None:
-    recipe = _load_recipe()
+@pytest.mark.parametrize("recipe_name", TEXT_RECIPE_NAMES)
+def test_qwen35_text_recipe_freezes_unused_vision_modules(
+    recipe_name: str,
+) -> None:
+    recipe = _load_recipe(recipe_name)
 
     assert recipe["policy"]["megatron_cfg"]["freeze_config"] == {
         "freeze_vision_model": True,
