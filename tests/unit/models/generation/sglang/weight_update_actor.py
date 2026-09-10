@@ -68,23 +68,33 @@ class MockFSDPWorker:
         return self.device_uuid
 
     def stream_weights(self, rollout_engines, num_gpus_per_engine):
-        from nemo_rl.models.policy.utils import stream_weights_via_http_impl
+        """Push weights over the same Ray CUDA-IPC path the SGLang refit uses.
+
+        Mirrors ``connect_sglang_rollout_engines`` +
+        ``update_weights_to_sglang_colocated`` on the real policy workers, so
+        the test exercises the production transport rather than a copy of it.
+        """
+        from nemo_rl.models.policy.utils import (
+            connect_colocate_topology,
+            iter_named_tensor_buckets,
+            send_hf_buckets_via_ipc_actor_impl,
+        )
 
         if not hasattr(self, "_ipc_worker_state"):
             self._ipc_worker_state = {}
 
-        rollout_engine_urls = ray.get(
-            [e.get_base_url.remote() for e in rollout_engines]
+        engines = list(rollout_engines)
+        connect_colocate_topology(
+            engine_gpu_counts=[num_gpus_per_engine] * len(engines),
+            worker_state=self._ipc_worker_state,
         )
 
-        stream_weights_via_http_impl(
-            params_generator=_hf_params_generator(self.model, self.dtype),
-            rollout_engine_urls=rollout_engine_urls,
-            num_gpus_per_engine=num_gpus_per_engine,
-            rank=self.rank,
-            world_size=dist.get_world_size(),
-            worker_name=f"MockFSDPWorker-{self.rank}",
-            buffer_size_bytes=512 * 1024 * 1024,
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=iter_named_tensor_buckets(
+                _hf_params_generator(self.model, self.dtype),
+                buffer_size_bytes=512 * 1024 * 1024,
+            ),
+            rollout_engines=engines,
             worker_state=self._ipc_worker_state,
         )
 

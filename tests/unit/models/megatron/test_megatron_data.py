@@ -146,6 +146,54 @@ class TestGetAndValidateSeqlen:
         sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
         assert seq_dim_size == 10
 
+    def test_get_and_validate_seqlen_skips_packed_multimodal_fields(self):
+        """mcore twin of the automodel ``check_sequence_dim`` skip.
+
+        A packed multimodal field has patch/image count on dim 1, not seqlen.
+        Without the skip every VLM step through the data plane trips the assert.
+        """
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = MagicMock()
+        data.__getitem__ = MagicMock(
+            side_effect=lambda k: torch.zeros(2, 10) if k == "input_ids" else None
+        )
+        data.items = MagicMock(
+            return_value=[
+                ("input_ids", torch.zeros(2, 10)),
+                # [B, max_patches, C, H, W] — dim 1 is 7 patches, not 10 tokens.
+                ("pixel_values", torch.zeros(2, 7, 3, 2, 2)),
+                ("image_grid_thw", torch.zeros(2, 4, 3)),
+            ]
+        )
+
+        sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
+
+        assert sequence_dim == 1
+        assert seq_dim_size == 10
+
+    def test_get_and_validate_seqlen_still_checks_per_token_multimodal(self):
+        """Only the *packed* registry is exempt. Per-token maps like
+        ``mm_token_type_ids`` are ``[B, S]``, so a seqlen mismatch there is a
+        real bug that must keep failing."""
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = MagicMock()
+        data.__getitem__ = MagicMock(
+            side_effect=lambda k: torch.zeros(2, 10) if k == "input_ids" else None
+        )
+        data.items = MagicMock(
+            return_value=[
+                ("input_ids", torch.zeros(2, 10)),
+                ("mm_token_type_ids", torch.zeros(2, 15)),  # Mismatched!
+            ]
+        )
+
+        with pytest.raises(AssertionError) as exc_info:
+            get_and_validate_seqlen(data)
+
+        assert "Dim 1 must be the sequence dim" in str(exc_info.value)
+
 
 @pytest.mark.mcore
 class TestProcessMicrobatch:
@@ -182,6 +230,39 @@ class TestProcessMicrobatch:
 
         # Verify get_ltor_masks_and_position_ids was called
         mock_get_masks.assert_called_once()
+
+    def test_process_microbatch_pads_dense_mxfp8_tokens(self):
+        """Dense MXFP8 batches pad all sequence tensors to a 32-token boundary."""
+        from nemo_rl.models.megatron import data as megatron_data
+
+        data_dict = {
+            "input_ids": torch.arange(72).unsqueeze(0),
+            "token_mask": torch.ones(1, 72),
+            "input_lengths": torch.tensor([72]),
+            "pixel_values": torch.ones(1, 3, 8, 8),
+        }
+
+        with patch.object(
+            megatron_data,
+            "get_ltor_masks_and_position_ids",
+            return_value=(
+                torch.ones(1, 96),
+                None,
+                torch.arange(96).unsqueeze(0),
+            ),
+        ):
+            result = megatron_data.process_microbatch(
+                data_dict,
+                pad_individual_seqs_to_multiple_of=32,
+                pack_sequences=False,
+                straggler_timer=MagicMock(),
+            )
+
+        assert result.original_seq_length == 72
+        assert result.input_ids.shape == (1, 96)
+        assert data_dict["token_mask"].shape == (1, 96)
+        assert torch.count_nonzero(data_dict["token_mask"][:, 72:]) == 0
+        assert data_dict["pixel_values"].shape == (1, 3, 8, 8)
 
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_repairs_routed_experts_padding_without_packing(
@@ -1176,6 +1257,13 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": True},
             "sequence_packing": {"enabled": False},
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
         }
 
         (
@@ -1230,6 +1318,8 @@ class TestGetMicrobatchIterator:
                 "sequence_parallel": False,
                 "pipeline_model_parallel_size": 1,
                 "context_parallel_size": 1,
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
             },
             "make_sequence_length_divisible_by": 1,
         }
@@ -1253,6 +1343,10 @@ class TestGetMicrobatchIterator:
         # With sequence packing, micro_batch_size should be 1
         assert micro_batch_size == 1
         assert data_iterator_len == 10
+        assert (
+            mock_make_iterator.call_args.kwargs["create_packed_seq_padding_mask"]
+            is True
+        )
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
@@ -1274,6 +1368,13 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": False},
             "sequence_packing": {"enabled": False},
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
         }
 
         mbs = 4
@@ -1297,6 +1398,67 @@ class TestGetMicrobatchIterator:
         assert micro_batch_size == mbs
         assert data_iterator_len == 16 // mbs
         assert seq_dim_size == 64
+
+    def test_get_microbatch_iterator_pads_dense_mxfp8_to_32(self):
+        """MXFP8 dense logprob batches expose their padded schedule length."""
+        from nemo_rl.models.megatron import data as megatron_data
+
+        mock_data = MagicMock()
+        mock_data.size = 2
+        mock_data.make_microbatch_iterator.return_value = iter([])
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            },
+        }
+
+        with (
+            patch.object(
+                megatron_data, "get_and_validate_seqlen", return_value=(1, 72)
+            ),
+            patch.object(
+                megatron_data, "make_processed_microbatch_iterator"
+            ) as mock_make_iterator,
+        ):
+            *_, seq_dim_size, padded_seq_length = megatron_data.get_microbatch_iterator(
+                data=mock_data,
+                cfg=cfg,
+                mbs=1,
+                straggler_timer=MagicMock(),
+            )
+
+            assert seq_dim_size == 72
+            assert padded_seq_length == 96
+            assert (
+                mock_make_iterator.call_args.kwargs[
+                    "pad_individual_seqs_to_multiple_of"
+                ]
+                == 32
+            )
+
+    def test_non_packed_pad_factor_combines_tp_sequence_parallel_alignment(self):
+        """Dense sequence-parallel batches align to the TP scatter factor."""
+        from nemo_rl.models.megatron.data import (
+            _get_non_packed_sequence_pad_factor,
+        )
+
+        cfg = {
+            "make_sequence_length_divisible_by": 6,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 4,
+                "sequence_parallel": True,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
+        }
+
+        assert _get_non_packed_sequence_pad_factor(cfg) == 12
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")

@@ -1,0 +1,9 @@
+defaults: grpo_math_1B_megatron_single_controller.yaml
+policy:
+  generation:
+    backend: megatron
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
