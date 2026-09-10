@@ -399,7 +399,7 @@ class TQTokenSource:
     ) -> TensorDict:
         started = time.perf_counter()
         try:
-            return _call_dp(
+            rows = _call_dp(
                 self._dp_client,
                 "get_samples",
                 sample_ids=staging_keys,
@@ -409,6 +409,7 @@ class TQTokenSource:
         finally:
             if timings is not None:
                 timings.fetch_ms += (time.perf_counter() - started) * 1000.0
+        return rows
 
     def _fetch_for_finalization(
         self,
