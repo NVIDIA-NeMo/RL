@@ -1,0 +1,17 @@
+defaults: ./vlm_sft-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8-energon.v1.yaml
+
+policy:
+  sequence_packing:
+    enabled: true
+    fuse_loss: true
+    algorithm: balanced_greedy_knapsack
+
+data:
+  energon:
+    packing_buffer_size: 64
+    max_samples_per_sequence: 16
+
+logger:
+  log_dir: logs/sft-nemotron-omni-30b-clevr-energon-packing
+  wandb:
+    name: sft-nemotron-omni-30b-clevr-energon-packing
