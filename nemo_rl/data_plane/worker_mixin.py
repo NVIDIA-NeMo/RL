@@ -116,7 +116,8 @@ def _broadcast_batched_data_dict(
                                 "empty_packed",
                                 len(v),
                                 v.dim_to_pack,
-                                v.pad_to_max_shape,
+                                v.preprocess_mode,
+                                v.preprocess_kwargs,
                             )
                         )
                         continue
@@ -130,7 +131,8 @@ def _broadcast_batched_data_dict(
                             str(values.device),
                             nested.offsets().tolist(),
                             shapes,
-                            v.pad_to_max_shape,
+                            v.preprocess_mode,
+                            v.preprocess_kwargs,
                         )
                     )
                 elif (
@@ -206,7 +208,14 @@ def _broadcast_batched_data_dict(
             ):
                 out[key] = tensor.to(src_device)
         elif kind == "packed_wire":
-            dtype_str, src_device, offsets, shapes, pad_to_max_shape = entry[2:]
+            (
+                dtype_str,
+                src_device,
+                offsets,
+                shapes,
+                preprocess_mode,
+                preprocess_kwargs,
+            ) = entry[2:]
             if is_leader:
                 flat = leader_flat[key].to(bcast_device)
             else:
@@ -224,17 +233,21 @@ def _broadcast_batched_data_dict(
                 if torch.device(src_device).type != torch.device(bcast_device).type:
                     nested = nested.to(src_device)
                 out[key] = PackedTensor.from_wire(
-                    nested, shapes, pad_to_max_shape=pad_to_max_shape
+                    nested,
+                    shapes,
+                    preprocess_mode=preprocess_mode,
+                    preprocess_kwargs=preprocess_kwargs,
                 )
         elif kind == "empty_packed":
             # Structural only: no payload, so followers rebuild from the
             # geometry and land on the leader's key set.
-            n_rows, dim_to_pack, pad_to_max_shape = entry[2:]
+            n_rows, dim_to_pack, preprocess_mode, preprocess_kwargs = entry[2:]
             if not is_leader:
                 out[key] = PackedTensor(
                     [None] * n_rows,
                     dim_to_pack,
-                    pad_to_max_shape=pad_to_max_shape,
+                    preprocess_mode=preprocess_mode,
+                    preprocess_kwargs=preprocess_kwargs,
                 )
         else:
             if not is_leader:

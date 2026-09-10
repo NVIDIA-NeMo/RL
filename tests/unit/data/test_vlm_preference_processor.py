@@ -101,6 +101,7 @@ def test_vlm_preference_processor_adds_nemotron_omni_media_metadata():
         result["message_log_rejected"],
     ):
         message = message_log[0]
-        assert message["pixel_values"].pad_to_max_shape
+        assert message["pixel_values"].preprocess_mode == "patchify"
+        assert message["pixel_values"].preprocess_kwargs == {"patch_dim": 16}
         assert message["imgs_sizes"].as_tensor().tolist() == [[15, 23]]
         assert message["num_frames"].as_tensor().tolist() == [1]
