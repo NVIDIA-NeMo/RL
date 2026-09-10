@@ -663,10 +663,17 @@ def test_build_refit_info_replicates_train_context_parallelism():
 
     dense = _find(info, "model.layers.0.mlp.gate_proj.weight")
     expert = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+    # Non-expert mesh keeps the CP axis (dp, cp, tp) and replicates along it.
     assert tuple(dense["src_mesh_info"].mesh.shape) == (2, 2, 2)
-    assert tuple(expert["src_mesh_info"].mesh.shape) == (2, 2, 2)
     assert isinstance(dense["src_placements"][1], Replicate)
-    assert isinstance(expert["src_placements"][2], Replicate)
+    # The expert mesh carries no CP axis: MCore's expert rank generator runs
+    # with cp=1 and folds the CP ranks into the expert DP dim.  So the mesh is
+    # (dp=4, ep=2) with EP innermost, and rank r owns expert coord r % 2 -
+    # matching MCore's [0, 1, 0, 1, ...] expert layout.
+    assert tuple(expert["src_mesh_info"].mesh.shape) == (4, 2)
+    assert expert["src_mesh_info"].mesh.flatten().tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert isinstance(expert["src_placements"][0], Replicate)
+    assert expert["src_placements"][1] == Shard(0)
     assert info["train_cp_size"] == 2
     assert info["gen_cp_size"] == 1
 

@@ -852,12 +852,19 @@ def build_nccl_reshard_refit_info(
             cp_size=cp_size,
             pp_size=stage_pp,
         )
+        # cp_size=1 on purpose: Megatron-Core lays experts out with a separate
+        # rank generator whose CP size is 1, folding the CP ranks into the
+        # expert data-parallel dim.  Emitting a CP axis here would make CP -
+        # not EP - the innermost dim, so `global_rank % ep_size` would recover
+        # the wrong EP coord (e.g. TP1/PP1/EP2/CP2 would yield EP [0,0,1,1]
+        # instead of MCore's [0,1,0,1]).  Training CP is unchanged; only the
+        # expert mesh drops the axis.
         expert_mesh, expert_dim_map = build_mesh_info(
             num_gpus,
             rank_offset=rank_offset,
             tp_size=1,
             ep_size=ep_size,
-            cp_size=cp_size,
+            cp_size=1,
             pp_size=stage_pp,
         )
         return (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map)
