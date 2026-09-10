@@ -100,6 +100,18 @@ not translate unsupported schemas. vLLM may reject an unsupported combination
 or select an unquantized fallback, so native-method inspection is required
 before a schema is considered qualified.
 
+Pinned vLLM 0.25.1 has the following ModelOpt real-quant limits:
+
+| ModelOpt format | Uniform schema | Inside `MIXED_PRECISION` |
+|---|---:|---:|
+| `FP8`, `NVFP4`, `W4A16_NVFP4`, `MXFP8` | Supported | Supported |
+| `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_PB_WO` | Supported | **Not supported** |
+| `MXFP4`, `W4A8_MXFP4_FP8`, `W4A8_NVFP4_FP8` | **Not supported** | **Not supported** |
+
+These are vLLM runtime limits. ModelOpt may export additional formats, but
+NeMo RL cannot use them for real-quant rollout until vLLM implements the
+corresponding native methods.
+
 NVFP4 W4A4 and W4A16 are supported recipe examples, not downstream mode
 branches. See [Quantization-Aware RL](../guides/quantization-aware-rl.md) for
 their current validation status.

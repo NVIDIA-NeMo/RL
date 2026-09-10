@@ -573,8 +573,15 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+    real_quant = generation_config["backend"] == "vllm" and bool(
+        generation_config.get("real_quant")
+    )
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+        if real_quant:
+            from nemo_rl.modelopt.utils import validate_real_quant_policy_config
+
+            validate_real_quant_policy_config(policy_config)
     elif generation_config["backend"] == "dynamo":
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services.
@@ -1490,7 +1497,6 @@ def setup(
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
-        real_quant = bool(generation_config.get("real_quant"))
         refit_transport = generation_config.get("refit_transport")
         if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
             # Keep optional remote transport dependencies off the default path.

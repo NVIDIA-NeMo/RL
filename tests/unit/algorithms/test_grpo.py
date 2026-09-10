@@ -3276,6 +3276,7 @@ def test_real_quant_setup_builds_vllm_from_policy_config(
     monkeypatch, mock_grpo_components
 ):
     from nemo_rl.algorithms import grpo as grpo_mod
+    from nemo_rl.modelopt import utils as modelopt_utils
 
     events = []
     descriptor = {"quant_method": "modelopt", "quant_algo": "FP8"}
@@ -3387,6 +3388,11 @@ def test_real_quant_setup_builds_vllm_from_policy_config(
     monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
     monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
     monkeypatch.setattr(grpo_mod, "VllmGeneration", DummyVllmGeneration)
+    monkeypatch.setattr(
+        modelopt_utils,
+        "validate_real_quant_policy_config",
+        lambda _config: events.append("validate"),
+    )
 
     dataset = MagicMock()
     dataset.__len__.return_value = 1
@@ -3398,8 +3404,10 @@ def test_real_quant_setup_builds_vllm_from_policy_config(
         policy_factory=DummyPolicy,
     )
 
-    assert events[:6] == [
+    assert events[:8] == [
+        "validate",
         "policy",
+        "validate",
         "config",
         "offload",
         "vllm",

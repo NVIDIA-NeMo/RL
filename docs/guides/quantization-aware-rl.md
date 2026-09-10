@@ -163,6 +163,8 @@ policy:
 
 ModelOpt derives the canonical configuration from `policy.quant_cfg`, and vLLM selects the corresponding native method. NeMo RL does not infer W4A4, W4A16, or another format from recipe names, and it does not translate unsupported schemas. Depending on vLLM, an unsupported format or fused-layer combination may be rejected or may select an unquantized fallback. Inspect representative native methods before treating a recipe as qualified.
 
+Pinned vLLM 0.25.1 supports `FP8`, `NVFP4`, `W4A16_NVFP4`, and `MXFP8` in both uniform and mixed ModelOpt schemas. It supports `FP8_PER_CHANNEL_PER_TOKEN` and `FP8_PB_WO` only as uniform schemas. It does **not** support `MXFP4`, `W4A8_MXFP4_FP8`, or `W4A8_NVFP4_FP8` for ModelOpt real-quant rollout. ModelOpt export support alone does not make a format usable by vLLM.
+
 For Nano3 W4A16 real-quant rollout, use the Nano3 weight-only policy recipe. The recipe itself selects supported tensors and leaves sensitive paths in BF16:
 
 ```yaml
@@ -395,4 +397,5 @@ uv run --extra mcore --extra modelopt \
 - **Real-quant refit transport**: NIXL, custom checkpoint engines, `nccl_reshard`, and remote sparse-delta transports are not supported because they bypass vLLM's native layerwise reload lifecycle.
 - **Router Replay (R3)**: R3 is supported on the Megatron policy path.
 - **Real-quant activation formats**: Runtime support is the intersection of formats emitted by ModelOpt and complete fused-layer combinations accepted by the pinned vLLM. The architecture supports mixed formats without downstream format branches, but only entries in the validation table above should be treated as empirically validated.
+- **Pinned vLLM 0.25.1 formats**: `FP8_PER_CHANNEL_PER_TOKEN` and `FP8_PB_WO` are not supported inside mixed schemas. `MXFP4`, `W4A8_MXFP4_FP8`, and `W4A8_NVFP4_FP8` are not supported for ModelOpt real-quant rollout in either uniform or mixed schemas. See [Real-Quant ModelOpt Rollout](#real-quant-modelopt-rollout) for the supported list.
 - **Model support**: Dense Transformer, MoE (Mixture of Experts), and hybrid MoE/Mamba models are supported on the Megatron policy + vLLM generation path when Megatron-Bridge and ModelOpt support the model architecture and quantization recipe.

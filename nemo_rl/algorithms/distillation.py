@@ -237,10 +237,17 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
+    real_quant = generation_config["backend"] == "vllm" and bool(
+        generation_config.get("real_quant")
+    )
     checkpoint_engine_config = None
     if generation_config["backend"] == "vllm":
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
+        if real_quant:
+            from nemo_rl.modelopt.utils import validate_real_quant_policy_config
+
+            validate_real_quant_policy_config(policy_config)
         refit_transport = vllm_config.get("refit_transport")
         if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
             raise ValueError(
@@ -515,7 +522,6 @@ def setup(
     # ==========================
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
-    real_quant = backend == "vllm" and bool(generation_config.get("real_quant"))
     student_policy = None
 
     if backend == "vllm":

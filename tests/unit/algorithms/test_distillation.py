@@ -1068,6 +1068,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
 
 def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypatch):
     import nemo_rl.algorithms.distillation as distil_mod
+    from nemo_rl.modelopt import utils as modelopt_utils
 
     events = []
     descriptor = {"quant_method": "modelopt", "quant_algo": "FP8"}
@@ -1182,14 +1183,21 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
     monkeypatch.setattr(distil_mod, "StatefulDataLoader", lambda *_a, **_k: dataloader)
     monkeypatch.setattr(distil_mod, "Policy", DummyPolicy)
     monkeypatch.setattr(distil_mod, "VllmGeneration", DummyVllmGeneration)
+    monkeypatch.setattr(
+        modelopt_utils,
+        "validate_real_quant_policy_config",
+        lambda _config: events.append("validate"),
+    )
 
     dataset = MagicMock()
     dataset.__len__.return_value = 1
     distil_mod.setup(master_config, MagicMock(), dataset, None)
 
+    assert events[0] == "validate"
     student_start = events.index("student")
-    assert events[student_start : student_start + 6] == [
+    assert events[student_start : student_start + 7] == [
         "student",
+        "validate",
         "config",
         "offload",
         "vllm",
