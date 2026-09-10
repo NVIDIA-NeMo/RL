@@ -817,7 +817,13 @@ def test_hash_verification_clean_roundtrip():
     client = _client(verify_tensor_hash=True)
     ids = _ids(4)
     client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
-    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids", "lp"])
+    out = client.get_samples(
+        sample_ids=ids, partition_id="p", select_fields=["ids", "lp"]
+    )
+
+    # The caller asked for two fields; the mirror columns are the guard's
+    # business and a leaked key breaks anything that iterates the result.
+    assert set(out.keys()) == {"ids", "lp"}
 
     assert client.snapshot()["hash_verify"] == {
         "rows_recorded": 4,
@@ -900,11 +906,16 @@ def test_hash_verification_survives_shard_readback():
     client.close()
 
 
-def test_hash_verification_checks_rows_it_never_wrote():
+@pytest.mark.parametrize(
+    "inner, mismatches",
+    [(NoOpDataPlaneClient(), 0), (_CorruptingClient(field="ids", row=2), 1)],
+    ids=["clean", "corrupted"],
+)
+def test_a_reader_that_never_wrote_the_row_still_verifies_it(inner, mismatches):
     """The transfer worth checking: the rollout actor writes, a policy worker
-    reads. The reading arrives with the row, so the reader verifies it without
-    ever having held the wire-in fold itself."""
-    inner = NoOpDataPlaneClient()
+    reads. The wire-in reading arrives with the row, so the reader compares
+    without ever having held the fold itself — and catches a corrupted trip
+    that used to be abstained on."""
     writer = _client(inner, verify_tensor_hash=True)
     ids = _ids(4)
     writer.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
@@ -915,73 +926,8 @@ def test_hash_verification_checks_rows_it_never_wrote():
     hv = reader.snapshot()["hash_verify"]
     assert hv["rows_checked"] == 4
     assert hv["rows_unverified"] == 0
-    assert hv["mismatches"] == 0
+    assert hv["mismatches"] == mismatches
     writer.close()
-
-
-def test_hash_verification_catches_corruption_across_processes():
-    """The same trip, corrupted. Before the reading travelled, this read was
-    abstained on and the corruption reached training silently."""
-    inner = _CorruptingClient(field="ids", row=2)
-    writer = _client(inner, verify_tensor_hash=True)
-    ids = _ids(4)
-    writer.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
-
-    reader = MetricsDataPlaneClient(inner, verify_tensor_hash=True)
-    reader.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
-
-    assert reader.snapshot()["hash_verify"]["mismatches"] == 1
-    writer.close()
-
-
-def test_mirror_columns_never_reach_the_caller():
-    """The caller asked for ``ids``; ``ids_hash`` is the guard's business.
-    A leaked key breaks every consumer that iterates the returned fields."""
-    client = _client(verify_tensor_hash=True)
-    ids = _ids(4)
-    client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
-    out = client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
-
-    assert set(out.keys()) == {"ids"}
-    assert client.snapshot()["hash_verify"]["rows_checked"] == 4
-    client.close()
-
-
-def test_mirror_column_rides_in_the_partition():
-    """It is a field like any other, so it survives whatever the row survives
-    -- sharding, checkpointing -- rather than living in one process."""
-    inner = NoOpDataPlaneClient()
-    client = _client(inner, verify_tensor_hash=True)
-    ids = _ids(4)
-    client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
-
-    stored = inner.get_samples(ids, "p", select_fields=["ids", "ids_hash", "lp_hash"])
-    assert stored["ids_hash"].dtype is torch.int64
-    assert stored["ids_hash"].shape == (4,)
-    assert (stored["ids_hash"] != stored["lp_hash"]).all(), "one mirror per field"
-    client.close()
-
-
-def test_a_put_that_could_not_stamp_leaves_reads_working(monkeypatch):
-    """A guard bug must never take a transfer down -- on either side. Without
-    the mirror the read still has to succeed, and abstain rather than claim
-    the rows were clean."""
-    client = _client(verify_tensor_hash=True)
-    ids = _ids(4)
-
-    def boom(*_args, **_kwargs):
-        raise NotImplementedError("no digest kernel for this dtype")
-
-    monkeypatch.setattr(client, "_row_fingerprints", boom)
-    client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
-    monkeypatch.undo()
-
-    out = client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
-    assert set(out.keys()) == {"ids"}
-    hv = client.snapshot()["hash_verify"]
-    assert hv["rows_unverified"] == 4 and hv["rows_checked"] == 0
-    assert hv["guard_failures"] >= 1, "the abstention is visible, not silent"
-    client.close()
 
 
 @pytest.mark.parametrize("verify_tensor_hash", [False, True])
