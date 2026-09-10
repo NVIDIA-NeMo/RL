@@ -87,6 +87,15 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
             metrics[k] = float(np.mean(v))
         else:
             metrics[k] = float(np.sum(v))
+
+    # Deferred-mode counterpart to rollout_reassembler's direct-mode
+    # routed_experts_row_coverage/routed_experts_sentinel_token_fraction:
+    # this step's per-reason count of rows whose route fragments failed to
+    # reassemble at the policy worker (see TQWorkerMixin._route_fallback_counts).
+    # Silent otherwise -- the only other trace is a logging.warning.
+    for reason, count in train_result.get("route_fallback_counts", {}).items():
+        metrics[f"routed_experts_deferred_fallback/{reason}"] = float(count)
+
     return metrics
 
 
@@ -95,11 +104,13 @@ def reduce_advantage_pump_metrics(
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
     *,
+    sample_masks: list[torch.Tensor] | None = None,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
     num_mask_sample_filtered: list[int] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
     num_assistant_messages: list[int] | None = None,
+    num_routed_experts_backfilled: list[int] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -107,6 +118,11 @@ def reduce_advantage_pump_metrics(
         rewards: One tensor per advantage_stage call; each row a sample reward.
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
+        sample_masks: Row validity for each ``rewards`` entry (token-capture
+            placeholders and mask_sample/overlong/seq-logprob-error rows carry
+            0). Weights ``reward`` so it averages over trained rows only,
+            matching what the advantage estimator's baseline already excludes.
+            None keeps the legacy unweighted mean.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
         num_mask_sample_filtered: Environment-flagged sample counts, one per
@@ -123,7 +139,17 @@ def reduce_advantage_pump_metrics(
     """
     out: dict[str, float] = {}
     if rewards:
-        out["reward"] = float(torch.cat([r.flatten() for r in rewards]).mean())
+        cat_rewards = torch.cat([r.flatten() for r in rewards])
+        if sample_masks:
+            cat_masks = torch.cat([m.flatten() for m in sample_masks])
+            mask_sum = cat_masks.sum()
+            out["reward"] = (
+                float((cat_rewards * cat_masks).sum() / mask_sum)
+                if mask_sum > 0
+                else 0.0
+            )
+        else:
+            out["reward"] = float(cat_rewards.mean())
     if masked_advantages:
         cat = torch.cat([a.flatten() for a in masked_advantages])
         if cat.numel() > 0:
@@ -149,6 +175,12 @@ def reduce_advantage_pump_metrics(
         out["num_invalid_tool_calls"] = float(n_invalid)
         out["num_malformed_thinking"] = float(n_malformed)
         out["num_assistant_messages"] = float(n_asst)
+        # Router-replay partial loss: a message sentinel-filled inside an
+        # otherwise-routed rollout, invisible to the replay_buffer's
+        # field-entirely-absent guard (see backfill_missing_routed_experts).
+        n_backfilled = sum(num_routed_experts_backfilled or [])
+        out["routed_experts_backfilled_rate"] = n_backfilled / n_asst
+        out["num_routed_experts_backfilled"] = float(n_backfilled)
     return out
 
 

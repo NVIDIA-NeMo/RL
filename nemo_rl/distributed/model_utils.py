@@ -1235,6 +1235,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     target_is_pre_rolled: bool = False,
+    return_packed_layout: bool = False,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
@@ -1257,10 +1258,14 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering.
         target_is_pre_rolled (bool): If True, target is already shifted and CP-sharded to match
             vocab_parallel_logits shape, skipping the internal per-sequence roll+CP-shard loop.
+        return_packed_layout (bool): Keep the physical ``[1, T-1]`` layout.
+            This is used when the input data was packed before it reached the
+            model worker.
 
     Returns:
-        torch.Tensor: Unpacked log probabilities tensor with shape [batch_size, unpacked_seqlen-1].
-            The total length is reduced by batch_size due to target shifting (one token per sequence).
+        torch.Tensor: Log probabilities in unpacked ``[batch_size,
+            unpacked_seqlen-1]`` layout, or physical ``[1, T-1]`` layout when
+            ``return_packed_layout`` is true.
     """
     batch_size = cu_seqlens_padded.shape[0] - 1
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
@@ -1352,6 +1357,9 @@ def from_parallel_logits_to_logprobs_packed_sequences(
                 probs[start_idx // cp_size : end_idx // cp_size], cp_group, seq_dim=0
             )
         probs = final_probs
+
+    if return_packed_layout:
+        return probs[:-1].unsqueeze(0)
 
     out_logprobs = torch.zeros(
         (batch_size, unpacked_seqlen - 1), dtype=probs.dtype, device=probs.device

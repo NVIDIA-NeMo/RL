@@ -112,6 +112,22 @@ VALUE_SEED_FIELDS = LP_SEED_FIELDS
 DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
+ROUTED_LEN_FIELD = "routed_len"
+ROUTED_EXPERTS_ENCODING_FIELD = "routed_experts_encoding"
+ROUTED_EXTRAS_METADATA_FIELD = "extras_metadata_json"
+
+# Wire codes for ROUTED_EXPERTS_ENCODING_FIELD: how a staged row's route
+# payload was encoded before its extras digest was committed. Shared by the
+# staging sink/source and the route-plan executor's digest recomputation.
+ROUTE_ENCODING_NONE = 0
+ROUTE_ENCODING_ENVELOPE = 1
+ROUTE_ENCODING_LIST = 2
+
+# Deferred route storage. Canonical rows carry one strict encoded route plan
+# per tag; policy workers omit the absent canonical route column and assemble
+# it from staging immediately before previous-policy logprob or training.
+ROUTE_PLAN_TAG = "route_assembly_plan"
+ROUTE_PASSTHROUGH_FLAG = "route_passthrough"
 
 
 def fields_with_optional_routed_experts(

@@ -14,6 +14,8 @@
 
 from typing import Literal, NotRequired, TypedDict, Union
 
+from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonSourceConfig
+
 
 class ResponseDatasetConfig(TypedDict):
     dataset_name: NotRequired[str]
@@ -57,9 +59,16 @@ class PreferenceDatasetConfig(TypedDict):
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    split_validation_size: NotRequired[float | int]
+    legacy_validation_split: NotRequired[bool]
+    seed: NotRequired[int]
+    max_samples: NotRequired[int | None]
+    cache_dir: NotRequired[str | None]
 
 
 class DataConfig(TypedDict):
+    backend: NotRequired[Literal["hf", "energon"]]
+    energon: NotRequired[EnergonLoaderConfig]
     max_input_seq_length: int | None
     add_bos: NotRequired[bool]
     add_eos: NotRequired[bool]
@@ -77,10 +86,16 @@ class DataConfig(TypedDict):
     num_prompts_per_dataloader: NotRequired[int]
     custom_dataloader: NotRequired[str]
     # dataset configs
-    train: ResponseDatasetConfig | PreferenceDatasetConfig | list[ResponseDatasetConfig]
+    train: (
+        ResponseDatasetConfig
+        | PreferenceDatasetConfig
+        | EnergonSourceConfig
+        | list[ResponseDatasetConfig]
+    )
     validation: NotRequired[
         ResponseDatasetConfig
         | PreferenceDatasetConfig
+        | EnergonSourceConfig
         | list[ResponseDatasetConfig]
         | None
     ]

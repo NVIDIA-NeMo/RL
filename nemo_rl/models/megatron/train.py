@@ -18,6 +18,7 @@ from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
+from megatron.core import tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -30,7 +31,11 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
 )
-from megatron.core.utils import StragglerDetector, get_model_config
+from megatron.core.utils import (
+    StragglerDetector,
+    get_model_config,
+    unwrap_model,
+)
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -72,6 +77,28 @@ PostProcessingFunction = Union[
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
 ]
+
+
+def _prepare_padding_mask_for_model(
+    model: GPTModel,
+    padding_mask: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Match a CP-local padding mask to the model's sequence-parallel layout."""
+    if padding_mask is None or not get_model_config(model).sequence_parallel:
+        return padding_mask
+
+    core_model = unwrap_model(model)
+    if isinstance(core_model, GPTModel) and core_model.pre_process:
+        return padding_mask
+
+    return (
+        tensor_parallel.scatter_to_sequence_parallel_region(
+            padding_mask.transpose(0, 1).contiguous(),
+            group=get_tensor_model_parallel_group(),
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
 
 
 @contextmanager
@@ -126,6 +153,7 @@ def model_forward(
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
     mtp_loss_mask: Optional[torch.Tensor] = None,
+    padding_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
     media_token_validity_mask: Optional[torch.Tensor] = None,
@@ -142,6 +170,7 @@ def model_forward(
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         mtp_loss_mask: MTP loss mask to exclude prompt tokens from MTP loss (optional)
+        padding_mask: Packed-sequence padding mask for MoE routing (optional)
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
@@ -166,6 +195,9 @@ def model_forward(
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
+    padding_mask = _prepare_padding_mask_for_model(model, padding_mask)
+    if padding_mask is not None:
+        additional_kwargs["padding_mask"] = padding_mask
 
     # Only sent when the model advertises the parameter, so it never reaches a
     # forward that would swallow it into **kwargs and quietly ignore it.
@@ -268,6 +300,7 @@ def forward_with_post_processing_fn(
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
+    padding_mask = processed_mb.padding_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
     original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
@@ -292,6 +325,7 @@ def forward_with_post_processing_fn(
                 packed_seq_params=packed_seq_params,
                 defer_fp32_logits=defer_fp32_logits,
                 mtp_loss_mask=mtp_loss_mask,
+                padding_mask=padding_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 media_token_validity_mask=media_token_validity_mask,

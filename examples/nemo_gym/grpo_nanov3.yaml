@@ -247,6 +247,7 @@ policy:
       num_speculative_tokens: 0
       logprobs_mode: processed_logprobs
       refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl".
+      offload_policy_before_refit: false
       expose_http_server: true
       enable_prefix_caching: true
       parsers:
@@ -258,6 +259,7 @@ policy:
       async_engine: true
       kv_cache_dtype: auto
       precision: ${policy.precision}
+      refit_with_reload_api: false
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
       expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
