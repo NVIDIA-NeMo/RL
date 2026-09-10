@@ -325,11 +325,16 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # FlashMLA derives its version from the Git revision in setup.py. Keep this pin
 # synchronized with the static dependency metadata below.
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
-# >= 5dde396bd is required for vLLM 0.28: the older vLLM plugin registers on
-# `fused_moe.layer.FusedMoE`, which 0.28 removed. ModelOpt swallows that AttributeError
-# in `import_plugin`, leaving the linear classes half-registered, so NeMo-RL's explicit
-# re-import of the plugin then fails with "RowParallelLinear already registered".
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "613e5e8b2e52eed20d72d80ce9df6732284e68c1" }
+# Pinned to exactly 5dde396bd (2026-08-04, "Fix vLLM 0.24+ compatibility"): it is the
+# first commit whose vLLM plugin survives vLLM 0.28 (the older plugin registers on
+# `fused_moe.layer.FusedMoE`, which 0.28 removed; ModelOpt swallows that AttributeError in
+# `import_plugin`, and NeMo-RL's explicit re-import then fails with "RowParallelLinear
+# already registered"). Do NOT move past 2ded5aba3 (#1550, 2026-08-07) without porting
+# nemo_rl/modelopt: it introduces per-expert `GroupedQuantizer` modules that break the
+# Megatron fakequant DDP hook bookkeeping (`KeyError: GroupedQuantizer(...)` in
+# `disable_forward_pre_hook`) and real-quant dist-checkpoint sharding validation
+# (`Invalid access pattern for ShardedTensor(... experts.N.linear_fc1.weight_quantizer._amax`).
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "5dde396bdf29c13636162840669d3f69002af9e6" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
 flashinfer-cubin = [
   { index = "flashinfer", extra = "sglang" },
