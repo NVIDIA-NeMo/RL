@@ -143,6 +143,7 @@ policy:
       dropout_position: "post"
       lora_A_init: "xavier"
       use_triton: true
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   megatron_cfg:
     enabled: false
@@ -282,11 +283,14 @@ policy:
       unified_memory_level: 0
       max_tokens: 16384
       logprobs_mode: processed_logprobs
+      offload_policy_before_refit: false
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+      refit_with_reload_api: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -348,6 +352,7 @@ value:
       dropout_position: "post"
       lora_A_init: "xavier"
       use_triton: true
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   megatron_cfg:
     enabled: false
