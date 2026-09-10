@@ -1534,15 +1534,12 @@ class TestPrepareForLpInference:
         w.optimizer._copy_main_params_to_param_buffer.assert_not_called()
         w.enable_forward_pre_hook.assert_called_once_with()
 
-    @pytest.mark.parametrize(
-        ("uses_shared_buffer", "step_is_open"),
-        [(False, True), (True, False)],
-    )
-    def test_reference_swap_keeps_param_sync_outside_open_shared_buffer_step(
-        self, mock_module_symbols, uses_shared_buffer, step_is_open
+    @pytest.mark.parametrize("step_is_open", [False, True])
+    def test_reference_swap_keeps_regular_param_sync_without_shared_buffer(
+        self, mock_module_symbols, step_is_open
     ):
         w = self._worker()
-        w._uses_mxfp8_overlap_shared_param_buffer.return_value = uses_shared_buffer
+        w._uses_mxfp8_overlap_shared_param_buffer.return_value = False
         w.should_disable_forward_pre_hook = True
         w.reference_state_dict = {}
         w.model.state_dict.return_value = {}
@@ -1555,4 +1552,31 @@ class TestPrepareForLpInference:
             pass
 
         w.disable_forward_pre_hook.assert_called_once_with(param_sync=True)
+        w.enable_forward_pre_hook.assert_called_once_with()
+
+    def test_reference_swap_materializes_closed_mxfp8_shared_buffer_without_reset(
+        self, mock_module_symbols
+    ):
+        """A completed sparse-MoE step can leave first-batch ready counts partial.
+
+        Materialize updated MXFP8 params without resetting DDP bookkeeping, then
+        disable the hook without asking DDP to gather the same params again.
+        """
+        w = self._worker()
+        w._uses_mxfp8_overlap_shared_param_buffer.return_value = True
+        w.should_disable_forward_pre_hook = True
+        w.reference_state_dict = {}
+        w.model.state_dict.return_value = {}
+        w._apply_state_dict_to_model = MagicMock()
+        w.disable_forward_pre_hook = MagicMock()
+        w.enable_forward_pre_hook = MagicMock()
+        w._materialize_model_params_for_read = MagicMock()
+        w._train_step_state = None
+
+        with w.use_reference_model():
+            pass
+
+        w._materialize_model_params_for_read.assert_called_once_with()
+        w.disable_forward_pre_hook.assert_called_once_with(param_sync=False)
+        w.model.zero_grad_buffer.assert_not_called()
         w.enable_forward_pre_hook.assert_called_once_with()
