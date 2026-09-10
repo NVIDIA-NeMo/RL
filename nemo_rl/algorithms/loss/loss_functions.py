@@ -18,6 +18,7 @@ import torch
 from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss.draft import (
+    DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
     DraftLossStats,
     streaming_vocab_parallel_soft_ce,
 )
@@ -76,7 +77,7 @@ class DraftCrossEntropyLossFn(LossFunction):
     def __init__(
         self,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        token_chunk_size: int = 4096,
+        token_chunk_size: int = DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
     ):
         self.vocab_parallel_group = vocab_parallel_group
         self.token_chunk_size = token_chunk_size
