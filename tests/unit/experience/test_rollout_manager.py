@@ -47,11 +47,14 @@ from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import GenerationUnavailable
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     Completion,
     PromptGroupRecord,
+    nemo_gym_capture_key,
 )
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
@@ -244,6 +247,7 @@ def _make_manager(
     mgr = object.__new__(RolloutManager)
     mgr._impl = impl
     mgr._tokenizer = None
+    mgr._use_nemo_gym = False
     mgr._num_generations_per_prompt = 1
     mgr._rollout_recovery_config = RolloutRecoveryConfig()
     mgr._tq_buffer = buffer
@@ -263,6 +267,62 @@ def _make_manager(
 
 
 class TestGenerateAndPushFlow:
+    def test_outer_retry_continues_after_inner_sibling_attempts(self):
+        class _AttemptingImpl:
+            def __init__(self) -> None:
+                self.dispatches: list[list[tuple[str, int]]] = []
+                self.calls = 0
+
+            async def run_rollout(
+                self,
+                _sample,
+                *,
+                logical_rollout_ids,
+                generation_indices=None,
+                on_completion=None,
+                attempt_allocator=None,
+                recovery_granularity=RecoveryGranularity.SIBLING,
+            ):
+                del generation_indices, on_completion, recovery_granularity
+                self.calls += 1
+                indices = [0, 1]
+                first = await attempt_allocator(indices)
+                self.dispatches.append(
+                    [(logical_rollout_ids[index], first[index]) for index in indices]
+                )
+                if self.calls == 1:
+                    second = await attempt_allocator([1])
+                    self.dispatches.append([(logical_rollout_ids[1], second[1])])
+                    raise GenerationUnavailable("outer retry")
+                return "record"
+
+        impl = _AttemptingImpl()
+        buf = _FakeBuffer()
+        mgr = _make_manager(
+            buf,
+            impl,
+            retry_policy=RolloutRetryPolicy(
+                max_infra_attempts=2,
+                max_data_attempts=1,
+                max_gym_row_attempts=2,
+                backoff_base_s=0.0,
+            ),
+        )
+        mgr._num_generations_per_prompt = 2
+        mgr._use_nemo_gym = True
+        sample = {
+            "idx": 3,
+            "extra_env_info": {"responses_create_params": {}},
+        }
+
+        assert _run(mgr.generate_and_push(sample)) is RolloutOutcome.COMMITTED
+        logical_ids = [dispatch[0] for dispatch in impl.dispatches[0]]
+        assert impl.dispatches == [
+            [(logical_ids[0], 0), (logical_ids[1], 0)],
+            [(logical_ids[1], 1)],
+            [(logical_ids[0], 1), (logical_ids[1], 2)],
+        ]
+
     def test_post_write_failure_does_not_regenerate_the_rollout(self):
         class _EnrichmentFailBuffer(_FakeBuffer):
             async def commit(
@@ -1080,6 +1140,12 @@ def test_nemo_gym_build_inputs_stamps_logical_group_coordinates():
     assert len({row[NEMO_GYM_GROUP_ID_KEY] for row in rows}) == 1
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
+    assert [row[NEMO_GYM_ATTEMPT_INDEX_KEY] for row in rows] == [0, 0, 0]
+    assert [row[NEMO_GYM_ROLLOUT_ID_KEY] for row in rows] == [
+        f"{rows[0][NEMO_GYM_GROUP_ID_KEY]}_g0",
+        f"{rows[0][NEMO_GYM_GROUP_ID_KEY]}_g1",
+        f"{rows[0][NEMO_GYM_GROUP_ID_KEY]}_g2",
+    ]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2]
 
 
@@ -1102,6 +1168,23 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     ]
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [2, 2]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
+    assert [row[NEMO_GYM_ROLLOUT_ID_KEY] for row in rows] == [
+        "stable-group_g0",
+        "stable-group_g1",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("attempt_index", "expected_capture_key"),
+    [(0, "logical-rollout"), (1, "logical-rollout-a1")],
+)
+def test_rollout_identity_uses_attempt_qualified_capture_key(
+    attempt_index: int,
+    expected_capture_key: str,
+) -> None:
+    assert (
+        nemo_gym_capture_key("logical-rollout", attempt_index) == expected_capture_key
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1711,6 +1794,7 @@ def _make_capture_manager(
 ):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
+    mgr._use_nemo_gym = True
     mgr._num_generations_per_prompt = num_generations
     mgr._rollout_recovery_config = recovery_config or RolloutRecoveryConfig()
     mgr._tq_buffer = buf
@@ -1736,17 +1820,24 @@ def _make_capture_manager(
             self,
             _sample,
             *,
-            rollout_ids=None,
+            logical_rollout_ids=None,
             generation_indices=None,
             on_completion=None,
+            attempt_allocator=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
         ):
+            indices = generation_indices or list(range(len(logical_rollout_ids)))
+            attempt_indices = await attempt_allocator(indices)
+            rollout_ids = list(logical_rollout_ids)
+            for index in indices:
+                rollout_ids[index] = nemo_gym_capture_key(
+                    logical_rollout_ids[index], attempt_indices[index]
+                )
             self.seen_rollout_ids = rollout_ids
             self.seen_generation_indices = list(generation_indices or [])
             self.seen_recovery_granularity = recovery_granularity
             if on_run is not None:
                 await on_run(_sample)
-            indices = generation_indices or list(range(len(rollout_ids)))
             selected_ids = [rollout_ids[index] for index in indices]
             selected_configs = (
                 [instance_configs[index] for index in indices]
@@ -1807,10 +1898,7 @@ class TestGenerateForFinalizationFlow:
         canonical_ids = [f"{group_id}_g0", f"{group_id}_g1"]
         attempt_ids = buf.reserve_rollout_ids[0]
         assert attempt_ids is not None
-        assert all(
-            attempt_id.startswith(f"{canonical_id}_a")
-            for attempt_id, canonical_id in zip(attempt_ids, canonical_ids)
-        )
+        assert attempt_ids == canonical_ids
         assert mgr._impl.seen_rollout_ids == attempt_ids
         assert request.group_id == group_id
         assert request.prompt_idx == 0
@@ -1848,12 +1936,19 @@ class TestGenerateForFinalizationFlow:
                 self,
                 _sample,
                 *,
-                rollout_ids=None,
+                logical_rollout_ids=None,
                 generation_indices=None,
                 on_completion=None,
+                attempt_allocator=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
             ):
                 del _sample, recovery_granularity
+                attempt_indices = await attempt_allocator(generation_indices)
+                rollout_ids = list(logical_rollout_ids)
+                for index in generation_indices:
+                    rollout_ids[index] = nemo_gym_capture_key(
+                        logical_rollout_ids[index], attempt_indices[index]
+                    )
                 generation_index = generation_indices[0]
                 rollout_id = rollout_ids[generation_index]
                 receipt = {
@@ -1961,12 +2056,19 @@ class TestGenerateForFinalizationFlow:
                 self,
                 _sample,
                 *,
-                rollout_ids=None,
+                logical_rollout_ids=None,
                 generation_indices=None,
                 on_completion=None,
+                attempt_allocator=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
             ):
                 indices = list(generation_indices)
+                attempt_indices = await attempt_allocator(indices)
+                rollout_ids = list(logical_rollout_ids)
+                for index in indices:
+                    rollout_ids[index] = nemo_gym_capture_key(
+                        logical_rollout_ids[index], attempt_indices[index]
+                    )
                 self.generation_indices.append(indices)
                 self.recovery_granularities.append(recovery_granularity)
                 completions = []

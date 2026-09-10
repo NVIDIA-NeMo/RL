@@ -172,6 +172,7 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
     manager = object.__new__(RolloutManager)
     manager._impl = impl
     manager._tokenizer = None
+    manager._use_nemo_gym = False
     manager._num_generations_per_prompt = 1
     manager._tq_buffer = buffer
     manager._weight_version = 0
@@ -461,6 +462,7 @@ class _PartialGymMethod:
         self._failures_before_success = failures_before_success
         self.attempts = 0
         self.dispatched: list[list[int]] = []
+        self.dispatch_identities: list[list[tuple[str, int, str]]] = []
 
     def options(self, **kwargs):
         del kwargs
@@ -469,6 +471,16 @@ class _PartialGymMethod:
     def remote(self, inputs, timer_prefix):
         del timer_prefix
         self.dispatched.append([row["_rowidx"] for row in inputs])
+        self.dispatch_identities.append(
+            [
+                (
+                    row["_ng_rollout_id"],
+                    row["_ng_attempt_index"],
+                    row["_ng_capture_id"],
+                )
+                for row in inputs
+            ]
+        )
         attempt = self.attempts
         self.attempts += 1
         return self._stream(inputs, attempt)
@@ -617,6 +629,17 @@ class TestPartialGymRedispatch:
         )
 
         assert method.dispatched == [[0, 1, 2, 3], [2, 3]]
+        first_logical_ids = [identity[0] for identity in method.dispatch_identities[0]]
+        assert method.dispatch_identities == [
+            [
+                (first_logical_ids[index], 0, first_logical_ids[index])
+                for index in range(4)
+            ],
+            [
+                (first_logical_ids[index], 1, f"{first_logical_ids[index]}-a1")
+                for index in (2, 3)
+            ],
+        ]
         assert len(completions) == 4
 
     def test_completed_rows_survive_across_attempts(self):
