@@ -795,6 +795,59 @@ class MegatronPolicyWorkerImpl(
             if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
                 optim_instance._copy_main_params_to_param_buffer()
 
+    def _stage_optimizer_params_for_read(self, optimizer: Any) -> None:
+        if getattr(optimizer, "is_stub_optimizer", False):
+            return
+
+        child_optimizers = getattr(optimizer, "chained_optimizers", None)
+        if child_optimizers is not None:
+            for child_optimizer in child_optimizers:
+                self._stage_optimizer_params_for_read(child_optimizer)
+            return
+
+        stage = getattr(optimizer, "_copy_main_params_to_param_buffer", None)
+        if not callable(stage):
+            raise RuntimeError(
+                "cannot materialize optimizer-owned MXFP8 parameters: "
+                f"{type(optimizer).__name__} does not provide param-buffer staging"
+            )
+        stage()
+
+    def _optimizer_model_chunks(self) -> list[Any]:
+        chunks: list[Any] = []
+
+        def collect(optimizer: Any) -> None:
+            chunks.extend(getattr(optimizer, "model_chunks", []) or [])
+            for child_optimizer in getattr(optimizer, "chained_optimizers", None) or []:
+                collect(child_optimizer)
+
+        collect(self.optimizer)
+        if not chunks and hasattr(self.model, "start_param_sync"):
+            chunks.append(self.model)
+
+        unique_chunks: list[Any] = []
+        seen: set[int] = set()
+        for chunk in chunks:
+            if id(chunk) in seen:
+                continue
+            seen.add(id(chunk))
+            unique_chunks.append(chunk)
+        return unique_chunks
+
+    def _materialize_model_params_for_read(self) -> None:
+        """Refresh optimizer-owned model params without resetting DDP grad state."""
+        if getattr(self, "_train_step_state", None) is not None:
+            raise RuntimeError(
+                "cannot materialize model parameters while a train step is open"
+            )
+
+        self._stage_optimizer_params_for_read(self.optimizer)
+        model_chunks = self._optimizer_model_chunks()
+        if not model_chunks:
+            raise RuntimeError("cannot materialize model parameters: no model chunks")
+        for model_chunk in model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
+
     def _uses_mxfp8_overlap_shared_param_buffer(self) -> bool:
         return getattr(
             self.megatron_cfg.optimizer, "reuse_grad_buf_for_mxfp8_param_ag", False
@@ -807,8 +860,7 @@ class MegatronPolicyWorkerImpl(
         ):
             return
 
-        self.optimizer.prepare_model_params_for_param_sync()
-        self.model.start_param_sync(force_sync=True)
+        self._materialize_model_params_for_read()
 
     def _get_model_extra_state_dict(self) -> dict[str, Any]:
         fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
@@ -2401,11 +2453,13 @@ class MegatronPolicyWorkerImpl(
         """
         ## disable overlap param gather when swapping weights
         if self.should_disable_forward_pre_hook:
-            shared_buffer_step_open = (
-                self._uses_mxfp8_overlap_shared_param_buffer()
-                and getattr(self, "_train_step_state", None) is not None
-            )
-            self.disable_forward_pre_hook(param_sync=not shared_buffer_step_open)
+            uses_mxfp8_shared_buffer = self._uses_mxfp8_overlap_shared_param_buffer()
+            if (
+                uses_mxfp8_shared_buffer
+                and getattr(self, "_train_step_state", None) is None
+            ):
+                self._materialize_model_params_for_read()
+            self.disable_forward_pre_hook(param_sync=not uses_mxfp8_shared_buffer)
 
         with torch.no_grad():
             # Save original references
@@ -4427,7 +4481,7 @@ class MegatronPolicyWorkerImpl(
         self.model.eval()
 
         if restore_mxfp8_shared_buffer:
-            self.optimizer.prepare_model_params_for_param_sync()
+            self._materialize_model_params_for_read()
 
         if not keep_train_buffers and not uses_mxfp8_shared_buffer:
             # offload grads to cpu
