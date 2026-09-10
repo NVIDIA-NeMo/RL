@@ -1091,23 +1091,17 @@ def check_train_dataloader_not_empty(
     batch_size_source: str,
     context: str = "",
 ) -> None:
-    """Fail fast when a ``drop_last`` train dataloader would yield zero batches.
+    """Fail fast when the training dataloader would yield zero batches.
 
-    Every training entry point builds its train dataloader with
-    ``drop_last=True``, so a batch size larger than the dataset produces a
-    dataloader of length zero: the training loop body never runs, yet epochs
-    advance and the run completes "successfully" without a single gradient
-    update. Raise up front and name the mismatch instead.
+    With ``drop_last=True``, an oversized batch can prevent all gradient
+    updates. Skip this check if the dataloader or dataset has no defined length.
 
     Args:
-        dataloader: The freshly constructed train dataloader.
-        dataset: The underlying train dataset (used for the message; a dataset
-            without ``__len__`` skips the check entirely).
-        batch_size: The batch size the dataloader was built with.
-        batch_size_source: Where that batch size comes from, as the user knows
-            it (e.g. ``policy.train_global_batch_size``); used in the message.
-        context: Optional suffix identifying the dataloader (e.g. a task name)
-            when a setup builds more than one.
+        dataloader: Training dataloader.
+        dataset: Underlying training dataset.
+        batch_size: Effective dataloader batch size.
+        batch_size_source: Configuration key or expression shown in the error.
+        context: Optional suffix identifying the dataloader in the error.
     """
     try:
         num_batches = len(dataloader)
