@@ -26,6 +26,25 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
+# Metrics combined across the sequences of one packed bin by extremum, not sum.
+# Keep in sync with _MB_METRIC_MIN / _MB_METRIC_MAX in
+# single_controller_utils/utils.py, grpo.py, grpo_sync.py and ppo.py.
+#
+# TODO: duplicated across seven sites. Omitting one silently sums extrema instead
+# of reducing them, reporting a "min" larger than any individual value. Hoist
+# into a single shared definition in loss/interfaces.py.
+_SEQ_METRIC_MIN: frozenset[str] = frozenset(
+    {"probs_ratio_min", "probs_ratio_clamped_min", "opd_full_reverse_kl_min"}
+)
+_SEQ_METRIC_MAX: frozenset[str] = frozenset(
+    {
+        "probs_ratio_max",
+        "probs_ratio_clamped_max",
+        "opd_full_reverse_kl_max",
+        "opd_full_decomposition_error",
+    }
+)
+
 
 class SequencePackingLossWrapper:
     def __init__(
@@ -146,9 +165,9 @@ class SequencePackingLossWrapper:
             loss_accum += loss
             for k, v in metrics.items():
                 if k not in metrics_accum:
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if k in _SEQ_METRIC_MIN:
                         metrics_accum[k] = float("inf")
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in _SEQ_METRIC_MAX:
                         metrics_accum[k] = float("-inf")
                     else:
                         metrics_accum[k] = 0
@@ -156,10 +175,10 @@ class SequencePackingLossWrapper:
                 val = v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v
 
                 # Skip inf/-inf sentinel values (from sequences with no valid tokens)
-                if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                if k in _SEQ_METRIC_MIN:
                     if not math.isinf(val):
                         metrics_accum[k] = min(metrics_accum[k], val)
-                elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                elif k in _SEQ_METRIC_MAX:
                     if not math.isinf(val):
                         metrics_accum[k] = max(metrics_accum[k], val)
                 else:

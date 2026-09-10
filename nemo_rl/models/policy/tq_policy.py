@@ -50,6 +50,7 @@ from nemo_rl.data_plane.schema import (
     LP_SEED_FIELDS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
+    fields_with_optional_opd_full,
     fields_with_optional_routed_experts,
 )
 from nemo_rl.models.policy.lm_policy import Policy
@@ -138,6 +139,12 @@ class TQPolicy(TQDriverMixin, Policy):
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
         )
+        # Per-token teacher payload column read by the full-vocabulary MOPD loss.
+        # Resolved by the driver in setup; absent means the feature is off and
+        # the column must stay out of every fetch.
+        self._opd_full_field: Optional[str] = (
+            self.cfg.get("on_policy_distillation_full") or {}
+        ).get("payload_field")
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -181,8 +188,11 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=fields_with_optional_opd_full(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                ),
+                field=self._opd_full_field,
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -200,8 +210,11 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         self.dp_client.register_partition(
             partition_id=partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=fields_with_optional_opd_full(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                ),
+                field=self._opd_full_field,
             ),
             num_samples=num_samples,
             consumer_tasks=[partition_id],
@@ -396,7 +409,9 @@ class TQPolicy(TQDriverMixin, Policy):
         # forward would run image-blind while the logprob forwards saw images.
         train_meta = self._with_route_fields(
             meta,
-            train_fields,
+            tuple(
+                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+            ),
             task_name="train",
             want_routes=True,
         )
@@ -530,8 +545,11 @@ class TQPolicy(TQDriverMixin, Policy):
             meta,
             # Raw fields, not pre-wrapped in fields_with_optional_routed_experts:
             # _with_route_fields applies that wrapper itself, gated on both
-            # router replay and route-plan passthrough.
-            train_fields,
+            # router replay and route-plan passthrough. The opd_full payload
+            # column has no such gate, so it is appended here.
+            tuple(
+                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+            ),
             task_name="train",
             want_routes=True,
         )

@@ -1211,3 +1211,87 @@ def test_create_advantage_estimator_opd_branch():
         estimator = _create_advantage_estimator(master_config)
     assert isinstance(estimator, OPDAdvantageEstimator)
     assert len(caught) == 3
+
+
+def _meta_teacher_class():
+    class MetaTeacher:
+        def __init__(self):
+            self.sharding_annotations = _MockShardingAnnotations(1)
+
+        def get_logprobs_from_meta(self, meta):
+            del meta
+
+    return MetaTeacher
+
+
+def test_tq_teacher_enrichment_advertises_the_full_payload_column(monkeypatch):
+    """With ``full.enabled`` the enriched meta names the payload column too.
+
+    The training fetch only sees what ``enrich`` returns, so a coordinator that
+    forgot the column would leave the loss without its teacher payload.
+    """
+    import asyncio
+
+    from nemo_rl.algorithms import opd
+    from nemo_rl.data_plane.schema import OPD_FULL_HIDDEN_STATES_FIELD
+
+    monkeypatch.setattr(opd, "read_columns", lambda *a, **kw: None)
+    monkeypatch.setattr(opd, "write_columns", lambda *a, **kw: None)
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"primary": _meta_teacher_class()()},
+        alias_to_group_alias={"math": "primary"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/shared"},
+            "full": {"enabled": True, "teacher_payload": "hidden_states"},
+        },
+    )
+    meta = _teacher_meta("group", batch_size=3, seq_len=5)
+
+    enriched = asyncio.run(coordinator.enrich(meta, _teacher_record("math")))
+
+    assert "teacher_reference_logprobs" in enriched.fields
+    assert OPD_FULL_HIDDEN_STATES_FIELD in enriched.fields
+    metrics = coordinator.drain_metrics()
+    # Tokens, not bytes: 3 samples x 5 tokens.
+    assert metrics["on_policy_distillation/teacher_full_payload_tokens"] == 15.0
+    # Drained: the counter resets with the rest.
+    assert (
+        coordinator.drain_metrics()[
+            "on_policy_distillation/teacher_full_payload_tokens"
+        ]
+        == 0.0
+    )
+
+
+def test_tq_teacher_enrichment_does_not_advertise_a_payload_when_full_is_disabled(
+    monkeypatch,
+):
+    import asyncio
+
+    from nemo_rl.algorithms import opd
+    from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
+
+    monkeypatch.setattr(opd, "read_columns", lambda *a, **kw: None)
+    monkeypatch.setattr(opd, "write_columns", lambda *a, **kw: None)
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"primary": _meta_teacher_class()()},
+        alias_to_group_alias={"math": "primary"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/shared"},
+            "full": {"enabled": False},
+        },
+    )
+
+    enriched = asyncio.run(
+        coordinator.enrich(
+            _teacher_meta("group", batch_size=2, seq_len=4), _teacher_record("math")
+        )
+    )
+
+    assert not set(OPD_FULL_FIELDS) & set(enriched.fields)
+    assert (
+        "on_policy_distillation/teacher_full_payload_tokens"
+        not in coordinator.drain_metrics()
+    )
