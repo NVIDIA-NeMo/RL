@@ -61,6 +61,20 @@ def configure_hybridep_packed_input_padding(
             raise ValueError(
                 "HybridEP input prepadding currently requires MTP disabled."
             )
+        return
+
+    if not (
+        sequence_packing_enabled and uses_hybridep_flex_dispatcher(megatron_cfg)
+    ):
+        return
+
+    padding_attr = "moe_hybridep_pad_uneven_dispatch_inputs"
+    if not hasattr(model_cfg, padding_attr):
+        raise RuntimeError(
+            "This Megatron-Core version does not support uneven-input padding "
+            "for HybridEP packed sequences."
+        )
+    setattr(model_cfg, padding_attr, True)
 
 
 def _get_hybridep_aligned_seq_len(

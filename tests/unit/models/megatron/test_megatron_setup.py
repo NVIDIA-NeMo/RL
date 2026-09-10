@@ -927,7 +927,9 @@ class TestApplyMoeConfig:
         )
         config["sequence_packing"] = {"enabled": True}
 
-        with pytest.raises(RuntimeError, match="does not support uneven-input padding"):
+        with pytest.raises(
+            RuntimeError, match="does not support uneven-input padding"
+        ):
             configure_hybridep_packed_input_padding(model_cfg, config)
 
     def test_hybridep_input_prepadding_requires_flex_dispatcher(self, monkeypatch):
