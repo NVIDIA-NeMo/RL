@@ -35,6 +35,7 @@ def test_raw_dflash_export_is_not_a_public_api() -> None:
     [
         "lm_head.weight",
         "module.draft_model.output_layer.weight",
+        "eagle_module.eagle_output_layer.weight",
         "draft.mask_embedding.weight",
         "module.mask_token",
     ],

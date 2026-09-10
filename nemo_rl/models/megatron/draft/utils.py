@@ -47,8 +47,18 @@ _HF_SNAPSHOT_ALLOW_PATTERNS = [
     "pytorch_model.bin.index.json",
 ]
 _HF_SNAPSHOT_IGNORE_PATTERNS = ["*.pt", "*.pth", "*.ckpt"]
+# Both the HF-mapped name ("lm_head") and the native Megatron/EAGLE names
+# ("output_layer", "eagle_output_layer") must be rejected: the validator runs on
+# raw state dicts too, where the copied target head is
+# `eagle_module.eagle_output_layer.weight`.
 _DFLASH_FORBIDDEN_EXPORT_COMPONENTS = frozenset(
-    {"lm_head", "output_layer", "mask_embedding", "mask_token"}
+    {
+        "lm_head",
+        "output_layer",
+        "eagle_output_layer",
+        "mask_embedding",
+        "mask_token",
+    }
 )
 _MODEL_LAYER_QKV_KEY_PATTERN = re.compile(
     r"^eagle_module\.decoder\.layers\.(\d+)\.self_attention\.linear_qkv\.weight$"

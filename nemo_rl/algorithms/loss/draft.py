@@ -20,6 +20,28 @@ from typing import Any
 
 import torch
 
+DEFAULT_DRAFT_TOKEN_CHUNK_SIZE = 4096
+
+# Every dtype the installed torch exposes gets its own header code, sorted by
+# name so all ranks agree. A shared fallback sentinel would let two ranks pass
+# *different* unsupported dtypes through the agreement check undetected.
+_DTYPE_HEADER_CODES: dict[torch.dtype, int] = {
+    dtype: index
+    for index, dtype in enumerate(
+        sorted(
+            {value for value in vars(torch).values() if isinstance(value, torch.dtype)},
+            key=str,
+        )
+    )
+}
+
+
+def _dtype_header_code(dtype: torch.dtype) -> int:
+    code = _DTYPE_HEADER_CODES.get(dtype)
+    if code is None:
+        raise ValueError(f"projected soft-CE does not support dtype {dtype}.")
+    return code
+
 
 @dataclass(frozen=True, slots=True)
 class DraftLossStats:
@@ -127,20 +149,6 @@ def _tp_assert_projected_metadata_agreement(
             )
         return
 
-    dtype_codes = {
-        dtype: index
-        for index, dtype in enumerate(
-            (
-                torch.bool,
-                torch.int32,
-                torch.int64,
-                torch.float16,
-                torch.bfloat16,
-                torch.float32,
-                torch.float64,
-            )
-        )
-    }
     header_values: list[int] = []
     for _, tensor in tensors:
         if tensor is None:
@@ -154,7 +162,7 @@ def _tp_assert_projected_metadata_agreement(
                 1,
                 tensor.ndim,
                 *shape,
-                dtype_codes.get(tensor.dtype, -1),
+                _dtype_header_code(tensor.dtype),
                 int(tensor.device == reference.device),
             )
         )
