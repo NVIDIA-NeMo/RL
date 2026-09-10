@@ -599,6 +599,7 @@ class DTensorPolicyWorkerV2Impl(
         sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         all_log_probs = []
+        all_token_masks: list[torch.Tensor] = []
         self.model.eval()
 
         # Create logprobs post-processor
@@ -647,19 +648,31 @@ class DTensorPolicyWorkerV2Impl(
                     continue
 
                 all_log_probs.append(token_logprobs)
+                if "token_mask" in _metrics:
+                    all_token_masks.append(_metrics["token_mask"])
 
         # Concatenate all batches
         return_data = BatchedDataDict[LogprobOutputSpec]()
 
-        all_log_probs_padded = []
-        for lp in all_log_probs:
-            padding_needed = seq_dim_size - lp.shape[1]
-            if padding_needed > 0:
-                lp = torch.nn.functional.pad(
-                    lp, (0, padding_needed), mode="constant", value=0.0
-                )
-            all_log_probs_padded.append(lp)
-        return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
+        def _pad_and_concat(
+            tensors_list: list[torch.Tensor], pad_value: float
+        ) -> torch.Tensor:
+            padded = []
+            for t in tensors_list:
+                padding_needed = seq_dim_size - t.shape[1]
+                if padding_needed > 0:
+                    t = torch.nn.functional.pad(
+                        t, (0, padding_needed), mode="constant", value=pad_value
+                    )
+                padded.append(t)
+            return torch.cat(padded, dim=0)
+
+        return_data["logprobs"] = _pad_and_concat(all_log_probs, pad_value=0.0).cpu()
+        if all_token_masks:
+            # Pad token_mask with 0 so padded positions are excluded from the loss.
+            return_data["token_mask"] = _pad_and_concat(
+                all_token_masks, pad_value=0.0
+            ).cpu()
 
         self.timer.stop("get_logprobs")
         return return_data

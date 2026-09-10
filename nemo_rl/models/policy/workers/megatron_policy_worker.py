@@ -49,7 +49,10 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config, unwrap_model
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
@@ -2196,26 +2199,48 @@ class MegatronPolicyWorkerImpl(
                 router_replay_train=False,
             )
 
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            all_log_probs_padded = []
-            all_logprobs = [l["logprobs"] for l in list_of_logprobs]
-            for lp in all_logprobs:
-                padding_needed = seq_length - lp.shape[1]
-                if padding_needed > 0:
-                    lp = torch.nn.functional.pad(
-                        lp, (0, padding_needed), mode="constant", value=0.0
-                    )
-                all_log_probs_padded.append(lp)
+        # Taken from config; every PP rank must build the same mask for the broadcast below.
+        has_token_mask = need_top_k_or_top_p_filtering(self.sampling_params)
 
-            logprobs = torch.cat(all_log_probs_padded, dim=0)
-            tensors = {"logprobs": logprobs}
+        def _pad_and_concat(
+            tensors_list: list[torch.Tensor], pad_value: float
+        ) -> torch.Tensor:
+            padded: list[torch.Tensor] = []
+            for t in tensors_list:
+                padding_needed = seq_length - t.shape[1]
+                if padding_needed > 0:
+                    t = torch.nn.functional.pad(
+                        t, (0, padding_needed), mode="constant", value=pad_value
+                    )
+                padded.append(t)
+            return torch.cat(padded, dim=0)
+
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            tensors: dict[str, Optional[torch.Tensor]] = {
+                "logprobs": _pad_and_concat(
+                    [l["logprobs"] for l in list_of_logprobs], pad_value=0.0
+                )
+            }
+            if has_token_mask:
+                # Pad token_mask with 0 so padded positions are excluded from the loss.
+                tensors["token_mask"] = _pad_and_concat(
+                    [l["token_mask"] for l in list_of_logprobs], pad_value=0.0
+                )
         else:
             tensors = {"logprobs": None}
-        logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
+            if has_token_mask:
+                tensors["token_mask"] = None
+        broadcasted = broadcast_tensors_from_last_stage(tensors)
+        logprobs = broadcasted["logprobs"]
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+        result: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict[LogprobOutputSpec](
+            logprobs=logprobs
+        )
+        if has_token_mask:
+            result["token_mask"] = broadcasted["token_mask"]
+        return result.to("cpu")
 
     def _resolve_output_layer_owner(self) -> Any:
         """Return the unwrapped module that owns ``output_layer`` on this rank.

@@ -1340,9 +1340,11 @@ class DTensorPolicyWorkerImpl(
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            token_logprobs = mask_out_neg_inf_logprobs(
+            token_logprobs, finite_mask = mask_out_neg_inf_logprobs(
                 token_logprobs, mask, "prev_logprobs"
             )
+            # Return the neginf mask so the caller can propagate -inf positions into the loss path.
+            return_data["token_mask"] = (data["token_mask"] * finite_mask).cpu()
 
         return_data["logprobs"] = token_logprobs.cpu()
         self.timer.stop("get_logprobs")
