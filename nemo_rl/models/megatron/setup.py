@@ -480,12 +480,12 @@ def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
 def validate_fp32_lm_head_config(config: PolicyConfig) -> None:
     """Reject an fp32 LM head that is enabled on only one engine.
 
-    ``megatron_cfg.fp32_lm_head`` and vLLM's ``NRL_VLLM_FP32_LM_HEAD`` (set via
-    ``generation.vllm_cfg.env_vars``) must agree: with bf16 heads on both sides
-    the logits round to the same grid, so enabling fp32 on one side alone makes
-    train/token_mult_prob_error *worse* than leaving the feature off. The
-    fused linear+CE path bypasses ``output_layer`` entirely, so the trainer
-    head would silently stay bf16 there too.
+    ``megatron_cfg.fp32_lm_head`` and either vLLM fp32-head implementation (set
+    via ``generation.vllm_cfg.env_vars``) must agree: with bf16 heads on both
+    sides the logits round to the same grid, so enabling fp32 on one side alone
+    makes train/token_mult_prob_error *worse* than leaving the feature off. The
+    fused linear+CE path bypasses ``output_layer`` entirely, so the trainer head
+    would silently stay bf16 there too.
 
     Only checked when generation uses the vLLM backend; SFT/DPO have no
     generation engine to disagree with.
@@ -496,13 +496,20 @@ def validate_fp32_lm_head_config(config: PolicyConfig) -> None:
     if generation.get("backend") != "vllm":
         return
     env_vars = (generation.get("vllm_cfg") or {}).get("env_vars") or {}
-    vllm_fp32 = str(env_vars.get("NRL_VLLM_FP32_LM_HEAD", "0")) == "1"
+    vllm_fp32_env = {
+        name: env_vars.get(name)
+        for name in (
+            "NRL_VLLM_FP32_LM_HEAD",
+            "NRL_VLLM_FP32_LM_HEAD_V2",
+        )
+    }
+    vllm_fp32 = any(str(value) == "1" for value in vllm_fp32_env.values())
     if trainer_fp32 != vllm_fp32:
         raise ValueError(
             "fp32 LM head must be enabled on both engines or neither: "
             f"megatron_cfg.fp32_lm_head={megatron_cfg.get('fp32_lm_head')!r} but "
-            f"generation.vllm_cfg.env_vars.NRL_VLLM_FP32_LM_HEAD="
-            f"{env_vars.get('NRL_VLLM_FP32_LM_HEAD')!r}. A one-sided fp32 head "
+            f"generation.vllm_cfg.env_vars selects {vllm_fp32_env!r}. "
+            "A one-sided fp32 head "
             "increases the generation/training logprob mismatch instead of "
             "reducing it."
         )
@@ -569,8 +576,8 @@ def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
         if output_layer is None:
             # Zero matches must not look like success: on the chunk that owns
             # the head, silently wrapping nothing leaves the trainer in bf16
-            # while vLLM (NRL_VLLM_FP32_LM_HEAD) runs fp32, which is worse than
-            # disabling the feature on both sides. ``post_process`` is how
+            # while vLLM runs fp32, which is worse than disabling the feature
+            # on both sides. ``post_process`` is how
             # Megatron marks that chunk (GPTModel, MambaModel/HybridModel,
             # NemotronVLModel, NemotronOmniModel all carry it).
             if getattr(module, "post_process", False) or getattr(

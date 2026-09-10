@@ -63,6 +63,14 @@ UnsupportedNativeRefitTransport = Literal["checkpoint_engine", "sparse_delta"]
 WeightUpdateFinalizer = Callable[[], None]
 
 
+def _uses_cached_fp32_lm_head() -> bool:
+    """Return whether the legacy copied-head implementation is active."""
+    return (
+        os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1"
+        and os.environ.get("NRL_VLLM_FP32_LM_HEAD_V2", "0") != "1"
+    )
+
+
 def _format_refit_key_error(label: str, keys: set[str]) -> str:
     """Format a bounded refit-key diagnostic."""
     ordered = sorted(keys)
@@ -358,7 +366,7 @@ class VllmInternalWorkerExtension:
     # None until init_collective builds it. Declared so a rebuild can release the
     # previous group without probing for the attribute's existence.
     model_update_group: Any = None
-    # fp32 LM head (NRL_VLLM_FP32_LM_HEAD) once-per-worker log gates.
+    # Legacy cached fp32 LM head once-per-worker log gates.
     _nrl_fp32_dirty_logged: bool = False
     _nrl_fp32_refresh_logged: bool = False
 
@@ -865,7 +873,7 @@ class VllmInternalWorkerExtension:
         Set on every batch of a multi-batch refit so the copy stays dirty until
         the whole update lands.
         """
-        if os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") != "1":
+        if not _uses_cached_fp32_lm_head():
             return
         marked = []
         for label, owner in self._fp32_lm_head_targets():
@@ -1122,7 +1130,7 @@ class VllmInternalWorkerExtension:
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
-                if os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1":
+                if _uses_cached_fp32_lm_head():
                     self._sync_fp32_lm_head()
 
             try:
@@ -1151,7 +1159,7 @@ class VllmInternalWorkerExtension:
                     self.model_runner.model, self.model_config, self.device
                 )
             self._maybe_process_mtp_drafter_after_loading()
-            if os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1":
+            if _uses_cached_fp32_lm_head():
                 self._sync_fp32_lm_head()
 
         yield finalize

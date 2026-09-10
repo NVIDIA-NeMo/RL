@@ -3973,7 +3973,9 @@ def _fp32_policy_cfg(trainer, vllm_env, fused=False, backend="vllm"):
     [
         (False, {}),
         ("tf32", {"NRL_VLLM_FP32_LM_HEAD": 1}),
+        ("tf32", {"NRL_VLLM_FP32_LM_HEAD_V2": 1}),
         (True, {"NRL_VLLM_FP32_LM_HEAD": "1"}),
+        (True, {"NRL_VLLM_FP32_LM_HEAD_V2": "1"}),
     ],
 )
 def test_validate_fp32_lm_head_config_accepts_matched_engines(trainer, vllm_env):
@@ -3987,6 +3989,7 @@ def test_validate_fp32_lm_head_config_accepts_matched_engines(trainer, vllm_env)
     [
         ("tf32", {}),  # trainer fp32, vLLM bf16: the production misconfiguration
         (False, {"NRL_VLLM_FP32_LM_HEAD": "1"}),  # vLLM fp32, trainer bf16
+        (False, {"NRL_VLLM_FP32_LM_HEAD_V2": "1"}),
     ],
 )
 def test_validate_fp32_lm_head_config_rejects_one_sided(trainer, vllm_env):

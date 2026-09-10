@@ -387,8 +387,9 @@ class MegatronConfig(TypedDict):
     defer_fp32_logits: NotRequired[bool]
     # Compute the LM output-layer GEMM in fp32 instead of bf16. bf16 rounding of
     # the logits is the dominant source of generation/training logprob mismatch
-    # (train/token_mult_prob_error). Set the matching NRL_VLLM_FP32_LM_HEAD=1 in
-    # generation.vllm_cfg.env_vars: applying this to only one engine makes the
+    # (train/token_mult_prob_error). Set a matching vLLM implementation in
+    # generation.vllm_cfg.env_vars (prefer NRL_VLLM_FP32_LM_HEAD_V2=1; V1 is
+    # NRL_VLLM_FP32_LM_HEAD=1). Applying this to only one engine makes the
     # multiplicative error worse, since both otherwise round to the same grid.
     #   False   - bf16 head (default)
     #   True    - full fp32 head (~2x cost on the logprob pass)

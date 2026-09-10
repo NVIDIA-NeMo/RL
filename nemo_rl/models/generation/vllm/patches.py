@@ -828,7 +828,7 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 
 
 def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:
-    """Compute NemotronH logits with an fp32 LM head (MiniMax-M1-style).
+    """Compute NemotronH logits with either fp32 LM head implementation.
 
     bf16 rounding of the logits GEMM output is the dominant contributor to
     generation/training logprob mismatch (train/token_mult_prob_error). With
@@ -837,10 +837,10 @@ def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:
 
     This must be a source patch (not a monkeypatch): the model executes in
     vLLM's EngineCore worker subprocesses, which import vllm independently of
-    this process. The patched code is opt-in at runtime via
-    NRL_VLLM_FP32_LM_HEAD=1 (set it through policy.generation.vllm_cfg.env_vars
-    so worker processes inherit it). Costs one fp32 copy of the vocab-sharded
-    head weight per rank.
+    this process. ``NRL_VLLM_FP32_LM_HEAD=1`` retains the existing lazy fp32
+    cache. ``NRL_VLLM_FP32_LM_HEAD_V2=1`` ports the vLLM ``LM_FP32`` patch: it
+    constructs the registered head in fp32 and disables quantization for that
+    module. V2 takes precedence if both variables are enabled.
     """
     try:
         file_to_patch = _get_vllm_file("model_executor/models/nemotron_h.py")
@@ -850,9 +850,32 @@ def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:
 
     old_snippet = """        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits"""
+    constructor_old_snippet = """        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )"""
+    constructor_new_snippet = """        import os as _os
+
+        self._nrl_lm_head_fp32_v2 = (
+            _os.environ.get("NRL_VLLM_FP32_LM_HEAD_V2", "0") == "1"
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            params_dtype=torch.float32 if self._nrl_lm_head_fp32_v2 else None,
+            quant_config=None if self._nrl_lm_head_fp32_v2 else self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )"""
     new_snippet = """        import os as _os
 
-        if _os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1":
+        if self._nrl_lm_head_fp32_v2:
+            hidden_states = hidden_states.to(dtype=torch.float32)
+        if (
+            _os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1"
+            and not self._nrl_lm_head_fp32_v2
+        ):
             # NeMo-RL patch: fp32 LM head (MiniMax-M1-style). bf16 rounding of
             # the logits is the dominant gen/train logprob mismatch source.
             _fp32_head = getattr(self, "_nrl_lm_head_fp32", None)
@@ -887,21 +910,51 @@ def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:
                 return self.logits_processor(_fp32_head, hidden_states.float())
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits"""
+    legacy_gate = """        if _os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1":"""
+    v2_gate = """        if self._nrl_lm_head_fp32_v2:
+            hidden_states = hidden_states.to(dtype=torch.float32)
+        if (
+            _os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1"
+            and not self._nrl_lm_head_fp32_v2
+        ):"""
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if "NRL_VLLM_FP32_LM_HEAD" in content:
-            logger.info("NemotronH fp32 LM head patch already present.")
+        constructor_is_patched = constructor_new_snippet in content
+        logits_are_patched = new_snippet in content
+        if constructor_is_patched and logits_are_patched:
+            logger.info("NemotronH fp32 LM head patches already present.")
             return
-        if content.count(old_snippet) != 1:
+
+        constructor_anchor_is_valid = constructor_is_patched or (
+            content.count(constructor_old_snippet) == 1
+        )
+        logits_anchor_is_valid = (
+            logits_are_patched
+            or content.count(old_snippet) == 1
+            or (
+                "_nrl_lm_head_fp32" in content
+                and content.count(legacy_gate) == 1
+            )
+        )
+        if not constructor_anchor_is_valid or not logits_anchor_is_valid:
             logger.warning(
-                "NemotronH fp32 LM head patch anchor not found exactly once "
-                "in %s; patch not applied.",
+                "NemotronH fp32 LM head patch anchors did not match the "
+                "expected vLLM 0.25.1 source in %s; patch not applied.",
                 file_to_patch,
             )
             return
-        write_back(content.replace(old_snippet, new_snippet, 1))
+        if not constructor_is_patched:
+            content = content.replace(
+                constructor_old_snippet, constructor_new_snippet, 1
+            )
+        if not logits_are_patched:
+            if "_nrl_lm_head_fp32" in content and legacy_gate in content:
+                content = content.replace(legacy_gate, v2_gate, 1)
+            else:
+                content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
 
-    logger.info("Applied NemotronH fp32 LM head source patch.")
+    logger.info("Applied NemotronH fp32 LM head V1/V2 source patches.")
 
 
 def _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch(

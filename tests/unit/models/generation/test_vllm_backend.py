@@ -1543,6 +1543,33 @@ def _make_fp32_head_extension(backend, model, drafter_model=None):
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize(
+    "v1_enabled, v2_enabled, expected",
+    [
+        (False, False, False),
+        (True, False, True),
+        (False, True, False),
+        (True, True, False),
+    ],
+)
+def test_cached_fp32_lm_head_is_disabled_by_v2(
+    monkeypatch, v1_enabled, v2_enabled, expected
+):
+    from nemo_rl.models.generation.vllm import vllm_backend as backend
+
+    for name, enabled in (
+        ("NRL_VLLM_FP32_LM_HEAD", v1_enabled),
+        ("NRL_VLLM_FP32_LM_HEAD_V2", v2_enabled),
+    ):
+        if enabled:
+            monkeypatch.setenv(name, "1")
+        else:
+            monkeypatch.delenv(name, raising=False)
+
+    assert backend._uses_cached_fp32_lm_head() is expected
+
+
+@pytest.mark.vllm
 def test_resolve_lm_head_owner_descends_wrappers_and_language_model():
     from nemo_rl.models.generation.vllm import vllm_backend as backend
 

@@ -51,6 +51,22 @@ _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
 _ROUTED_EXPERTS_MARKER = "def get_routed_experts_layer_indices"
+_NEMOTRON_H_SOURCE = """class NemotronHForCausalLM:
+    def __init__(self, *, vllm_config, prefix=""):
+        config = vllm_config.model_config.hf_config
+        self.quant_config = vllm_config.quant_config
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def compute_logits(self, hidden_states):
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+"""
 
 
 def test_external_vllm_patch_allowlist(monkeypatch):
@@ -145,6 +161,16 @@ def patched_radio_source(tmp_path, monkeypatch):
     return copied
 
 
+@pytest.fixture
+def patched_nemotron_h_source(tmp_path, monkeypatch):
+    """A minimal vLLM 0.25.1 NemotronH source shape with the patch applied."""
+    source = tmp_path / "nemotron_h.py"
+    source.write_text(_NEMOTRON_H_SOURCE)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+    patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+    return source
+
+
 @pytest.mark.vllm
 def test_namespace_tool_patch_anchor_still_matches_installed_vllm(
     patched_tool_parser_source,
@@ -236,6 +262,133 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+def test_nemotron_h_fp32_lm_head_v2_patch_ports_source_behavior(
+    patched_nemotron_h_source,
+):
+    content = patched_nemotron_h_source.read_text()
+    assert 'get("NRL_VLLM_FP32_LM_HEAD_V2", "0") == "1"' in content
+    assert (
+        "params_dtype=torch.float32 if self._nrl_lm_head_fp32_v2 else None"
+        in content
+    )
+    assert "quant_config=None if self._nrl_lm_head_fp32_v2" in content
+    assert "hidden_states = hidden_states.to(dtype=torch.float32)" in content
+    assert "and not self._nrl_lm_head_fp32_v2" in content
+    ast.parse(content)
+
+
+@pytest.mark.parametrize(
+    "v1_enabled, v2_enabled, expected_fp32",
+    [
+        (False, False, False),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
+def test_nemotron_h_fp32_lm_head_v2_runtime_gate(
+    patched_nemotron_h_source,
+    monkeypatch,
+    v1_enabled,
+    v2_enabled,
+    expected_fp32,
+):
+    for name, enabled in (
+        ("NRL_VLLM_FP32_LM_HEAD", v1_enabled),
+        ("NRL_VLLM_FP32_LM_HEAD_V2", v2_enabled),
+    ):
+        if enabled:
+            monkeypatch.setenv(name, "1")
+        else:
+            monkeypatch.delenv(name, raising=False)
+
+    calls = {}
+
+    class FakeLMHead:
+        pass
+
+    def parallel_lm_head(vocab_size, hidden_size, **kwargs):
+        calls["head_args"] = (vocab_size, hidden_size)
+        calls["head_kwargs"] = kwargs
+        return FakeLMHead()
+
+    class FakeLogitsProcessor:
+        def __init__(self, vocab_size):
+            calls["processor_vocab_size"] = vocab_size
+
+        def __call__(self, _head, hidden_states):
+            calls["hidden_states"] = hidden_states
+            return hidden_states
+
+    namespace = {
+        "LogitsProcessor": FakeLogitsProcessor,
+        "ParallelLMHead": parallel_lm_head,
+        "maybe_prefix": lambda _prefix, name: name,
+        "torch": torch,
+    }
+    exec(patched_nemotron_h_source.read_text(), namespace)
+    quant_config = object()
+    vllm_config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(
+            hf_config=types.SimpleNamespace(vocab_size=128, hidden_size=64)
+        ),
+        quant_config=quant_config,
+    )
+
+    model = namespace["NemotronHForCausalLM"](vllm_config=vllm_config)
+    assert calls["head_args"] == (128, 64)
+    assert calls["head_kwargs"]["params_dtype"] is (
+        torch.float32 if expected_fp32 else None
+    )
+    assert calls["head_kwargs"]["quant_config"] is (
+        None if expected_fp32 else quant_config
+    )
+
+    hidden_states = torch.ones(2, 64, dtype=torch.bfloat16)
+    logits = model.compute_logits(hidden_states)
+    expected_dtype = torch.float32 if expected_fp32 else torch.bfloat16
+    assert logits.dtype is expected_dtype
+    assert calls["hidden_states"].dtype is expected_dtype
+    assert not hasattr(model, "_nrl_lm_head_fp32")
+
+
+def test_nemotron_h_fp32_lm_head_patch_is_idempotent(
+    patched_nemotron_h_source, monkeypatch
+):
+    before = patched_nemotron_h_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_nemotron_h_source)
+    )
+
+    patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+
+    assert patched_nemotron_h_source.read_text() == before
+
+
+def test_nemotron_h_fp32_lm_head_patch_upgrades_existing_v1(
+    tmp_path, monkeypatch
+):
+    original_logits = """        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits"""
+    legacy_logits = """        import os as _os
+
+        if _os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1":
+            self._nrl_lm_head_fp32 = None
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits"""
+    source = tmp_path / "nemotron_h.py"
+    source.write_text(_NEMOTRON_H_SOURCE.replace(original_logits, legacy_logits))
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+
+    content = source.read_text()
+    assert content.count("import os as _os") == 2
+    assert "params_dtype=torch.float32" in content
+    assert "and not self._nrl_lm_head_fp32_v2" in content
+    assert content.count("logits = self.logits_processor") == 1
+    ast.parse(content)
 
 
 @pytest.fixture
