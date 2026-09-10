@@ -1261,6 +1261,33 @@ def test_0251_adapter_rejects_missing_checkpoint_alias_and_loader_before_receive
             )
 
 
+@pytest.mark.parametrize("role", ["weight", "weight_scale"])
+@pytest.mark.parametrize("projection", ["gate_proj", "down_proj", "experts.up_proj"])
+def test_0251_adapter_resolves_only_the_requested_checkpoint_module(
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    projection: str,
+) -> None:
+    adapter, model, _retained_loads = _make_binding_adapter(monkeypatch, [])
+    adapter.prepare(_native_binding_refit_info())
+    adapter.begin_update()
+
+    def reject_model_scan(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("component lookup must not traverse the entire model")
+
+    with monkeypatch.context() as lookup_patch:
+        lookup_patch.setattr(model, "named_parameters", reject_model_scan)
+        lookup_patch.setattr(model, "named_modules", reject_model_scan)
+        spec = adapter.resolve_destination(
+            logical_name=f"model.layers.0.mlp.{projection}.weight", role=role
+        )
+
+    assert spec.pre is not None and spec.post is not None
+    ctx = spec.pre(spec.base)
+    ctx.buf.fill_(3)
+    spec.post(ctx)
+
+
 def test_0251_adapter_wrapped_loader_owns_received_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
