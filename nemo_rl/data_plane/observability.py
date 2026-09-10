@@ -134,6 +134,17 @@ def _hash_field(name: str) -> str:
     return f"{name}{_HASH_SUFFIX}"
 
 
+def _with_mirrors(fields: Sequence[str]) -> list[str]:
+    """``fields`` followed by one mirror column each.
+
+    Idempotent: ``meta.fields`` comes back from ``put_samples`` already
+    carrying the mirrors, and suffixing those would ask for
+    ``tokens_hash_hash``.
+    """
+    plain = [f for f in fields if not f.endswith(_HASH_SUFFIX)]
+    return [*plain, *(_hash_field(f) for f in plain)]
+
+
 def _as_i64(value: int) -> int:
     """Wrap a uint64 digest into the signed range ``torch.int64`` accepts."""
     value &= _U64 - 1
@@ -1660,7 +1671,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                     f"wire guard's mirror columns would shadow. Rename them or "
                     f"set observability.verify_tensor_hash=false."
                 )
-            fields = list(fields) + [_hash_field(f) for f in fields]
+            fields = _with_mirrors(fields)
         self._run(
             "register",
             partition_id,
@@ -1703,7 +1714,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         entered = monotonic()
         fetch = select_fields if select_fields is not None else meta.fields
         if self._verify_tensor_hash and fetch is not None:
-            fetch = list(fetch) + [_hash_field(f) for f in fetch]
+            fetch = _with_mirrors(fetch)
         out = self._run(
             "get_data",
             meta.partition_id,
@@ -1755,7 +1766,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         sample_ids_list = _as_list(sample_ids)
         fetch = list(select_fields)
         if self._verify_tensor_hash:
-            fetch += [_hash_field(f) for f in select_fields]
+            fetch = _with_mirrors(select_fields)
         def read(columns):
             return self._run(
                 "get",
@@ -1771,7 +1782,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         try:
             out = read(fetch)
         except Exception as exc:  # noqa: BLE001 - a guard bug must not fail a read
-            if fetch == list(select_fields):
+            if not self._verify_tensor_hash:
                 raise
             # The mirror is absent: the put that wrote these rows could not
             # fold, or predates the guard. Read what the caller asked for and
