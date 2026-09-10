@@ -164,7 +164,7 @@ def inspect_snapshot(
     recovery = torch.load(snapshot / "rollout_recovery.pt", weights_only=True)
     if not isinstance(recovery, dict):
         raise TypeError("rollout recovery sidecar is not a mapping")
-    replay = torch.load(snapshot / "replay_buffer_metadata.pt", weights_only=True)
+    replay = torch.load(snapshot / "replay_buffer_metadata.pt", weights_only=False)
     if not isinstance(replay, dict) or not replay.get("groups"):
         raise AssertionError(
             "snapshot has no completed canonical group alongside the unfinished "
@@ -243,7 +243,7 @@ def inspect_snapshot(
             "selected Gym continuation did not map to exactly one resources snapshot"
         )
     resource_snapshot = resource_snapshots[0]
-    resource_name = resources["participant"]["name"]
+    resource_name = resources["participant"]["participant_name"]
     expected_revision = boundary["resource_state_revisions"].get(resource_name)
     if resource_snapshot.get("state_revision") != expected_revision:
         raise AssertionError(
@@ -307,6 +307,7 @@ def select_snapshot(args: argparse.Namespace) -> None:
                 ValueError,
             ) as error:
                 last_error = f"{snapshot}: {type(error).__name__}: {error}"
+                print(f"snapshot candidate rejected: {last_error}", flush=True)
                 continue
             args.selection.parent.mkdir(parents=True, exist_ok=True)
             args.selection.write_text(
