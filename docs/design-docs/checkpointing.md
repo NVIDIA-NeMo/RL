@@ -42,7 +42,7 @@ uv run --extra mcore examples/converters/convert_megatron_to_hf.py \
 When training with [LoRA (Low-Rank Adaptation)](../guides/lora.md) on the Megatron backend, the resulting checkpoint contains only the adapter weights alongside the base model configuration. The `convert_lora_to_hf.py` script supports two export modes:
 
 - **Merged**: fold the LoRA adapter into the base model and export a single standalone HuggingFace checkpoint.
-- **Adapter-only**: export only the LoRA adapter weights in [HuggingFace PEFT](https://huggingface.co/docs/peft) format, keeping the base model separate.
+- **Adapter-only**: export only the LoRA adapter weights in [HuggingFace PEFT](https://huggingface.co/docs/peft/en/index) format, keeping the base model separate.
 
 This script requires Megatron-Core, so make sure to launch with the `mcore` extra.
 

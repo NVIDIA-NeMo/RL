@@ -1,0 +1,4 @@
+defaults: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml
+
+data_plane:
+  backend: mooncake_cpu

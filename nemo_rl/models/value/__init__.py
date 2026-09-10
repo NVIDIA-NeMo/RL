@@ -15,5 +15,12 @@
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
 from nemo_rl.models.value.lm_value import Value
+from nemo_rl.models.value.tq_value import TQValue
 
-__all__ = ["Value", "ValueConfig", "ValueInterface", "ValueOutputSpec"]
+__all__ = [
+    "TQValue",
+    "Value",
+    "ValueConfig",
+    "ValueInterface",
+    "ValueOutputSpec",
+]

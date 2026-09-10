@@ -91,10 +91,9 @@ class LocalParamSpec:
         post: ``RefitCtx -> None``; runs after xferdtensor
             e.g., copy back the received buffer into the merged param.
 
-    TODO: A layout that block-permutes the *assembled* param (e.g. FlashInfer
-    TRTLLM w13) would need a group-level finalize run once after all components
-    land — a future loop-level addition, not a per-param field. ``pre``/``post``
-    covers today's backends (Triton, FlashInfer CUTLASS, Megatron).
+    Layout-specific backends can receive into canonical storage in ``pre``, load
+    each logical component in ``post``, and use a transport-level finalizer after
+    all components land. FlashInfer TRTLLM uses this path for grouped experts.
     """
 
     base: Any
@@ -577,8 +576,14 @@ def _extract_layer_name(param_name: str) -> str:
     return param_name.split(".")[0]
 
 
-def check_nccl_reshard_refit_support(master_config: dict) -> None:
+def check_nccl_reshard_refit_support(master_config: Any) -> None:
     """Validate ``master_config`` against every precondition of nccl_reshard_refit.
+
+    Typed ``Any`` because the annotation was ``dict`` and the body reads
+    ``master_config.policy`` -- attribute access a plain dict does not support. Both
+    callers pass a MasterConfig object (grpo's and the single-controller's are different
+    classes), so there is no one concrete type to name here; what is required is an object
+    exposing ``.policy`` as a mapping.
 
     Collects all violations and raises a single ``ValueError`` listing them, so
     a user fixing their config can address everything in one pass rather than
@@ -626,6 +631,14 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             "policy.generation.vllm_kwargs.enable_eplb must be False "
             "(nccl_reshard_refit fixes the expert->rank mapping at setup; "
             "dynamic expert load balancing can change ownership afterwards)."
+        )
+
+    if vllm_cfg.get("refit_with_reload_api"):
+        violations.append(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+            "explicitly unsupported with refit_transport='nccl_reshard' "
+            "(nccl_reshard_refit is its own refit path and does not use "
+            "vLLM's reload_weights API)."
         )
 
     # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
