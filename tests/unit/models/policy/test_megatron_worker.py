@@ -1646,6 +1646,7 @@ def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch)
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
     model = _FakeTrainableModel()
     move_calls = []
 
