@@ -69,3 +69,13 @@ def test_qwen35_bf16_trtllm_recipe_uses_supported_expert_layout() -> None:
         "moe_backend": "flashinfer_trtllm",
         "expert_placement_strategy": "linear",
     }
+
+
+def test_qwen35_bf16_trtllm_recipe_freezes_unused_vision_modules() -> None:
+    recipe = _load_recipe()
+
+    assert recipe["policy"]["megatron_cfg"]["freeze_config"] == {
+        "freeze_vision_model": True,
+        "freeze_vision_projection": True,
+        "freeze_language_model": False,
+    }
