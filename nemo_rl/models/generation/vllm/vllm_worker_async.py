@@ -25,6 +25,8 @@ from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
+
+from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
 import uvicorn
 from fastapi import FastAPI
 
@@ -425,7 +427,7 @@ class VllmAsyncGenerationWorkerImpl(
         return self.base_url
 
     async def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self, dp_cfg: DataPlaneRuntimeConfig, staging_partition: str
     ) -> bool:
         """Install capture on model-owner ranks that serve HTTP requests."""
         if not self.is_model_owner:

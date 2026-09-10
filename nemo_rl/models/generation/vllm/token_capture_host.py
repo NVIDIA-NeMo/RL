@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
+from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
+
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.capture import (
         ActiveCall,
@@ -55,7 +57,7 @@ class TokenCaptureHost:
         """Gym's ``install_capture`` seam (the ``CaptureHost`` contract)."""
         self.token_capture = capture
 
-    def setup(self, dp_cfg: dict[str, Any], staging_partition: str) -> bool:
+    def setup(self, dp_cfg: DataPlaneRuntimeConfig, staging_partition: str) -> bool:
         """Install Gym capture with a worker-local staging client and adapter."""
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter

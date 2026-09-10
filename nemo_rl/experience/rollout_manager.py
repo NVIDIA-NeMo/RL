@@ -1932,18 +1932,18 @@ class RolloutManager:
                     )
                 raise
 
-            self._stats.committed += 1
-            # A commit proves the fleet is answering, which is exactly the claim the
-            # consecutive budget is testing, so it clears the run of drops. Placed on
-            # the success path rather than in the infra handler so that a prompt which
-            # succeeded on a retry also counts -- the fleet recovered either way.
-            self._consecutive_infra_drops = 0
-            if lineage_group_id is not None:
-                async with (
-                    self._tq_buffer.data_plane_checkpoint_barrier.mutation()
-                ) as cut:
-                    self._recovery_ledger.discard_group(cut, lineage_group_id)
-            return RolloutOutcome.COMMITTED
+            break
+
+        self._stats.committed += 1
+        # A commit proves the fleet is answering, which is exactly the claim the
+        # consecutive budget is testing, so it clears the run of drops. Placed on
+        # the success path rather than in the infra handler so that a prompt which
+        # succeeded on a retry also counts -- the fleet recovered either way.
+        self._consecutive_infra_drops = 0
+        if lineage_group_id is not None:
+            async with self._tq_buffer.data_plane_checkpoint_barrier.mutation() as cut:
+                self._recovery_ledger.discard_group(cut, lineage_group_id)
+        return RolloutOutcome.COMMITTED
 
     async def _retry_after_failure(
         self,
