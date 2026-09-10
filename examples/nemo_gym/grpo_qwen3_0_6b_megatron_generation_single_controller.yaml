@@ -1,0 +1,78 @@
+# GRPO on the NeMo-Gym workplace-assistant environment via the SingleController path,
+# using non-colocated Megatron Inference.
+# Gym rollouts go through the persistent Megatron engine's OpenAI-compatible server,
+# Smoke-test scale; Qwen3-0.6B on one node with 2 GPUs (1 training + 1 generation).
+# The CI-run variant, tests/functional/grpo_megatron_generation_gym_single_controller.sh,
+# loads this file and overrides only test scale, data paths, and logging; the resolved
+# config stays value-equal to the vLLM SC test (grpo_async_gym_single_controller.sh)
+# everywhere but the generation backend.
+defaults: "grpo_qwen3_30ba3b_instruct.yaml"
+
+grpo:
+  # SC requires one optimizer step per RL step:
+  # num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  max_num_steps: 10  # short demo; raise for a real run
+  # SC does not support validation yet (setup raises when it is enabled).
+  val_period: 0
+  val_at_start: false
+  # The KL term below needs reference logprobs; the base skips them.
+  skip_reference_policy_logprobs_calculation: false
+  # SC replaces the legacy async-GRPO path.
+  async_grpo: null
+
+loss_fn:
+  # A small KL term (the base uses 0) exercises the reference-model path end to end.
+  reference_policy_kl_penalty: 0.01
+  use_importance_sampling_correction: true
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 8
+  # Full workplace-assistant prompts (all tools attached) run past 4k tokens.
+  max_total_sequence_length: 8192
+
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+
+  generation:
+    backend: "megatron"
+    mcore_generation_config:
+      # NeMo-Gym drives rollouts through the engine's OpenAI server.
+      expose_http_server: true
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 1
+
+# The gym family sets no data_plane block. Only keys without a schema default
+# are set here; see nemo_rl/data_plane/interfaces.py, and the fully documented
+# block in examples/configs/grpo_math_1B.yaml.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+
+async_rl:
+  sampler:
+    name: in_order
+    # 0 = fully synchronous, so the importance sampling correction above is an
+    # inert no-op (all ratios are 1); it is enabled to match the vLLM SC test.
+    max_lookahead_versions: 0
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+
+checkpointing:
+  enabled: false
+
+cluster:
+  gpus_per_node: 2

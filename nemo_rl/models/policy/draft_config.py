@@ -37,7 +37,10 @@ class Eagle3DraftConfig(BaseModel, extra="allow"):
     """Configuration for EAGLE-3 draft-model co-training with the policy."""
 
     supports_context_parallel: ClassVar[bool] = False
-    supports_sequence_packing: ClassVar[bool] = False
+    # The packed EAGLE-3 path re-embeds per-segment-shifted token ids (see
+    # megatron/train.py); it needs pipeline_model_parallel_size=1 because the
+    # embedding lives only on the first pipeline stage.
+    supports_sequence_packing: ClassVar[bool] = True
     supports_target_sequence_parallel: ClassVar[bool] = False
 
     speculator_type: Literal["eagle3"] = "eagle3"

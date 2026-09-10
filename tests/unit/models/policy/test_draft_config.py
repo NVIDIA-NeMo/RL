@@ -21,8 +21,8 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.models.policy.draft_config import (
     DFlashDraftConfig,
-    DSparkDraftConfig,
     DraftOptimizerConfig,
+    DSparkDraftConfig,
     Eagle3DraftConfig,
 )
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers

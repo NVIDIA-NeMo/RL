@@ -625,6 +625,14 @@ class TestTimeoutChecker:
         assert checker.check_save() is True
         assert checker.check_save() is False
 
+    def test_would_save_does_not_consume_deadline(self):
+        checker = TimeoutChecker(timeout="00:00:00:00")
+
+        assert checker.would_save() is True
+        assert checker.would_save() is True
+        assert checker.check_save() is True
+        assert checker.would_save() is False
+
     def test_fit_last_save_time_enabled(self):
         # Create a TimeoutChecker with a 3-second timeout and enable fit_last_save_time logic
         checker = TimeoutChecker(timeout="00:00:00:03", fit_last_save_time=True)

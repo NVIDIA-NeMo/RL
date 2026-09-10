@@ -28,7 +28,6 @@ from nemo_rl.algorithms.loss.draft import (
     _tile_log_normalizers,
 )
 
-
 _VOCAB_GRADIENT_CHUNK_SIZE = 4096
 
 

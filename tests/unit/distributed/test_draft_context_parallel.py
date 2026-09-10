@@ -350,9 +350,7 @@ def _run_cuda_cp_zero_owner_attention(
         layout = layout_module.build_draft_sequence_layout(
             logical_sample_ids=sample_ids,
             cu_seqlens_q=torch.tensor([0, 16], dtype=torch.int64, device=device),
-            cu_seqlens_q_padded=torch.tensor(
-                [0, 16], dtype=torch.int64, device=device
-            ),
+            cu_seqlens_q_padded=torch.tensor([0, 16], dtype=torch.int64, device=device),
             cp_rank=rank,
             cp_size=world_size,
             tp_rank=0,
@@ -385,22 +383,24 @@ def _run_cuda_cp_zero_owner_attention(
         selected_cp_anchor = max(int(anchor.item()) for anchor in owner_anchors)
 
         full_shape = (1, 16, 1, 16)
-        full_k_value = torch.arange(
-            math.prod(full_shape), dtype=torch.float32, device=device
-        ).reshape(full_shape) / 100
+        full_k_value = (
+            torch.arange(
+                math.prod(full_shape), dtype=torch.float32, device=device
+            ).reshape(full_shape)
+            / 100
+        )
         full_v_value = torch.flip(full_k_value, dims=(1,))
         local_positions = layout.cp_global_positions
-        trunk_k = (
-            full_k_value[:, local_positions].detach().clone().requires_grad_(True)
-        )
-        trunk_v = (
-            full_v_value[:, local_positions].detach().clone().requires_grad_(True)
-        )
+        trunk_k = full_k_value[:, local_positions].detach().clone().requires_grad_(True)
+        trunk_v = full_v_value[:, local_positions].detach().clone().requires_grad_(True)
         block_shape = (plan.sample_rows.numel(), plan.block_size, 1, 16)
         full_block_shape = (expected_owners, plan.block_size, 1, 16)
-        full_block_value = torch.arange(
-            math.prod(full_block_shape), dtype=torch.float32, device=device
-        ).reshape(full_block_shape) / 50
+        full_block_value = (
+            torch.arange(
+                math.prod(full_block_shape), dtype=torch.float32, device=device
+            ).reshape(full_block_shape)
+            / 50
+        )
         block_q = full_block_value[: block_shape[0]].clone().requires_grad_(True)
         block_k = (full_block_value[: block_shape[0]] + 0.25).requires_grad_(True)
         block_v = (full_block_value[: block_shape[0]] - 0.25).requires_grad_(True)
@@ -426,9 +426,7 @@ def _run_cuda_cp_zero_owner_attention(
         oracle_layout = layout_module.build_draft_sequence_layout(
             logical_sample_ids=sample_ids,
             cu_seqlens_q=torch.tensor([0, 16], dtype=torch.int64, device=device),
-            cu_seqlens_q_padded=torch.tensor(
-                [0, 16], dtype=torch.int64, device=device
-            ),
+            cu_seqlens_q_padded=torch.tensor([0, 16], dtype=torch.int64, device=device),
             cp_rank=0,
             cp_size=1,
             tp_rank=0,
@@ -449,12 +447,8 @@ def _run_cuda_cp_zero_owner_attention(
         oracle_k = full_k_value.detach().clone().requires_grad_(True)
         oracle_v = full_v_value.detach().clone().requires_grad_(True)
         oracle_q = full_block_value.detach().clone().requires_grad_(True)
-        oracle_block_k = (full_block_value.detach().clone() + 0.25).requires_grad_(
-            True
-        )
-        oracle_block_v = (full_block_value.detach().clone() - 0.25).requires_grad_(
-            True
-        )
+        oracle_block_k = (full_block_value.detach().clone() + 0.25).requires_grad_(True)
+        oracle_block_v = (full_block_value.detach().clone() - 0.25).requires_grad_(True)
         oracle_output = attention_module.dflash_block_only_attention(
             plan=oracle_plan,
             trunk_k=oracle_k,

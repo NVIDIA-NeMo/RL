@@ -442,9 +442,7 @@ def build_dspark_batch_plan(
     global_label_positions = extended.global_query_positions[:, 1 : block_size + 1]
     slot_valid = extended.slot_valid[:, 1 : block_size + 1]
     packed_rope_positions = extended.packed_rope_positions[:, :block_size]
-    packed_label_rope_positions = extended.packed_rope_positions[
-        :, 1 : block_size + 1
-    ]
+    packed_label_rope_positions = extended.packed_rope_positions[:, 1 : block_size + 1]
     return DSparkBatchPlan(
         batch_size=extended.batch_size,
         sequence_length=extended.sequence_length,

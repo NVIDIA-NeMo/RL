@@ -10,8 +10,9 @@ Use it only for non-colocated vLLM generation:
 - `policy.generation.colocated.enabled=false`
 - `policy.generation.refit_transport=nixl`
 
-Colocated generation still uses IPC/HTTP refit. Non-colocated generation without
-checkpoint-engine refit still uses the NCCL collective update path.
+Without checkpoint-engine refit, colocated vLLM uses ZMQ/CUDA IPC and
+non-colocated vLLM uses NCCL. SGLang uses Ray CUDA IPC when colocated and its
+own NCCL weight-update group with a Megatron policy when non-colocated.
 
 `examples/configs/grpo_math_8B_megatron_nixl.yaml` is a complete two-node
 example built as an overlay on the standard 8B Megatron recipe.

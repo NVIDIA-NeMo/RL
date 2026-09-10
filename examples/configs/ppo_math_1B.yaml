@@ -8,8 +8,14 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  ppo_epochs: 4
+  ppo_epochs: 4  # actor passes over each rollout batch
+  # Critic passes over each rollout batch; follows ppo_epochs unless overridden.
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
+  # step_<n> dir of a critic-pretrain run whose value/ seeds the critic.
+  # Only a fresh run reads it; a resume ignores it and restores the critic from
+  # its own checkpoint, so it can stay set.
+  warm_start_value_checkpoint: null
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -134,6 +140,7 @@ policy:
       dropout_position: "post"
       lora_A_init: "xavier"
       use_triton: true
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   megatron_cfg:
     enabled: false
@@ -272,11 +279,15 @@ policy:
       enable_chunked_prefill: true
       unified_memory_level: 0
       max_tokens: 16384
+      logprobs_mode: processed_logprobs
+      offload_policy_before_refit: false
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+      refit_with_reload_api: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -333,6 +344,7 @@ value:
       dropout_position: "post"
       lora_A_init: "xavier"
       use_triton: true
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   megatron_cfg:
     enabled: false

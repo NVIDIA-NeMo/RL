@@ -27,6 +27,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
+    GAEConfig,
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
 )
@@ -95,7 +96,20 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import (
+    Bucket,
+    bucket_scope,
+    managed_span,
+    trace_fn,
+)
+from nemo_rl.telemetry.setup import get_telemetry_handle
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    validate_warm_start_checkpoint,
+)
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -106,6 +120,7 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
+from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -150,21 +165,6 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
         return self.warmup_generation_lead_steps
 
 
-class AdvEstimatorConfig(TypedDict):
-    """Configuration for PPO advantage estimator (GAE or raw_reward)."""
-
-    name: str  # "gae" or "raw_reward"
-    # GAE-specific (only used when name="gae")
-    gae_lambda: NotRequired[float]
-    gae_gamma: NotRequired[float]
-    normalize_advantages: NotRequired[bool]
-    # VAPO decoupled GAE (None = standard GAE, no decoupling)
-    gae_lambda_value: NotRequired[Optional[float]]
-    gae_lambda_policy: NotRequired[Optional[float]]
-    # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled.
-    length_adaptive_alpha: NotRequired[float]
-
-
 class PPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
@@ -190,35 +190,49 @@ class PPOConfig(BaseModel, extra="allow"):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
+    # Number of actor (policy) passes over each rollout batch.
     ppo_epochs: int = 4
+    # Number of critic (value) passes over each rollout batch. Defaults to
+    # ppo_epochs (see validate_epoch) unless explicitly set.
+    critic_ppo_epochs: int = 4
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
-    # Advantage estimator configuration (gae or raw_reward)
-    adv_estimator: AdvEstimatorConfig = Field(
-        default_factory=lambda: AdvEstimatorConfig(
-            name="gae",
-            gae_lambda=0.95,
-            gae_gamma=1.0,
-            normalize_advantages=True,
-            gae_lambda_value=None,
-            gae_lambda_policy=None,
-            length_adaptive_alpha=0.0,
-        )
-    )
+    adv_estimator: GAEConfig = Field(default_factory=GAEConfig)
     # Number of PPO steps of critic-only warmup before policy training begins.
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
     policy_training_start_step: int = 0
+    # Step directory of a critic-pretrain run whose value/ seeds this run's critic.
+    # Only a fresh run reads it; a resume ignores it and restores the critic from
+    # its own checkpoint, so it can stay set.
+    warm_start_value_checkpoint: str | None = None
     # Nullable sequence-level multiplicative probability-error threshold.
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None = None
+    # Advantage value assigned to invalid-tool-call tokens; None disables it.
+    invalid_tool_call_advantage: float | None = None
+    # Advantage value assigned to malformed-thinking tokens; None disables it.
+    malformed_thinking_advantage: float | None = None
+
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
-    async_ppo: AsyncPPOConfig = Field(default_factory=AsyncPPOConfig)
+    # Legacy async config block; SC reads its async knobs from `async_rl` instead.
+    async_ppo: AsyncPPOConfig | None = Field(default_factory=AsyncPPOConfig)
 
     @model_validator(mode="after")
-    def validate_async_warmup_settings(self) -> "PPOConfig":
+    def validate_epoch(self) -> "PPOConfig":
+        if "critic_ppo_epochs" not in self.model_fields_set:
+            self.critic_ppo_epochs = self.ppo_epochs
+        if self.ppo_epochs < 1:
+            raise ValueError("ppo.ppo_epochs must be at least 1")
+        if self.critic_ppo_epochs < 1:
+            raise ValueError("ppo.critic_ppo_epochs must be at least 1")
+        return self
+
+    @model_validator(mode="after")
+    def validate_async_warmup(self) -> "PPOConfig":
         if (
-            self.async_ppo.enabled
+            self.async_ppo is not None
+            and self.async_ppo.enabled
             and self.policy_training_start_step == 0
             and self.async_ppo.warmup_generation_lead_steps is not None
         ):
@@ -289,6 +303,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: PPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    telemetry: Optional[TelemetryConfig] = None
 
 
 # ===============================================================================
@@ -727,18 +742,22 @@ def setup(
     worker_init_timing_metrics = {}
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    # Only a fresh run reads this; a resume ignores it and restores the critic from
+    # its own checkpoint, so the key can stay in the config.
+    warm_start = ppo_config.warm_start_value_checkpoint
+    if last_checkpoint_path is None and warm_start is not None:
+        validate_warm_start_checkpoint(warm_start)
+        print(f"🔥 Warm-starting the value model from {warm_start}")
     value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
-        last_checkpoint_path,
+        last_checkpoint_path or warm_start,
         model_component="value",
     )
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
-    # ticks once per train() call (matching upstream main's per-rollout
-    # convention), and PPO calls each worker's train() `ppo_epochs` times
-    # per outer step. So total ticks = (outer steps) * ppo_epochs.
-    # Scale train_iters accordingly so the configured warmup/decay horizon
-    # matches the actual scheduler-step count.
+    # ticks once per train() call, so policy and value need separate budgets
+    # when their epoch counts or training start steps differ.
     ppo_epochs = ppo_config.ppo_epochs
+    critic_ppo_epochs = ppo_config.critic_ppo_epochs
     async_config = ppo_config.async_ppo
     if async_config.enabled:
         outer_training_steps = ppo_config.max_num_steps
@@ -747,13 +766,22 @@ def setup(
             ppo_config.max_num_steps,
             ppo_config.max_num_epochs * len(dataloader),
         )
-    total_train_iters = outer_training_steps * ppo_epochs
-
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+        policy_training_steps = max(
+            outer_training_steps - ppo_config.policy_training_start_step,
+            0,
+        )
+        # Megatron-Bridge requires a positive scheduler horizon at setup. The
+        # scheduler is never advanced when critic warmup spans the whole run.
+        policy_config["megatron_cfg"]["train_iters"] = max(
+            policy_training_steps * ppo_epochs,
+            1,
+        )
 
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = total_train_iters
+        value_config["megatron_cfg"]["train_iters"] = (
+            outer_training_steps * critic_ppo_epochs
+        )
 
     # Define initialization functions that will be used in all paths
     def init_policy():
@@ -804,7 +832,6 @@ def setup(
     def initialize_generation_with_policy(
         init_generation_fn,
         generation_name: str,
-        init_time_key: str,
         worker_init_timing_metrics: dict,
     ):
         """Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
@@ -812,7 +839,6 @@ def setup(
         Args:
             init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)
             generation_name: Name of the generation engine ("vLLM" or "SGLang")
-            init_time_key: Key name for storing initialization time in metrics ("vllm_init_time_s" or "sglang_init_time_s")
             worker_init_timing_metrics: Dictionary to store timing metrics
 
         Returns:
@@ -823,7 +849,7 @@ def setup(
 
         # Policy and value initialize serially because they share training GPUs.
         policy_generation, generation_time = init_generation_fn()
-        worker_init_timing_metrics[init_time_key] = generation_time
+        worker_init_timing_metrics["generation_init_time_s"] = generation_time
 
         policy, policy_time = init_policy()
         # Block until the policy worker's __init__ completes and offload to
@@ -881,7 +907,6 @@ def setup(
         policy_generation, policy, value_model = initialize_generation_with_policy(
             init_generation_fn=init_vllm,
             generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
@@ -900,7 +925,6 @@ def setup(
         policy_generation, policy, value_model = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
             generation_name="SGLang",
-            init_time_key="sglang_init_time_s",
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
@@ -919,7 +943,20 @@ def setup(
     # during setup to free GPU for value model initialization).
     policy.prepare_for_training()
 
-    if not colocated_inference:
+    if backend == "sglang":
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        worker_init_timing_metrics["sglang_weight_sync_init_time_s"] = (
+            time.perf_counter() - t0
+        )
+    elif not colocated_inference:
         assert policy_generation is not None
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
@@ -939,10 +976,10 @@ def setup(
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+    if backend != "sglang":
+        state_dict_info = policy.prepare_refit_info()
+        if policy_generation is not None:
+            policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -952,12 +989,12 @@ def setup(
     if worker_init_timing_metrics:
         print("\n▶ Worker Initialization Timing:")
 
-        vllm_time = worker_init_timing_metrics.get("vllm_init_time_s", 0)
+        gen_time = worker_init_timing_metrics.get("generation_init_time_s", 0)
         policy_time = worker_init_timing_metrics.get("policy_init_time_s", 0)
         total_setup = worker_init_timing_metrics.get("total_setup_time_s", 0)
 
-        if vllm_time:
-            print(f"  vLLM init: {vllm_time:.1f}s")
+        if gen_time:
+            print(f"  Generation init: {gen_time:.1f}s")
 
         if policy_time:
             print(f"  Policy init: {policy_time:.1f}s")
@@ -1144,11 +1181,11 @@ def _create_advantage_estimator(master_config: MasterConfig):
 
     adv_estimator_config = ppo_config.adv_estimator
 
-    adv_estimator_name = adv_estimator_config["name"]
+    adv_estimator_name = adv_estimator_config.name
     if adv_estimator_name == "gae":
         adv_estimator = GeneralizedAdvantageEstimator(adv_estimator_config, loss_config)
-        gae_lambda = adv_estimator_config["gae_lambda"]
-        gae_gamma = adv_estimator_config["gae_gamma"]
+        gae_lambda = adv_estimator_config.gae_lambda
+        gae_gamma = adv_estimator_config.gae_gamma
         print(f"  ✓ Using GAE advantage estimator (λ={gae_lambda}, γ={gae_gamma})")
     elif adv_estimator_name == "raw_reward":
         adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
@@ -1196,6 +1233,7 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
 # ===============================================================================
 
 
+@trace_fn(RLSpanGroup.JOB, "rl.ppo.job")
 def ppo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -1217,10 +1255,12 @@ def ppo_train(
     Based on the grpo_train loop with PPO-specific modifications:
     - Value model inference and training (actor-critic)
     - GAE advantage estimation with value bootstrap
-    - Multiple training steps per rollout (ppo_epochs)
+    - Multiple actor and critic training steps per rollout
     - Configurable policy training start epoch
     """
     timer = Timer()
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -1254,6 +1294,7 @@ def ppo_train(
     current_epoch = ppo_save_state["current_epoch"]
     max_num_epochs = master_config.ppo.max_num_epochs
     ppo_epochs = master_config.ppo.ppo_epochs
+    critic_ppo_epochs = master_config.ppo.critic_ppo_epochs
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
@@ -1315,10 +1356,25 @@ def ppo_train(
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                managed_span(
+                    RLSpanGroup.STEP,
+                    "rl.ppo.step",
+                    tracer=_tracer,
+                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                ),
+            ):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
-                with timer.time("data_processing"):
+                with (
+                    timer.time("data_processing"),
+                    managed_span(
+                        RLSpanGroup.DATA_PROCESSING,
+                        "rl.ppo.data_processing",
+                        tracer=_tracer,
+                    ),
+                ):
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
                             master_config.ppo.num_generations_per_prompt
@@ -1385,7 +1441,14 @@ def ppo_train(
                             policy.offload_to_cpu()
                         policy_generation.prepare_for_generation()
 
-                with timer.time("generation"):
+                with (
+                    timer.time("generation"),
+                    managed_span(
+                        RLSpanGroup.ROLLOUT,
+                        "rl.ppo.generation",
+                        tracer=_tracer,
+                    ),
+                ):
                     if policy_generation is not None:
                         policy_generation.clear_logger_metrics()
 
@@ -1457,7 +1520,14 @@ def ppo_train(
                 # Process rewards and build training data
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
                 print("▶ Processing rewards...", flush=True)
-                with timer.time("reward_calculation"):
+                with (
+                    timer.time("reward_calculation"),
+                    managed_span(
+                        RLSpanGroup.REWARD,
+                        "rl.ppo.reward_calculation",
+                        tracer=_tracer,
+                    ),
+                ):
                     rewards = repeated_batch["total_reward"]
 
                 with timer.time("data_processing"):
@@ -1531,7 +1601,14 @@ def ppo_train(
                     policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
-                with timer.time("policy_and_reference_logprobs"):
+                with (
+                    timer.time("policy_and_reference_logprobs"),
+                    managed_span(
+                        RLSpanGroup.LOGPROB,
+                        "rl.ppo.policy_and_reference_logprobs",
+                        tracer=_tracer,
+                    ),
+                ):
                     logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
                             "input_ids": train_data["input_ids"],
@@ -1570,7 +1647,14 @@ def ppo_train(
                 # Build prompt IDs for advantage estimation (groups responses from same prompt).
                 # Use the token-length-based extractor so multi-turn prompts containing
                 # assistant messages still resolve to the original prompt only.
-                with timer.time("advantage_calculation"):
+                with (
+                    timer.time("advantage_calculation"),
+                    managed_span(
+                        RLSpanGroup.ADVANTAGE,
+                        "rl.ppo.advantage_calculation",
+                        tracer=_tracer,
+                    ),
+                ):
                     print("▶ Computing advantages...", flush=True)
                     initial_prompt_message_logs = extract_initial_prompt_messages(
                         repeated_batch["message_log"],
@@ -1588,8 +1672,8 @@ def ppo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
                         mask=advantage_mask,
-                        reference_logprobs=train_data.get("reference_policy_logprobs"),
-                        logprobs=train_data["prev_logprobs"],
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
@@ -1606,60 +1690,80 @@ def ppo_train(
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
-                for step in range(ppo_epochs):
+
+                # Actor and critic share the training GPUs. Keep each model
+                # resident for all of its PPO epochs so their update phases need
+                # only one onload/offload cycle apiece.
+                print("▶ Training value...", flush=True)
+                with timer.time("value_training_prep"):
+                    value_model.prepare_for_training()
+                for critic_epoch in range(critic_ppo_epochs):
                     print(
-                        f"▶ Step {step + 1}/{ppo_epochs}...",
+                        f"▶ Value epoch {critic_epoch + 1}/{critic_ppo_epochs}...",
                         flush=True,
                     )
-
-                    # Train value model first (critic before actor, matching veRL).
-                    with timer.time("value_training_prep"):
-                        value_model.prepare_for_training()
-
-                    with timer.time("value_training"):
-                        print("▶ Training value...", flush=True)
+                    with (
+                        timer.time("value_training"),
+                        managed_span(
+                            RLSpanGroup.POLICY_UPDATE,
+                            "rl.ppo.value_training",
+                            tracer=_tracer,
+                            **{"rl.iteration": total_steps + 1},
+                        ),
+                    ):
                         value_results = value_model.train(
                             train_data,
                             value_loss_fn,
                             timer=timer,
                         )
+                with timer.time("value_training"):
+                    value_model.finish_training()
 
-                        value_model.finish_training()
+                train_results = None
+                if total_steps >= policy_training_start_step:
+                    if (
+                        total_steps == policy_training_start_step
+                        and policy_training_start_step > 0
+                    ):
+                        print(
+                            f"  ✓ Critic warmup complete ({policy_training_start_step} steps). "
+                            f"Starting policy training.",
+                            flush=True,
+                        )
+                    print("▶ Preparing for training...", flush=True)
+                    with timer.time("training_prep"):
+                        policy.prepare_for_training()
+                        POLICY_GENERATION_STALE = True
 
-                    train_results = None
-                    if total_steps >= policy_training_start_step:
-                        if (
-                            total_steps == policy_training_start_step
-                            and policy_training_start_step > 0
+                    print("▶ Training policy...", flush=True)
+                    for policy_epoch in range(ppo_epochs):
+                        print(
+                            f"▶ Policy epoch {policy_epoch + 1}/{ppo_epochs}...",
+                            flush=True,
+                        )
+                        with (
+                            timer.time("policy_training"),
+                            managed_span(
+                                RLSpanGroup.POLICY_UPDATE,
+                                "rl.ppo.policy_training",
+                                tracer=_tracer,
+                                **{"rl.iteration": total_steps + 1},
+                            ),
                         ):
-                            print(
-                                f"  ✓ Critic warmup complete ({policy_training_start_step} steps). "
-                                f"Starting policy training.",
-                                flush=True,
-                            )
-                        print("▶ Preparing for training...", flush=True)
-                        with timer.time("training_prep"):
-                            policy.prepare_for_training()
-                            POLICY_GENERATION_STALE = True
-
-                        print("▶ Training policy...", flush=True)
-                        with timer.time("policy_training"):
                             train_results = policy.train(
                                 train_data,
                                 loss_fn,
                                 timer=timer,
                             )
-                            if step < ppo_epochs - 1:
-                                policy.offload_to_cpu()
 
-                    if train_results is not None:
-                        print(
-                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}"
-                        )
-                    if value_results is not None:
-                        print(
-                            f"    • Value loss: {value_results['loss'].mean().item():.4f}"
-                        )
+                if train_results is not None:
+                    print(
+                        f"    • Policy loss: {train_results['loss'].mean().item():.4f}"
+                    )
+                if value_results is not None:
+                    print(
+                        f"    • Value loss: {value_results['loss'].mean().item():.4f}"
+                    )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -1854,7 +1958,14 @@ def ppo_train(
                                 metric_name
                             ]
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.ppo.checkpointing",
+                            tracer=_tracer,
+                        ),
+                    ):
                         print(
                             f"Saving checkpoint for step {total_steps + 1}...",
                             flush=True,
@@ -2081,8 +2192,7 @@ def async_ppo_train(
     max_trajectory_age_steps = async_config.max_trajectory_age_steps
     warmup_generation_lead_steps = async_config.resolved_warmup_generation_lead_steps
     policy_training_start_step = master_config.ppo.policy_training_start_step
-    if master_config.ppo.ppo_epochs < 1:
-        raise ValueError("ppo.ppo_epochs must be at least 1")
+    critic_ppo_epochs = master_config.ppo.critic_ppo_epochs
     if max_trajectory_age_steps > 1:
         print(
             "⚠️ WARNING: max_trajectory_age_steps > 1 increases off-policy "
@@ -2578,8 +2688,8 @@ def async_ppo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
                         mask=advantage_mask,
-                        reference_logprobs=train_data.get("reference_policy_logprobs"),
-                        logprobs=train_data["prev_logprobs"],
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
@@ -2593,47 +2703,49 @@ def async_ppo_train(
                     if returns is not None:
                         train_data["returns"] = returns
 
-                # ---- 7. ppo_epochs inner loop (critic, then actor) ----
-                # Each epoch: value on GPU -> train -> off. Then, once past critic
-                # warmup, policy on GPU -> train -> off (except the last epoch,
-                # which leaves the policy on GPU for the refit broadcast below).
+                # ---- 7. Grouped critic epochs, then grouped actor epochs ----
+                # Actor and critic share the training GPUs. Keep each model
+                # resident for its complete update phase to avoid per-epoch
+                # onload/offload cycles. The policy remains resident after its
+                # final epoch for the refit broadcast below.
                 # During warmup (step < policy_training_start_step) the policy is
                 # frozen: it is never loaded/trained here, exactly as in sync
                 # ppo_train, so train_results stays None for the step.
                 is_policy_training_step = step >= policy_training_start_step
                 train_results = None
                 value_results = None
-                for epoch in range(ppo_epochs):
-                    print(f"▶ PPO epoch {epoch + 1}/{ppo_epochs}...")
-                    with timer.time("value_training_prep"):
-                        value_model.prepare_for_training()
+
+                with timer.time("value_training_prep"):
+                    value_model.prepare_for_training()
+                for critic_epoch in range(critic_ppo_epochs):
+                    print(f"▶ Value epoch {critic_epoch + 1}/{critic_ppo_epochs}...")
                     with timer.time("value_training"):
                         value_results = value_model.train(
                             train_data,
                             value_loss_fn,
                             timer=timer,
                         )
-                        value_model.finish_training()
+                with timer.time("value_training"):
+                    value_model.finish_training()
 
-                    if is_policy_training_step:
-                        if (
-                            step == policy_training_start_step
-                            and policy_training_start_step > 0
-                            and epoch == 0
-                        ):
-                            print(
-                                f"  ✓ Critic warmup complete ({policy_training_start_step} "
-                                "steps). Starting policy training.",
-                                flush=True,
-                            )
-                        with timer.time("training_prep"):
-                            policy.prepare_for_training()
+                if is_policy_training_step:
+                    if (
+                        step == policy_training_start_step
+                        and policy_training_start_step > 0
+                    ):
+                        print(
+                            f"  ✓ Critic warmup complete ({policy_training_start_step} "
+                            "steps). Starting policy training.",
+                            flush=True,
+                        )
+                    with timer.time("training_prep"):
+                        policy.prepare_for_training()
+                    for policy_epoch in range(ppo_epochs):
+                        print(f"▶ Policy epoch {policy_epoch + 1}/{ppo_epochs}...")
                         with timer.time("policy_training"):
                             train_results = policy.train(
                                 train_data, loss_fn, timer=timer
                             )
-                            if epoch < ppo_epochs - 1:
-                                policy.offload_to_cpu()
 
                 # ---- 8. Refit once after all PPO epochs ----
                 # Warmup still advances the replay-buffer version, but skips the
@@ -3047,7 +3159,19 @@ def validate(
         return {}, {}
 
     timer = Timer()
-    with timer.time("total_validation_time"):
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
+    with (
+        timer.time("total_validation_time"),
+        managed_span(
+            RLSpanGroup.EVALUATE,
+            "rl.ppo.evaluate",
+            tracer=_tracer,
+        ),
+        # Scored-and-discarded generation: overhead, not goodput. See the same
+        # scope in nemo_rl/algorithms/grpo.py::validate.
+        bucket_scope(Bucket.OVERHEAD),
+    ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []

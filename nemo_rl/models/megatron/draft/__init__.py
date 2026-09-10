@@ -21,6 +21,7 @@ from nemo_rl.models.megatron.draft.hidden_capture import (
     get_eagle3_aux_hidden_state_layers,
 )
 from nemo_rl.models.megatron.draft.utils import (
+    draft_model_detached,
     export_dflash_weights_to_hf,
     export_eagle_weights_to_hf,
     load_hf_weights_to_dflash,
@@ -35,6 +36,7 @@ __all__ = [
     "HiddenStateCapture",
     "get_capture_context",
     "EagleModel",
+    "draft_model_detached",
     "load_hf_weights_to_eagle",
     "load_hf_weights_to_dflash",
     "export_dflash_weights_to_hf",

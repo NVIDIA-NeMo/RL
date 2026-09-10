@@ -123,9 +123,7 @@ def test_dspark_registry_resolves_public_training_provider() -> None:
 
 def test_dspark_build_rejects_split_vocab_before_body_creation() -> None:
     provider = DSparkSpeculator(
-        _config().model_copy(
-            update={"model_name": None, "draft_vocab_size": 32_000}
-        )
+        _config().model_copy(update={"model_name": None, "draft_vocab_size": 32_000})
     )
 
     with pytest.raises(ValueError, match="must match the live target vocabulary"):
@@ -138,9 +136,7 @@ def test_dspark_build_rejects_split_vocab_before_body_creation() -> None:
 
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_dspark_packed_cp_masks_label_positions_for_counts(cp_size: int) -> None:
-    config = _config().model_copy(
-        update={"block_size": 3, "anchors_per_sample": 8}
-    )
+    config = _config().model_copy(update={"block_size": 3, "anchors_per_sample": 8})
     provider = DSparkSpeculator(config)
     logical_length = 31
     sample_ids = torch.tensor([91], dtype=torch.int64)
@@ -172,12 +168,17 @@ def test_dspark_packed_cp_masks_label_positions_for_counts(cp_size: int) -> None
     assert query_position != label_position
     data["token_mask"][int(plan.sample_rows[row]), label_position] = 0
 
-    expected_mask = plan.loss_mask & data["token_mask"].to(torch.bool)[
-        plan.sample_rows[:, None], plan.packed_label_rope_positions
-    ]
+    expected_mask = (
+        plan.loss_mask
+        & data["token_mask"].to(torch.bool)[
+            plan.sample_rows[:, None], plan.packed_label_rope_positions
+        ]
+    )
 
     class _Adapter:
-        def objective_stats(self, *, valid_mask: Tensor, **_: object) -> SimpleNamespace:
+        def objective_stats(
+            self, *, valid_mask: Tensor, **_: object
+        ) -> SimpleNamespace:
             counts = valid_mask.sum(dim=0, dtype=torch.float32)
             return SimpleNamespace(
                 combined=SimpleNamespace(

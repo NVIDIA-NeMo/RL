@@ -44,6 +44,7 @@ from nemo_rl.models.megatron.draft.block_plan import DFlashBatchPlan
 
 if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+
     from nemo_rl.models.megatron.draft.sequence_layout import DraftSequenceLayout
 
 

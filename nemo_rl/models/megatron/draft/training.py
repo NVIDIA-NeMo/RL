@@ -17,10 +17,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Protocol, cast
 
+import torch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.utils import unwrap_model
-import torch
 from torch import Tensor
 from torch.distributed._functional_collectives import all_gather_tensor_autograd
 
@@ -36,7 +36,6 @@ from nemo_rl.models.megatron.draft.block_plan import (
     build_dflash_batch_plan,
     build_dspark_batch_plan,
 )
-
 from nemo_rl.models.megatron.draft.dflash import DFlashBody, DFlashBodyConfig
 from nemo_rl.models.megatron.draft.utils import (
     DRAFT_GRAD_NORM_GROUP,
@@ -51,13 +50,14 @@ from nemo_rl.models.megatron.draft.utils import (
 )
 from nemo_rl.models.policy.draft_config import (
     DFlashDraftConfig,
-    DSparkDraftConfig,
     DraftConfig,
+    DSparkDraftConfig,
     Eagle3DraftConfig,
 )
 
 if TYPE_CHECKING:
     from megatron.bridge.models.model_provider import ModelProviderMixin
+
     from nemo_rl.models.megatron.draft.hidden_capture import CapturedStates
     from nemo_rl.models.megatron.draft.sequence_layout import DraftSequenceLayout
 

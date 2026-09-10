@@ -124,12 +124,19 @@ fi
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 
-# Optional override for policy.tokenizer.use_fastokens (Rust-backed BPE tokenizer,
-# ~10x faster encode). The config is the source of truth; propagate this env var
-# to all Ray nodes ONLY when the user explicitly set it before submitting.
-# Unset means "defer to config"; forcing a default here would override config off.
-if [[ -n "${NRL_USE_FASTOKENS:-}" ]]; then
-  export NRL_USE_FASTOKENS
+# Optional override for fastokens (Rust-backed BPE tokenizer, ~10x faster encode).
+# NRL_USE_FASTOKENS is the top-level NeMo-RL flag. When set, mirror it to
+# VLLM_USE_FASTOKENS so vLLM workers follow the same setting. VLLM_USE_FASTOKENS
+# alone remains a vLLM-only flag. Keep this in sync with normalize_fastokens_env().
+if [[ -n "${NRL_USE_FASTOKENS+set}" ]]; then
+  if [[ "${NRL_USE_FASTOKENS}" == "1" ]]; then
+    export VLLM_USE_FASTOKENS=1
+  else
+    export VLLM_USE_FASTOKENS=0
+  fi
+fi
+if [[ -n "${VLLM_USE_FASTOKENS+set}" ]]; then
+  export VLLM_USE_FASTOKENS
 fi
 
 # Setting ulimit is recommended by ray best practices page
@@ -156,6 +163,7 @@ fi
 # Port layout (all below ephemeral floor at 9000). Python port-range bounds
 # are half-open: [low, high).
 #   1200-1201    Ray GCS + client server (head only)
+#   [1202, 1300) SingleController generation router (driver-local allocation)
 #   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
 #   1313-1399    Dynamo etcd/NATS control plane (driver-local allocation)
 #   1400-1999    Master address / TCPStore (cluster.master_port_range_low/high)

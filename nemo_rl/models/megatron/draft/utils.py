@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, cast
+from typing import Any, Callable, Iterable, Iterator, Mapping, cast
 
 import torch
 import torch.distributed as dist
@@ -1691,6 +1692,32 @@ def get_attached_draft_model(model: list[MegatronModule]) -> MegatronModule | No
     return None
 
 
+@contextmanager
+def draft_model_detached(model: list[MegatronModule]) -> Iterator[None]:
+    """Temporarily detach the nested draft model from its owner chunk.
+
+    Megatron-Bridge conversion only covers the base model's HF architecture;
+    draft weights are refit through `export_eagle_weights_to_hf` instead.
+    """
+    owner_chunk: MegatronModule | None = None
+    draft_model: MegatronModule | None = None
+    for model_chunk in reversed(model):
+        unwrapped_chunk = unwrap_model(model_chunk)
+        chunk_draft = getattr(unwrapped_chunk, "draft_model", None)
+        if chunk_draft is not None:
+            owner_chunk = unwrapped_chunk
+            draft_model = chunk_draft
+            break
+    if owner_chunk is None:
+        yield
+        return
+    delattr(owner_chunk, "draft_model")
+    try:
+        yield
+    finally:
+        owner_chunk.draft_model = draft_model
+
+
 def _export_layer_weights_to_hf(
     *,
     source_state: Mapping[str, Tensor],
@@ -1977,7 +2004,9 @@ def load_hf_weights_to_dspark(
         _load_checkpoint_state(model_name, revision=model_revision)
     )
     body_names = set(body.state_dict())
-    body_state = {name: tensor for name, tensor in normalized.items() if name in body_names}
+    body_state = {
+        name: tensor for name, tensor in normalized.items() if name in body_names
+    }
     missing, _ = _load_normalized_hf_weights_to_dflash(body, body_state)
 
     head_state = {
@@ -2006,9 +2035,7 @@ def load_hf_weights_to_dspark(
         )
     adapter.load_state_dict(mapped_heads, strict=False)
     ignored_target_names = {"embed_tokens.weight", "lm_head.weight"}
-    expected_head_names = {
-        name for name in model_state if not name.startswith("body.")
-    }
+    expected_head_names = {name for name in model_state if not name.startswith("body.")}
     consumed = body_names | expected_head_names | ignored_target_names
     unexpected = sorted(set(normalized).difference(consumed))
     return sorted(set(missing)), unexpected

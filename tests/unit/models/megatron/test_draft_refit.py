@@ -771,11 +771,11 @@ def test_cp_lane_manifest_mismatch_fails_before_refit_builder(
 
 def test_decode_wire_manifest_flags_malformed_metadata_as_wire_invalid() -> None:
     from nemo_rl.models.megatron.draft.utils import (
-        _decode_wire_manifest,
         _DRAFT_REFIT_STATUS_OK,
         _DRAFT_REFIT_STATUS_WIRE_INVALID,
-        _wire_manifest,
         DraftRefitTensorSpec,
+        _decode_wire_manifest,
+        _wire_manifest,
     )
 
     spec = DraftRefitTensorSpec(

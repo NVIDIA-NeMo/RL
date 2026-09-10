@@ -20,7 +20,6 @@ from pathlib import Path
 
 import torch
 
-
 _DRAFT_LOSS_PATH = Path(__file__).parents[3] / "nemo_rl/algorithms/loss/draft.py"
 _SPEC = importlib.util.spec_from_file_location(
     "draft_loss_zero_owner_under_test",

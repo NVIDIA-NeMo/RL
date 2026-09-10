@@ -14,11 +14,11 @@
 
 import math
 import os
+from collections.abc import Callable, Iterator
 from functools import lru_cache
 from typing import Any, List, Tuple
 
 import torch
-
 
 _PACKED_FRAME_DATA = 0
 _PACKED_FRAME_COMPLETE = 1
@@ -235,33 +235,24 @@ def packed_broadcast_producer(
         s.synchronize()
 
 
-def packed_broadcast_consumer(
-    iterator,
-    group,
-    src,
-    post_unpack_func,
+def _packed_broadcast_consumer_batches(
+    iterator: Iterator[Any],
+    group: Any,
+    src: int,
     *,
+    num_buffers: int | None = None,
     preflight_checked: bool = False,
-):
-    """Consume a packed tensor and unpack it into a list of tensors.
+) -> Iterator[list[tuple[str, torch.Tensor]]]:
+    """Yield unpacked batches while retaining ownership of their receive buffers.
 
-    Args:
-        iterator: iterator of model parameters. Returns a tuple of (name, tensor)
-        group: process group (vllm PyNcclCommunicator)
-        src: source rank (0 in current implementation)
-        post_unpack_func: function to apply to each tensor after unpacking
+    Frames are read through the producer's terminal frame even after a protocol
+    mismatch is detected, so a consumer that stops matching the producer never
+    leaves it blocked on an unpaired broadcast. The mismatch is raised once the
+    stream has been drained.
 
-    Returns:
-        None
-
-    Note:
-        Synchronous Python unpack and load-callback failures are preserved while
-        remaining frames are drained through the terminal frame. Stream
-        synchronization, CUDA allocation/kernel/OOM, and NCCL/broadcast failures
-        are communicator-fatal and propagate directly because further
-        collectives on that context or transport are not reliable. Peer liveness
-        in that case requires communicator teardown by the caller.
-
+    The readiness collective lives here rather than in the caller so that it
+    stays the first collective this side posts, including on the lazy
+    ``return_iterator`` path where nothing runs until the first pull.
     """
     if not preflight_checked:
         packed_broadcast_preflight_consumer(group, src)
@@ -278,8 +269,6 @@ def packed_broadcast_consumer(
         Returns:
             unpacked List[(name, tensor)]
         """
-        unpacked_list = []
-        # Perform batched split with torch.split_with_sizes
         packed_tensor_sizes = list(map(lambda x: x[4], meta_data_list))
         unpacked_tensor = packed_tensor.split_with_sizes(packed_tensor_sizes)
 
@@ -298,7 +287,7 @@ def packed_broadcast_consumer(
                 tensor = tensor.clone()
             return tensor.view(dtype).reshape(tuple(shape))
 
-        unpacked_list = [
+        return [
             (
                 meta_data_list[i][0],
                 restore_tensor(tensor, meta_data_list[i][1], meta_data_list[i][2]),
@@ -306,9 +295,8 @@ def packed_broadcast_consumer(
             for i, tensor in enumerate(unpacked_tensor)
         ]
 
-        return unpacked_list
-
-    num_buffers = get_num_buffers()
+    if num_buffers is None:
+        num_buffers = get_num_buffers()
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
@@ -320,90 +308,169 @@ def packed_broadcast_consumer(
     ]
 
     protocol_error: str | None = None
-    consumer_error: BaseException | None = None
-    while True:
-        # Move to the next buffer
-        buffer_idx = (buffer_idx + 1) % num_buffers
-        # A deferred CUDA/NCCL failure invalidates the drain transport itself.
-        streams[buffer_idx].synchronize()
-        with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
-            status, packed_size, tensor_count = _broadcast_packed_frame_header(
-                group,
-                src,
-                status=_PACKED_FRAME_DATA,
-            )
-            if status == _PACKED_FRAME_ERROR:
-                if consumer_error is None:
-                    consumer_error = RuntimeError(
+    producer_error: str | None = None
+    try:
+        while True:
+            # Move to the next buffer
+            buffer_idx = (buffer_idx + 1) % num_buffers
+            # A deferred CUDA/NCCL failure invalidates the drain transport itself.
+            streams[buffer_idx].synchronize()
+            with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
+                status, packed_size, tensor_count = _broadcast_packed_frame_header(
+                    group,
+                    src,
+                    status=_PACKED_FRAME_DATA,
+                )
+                if status == _PACKED_FRAME_ERROR:
+                    producer_error = (
                         "Packed-broadcast producer failed during payload transfer"
                     )
-                break
-            if status == _PACKED_FRAME_COMPLETE:
-                try:
-                    next(iterator)
-                except StopIteration:
                     break
-                if protocol_error is None:
-                    protocol_error = (
-                        "Packed-broadcast producer completed before consumer metadata"
+                if status == _PACKED_FRAME_COMPLETE:
+                    try:
+                        next(iterator)
+                    except StopIteration:
+                        break
+                    if protocol_error is None:
+                        protocol_error = "Packed-broadcast producer completed before consumer metadata"
+                    break
+                if status != _PACKED_FRAME_DATA or packed_size < 0 or tensor_count <= 0:
+                    raise RuntimeError(
+                        "Invalid packed-broadcast DATA frame: "
+                        f"status={status}, bytes={packed_size}, tensors={tensor_count}"
                     )
-                break
-            if status != _PACKED_FRAME_DATA or packed_size < 0 or tensor_count <= 0:
-                raise RuntimeError(
-                    "Invalid packed-broadcast DATA frame: "
-                    f"status={status}, bytes={packed_size}, tensors={tensor_count}"
-                )
 
-            # Initialize the packing tensor meta data
-            packing_tensor_meta_data[buffer_idx] = []
-            packing_tensor_sizes[buffer_idx] = 0
-            offsets[buffer_idx] = 0
-            for _ in range(tensor_count):
-                try:
-                    name, (shape, dtype) = next(iterator)
-                except StopIteration:
-                    protocol_error = "Packed-broadcast producer sent more tensors than consumer metadata"
-                    continue
-                if protocol_error is None:
-                    tensor_size = math.prod(shape) * dtype.itemsize
-                    packing_tensor_meta_data[buffer_idx].append(
-                        (name, shape, dtype, offsets[buffer_idx], tensor_size)
-                    )
-                    packing_tensor_sizes[buffer_idx] += tensor_size
-                    offsets[buffer_idx] += tensor_size
-
-            packed_tensors[buffer_idx] = torch.empty(
-                packed_size, dtype=torch.uint8, device="cuda"
-            )
-            group.broadcast(packed_tensors[buffer_idx], src=src)
-            if (
-                protocol_error is None
-                and packing_tensor_sizes[buffer_idx] != packed_size
-            ):
-                protocol_error = (
-                    "Packed-broadcast payload size does not match consumer metadata: "
-                    f"producer={packed_size}, consumer={packing_tensor_sizes[buffer_idx]}"
-                )
-            if protocol_error is None and consumer_error is None:
-                try:
-                    post_unpack_func(
-                        unpack_tensor(
-                            packed_tensors[buffer_idx],
-                            packing_tensor_meta_data[buffer_idx],
+                # Initialize the packing tensor meta data
+                packing_tensor_meta_data[buffer_idx] = []
+                packing_tensor_sizes[buffer_idx] = 0
+                offsets[buffer_idx] = 0
+                for _ in range(tensor_count):
+                    try:
+                        name, (shape, dtype) = next(iterator)
+                    except StopIteration:
+                        protocol_error = "Packed-broadcast producer sent more tensors than consumer metadata"
+                        continue
+                    if protocol_error is None:
+                        tensor_size = math.prod(shape) * dtype.itemsize
+                        packing_tensor_meta_data[buffer_idx].append(
+                            (name, shape, dtype, offsets[buffer_idx], tensor_size)
                         )
+                        packing_tensor_sizes[buffer_idx] += tensor_size
+                        offsets[buffer_idx] += tensor_size
+
+                packed_tensors[buffer_idx] = torch.empty(
+                    packed_size, dtype=torch.uint8, device="cuda"
+                )
+                group.broadcast(packed_tensors[buffer_idx], src=src)
+                if (
+                    protocol_error is None
+                    and packing_tensor_sizes[buffer_idx] != packed_size
+                ):
+                    protocol_error = (
+                        "Packed-broadcast payload size does not match consumer metadata: "
+                        f"producer={packed_size}, consumer={packing_tensor_sizes[buffer_idx]}"
                     )
-                except BaseException as error:
-                    consumer_error = error
+                if protocol_error is None:
+                    yield unpack_tensor(
+                        packed_tensors[buffer_idx],
+                        packing_tensor_meta_data[buffer_idx],
+                    )
+    finally:
+        # Join all recv/unpack/load side streams before returning. Without this,
+        # generation can start reading model weights while the final unpack/load
+        # copies are still in flight on the side streams, producing garbage
+        # logprobs (vLLM >= 0.25's PyNcclCommunicator enqueues on the current
+        # stream without blocking).
+        for stream in streams:
+            stream.synchronize()
 
-    # Join all recv/unpack/load side streams before returning. Without this,
-    # generation can start reading model weights while the final unpack/load
-    # copies are still in flight on the side streams, producing garbage
-    # logprobs (vLLM >= 0.25's PyNcclCommunicator enqueues on the current
-    # stream without blocking).
-    for s in streams:
-        s.synchronize()
-
-    if consumer_error is not None:
-        raise consumer_error
+    if producer_error is not None:
+        raise RuntimeError(producer_error)
     if protocol_error is not None:
         raise RuntimeError(protocol_error)
+
+
+def packed_broadcast_consumer(
+    iterator: Iterator[Any],
+    group: Any,
+    src: int,
+    post_unpack_func: Callable[[list[tuple[str, torch.Tensor]]], None] | None,
+    return_iterator: bool = False,
+    *,
+    num_buffers: int | None = None,
+    preflight_checked: bool = False,
+) -> Iterator[tuple[str, torch.Tensor]] | None:
+    """Consume a packed tensor as callbacks or a lazy weight iterator.
+
+    Args:
+        iterator: iterator of model parameters. Returns a tuple of (name, tensor)
+        group: process group (vllm PyNcclCommunicator)
+        src: source rank (0 in current implementation)
+        post_unpack_func: function to apply to each unpacked batch. May be None
+            when ``return_iterator`` is True.
+        return_iterator: return a lazy, flattened weight iterator for consumers
+            such as vLLM's ``reload_weights`` API.
+        num_buffers: number of alternating CUDA buffers/streams. Uses the
+            NRL_REFIT_NUM_BUFFERS default when unset. Chunk boundaries only
+            depend on the packed-buffer target size, so the producer and
+            consumer may use different buffer counts.
+        preflight_checked: caller already completed the shared readiness collective.
+
+    Returns:
+        A lazy iterator when ``return_iterator`` is True, otherwise None.
+
+    Note:
+        Synchronous Python unpack and load-callback failures are preserved while
+        remaining frames are drained through the terminal frame. Stream
+        synchronization, CUDA allocation/kernel/OOM, and NCCL/broadcast failures
+        are communicator-fatal and propagate directly because further
+        collectives on that context or transport are not reliable. Peer liveness
+        in that case requires communicator teardown by the caller.
+
+    """
+    batches = _packed_broadcast_consumer_batches(
+        iterator,
+        group,
+        src,
+        num_buffers=num_buffers,
+        preflight_checked=preflight_checked,
+    )
+    if return_iterator:
+
+        def weight_iterator() -> Iterator[tuple[str, torch.Tensor]]:
+            try:
+                for batch in batches:
+                    for weight in batch:
+                        yield weight
+            finally:
+                close_batches = getattr(batches, "close", None)
+                if close_batches is not None:
+                    close_batches()
+
+        return weight_iterator()
+
+    if post_unpack_func is None:
+        raise ValueError("post_unpack_func is required when return_iterator is False")
+
+    consumer_error: BaseException | None = None
+    try:
+        for batch in batches:
+            if consumer_error is not None:
+                # Keep pulling frames so the producer is not left broadcasting
+                # into a consumer that stopped participating; the failure is
+                # re-raised once the terminal frame has been read.
+                continue
+            try:
+                post_unpack_func(batch)
+            except BaseException as error:
+                consumer_error = error
+    except BaseException:
+        # A load-callback failure is the actionable one and is what this path
+        # reported before the frame protocol existed; a protocol mismatch
+        # observed while draining after it is a consequence, not the cause.
+        if consumer_error is not None:
+            raise consumer_error from None
+        raise
+    if consumer_error is not None:
+        raise consumer_error
+    return None

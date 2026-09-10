@@ -16,6 +16,7 @@
 
 import json
 import logging
+from copy import deepcopy
 from typing import Any, Dict, cast
 
 import torch
@@ -308,6 +309,173 @@ def preference_preprocessor(
     return output
 
 
+class _NemotronOmniPreferenceProcessorProxy:
+    """Render content-list images as placeholders without dropping source media."""
+
+    def __init__(self, processor: Any) -> None:
+        self._processor = processor
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._processor, name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._processor(*args, **kwargs)
+
+    @property
+    def model_input_names(self) -> list[str]:
+        # Some bundled Nemotron processors return these model-owned metadata
+        # tensors without declaring them in model_input_names.
+        return list(
+            dict.fromkeys(
+                [
+                    *getattr(self._processor, "model_input_names", []),
+                    "imgs_sizes",
+                    "num_frames",
+                ]
+            )
+        )
+
+    def apply_chat_template(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+        template_messages = []
+        image_token = getattr(self._processor, "image_token", "<image>")
+        for message in messages:
+            template_message = deepcopy(message)
+            content = message.get("content")
+            if isinstance(content, list):
+                if hasattr(self._processor, "conversation_preprocessor"):
+                    template_message = self._processor.conversation_preprocessor(
+                        message
+                    )
+                else:
+                    text_parts = []
+                    for item in content:
+                        if item["type"] == "image":
+                            text_parts.append(image_token)
+                        elif item["type"] == "text":
+                            text_parts.append(item["text"])
+                        else:
+                            raise ValueError(
+                                "Nemotron Omni MPO currently supports image/text "
+                                f"content only; got {item['type']!r}."
+                            )
+                    template_message["content"] = "\n".join(text_parts)
+            template_messages.append(template_message)
+        return self._processor.apply_chat_template(template_messages, **kwargs)
+
+
+def vlm_preference_preprocessor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    processor: AutoProcessor,
+    max_seq_length: int,
+    idx: int,
+) -> PreferenceDatumSpec:
+    """Process an image preference pair using the canonical VLM processor.
+
+    The processor-expanded token sequence and media tensors are retained
+    unchanged. NeMo-RL's Megatron data path packs the expanded rows into full
+    THD input; the canonical ``NemotronOmniModel`` inserts media embeddings
+    before selecting this rank's context-parallel tokens.
+    """
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    completions = datum_dict["completions"]
+    if len(completions) != 2:
+        raise ValueError("VLM preference training requires exactly two completions")
+    ordered = sorted(completions, key=lambda completion: completion["rank"])
+    if ordered[0]["rank"] == ordered[1]["rank"]:
+        raise ValueError("Tied preference ranks are not supported")
+
+    placeholder_style_processors = {
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+    }
+    message_processor = (
+        _NemotronOmniPreferenceProcessorProxy(processor)
+        if type(processor).__name__ in placeholder_style_processors
+        else processor
+    )
+
+    def _format_branch(completion: dict[str, Any]) -> VLMMessageLogType:
+        messages = deepcopy(datum_dict["context"]) + deepcopy(completion["completion"])
+        message_log = get_formatted_message_log(
+            messages,
+            message_processor,
+            task_data_spec,
+        )
+
+        # Mirror the canonical Nemotron Omni metadata contract. Dynamic-resolution
+        # image batches may differ spatially across rows, while imgs_sizes
+        # preserves the true crop consumed by model-owned patchification.
+        for raw_message in message_log:
+            message = cast(Any, raw_message)
+            pixel_values = message.get("pixel_values")
+            if not isinstance(pixel_values, PackedTensor):
+                continue
+            pixel_values.pad_to_max_shape = True
+            pixels = pixel_values.as_tensor()
+            if pixels is not None and pixels.ndim == 4 and "imgs_sizes" not in message:
+                num_images, _, height, width = pixels.shape
+                message["imgs_sizes"] = PackedTensor(
+                    torch.tensor(
+                        [[height, width]] * num_images,
+                        dtype=torch.long,
+                    ),
+                    dim_to_pack=0,
+                )
+            imgs_sizes = message.get("imgs_sizes")
+            if isinstance(imgs_sizes, PackedTensor) and "num_frames" not in message:
+                sizes = imgs_sizes.as_tensor()
+                if sizes is not None:
+                    message["num_frames"] = PackedTensor(
+                        torch.ones(len(sizes), dtype=torch.long),
+                        dim_to_pack=0,
+                    )
+        return cast(VLMMessageLogType, message_log)
+
+    message_log_chosen = _format_branch(ordered[0])
+    message_log_rejected = _format_branch(ordered[1])
+    length_chosen = sum(len(message["token_ids"]) for message in message_log_chosen)
+    length_rejected = sum(len(message["token_ids"]) for message in message_log_rejected)
+
+    loss_multiplier = 1.0
+    if max(length_chosen, length_rejected) > max_seq_length:
+        tokenizer = getattr(processor, "tokenizer", processor)
+        vocabulary = cast(dict[str, int], tokenizer.get_vocab())
+        media_token_ids = {
+            vocabulary[token]
+            for token in ("<img>", "<image>", "</img>")
+            if token in vocabulary
+        }
+
+        for message_log in (message_log_chosen, message_log_rejected):
+            stub_length = max(1, min(4, max_seq_length // len(message_log)))
+            for raw_message in message_log:
+                message = cast(Any, raw_message)
+                token_ids = cast(torch.Tensor, message["token_ids"])[:stub_length]
+                for media_token_id in media_token_ids:
+                    token_ids = token_ids[torch.ne(token_ids, media_token_id)]
+                message["token_ids"] = token_ids
+                for key, value in list(message.items()):
+                    if isinstance(value, PackedTensor):
+                        message[key] = PackedTensor.empty_like(value)
+        loss_multiplier = 0.0
+        length_chosen = sum(len(message["token_ids"]) for message in message_log_chosen)
+        length_rejected = sum(
+            len(message["token_ids"]) for message in message_log_rejected
+        )
+
+    return PreferenceDatumSpec(
+        message_log_chosen=message_log_chosen,
+        message_log_rejected=message_log_rejected,
+        length_chosen=length_chosen,
+        length_rejected=length_rejected,
+        loss_multiplier=loss_multiplier,
+        idx=idx,
+        task_name=task_data_spec.task_name or "vlm-preference",
+    )
+
+
 # Example of a generic math data processor
 def math_data_processor(
     datum_dict: dict[str, Any],
@@ -460,9 +628,8 @@ def vlm_hf_data_processor(
     from nemo_rl.data.datasets.response_datasets.refcoco import format_refcoco_dataset
     from nemo_rl.data.multimodal_utils import (
         PackedTensor,
-        get_dim_to_pack_along,
+        extract_multimodal_model_inputs,
         get_multimodal_default_settings_from_processor,
-        get_multimodal_keys_from_processor,
         resolve_to_image,
         uses_image_placeholder,
     )
@@ -490,6 +657,8 @@ def vlm_hf_data_processor(
         pass  # Daily-Omni data is already formatted by DailyOmniDataset.format_data
     elif datum_dict["task_name"] in ("intent-train", "intent-bench"):
         pass  # IntentDataset.format_data already produces the message structure
+    elif "messages" in datum_dict:
+        pass  # Generic ResponseDataset data can already use the message structure
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
@@ -606,50 +775,13 @@ def vlm_hf_data_processor(
 
     # add this for backward compatibility
     user_message["token_ids"] = message["input_ids"][0]
-    # add all keys and values to the user message, and the list of keys
-    multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    # Current Nemotron Omni processors emit imgs_sizes. Historical MMPR
-    # checkpoints instead emit a batch of fixed-size image tiles and only
-    # declare pixel_values. Treat each tile as one dynamic-resolution image so
-    # the Nemotron Omni path can patchify it and preserve the processor's exact
-    # placeholder count.
-    if (
-        uses_placeholder
-        and "pixel_values" in message
-        and "imgs_sizes" not in message
-        and message["pixel_values"].ndim == 4
-    ):
-        pixel_values = message["pixel_values"]
-        num_tiles, _, height, width = pixel_values.shape
-        message["imgs_sizes"] = torch.tensor(
-            [[height, width]] * num_tiles, dtype=torch.long
-        )
-
-    # imgs_sizes is not always declared in model_input_names by bundled image
-    # processors, so append it explicitly when present. RADIO uses temporal
-    # patching even for still images and requires one num_frames=1 entry per
-    # image/tile.
-    if "imgs_sizes" in message and "imgs_sizes" not in multimodal_keys:
-        multimodal_keys.append("imgs_sizes")
-    if "imgs_sizes" in message and "num_frames" not in message:
-        message["num_frames"] = torch.ones(len(message["imgs_sizes"]), dtype=torch.long)
-    if "num_frames" in message and "num_frames" not in multimodal_keys:
-        multimodal_keys.append("num_frames")
-    for key in multimodal_keys:
-        if key in message:
-            user_message[key] = PackedTensor(
-                message[key],
-                dim_to_pack=get_dim_to_pack_along(processor, key),
-                pad_to_max_shape=uses_placeholder and key == "pixel_values",
-            )
-
-    # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
-    if "token_type_ids" in message:
-        user_message["token_type_ids"] = message["token_type_ids"][0]
-
-    # for qwen2.5-vl (transformers>=5.3), mm_token_type_ids tells the model which tokens are text/image/video for 3D RoPE
-    if "mm_token_type_ids" in message:
-        user_message["mm_token_type_ids"] = message["mm_token_type_ids"][0]
+    # Single source of truth for media extraction: the MMPR imgs_sizes
+    # fallback, RADIO num_frames synthesis, PackedTensor wrapping (incl. the
+    # imgs_sizes int32 cast) and the gemma / qwen2.5-vl sequence-type maps all
+    # live in ``extract_multimodal_model_inputs``, which the NeMo-Gym path also
+    # uses. One implementation is what stops the two paths from handing the
+    # same model differently-typed inputs.
+    user_message.update(extract_multimodal_model_inputs(processor, message))
 
     ### append to user message
     message_log.append(user_message)
@@ -676,8 +808,11 @@ def vlm_hf_data_processor(
         loss_multiplier = 0.0
     else:
         # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
+        # Placeholder-style processors set vllm_content to None so vLLM uses expanded input_ids.
         vllm_kwargs = {
-            "vllm_content": string_formatted_dialog,
+            "vllm_content": (
+                None if uses_placeholder and images else string_formatted_dialog
+            ),
             "vllm_images": images,
             "vllm_audios": audios,
             "vllm_videos": videos,
@@ -799,7 +934,7 @@ def nemo_gym_data_processor(
                 "Gym video data requires a multimodal processor with "
                 "apply_chat_template and tokenizer attributes"
             )
-        from nemo_rl.environments.nemo_gym_video import (
+        from nemo_rl.environments.nemo_gym_multimodal import (
             nemo_gym_example_to_video_datum_spec,
         )
 

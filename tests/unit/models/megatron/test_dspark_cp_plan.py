@@ -111,4 +111,7 @@ def test_dspark_plan_drops_a_query_label_window_crossing_cp_ownership() -> None:
 
     assert plan.excluded_window_count > 0
     assert plan.boundary_valid_mask.all()
-    assert torch.all(plan.owner_cp_ranks[:, None] == layout.owner_cp_rank[plan.global_label_positions])
+    assert torch.all(
+        plan.owner_cp_ranks[:, None]
+        == layout.owner_cp_rank[plan.global_label_positions]
+    )
