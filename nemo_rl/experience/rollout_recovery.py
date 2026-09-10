@@ -30,11 +30,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
+from nemo_rl.experience.interfaces import nemo_gym_capture_key
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
 _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
@@ -67,7 +69,7 @@ _PROMPT_REF_STATE_FIELDS = frozenset({"sample_id", "task_name"})
 _SIBLING_STATE_FIELDS = frozenset({"generation_index", "attempts"})
 _ATTEMPT_STATE_FIELDS = frozenset(
     {
-        "attempt_uuid",
+        "attempt_index",
         "status",
         "receipt",
         "reward",
@@ -172,7 +174,7 @@ def _validate_prompt_identity(
 class RolloutAttemptRecord:
     """One physical attempt for a stable logical sibling."""
 
-    attempt_uuid: uuid.UUID
+    attempt_index: int
     status: RolloutAttemptStatus
     receipt: Optional[dict[str, Any]] = None
     reward: Optional[float] = None
@@ -181,8 +183,8 @@ class RolloutAttemptRecord:
 
     @property
     def attempt_id(self) -> str:
-        """Return the compact external representation of this attempt UUID."""
-        return self.attempt_uuid.hex
+        """Return the external representation of this numeric attempt."""
+        return str(self.attempt_index)
 
 
 @dataclass
@@ -247,11 +249,11 @@ class PromptGroupRecoveryRecord:
         return f"{self.group_id}_g{generation_index}"
 
     def gate_rollout_id(self, generation_index: int) -> str:
-        """Derive the physical Gate ID from group, sibling, and attempt UUID."""
+        """Derive the physical Gate ID from logical identity and attempt index."""
         sibling = self.siblings[generation_index]
-        return (
-            f"{self.logical_rollout_id(generation_index)}"
-            f"_a{sibling.current_attempt.attempt_id}"
+        return nemo_gym_capture_key(
+            self.logical_rollout_id(generation_index),
+            sibling.current_attempt.attempt_index,
         )
 
     @property
@@ -284,9 +286,9 @@ class SiblingSealResult:
     mask_sample: bool
 
 
-def _new_attempt() -> RolloutAttemptRecord:
+def _new_attempt(attempt_index: int) -> RolloutAttemptRecord:
     return RolloutAttemptRecord(
-        attempt_uuid=uuid.uuid4(),
+        attempt_index=attempt_index,
         status=RolloutAttemptStatus.RESERVED,
     )
 
@@ -366,7 +368,7 @@ class RolloutRecoveryLedger:
             siblings.append(
                 RolloutSiblingRecord(
                     generation_index=generation_index,
-                    attempts=[_new_attempt()],
+                    attempts=[_new_attempt(0)],
                 )
             )
         record = PromptGroupRecoveryRecord(
@@ -536,8 +538,54 @@ class RolloutRecoveryLedger:
                     f"{record.logical_rollout_id(sibling.generation_index)!r} "
                     f"from status {attempt.status.value!r}"
                 )
-            sibling.attempts.append(_new_attempt())
+            sibling.attempts.append(_new_attempt(len(sibling.attempts)))
         return self._copy_group(record)
+
+    def allocate_dispatch_attempts(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        generation_indices: list[int],
+    ) -> dict[int, int]:
+        """Allocate one numeric attempt for each sibling actually dispatched."""
+        cut.require_live()
+        record = self._require_group(group_id)
+        if record.phase is not PromptGroupPhase.ADMITTED:
+            raise ValueError(f"cannot dispatch unadmitted recovery group {group_id!r}")
+        if record.status is not PromptGroupStatus.GENERATING:
+            raise ValueError(
+                f"cannot dispatch group {group_id!r} from {record.status.value!r}"
+            )
+        if len(generation_indices) != len(set(generation_indices)):
+            raise ValueError("generation_indices must be unique")
+
+        allocated: dict[int, int] = {}
+        for generation_index in generation_indices:
+            sibling = self._require_sibling(record, generation_index)
+            attempt = sibling.current_attempt
+            if attempt.status is RolloutAttemptStatus.SEALED:
+                raise ValueError(
+                    "cannot redispatch sealed logical rollout "
+                    f"{record.logical_rollout_id(generation_index)!r}"
+                )
+            if attempt.status is RolloutAttemptStatus.DISPATCHED:
+                attempt.status = RolloutAttemptStatus.ABANDONED
+            if attempt.status in {
+                RolloutAttemptStatus.ABANDONED,
+                RolloutAttemptStatus.FAILED,
+            }:
+                attempt = _new_attempt(len(sibling.attempts))
+                sibling.attempts.append(attempt)
+            if attempt.status is not RolloutAttemptStatus.RESERVED:
+                raise ValueError(
+                    "cannot dispatch logical rollout "
+                    f"{record.logical_rollout_id(generation_index)!r} "
+                    f"from status {attempt.status.value!r}"
+                )
+            attempt.status = RolloutAttemptStatus.DISPATCHED
+            allocated[generation_index] = attempt.attempt_index
+        return allocated
 
     def mark_group_dispatched(
         self,
@@ -560,13 +608,11 @@ class RolloutRecoveryLedger:
             if generation_indices is not None
             else list(range(record.expected_generations))
         )
-        attempts = [
-            self._require_sibling(record, index).current_attempt for index in indices
-        ]
-        if any(attempt.status != RolloutAttemptStatus.RESERVED for attempt in attempts):
-            raise ValueError("only reserved rollout attempts may be dispatched")
-        for attempt in attempts:
-            attempt.status = RolloutAttemptStatus.DISPATCHED
+        self.allocate_dispatch_attempts(
+            cut,
+            group_id,
+            generation_indices=indices,
+        )
 
     def mark_sibling_sealed(
         self,
@@ -861,7 +907,7 @@ class RolloutRecoveryLedger:
                             "generation_index": sibling.generation_index,
                             "attempts": [
                                 {
-                                    "attempt_uuid": attempt.attempt_uuid.bytes,
+                                    "attempt_index": attempt.attempt_index,
                                     "status": attempt.status.value,
                                     "receipt": copy.deepcopy(attempt.receipt),
                                     "reward": attempt.reward,
@@ -894,6 +940,11 @@ class RolloutRecoveryLedger:
             context="rollout recovery state",
         )
         schema_version = state.get("schema_version")
+        if schema_version == 2:
+            raise ValueError(
+                "Unsupported rollout-recovery schema version 2: UUID attempt "
+                "identities cannot be safely migrated to numeric attempt indices"
+            )
         if (
             isinstance(schema_version, bool)
             or not isinstance(schema_version, int)
@@ -907,12 +958,8 @@ class RolloutRecoveryLedger:
             raise ValueError("rollout-recovery state must contain a groups list")
 
         ledger = cls()
-        seen_attempt_uuids: set[uuid.UUID] = set()
         for raw_group in raw_groups:
-            record = cls._group_from_state(
-                raw_group,
-                seen_attempt_uuids=seen_attempt_uuids,
-            )
+            record = cls._group_from_state(raw_group)
             if record.group_id in ledger._groups:
                 raise ValueError(f"duplicate recovery group_id={record.group_id!r}")
             ledger._groups[record.group_id] = record
@@ -946,8 +993,6 @@ class RolloutRecoveryLedger:
     def _group_from_state(
         cls,
         raw_group: Any,
-        *,
-        seen_attempt_uuids: set[uuid.UUID],
     ) -> PromptGroupRecoveryRecord:
         if not isinstance(raw_group, dict):
             raise ValueError("rollout-recovery group must be a mapping")
@@ -1020,7 +1065,7 @@ class RolloutRecoveryLedger:
             if not isinstance(attempts_state, list) or not attempts_state:
                 raise ValueError(f"logical rollout {logical_id!r} has no attempts")
             attempts: list[RolloutAttemptRecord] = []
-            for attempt_state in attempts_state:
+            for expected_attempt_index, attempt_state in enumerate(attempts_state):
                 if not isinstance(attempt_state, dict):
                     raise ValueError("rollout-recovery attempt must be a mapping")
                 _reject_unknown_fields(
@@ -1028,17 +1073,16 @@ class RolloutRecoveryLedger:
                     expected=_ATTEMPT_STATE_FIELDS,
                     context="rollout-recovery attempt",
                 )
-                raw_attempt_uuid = attempt_state.get("attempt_uuid")
+                attempt_index = attempt_state.get("attempt_index")
                 if (
-                    not isinstance(raw_attempt_uuid, bytes)
-                    or len(raw_attempt_uuid) != 16
+                    isinstance(attempt_index, bool)
+                    or not isinstance(attempt_index, int)
+                    or attempt_index != expected_attempt_index
                 ):
-                    raise ValueError("attempt_uuid must contain exactly 16 bytes")
-                attempt_uuid = uuid.UUID(bytes=raw_attempt_uuid)
-                if attempt_uuid in seen_attempt_uuids:
-                    raise ValueError("duplicate rollout attempt identity")
-                seen_attempt_uuids.add(attempt_uuid)
-                gate_id = f"{logical_id}_a{attempt_uuid.hex}"
+                    raise ValueError(
+                        "attempt indices must be contiguous non-negative integers"
+                    )
+                gate_id = nemo_gym_capture_key(logical_id, attempt_index)
                 raw_attempt_status = attempt_state.get("status")
                 if not isinstance(raw_attempt_status, str):
                     raise ValueError(
@@ -1088,7 +1132,7 @@ class RolloutRecoveryLedger:
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
                     RolloutAttemptRecord(
-                        attempt_uuid=attempt_uuid,
+                        attempt_index=attempt_index,
                         status=attempt_status,
                         receipt=copy.deepcopy(receipt),
                         reward=float(reward) if reward is not None else None,

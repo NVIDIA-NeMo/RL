@@ -106,6 +106,7 @@ def _make_manager(buffer, impl, policy) -> RolloutManager:
     manager = object.__new__(RolloutManager)
     manager._impl = impl
     manager._tokenizer = None
+    manager._use_nemo_gym = False
     manager._num_generations_per_prompt = 1
     manager._tq_buffer = buffer
     manager._weight_version = 0
