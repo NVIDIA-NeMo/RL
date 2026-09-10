@@ -26,10 +26,15 @@ from nemo_rl.data_plane import KVBatchMeta
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
-    {"probs_ratio_min", "probs_ratio_clamped_min"}
+    {"probs_ratio_min", "probs_ratio_clamped_min", "opd_full_reverse_kl_min"}
 )
 _MB_METRIC_MAX: frozenset[str] = frozenset(
-    {"probs_ratio_max", "probs_ratio_clamped_max"}
+    {
+        "probs_ratio_max",
+        "probs_ratio_clamped_max",
+        "opd_full_reverse_kl_max",
+        "opd_full_decomposition_error",
+    }
 )
 _MB_METRIC_MEAN: frozenset[str] = frozenset(
     {
