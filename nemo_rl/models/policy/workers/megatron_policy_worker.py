@@ -3128,6 +3128,12 @@ class MegatronPolicyWorkerImpl(
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
     ) -> None:
+        # Refit reads parameters directly, without the forward all-gather hooks.
+        if isinstance(self.model, DistributedDataParallel):
+            if self.model.ddp_config.overlap_param_gather:
+                self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
+                self.model.start_param_sync(force_sync=True)
+                torch.cuda.synchronize()
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
@@ -3776,6 +3782,13 @@ class MegatronPolicyWorkerImpl(
         # those tensors for CPU storage, so the checkpoint references would keep
         # the old CUDA storage alive and defeat the offload.
         self.finalize_async_save()
+
+        # Gather before offloading buffers that may also back parameter storage.
+        if isinstance(self.model, DistributedDataParallel):
+            if self.model.ddp_config.overlap_param_gather:
+                self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
+                self.model.start_param_sync(force_sync=True)
+                torch.cuda.synchronize()
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
