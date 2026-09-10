@@ -27,15 +27,12 @@ The same reasoning covers the NeMo-Gym port-reservation wiring
 socket/plumbing contracts, pinned here without a GPU.
 """
 
+import asyncio
 import socket
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-    text_generation_server as mlm_text_gen_server,
-)
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import HeldPortReservation
@@ -172,7 +169,8 @@ def test_http_server_port_reservation(monkeypatch):
     reserved port is bound and listening from reservation time (early Gym
     probes queue instead of being refused), the worker adopts that same socket
     through the fd handoff — the port is never released in between — and the
-    server falls back to a fresh port only when nothing was reserved.
+    server falls back to a fresh port only when nothing was reserved. Teardown
+    then closes the LLM handle once and drops the published URL.
     """
     # The holder resolves the node IP via held_port; the server resolves it via
     # virtual_cluster (megatron_worker imports it at call time). Patch both.
@@ -193,40 +191,59 @@ def test_http_server_port_reservation(monkeypatch):
     with socket.create_connection(("127.0.0.1", port), timeout=5):
         pass
 
-    # Server start with the network and MLM server stubbed out.
-    started = {}
-    monkeypatch.setattr(
-        mlm_text_gen_server,
-        "start_text_gen_server",
-        lambda **kwargs: started.update(kwargs),
-    )
+    # Server start with the LLM handle faked; MegatronAsyncLLM.serve owns the
+    # sock/port pass-through to the MLM server and returns once it listens.
+    class FakeServingLLM:
+        """Captures the ServeConfig handed to MegatronAsyncLLM.serve."""
+
+        def __init__(self) -> None:
+            self.serve_config = None
+            self.serve_blocking = None
+            self.close_calls = 0
+
+        async def serve(self, serve_config, *, blocking=True):
+            self.serve_config = serve_config
+            self.serve_blocking = blocking
+
+        def run_sync(self, coro):
+            return asyncio.run(coro)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
     monkeypatch.setattr(
         "nemo_rl.distributed.virtual_cluster._get_free_port_local",
         lambda: 12345,
     )
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    requests_mock = MagicMock()
-    health_get = requests_mock.Session.return_value.__enter__.return_value.get
-    health_get.return_value.status_code = 200
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.megatron.megatron_worker.requests",
-        requests_mock,
-    )
 
     for reserved_port, expected_port in ((port, port), (None, 12345)):
-        worker = SimpleNamespace(
-            coordinator_addr="tcp://127.0.0.1:5555",
-            megatron_tokenizer=object(),
-            rank=0,
-            cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
-            _reserved_http_server_port=reserved_port,
-            inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
-        )
-        base_url = MegatronGenerationMixin._setup_openai_api_server(worker)
-        reserved_socket = started["sock"]
+        llm = FakeServingLLM()
+        worker = object.__new__(MegatronGenerationMixin)
+        worker._init_inference_engine_state()
+        worker.rank = 0
+        # Non-default so a dropped pass-through cannot hide behind ServeConfig's [].
+        worker.cfg = {
+            "generation": {"mcore_generation_config": {"parsers": ["json", "tool_use"]}}
+        }
+        worker._reserved_http_server_port = reserved_port
+        worker.llm = llm
+        base_url = worker._setup_openai_api_server()
+        assert llm.serve_config is not None
+        reserved_socket = llm.serve_config.sock
         try:
-            assert started["server_port"] == expected_port
+            assert llm.serve_config.port == expected_port
+            assert llm.serve_config.parsers == ["json", "tool_use"]
+            assert llm.serve_blocking is False
             assert base_url == f"http://10.0.0.5:{expected_port}/v1"
+
+            # Teardown closes the handle once and drops the URL; a second call
+            # finds no engine and does nothing.
+            worker.base_url = base_url
+            worker.shutdown_inference_engine()
+            assert llm.close_calls == 1
+            assert worker.llm is None and worker.base_url is None
+            worker.shutdown_inference_engine()
+            assert llm.close_calls == 1
             if reserved_port is None:
                 assert reserved_socket is None
                 continue

@@ -149,9 +149,7 @@ def test_direct_megatron_video_request_marks_preexpanded_prompt():
     ("modality", "num_frames"),
     [("image", torch.tensor([1])), ("video", torch.tensor([4]))],
 )
-def test_direct_megatron_multimodal_generate_round_trip(
-    monkeypatch, modality, num_frames
-):
+def test_direct_megatron_multimodal_generate_round_trip(modality, num_frames):
     """Exercise RL request construction and response packing around a mocked MCore LLM."""
 
     class _MultimodalWrapper:
@@ -173,7 +171,6 @@ def test_direct_megatron_multimodal_generate_round_trip(
     }
     worker.tokenizer = SimpleNamespace(pad_token_id=0)
     worker.megatron_tokenizer = SimpleNamespace(eod=2)
-    worker._inference_loop = object()
     worker._get_megatron_inference_wrapper_cls = lambda: _MultimodalWrapper
 
     frame_count = int(num_frames.sum())
@@ -211,19 +208,12 @@ def test_direct_megatron_multimodal_generate_round_trip(
     ]
     worker._generate_with_persistent_engine = mock_generate
 
-    class _CompletedFuture:
-        def result(self):
+    class _FakeLLM:
+        def run_sync(self, coro):
+            assert coro is mocked_call
             return replies
 
-    def mock_run_coroutine_threadsafe(call, loop):
-        assert call is mocked_call
-        assert loop is worker._inference_loop
-        return _CompletedFuture()
-
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.megatron.megatron_worker.asyncio.run_coroutine_threadsafe",
-        mock_run_coroutine_threadsafe,
-    )
+    worker.llm = _FakeLLM()
 
     output = worker.generate(data=data)
 
