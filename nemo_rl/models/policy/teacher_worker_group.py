@@ -170,6 +170,9 @@ class TeacherWorkerGroup:
 
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.
+        # Rollout routes belong to the student, not the teacher (which may have
+        # different experts). Teacher batches intentionally carry no routes.
+        cfg["router_replay"] = {"enabled": False}
         if cfg.get("dtensor_cfg", {}).get("enabled", False):
             raise ValueError(
                 f"Teacher '{self.alias}': only the Megatron backend is supported "
@@ -295,7 +298,12 @@ class TeacherWorkerGroup:
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
-            common_kwargs={"micro_batch_size": mbs},
+            common_kwargs={
+                "micro_batch_size": mbs,
+                # Like reference-policy scoring, teachers use their own router.
+                # This also prevents materializing any supplied Ray route tags.
+                "require_router_replay": False,
+            },
         )
         logprobs = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures)
