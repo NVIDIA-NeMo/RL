@@ -1081,3 +1081,47 @@ def print_efficiency_summary(
     loggable["efficiency/efficiency_pct_is_per_step"] = float(pct_is_per_step)
 
     return loggable
+
+
+def check_train_dataloader_not_empty(
+    dataloader: Any,
+    *,
+    dataset: Any,
+    batch_size: int,
+    batch_size_source: str,
+    context: str = "",
+) -> None:
+    """Fail fast when a ``drop_last`` train dataloader would yield zero batches.
+
+    Every training entry point builds its train dataloader with
+    ``drop_last=True``, so a batch size larger than the dataset produces a
+    dataloader of length zero: the training loop body never runs, yet epochs
+    advance and the run completes "successfully" without a single gradient
+    update. Raise up front and name the mismatch instead.
+
+    Args:
+        dataloader: The freshly constructed train dataloader.
+        dataset: The underlying train dataset (used for the message; a dataset
+            without ``__len__`` skips the check entirely).
+        batch_size: The batch size the dataloader was built with.
+        batch_size_source: Where that batch size comes from, as the user knows
+            it (e.g. ``policy.train_global_batch_size``); used in the message.
+        context: Optional suffix identifying the dataloader (e.g. a task name)
+            when a setup builds more than one.
+    """
+    try:
+        num_batches = len(dataloader)
+        dataset_size = len(dataset)
+    except TypeError:
+        # Iterable-style dataset without a length; nothing to pre-check.
+        return
+    if num_batches > 0:
+        return
+    raise ValueError(
+        f"The train dataloader{context} would yield zero batches: "
+        f"{batch_size_source}={batch_size} exceeds the dataset size "
+        f"({dataset_size} samples), and with drop_last=True the only, partial "
+        f"batch is dropped. Training would silently complete without a single "
+        f"gradient update. Reduce {batch_size_source} to at most the dataset "
+        f"size, or provide more data."
+    )
