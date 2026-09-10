@@ -31,6 +31,7 @@ from nemo_rl.distributed.batched_data_dict import (
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
@@ -105,6 +106,35 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         reserved_http_server_port: Optional[int] = None,
     ):
         self.debug_payload_metrics = False
+        configured_extension_fqn = config.get("worker_extension_cls_fqn")
+        if (
+            configured_extension_fqn is not None
+            and worker_extension_cls_fqn is not None
+            and configured_extension_fqn != worker_extension_cls_fqn
+        ):
+            raise ValueError(
+                "worker_extension_cls_fqn was set to different values in the "
+                "policy config and Policy constructor"
+            )
+        extension_fqn = (
+            configured_extension_fqn
+            if configured_extension_fqn is not None
+            else worker_extension_cls_fqn
+        )
+        # Only the config-supplied FQN is mutually exclusive with quant_cfg: a config
+        # author cannot know which worker quant_cfg resolves to, so silently replacing
+        # it would be a footgun. The constructor argument is exempt because callers
+        # passing it already see the resolved class name and are expected to subclass
+        # it, which has always been supported alongside quantization.
+        if configured_extension_fqn is not None and config.get("quant_cfg") is not None:
+            raise ValueError(
+                "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
+                "a custom policy worker cannot be combined with ModelOpt quantization"
+            )
+        if extension_fqn is not None:
+            # Validate registration before allocating workers or placement groups.
+            get_actor_python_env(extension_fqn)
+
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
@@ -237,11 +267,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
         # If a worker extension class is provided, use it instead of the default worker builder class
-        if worker_extension_cls_fqn is not None:
+        if extension_fqn is not None:
             print(
-                f"Using worker extension class: {worker_extension_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
+                f"Using worker extension class: {extension_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
             )
-            worker_builder_cls_fqn = worker_extension_cls_fqn
+            worker_builder_cls_fqn = extension_fqn
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
