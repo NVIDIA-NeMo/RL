@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -79,6 +80,31 @@ PostProcessingFunction = Union[
     "TeacherFullPayloadPostProcessor",
     "TopkLogitsPostProcessor",
 ]
+
+
+def _prepare_position_ids_for_model(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    packed_seq_params: Optional[PackedSeqParams],
+) -> Optional[torch.Tensor]:
+    """Supply unused position IDs for MCore's packed HybridModel MTP assertion."""
+    if position_ids is not None or packed_seq_params is None:
+        return position_ids
+
+    core_model = unwrap_model(model)
+    # Deliberately exclude VLM wrappers/subclasses and learned absolute positions.
+    # MCore f96158a9 requires non-null MTP position IDs, even though this path
+    # builds RoPE separately from packed metadata and never embeds these IDs.
+    # Match the actual forward input (including its CP shard), not the full batch.
+    if (
+        type(core_model) is HybridModel
+        and core_model.mtp_process
+        and core_model.position_embedding_type in ("rope", "yarn", "none")
+        and not core_model.embedding.add_position_embedding
+    ):
+        return torch.zeros_like(input_ids)
+    return position_ids
 
 
 def _prepare_padding_mask_for_model(
@@ -188,6 +214,10 @@ def model_forward(
     )
     if len(multimodal_data) > 0:
         position_ids = None
+    else:
+        position_ids = _prepare_position_ids_for_model(
+            model, input_ids_cp_sharded, position_ids, packed_seq_params
+        )
 
     additional_kwargs = {}
     # Mamba models currently do not support packed_seq_params
