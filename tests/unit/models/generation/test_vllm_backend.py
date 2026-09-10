@@ -1178,9 +1178,12 @@ def test_generation_prepare_refit_info_rejects_mxfp8_grouped_moe(
             "is_mx": True,
         }
     }
-    generation.worker_group = SimpleNamespace(
-        run_all_workers_single_data=MagicMock(return_value=["future"])
-    )
+    # Same per-leader dispatch as the test below. Asserting on the old whole-group call
+    # would pass whatever the code did, since nothing calls it any more.
+    leader = MagicMock()
+    generation.worker_group = SimpleNamespace(workers=[leader])
+    generation.dp_size = 1
+    generation._refit_membership = None
     monkeypatch.setattr(vllm_generation.ray, "get", MagicMock())
 
     with pytest.raises(AssertionError, match="MXFP8 refit does not support"):
@@ -1188,7 +1191,8 @@ def test_generation_prepare_refit_info_rejects_mxfp8_grouped_moe(
             {"model.layers.0.mlp.experts.gate_up_proj": object()}
         )
 
-    generation.worker_group.run_all_workers_single_data.assert_not_called()
+    leader.prepare_refit_info.remote.assert_not_called()
+    leader.prepare_refit_info_async.remote.assert_not_called()
 
 
 @pytest.mark.vllm
@@ -1250,21 +1254,25 @@ def test_generation_prepare_refit_info_keeps_reload_flag_out_of_rpc(
             "refit_with_reload_api": True,
         }
     }
-    generation.worker_group = SimpleNamespace(
-        run_all_workers_single_data=MagicMock(return_value=["future"])
-    )
+    # Addressed per surviving DP leader rather than through the worker group: the
+    # whole-group fan-out reaches a dead actor once a shard is lost, which is exactly
+    # the state prepare_refit_info runs in on the recovery path. _refit_leader_workers
+    # with no recorded membership is every leader, so one shard is one worker here.
+    leader = MagicMock()
+    generation.worker_group = SimpleNamespace(workers=[leader])
+    generation.dp_size = 1
+    generation._refit_membership = None
     ray_get = MagicMock()
     monkeypatch.setattr(vllm_generation.ray, "get", ray_get)
     state_dict_info = {"model.weight": object()}
 
     generation.prepare_refit_info(state_dict_info)
 
-    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-        expected_method,
-        state_dict_info=state_dict_info,
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-    )
-    ray_get.assert_called_once_with(["future"])
+    # The point of the test: state_dict_info and nothing else. refit_with_reload_api is
+    # a local engine setting and must not travel in the RPC.
+    remote = getattr(leader, expected_method).remote
+    remote.assert_called_once_with(state_dict_info=state_dict_info)
+    ray_get.assert_called_once_with([remote.return_value])
 
 
 @pytest.mark.vllm
