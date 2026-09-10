@@ -31,8 +31,77 @@ from nemo_rl.models.policy.utils import (
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
+    resolve_model_class,
     stream_weights_via_ipc_zmq_impl,
 )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "hf_class_name", "nemo_class_name"),
+    [
+        ("qwen2_5_vl", "hf_image_text", "nemo_image_text"),
+        ("qwen2_5_omni", "hf_text_waveform", "nemo_text_waveform"),
+        ("unknown_model", "hf_causal_lm", "nemo_causal_lm"),
+    ],
+)
+@pytest.mark.parametrize("nemo_available", [False, True])
+def test_resolve_model_class_selects_requested_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    model_type: str,
+    hf_class_name: str,
+    nemo_class_name: str,
+    nemo_available: bool,
+) -> None:
+    """The caller chooses plain Transformers or NeMo AutoModel classes."""
+    hf_classes = {
+        "hf_image_text": object(),
+        "hf_text_waveform": object(),
+        "hf_causal_lm": object(),
+    }
+    nemo_classes = {
+        "nemo_image_text": object(),
+        "nemo_text_waveform": object(),
+        "nemo_causal_lm": object(),
+    }
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.HF_AUTOMODEL_FACTORY",
+        {
+            "qwen2_5_vl": hf_classes["hf_image_text"],
+            "qwen2_5_omni": hf_classes["hf_text_waveform"],
+        },
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.AUTOMODEL_FACTORY",
+        {
+            "qwen2_5_vl": nemo_classes["nemo_image_text"],
+            "qwen2_5_omni": nemo_classes["nemo_text_waveform"],
+        },
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.AutoModelForCausalLM",
+        hf_classes["hf_causal_lm"],
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.NeMoAutoModelForCausalLM",
+        nemo_classes["nemo_causal_lm"],
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.NEMO_AUTOMODEL_AVAILABLE", nemo_available
+    )
+
+    assert (
+        resolve_model_class(model_type, use_nemo_automodel=False)
+        is hf_classes[hf_class_name]
+    )
+    expected_default = (
+        nemo_classes[nemo_class_name] if nemo_available else hf_classes[hf_class_name]
+    )
+    assert resolve_model_class(model_type) is expected_default
+
+
+def test_resolve_model_class_routes_gemma4_unified_to_image_text_model():
+    assert "ImageTextToText" in resolve_model_class("gemma4_unified").__name__
 
 
 class TestGetMegatronCheckpointDir:
@@ -135,6 +204,79 @@ class _FakeIpcSocket:
 
     def getsockopt(self, _option):
         return 0
+
+
+def test_stream_weights_drains_group_before_requesting_next(monkeypatch):
+    events = []
+
+    class OrderingSocket(_FakeIpcSocket):
+        def send_pyobj(self, payload):
+            if payload == IPCProtocol.COMPLETE:
+                events.append("complete")
+            else:
+                events.append(("send", payload[1]))
+            super().send_pyobj(payload)
+
+        def recv(self):
+            events.append("ack")
+            return super().recv()
+
+    def param_groups():
+        events.append("group_0")
+        tensor = torch.ones(1)
+        tensor_ref = weakref.ref(tensor)
+        group = (("weight_0", tensor),)
+        yield group
+        del group, tensor
+        assert tensor_ref() is None
+        events.append("group_0_released")
+
+        events.append("group_1")
+        yield tuple((f"weight_{index}", torch.ones(1)) for index in range(1, 4))
+
+        events.append("group_2")
+        yield (("oversized_weight", torch.ones(300)),)
+
+        events.append("empty_group")
+        yield ()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: unittest.mock.Mock(synchronize=lambda: None),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda _buffer: ("ipc-handle",),
+    )
+
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=param_groups(),
+        buffer_size_bytes=2048,
+        zmq_socket=OrderingSocket(),
+        rank=0,
+        worker_name="test_worker",
+        drain_between_groups=True,
+    )
+
+    assert events == [
+        "group_0",
+        ("send", ["weight_0"]),
+        "ack",
+        "group_0_released",
+        "group_1",
+        ("send", ["weight_1", "weight_2"]),
+        "ack",
+        ("send", ["weight_3"]),
+        "ack",
+        "group_2",
+        ("send", ["oversized_weight"]),
+        "ack",
+        "empty_group",
+        "complete",
+        "ack",
+    ]
 
 
 def test_stream_weights_releases_buffers_before_complete_without_full_gc(

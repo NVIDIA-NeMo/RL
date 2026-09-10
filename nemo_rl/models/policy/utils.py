@@ -56,18 +56,18 @@ except ImportError:
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
-# an automodel factory for loading the huggingface models from correct class
-
-AUTOMODEL_FACTORY: Dict[str, Any] = {
-    # Add an entry here when a model (1) uses HF's standard loading path
-    # (no custom NeMo automodel impl) AND (2) its architecture isn't
-    # loadable via AutoModelForCausalLM (e.g. VLMs using
-    # ForConditionalGeneration / ForImageTextToText). Models with a
-    # custom NeMo automodel impl (e.g. qwen3_5_moe) don't need an entry
-    # — the custom impl intercepts from_pretrained regardless of the
-    # parent AutoModel class. Check MODEL_ARCH_MAPPING in the NeMo
-    # automodel registry to see which architectures have custom impls:
-    # https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
+# Plain Hugging Face classes remain separate from the NeMo AutoModel wrappers so
+# callers that manage distribution can request them when NeMo AutoModel is installed.
+# Add an entry here whenever a model's architecture isn't loadable via
+# AutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /
+# ForImageTextToText). Unlike AUTOMODEL_FACTORY below, this dict is also read on
+# the ``use_nemo_automodel=False`` path (DTensor V1), where no NeMo custom impl
+# intercepts from_pretrained -- so a model that has a custom NeMo automodel impl
+# still needs an entry here when its parent AutoModel class is not
+# AutoModelForCausalLM. Check MODEL_ARCH_MAPPING in the NeMo automodel registry
+# to see which architectures have custom impls:
+# https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
+HF_AUTOMODEL_FACTORY: Dict[str, Any] = {
     "qwen2_5_vl": AutoModelForImageTextToText,
     "qwen2_vl": AutoModelForImageTextToText,
     "qwen2_5_omni": AutoModelForTextToWaveform,
@@ -76,10 +76,13 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
     "internvl": AutoModelForImageTextToText,
     "gemma3": AutoModelForImageTextToText,
     "gemma4": AutoModelForImageTextToText,
+    "gemma4_unified": AutoModelForImageTextToText,
     "smolvlm": AutoModelForImageTextToText,
     "mistral3": AutoModelForImageTextToText,
     "llama4": AutoModelForImageTextToText,
 }
+
+AUTOMODEL_FACTORY: Dict[str, Any] = HF_AUTOMODEL_FACTORY
 
 if NEMO_AUTOMODEL_AVAILABLE:
     AUTOMODEL_FACTORY = {
@@ -93,6 +96,7 @@ if NEMO_AUTOMODEL_AVAILABLE:
         "internvl": NeMoAutoModelForImageTextToText,
         "gemma3": NeMoAutoModelForImageTextToText,
         "gemma4": NeMoAutoModelForImageTextToText,
+        "gemma4_unified": NeMoAutoModelForImageTextToText,
         "smolvlm": NeMoAutoModelForImageTextToText,
         "mistral3": NeMoAutoModelForImageTextToText,
         "llama4": NeMoAutoModelForImageTextToText,
@@ -129,11 +133,21 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
 
 
-def resolve_model_class(model_name: str) -> Any:
-    """Resolve the appropriate model class for a given model name."""
-    if NEMO_AUTOMODEL_AVAILABLE:
+def resolve_model_class(
+    model_name: str,
+    *,
+    use_nemo_automodel: bool = True,
+) -> Any:
+    """Resolve the model class for a model type.
+
+    Args:
+        model_name: Model type to resolve.
+        use_nemo_automodel: Whether to prefer NeMo AutoModel wrappers when they
+            are available.
+    """
+    if use_nemo_automodel and NEMO_AUTOMODEL_AVAILABLE:
         return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
+    return HF_AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -360,7 +374,13 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
+    *,
+    drain_between_groups: bool = False,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -368,11 +388,14 @@ def stream_weights_via_ipc_zmq_impl(
     to reduce memory allocation overhead and improve stability.
 
     Args:
-        params_generator: Generator yielding (name, tensor) pairs
+        params_generator: Generator yielding (name, tensor) pairs. When
+            ``drain_between_groups`` is true, yields groups of those pairs.
         buffer_size_bytes: total size of buffer in bytes for batching parameters
         zmq_socket: ZMQ socket for communication
         rank: Worker rank for logging
         worker_name: Name of the worker for logging
+        drain_between_groups: Drain buffered tensors and acknowledgements before
+            requesting the next parameter group.
     """
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
@@ -433,7 +456,42 @@ def stream_weights_via_ipc_zmq_impl(
     count_of_groups = 0
 
     try:
-        for name, tensor in params_generator:
+        group_boundary = object()
+        if drain_between_groups:
+            param_groups = params_generator
+
+            def _iter_params_with_group_boundaries():
+                groups = iter(param_groups)
+                while True:
+                    try:
+                        group = next(groups)
+                    except StopIteration:
+                        return
+                    try:
+                        yield from group
+                    finally:
+                        del group
+                    yield group_boundary
+
+            params_generator = _iter_params_with_group_boundaries()
+
+        for item in params_generator:
+            if item is group_boundary:
+                # The grouped producer may synchronize before its next group.
+                # Drain this group first so producer and consumer cannot wait on
+                # opposite sides of that synchronization.
+                if param_names:
+                    await_recv = send_buffer_group_overlap(
+                        current_buffer, param_names, used_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    used_bytes, param_names = 0, []
+                if await_recv:
+                    zmq_socket.recv()
+                    await_recv = False
+                continue
+
+            name, tensor = item
             # Initialize device and buffers on first tensor
             if buffer_a is None:
                 buffer_device = tensor.device
@@ -485,6 +543,7 @@ def stream_weights_via_ipc_zmq_impl(
                 finally:
                     del oversized_buffer
                     torch.cuda.empty_cache()
+                del tensor
                 continue
 
             # Check if we need to send current buffer and switch to the other one
@@ -501,6 +560,7 @@ def stream_weights_via_ipc_zmq_impl(
             # Pack tensor into current buffer
             param_names.append(name)
             used_bytes = pack_tensor(current_buffer, tensor, used_bytes)
+            del tensor
 
         # Send remaining tensors
         if param_names:
