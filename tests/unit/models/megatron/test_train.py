@@ -1184,6 +1184,16 @@ class TestLossPostProcessor:
 class TestLogprobsPostProcessor:
     """Tests for LogprobsPostProcessor class."""
 
+    def test_rejects_topk_with_fused_linear_logprobs(self):
+        from nemo_rl.models.megatron.train import LogprobsPostProcessor
+
+        with pytest.raises(ValueError, match="incompatible with fused-linear"):
+            LogprobsPostProcessor(
+                cfg={"sequence_packing": {"enabled": False}},
+                use_fused_linear_logprobs=True,
+                topk=16,
+            )
+
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0

@@ -307,6 +307,22 @@ class Fp8Config(TypedDict):
 
 
 # Type exists to be lax if not specified
+def provider_override_allowed(megatron_cfg: Any, key: str) -> bool:
+    """Whether a megatron_cfg key may be applied onto the model provider.
+
+    Student configs carry no allowlist and every key applies (status quo).
+    Teacher configs (built by TeacherWorkerGroup from a clone of the student's
+    config) carry ``_provider_override_allowlist`` = the keys explicitly set
+    for that teacher (``default_teacher_cfg`` merged with its
+    ``teacher_overrides``): a teacher's model structure comes
+    from its own checkpoint, so inherited student keys must not reach its
+    provider (a VLM student's tower keys crash a text teacher at load; its
+    mtp_num_layers=0 crashes an MTP-bearing teacher at first forward).
+    """
+    allowlist = megatron_cfg.get("_provider_override_allowlist")
+    return allowlist is None or key in allowlist
+
+
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
 
@@ -576,6 +592,11 @@ class RouterReplayConfigDisabled(TypedDict):
 
 class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
+    # ``inline`` carries the dense tensor through Gym and the RL driver.
+    # ``ray`` carries small tags and resolves the tensor in policy workers.
+    transport: NotRequired[Literal["inline", "ray"]]
+    # Internal run-unique store identifier populated during setup.
+    _store_run_instance_id: NotRequired[str]
 
 
 class PolicyConfig(TypedDict):

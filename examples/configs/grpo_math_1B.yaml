@@ -41,6 +41,8 @@ grpo:
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    proximal_teacher_alpha: 1.0  # OPD/TROPD teacher interpolation weight in (0, 1]
+    subtract_global_baseline: false  # OPD/TROPD: center valid token advantages globally
   reward_scaling:
     enabled: false
     source_min: 0.0

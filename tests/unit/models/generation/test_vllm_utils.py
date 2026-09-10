@@ -26,7 +26,6 @@ from nemo_rl.models.generation.interfaces import (
     get_num_routed_experts,
     resolve_routed_experts_dtype,
 )
-from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
@@ -1042,22 +1041,83 @@ def test_pad_and_align_uses_resolved_dtype():
     )
 
 
-def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
-    monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
-
+def test_pad_and_align_accepts_uint16_backend_routes():
     class Output:
         pass
 
     request_output = Output()
     completion_output = Output()
-    completion_output.routed_experts = torch.full((2, 1, 2), 200)
+    completion_output.routed_experts = torch.tensor(
+        [[[1, 2]], [[3, 4]]], dtype=torch.uint16
+    )
 
-    with pytest.raises(ValueError, match="exceeds the resolved carry dtype"):
-        pad_and_align_routed_expert_indices(
-            request_output,
-            completion_output,
-            valid_length=3,
-            padded_length=3,
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=3,
+        padded_length=3,
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.int16,
+    )
+
+    assert routed_experts.dtype == torch.int16
+    assert torch.equal(
+        routed_experts[:2],
+        completion_output.routed_experts.to(torch.int16),
+    )
+
+
+def test_attach_routed_experts_uses_ref_factory_once():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        prompt_routed_experts=torch.tensor(
+            [[[10]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+        ),
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[200],
+                routed_experts=torch.tensor(
+                    [[[20]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+    stored = []
+
+    def make_ref(routed_experts):
+        stored.append(routed_experts.clone())
+        return {"schema": "test-ref"}
+
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.int16,
+        routed_experts_ref_factory=make_ref,
+    )
+
+    assert response.choices[0].message.routed_experts == {"schema": "test-ref"}
+    assert len(stored) == 1
+    assert stored[0].dtype == torch.int16
+    assert stored[0].tolist() == [[[10]], [[20]], [[0]]]
+
+
+def test_attach_routed_experts_ref_rejects_multiple_choices():
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="exactly one chat choice"):
+        attach_routed_experts_to_chat_response_choices(
+            response,
+            SimpleNamespace(outputs=[]),
             device=torch.device("cpu"),
-            routed_experts_dtype=torch.int8,
+            routed_experts_ref_factory=lambda routed_experts: {},
         )

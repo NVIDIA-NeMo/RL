@@ -36,7 +36,10 @@ from nemo_rl.distributed.batched_data_dict import (
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
-from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.models.policy.interfaces import (
+    ReferenceLogprobOutputSpec,
+    TopkLogitsOutputSpec,
+)
 
 
 @dataclass
@@ -80,7 +83,9 @@ def create_teacher_configs_from_opd_config(
             continue
         seen_models.add(model_name)
 
-        # defaults <- per-alias override, then validated/typed by the schema.
+        # defaults <- per-alias override, then schema-validated. Partial blocks
+        # are honored as written; set gpus_per_node in default_teacher_cfg to
+        # match the cluster (the schema default is 8).
         merged = {**default_cfg, **dict(overrides.get(alias, {}))}
         res = TeacherResourceConfig(**merged)
 
@@ -149,6 +154,19 @@ class TeacherWorkerGroup:
         # Apply any additional megatron config overrides from teacher config.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
+
+        # A teacher's MODEL comes from its own checkpoint: only keys the user
+        # explicitly wrote for this teacher may be applied onto its model
+        # provider. The clone of the student's config above is kept only for
+        # data-pipeline fields (packing, chunking, precision, ...), which must
+        # match the student's batches; its model-architecture keys (towers,
+        # mtp, ...) must not leak onto a possibly different architecture.
+        # setup.py / community_import.py consult this allowlist when building
+        # teacher providers; student configs carry no allowlist and behave as
+        # before.
+        cfg["megatron_cfg"]["_provider_override_allowlist"] = sorted(
+            teacher_cfg.megatron_cfg_overrides.keys()
+        )
 
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.
@@ -289,6 +307,64 @@ class TeacherWorkerGroup:
 
         # Undo packing reorder if needed — must use inverse permutation
         # (argsort), matching lm_policy.py's reorder_data.
+        if unsorted_data_indices is not None:
+            result.reorder_data(unsorted_data_indices)
+
+        return result
+
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        return_logsumexp: bool = False,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Run forward pass on teacher and return per-position top-k logits."""
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        mbs = micro_batch_size or self._micro_batch_size
+
+        if self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+            unsorted_data_indices = None
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "get_topk_logits",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "k": k,
+                "micro_batch_size": mbs,
+                "return_logsumexp": return_logsumexp,
+            },
+        )
+
+        pad_value_dict = {"topk_logits": 0.0, "topk_indices": -1}
+        if return_logsumexp:
+            pad_value_dict["V_logsumexp"] = 0.0
+        result = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures),
+            pad_value_dict=pad_value_dict,
+        )
+
         if unsorted_data_indices is not None:
             result.reorder_data(unsorted_data_indices)
 

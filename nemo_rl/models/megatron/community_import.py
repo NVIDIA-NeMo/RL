@@ -133,7 +133,14 @@ def import_model_from_hf_name(
     model_provider = bridge.to_megatron_provider(load_weights=True)
 
     if megatron_config is not None:
+        # Function-scope import: containers may carry an older installed
+        # nemo_rl in isolated worker venvs; resolving at call time (after the
+        # launcher's PYTHONPATH is in effect) avoids stale-module imports.
+        from nemo_rl.models.policy import provider_override_allowed
+
         for key, value in iter_vlm_config_overrides(megatron_config):
+            if not provider_override_allowed(megatron_config, key):
+                continue
             # Match the import-time behaviour in megatron/setup.py: a key the
             # recipe set explicitly must not be dropped just because this
             # provider lacks the field, or a frozen tower silently trains.

@@ -23,6 +23,72 @@ policy:
     enabled: true
 ```
 
+`policy.router_replay.transport` selects how route data reaches the policy:
+
+- `inline` (the default) carries dense routed-expert indices in the rollout
+  batch. When `data_plane.enabled=true`, this is the existing TransferQueue
+  implementation; there is no separate TQ selector.
+- `ray` carries only an opaque tag through Gym and the RL replay buffer. A
+  source-local actor on the generation node owns a Ray reference to each full
+  routed-expert array. Policy workers retrieve that immutable whole object
+  directly for unsliced single-turn samples. For sliced multi-turn samples,
+  the source actor returns only the logical ranges selected by the policy
+  microbatch, preventing cumulative prompts from making reads quadratic in the
+  number of turns. This path currently requires async GRPO,
+  `env.should_use_nemo_gym=true`, vLLM's async engine, and
+  `data_plane.enabled=false`. It also requires
+  `checkpointing.load_replay_buffer=false`: replay-buffer checkpoints contain
+  only tags, not the Ray-owned route arrays. On a frontier-aligned resume,
+  buffered rollouts are regenerated rather than restoring stale references.
+
+For example, the Ray-reference path is selected with:
+
+```yaml
+data_plane: null
+checkpointing:
+  load_replay_buffer: false
+policy:
+  router_replay:
+    enabled: true
+    transport: ray
+```
+
+Leave `transport` unset (or set it to `inline`) when using TransferQueue. Ray
+reference tags in TransferQueue are not implemented yet and are rejected during
+configuration validation.
+
+### Ray-reference identity and retries
+
+Within each source store/instance, a route object is addressed by:
+
+```text
+(target_weight_version, task_index, rollout_index, attempt_index, request_id)
+```
+
+The async RL collector stamps `_ng_attempt_index=0` on the initial submission
+and increments it on each batch retry. Gym forwards this field alongside
+`_ng_task_index`, `_ng_rollout_index`, and `_ng_target_weight_version` through
+`responses_create_params.metadata.extra_body` to the RL vLLM endpoint. The
+endpoint records it as `attempt_index` in the returned reference. `request_id`
+still distinguishes multiple model calls/turns within an attempt.
+
+References retain the `nemo_rl.routed_experts_ref.v1` schema. When reading older
+reference data, an absent `attempt_index` is interpreted as 0; explicit invalid
+values (including null) are still rejected. This compatibility fallback is not
+applied to live replay requests or new store inserts, which require an explicit
+nonnegative integer attempt index. Deploy the RL and Gym changes together so
+live requests carry the field. Auxiliary model calls with no rollout identity
+remain exempt from replay capture.
+
+The fallback only supplies missing reference metadata; it does not restore
+Ray-owned route arrays. The `checkpointing.load_replay_buffer=false` requirement
+described above is unchanged.
+
+Retries cannot overwrite an earlier attempt's route object, even if they reuse
+the same request ID. Duplicate inserts within the same full key are rejected.
+Logical slices retain the attempt identity, and target-version garbage
+collection retires all attempts for the consumed versions.
+
 When Router Replay is enabled, NeMo RL configures vLLM rollout generation to
 return routed expert indices by setting `enable_return_routed_experts=True` in
 the vLLM kwargs. The generation payload is then carried through the normal

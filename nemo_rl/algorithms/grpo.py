@@ -16,6 +16,7 @@ import json
 import os
 import time
 import warnings
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
@@ -30,6 +31,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms import opd_diagnostics as opd_diag
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     GDPOAdvantageEstimator,
@@ -89,11 +91,15 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
     RESUME_BASE_ORDINAL_KEY,
     RETAINED_TASK_INDICES_KEY,
+    TARGET_WEIGHT_VERSION_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
 from nemo_rl.experience.metric_utils import is_histogram_metric
@@ -127,6 +133,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
+    validate_router_replay_transport_path,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -146,6 +153,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.routed_experts_ref import retire_routed_experts_through
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -559,6 +567,15 @@ def setup(
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
+    validate_router_replay_transport_path(
+        policy_config,
+        data_plane_enabled=bool((master_config.data_plane or {}).get("enabled", False)),
+        async_grpo_enabled=bool(
+            grpo_config.async_grpo and grpo_config.async_grpo.enabled
+        ),
+        nemo_gym_enabled=enable_nemo_gym,
+        load_replay_buffer=checkpointing_config.get("load_replay_buffer"),
+    )
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -2046,12 +2063,82 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
     )
 
 
+def _batch_row_value(batch: BatchedDataDict, key: str, row_index: int) -> Any:
+    """Read one row-aligned diagnostic value without affecting training."""
+    values = batch.get(key)
+    if values is None:
+        return None
+    try:
+        value = values[row_index]
+    except (IndexError, KeyError, TypeError):
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        return value.detach().cpu().item()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _async_sample_identity_fields(
+    batch: BatchedDataDict, row_index: int
+) -> dict[str, Any]:
+    """Build a compact identity for one row in an async training batch."""
+    identity_fields: dict[str, Any] = {"batch_index": row_index}
+    for source_key, output_key in (
+        (NEMO_GYM_TASK_INDEX_KEY, "task_index"),
+        (NEMO_GYM_ROLLOUT_INDEX_KEY, "rollout_index"),
+        (NEMO_GYM_ATTEMPT_INDEX_KEY, "attempt_index"),
+        (TARGET_WEIGHT_VERSION_KEY, "target_weight_version"),
+    ):
+        value = _batch_row_value(batch, source_key, row_index)
+        if value is not None:
+            identity_fields[output_key] = value
+
+    agent_ref = _batch_row_value(batch, "agent_ref", row_index)
+    if isinstance(agent_ref, Mapping):
+        # Agent refs are normally just {"name": ...}. Keep scalar identity
+        # fields but avoid accidentally dumping a large nested config.
+        compact_agent_ref = {
+            str(key): value
+            for key, value in agent_ref.items()
+            if value is None or isinstance(value, (bool, float, int, str))
+        }
+        if compact_agent_ref:
+            identity_fields["agent_ref"] = compact_agent_ref
+        if agent_ref.get("name") is not None:
+            identity_fields["agent_name"] = agent_ref["name"]
+    elif agent_ref is not None:
+        identity_fields["agent_ref"] = str(agent_ref)
+    return identity_fields
+
+
+def _emit_async_sample_event(
+    event: str,
+    batch: BatchedDataDict,
+    row_index: int,
+    *,
+    message: str,
+    **fields: Any,
+) -> None:
+    """Print one human-readable diagnostic with stable sample identity."""
+    diagnostic_fields = {
+        "event": event,
+        **_async_sample_identity_fields(batch, row_index),
+        **fields,
+    }
+    details = " ".join(f"{key}={value!r}" for key, value in diagnostic_fields.items())
+    print(f"{message}; {details}", flush=True)
+
+
 def _apply_message_level_advantage_penalties(
     train_data: BatchedDataDict[ClippedPGLossDataDict],
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
     invalid_tool_call_advantage: float | None,
     malformed_thinking_advantage: float | None,
     log_config: bool = False,
+    sample_metadata: Optional[BatchedDataDict] = None,
 ) -> Optional[dict[str, float]]:
     """Overwrite advantages for flagged assistant-message token spans.
 
@@ -2067,6 +2154,8 @@ def _apply_message_level_advantage_penalties(
         invalid_tool_call_advantage: Advantage value assigned to invalid tool calls.
         malformed_thinking_advantage: Advantage value assigned to malformed thinking.
         log_config: If True, print the configured penalty values once.
+        sample_metadata: Optional row-aligned async rollout metadata used to add
+            bounded sample identities to per-message diagnostics.
 
     Returns:
         Dictionary of penalty metrics if penalties are applied, otherwise None.
@@ -2122,17 +2211,39 @@ def _apply_message_level_advantage_penalties(
 
             if is_invalid:
                 num_invalid_tool_calls += 1
-                print(
-                    f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
-                    flush=True,
-                )
+                message = f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}"
+                if sample_metadata is not None:
+                    _emit_async_sample_event(
+                        "message_advantage_overridden",
+                        sample_metadata,
+                        i,
+                        message=message,
+                        reason="invalid_tool_call",
+                        message_index=j,
+                        token_start=token_offset,
+                        token_end=token_offset + msg_len,
+                        advantage=invalid_neg_adv,
+                    )
+                else:
+                    print(message, flush=True)
                 advantages[i, token_offset : token_offset + msg_len] = invalid_neg_adv
             elif is_malformed_thinking:
                 num_malformed_thinking += 1
-                print(
-                    f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
-                    flush=True,
-                )
+                message = f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}"
+                if sample_metadata is not None:
+                    _emit_async_sample_event(
+                        "message_advantage_overridden",
+                        sample_metadata,
+                        i,
+                        message=message,
+                        reason="malformed_thinking",
+                        message_index=j,
+                        token_start=token_offset,
+                        token_end=token_offset + msg_len,
+                        advantage=malformed_neg_adv,
+                    )
+                else:
+                    print(message, flush=True)
                 advantages[i, token_offset : token_offset + msg_len] = malformed_neg_adv
             token_offset += msg_len
 
@@ -2159,6 +2270,7 @@ def _apply_configured_message_level_advantage_penalties(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
     master_config: MasterConfig,
     log_config: bool = False,
+    sample_metadata: Optional[BatchedDataDict] = None,
 ) -> Optional[dict[str, float]]:
     """Resolve config and apply message-level advantage penalties."""
     (
@@ -2171,6 +2283,7 @@ def _apply_configured_message_level_advantage_penalties(
         invalid_tool_call_advantage=invalid_tool_call_advantage,
         malformed_thinking_advantage=malformed_thinking_advantage,
         log_config=log_config,
+        sample_metadata=sample_metadata,
     )
 
 
@@ -2334,7 +2447,17 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
-        adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
+        opd_module.assert_topk_stats_supported(master_config)
+        opd_config = master_config.on_policy_distillation
+        if opd_config is None:
+            raise ValueError(
+                "grpo.adv_estimator.name='opd' requires an "
+                "on_policy_distillation config block"
+            )
+        adv_estimator = OPDAdvantageEstimator(
+            adv_estimator_config,
+            loss_config,
+        )
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
@@ -2576,6 +2699,7 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
+    sample_metadata: Optional[BatchedDataDict] = None,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -2590,6 +2714,8 @@ def compute_and_apply_seq_logprob_error_masking(
         rewards: Reward tensor for computing statistics on masked sequences.
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
                                     exceeding this threshold. If None, only compute metrics.
+        sample_metadata: Optional row-aligned async rollout metadata used to add
+            bounded sample identities to masking diagnostics.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
@@ -2653,15 +2779,36 @@ def compute_and_apply_seq_logprob_error_masking(
             seq_mult_prob_error <= seq_logprob_error_threshold
         ).float() * original_sample_mask
 
-        diff_mask = original_sample_mask - seq_error_mask
-        num_masked_seqs = int(diff_mask.sum().item())
+        diff_mask_bool = original_sample_mask.bool() & ~seq_error_mask.bool()
+        num_masked_seqs = int(diff_mask_bool.sum().item())
 
         if num_masked_seqs > 0:
-            diff_mask_bool = diff_mask.bool()
             masked_correct_count = int(
                 (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
             )
             masked_correct_pct = masked_correct_count / num_masked_seqs
+            # Sync callers retain the aggregate masking message above. Only the
+            # async path has row identity metadata for per-sample diagnostics.
+            if sample_metadata is not None:
+                for row_index in (
+                    torch.nonzero(diff_mask_bool, as_tuple=False).flatten().tolist()
+                ):
+                    _emit_async_sample_event(
+                        "sample_masked",
+                        sample_metadata,
+                        row_index,
+                        message=(
+                            "Masking async GRPO sample because its sequence-level "
+                            "logprob error exceeds the threshold"
+                        ),
+                        reason="seq_logprob_error",
+                        stage="pre_training",
+                        seq_mult_prob_error=float(
+                            seq_mult_prob_error[row_index].detach().cpu().item()
+                        ),
+                        threshold=seq_logprob_error_threshold,
+                        reward=float(rewards.view(-1)[row_index].detach().cpu().item()),
+                    )
 
         # Compute after-mask metrics (only for sequences that passed the threshold)
         kept_mask = seq_error_mask.bool() & valid_seq_mask
@@ -4679,7 +4826,7 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with timer.time("total_step_time"):
-                num_mask_sample_filtered = 0
+                sample_mask_metrics: dict[str, int] = {}
 
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
@@ -4880,22 +5027,111 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
-                    # Apply overlong filtering - mask out truncated sequences from loss computation
-                    with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config.grpo.overlong_filtering
-                        if use_overlong_filtering:
-                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                            truncated = repeated_batch["truncated"]
+                    with timer.time("async_sample_masking"):
+                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                        if loss_multiplier.ndim != 1:
+                            raise ValueError(
+                                "loss_multiplier must be one-dimensional, got "
+                                f"shape={tuple(loss_multiplier.shape)}"
+                            )
+                        batch_size = loss_multiplier.numel()
+                        eligible = loss_multiplier != 0
+                        sample_mask_metrics = {
+                            "num_masked_seqs_by_loss_multiplier": int(
+                                (~eligible).sum().item()
+                            ),
+                            "num_masked_seqs_by_empty_response_output": 0,
+                            "num_masked_seqs_by_overlong_filtering": 0,
+                            "num_masked_seqs_by_rollout": 0,
+                            "num_masked_seqs_by_logprob_error": 0,
+                        }
 
-                            if isinstance(truncated, list):
-                                truncated = torch.tensor(truncated, dtype=torch.bool)
+                        # Attribute overlapping masks in precedence order so each
+                        # row contributes to exactly one reason metric.
+                        for row_index in (
+                            torch.nonzero(~eligible, as_tuple=False).flatten().tolist()
+                        ):
+                            _emit_async_sample_event(
+                                "sample_masked",
+                                repeated_batch,
+                                row_index,
+                                message=(
+                                    "Async GRPO sample entered training with a zero "
+                                    "loss multiplier"
+                                ),
+                                reason="loss_multiplier",
+                                stage="batch_entry",
+                            )
 
-                            loss_multiplier[truncated] = 0
-                            repeated_batch["loss_multiplier"] = loss_multiplier
+                        mask_reasons = [
+                            (
+                                NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
+                                "empty_response_output",
+                                "num_masked_seqs_by_empty_response_output",
+                                "Masking async GRPO sample because its response output is empty",
+                            )
+                        ]
+                        if master_config.grpo.overlong_filtering:
+                            mask_reasons.append(
+                                (
+                                    "truncated",
+                                    "overlong_filtering",
+                                    "num_masked_seqs_by_overlong_filtering",
+                                    "Masking async GRPO sample because of overlong filtering",
+                                )
+                            )
+                        mask_reasons.append(
+                            (
+                                "mask_sample",
+                                "rollout",
+                                "num_masked_seqs_by_rollout",
+                                "Masking async GRPO sample because the rollout marked it for masking",
+                            )
+                        )
 
-                    with timer.time("mask_sample_filter"):
-                        num_mask_sample_filtered = _apply_mask_sample_filter(
-                            repeated_batch
+                        for (
+                            field_name,
+                            reason,
+                            metric_name,
+                            diagnostic_message,
+                        ) in mask_reasons:
+                            if field_name not in repeated_batch:
+                                continue
+                            candidate_mask = repeated_batch[field_name]
+                            if not isinstance(candidate_mask, torch.Tensor):
+                                candidate_mask = torch.as_tensor(candidate_mask)
+                            candidate_mask = candidate_mask.reshape(-1)
+                            if candidate_mask.numel() != batch_size:
+                                raise ValueError(
+                                    f"{field_name} has {candidate_mask.numel()} rows; "
+                                    f"expected {batch_size}"
+                                )
+                            candidate_mask = candidate_mask.to(
+                                device=eligible.device, dtype=torch.bool
+                            )
+                            newly_masked = eligible & candidate_mask
+                            sample_mask_metrics[metric_name] = int(
+                                newly_masked.sum().item()
+                            )
+                            for row_index in (
+                                torch.nonzero(newly_masked, as_tuple=False)
+                                .flatten()
+                                .tolist()
+                            ):
+                                _emit_async_sample_event(
+                                    "sample_masked",
+                                    repeated_batch,
+                                    row_index,
+                                    message=diagnostic_message,
+                                    reason=reason,
+                                    stage="pre_training",
+                                )
+                            loss_multiplier[newly_masked] = 0
+                            eligible &= ~newly_masked
+
+                        repeated_batch["loss_multiplier"] = loss_multiplier
+                        sample_mask_metrics["num_masked_seqs_total"] = sum(
+                            sample_mask_metrics.values()
                         )
 
                     # Add loss mask to each message
@@ -4942,6 +5178,19 @@ def async_grpo_train(
                 skip_prev_logprobs, skip_reference_logprobs = (
                     _resolve_logprob_skip_flags(master_config)
                 )
+                opd_diagnostic_payloads: dict[str, Any] = {}
+                fused_student_topk: Optional[dict[str, torch.Tensor]] = None
+                should_fuse_student_topk = (
+                    opd_diag._should_log_opd_topk_stats(master_config, step)
+                    and opd_diag._get_opd_topk_stats_mode(master_config)
+                    == opd_diag.OPD_TOPK_STATS_MODE_STUDENT_ONLINE_TEACHER_DEFERRED
+                    and "agent_ref" in repeated_batch
+                )
+                fused_student_topk_k = (
+                    opd_diag._get_opd_topk_stats_k(master_config)
+                    if should_fuse_student_topk
+                    else None
+                )
                 seq_logprob_error_threshold = (
                     master_config.grpo.seq_logprob_error_threshold
                 )
@@ -4954,9 +5203,20 @@ def async_grpo_train(
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
                     if not skip_prev_logprobs:
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            train_data, timer=timer
-                        )["logprobs"]
+                        student_logprob_kwargs: dict[str, Any] = {"timer": timer}
+                        if fused_student_topk_k is not None:
+                            student_logprob_kwargs["topk"] = fused_student_topk_k
+                        student_logprob_result = policy.get_logprobs(
+                            train_data, **student_logprob_kwargs
+                        )
+                        train_data["prev_logprobs"] = student_logprob_result["logprobs"]
+                        if should_fuse_student_topk:
+                            fused_student_topk = {
+                                "topk_logprobs": student_logprob_result[
+                                    "topk_logprobs"
+                                ],
+                                "topk_indices": student_logprob_result["topk_indices"],
+                            }
                     else:
                         train_data["prev_logprobs"] = torch.zeros_like(
                             train_data["generation_logprobs"]
@@ -4978,6 +5238,7 @@ def async_grpo_train(
                             train_data["prev_logprobs"]
                         )
 
+                pre_seq_error_sample_loss_mask = train_data["sample_mask"].clone()
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
@@ -4987,18 +5248,47 @@ def async_grpo_train(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        sample_metadata=repeated_batch,
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:
                         seq_logprob_error_metrics[
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
+                num_logprob_error_masks = int(
+                    seq_logprob_error_metrics["num_masked_seqs_by_logprob_error"]
+                )
+                sample_mask_metrics["num_masked_seqs_by_logprob_error"] = (
+                    num_logprob_error_masks
+                )
+                sample_mask_metrics["num_masked_seqs_total"] += num_logprob_error_masks
 
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
                     trajectory_teacher_logprobs = _pad_teacher_logprobs(
                         trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
                     )
+
+                (
+                    opd_diagnostic_payloads,
+                    opd_diagnostic_metrics,
+                ) = opd_diag._collect_opd_diagnostic_payloads(
+                    master_config=master_config,
+                    step=step,
+                    tokenizer=tokenizer,
+                    policy=policy,
+                    trajectory_collector=trajectory_collector,
+                    train_data=train_data,
+                    repeated_batch=repeated_batch,
+                    rewards=rewards,
+                    input_lengths=input_lengths,
+                    teacher_logprobs=trajectory_teacher_logprobs,
+                    fused_student_topk=fused_student_topk,
+                    pre_seq_error_sample_loss_mask=pre_seq_error_sample_loss_mask,
+                    have_real_prev_logprobs=not skip_prev_logprobs,
+                    timer=timer,
+                )
+                rollout_metrics.update(opd_diagnostic_metrics)
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -5048,6 +5338,7 @@ def async_grpo_train(
                             repeated_batch["message_log"],
                             master_config,
                             log_config=True,
+                            sample_metadata=repeated_batch,
                         )
                     )
 
@@ -5067,6 +5358,20 @@ def async_grpo_train(
                         train_data,
                         loss_fn,
                         timer=timer,
+                    )
+
+                # weight_version is the target version just consumed. The
+                # policy call has joined every worker, while all future
+                # buffered/in-flight rollouts target strictly newer versions.
+                with timer.time("router_replay_gc"):
+                    routed_experts_gc = retire_routed_experts_through(
+                        master_config.policy, weight_version
+                    )
+                if routed_experts_gc is not None:
+                    print(
+                        "🧹 Retired routed-experts Ray objects through target "
+                        f"{weight_version}: {routed_experts_gc}",
+                        flush=True,
                     )
 
                 is_last_step = step + 1 == master_config.grpo.max_num_steps
@@ -5246,7 +5551,7 @@ def async_grpo_train(
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
-                    "num_mask_sample_filtered": num_mask_sample_filtered,
+                    **sample_mask_metrics,
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
@@ -5478,6 +5783,29 @@ def async_grpo_train(
                     log_data, f"train_data_step{step + 1}.jsonl"
                 )
                 del log_data
+            if "sample" in opd_diagnostic_payloads:
+                logger.log_batched_dict_as_jsonl(
+                    opd_diagnostic_payloads["sample"],
+                    f"opd_sample_stats_step{step + 1}.jsonl",
+                )
+            for payload_key, filename in (
+                ("token", f"opd_token_stats_step{step + 1}.pt"),
+                (
+                    "topk_offline_inputs",
+                    f"opd_topk_offline_inputs_step{step + 1}.pt",
+                ),
+                (
+                    "topk_student_stats",
+                    f"opd_topk_student_stats_step{step + 1}.pt",
+                ),
+                ("topk_stats", f"opd_topk_stats_step{step + 1}.pt"),
+            ):
+                if payload_key in opd_diagnostic_payloads:
+                    torch.save(
+                        opd_diagnostic_payloads[payload_key],
+                        os.path.join(logger.base_log_dir, filename),
+                    )
+            del opd_diagnostic_payloads
             del train_data
             del flat_messages_content
 

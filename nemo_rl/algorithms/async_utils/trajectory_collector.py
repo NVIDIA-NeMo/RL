@@ -50,9 +50,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
+    TARGET_WEIGHT_VERSION_KEY,
 )
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
@@ -1123,6 +1125,42 @@ class AsyncTrajectoryCollector:
                     f"🧹 Released reservation for target weight {target_weight_version}"
                 )
 
+    @staticmethod
+    def _attach_multimodal_rows(
+        sub_data: BatchedDataDict,
+        multimodal_data: Optional[dict[str, Any]],
+        row_indices: list[int],
+    ) -> None:
+        """Copy the multimodal rows for ``row_indices`` into a teacher sub-batch.
+
+        ``row_indices`` must already include any DP-padding repeats so media
+        rows stay paired with the repeated token rows. Keys that are ``None``
+        or carry no logical segments are skipped so text-only groups send no
+        media keys to their teacher.
+
+        Args:
+            sub_data: teacher sub-batch holding ``input_ids`` (and lengths)
+            multimodal_data: batch-level multimodal inputs, row-aligned with
+                the full ``input_ids`` batch; ``None``/empty is a no-op
+            row_indices: full-batch row index for every row of ``sub_data``
+        """
+        if not multimodal_data:
+            return
+        selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
+            row_indices
+        )
+        sub_data.update(
+            {
+                key: value
+                for key, value in selected_multimodal.items()
+                if value is not None
+                and not (
+                    isinstance(value, PackedTensor)
+                    and not any(value.logical_segment_counts_by_row())
+                )
+            }
+        )
+
     def _compute_teacher_logprobs(
         self,
         input_ids: torch.Tensor,
@@ -1200,21 +1238,7 @@ class AsyncTrajectoryCollector:
             sub_data = BatchedDataDict({"input_ids": sub_input_ids})
             if sub_lengths is not None:
                 sub_data["input_lengths"] = sub_lengths
-            if multimodal_data:
-                selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
-                    row_indices
-                )
-                sub_data.update(
-                    {
-                        key: value
-                        for key, value in selected_multimodal.items()
-                        if value is not None
-                        and not (
-                            isinstance(value, PackedTensor)
-                            and not any(value.logical_segment_counts_by_row())
-                        )
-                    }
-                )
+            self._attach_multimodal_rows(sub_data, multimodal_data, row_indices)
 
             # Serialize calls per teacher to prevent NCCL collective desync
             t_lock_start = time.time()
@@ -1254,12 +1278,173 @@ class AsyncTrajectoryCollector:
 
         return result, total_time
 
+    async def compute_teacher_topk(
+        self,
+        input_ids: torch.Tensor,
+        agent_refs: list[dict[str, Any]],
+        input_lengths: Optional[torch.Tensor] = None,
+        k: int = 32,
+        multimodal_data: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Compute teacher top-k logits without blocking the actor event loop."""
+        return await asyncio.to_thread(
+            self._compute_teacher_topk_sync,
+            input_ids,
+            agent_refs,
+            input_lengths=input_lengths,
+            k=k,
+            multimodal_data=multimodal_data,
+        )
+
+    def _compute_teacher_topk_sync(
+        self,
+        input_ids: torch.Tensor,
+        agent_refs: list[dict[str, Any]],
+        input_lengths: Optional[torch.Tensor] = None,
+        k: int = 32,
+        multimodal_data: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Compute teacher top-k logits for a driver-selected batch.
+
+        Top-k tensors are large, so this is triggered by the trainer only on
+        OPD logging steps instead of being stored in every replay-buffer entry.
+
+        Args:
+            input_ids: [B, S] tokenized input tensor
+            agent_refs: list of B agent reference dicts
+            input_lengths: [B] per-sample lengths (required for sequence packing)
+            k: number of top-k entries per position
+            multimodal_data: batch-level multimodal inputs, row-aligned with
+                ``input_ids`` and sliced per teacher (same contract as
+                :meth:`_compute_teacher_logprobs`)
+
+        Returns:
+            dict with ``topk_logits`` [B, S, k] bf16, ``topk_indices`` [B, S, k]
+            int64 (-1 where padded), ``V_logsumexp`` [B, S] fp32, and
+            ``teacher_topk_time`` in seconds
+        """
+        k = int(k)
+        if k <= 0:
+            raise ValueError(f"k must be positive for teacher top-k logging, got {k}")
+        if not self.teacher_worker_groups:
+            raise RuntimeError("No non-colocated teacher worker groups are available")
+
+        opd_cfg = self.on_policy_distillation_cfg
+        teacher_model_by_agent_name = opd_cfg.get("teacher_model_by_agent_name", {})
+        default_teacher_alias = opd_cfg.get("default_teacher_alias")
+        strict = opd_cfg.get("strict_agent_name_match", False)
+
+        reference_aliases = resolve_reference_aliases(
+            agent_refs,
+            teacher_model_by_agent_name,
+            default_teacher_alias=default_teacher_alias,
+            strict_agent_name_match=strict,
+        )
+        group_keys = [self.alias_to_group_alias.get(a, a) for a in reference_aliases]
+
+        group_to_indices: dict[str, list[int]] = defaultdict(list)
+        for i, gk in enumerate(group_keys):
+            group_to_indices[gk].append(i)
+
+        B, S = input_ids.shape
+        result_logits = torch.zeros(B, S, k, dtype=torch.bfloat16)
+        result_indices = torch.full((B, S, k), -1, dtype=torch.int64)
+        result_logsumexp = torch.zeros(B, S, dtype=torch.float32)
+
+        def _normalize_seq_len(
+            tensor: torch.Tensor, value: float | int
+        ) -> torch.Tensor:
+            if tensor.shape[1] == S:
+                return tensor
+            if tensor.shape[1] > S:
+                return tensor[:, :S, ...]
+            pad = (0, S - tensor.shape[1])
+            if tensor.ndim == 3:
+                pad = (0, 0, 0, S - tensor.shape[1])
+            return torch.nn.functional.pad(
+                tensor,
+                pad,
+                mode="constant",
+                value=value,
+            )
+
+        def _get_topk_for_group(group_key, indices):
+            twg = self.teacher_worker_groups[group_key]
+            sub_input_ids = input_ids[indices]
+            sub_lengths = input_lengths[indices] if input_lengths is not None else None
+            row_indices = list(indices)
+
+            dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
+            actual_batch_size = sub_input_ids.shape[0]
+            remainder = actual_batch_size % dp_size
+            if remainder != 0:
+                pad_count = dp_size - remainder
+                pad_rows = sub_input_ids[-1:].expand(pad_count, -1)
+                sub_input_ids = torch.cat([sub_input_ids, pad_rows], dim=0)
+                if sub_lengths is not None:
+                    sub_lengths = torch.cat(
+                        [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
+                    )
+                # Keep media rows paired with the repeated token row.
+                row_indices.extend([row_indices[-1]] * pad_count)
+
+            sub_data = BatchedDataDict({"input_ids": sub_input_ids})
+            if sub_lengths is not None:
+                sub_data["input_lengths"] = sub_lengths
+            self._attach_multimodal_rows(sub_data, multimodal_data, row_indices)
+
+            t_lock_start = time.time()
+            with self._teacher_locks[group_key]:
+                t_inference_start = time.time()
+                topk_result = twg.get_topk_logits(sub_data, k=k, return_logsumexp=True)
+            t_done = time.time()
+            print(
+                f"[teacher_topk] group={group_key} samples={actual_batch_size} k={k} "
+                f"lock_wait={t_inference_start - t_lock_start:.2f}s "
+                f"inference={t_done - t_inference_start:.2f}s",
+                flush=True,
+            )
+
+            topk_logits = _normalize_seq_len(
+                topk_result["topk_logits"][:actual_batch_size], 0.0
+            )
+            topk_indices = _normalize_seq_len(
+                topk_result["topk_indices"][:actual_batch_size], -1
+            )
+            V_logsumexp = _normalize_seq_len(
+                topk_result["V_logsumexp"][:actual_batch_size], 0.0
+            )
+            return indices, topk_logits, topk_indices, V_logsumexp
+
+        t_total_start = time.time()
+        for gk, idxs in group_to_indices.items():
+            indices, topk_logits, topk_indices, V_logsumexp = _get_topk_for_group(
+                gk, idxs
+            )
+            result_logits[indices] = topk_logits.to(torch.bfloat16)
+            result_indices[indices] = topk_indices.to(torch.int64)
+            result_logsumexp[indices] = V_logsumexp.to(torch.float32)
+
+        total_time = time.time() - t_total_start
+        print(
+            f"[teacher_topk] total={total_time:.2f}s for {B} samples across "
+            f"{len(group_to_indices)} teacher(s), k={k}",
+            flush=True,
+        )
+        return {
+            "topk_logits": result_logits,
+            "topk_indices": result_indices,
+            "V_logsumexp": result_logsumexp,
+            "teacher_topk_time": total_time,
+        }
+
     async def _iter_rollout_groups(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
         num_generations: int,
         use_nemo_gym: bool,
         task_index_to_group_index: dict[int, int],
+        target_weight_version: Optional[int] = None,
     ) -> AsyncGenerator[RolloutGroupResult, None]:
         """Yield prompt groups from either backend through one result type."""
         if use_nemo_gym:
@@ -1304,6 +1489,7 @@ class AsyncTrajectoryCollector:
                 ),
                 deduplicate_multimodal_data=self._deduplicate_multimodal_data,
                 debug_payload_metrics=self._debug_payload_metrics,
+                target_weight_version=target_weight_version,
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
@@ -1453,6 +1639,12 @@ class AsyncTrajectoryCollector:
     ) -> None:
         """Push one prompt group to the replay buffer with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
+        if isinstance(self.master_config, GRPOMasterConfig):
+            final_batch_cpu[TARGET_WEIGHT_VERSION_KEY] = torch.full(
+                (final_batch_cpu.size,),
+                int(target_weight_version),
+                dtype=torch.long,
+            )
         rollout_metrics = rollout_result.rollout_metrics
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
@@ -1605,6 +1797,14 @@ class AsyncTrajectoryCollector:
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
+            if use_nemo_gym:
+                # Give every Gym submission a retry identity. This branch retries
+                # the full batch, so stamp the repeated rows immediately before
+                # each submission rather than relying on the source branch's
+                # pending-group-only retry implementation.
+                for row in repeated_batch["extra_env_info"]:
+                    row[NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt - 1
+
             push_tasks: list[asyncio.Task[None]] = []
             scheduled_group_indices: set[int] = set()
             stream_error: Exception | None = None
@@ -1614,6 +1814,7 @@ class AsyncTrajectoryCollector:
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,
+                    target_weight_version=target_weight_version,
                 ):
                     group_index = rollout_result.group_index
                     if group_index not in expected_group_indices:

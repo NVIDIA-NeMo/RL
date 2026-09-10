@@ -35,6 +35,7 @@ from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
+from nemo_rl.utils.routed_experts_ref import materialize_routed_experts_refs
 
 
 @dataclass
@@ -123,22 +124,58 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
-        # Move to GPU
+        routed_experts = data_dict.get("routed_experts")
+        if routed_experts is not None and not isinstance(routed_experts, torch.Tensor):
+            if "input_lengths" not in data_dict:
+                raise ValueError(
+                    "Ray-reference routed_experts requires input_lengths for "
+                    "microbatch-local materialization."
+                )
+            data_dict["routed_experts"] = materialize_routed_experts_refs(
+                routed_experts,
+                input_ids=data_dict["input_ids"],
+                input_lengths=data_dict["input_lengths"],
+            )
+
+        # Sequence packing discards the rectangular per-sample padding and then
+        # selects this CP rank's tokens.  Keep routed_experts on CPU until those
+        # transforms have run: moving [B, max_seq, layers, topk] here can require
+        # tens of GiB even though the model consumes only the compact CP-local
+        # tensor.  Other tensors retain the existing eager H2D behavior.
+        routed_experts_for_cpu_packing = None
+        if pack_sequences:
+            routed_experts = data_dict.get("routed_experts")
+            if (
+                isinstance(routed_experts, torch.Tensor)
+                and routed_experts.device.type == "cpu"
+            ):
+                routed_experts_for_cpu_packing = routed_experts
+                del data_dict["routed_experts"]
+
         data_dict = data_dict.to("cuda")
+        if routed_experts_for_cpu_packing is not None:
+            data_dict["routed_experts"] = routed_experts_for_cpu_packing
 
         # Process the microbatch
-        processed_inputs = process_microbatch(
-            data_dict=data_dict,
-            seq_length_key=seq_length_key,
-            pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
-            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-            pad_full_seq_to=pad_full_seq_to,
-            pack_sequences=pack_sequences,
-            delegate_pack_to_model=delegate_pack_to_model,
-            delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
-            model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
-            straggler_timer=straggler_timer,
-        )
+        try:
+            processed_inputs = process_microbatch(
+                data_dict=data_dict,
+                seq_length_key=seq_length_key,
+                pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+                pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                pad_full_seq_to=pad_full_seq_to,
+                pack_sequences=pack_sequences,
+                delegate_pack_to_model=delegate_pack_to_model,
+                delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
+                model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+                straggler_timer=straggler_timer,
+            )
+        finally:
+            # No forward/loss consumer reads routed_experts from data_dict; the
+            # processed CP-local tensor is carried explicitly below.  Drop the
+            # potentially enormous rectangular CPU materialization promptly.
+            if routed_experts_for_cpu_packing is not None:
+                del data_dict["routed_experts"]
 
         yield ProcessedMicrobatch(
             data_dict=data_dict,
@@ -447,17 +484,30 @@ def process_microbatch(
                             total_tokens=input_ids.shape[1],
                             cp_size=get_context_parallel_world_size(),
                             cp_rank=get_context_parallel_rank(),
+                            # Megatron's CP helper operates on CUDA sequence
+                            # metadata and also constructs CUDA indices
+                            # internally.  Build the indices there, then copy
+                            # only the small index vector to the routes' device.
                             device=input_ids.device,
                         )
                         routed_experts_cp_sharded = routed_experts.index_select(
-                            1, cp_partition_indices
+                            1,
+                            cp_partition_indices.to(device=routed_experts.device),
                         ).contiguous()
                         if _token_identity_packed is not None:
                             token_identity_cp_sharded = (
                                 _token_identity_packed.index_select(
-                                    1, cp_partition_indices
+                                    1,
+                                    cp_partition_indices.to(
+                                        device=_token_identity_packed.device
+                                    ),
                                 ).contiguous()
                             )
+                    # routed_experts may deliberately still be on CPU here.
+                    # Transfer only the compact tensor consumed by this CP rank.
+                    routed_experts_cp_sharded = routed_experts_cp_sharded.to(
+                        device=input_ids.device
+                    )
                 if (
                     routed_experts_cp_sharded is not None
                     and routed_experts_cp_sharded.dim() != 4
@@ -725,7 +775,9 @@ def _verify_r3_trace_cp_token_alignment(
             "their source [batch_idx, token_pos] identities."
         )
 
-    expected_routed = source_routed_experts[source_rows, source_cols].to(
+    routed_source_rows = source_rows.to(device=source_routed_experts.device)
+    routed_source_cols = source_cols.to(device=source_routed_experts.device)
+    expected_routed = source_routed_experts[routed_source_rows, routed_source_cols].to(
         device=flat_routed.device,
         dtype=flat_routed.dtype,
     )

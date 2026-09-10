@@ -28,6 +28,7 @@ from nemo_rl.distributed.model_utils import (
     _compute_distributed_log_softmax,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
+    distributed_vocab_logsumexp,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
@@ -1491,6 +1492,30 @@ class DistributedVocabTopkOpsTestActor:
         torch.testing.assert_close(regathered, topk_vals, rtol=0, atol=0)
         return {"success": True, "error": None}
 
+    def test_distributed_vocab_logsumexp(self):
+        """Full-vocabulary normalizers match a single-tensor fp32 baseline."""
+        tp_rank = torch.distributed.get_rank(self.tp_group)
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+
+        torch.manual_seed(7331)
+        full_logits = torch.randn(
+            batch_size, seq_len, vocab_size, device="cuda", dtype=torch.bfloat16
+        )
+        expected = torch.logsumexp(full_logits.float(), dim=-1)
+        actual = distributed_vocab_logsumexp(
+            full_logits[:, :, vocab_start_index:vocab_end_index],
+            self.tp_group,
+            chunk_size=self.chunk_size,
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
+        return {"success": True, "error": None}
+
     def test_gather_logits_at_global_indices(self):
         """Gathered logits at global indices match the single-GPU fp32 gather."""
         tp_rank = torch.distributed.get_rank(self.tp_group)
@@ -1554,7 +1579,11 @@ def register_distributed_vocab_topk_ops_test_actor():
 @pytest.mark.parametrize("tp_size, chunk_size", [(1, 5), (2, 4), (2, None)])
 @pytest.mark.parametrize(
     "method_name",
-    ["test_distributed_vocab_topk", "test_gather_logits_at_global_indices"],
+    [
+        "test_distributed_vocab_topk",
+        "test_distributed_vocab_logsumexp",
+        "test_gather_logits_at_global_indices",
+    ],
 )
 def test_distributed_vocab_topk_ops(
     register_distributed_vocab_topk_ops_test_actor, method_name, tp_size, chunk_size

@@ -19,7 +19,6 @@ from typing import Any, Iterable, Optional, Union
 
 import numpy as np
 import ray
-import torch
 from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
@@ -555,6 +554,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         timer: Optional[Timer] = None,
+        topk: Optional[int] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a data dict.
 
@@ -572,6 +572,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if timer
             else nullcontext()
         ):
+            common_kwargs = {"topk": topk} if topk is not None else {}
             futures = self.worker_group.run_all_workers_sharded_data(
                 "get_logprobs",
                 data=sharded_data,
@@ -586,9 +587,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
+                common_kwargs=common_kwargs,
             )
+        worker_batches = self.worker_group.get_all_worker_results(
+            futures, fetch_returned_only=True
+        )
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
-            self.worker_group.get_all_worker_results(futures, fetch_returned_only=True)
+            worker_batches,
+            pad_value_dict={
+                "logprobs": 0.0,
+                "topk_logprobs": 0.0,
+                "topk_indices": -1,
+            },
         )
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
@@ -660,8 +670,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        return_logsumexp: bool = False,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
-        """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        """Dispatch top-k inference while preserving CP and packed-sequence shapes."""
         with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
 
@@ -684,17 +695,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+                common_kwargs={
+                    "k": k,
+                    "micro_batch_size": micro_batch_size,
+                    "return_logsumexp": return_logsumexp,
+                },
             )
 
-        # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
         worker_batches = self.worker_group.get_all_worker_results(futures)
-        all_topk_logits = [wb["topk_logits"] for wb in worker_batches]
-        all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
-
-        stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
-        stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
-        stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+        stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict.from_batches(
+            worker_batches,
+            pad_value_dict={
+                "topk_logits": 0.0,
+                "topk_indices": -1,
+                "V_logsumexp": 0.0,
+            },
+        )
 
         if unsorted_data_indices is not None:
             stacked.reorder_data(unsorted_data_indices)
