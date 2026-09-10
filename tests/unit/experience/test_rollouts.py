@@ -2209,6 +2209,34 @@ def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     assert not rollout_result.final_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY].any()
 
 
+@pytest.mark.parametrize(
+    "response,total_tokens,expected",
+    [
+        ({}, 3, False),
+        ({}, 4, True),
+        ({}, 5, True),
+        ({"incomplete_details": {"reason": "max_output_tokens"}}, 3, True),
+        ({"incomplete_details": {"reason": "content_filter"}}, 3, False),
+        ({"metadata": {"stop_reason": "context_length"}}, 3, True),
+        ({"metadata": {"stop_reason": "error"}}, 3, False),
+    ],
+)
+def test_nemo_gym_result_hit_max_tokens_prefers_explicit_reason(
+    response, total_tokens, expected
+):
+    result = {
+        "message_log": [
+            {
+                "role": "assistant",
+                "token_ids": torch.arange(total_tokens),
+            }
+        ],
+        "full_result": {"response": response},
+    }
+
+    assert rollouts_mod._nemo_gym_result_hit_max_tokens(result, 4) is expected
+
+
 def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
     input_batch = BatchedDataDict({"loss_multiplier": torch.ones(3)})
     expected = rollouts_mod.NemoGymRolloutResult(

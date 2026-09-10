@@ -44,6 +44,7 @@ from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
     _find_routed_experts_template,
+    _nemo_gym_result_hit_max_tokens,
     _tensorize_by_key,
     attach_static_multimodal_payload,
     calculate_rewards,
@@ -1012,9 +1013,7 @@ class AsyncNemoGymRolloutImpl:
             "generation_logprobs",
         )
         # Calculate truncation.
-        truncated = (
-            sum(len(m["token_ids"]) for m in result["message_log"]) == self._max_seq_len
-        )
+        truncated = _nemo_gym_result_hit_max_tokens(result, self._max_seq_len)
 
         # Same gate as the batched path: when masking is off, drop the env
         # mask flag so later batch building never sees it.
