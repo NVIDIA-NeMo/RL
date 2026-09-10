@@ -1,0 +1,51 @@
+defaults: ../../dpo.yaml
+dpo:
+  val_period: 50
+  max_num_steps: 100
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  max_total_sequence_length: 4096
+  optimizer:
+    kwargs:
+      lr: 5.5e-05
+  hf_config_overrides:
+    # Keep as 0.0, not 0: Hugging Face strict config validation declares
+    # router_aux_loss_coef as float and rejects YAML's integer 0.
+    router_aux_loss_coef: 0.0
+  dtensor_cfg:
+    _v2: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    expert_parallel_size: 8
+    # Recompute activations to fit 30B-A3B on 1n8g: avoids the full-vocab
+    # log_softmax OOM in DPO loss-input prep (~step 8) on 80 GiB GPUs.
+    activation_checkpointing: true
+    moe_parallelizer:
+      reshard_after_forward: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: torch_fp32
+        experts: torch_mm
+        enable_deepep: true
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  offload_optimizer_for_logprob: true
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
+  tensorboard:
+    log_dir: tb_logs-dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
+  mlflow:
+    run_name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
+cluster:
+  gpus_per_node: 8
