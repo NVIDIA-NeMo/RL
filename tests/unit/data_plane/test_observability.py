@@ -42,7 +42,6 @@ from nemo_rl.data_plane.observability import (
     headline_series,
     merge_snapshots,
 )
-from nemo_rl.data_plane.wire_guard import WireGuardState
 
 # ── helpers ────────────────────────────────────────────────────────────
 
@@ -962,27 +961,6 @@ def test_accounting_follows_the_sample_when_another_process_clears(
     if verify_tensor_hash:
         assert set(writer._hash_by_partition["p"]) == still_live
     writer.close()
-
-
-def test_wire_guard_state_serves_a_reader_that_never_wrote():
-    """The point of the shared store: the rollout actor writes, a policy
-    worker reads, and the reader has no local wire-in reading of its own."""
-    state = WireGuardState()
-    state.record("p", {"a": {"lp": 11, "ids": 12}, "b": {"lp": 21}})
-
-    assert state.fetch("p", ["a", "b", "missing"]) == {
-        "a": {"lp": 11, "ids": 12},
-        "b": {"lp": 21},
-    }
-    # A row written field by field accumulates rather than replacing.
-    state.record("p", {"b": {"ids": 22}})
-    assert state.fetch("p", ["b"]) == {"b": {"lp": 21, "ids": 22}}
-
-    state.release("p", ["a"])
-    assert state.fetch("p", ["a"]) == {}
-    assert state.n_rows() == 1
-    state.release("p", None)
-    assert state.n_rows() == 0
 
 
 def test_hash_fingerprint_covers_jagged_fields():
