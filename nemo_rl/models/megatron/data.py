@@ -116,6 +116,7 @@ def make_processed_microbatch_iterator(
     model_slices_context_parallel_inputs: bool = False,
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
+    mtp_enabled: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -133,6 +134,7 @@ def make_processed_microbatch_iterator(
         create_packed_seq_padding_mask: Whether to mask packed padding from MoE routing
         prepad_packed_seq_for_hybridep: Whether to align packed inputs across the
             HybridEP group before model forward
+        mtp_enabled: Whether the model uses multi-token prediction layers.
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -157,6 +159,7 @@ def make_processed_microbatch_iterator(
             straggler_timer=straggler_timer,
             create_packed_seq_padding_mask=create_packed_seq_padding_mask,
             prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
+            mtp_enabled=mtp_enabled,
         )
 
         yield ProcessedMicrobatch(
@@ -241,6 +244,7 @@ def get_microbatch_iterator(
     delegate_pack_to_model: bool = False,
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    mtp_enabled: bool = False,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -253,6 +257,7 @@ def get_microbatch_iterator(
         cfg: Configuration dictionary
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+        mtp_enabled: Whether the model uses multi-token prediction layers.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -320,6 +325,7 @@ def get_microbatch_iterator(
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+        mtp_enabled=mtp_enabled,
     )
 
     # Compute padded sequence length for pipeline parallelism
@@ -363,6 +369,7 @@ def process_microbatch(
     straggler_timer: Optional[StragglerDetector] = None,
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
+    mtp_enabled: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     if create_packed_seq_padding_mask and model_slices_context_parallel_inputs:
@@ -706,10 +713,43 @@ def process_microbatch(
                         else local_media_mask
                     ).bool()
 
-                # For packed sequences, position_ids and attention_mask are typically None
-                # The PackedSeqParams handles all necessary sequence information
-                position_ids = None
+                # PackedSeqParams carries the sequence layout:
+                # attention_mask and position_ids are normally None here.
+                # The MTP block is different: it rolls and embeds position_ids per packed segment.
+                # Pack per-sample arange positions like input_ids, on every forward.
                 attention_mask = None
+                if mtp_enabled:
+                    position_ids_source = (
+                        torch.arange(
+                            original_seq_length,
+                            dtype=torch.long,
+                            device=input_ids.device,
+                        )
+                        .unsqueeze(0)
+                        .expand(original_batch_size, -1)
+                    )
+                    (
+                        packed_position_ids,
+                        local_position_ids,
+                        _,
+                        _,
+                        _,
+                    ) = _pack_sequences_for_megatron(
+                        position_ids_source,
+                        seq_lengths,
+                        pad_individual_seqs_to_multiple_of,
+                        pad_packed_seq_to_multiple_of,
+                        pad_full_seq_to,
+                        cp_rank=get_context_parallel_rank(),
+                        cp_size=get_context_parallel_world_size(),
+                    )
+                    position_ids = (
+                        packed_position_ids
+                        if model_slices_context_parallel_inputs
+                        else local_position_ids
+                    )
+                else:
+                    position_ids = None
         else:
             if routed_experts is not None:
                 if "input_lengths" not in data_dict:

@@ -164,12 +164,13 @@ def _make_worker(loss_type):
     w._opd_full_teacher_checkpoint_path = None
     w.media_placeholder_token_id = None
     # Model-capability flags __init__ derives from self.model, which
-    # object.__new__ skips. train_microbatch passes all three straight through
+    # object.__new__ skips. train_microbatch passes all four straight through
     # to get_microbatch_iterator, so the plain-model defaults (NeMo-RL owns
-    # packing and CP sharding) have to be spelled out here.
+    # packing and CP sharding, no MTP) have to be spelled out here.
     w.delegate_pack_to_model = False
     w.delegate_mtp_loss_mask_to_model = False
     w.model_slices_context_parallel_inputs = False
+    w.mtp_enabled = False
     w._first_train_step_forward_pre_hook_disabled = False
     w._first_train_step_param_sync_func = None
     # Normally set from get_rank_safe() in __init__, which object.__new__ skips.
@@ -481,6 +482,7 @@ class TestTrainMicrobatch:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 1
+        w.mtp_enabled = True
         w.delegate_pack_to_model = delegate_pack_to_model
         w.delegate_mtp_loss_mask_to_model = delegate_mtp_loss_mask_to_model
         w.model_slices_context_parallel_inputs = model_slices_context_parallel_inputs
@@ -497,6 +499,7 @@ class TestTrainMicrobatch:
             kwargs["model_slices_context_parallel_inputs"]
             is model_slices_context_parallel_inputs
         )
+        assert kwargs["mtp_enabled"] is True
 
     def test_passes_placeholder_n_one_to_loss(self, mock_module_symbols):
         """The N=1 trick: loss must be called with global_valid_*=1 so it

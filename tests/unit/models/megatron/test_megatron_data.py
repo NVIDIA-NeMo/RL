@@ -569,12 +569,13 @@ class TestProcessMicrobatch:
             seq_length_key="input_lengths",
             pack_sequences=True,
             model_slices_context_parallel_inputs=True,
+            mtp_enabled=True,
             straggler_timer=MagicMock(),
         )
 
         # The mask was packed, not re-derived from input_ids: one call per
         # tensor, and the second is the mask itself.
-        assert mock_pack.call_count == 2
+        assert mock_pack.call_count == 3
         assert torch.equal(
             mock_pack.call_args_list[1].args[0], data_dict["mtp_loss_mask"]
         )
@@ -588,6 +589,11 @@ class TestProcessMicrobatch:
         assert result.input_ids_cp_sharded is result.input_ids
         assert torch.equal(result.input_ids_cp_sharded, tokens_full)
         assert result.mtp_loss_mask.shape[1] == result.input_ids_cp_sharded.shape[1]
+        # position_ids must also take the full row here, for the same reason
+        # as mtp_loss_mask: the model slices CP itself and expects every
+        # token-aligned input at the same (unsharded) length.
+        assert result.position_ids is not None
+        assert torch.equal(result.position_ids, tokens_full)
 
     def test_caller_packing_matches_mbridge_thd_contract(self):
         from megatron.bridge.data.packing.in_batch import (
@@ -683,14 +689,80 @@ class TestProcessMicrobatch:
             data_dict,
             seq_length_key="input_lengths",
             pack_sequences=True,
+            mtp_enabled=True,
             straggler_timer=MagicMock(),
         )
 
-        # _pack_sequences_for_megatron is called once for input_ids and once for mtp_loss_mask.
-        assert mock_pack.call_count == 2
+        # _pack_sequences_for_megatron is called for input_ids, mtp_loss_mask, position_ids.
+        assert mock_pack.call_count == 3
         # mtp_loss_mask takes the packed tensor (index 1 of the pack return tuple).
         assert result.mtp_loss_mask is not None
         assert torch.equal(result.mtp_loss_mask, packed_idx1)
+        assert result.position_ids is not None
+        assert torch.equal(result.position_ids, packed_idx1)
+
+    @pytest.mark.parametrize(
+        ("mtp_enabled", "with_mtp_loss_mask"),
+        [
+            pytest.param(True, False, id="mtp-logprob-pass"),
+            pytest.param(True, True, id="mtp-train-pass"),
+            pytest.param(False, False, id="mtp-disabled"),
+        ],
+    )
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
+    )
+    def test_process_microbatch_with_packing_builds_mtp_position_ids(
+        self, mock_cp_world, mock_cp_rank, mtp_enabled, with_mtp_loss_mask
+    ):
+        """With packing, MTP models get position_ids that reset per packed segment.
+
+        The trigger is the model running MTP, not the presence of mtp_loss_mask:
+        logprob passes carry no mask yet still run the MTP block, and
+        HybridModel asserts position_ids there. Runs the real
+        _pack_sequences_for_megatron to check the values.
+        """
+        from nemo_rl.models.megatron.data import (
+            _pack_sequences_for_megatron,
+            process_microbatch,
+        )
+
+        input_ids = torch.tensor([[10, 11, 12, 0, 0], [20, 21, 0, 0, 0]])
+        seq_lengths = torch.tensor([3, 2])
+        data_dict = {"input_ids": input_ids, "input_lengths": seq_lengths}
+        if with_mtp_loss_mask:
+            data_dict["mtp_loss_mask"] = torch.tensor(
+                [[1, 1, 1, 0, 0], [1, 1, 0, 0, 0]]
+            )
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            mtp_enabled=mtp_enabled,
+            straggler_timer=MagicMock(),
+        )
+
+        if not mtp_enabled:
+            assert result.position_ids is None
+            return
+
+        # An independent packing of the same per-sample arange positions must
+        # agree with what process_microbatch produced.
+        position_ids_source = (
+            torch.arange(input_ids.shape[1], dtype=torch.long)
+            .unsqueeze(0)
+            .expand(input_ids.shape[0], -1)
+        )
+        _, expected_position_ids, _, _, _ = _pack_sequences_for_megatron(
+            position_ids_source, seq_lengths
+        )
+        assert result.position_ids is not None
+        assert torch.equal(result.position_ids, expected_position_ids)
+        # Positions reset to 0 at each packed segment boundary rather than
+        # running continuously across the whole packed buffer.
+        assert result.position_ids.tolist() == [[0, 1, 2, 0, 1]]
 
     @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
     @patch(
@@ -1335,6 +1407,7 @@ class TestGetMicrobatchIterator:
             cfg=cfg,
             mbs=4,
             straggler_timer=MagicMock(),
+            mtp_enabled=True,
         )
 
         # Verify sequence packing path was taken
@@ -1347,6 +1420,7 @@ class TestGetMicrobatchIterator:
             mock_make_iterator.call_args.kwargs["create_packed_seq_padding_mask"]
             is True
         )
+        assert mock_make_iterator.call_args.kwargs["mtp_enabled"] is True
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
@@ -1599,6 +1673,7 @@ class TestMakeProcessedMicrobatchIterator:
             pad_packed_seq_to_multiple_of=16,
             straggler_timer=MagicMock(),
             pad_full_seq_to=1024,
+            mtp_enabled=True,
         )
 
         microbatch = next(processed_iterator)
@@ -1611,6 +1686,7 @@ class TestMakeProcessedMicrobatchIterator:
         assert call_kwargs["pad_individual_seqs_to_multiple_of"] == 8
         assert call_kwargs["pad_packed_seq_to_multiple_of"] == 16
         assert call_kwargs["pad_full_seq_to"] == 1024
+        assert call_kwargs["mtp_enabled"] is True
 
 
 PACK_SEQUENCES_TEST_ACTOR_FQN = (
