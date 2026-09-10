@@ -899,7 +899,7 @@ Depending on your data shape, you may want to change these values."""
             counts_left[agent_name] -= 1
             if counts_left[agent_name] <= 0:
                 counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
+            if num_results % 50 == 0 and counts_left:
                 top_left = counts_left.most_common(5)
                 top_left_str = "\n".join(
                     f"{index + 1}. {name}: {count}"
