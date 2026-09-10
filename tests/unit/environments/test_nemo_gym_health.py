@@ -116,7 +116,17 @@ class TestUnspunActor:
         env = _unspun()
         with pytest.raises(RuntimeError, match="_spinup\\(\\) was never called"):
             # run_rollouts is an async generator, so the guard fires on first advance.
-            gen = env.run_rollouts([{"agent_ref": {"name": "a"}}], None, "timing/x")
+            gen = env.run_rollouts(
+                [
+                    {
+                        "agent_ref": {"name": "a"},
+                        "_ng_rollout_id": "rollout-0",
+                        "_ng_attempt_index": 0,
+                    }
+                ],
+                None,
+                "timing/x",
+            )
             import asyncio
 
             asyncio.run(anext(gen))
@@ -143,7 +153,14 @@ def test_run_rollouts_resolves_task_source_before_reading_agent_ref():
     env.head_server_config = "head-server"
     env.rch = _TaskSourceResolvingRolloutHelper()
 
-    rows = [{"task_source": "workplace_assistant"}]
+    rows = [
+        {
+            "task_source": "workplace_assistant",
+            "_ng_rollout_id": "rollout-0",
+            "_ng_attempt_index": 0,
+            "_ng_capture_id": "rollout-0",
+        }
+    ]
     asyncio.run(_drain(env.run_rollouts(rows, "timing/test")))
 
     assert rows[0]["agent_ref"]["name"] == "workplace_assistant_simple_agent"
@@ -164,7 +181,15 @@ def test_run_rollouts_echoes_resolved_agent_ref_with_streamed_result():
         return [
             item
             async for item in env.run_rollouts(
-                [{"task_source": "workplace_assistant", "_rowidx": 0}],
+                [
+                    {
+                        "task_source": "workplace_assistant",
+                        "_rowidx": 0,
+                        "_ng_rollout_id": "rollout-0",
+                        "_ng_attempt_index": 0,
+                        "_ng_capture_id": "rollout-0",
+                    }
+                ],
                 "timing/test",
             )
         ]
