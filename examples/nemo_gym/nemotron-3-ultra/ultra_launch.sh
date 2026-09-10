@@ -61,6 +61,12 @@ set -euo pipefail
 #   MAX_NUM_BATCHED_TOKENS=8480            vLLM max batched tokens (MTP)
 #   NRL_MAX_STEPS=                         Override grpo.max_num_steps
 #   EXTRA_MOUNTS=                          Comma-separated host:container pairs
+#   MOUNT_LOCAL_GYM=1                      0 to skip the full local Gym overlay
+#   NRL_DRIVER_PYTHONPATH=                 Extra PYTHONPATH for the driver
+#   NRL_DRIVER_PIP_INSTALL=                Packages to install in the driver venv
+#   NRL_VLLM_WORKER_PIP_INSTALL=           Packages to install in the async vLLM worker venv
+#   NRL_NEMO_GYM_PIP_INSTALL=              Packages to install in the Gym actor venv
+#   NRL_GYM_SERVER_PIP_INSTALL=            Packages to install in every Gym server venv
 #   USE_SNAPSHOT=1                         Snapshot source tree at submission
 #   DRY_RUN=0                              1 to print TRAIN_CMD and exit
 #   INTERACTIVE=0                          1 to bring up Ray and idle for attach
@@ -757,9 +763,13 @@ if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
   _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
   echo "  Mount: configs → /opt/nemo-rl/examples/configs"
 fi
-if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-  echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+if [[ "${MOUNT_LOCAL_GYM:-1}" == "1" ]]; then
+  if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+    echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+  fi
+else
+  echo "  Mount: Gym skipped (using container Gym with selective overlays)"
 fi
 
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
@@ -806,7 +816,13 @@ fi
 # then seed fresh from Lustre.
 # =============================================================================
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
-command -v zstd >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zstd; } 2>/dev/null || true
+# zstd is not in the container image (only libzstd.so), so this apt path runs on
+# every node on every launch, fetching from the public ports.ubuntu.com mirror.
+# It MUST be bounded: an unbounded stall here never returns, the node never
+# reaches 'ray start', and the head spins at N-4/N actors until the job is
+# killed. A *failure* is already handled (tar --zstd extraction below is
+# non-fatal), so timing out degrades to an already-supported path.
+command -v zstd >/dev/null 2>&1 || { timeout 120 apt-get update -qq && timeout 120 apt-get install -y -qq zstd; } || echo "[CACHE SEED] zstd unavailable on \${SLURMD_NODENAME:-\$(hostname)}; tarball seeding will be skipped" >&2
 echo "[CACHE SEED] Clearing stale /tmp caches and seeding from Lustre..."
 WARM_SEED="${NRL_VLLM_CACHE_SEED_DIR}"
 LOCAL_IND="${INDUCTOR_CACHE_DIR}"
@@ -844,6 +860,52 @@ fi
 _seed_cache "\$CACHE_READ/inductor_cache.tar.zst" "\$LOCAL_IND" "Inductor"
 _seed_cache "\$CACHE_READ/triton_cache.tar.zst" "\$LOCAL_TRI" "Triton"
 
+if [ -n "${NRL_VLLM_WORKER_PIP_INSTALL:-}" ]; then
+  _worker_venv="\${NEMO_RL_VENV_DIR:-/opt/ray_venvs}/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+  if [ ! -x "\$_worker_venv/bin/python" ]; then
+    echo "[WORKER DEPS] no prefetched async vLLM worker venv at \$_worker_venv" >&2
+    exit 1
+  fi
+  uv pip install --python "\$_worker_venv/bin/python" ${NRL_VLLM_WORKER_PIP_INSTALL:-}
+  echo "[WORKER DEPS] installed '${NRL_VLLM_WORKER_PIP_INSTALL:-}' into \$_worker_venv"
+fi
+
+# The Gym actor venv is built from NeMo-RL's uv.lock (PY_EXECUTABLES.NEMO_GYM),
+# not from Gym's own pyproject, so overlaying a newer Gym checkout through
+# EXTRA_MOUNTS can leave that source ahead of the venv's pinned dependencies.
+# Warn instead of exiting when the venv is absent: unlike the async vLLM worker
+# venv, this one is only prefetched when the image build did not filter it out.
+if [ -n "${NRL_NEMO_GYM_PIP_INSTALL:-}" ]; then
+  _gym_venv="\${NEMO_RL_VENV_DIR:-/opt/ray_venvs}/nemo_rl.environments.nemo_gym.NemoGym"
+  if [ ! -x "\$_gym_venv/bin/python" ]; then
+    echo "[GYM DEPS] no prefetched Gym actor venv at \$_gym_venv; skipping" >&2
+  else
+    uv pip install --python "\$_gym_venv/bin/python" ${NRL_NEMO_GYM_PIP_INSTALL:-}
+    echo "[GYM DEPS] installed '${NRL_NEMO_GYM_PIP_INSTALL:-}' into \$_gym_venv"
+  fi
+fi
+
+# Gym's per-server venvs are prefetched into NEMO_GYM_VENV_DIR at image build
+# and reused as-is at runtime (build_nemo_gym_config passes the directory
+# through as uv_venv_dir), so Gym never re-resolves them against a mounted
+# checkout. Every server then imports the overlaid sources out of its own stale
+# venv, which is the same skew NRL_NEMO_GYM_PIP_INSTALL fixes for the actor --
+# just replicated across every server. Failures here are per-venv and
+# non-fatal: a server whose venv cannot take the pin fails later at import with
+# a message naming the venv, which beats losing the whole node's setup.
+if [ -n "${NRL_GYM_SERVER_PIP_INSTALL:-}" ]; then
+  _gym_server_venvs=0
+  for _server_venv in "\${NEMO_GYM_VENV_DIR:-/opt/gym_venvs}"/*/*/.venv; do
+    [ -x "\$_server_venv/bin/python" ] || continue
+    if uv pip install --python "\$_server_venv/bin/python" ${NRL_GYM_SERVER_PIP_INSTALL:-}; then
+      _gym_server_venvs=\$((_gym_server_venvs + 1))
+    else
+      echo "[GYM SERVER DEPS] failed on \$_server_venv" >&2
+    fi
+  done
+  echo "[GYM SERVER DEPS] installed '${NRL_GYM_SERVER_PIP_INSTALL:-}' into \$_gym_server_venvs server venv(s)"
+fi
+
 echo "[CACHE SEED] Done."
 SETUPEOF
 export SETUP_COMMAND
@@ -856,6 +918,8 @@ export SETUP_COMMAND
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
+${NRL_DRIVER_PIP_INSTALL:+uv pip install --python /opt/nemo_rl_venv/bin/python ${NRL_DRIVER_PIP_INSTALL} ; }\
+${NRL_DRIVER_PYTHONPATH:+PYTHONPATH=${NRL_DRIVER_PYTHONPATH} }\
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
 WANDB_INIT_TIMEOUT=300 \
@@ -875,7 +939,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+uv run ${NRL_DRIVER_UV_RUN_FLAGS:-} ${NRL_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
