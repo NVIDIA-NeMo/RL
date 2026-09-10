@@ -23,7 +23,7 @@ from unittest.mock import patch
 import ray
 import torch
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -366,7 +366,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
     quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws")
     keyword_ignored_layers = []
-    vllm_param_names_for_report = []
     if "quantization_ignored_layer_kws" in vllm_cfg:
         warnings.warn(
             "quantization_ignored_layer_kws is deprecated in NeMo RL 0.8; "
@@ -383,7 +382,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             )
             for name, _ in model.named_parameters()
         ]
-        vllm_param_names_for_report = param_names
         ignored_layers = [
             n
             for n in param_names
@@ -426,17 +424,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         pattern_match_error = None
         if quantization_ignore_patterns:
             try:
-                if vllm_param_names_for_report:
-                    pattern_param_names = vllm_param_names_for_report
-                else:
-                    with init_empty_weights():
-                        model = AutoModel.from_config(config)
-                    pattern_param_names = [
-                        f"model.{name}".removesuffix(".weight").replace(
-                            "model.backbone.", "backbone."
-                        )
-                        for name, _ in model.named_parameters()
-                    ]
+                pattern_param_names = _enumerate_module_prefixes(config)
                 for pattern in quantization_ignore_patterns:
                     has_glob = any(char in pattern for char in "*?[")
                     pattern_matches[pattern] = [
@@ -497,6 +485,37 @@ def is_fp8_model(vllm_config):
         return True
 
     return False
+
+
+def _enumerate_module_prefixes(config) -> list[str]:
+    """Enumerate checkpoint parameter names in vllm's module-prefix namespace.
+
+    ``AutoModel`` builds the *base* model, so ``lm_head`` -- which lives on the
+    ``ForCausalLM`` wrapper -- is never enumerated and any ``lm_head`` pattern
+    reports zero matches even though vllm does exclude that layer. The causal-LM
+    class carries the head and already emits the full ``model.``/``backbone.``
+    prefix that vllm uses, so no prefix is synthesised here. Architectures with
+    no causal-LM mapping (vision-language configs, encoders) fall back to the
+    base model with the historical prefix synthesis.
+
+    ``remove_duplicate=False`` keeps ``lm_head.weight`` when it is tied to
+    ``embed_tokens.weight``; the default dedup by tensor identity drops it.
+    """
+    with init_empty_weights():
+        try:
+            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        except (KeyError, ValueError):
+            model = AutoModel.from_config(config, trust_remote_code=True)
+            return [
+                f"model.{name}".removesuffix(".weight").replace(
+                    "model.backbone.", "backbone."
+                )
+                for name, _ in model.named_parameters(remove_duplicate=False)
+            ]
+    return [
+        name.removesuffix(".weight")
+        for name, _ in model.named_parameters(remove_duplicate=False)
+    ]
 
 
 def _get_params_in_layers(param_names, layers):

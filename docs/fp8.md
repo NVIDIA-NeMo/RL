@@ -157,7 +157,7 @@ Example `report.json`:
     "quantization_ignore_patterns": {
       "match_error": null,
       "matches": {
-        "lm_head": ["model.lm_head"],
+        "lm_head": ["lm_head"],
         "model.layers.*.mlp.gate": ["model.layers.0.mlp.gate"]
       },
       "patterns": ["lm_head", "model.layers.*.mlp.gate"]

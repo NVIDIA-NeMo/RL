@@ -182,12 +182,15 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
 def test_init_fp8_returns_ignore_report_for_modelopt_patterns(fp8_module, monkeypatch):
     fp8 = fp8_module
 
-    class FakeModel:
-        def named_parameters(self):
+    class FakeCausalLM:
+        """Parameter names as AutoModelForCausalLM emits them: head included,
+        decoder already under the ``model.`` prefix vLLM uses."""
+
+        def named_parameters(self, remove_duplicate=True):
             return [
                 ("lm_head.weight", object()),
-                ("layers.0.mlp.gate.weight", object()),
-                ("layers.0.mlp.experts.0.gate_proj.weight", object()),
+                ("model.layers.0.mlp.gate.weight", object()),
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", object()),
             ]
 
     monkeypatch.setenv("NRL_DUMP_FP8_QUANTIZATION_IGNORE", "yes")
@@ -197,7 +200,11 @@ def test_init_fp8_returns_ignore_report_for_modelopt_patterns(fp8_module, monkey
         "from_pretrained",
         lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
     )
-    monkeypatch.setattr(fp8.AutoModel, "from_config", lambda *_args: FakeModel())
+    monkeypatch.setattr(
+        fp8.AutoModelForCausalLM,
+        "from_config",
+        lambda *_args, **_kwargs: FakeCausalLM(),
+    )
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
     vllm_kwargs, ignore_report = fp8.init_fp8(
@@ -219,7 +226,7 @@ def test_init_fp8_returns_ignore_report_for_modelopt_patterns(fp8_module, monkey
     assert ignore_report["sources"]["quantization_ignore_patterns"] == {
         "patterns": ["lm_head", "model.layers.*.mlp.gate"],
         "matches": {
-            "lm_head": ["model.lm_head"],
+            "lm_head": ["lm_head"],
             "model.layers.*.mlp.gate": ["model.layers.0.mlp.gate"],
         },
         "match_error": None,

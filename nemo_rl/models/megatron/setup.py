@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import warnings
@@ -224,6 +225,20 @@ def _patch_megatron_fp8_context_layer_quantization_logging() -> None:
         return original_get_fp8_context(config, layer_no=layer_no, is_init=is_init)
 
     fp8_utils.get_fp8_context = wrapped_get_fp8_context
+    # Every real call site binds the function by value at import time
+    # (``from megatron.core.fp8_utils import get_fp8_context``), and importing
+    # this module already pulls in megatron.core.transformer via
+    # ``megatron.bridge``. Rebinding only on fp8_utils would therefore leave
+    # transformer_block, recompute, multi_token_prediction, combined_1f1b and
+    # the vision projector calling the unwrapped function, and nothing would be
+    # logged.
+    for module in list(sys.modules.values()):
+        if module is None or module is fp8_utils:
+            continue
+        if not getattr(module, "__name__", "").startswith("megatron."):
+            continue
+        if getattr(module, "get_fp8_context", None) is original_get_fp8_context:
+            module.get_fp8_context = wrapped_get_fp8_context
     setattr(fp8_utils, _MEGATRON_FP8_CONTEXT_LAYER_QUANTIZATION_PATCH_ATTR, True)
     logger.info("Patched Megatron FP8 layer-quantization logging.")
 
