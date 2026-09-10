@@ -384,6 +384,19 @@ def _test_dtensor_worker_training(policy, data, loss_fn):
         assert "loss" in results, "Training results should contain 'loss'"
         loss_tensor = results["loss"]
         verify_loss_tensor(loss_tensor)
+
+        # global_loss reports the mathematical objective, not the DP/CP factor
+        # applied only to compensate FSDP gradient averaging during backward.
+        # all_mb_metrics are divided by num_global_batches in the worker, so
+        # undo that scaling before comparing the two reporting paths.
+        num_global_batches = loss_tensor.numel()
+        scaled_metric_loss = sum(results["all_mb_metrics"]["loss"])
+        torch.testing.assert_close(
+            loss_tensor.sum(),
+            loss_tensor.new_tensor(scaled_metric_loss * num_global_batches),
+            rtol=1e-4,
+            atol=1e-5,
+        )
         losses.append(loss_tensor[-1].item())
 
         print(f"Training loss: {results['loss']}")
