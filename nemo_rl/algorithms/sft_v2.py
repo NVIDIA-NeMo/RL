@@ -405,7 +405,7 @@ def setup_sft_v2(
             raise ValueError(
                 "Energon packing requires sequence_packing enabled with fuse_loss."
             )
-        if sequence_packing["algorithm"] not in {
+        if sequence_packing.get("algorithm") not in {
             "greedy_knapsack",
             "balanced_greedy_knapsack",
         }:
