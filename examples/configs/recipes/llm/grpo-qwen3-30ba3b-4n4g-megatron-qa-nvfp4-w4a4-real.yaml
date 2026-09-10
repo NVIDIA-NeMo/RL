@@ -13,15 +13,8 @@ checkpointing:
 policy:
   quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
   generation:
-    quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
+    quant_cfg: null
     real_quant: true
-    real_quant_ignore:
-    - lm_head
-    - '*output_layer*'
-    - '*mlp.gate*'
-    - '*router*'
-    - '*self_attention*'
-    - '*self_attn*'
     vllm_kwargs:
       moe_backend: auto
 logger:

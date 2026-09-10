@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="610" viewBox="0 0 1200 610" role="img" aria-labelledby="title desc">
+  <title id="title">ModelOpt real-quant export and online refit flow</title>
+  <desc id="desc">A one-time startup flow creates the quantization schema and initializes vLLM. After every policy update, Megatron-Bridge reconstructs logical Hugging Face weights, ModelOpt packs them with sidecars, NeMo RL transports them in memory, and vLLM reloads them before rollout.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#344054"/>
+    </marker>
+    <style>
+      .title { font: 700 24px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #101828; }
+      .phase { font: 700 15px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #101828; }
+      .owner { font: 700 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+      .node-title { font: 700 15px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #101828; }
+      .node-copy { font: 400 13px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #475467; }
+      .note { font: 600 12px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #475467; }
+      .arrow { fill: none; stroke: #344054; stroke-width: 2; marker-end: url(#arrow); }
+      .box { fill: #ffffff; stroke: #98a2b3; stroke-width: 1.5; rx: 6; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="610" fill="#ffffff"/>
+  <text class="title" x="40" y="42">Real-quant export and online refit</text>
+
+  <rect x="40" y="68" width="1120" height="188" rx="6" fill="#f8fafc" stroke="#d0d5dd"/>
+  <rect x="40" y="68" width="9" height="188" fill="#0e7490"/>
+  <text class="phase" x="66" y="97">STARTUP ONCE</text>
+
+  <g transform="translate(66 116)">
+    <rect class="box" width="226" height="108"/>
+    <rect width="226" height="25" rx="6" fill="#dff3ea"/>
+    <rect y="19" width="226" height="6" fill="#dff3ea"/>
+    <text class="owner" x="12" y="17" fill="#166534">MEGATRON + MODELOPT</text>
+    <text class="node-title" x="14" y="51">Quantized policy</text>
+    <text class="node-copy" x="14" y="75">Apply recipe and calibrate</text>
+    <text class="node-copy" x="14" y="94">quantizers</text>
+  </g>
+
+  <path class="arrow" d="M 300 170 H 342"/>
+
+  <g transform="translate(352 116)">
+    <rect class="box" width="226" height="108"/>
+    <rect width="226" height="25" rx="6" fill="#dff3ea"/>
+    <rect y="19" width="226" height="6" fill="#dff3ea"/>
+    <text class="owner" x="12" y="17" fill="#166534">MODELOPT</text>
+    <text class="node-title" x="14" y="51">Canonical schema</text>
+    <text class="node-copy" x="14" y="75">Build quantization_config</text>
+    <text class="node-copy" x="14" y="94">from calibrated policy</text>
+  </g>
+
+  <path class="arrow" d="M 586 170 H 628"/>
+
+  <g transform="translate(638 116)">
+    <rect class="box" width="226" height="108"/>
+    <rect width="226" height="25" rx="6" fill="#e0ecff"/>
+    <rect y="19" width="226" height="6" fill="#e0ecff"/>
+    <text class="owner" x="12" y="17" fill="#1d4ed8">NEMO RL</text>
+    <text class="node-title" x="14" y="51">Generation config</text>
+    <text class="node-copy" x="14" y="75">Pass schema through</text>
+    <text class="node-copy" x="14" y="94">hf_overrides</text>
+  </g>
+
+  <path class="arrow" d="M 872 170 H 914"/>
+
+  <g transform="translate(924 116)">
+    <rect class="box" width="210" height="108"/>
+    <rect width="210" height="25" rx="6" fill="#fff0d5"/>
+    <rect y="19" width="210" height="6" fill="#fff0d5"/>
+    <text class="owner" x="12" y="17" fill="#9a3412">VLLM</text>
+    <text class="node-title" x="14" y="51">Native engine</text>
+    <text class="node-copy" x="14" y="75">Allocate checkpoint-form</text>
+    <text class="node-copy" x="14" y="94">quantized modules</text>
+  </g>
+
+  <rect x="40" y="282" width="1120" height="282" rx="6" fill="#f8fafc" stroke="#d0d5dd"/>
+  <rect x="40" y="282" width="9" height="282" fill="#b45309"/>
+  <text class="phase" x="66" y="311">EVERY POLICY UPDATE</text>
+
+  <g transform="translate(66 333)">
+    <rect class="box" width="190" height="126"/>
+    <rect width="190" height="25" rx="6" fill="#e0ecff"/>
+    <rect y="19" width="190" height="6" fill="#e0ecff"/>
+    <text class="owner" x="12" y="17" fill="#1d4ed8">NEMO RL POLICY</text>
+    <text class="node-title" x="14" y="51">Current state</text>
+    <text class="node-copy" x="14" y="75">BF16 weights plus</text>
+    <text class="node-copy" x="14" y="94">quantizer state</text>
+  </g>
+
+  <path class="arrow" d="M 264 396 H 290"/>
+
+  <g transform="translate(300 333)">
+    <rect class="box" width="202" height="126"/>
+    <rect width="202" height="25" rx="6" fill="#ece7f8"/>
+    <rect y="19" width="202" height="6" fill="#ece7f8"/>
+    <text class="owner" x="12" y="17" fill="#6b21a8">MEGATRON-BRIDGE</text>
+    <text class="node-title" x="14" y="51">Logical HF weights</text>
+    <text class="node-copy" x="14" y="75">Gather TP / PP / EP</text>
+    <text class="node-copy" x="14" y="94">Split fused parameters</text>
+    <text class="node-copy" x="14" y="113">Assign canonical names</text>
+  </g>
+
+  <path class="arrow" d="M 510 396 H 536"/>
+
+  <g transform="translate(546 333)">
+    <rect class="box" width="202" height="126"/>
+    <rect width="202" height="25" rx="6" fill="#dff3ea"/>
+    <rect y="19" width="202" height="6" fill="#dff3ea"/>
+    <text class="owner" x="12" y="17" fill="#166534">MODELOPT</text>
+    <text class="node-title" x="14" y="51">Packed payload</text>
+    <text class="node-copy" x="14" y="75">Pack current weight</text>
+    <text class="node-copy" x="14" y="94">Emit format sidecars</text>
+    <text class="node-copy" x="14" y="113">Preserve HF schema</text>
+  </g>
+
+  <path class="arrow" d="M 756 396 H 782"/>
+
+  <g transform="translate(792 333)">
+    <rect class="box" width="154" height="126"/>
+    <rect width="154" height="25" rx="6" fill="#e0ecff"/>
+    <rect y="19" width="154" height="6" fill="#e0ecff"/>
+    <text class="owner" x="12" y="17" fill="#1d4ed8">NEMO RL</text>
+    <text class="node-title" x="14" y="51">Transport</text>
+    <text class="node-copy" x="14" y="75">Stream tensors</text>
+    <text class="node-copy" x="14" y="94">in memory</text>
+    <text class="note" x="14" y="113">No checkpoint file</text>
+  </g>
+
+  <path class="arrow" d="M 954 396 H 960"/>
+
+  <g transform="translate(970 333)">
+    <rect class="box" width="164" height="126"/>
+    <rect width="164" height="25" rx="6" fill="#fff0d5"/>
+    <rect y="19" width="164" height="6" fill="#fff0d5"/>
+    <text class="owner" x="12" y="17" fill="#9a3412">VLLM</text>
+    <text class="node-title" x="14" y="51">Native reload</text>
+    <text class="node-copy" x="14" y="75">1. Initialize</text>
+    <text class="node-copy" x="14" y="94">2. Load tensors</text>
+    <text class="node-copy" x="14" y="113">3. Finalize + repack</text>
+  </g>
+
+  <path class="arrow" d="M 1052 467 V 500"/>
+  <rect x="945" y="510" width="189" height="34" rx="6" fill="#fff0d5" stroke="#c2410c" stroke-width="1.5"/>
+  <text class="node-title" x="1000" y="532">Rollouts</text>
+
+  <text class="note" x="66" y="531">Repeat after the optimizer changes policy weights or quantizer state.</text>
+</svg>

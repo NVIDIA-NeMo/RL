@@ -30,6 +30,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.train import force_param_sync
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
@@ -1195,6 +1196,8 @@ class MegatronPolicyWorkerImpl(
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        if "logprobs" not in reference_logprobs:
+            return return_data
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
@@ -2051,7 +2054,21 @@ class MegatronPolicyWorkerImpl(
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+        # Logprobs are replicated across TP/CP/PP, and only rank zero on those
+        # axes is consumed. Avoid copying the discarded replicas to host.
+        if not self._is_replica_leader():
+            return BatchedDataDict[LogprobOutputSpec]()
+
+        # Copy through pinned memory explicitly. A blocking copy to newly
+        # allocated pageable memory can stall inside cuMemcpyDtoHAsync after
+        # long logprob forwards. Ray must not serialize the destination until
+        # the asynchronous copy has completed.
+        cpu_logprobs = torch.empty_like(logprobs, device="cpu", pin_memory=True)
+        copy_stream = torch.cuda.current_stream(logprobs.device)
+        cpu_logprobs.copy_(logprobs, non_blocking=True)
+        copy_stream.synchronize()
+        return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
 
     def _apply_state_dict_to_model(
         self,
@@ -2116,7 +2133,10 @@ class MegatronPolicyWorkerImpl(
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         ## disable overlap param gather when swapping weights
-        if self.should_disable_forward_pre_hook:
+        reenable_forward_pre_hook = (
+            self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled()
+        )
+        if reenable_forward_pre_hook:
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
@@ -2172,7 +2192,7 @@ class MegatronPolicyWorkerImpl(
                 torch.cuda.empty_cache()
 
             ## re-enable overlap param gather after weight swap
-            if self.should_disable_forward_pre_hook:
+            if reenable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
@@ -3393,6 +3413,16 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
+        # Packed logprob shards can require different numbers of forwards on
+        # different DP ranks, so their forwards cannot run DP collectives. Do
+        # the one required parameter gather before releasing any train buffer.
+        # During an open split train step, parameters are already gathered and
+        # the accumulated gradients must not be zeroed.
+        if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
+            self._disable_forward_pre_hook_until_next_train_step(
+                param_sync=not keep_train_buffers
+            )
+
         if not keep_train_buffers:
             # offload grads to cpu
             self.model = self.move_model(
@@ -3498,13 +3528,24 @@ class MegatronPolicyWorkerImpl(
         )
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
-    def offload_before_refit(self):
+    def offload_before_refit(self, *, sync_params: bool = True):
         """Offload the optimizer and buffers to the CPU."""
         # An in-flight async checkpoint keeps references to the CUDA tensors in
         # its sharded state dict until the write is finalized. Offloading swaps
         # those tensors for CPU storage, so the checkpoint references would keep
         # the old CUDA storage alive and defeat the offload.
         self.finalize_async_save()
+
+        # With overlapped parameter gathering, optimizer.step() publishes only
+        # the local DP shard. Refit reads parameters outside a model forward, so
+        # it must force the deferred DP gather before exporting those weights.
+        if (
+            sync_params
+            and self.should_disable_forward_pre_hook
+            and isinstance(self.model, DistributedDataParallel)
+            and self.optimizer is not None
+        ):
+            force_param_sync([self.model], optimizer=self.optimizer)
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -3622,7 +3663,15 @@ class MegatronPolicyWorkerImpl(
             self.model, "cpu", move_params=not keep_params_for_generation
         )
         torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
+        self.offload_before_refit(sync_params=False)  # rerun the old offload function
+
+        # force_param_sync() marked every DDP bucket as dispatched for the snapshot
+        # consumed by refit. Parameter storage was then offloaded outside a forward;
+        # start the next forward in a new gather epoch instead of reusing that state.
+        if self.should_disable_forward_pre_hook and isinstance(
+            self.model, DistributedDataParallel
+        ):
+            self.model.reset_param_sync_dispatch_state()
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
@@ -3773,7 +3822,11 @@ class MegatronPolicyWorkerImpl(
             if not is_training:
                 self.model.eval()
 
-            if self.should_disable_forward_pre_hook:
+            reenable_forward_pre_hook = (
+                self.should_disable_forward_pre_hook
+                and self._forward_pre_hook_enabled()
+            )
+            if reenable_forward_pre_hook:
                 self.disable_forward_pre_hook()
             save_checkpoint(
                 state=self.mcore_state,
@@ -3791,7 +3844,7 @@ class MegatronPolicyWorkerImpl(
                     ckpt_cfg=self.mcore_state.cfg.checkpoint,
                     blocking=True,
                 )
-            if self.should_disable_forward_pre_hook:
+            if reenable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
             if not is_training:

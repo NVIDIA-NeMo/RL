@@ -48,6 +48,7 @@ The bugs these catch:
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -171,6 +172,7 @@ def _make_worker(loss_type):
     # The step summary in finish_train_step reads it eagerly to decide whether
     # this rank prints.
     w.rank = 0
+    w.should_disable_forward_pre_hook = False
     # Also set in __init__: the finish path reads them to put the DDP forward
     # pre-hook back after the first optimizer step.
     w._log_gpu_mem = MagicMock()
@@ -1466,6 +1468,38 @@ class TestPrepareForLpInference:
         assert first.kwargs == {"move_grads": False}
         w.model.eval.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("keep_train_buffers", "expected_param_sync"),
+        [(False, True), (True, False)],
+    )
+    def test_disables_param_gather_before_packed_logprobs(
+        self, mock_module_symbols, keep_train_buffers, expected_param_sync
+    ):
+        w = self._worker()
+        events = []
+        w.should_disable_forward_pre_hook = True
+        w._forward_pre_hook_enabled = MagicMock(return_value=True)
+        w._disable_forward_pre_hook_until_next_train_step = MagicMock(
+            side_effect=lambda **kwargs: events.append(("disable", kwargs))
+        )
+        w.move_model = MagicMock(
+            side_effect=lambda model, device, **kwargs: (
+                events.append(("move", device, kwargs)) or model
+            )
+        )
+
+        with patch("torch.randn"):
+            w.prepare_for_lp_inference(keep_train_buffers=keep_train_buffers)
+
+        assert events[0] == ("move", "cuda", {"move_grads": False})
+        assert events[1] == ("disable", {"param_sync": expected_param_sync})
+        if not keep_train_buffers:
+            assert events[2] == (
+                "move",
+                "cpu",
+                {"move_params": False, "move_grads": True},
+            )
+
     def test_keeps_buffers_across_an_open_step(self, mock_module_symbols):
         """The sequence the streaming pump actually produces: open a step, run a
         chunk, take the logprob detour, run another chunk, finish. The finalize
@@ -1480,3 +1514,92 @@ class TestPrepareForLpInference:
         w.finish_train_step()
         assert self._grad_offload_calls(w) == []
         assert sentinel.call_count == 1
+
+
+class TestReplicatedLogprobResult:
+    @staticmethod
+    def _worker():
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.cfg.update(
+            {
+                "logprob_batch_size": 1,
+                "sequence_packing": {"enabled": True},
+            }
+        )
+        w.timer = MagicMock()
+        return w
+
+    @pytest.mark.parametrize("is_leader", [False, True])
+    def test_only_replica_leader_copies_logprobs_to_cpu(self, is_leader):
+        w = self._worker()
+        w._is_replica_leader = MagicMock(return_value=is_leader)
+        worker_logprobs = torch.tensor([[1.0, 2.0, 3.0]])
+
+        with (
+            patch(f"{WORKER_MOD}.attach_media_token_validity_mask"),
+            patch(
+                f"{WORKER_MOD}.get_microbatch_iterator",
+                return_value=(iter(()), 1, 1, 4, 4),
+            ),
+            patch(f"{WORKER_MOD}.LogprobsPostProcessor"),
+            patch(f"{WORKER_MOD}._should_use_router_replay", return_value=False),
+            patch(
+                f"{WORKER_MOD}.megatron_forward_backward",
+                return_value=[{"logprobs": worker_logprobs}],
+            ),
+            patch(
+                f"{WORKER_MOD}.parallel_state.is_pipeline_last_stage",
+                return_value=True,
+            ),
+            patch(
+                f"{WORKER_MOD}.broadcast_tensors_from_last_stage",
+                side_effect=lambda tensors: tensors,
+            ) as broadcast,
+            patch(f"{WORKER_MOD}.torch.empty_like") as empty_like,
+            patch(f"{WORKER_MOD}.torch.cuda.current_stream") as current_stream,
+        ):
+            cpu_logprobs = MagicMock()
+            empty_like.return_value = cpu_logprobs
+            result = w.get_logprobs(data=MagicMock())
+
+        broadcast.assert_called_once()
+        if is_leader:
+            source_logprobs = empty_like.call_args.args[0]
+            torch.testing.assert_close(
+                source_logprobs, torch.tensor([[1.0, 2.0, 3.0, 0.0]])
+            )
+            empty_like.assert_called_once_with(
+                source_logprobs, device="cpu", pin_memory=True
+            )
+            cpu_logprobs.copy_.assert_called_once_with(
+                source_logprobs, non_blocking=True
+            )
+            current_stream.assert_called_once_with(source_logprobs.device)
+            current_stream.return_value.synchronize.assert_called_once_with()
+            assert result["logprobs"] is cpu_logprobs
+        else:
+            assert not result
+            empty_like.assert_not_called()
+            current_stream.assert_not_called()
+
+    @pytest.mark.parametrize("has_inner_result", [False, True])
+    def test_reference_logprobs_accept_empty_nonleader_result(self, has_inner_result):
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+        w = self._worker()
+        inner = BatchedDataDict()
+        if has_inner_result:
+            inner["logprobs"] = torch.tensor([[1.0, 2.0]])
+
+        with (
+            patch.object(w, "use_reference_model", return_value=nullcontext()),
+            patch.object(w, "get_logprobs", return_value=inner),
+        ):
+            result = w.get_reference_policy_logprobs(data=MagicMock())
+
+        if has_inner_result:
+            torch.testing.assert_close(result["reference_logprobs"], inner["logprobs"])
+        else:
+            assert not result

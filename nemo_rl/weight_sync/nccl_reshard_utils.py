@@ -623,7 +623,7 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "vLLM's reload_weights API)."
         )
 
-    # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
+    # ModelOpt real-quant rollout holds packed vLLM parameters and refits
     # through vLLM's layerwise-reload weight loaders; the bulk xferdtensor
     # path writes directly into param storage, bypassing both.
     if generation.get("real_quant"):

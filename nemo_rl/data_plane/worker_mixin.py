@@ -821,6 +821,8 @@ class TQWorkerMixin:
             result_key: Key into ``result`` for the tensor to write back.
             tq_field: Field name on the TQ side.
         """
+        if not self._is_replica_leader():
+            return
         if self._dp_client is None:
             return
         from collections.abc import Mapping

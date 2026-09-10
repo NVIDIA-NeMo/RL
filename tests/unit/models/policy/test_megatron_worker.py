@@ -270,12 +270,27 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
 
     events = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = object()
-    worker.optimizer = None
+    optimizer = object()
+
+    class _FakeDDP:
+        pass
+
+    worker.model = _FakeDDP()
+    worker.optimizer = optimizer
     worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = False
+    worker.should_disable_forward_pre_hook = True
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.force_param_sync",
+        lambda model, optimizer: events.append(("force_param_sync", model, optimizer)),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.DistributedDataParallel",
+        _FakeDDP,
+    )
     worker.move_model = lambda model, device, move_params, move_grads: (
         events.append("move_model") or model
     )
@@ -300,7 +315,9 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     MegatronPolicyWorkerImpl.offload_before_refit(worker)
 
     assert events[0] == "finalize_async_save"
-    assert events.index("finalize_async_save") < events.index("move_model")
+    sync_event = ("force_param_sync", [worker.model], optimizer)
+    assert events.index("finalize_async_save") < events.index(sync_event)
+    assert events.index(sync_event) < events.index("move_model")
 
 
 @pytest.mark.parametrize("offload_optimizer", [False, True])
@@ -317,6 +334,7 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     worker.model = object()
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = False
     worker.offload_optimizer_for_refit = offload_optimizer
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
@@ -364,8 +382,14 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = _FakeTrainableModel()
+
+    class _FakeDDP(_FakeTrainableModel):
+        def reset_param_sync_dispatch_state(self):
+            events.append("reset_param_sync_dispatch_state")
+
+    worker.model = _FakeDDP()
     worker.model.eval = lambda: events.append("eval")
+    worker.should_disable_forward_pre_hook = True
     worker.cfg = (
         {"generation": {"backend": generation_backend}} if generation_backend else {}
     )
@@ -376,7 +400,9 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     worker.move_model = lambda model, device, **kwargs: (
         events.append("move_model") or move_kwargs.append(kwargs) or model
     )
-    worker.offload_before_refit = lambda: events.append("offload_before_refit")
+    worker.offload_before_refit = lambda *, sync_params=True: events.append(
+        ("offload_before_refit", sync_params)
+    )
 
     class _AllocatorWakeup:
         def cuda(self):
@@ -393,6 +419,10 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
         lambda *args, **kwargs: events.append("memory_reserved") or 0,
     )
     monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.DistributedDataParallel",
+        _FakeDDP,
+    )
 
     MegatronPolicyWorkerImpl.offload_after_refit(worker)
 
@@ -400,6 +430,10 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     assert events.index("finalize_async_save") < events.index("move_model")
     assert events.index("eval") < events.index("move_model")
     assert move_kwargs[0]["move_params"] is expect_move_params
+    assert ("offload_before_refit", False) in events
+    assert events.index(("offload_before_refit", False)) < events.index(
+        "reset_param_sync_dispatch_state"
+    )
 
 
 def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
@@ -425,7 +459,8 @@ def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
     assert move_kwargs == [{"move_params": True, "move_grads": False}]
 
 
-def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
+@pytest.mark.parametrize("hook_enabled", [False, True])
+def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch, hook_enabled):
     """Params offloaded by colocated generation must be onloaded before the save walks them."""
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -439,7 +474,10 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     worker.optimizer = object()
     worker.scheduler = None
     worker.optimizer_cpu_offload = False
-    worker.should_disable_forward_pre_hook = False
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = lambda: hook_enabled
+    worker.disable_forward_pre_hook = lambda: events.append("disable_hook")
+    worker.enable_forward_pre_hook = lambda: events.append("enable_hook")
     worker.checkpointing_context = None
     worker.mcore_state = SimpleNamespace(
         cfg=SimpleNamespace(
@@ -471,6 +509,9 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     assert events.index("move_model_cuda") < events.index("mcore_save")
     assert events.index("move_optimizer_cuda") < events.index("mcore_save")
     assert events.index("synchronize") < events.index("mcore_save")
+    assert [event for event in events if event.endswith("_hook")] == (
+        ["disable_hook", "enable_hook"] if hook_enabled else []
+    )
     assert worker.mcore_state.cfg.checkpoint.save == "original_path"
 
 
@@ -743,6 +784,30 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
     assert worker._first_train_step_param_sync_func == "sync"
     assert model_config.param_sync_func is None
     assert worker._first_train_step_forward_pre_hook_disabled is True
+
+
+@pytest.mark.parametrize("hook_enabled", [False, True])
+def test_use_reference_model_preserves_forward_pre_hook_state(hook_enabled) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = lambda: hook_enabled
+    hook_events = []
+    worker.disable_forward_pre_hook = lambda: hook_events.append("disable")
+    worker.enable_forward_pre_hook = lambda: hook_events.append("enable")
+    worker.model = SimpleNamespace(state_dict=lambda: {})
+    worker.reference_state_dict = {}
+    worker._apply_state_dict_to_model = lambda *_args, **_kwargs: None
+    worker.sampling_params = None
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+
+    with worker.use_reference_model():
+        pass
+
+    assert hook_events == (["disable", "enable"] if hook_enabled else [])
 
 
 @pytest.mark.parametrize("update_successful", [False, True])

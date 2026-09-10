@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1050" viewBox="0 0 1400 1050" role="img" aria-labelledby="title desc">
+  <title id="title">Future unified offline export call flow</title>
+  <desc id="desc">Proposed call flow in which Megatron and Transformers offline exporters retain their topology and checkpoint writers while sharing ModelOpt per-weight quantization packing and configuration generation.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#344054"/>
+    </marker>
+    <style>
+      .title { font: 700 25px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #101828; }
+      .subtitle { font: 400 14px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #475467; }
+      .lane { font: 700 14px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #344054; }
+      .owner { font: 700 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+      .call { font: 600 13px ui-monospace, "SFMono-Regular", Consolas, monospace; fill: #101828; }
+      .copy { font: 400 13px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #475467; }
+      .note { font: 600 12px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #475467; }
+      .box { fill: #ffffff; stroke: #98a2b3; stroke-width: 1.5; rx: 6; }
+      .proposed { fill: #fffaeb; stroke: #f79009; stroke-width: 1.5; stroke-dasharray: 7 5; rx: 6; }
+      .arrow { fill: none; stroke: #344054; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1400" height="1050" fill="#ffffff"/>
+  <text class="title" x="52" y="44">Future unified offline export call flow</text>
+  <text class="subtitle" x="52" y="69">Proposed migration: keep framework-specific topology and checkpoint writers; share ModelOpt packing and configuration.</text>
+
+  <text class="lane" x="80" y="108">MEGATRON MODEL</text>
+  <text class="lane" x="750" y="108">TRANSFORMERS MODEL</text>
+
+  <g transform="translate(70 128)">
+    <rect class="box" width="580" height="78"/>
+    <rect width="145" height="78" rx="6" fill="#e0ecff"/>
+    <rect x="139" width="6" height="78" fill="#e0ecff"/>
+    <text class="owner" x="16" y="31" fill="#1d4ed8">MBRIDGE ENTRY</text>
+    <text class="call" x="168" y="29">examples/quantization/export.py</text>
+    <text class="copy" x="168" y="53">Load the distributed quantized Megatron checkpoint.</text>
+  </g>
+
+  <g transform="translate(750 128)">
+    <rect class="box" width="580" height="78"/>
+    <rect width="145" height="78" rx="6" fill="#fef0c7"/>
+    <rect x="139" width="6" height="78" fill="#fef0c7"/>
+    <text class="owner" x="16" y="31" fill="#b54708">MODELOPT ENTRY</text>
+    <text class="call" x="168" y="29">export_hf_checkpoint()</text>
+    <text class="copy" x="168" y="53">Accept the resident or CPU/disk-offloaded HF model.</text>
+  </g>
+
+  <path class="arrow" d="M 360 214 V 237"/>
+  <path class="arrow" d="M 1040 214 V 237"/>
+
+  <g transform="translate(70 245)">
+    <rect class="proposed" width="580" height="108"/>
+    <text class="owner" x="18" y="27" fill="#b54708">PROPOSED MBRIDGE OFFLINE ADAPTER</text>
+    <text class="call" x="18" y="54">build_hf_modelopt_export_plan()</text>
+    <text class="call" x="18" y="77">export_hf_weights_modelopt()</text>
+    <text class="copy" x="18" y="98">Select ModelOpt-aware conversion tasks without changing the writer.</text>
+  </g>
+
+  <g transform="translate(750 245)">
+    <rect class="proposed" width="580" height="108"/>
+    <text class="owner" x="18" y="27" fill="#b54708">PROPOSED TRANSFORMERS ADAPTER</text>
+    <text class="call" x="18" y="54">_export_transformers_checkpoint[_streaming]()</text>
+    <text class="copy" x="18" y="77">Enumerate canonical HF module and weight names.</text>
+    <text class="copy" x="18" y="98">Route supported formats through the functional API.</text>
+  </g>
+
+  <path class="arrow" d="M 360 361 V 384"/>
+  <path class="arrow" d="M 1040 361 V 384"/>
+
+  <g transform="translate(70 392)">
+    <rect class="box" width="580" height="112"/>
+    <rect width="145" height="112" rx="6" fill="#e0ecff"/>
+    <rect x="139" width="6" height="112" fill="#e0ecff"/>
+    <text class="owner" x="16" y="31" fill="#1d4ed8">MBRIDGE</text>
+    <text class="call" x="168" y="29">stream_weights_megatron_to_hf()</text>
+    <text class="call" x="168" y="53">task.mapping.megatron_to_hf()</text>
+    <text class="copy" x="168" y="78">Reconstruct each logical HF weight from TP/PP/EP</text>
+    <text class="copy" x="168" y="98">and fused Megatron layouts; align quantizer state.</text>
+  </g>
+
+  <g transform="translate(750 392)">
+    <rect class="box" width="580" height="112"/>
+    <rect width="145" height="112" rx="6" fill="#fef0c7"/>
+    <rect x="139" width="6" height="112" fill="#fef0c7"/>
+    <text class="owner" x="16" y="31" fill="#b54708">TRANSFORMERS</text>
+    <text class="call" x="168" y="29">named_modules() / export handlers</text>
+    <text class="copy" x="168" y="55">The in-memory tensor already has its logical HF</text>
+    <text class="copy" x="168" y="75">name and layout. No topology conversion is needed.</text>
+    <text class="copy" x="168" y="98">Offloaded models still materialize one layer at a time.</text>
+  </g>
+
+  <path class="arrow" d="M 360 512 V 544 H 700 V 566"/>
+  <path class="arrow" d="M 1040 512 V 544 H 700 V 566"/>
+
+  <g transform="translate(190 574)">
+    <rect class="box" width="1020" height="184"/>
+    <rect width="180" height="184" rx="6" fill="#dcfae6"/>
+    <rect x="174" width="6" height="184" fill="#dcfae6"/>
+    <text class="owner" x="18" y="31" fill="#067647">SHARED MODELOPT</text>
+    <text class="owner" x="18" y="51" fill="#067647">FUNCTIONAL CORE</text>
+    <text class="call" x="208" y="31">get_quantized_weight_export_spec()</text>
+    <text class="copy" x="570" y="31">Describe stable format and block metadata.</text>
+    <text class="call" x="208" y="64">capture_quantized_weight_export_state()</text>
+    <text class="copy" x="570" y="64">Capture current scales and amax without mutation.</text>
+    <text class="call" x="208" y="97">merge/select_quantized_weight_export_state()</text>
+    <text class="copy" x="570" y="97">Megatron only: mirror topology and fused-weight transforms.</text>
+    <text class="call" x="208" y="130">export_quantized_weight_tensors()</text>
+    <text class="copy" x="570" y="130">Emit packed weight and format-owned sidecars.</text>
+    <text class="call" x="208" y="163">build_hf_quantization_config()</text>
+    <text class="copy" x="570" y="163">Build one canonical deployment schema.</text>
+  </g>
+
+  <path class="arrow" d="M 700 766 V 792 H 360 V 815"/>
+  <path class="arrow" d="M 700 766 V 792 H 1040 V 815"/>
+
+  <g transform="translate(70 823)">
+    <rect class="box" width="580" height="94"/>
+    <rect width="145" height="94" rx="6" fill="#e0ecff"/>
+    <rect x="139" width="6" height="94" fill="#e0ecff"/>
+    <text class="owner" x="16" y="31" fill="#1d4ed8">MBRIDGE WRITER</text>
+    <text class="call" x="168" y="29">save_hf_pretrained() / save_generator()</text>
+    <text class="copy" x="168" y="54">Stream safetensors shards and preserve HF artifacts.</text>
+    <text class="copy" x="168" y="76">Add the canonical ModelOpt quantization configuration.</text>
+  </g>
+
+  <g transform="translate(750 823)">
+    <rect class="box" width="580" height="94"/>
+    <rect width="145" height="94" rx="6" fill="#fef0c7"/>
+    <rect x="139" width="6" height="94" fill="#fef0c7"/>
+    <text class="owner" x="16" y="31" fill="#b54708">HF WRITER</text>
+    <text class="call" x="168" y="29">model.save_pretrained() / shard writer</text>
+    <text class="copy" x="168" y="54">Keep existing resident and streaming output paths.</text>
+    <text class="copy" x="168" y="76">Write the canonical ModelOpt quantization configuration.</text>
+  </g>
+
+  <path class="arrow" d="M 360 925 V 958 H 700 V 977"/>
+  <path class="arrow" d="M 1040 925 V 958 H 700 V 977"/>
+
+  <g transform="translate(390 985)">
+    <rect class="box" width="620" height="48"/>
+    <text class="call" x="25" y="29">Canonical HF checkpoint: safetensors + config + tokenizer/assets</text>
+  </g>
+
+</svg>

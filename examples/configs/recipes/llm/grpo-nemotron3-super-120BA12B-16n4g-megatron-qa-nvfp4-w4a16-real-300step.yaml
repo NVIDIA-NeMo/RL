@@ -7,29 +7,8 @@ policy:
   disable_modelopt_layer_spec: true
   quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
   generation:
-    quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
+    quant_cfg: null
     real_quant: true
-    real_quant_ignore:
-      - lm_head
-      - '*output_layer*'
-      - '*mtp*'
-      - '*router*'
-      - '*mixer.gate*'
-      - '*self_attention*'
-      - '*self_attn*'
-      - '*.q_proj*'
-      - '*.k_proj*'
-      - '*.v_proj*'
-      - '*.o_proj*'
-      - '*.qkv_proj*'
-      - '*.linear_qkv*'
-      - '*.linear_proj*'
-      - '*.mixer.in_proj*'
-      - '*.mixer.out_proj*'
-      - '*fc1_latent_proj*'
-      - '*fc2_latent_proj*'
-      - '*.shared_expert.*'
-      - '*.shared_experts.*'
     vllm_kwargs:
       moe_backend: auto
       attention_config:
