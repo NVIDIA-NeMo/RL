@@ -890,7 +890,11 @@ def grpo_train_sync(
                 if skip_prev_logprobs:
                     sample_mask = loss_multiplier
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                    seq_logprob_error_metrics = (
+                        {}
+                        if master_config.grpo.seq_logprob_error_in_loss
+                        else _placeholder_seq_logprob_error_metrics()
+                    )
                 else:
                     sample_mask, seq_logprob_error_metrics = (
                         _compute_seq_logprob_error_metrics(

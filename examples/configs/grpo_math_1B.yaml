@@ -48,6 +48,9 @@ grpo:
     target_min: 0.0
     target_max: 1.0
   seq_logprob_error_threshold: null
+  # Opt-in single-forward Megatron GRPO: apply the threshold during training
+  # and normalize gradients over survivors before the optimizer step.
+  seq_logprob_error_in_loss: false
   # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
   invalid_tool_call_advantage: null
   # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
