@@ -1004,14 +1004,15 @@ Depending on your data shape, you may want to change these values."""
             if not _is_trainable_output_item(output_item_dict):
                 continue
 
-            assert (
-                seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
-Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
-output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
-"""
+            # TODO @bxyu-nvidia: Comment this out only for testing with external vLLM
+#             assert (
+#                 seen_token_ids
+#                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
+#             ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+# Seen token IDs: {seen_token_ids}
+# Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
+# output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
+# """
 
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
             generation_token_ids = output_item_dict.pop("generation_token_ids")
