@@ -16,6 +16,7 @@ import contextlib
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 pytestmark = pytest.mark.vllm
 
@@ -33,12 +34,12 @@ def test_weight_update_lifecycle_uses_layerwise_reload_for_deepseek_v4_fp8(
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
-    model = object()
+    model = torch.nn.Module()
     ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
     ext.model_config = object()
     ext.device = "cpu"
     ext._uses_native_layerwise_refit = lambda _transport: True
-    ext._validate_native_layerwise_refit = lambda: None
+    ext._validate_native_layerwise_refit = lambda _transport: None
     ext._uses_deepseek_v4_fp8_refit = lambda: True
     ext._nrl_layerwise_reload_failure = None
     call_order = []
@@ -116,11 +117,11 @@ def test_deepseek_v4_layerwise_failure_restores_global_state(monkeypatch):
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_runner = SimpleNamespace(model=torch.nn.Module(), vllm_config=object())
     ext.model_config = object()
     ext.device = "cpu"
     ext._uses_native_layerwise_refit = lambda _transport: True
-    ext._validate_native_layerwise_refit = lambda: None
+    ext._validate_native_layerwise_refit = lambda _transport: None
     ext._uses_deepseek_v4_fp8_refit = lambda: True
     ext._nrl_layerwise_reload_failure = None
     restored = []
@@ -158,10 +159,10 @@ def test_deepseek_v4_context_entry_failure_preserves_original_error(
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_runner = SimpleNamespace(model=torch.nn.Module(), vllm_config=object())
     ext.device = "cpu"
     ext._uses_native_layerwise_refit = lambda _transport: True
-    ext._validate_native_layerwise_refit = lambda: None
+    ext._validate_native_layerwise_refit = lambda _transport: None
     ext._uses_deepseek_v4_fp8_refit = lambda: True
     failure = RuntimeError("context entry failed")
     restored = []
@@ -210,7 +211,7 @@ def test_weight_update_lifecycle_keeps_full_post_load_for_non_deepseek_models(
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
-    model = object()
+    model = torch.nn.Module()
     ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
     ext.model_config = object()
     ext.device = "cpu"

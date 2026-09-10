@@ -984,10 +984,7 @@ class VllmInternalWorkerExtension:
         return (
             transport in ("ipc", "collective", "nccl_reshard")
             and self._uses_unquantized_flashinfer_trtllm()
-        ) or (
-            transport in ("ipc", "collective")
-            and self._uses_deepseek_v4_fp8_refit()
-        )
+        ) or (transport in ("ipc", "collective") and self._uses_deepseek_v4_fp8_refit())
 
     def _uses_deepseek_v4_fp8_refit(self) -> bool:
         """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
