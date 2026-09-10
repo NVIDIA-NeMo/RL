@@ -18,6 +18,7 @@ for saving and loading model checkpoints in DTensor-based policy workers.
 """
 
 import os
+import tempfile
 from typing import Any, Optional
 
 import torch
@@ -41,6 +42,25 @@ from transformers import AutoTokenizer
 
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
+
+
+def _resolve_lora_adapter_dir(restore_from: str) -> str:
+    """Resolve a ``lora_cfg.restore_from`` path to the directory holding the adapter files.
+
+    Accepts a NeMo RL checkpoint weights directory (``step_*/policy/weights``),
+    its ``model`` subdirectory, or any directory directly containing
+    ``adapter_model.safetensors`` + ``adapter_config.json`` (HF PEFT layout).
+    """
+    for candidate in (restore_from, os.path.join(restore_from, "model")):
+        if os.path.isfile(os.path.join(candidate, "adapter_model.safetensors")):
+            return candidate
+    raise FileNotFoundError(
+        f"dtensor_cfg.lora_cfg.restore_from={restore_from!r}: no "
+        "adapter_model.safetensors found there or in its 'model' subdirectory. "
+        "restore_from must point to a PEFT adapter checkpoint (a directory "
+        "containing adapter_model.safetensors + adapter_config.json, e.g. a "
+        "previous run's step_*/policy/weights directory)."
+    )
 
 
 def _normalize_supported_save_consolidated(
@@ -381,6 +401,45 @@ class AutomodelCheckpointManager:
             # ConsolidatedHFAddon (we pass tokenizer=None above), which is where
             # nemo_automodel applies its own rank-0 guard, so we must apply it here.
             save_tokenizer_on_rank0(tokenizer, tokenizer_path)
+
+    def load_lora_adapter(self, model: nn.Module, adapter_dir: str) -> None:
+        """Load validated donor adapter weights, preserving checkpointer configuration.
+
+        Args:
+            model: Model whose adapters will be initialized.
+            adapter_dir: Adapter directory or checkpoint weights directory.
+        """
+        assert self.checkpointer is not None, (
+            "Checkpointer must be initialized before warm starting LoRA adapters."
+        )
+        adapter_dir = os.path.abspath(_resolve_lora_adapter_dir(adapter_dir))
+        cfg = self.checkpointer.config
+        previous_config = {
+            "model_save_format": cfg.model_save_format,
+            "is_peft": cfg.is_peft,
+            "dequantize_base_checkpoint": cfg.dequantize_base_checkpoint,
+            "checkpoint_dir": cfg.checkpoint_dir,
+        }
+        with tempfile.TemporaryDirectory(prefix="nrl_lora_warm_start_") as staging_dir:
+            load_dir = adapter_dir
+            if os.path.basename(adapter_dir) != "model":
+                # Automodel selects PEFT loading by basename: the path must
+                # end in "model" (_is_model_checkpoint_path).
+                load_dir = os.path.join(staging_dir, "model")
+                os.symlink(adapter_dir, load_dir)
+            try:
+                self.update_checkpointer_config(
+                    config_updates={
+                        "model_save_format": "safetensors",
+                        "is_peft": True,
+                        "dequantize_base_checkpoint": False,
+                    },
+                    checkpoint_root=os.path.dirname(load_dir),
+                )
+                self.checkpointer.load_model(model=model, model_path=load_dir)
+            finally:
+                self.update_checkpointer_config(config_updates=previous_config)
+        print(f"Warm-started LoRA adapters from {adapter_dir}")
 
     def load_checkpoint(
         self,

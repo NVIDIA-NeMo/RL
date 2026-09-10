@@ -44,6 +44,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # - 'block': graphs are owned at the enclosing block (TransformerBlock / HybridBlock).
     # Only meaningful when cuda_graph_impl='local'.
     inference_cuda_graph_scope: NotRequired[str]
+    # Required for EP>1 + inference CUDA graphs, except when using the
+    # `inference_optimized` transformer implementation.
+    moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
 
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
@@ -53,6 +56,10 @@ class MCoreGenerationSpecificArgs(TypedDict):
     allow_stale_multimodal_embeddings: NotRequired[bool]
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
+    # Move training gradients and optimizer state to CPU around a non-colocated
+    # refit when extra GPU headroom is needed for transfer staging. The
+    # recommended default is False.
+    offload_policy_before_refit: bool
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
@@ -91,8 +98,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
-    # Merged into megatron_cfg for gen workers; required for EP>1 + local CUDA graphs.
-    moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
 
 
 class MCoreGenerationConfig(GenerationConfig):

@@ -91,10 +91,9 @@ class LocalParamSpec:
         post: ``RefitCtx -> None``; runs after xferdtensor
             e.g., copy back the received buffer into the merged param.
 
-    TODO: A layout that block-permutes the *assembled* param (e.g. FlashInfer
-    TRTLLM w13) would need a group-level finalize run once after all components
-    land — a future loop-level addition, not a per-param field. ``pre``/``post``
-    covers today's backends (Triton, FlashInfer CUTLASS, Megatron).
+    Layout-specific backends can receive into canonical storage in ``pre``, load
+    each logical component in ``post``, and use a transport-level finalizer after
+    all components land. FlashInfer TRTLLM uses this path for grouped experts.
     """
 
     base: Any
@@ -614,6 +613,14 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "policy.generation.vllm_kwargs.enable_eplb must be False "
             "(nccl_reshard_refit fixes the expert->rank mapping at setup; "
             "dynamic expert load balancing can change ownership afterwards)."
+        )
+
+    if vllm_cfg.get("refit_with_reload_api"):
+        violations.append(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+            "explicitly unsupported with refit_transport='nccl_reshard' "
+            "(nccl_reshard_refit is its own refit path and does not use "
+            "vLLM's reload_weights API)."
         )
 
     # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits

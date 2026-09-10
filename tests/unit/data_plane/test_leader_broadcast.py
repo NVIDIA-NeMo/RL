@@ -50,8 +50,8 @@ def _in_gloo_group(body, rank: int, world_size: int, tmp_init_file: str, q):
         dist.destroy_process_group()
 
 
-def _run_two_ranks(body, tmp_init_file: str):
-    """Spawn two ranks over ``body`` and require both to report ok."""
+def _collect_two_rank_results(body, tmp_init_file: str):
+    """Spawn two ranks over ``body`` and collect both outcomes."""
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     procs = [
@@ -60,11 +60,22 @@ def _run_two_ranks(body, tmp_init_file: str):
     ]
     for p in procs:
         p.start()
-    for p in procs:
-        p.join(timeout=30)
-        assert p.exitcode == 0, f"worker exited with {p.exitcode}"
+    try:
+        for p in procs:
+            p.join(timeout=30)
+        assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
+        return sorted([q.get(timeout=5) for _ in range(2)])
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=5)
 
-    results = sorted([q.get() for _ in range(2)])
+
+def _run_two_ranks(body, tmp_init_file: str):
+    """Spawn two ranks over ``body`` and require both to report ok."""
+    results = _collect_two_rank_results(body, tmp_init_file)
     assert results == [(0, "ok"), (1, "ok")], results
 
 
@@ -157,6 +168,13 @@ def _all_empty_body(rank: int):
     assert packed.pad_to_max_shape is True
 
 
+def _unsupported_type_body(rank: int):
+    data = BatchedDataDict({"source_ids": ["a", "b"]}) if rank == 0 else None
+    _broadcast_batched_data_dict(
+        data, is_leader=(rank == 0), src=0, group=dist.group.WORLD
+    )
+
+
 def test_leader_broadcast_round_trip(tmp_path):
     _run_two_ranks(_round_trip_body, str(tmp_path / "init"))
 
@@ -169,6 +187,18 @@ def test_leader_broadcast_keeps_media_free_packed_key(tmp_path):
     set than the same shard on the independent-fetch path.
     """
     _run_two_ranks(_all_empty_body, str(tmp_path / "init_empty"))
+
+
+def test_leader_broadcast_reports_descriptor_error_to_all_ranks(tmp_path):
+    results = _collect_two_rank_results(
+        _unsupported_type_body, str(tmp_path / "init_error")
+    )
+
+    assert results[0][0] == 0
+    assert results[0][1].startswith("err: TypeError:")
+    assert results[1][0] == 1
+    assert results[1][1].startswith("err: RuntimeError:")
+    assert all("source_ids" in outcome for _, outcome in results)
 
 
 def test_get_replica_group_default_is_none():

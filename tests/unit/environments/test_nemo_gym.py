@@ -77,6 +77,66 @@ from tests.unit.models.generation.test_vllm_generation import (
 )
 
 
+def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
+    capsys,
+) -> None:
+    async def _run() -> None:
+        rows = [
+            {
+                "_rowidx": index,
+                "task_source": "test_resources_server",
+                "responses_create_params": {"input": []},
+            }
+            for index in range(11)
+        ]
+
+        class _RolloutCollectionHelper:
+            def run_examples(self, examples, head_server_config):
+                del head_server_config
+                for row in examples:
+                    row["agent_ref"] = {"name": "resolved_agent"}
+
+                async def _completed_result(row):
+                    return row, {"response": {"output": []}}
+
+                return [_completed_result(row) for row in examples]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _token_capture_enabled = False
+            _tokenizer = object()
+
+            def _require_spinup(self):
+                pass
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(
+                self,
+                row,
+                result,
+                result_tokenizer,
+                *,
+                include_initial_multimodal_data,
+            ):
+                del self, row, result, result_tokenizer, include_initial_multimodal_data
+                return {"message_log": []}
+
+        streamed = []
+        async for result in NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), rows, "test"
+        ):
+            streamed.append(result)
+
+        assert len(streamed) == len(rows)
+
+    asyncio.run(_run())
+
+    captured = capsys.readouterr()
+    assert "1. resolved_agent: 1" in captured.err
+    assert "task-source:test_resources_server" not in captured.err
+
+
 def test_multimodal_content_types_cover_responses_media_aliases():
     assert {
         "input_image",
@@ -507,6 +567,7 @@ def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
     assert datum is not None
     user_message = datum["message_log"][0]
     assert user_message["num_frames"].as_tensor().tolist() == [4]
+    assert user_message["num_frames"].as_tensor().dtype == torch.int32
     assert user_message["imgs_sizes"].as_tensor().dtype == torch.int32
     extra_env_info = datum["extra_env_info"]
     outbound_content = extra_env_info["responses_create_params"]["input"][0]["content"]
@@ -1527,7 +1588,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
     async def _run():
         nemo_gym_row = {
             "_rowidx": 7,
-            "agent_ref": {"name": "test_agent"},
+            "agent_ref": {"name": "legacy_test_agent"},
             "responses_create_params": {
                 "input": [
                     {
@@ -1566,6 +1627,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             cfg = {}
             rch = _RolloutCollectionHelper()
             head_server_config = object()
+            _token_capture_enabled = False
 
             def _require_spinup(self):
                 pass
@@ -1599,7 +1661,8 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
 
         assert postprocess_calls == [(nemo_gym_row, nemo_gym_result, tokenizer, True)]
         assert streamed_results[0][0] == 7
-        assert streamed_results[0][1] == {"message_log": []}
+        assert streamed_results[0][1] == nemo_gym_row["agent_ref"]
+        assert streamed_results[0][2] == {"message_log": []}
 
     asyncio.run(_run())
 
@@ -1622,6 +1685,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
 
         row = {
             "_rowidx": 3,
+            "task_source": "test_resources_server",
             "agent_ref": {"name": "mock-megatron-agent"},
             "responses_create_params": {
                 "input": [
@@ -1682,6 +1746,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             head_server_config = SimpleNamespace(backend="megatron")
             _tokenizer = _Tokenizer()
             _processor = None
+            _token_capture_enabled = False
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
@@ -1695,8 +1760,9 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
         ):
             streamed.append(item)
 
-        row_index, result, _metrics = streamed[0]
+        row_index, agent_ref, result, _metrics = streamed[0]
         assert row_index == 3
+        assert agent_ref == row["agent_ref"]
         assert [message["role"] for message in result["message_log"]] == [
             "user",
             "assistant",
@@ -1796,13 +1862,14 @@ def test_nemo_gym_sanity(
             "temperature"
         ]
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
+        example["task_source"] = "example_multi_step_resources_server"
         example["_rowidx"] = idx
 
     actual_result = [None] * len(nemo_gym_sanity_test_data["input"])
     for result_ref in nemo_gym.run_rollouts.options(num_returns="streaming").remote(
         nemo_gym_sanity_test_data["input"], ""
     ):
-        rowidx, result, _ = ray.get(result_ref)
+        rowidx, _agent_ref, result, _ = ray.get(result_ref)
         actual_result[rowidx] = result
     expected_result = nemo_gym_sanity_test_data["expected_output"]
 
@@ -1833,8 +1900,13 @@ def test_nemo_gym_sanity(
                 message["prompt_str"] = "dummy prompt_str"
             if "generation_str" in message:
                 message["generation_str"] = "dummy generation_str"
-            message.setdefault("is_invalid_tool_call", False)
-            message.setdefault("has_malformed_thinking", False)
+            for generation_flag in (
+                "is_invalid_tool_call",
+                "has_malformed_thinking",
+            ):
+                if generation_flag in message:
+                    assert isinstance(message[generation_flag], bool)
+                    message.pop(generation_flag)
 
         return d
 

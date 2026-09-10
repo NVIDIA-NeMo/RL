@@ -98,6 +98,10 @@ class VllmSpecificArgs(TypedDict):
     # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
     # affecting other test cases.
     env_vars: NotRequired[dict[str, str]]
+    # Opt into vLLM's native reload_weights API for refit. The default stays
+    # False so existing IPC/NCCL refit behavior keeps using NeMo-RL's legacy
+    # loader path.
+    refit_with_reload_api: NotRequired[bool]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
 
@@ -189,6 +193,12 @@ class VllmConfig(GenerationConfig):
     # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
     real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
+
+    # FQN of a worker extension class to use instead of the resolved default
+    # generation worker. Must be a subclass of the resolved worker and cannot
+    # be combined with quant_cfg. Its runtime environment must already be in
+    # ACTOR_ENVIRONMENT_REGISTRY.
+    worker_extension_cls_fqn: NotRequired[str | None]
 
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:

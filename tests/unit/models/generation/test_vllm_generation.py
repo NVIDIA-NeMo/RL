@@ -21,7 +21,7 @@ import threading
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import ray
@@ -145,6 +145,120 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_vllm_generation_selects_worker_extension(
+    async_engine,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = async_engine
+    extension_fqn = "tests.extensions.CustomGenerationWorker"
+    config["worker_extension_cls_fqn"] = extension_fqn
+
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with (
+        patch.dict(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            {extension_fqn: "python"},
+        ),
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerBuilder"
+        ) as worker_builder,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerGroup"
+        ) as worker_group,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+            return_value=[None],
+        ),
+    ):
+        worker_group.return_value.dp_size = 1
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    assert worker_builder.call_args.args[:2] == (extension_fqn, config)
+    assert worker_builder.call_args.kwargs == (
+        {"defer_model_load": True} if async_engine else {}
+    )
+
+
+def test_vllm_generation_rejects_worker_extension_with_quantization() -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["worker_extension_cls_fqn"] = "tests.extensions.CustomGenerationWorker"
+    config["quant_cfg"] = "NVFP4"
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with pytest.raises(
+        ValueError,
+        match="worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+    ):
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    cluster._init_placement_groups.assert_not_called()
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_vllm_generation_rejects_unregistered_worker_extension(
+    async_engine: bool,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = async_engine
+    config["worker_extension_cls_fqn"] = "tests.extensions.UnregisteredGenerationWorker"
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with (
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerGroup"
+        ) as worker_group,
+        pytest.raises(ValueError, match="No actor environment registered"),
+    ):
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    worker_group.assert_not_called()
+    cluster._init_placement_groups.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm", "dynamo"])
+def test_generation_config_rejects_worker_extension_for_other_backends(
+    backend: str,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["backend"] = backend
+    config["worker_extension_cls_fqn"] = "tests.extensions.CustomGenerationWorker"
+
+    with pytest.raises(ValueError, match="only supported by the vLLM backend"):
+        configure_generation_config(config, MagicMock())
+
+
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "megatron", "trtllm", "dynamo"])
+@pytest.mark.parametrize("include_null", [False, True])
+def test_generation_config_allows_no_worker_extension(
+    backend: str,
+    include_null: bool,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["backend"] = backend
+    if include_null:
+        config["worker_extension_cls_fqn"] = None
+
+    configure_generation_config(config, MagicMock())
+
+
+def test_generation_config_allows_vllm_worker_extension() -> None:
+    config = deepcopy(basic_vllm_test_config)
+    extension_fqn = "tests.extensions.CustomGenerationWorker"
+    config["worker_extension_cls_fqn"] = extension_fqn
+
+    configured = configure_generation_config(config, MagicMock())
+
+    assert configured["worker_extension_cls_fqn"] == extension_fqn
 
 
 def test_context_capped_max_new_tokens():
@@ -547,8 +661,23 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class VLLMValidationError(Exception):
-        pass
+    class VLLMValidationError(ValueError):
+        def __init__(self, message, *, parameter=None, value=None):
+            super().__init__(message)
+            self.parameter = parameter
+            self.value = value
+
+        def __str__(self):
+            base = super().__str__()
+            extras = [
+                f"{name}={value}"
+                for name, value in (
+                    ("parameter", self.parameter),
+                    ("value", self.value),
+                )
+                if value is not None
+            ]
+            return f"{base} ({', '.join(extras)})" if extras else base
 
     class ToolParserManager:
         import_tool_parser = MagicMock()
@@ -661,6 +790,78 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
 
 
+def _nemo_gym_recognizes_context_overflow(
+    *, status: int, response_content: str
+) -> bool:
+    """Mirror responses_api_models/vllm_model/app.py overflow detection."""
+    return status == 400 and (
+        "context length" in response_content or "max_tokens" in response_content
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
+    """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
+    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
+        "vllm_cfg": {},
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
+    worker._capture_calls = {}
+    worker.token_capture = None
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+
+    max_model_len = 128
+    renderer = openai_serving_chat.instances[0].kwargs["online_renderer"]
+    renderer.model_config = types.SimpleNamespace(max_model_len=max_model_len)
+    serving_chat = openai_serving_chat.instances[0]
+    chat_handler = next(
+        handler for path, handler in app.routes if path == "/v1/chat/completions"
+    )
+    overflow_prompt = [0] * max_model_len
+
+    async def create_chat_completion(request, _raw_request):
+        renderer._clamp_max_tokens(request, request.max_tokens, overflow_prompt)
+
+    serving_chat.create_chat_completion = create_chat_completion
+    response = await chat_handler(
+        types.SimpleNamespace(
+            top_k=-1,
+            top_p=1.0,
+            temperature=1.0,
+            max_tokens=1,
+            max_completion_tokens=None,
+        ),
+        MagicMock(),
+    )
+
+    response_content = response.body.decode()
+    assert response.status_code == 400
+    assert "maximum context length" in response_content
+    assert "(parameter=input_tokens, value=128)" in response_content
+    assert _nemo_gym_recognizes_context_overflow(
+        status=response.status_code,
+        response_content=response_content,
+    )
+    error = json.loads(response_content)["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["param"] == "input_tokens"
+    assert error["code"] == 400
+
+
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
     monkeypatch,
 ):
@@ -762,6 +963,7 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
         )
 
     assert configured["vllm_cfg"]["load_format"] == "auto"
+    assert configured["_draft_weights_from_refit"] is False
 
 
 @pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
@@ -807,6 +1009,7 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+    assert configured["_draft_weights_from_refit"] is True
 
 
 def test_configure_generation_config_keeps_real_quant_export_on_cpu() -> None:
@@ -1167,6 +1370,61 @@ def test_vllm_missing_required_config_key(cluster):
         "Error should mention the missing 'model_name' key"
     )
     print(f"Successfully caught missing config key with error: {error_message}")
+
+
+@pytest.mark.parametrize(
+    ("config_updates", "error_match"),
+    [
+        ({"colocated.enabled": True}, "not supported yet.*colocated"),
+        ({"refit_transport": "nccl_reshard"}, "explicitly unsupported.*nccl_reshard"),
+        (
+            {"refit_transport": "nixl"},
+            "not supported yet.*update_weights_from_checkpoint_engine",
+        ),
+        (
+            {"refit_transport": "custom.module:Engine"},
+            "not supported yet.*update_weights_from_checkpoint_engine",
+        ),
+        ({"refit_transport": "vllm_s3_sparse"}, "refit_transport"),
+        ({"refit_transport": "vllm_zmq_sparse"}, "refit_transport"),
+        ({"quant_cfg": "NVFP4_DEFAULT_CFG"}, "explicitly unsupported.*quant_cfg"),
+        ({"_draft_weights_from_refit": True}, "policy.draft.enabled=true"),
+        (
+            {
+                "vllm_kwargs": {
+                    "speculative_config": {
+                        "method": "mtp",
+                        "num_speculative_tokens": 1,
+                    }
+                },
+                "_mtp_weights_from_refit": True,
+            },
+            "not supported yet.*MTP draft weights",
+        ),
+    ],
+)
+def test_vllm_generation_rejects_unsupported_reload_refit_config(
+    config_updates, error_match
+):
+    class DummyCluster:
+        num_gpus_per_node = 1
+
+        def world_size(self):
+            return 1
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config["refit_transport"] = None
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    for path, value in config_updates.items():
+        target = vllm_config
+        parts = path.split(".")
+        for part in parts[:-1]:
+            target = target[part]
+        target[parts[-1]] = value
+
+    with pytest.raises(AssertionError, match=error_match):
+        VllmGeneration(DummyCluster(), vllm_config)
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):

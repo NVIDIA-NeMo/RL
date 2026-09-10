@@ -146,6 +146,7 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  worker_extension_cls_fqn: null # optional registered policy-worker subclass; mutually exclusive with quant_cfg
 
   dtensor_cfg:
     _v2: true
@@ -176,6 +177,7 @@ policy:
       dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
   
   megatron_cfg:
     enabled: false
@@ -244,6 +246,9 @@ policy:
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
+    # For HybridEP sequence packing with PP=1 and MTP disabled, set true to align
+    # uneven rank-local inputs before forward and avoid collective-order hangs.
+    moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
@@ -269,6 +274,7 @@ policy:
       lora_B_init_method: "zero"
       a2a_experimental: false
       lora_dtype: None
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
     optimizer:
       optimizer: "adam"
@@ -391,6 +397,9 @@ policy:
     # null = topology default (IPC colocated, NCCL non-colocated).
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
     refit_transport: null
+    # vLLM backend only - sglang/megatron/trtllm/dynamo require this to remain null.
+    # Selects the NeMo-RL Ray actor class, NOT vLLM's own `worker_extension_cls`.
+    worker_extension_cls_fqn: null # optional registered vLLM generation-worker subclass; mutually exclusive with quant_cfg
     # Keep real-quant export tensors on CPU by default. Set false only for
     # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
     real_quant_export_cpu_offload: true
@@ -421,6 +430,7 @@ policy:
       num_speculative_tokens: 0
       logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
       refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl"
+      offload_policy_before_refit: false  # Keep policy state on GPU by default. Enable when a non-colocated Megatron refit needs additional GPU headroom for transfer staging.
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
     vllm_cfg:
@@ -428,6 +438,8 @@ policy:
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+      refit_with_reload_api: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
@@ -562,6 +574,16 @@ data_plane:
     local_buffer_size:    4294967296 # 4 GiB/process
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
     staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
+    use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
+                                     # 8 clients/node is ~8 GiB off the training
+                                     # budget. Must exceed the largest per-sample,
+                                     # per-field payload: below that, GDR reads of
+                                     # CPU-written values fail inside TransferQueue.
+                                     # Lower values split fetches into more
+                                     # serialized groups and cost throughput;
+                                     # higher buys little at linear HBM cost.
+                                     # GDR needs that headroom to pay off.
   # observability:                    # NotRequired
   #   enabled: false
 
