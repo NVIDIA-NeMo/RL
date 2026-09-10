@@ -1318,6 +1318,8 @@ class TestGetMicrobatchIterator:
                 "sequence_parallel": False,
                 "pipeline_model_parallel_size": 1,
                 "context_parallel_size": 1,
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
             },
             "make_sequence_length_divisible_by": 1,
         }
@@ -1341,6 +1343,10 @@ class TestGetMicrobatchIterator:
         # With sequence packing, micro_batch_size should be 1
         assert micro_batch_size == 1
         assert data_iterator_len == 10
+        assert (
+            mock_make_iterator.call_args.kwargs["create_packed_seq_padding_mask"]
+            is True
+        )
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")

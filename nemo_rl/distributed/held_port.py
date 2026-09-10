@@ -39,6 +39,7 @@ def receive_held_socket(port: int) -> socket.socket:
     fds: list[int] = []
     received_socket: socket.socket
     try:
+        # Retrieve the reserved socket fd's from HeldPortReservation.
         client.connect(_held_port_uds_name(port))
         _, fds, _, _ = socket.recv_fds(client, 1024, 1)
         if not fds:
@@ -50,10 +51,12 @@ def receive_held_socket(port: int) -> socket.socket:
         # reservation socket and fail with EADDRINUSE.
         released = client.recv(1)
         if released != _HANDOFF_RELEASED:
+            # Unexpected contract, the reserved socket should be released.
             socket.close(fds.pop())
             raise RuntimeError(
                 f"Port holder for port {port} did not confirm releasing its socket."
             )
+        # Manufacture a new socket from the FD.
         received_socket = socket.socket(fileno=fds.pop())
     except OSError as e:
         for fd in fds:
@@ -95,8 +98,10 @@ class HeldPortReservation:
         return self._node_ip, self._port
 
     def _serve_fd_once(self) -> None:
+        # Wait until connection.
         conn, _ = self._uds.accept()
         try:
+            # Send reserved TCP socket across Unix socket for hand-over.
             socket.send_fds(conn, [b"s"], [self._sock.fileno()])
             # The receiver holds a duplicate fd, so the port remains reserved.
             # Close this copy before acknowledging the handoff; the receiver may

@@ -31,6 +31,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
 )
+from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
@@ -142,6 +143,9 @@ def test_all_config_files_have_required_keys(config_file):
     elif "dpo" in config_dict:
         master_config_class = DPOMasterConfig
         config_type = "dpo"
+    elif "mpo" in config_dict:
+        master_config_class = MPOMasterConfig
+        config_type = "mpo"
     elif "sft" in config_dict:
         master_config_class = SFTMasterConfig
         config_type = "sft"
