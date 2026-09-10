@@ -102,6 +102,7 @@ policy: &POLICY_BASE
             lora_B_init_method: "zero"
             a2a_experimental: false
             lora_dtype: null
+            restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
         optimizer:
             optimizer: "adam"
