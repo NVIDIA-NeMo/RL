@@ -544,6 +544,7 @@ class TQTokenSource:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
+        self._dp_client = dp_client
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
 
