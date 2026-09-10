@@ -59,6 +59,21 @@ def _build_draft_sequence_layout(**kwargs: Any) -> "DraftSequenceLayout":
     return build_draft_sequence_layout(**kwargs)
 
 
+def _draft_training_enabled(cfg: dict[str, Any]) -> bool:
+    """Whether a draft provider is enabled for this run.
+
+    The presence of ``draft_sample_ids`` is not proof: the data-plane worker
+    mixin attaches them to *every* presharded batch (``train_presharded``), so
+    an ordinary TQ batch carries them even with draft training off.
+    """
+    draft_cfg = cfg.get("draft")
+    if draft_cfg is None:
+        return False
+    if isinstance(draft_cfg, dict):
+        return bool(draft_cfg.get("enabled", False))
+    return bool(getattr(draft_cfg, "enabled", False))
+
+
 def _get_packed_draft_sequence_layout(
     *,
     data_dict: BatchedDataDict[Any],
@@ -67,7 +82,11 @@ def _get_packed_draft_sequence_layout(
     processed_inputs: "ProcessedInputs",
     delegate_pack_to_model: bool,
 ) -> Optional["DraftSequenceLayout"]:
-    if not cfg["sequence_packing"]["enabled"] or "draft_sample_ids" not in data_dict:
+    if (
+        not cfg["sequence_packing"]["enabled"]
+        or not _draft_training_enabled(cfg)
+        or "draft_sample_ids" not in data_dict
+    ):
         return None
     if delegate_pack_to_model:
         raise NotImplementedError(

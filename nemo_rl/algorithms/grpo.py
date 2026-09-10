@@ -2356,8 +2356,18 @@ def _preserve_draft_sample_ids(
     repeated_batch: BatchedDataDict,
 ) -> None:
     """Carry stable rollout identity into the policy training payload."""
-    if "draft_sample_ids" in repeated_batch:
-        target["draft_sample_ids"] = repeated_batch["draft_sample_ids"]
+    if "draft_sample_ids" not in repeated_batch:
+        return
+    sample_ids = repeated_batch["draft_sample_ids"]
+    # A row-count mismatch means the source batch no longer lines up with the
+    # target, so the IDs would silently label the wrong rows.
+    if target.size != len(sample_ids):
+        raise ValueError(
+            f"draft_sample_ids carries {len(sample_ids)} rows but the target "
+            f"batch has {target.size}; rollout postprocessing must preserve "
+            "input row order and row count."
+        )
+    target["draft_sample_ids"] = sample_ids
 
 
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
@@ -3244,9 +3254,17 @@ def grpo_train(
                             ),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
-                        repeated_batch = nemo_gym_rollout_result.final_batch
+                        gym_final_batch = nemo_gym_rollout_result.final_batch
+                        # Gym rebuilds the batch from its own result rows and
+                        # keeps only the columns it models, so draft_sample_ids
+                        # would be dropped here. The rebuilt batch is in input
+                        # row order (run_nemo_gym_rollout_sync restores it), so
+                        # the IDs carry over positionally.
+                        _preserve_draft_sample_ids(gym_final_batch, repeated_batch)
+                        repeated_batch = gym_final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
+                        del gym_final_batch
 
                     # Use async rollouts when enabled by config/backend defaults.
                     elif should_use_async_rollouts(master_config.policy["generation"]):

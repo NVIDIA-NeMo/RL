@@ -23,6 +23,7 @@ focusing on:
 - Sequence dimension validation
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1667,6 +1668,7 @@ class TestMakeProcessedMicrobatchIterator:
         cfg = {
             "sequence_packing": {"enabled": True},
             "megatron_cfg": {"sequence_parallel": True},
+            "draft": SimpleNamespace(enabled=True),
         }
 
         microbatch = next(
@@ -1690,6 +1692,70 @@ class TestMakeProcessedMicrobatchIterator:
         assert call["cp_size"] == 2
         assert call["tp_rank"] == 1
         assert call["tp_size"] == 2
+
+    @pytest.mark.parametrize(
+        "draft_cfg",
+        [None, SimpleNamespace(enabled=False), {"enabled": False}],
+        ids=["absent", "provider-disabled", "dict-disabled"],
+    )
+    @patch("nemo_rl.models.megatron.data._build_draft_sequence_layout")
+    @patch("nemo_rl.models.megatron.data.process_microbatch")
+    def test_make_processed_microbatch_iterator_skips_draft_layout_when_draft_disabled(
+        self,
+        mock_process,
+        mock_build_layout,
+        draft_cfg,
+    ):
+        """TQ presharded batches always carry draft_sample_ids.
+
+        ``train_presharded`` attaches them unconditionally, so a model-owned
+        packing run with draft training off must not be mistaken for draft
+        training and must not raise.
+        """
+        from nemo_rl.models.megatron.data import (
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
+
+        mock_process.return_value = ProcessedInputs(
+            input_ids=MagicMock(),
+            input_ids_cp_sharded=MagicMock(),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=None,
+        )
+
+        values = {
+            "draft_sample_ids": torch.tensor([101, 303], dtype=torch.int64),
+            "input_lengths": torch.tensor([5, 3], dtype=torch.int64),
+        }
+        mock_data_dict = MagicMock()
+        mock_data_dict.to.return_value = mock_data_dict
+        mock_data_dict.__contains__.side_effect = values.__contains__
+        mock_data_dict.__getitem__.side_effect = values.__getitem__
+        cfg = {
+            "sequence_packing": {"enabled": True},
+            "megatron_cfg": {"sequence_parallel": False},
+        }
+        if draft_cfg is not None:
+            cfg["draft"] = draft_cfg
+
+        microbatch = next(
+            make_processed_microbatch_iterator(
+                raw_iterator=iter([mock_data_dict]),
+                cfg=cfg,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=8,
+                pad_packed_seq_to_multiple_of=16,
+                straggler_timer=MagicMock(),
+                pad_full_seq_to=None,
+                delegate_pack_to_model=True,
+            )
+        )
+
+        assert microbatch.draft_sequence_layout is None
+        mock_build_layout.assert_not_called()
 
 
 PACK_SEQUENCES_TEST_ACTOR_FQN = (

@@ -48,6 +48,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
+    _preserve_draft_sample_ids,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -162,6 +163,53 @@ def test_grpo_dflash_sample_ids_are_stable_across_prompt_group_order() -> None:
     assert forward_ids.dtype == torch.int64
     assert torch.equal(forward_ids, reverse_ids.roll(2))
     assert torch.unique(forward_ids).numel() == 4
+
+
+def _gym_style_rebuilt_batch(num_rows: int) -> BatchedDataDict:
+    """A Gym final_batch: rebuilt from result rows, draft columns dropped."""
+    return BatchedDataDict(
+        {
+            "message_log": [[] for _ in range(num_rows)],
+            "length": torch.arange(num_rows, dtype=torch.int64),
+            "loss_multiplier": torch.ones(num_rows),
+            "total_reward": torch.zeros(num_rows),
+            "truncated": torch.zeros(num_rows, dtype=torch.bool),
+        }
+    )
+
+
+def test_preserve_draft_sample_ids_survives_nemo_gym_batch_rebuild() -> None:
+    """Sync Gym replaces repeated_batch with a rebuild that has no draft IDs."""
+    repeated_batch = BatchedDataDict(
+        {
+            "idx": [17, 17, 23, 23],
+            "task_name": ["math"] * 4,
+        }
+    )
+    _attach_grpo_draft_sample_ids(repeated_batch, num_generations_per_prompt=2)
+    gym_final_batch = _gym_style_rebuilt_batch(4)
+    assert "draft_sample_ids" not in gym_final_batch
+
+    _preserve_draft_sample_ids(gym_final_batch, repeated_batch)
+
+    # Gym restores input row order, so the IDs carry over positionally.
+    assert torch.equal(
+        gym_final_batch["draft_sample_ids"], repeated_batch["draft_sample_ids"]
+    )
+
+
+def test_preserve_draft_sample_ids_rejects_row_count_mismatch() -> None:
+    """Silently relabelled rows would poison the draft plan; fail instead."""
+    repeated_batch = BatchedDataDict(
+        {
+            "idx": [17, 17, 23, 23],
+            "task_name": ["math"] * 4,
+        }
+    )
+    _attach_grpo_draft_sample_ids(repeated_batch, num_generations_per_prompt=2)
+
+    with pytest.raises(ValueError, match="draft_sample_ids carries 4 rows"):
+        _preserve_draft_sample_ids(_gym_style_rebuilt_batch(3), repeated_batch)
 
 
 @pytest.mark.parametrize("load_replay_buffer", [True, None])
