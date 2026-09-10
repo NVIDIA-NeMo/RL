@@ -25,7 +25,7 @@ COUNTER_DATA=$TEST_DIR/session_state_mgmt.jsonl
 PHASE1_PID=""
 
 GYM_ROOT=${NEMO_GYM_SOURCE_DIR:-$PROJECT_ROOT/3rdparty/Gym-workspace/Gym}
-SNAPSHOT_INTERVAL_S=${SC_GYM_TURN_RECOVERY_INTERVAL_S:-0.5}
+SNAPSHOT_INTERVAL_S=${SC_GYM_TURN_RECOVERY_INTERVAL_S:-5}
 SNAPSHOT_TIMEOUT_S=${SC_GYM_TURN_RECOVERY_TIMEOUT_S:-2400}
 PHASE2_TIMEOUT_S=${SC_GYM_TURN_RECOVERY_PHASE2_TIMEOUT_S:-2400}
 MAX_STEPS=${SC_GYM_TURN_RECOVERY_MAX_STEPS:-2}
@@ -83,6 +83,7 @@ COMMON_OVERRIDES=(
     ++rollout_checkpointing.restore_mode=latest
     ++rollout_checkpointing.gym.capability_discovery_enabled=true
     ++rollout_checkpointing.gym.participant_checkpointing_enabled=true
+    ++env.nemo_gym.nemo_gym_log_dir="$TEST_DIR/gym_logs"
     ++rollout_checkpointing.gym.prepare_timeout_s=180
     async_rl.sampler.name=in_order
     async_rl.sampler.max_lookahead_versions=0
@@ -97,9 +98,10 @@ COMMON_OVERRIDES=(
     grpo.num_generations_per_prompt="$NUM_GENERATIONS"
     grpo.max_num_steps="$MAX_STEPS"
     policy.train_global_batch_size="$TRAIN_GLOBAL_BATCH_SIZE"
-    policy.generation.temperature=0.0
+    policy.generation.temperature=0.1
     policy.generation.max_new_tokens=128
-    'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/example_session_state_mgmt/configs/example_session_state_mgmt.yaml]'
+    'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/example_session_state_mgmt.yaml]'
+    '~env.nemo_gym.code_gen'
 )
 
 echo "=== Phase 1: publish one coordinated Gym + TQ turn checkpoint ==="
@@ -107,6 +109,7 @@ command -v setsid >/dev/null
 setsid env \
     SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
     SC_SIBLING_RECOVERY_TEST_EVENTS="$PHASE1_EVENTS" \
+    NEMO_GYM_TEST_HOLD_FIRST_BOUNDARY=1 \
     RUN_CONVERGENCE_CHECKS=0 \
     NEMO_GYM_SOURCE_DIR="$GYM_ROOT" \
     NEMO_GYM_CHECKPOINT_CONTROL_TOKEN="$NEMO_GYM_CHECKPOINT_CONTROL_TOKEN" \
