@@ -88,8 +88,8 @@ def prepare_packed_sft_batch(
         raise ValueError("All physical packs in a batch need one capacity.")
     capacity = capacities.pop()
     packed_logs: list[list[dict[str, Any]]] = []
-    boundaries: list[torch.Tensor] = []
-    padded_boundaries: list[torch.Tensor] = []
+    boundaries: list[torch.Tensor | None] = []
+    padded_boundaries: list[torch.Tensor | None] = []
     source_ids: list[list[str]] = []
 
     for pack in packs:
