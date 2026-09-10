@@ -199,6 +199,15 @@ class RolloutRetryPolicy:
 
 
 @dataclass
+class _RetryState:
+    """Per-prompt attempt accounting shared by both dispatch paths."""
+
+    infra_attempts: int = 0
+    data_attempts: int = 0
+    group_attempt: int = 0
+
+
+@dataclass
 class RolloutStats:
     """Counters describing what the retry policy has been doing.
 
@@ -1816,12 +1825,8 @@ class RolloutManager:
                     "the resumed configuration requests "
                     f"{self._num_generations_per_prompt}"
                 )
-        policy = self._retry_policy
-        infra_attempts = 0
-        data_attempts = 0
-        last_infra_error: Optional[Exception] = None
+        retry = _RetryState()
         logical_group_id: Optional[str] = None
-        group_attempt = 0
         extra_env_info = input_sample.get("extra_env_info")
         if isinstance(extra_env_info, dict):
             configured_group_id = extra_env_info.get(NEMO_GYM_GROUP_ID_KEY)
@@ -1839,13 +1844,13 @@ class RolloutManager:
                 raise ValueError(
                     f"{NEMO_GYM_GROUP_ATTEMPT_KEY} must be a non-negative integer"
                 )
-            group_attempt = configured_group_attempt
+            retry.group_attempt = configured_group_attempt
 
         # The loop condition is the infrastructure budget, so running out of it exits
         # here rather than raising from inside the handler. The data budget is tracked
         # separately and terminates from within, since exhausting it is a statement
         # about the prompt rather than about the fleet.
-        while infra_attempts < policy.max_infra_attempts:
+        while True:
             start_version = self._weight_version
             # A lineage-tracked prompt reuses its durable logical ID only after the
             # prior attempt's buffer slot was removed successfully. Ordinary callers
@@ -1871,7 +1876,7 @@ class RolloutManager:
                         attempt_extra_env_info = attempt_input_sample["extra_env_info"]
                         attempt_extra_env_info[NEMO_GYM_GROUP_ID_KEY] = logical_group_id
                         attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
-                            group_attempt
+                            retry.group_attempt
                         )
                     record = await self.run_rollout(attempt_input_sample)
                 finally:
@@ -1912,51 +1917,9 @@ class RolloutManager:
                 # and would spend the rollout retry budget on the wrong subsystem.
                 if _contains_post_write_enrichment_error(error):
                     raise
-                reason = type(error).__name__
-
-                if classify_rollout_failure(error) is FailureClass.INFRA:
-                    infra_attempts += 1
-                    last_infra_error = error
-                    if infra_attempts >= policy.max_infra_attempts:
-                        break
-                    self._stats.record_redispatch(reason)
-                    # The backpressure permit is held across this sleep, so the wait is
-                    # capped by max_backoff_s rather than growing without bound.
-                    await asyncio.sleep(policy.backoff_for(infra_attempts))
-                    group_attempt += 1
+                if await self._retry_after_failure(retry, error, input_sample):
                     continue
-
-                data_attempts += 1
-                if data_attempts >= policy.max_data_attempts:
-                    self._stats.record_data_failure(reason)
-                    if self._skipped_prompts >= policy.max_skipped_prompts:
-                        # At the default of 0 this fires on the first exhaustion and the
-                        # original failure propagates unchanged -- one knob, and its
-                        # zero value is the old "fail_fast" without a second key to
-                        # contradict it.
-                        if policy.max_skipped_prompts == 0:
-                            raise
-                        raise RolloutDataFailure(
-                            f"skipped {self._skipped_prompts} prompts and this one also "
-                            f"exhausted its data budget, exceeding max_skipped_prompts="
-                            f"{policy.max_skipped_prompts}; the dataset or "
-                            "sequence-length configuration is likely wrong"
-                        ) from error
-                    self._skipped_prompts += 1
-                    print(
-                        f"skipping prompt idx={input_sample['idx']} after "
-                        f"{data_attempts} deterministic failure(s) ({reason}: {error})",
-                        flush=True,
-                    )
-                    self._stats.skipped += 1
-                    return RolloutOutcome.SKIPPED
-                # A data retry, NOT a re-dispatch: the fleet is fine, this prompt is
-                # suspect. Recording it as a re-dispatch made rollout/redispatch_total --
-                # documented above as the sign the fleet is degrading -- climb for bad
-                # data, which is the one distinction the two budgets exist to draw.
-                self._stats.record_data_retry(reason)
-                group_attempt += 1
-                continue
+                return RolloutOutcome.SKIPPED
             except BaseException:
                 # Cancellation and other non-Exception exits: clean up, never retry.
                 try:
@@ -1981,42 +1944,71 @@ class RolloutManager:
                     self._recovery_ledger.discard_group(cut, lineage_group_id)
             return RolloutOutcome.COMMITTED
 
-        # The infrastructure budget ran out. The same failure followed the prompt across
-        # repeated shard selections, which says the fleet is broken rather than the
-        # prompt.
-        #
-        # The budget is >= 1 (enforced in RolloutRetryPolicy), so the loop ran at least
-        # once and can only have exited through the infra branch's break.
-        assert last_infra_error is not None
-        reason = type(last_infra_error).__name__
-        self._consecutive_infra_drops += 1
-        if self._consecutive_infra_drops > policy.max_consecutive_dropped_prompts:
-            raise RolloutRedispatchExhausted(
-                f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
-                f"budget after {infra_attempts} attempt(s) "
-                f"(max_infra_attempts_per_prompt="
-                f"{policy.max_infra_attempts}), and this was drop "
-                f"{self._consecutive_infra_drops} with no rollout committed in between, "
-                f"exceeding max_consecutive_dropped_prompts="
-                f"{policy.max_consecutive_dropped_prompts}; the generation fleet is not "
-                f"recovering. Last failure was {reason}: {last_infra_error}"
-            ) from last_infra_error
+    async def _retry_after_failure(
+        self,
+        state: _RetryState,
+        error: Exception,
+        input_sample: DatumSpec,
+        *,
+        allow_data_skip: bool = True,
+    ) -> bool:
+        """Account for a cleaned-up attempt; return whether to try again.
 
-        # Under the budget: give up on this prompt and let the run continue. The caller
-        # owns the backpressure permit for a SKIPPED outcome, and -- because the prompt
-        # may have been stamped for a specific training step that will now never fill --
-        # owns atomically replacing its retained ledger entry or crediting the shortfall
-        # so the train pump can close that step short.
-        self._stats.record_infra_drop(reason, self._consecutive_infra_drops)
-        print(
-            f"dropping prompt idx={input_sample['idx']} after {infra_attempts} "
-            f"infrastructure failure(s) ({reason}: {last_infra_error}) "
-            f"[consecutive drop {self._consecutive_infra_drops}/"
-            f"{policy.max_consecutive_dropped_prompts}]",
-            flush=True,
-        )
+        Terminal budget failures propagate; False means the caller must transfer
+        its retained ownership to the replacement/shortfall path.
+        """
+        policy = self._retry_policy
+        reason = type(error).__name__
+        if classify_rollout_failure(error) is FailureClass.INFRA:
+            state.infra_attempts += 1
+            if state.infra_attempts < policy.max_infra_attempts:
+                self._stats.record_redispatch(reason)
+                await asyncio.sleep(policy.backoff_for(state.infra_attempts))
+                state.group_attempt += 1
+                return True
+            self._consecutive_infra_drops += 1
+            if self._consecutive_infra_drops > policy.max_consecutive_dropped_prompts:
+                raise RolloutRedispatchExhausted(
+                    f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
+                    f"budget after {state.infra_attempts} attempt(s) "
+                    f"(max_infra_attempts_per_prompt={policy.max_infra_attempts}), "
+                    f"and this was drop {self._consecutive_infra_drops} with no rollout "
+                    "committed in between, exceeding max_consecutive_dropped_prompts="
+                    f"{policy.max_consecutive_dropped_prompts}; the generation fleet "
+                    f"is not recovering. Last failure was {reason}: {error}"
+                ) from error
+            self._stats.record_infra_drop(reason, self._consecutive_infra_drops)
+            print(
+                f"dropping prompt idx={input_sample['idx']} after "
+                f"{state.infra_attempts} infrastructure failure(s) ({reason}: {error}) "
+                f"[consecutive drop {self._consecutive_infra_drops}/"
+                f"{policy.max_consecutive_dropped_prompts}]",
+                flush=True,
+            )
+        else:
+            state.data_attempts += 1
+            if state.data_attempts < policy.max_data_attempts:
+                self._stats.record_data_retry(reason)
+                state.group_attempt += 1
+                return True
+            self._stats.record_data_failure(reason)
+            if not allow_data_skip or policy.max_skipped_prompts == 0:
+                raise error
+            if self._skipped_prompts >= policy.max_skipped_prompts:
+                raise RolloutDataFailure(
+                    f"skipped {self._skipped_prompts} prompts and this one also "
+                    "exhausted its data budget, exceeding max_skipped_prompts="
+                    f"{policy.max_skipped_prompts}; the dataset or "
+                    "sequence-length configuration is likely wrong"
+                ) from error
+            self._skipped_prompts += 1
+            print(
+                f"skipping prompt idx={input_sample['idx']} after "
+                f"{state.data_attempts} deterministic failure(s) ({reason}: {error})",
+                flush=True,
+            )
         self._stats.skipped += 1
-        return RolloutOutcome.SKIPPED
+        return False
 
     async def generate_for_finalization(
         self,
@@ -2056,11 +2048,8 @@ class RolloutManager:
                 f"{recovery_group.expected_generations} generation(s), but the "
                 f"resumed configuration requests {self._num_generations_per_prompt}"
             )
-        policy = self._retry_policy
-        infra_attempts = 0
-        data_attempts = 0
-        last_infra_error: Optional[Exception] = None
-        while infra_attempts < policy.max_infra_attempts:
+        retry = _RetryState()
+        while True:
             try:
                 request = await self._generate_for_finalization_attempt(
                     input_sample,
@@ -2068,55 +2057,22 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
-                reason = type(error).__name__
-                if classify_rollout_failure(error) is FailureClass.INFRA:
-                    infra_attempts += 1
-                    last_infra_error = error
-                    if infra_attempts >= policy.max_infra_attempts:
-                        break
-                    self._stats.record_redispatch(reason)
-                    await asyncio.sleep(policy.backoff_for(infra_attempts))
+                if (
+                    owns_recovery_group
+                    and classify_rollout_failure(error) is FailureClass.INFRA
+                    and retry.infra_attempts + 1 >= self._retry_policy.max_infra_attempts
+                ):
+                    # An independent caller has no controller to release its lineage.
+                    async with self._recovery_mutation() as cut:
+                        await self.discard_recovery_group(cut, recovery_group_id)
+                if await self._retry_after_failure(
+                    retry, error, input_sample, allow_data_skip=False
+                ):
                     continue
-
-                data_attempts += 1
-                if data_attempts >= policy.max_data_attempts:
-                    self._stats.record_data_failure(reason)
-                    raise
-                self._stats.record_data_retry(reason)
-                continue
+                return None
 
             self._consecutive_infra_drops = 0
             return request
-
-        assert last_infra_error is not None
-        reason = type(last_infra_error).__name__
-        self._consecutive_infra_drops += 1
-        if owns_recovery_group:
-            # Without controller-owned recovery lineage, nobody above this method
-            # knows the temporary group ID. Clean its known staging ownership before
-            # dropping the only record that names those rows.
-            async with self._recovery_mutation() as cut:
-                await self.discard_recovery_group(cut, recovery_group_id)
-        if self._consecutive_infra_drops > policy.max_consecutive_dropped_prompts:
-            raise RolloutRedispatchExhausted(
-                f"prompt idx={input_sample['idx']} exhausted its infrastructure "
-                f"retry budget after {infra_attempts} capture attempt(s) and this "
-                f"was drop {self._consecutive_infra_drops}, exceeding "
-                f"max_consecutive_dropped_prompts="
-                f"{policy.max_consecutive_dropped_prompts}; last failure was "
-                f"{reason}: {last_infra_error}"
-            ) from last_infra_error
-        self._stats.record_infra_drop(reason, self._consecutive_infra_drops)
-        print(
-            f"dropping capture prompt idx={input_sample['idx']} after "
-            f"{infra_attempts} infrastructure failure(s) ({reason}: "
-            f"{last_infra_error}) [consecutive drop "
-            f"{self._consecutive_infra_drops}/"
-            f"{policy.max_consecutive_dropped_prompts}]",
-            flush=True,
-        )
-        self._stats.skipped += 1
-        return None
 
     async def _generate_for_finalization_attempt(
         self,
