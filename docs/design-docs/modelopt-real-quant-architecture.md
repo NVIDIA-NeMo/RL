@@ -45,14 +45,7 @@ tensor.
 | NeMo RL | Policy-first startup, configuration transfer, tensor transport, and refit lifecycle |
 | vLLM | Native ModelOpt loading, runtime layouts, post-load processing, and kernel selection |
 
-```mermaid
-flowchart LR
-    A[ModelOpt policy] --> B[Megatron-Bridge topology conversion]
-    B --> C[ModelOpt canonical tensors]
-    C --> D[NeMo RL transport]
-    D --> E[Native vLLM ModelOpt loader]
-    E --> F[Rollouts]
-```
+![ModelOpt real-quant export and online refit flow](../assets/modelopt-real-quant-export-refit.svg)
 
 ## Startup
 
