@@ -15,6 +15,7 @@
 from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.vllm.config import VllmRefitConfig
 
 
 class SglangQuantizationConfig(TypedDict):
@@ -97,6 +98,17 @@ class SglangSpecificArgs(TypedDict):
 
     # Weight precision for rollout/refit.
     quantization: SglangQuantizationConfig
+
+    # Enable serving health checks and refit-time recovery of hung/dead engines.
+    # The exemplar YAML defaults this to False. The tuning fields below are
+    # required when enabled and validated when fault tolerance is initialized.
+    use_fault_tolerance: bool
+    rollout_health_check_interval: NotRequired[int]
+    rollout_health_check_timeout: NotRequired[int]
+    rollout_health_check_first_wait: NotRequired[int]
+    # Nonnegative restart limit per logical engine over the generation object's
+    # lifetime; abort if exhausted. The exemplar YAML recommends 3; 0 disables restarts.
+    rollout_max_restart_attempts: NotRequired[int]
 
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
@@ -239,3 +251,12 @@ class SGLangConfig(GenerationConfig):
 
     sglang_cfg: SglangSpecificArgs
     sglang_kwargs: NotRequired[dict[str, Any]]
+    # Null selects the default refit path: Ray CUDA-IPC when colocated, and
+    # SGLang's own NCCL weight-update group when non-colocated -- which today
+    # is Megatron-policy only (see weight_sync/factory.py). ``nixl`` and custom
+    # ``module:ClassName`` checkpoint engines are supported for non-colocated
+    # generation with any policy backend.
+    refit_transport: NotRequired[str | None]
+    # Normalized by the same schema as vLLM's: ``checkpoint_engine_refit_config``
+    # runs ``normalize_vllm_refit_config`` and writes the validated model back.
+    refit_cfg: NotRequired[VllmRefitConfig | None]
