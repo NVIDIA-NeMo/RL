@@ -42,6 +42,7 @@ def _policy() -> tuple[TQPolicy, MagicMock]:
     policy = object.__new__(TQPolicy)
     policy.cfg = {"train_global_batch_size": 4, "train_micro_batch_size": 1}
     policy._router_replay_enabled = False
+    policy._opd_full_field = None  # opd_full off, as __init__ leaves it
     policy.flops_tracker = None
     policy.sharding_annotations = MagicMock()
     policy.sharding_annotations.get_axis_size.return_value = 2
