@@ -813,8 +813,9 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
     worker._http_engine_client = worker.llm
-    worker._capture_calls = {}
-    worker.token_capture = None
+    from nemo_rl.models.generation.vllm.token_capture_host import TokenCaptureHost
+
+    worker.capture_host = TokenCaptureHost()
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
