@@ -525,6 +525,44 @@ def test_reconstruct_right_pads_a_short_payload_on_the_sequence_dim():
     torch.testing.assert_close(teacher_logits[:, 3:], torch.zeros(1, 2, 4))
 
 
+def test_reconstruct_takes_the_cp_window_before_projecting(monkeypatch):
+    """Projecting first costs cp_size times the matmul and a full-sequence tensor.
+
+    The result is identical either way, so only the shape handed to the matmul
+    distinguishes them -- and that allocation is ``[B, S, V_local]``, which the
+    divergence kernel's chunking cannot bound.
+    """
+    from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+
+    cp_size, cp_rank = 4, 0
+    payload = torch.randn(1, 32, 3)
+    lm_head = torch.randn(5, 3)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: cp_size)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: cp_rank)
+
+    projected_shapes = []
+    real_matmul = torch.matmul
+
+    def spy(a, b, *args, **kwargs):
+        projected_shapes.append(tuple(a.shape))
+        return real_matmul(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "matmul", spy)
+
+    teacher_logits = reconstruct_opd_full_teacher_logits(
+        payload,
+        teacher_payload="hidden_states",
+        student_logits=torch.zeros(1, 8, 5),
+        vocab_parallel_rank=0,
+        context_parallel_group=object(),  # opaque: world size and rank are stubbed
+        teacher_output_layer_weight=lm_head,
+    )
+
+    window = _get_tokens_on_this_cp_rank(payload, cp_rank, cp_size, seq_dim=1)
+    assert projected_shapes == [tuple(window.shape)]
+    torch.testing.assert_close(teacher_logits, window @ lm_head.t())
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [

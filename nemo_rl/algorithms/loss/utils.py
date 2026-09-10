@@ -159,9 +159,10 @@ def reconstruct_opd_full_teacher_logits(
         ValueError: If the payload and student shard cannot be aligned, or if the
             hidden-state path is used without a teacher LM-head shard.
     """
-    payload = payload.to(device=student_logits.device)
     vocab_shard_size = int(student_logits.shape[-1])
 
+    # Every narrowing below happens before the device copy, and before the
+    # hidden-state path widens the payload to the vocabulary.
     if teacher_payload == "hidden_states":
         if teacher_output_layer_weight is None:
             raise ValueError(
@@ -174,10 +175,6 @@ def reconstruct_opd_full_teacher_logits(
                 f"payload width {payload.shape[-1]} vs LM-head input width "
                 f"{teacher_output_layer_weight.shape[1]}."
             )
-        teacher_logits = torch.matmul(
-            payload.to(dtype=teacher_output_layer_weight.dtype),
-            teacher_output_layer_weight.t(),
-        )
     else:
         assert vocab_parallel_rank is not None, (
             "vocab_parallel_rank is required to slice the opd_full logits payload"
@@ -190,32 +187,50 @@ def reconstruct_opd_full_teacher_logits(
                 f"window: payload width {payload.shape[-1]} vs required "
                 f"{vocab_end_index}."
             )
-        teacher_logits = payload[..., vocab_start_index:vocab_end_index]
+        payload = payload[..., vocab_start_index:vocab_end_index]
 
-    if int(teacher_logits.shape[-1]) != vocab_shard_size:
-        raise ValueError(
-            "Reconstructed teacher logits must match the student vocabulary shard "
-            f"width; got {teacher_logits.shape[-1]} vs {vocab_shard_size}."
-        )
-
+    # Narrow to this rank's sequence window *before* the payload is widened to
+    # the vocabulary. Projecting first would do cp_size times the matmul and
+    # allocate a full-sequence [B, S, V_local] tensor that the divergence
+    # kernel's chunking cannot bound.
     cp_size = (
         1
         if context_parallel_group is None
         else torch.distributed.get_world_size(context_parallel_group)
     )
     target_seq_len = int(student_logits.shape[1]) * cp_size
-    pad_len = target_seq_len - int(teacher_logits.shape[1])
+    pad_len = target_seq_len - int(payload.shape[1])
     if pad_len < 0:
         raise ValueError(
             "Teacher payload is longer than the student forward window: "
-            f"{teacher_logits.shape[1]} vs {target_seq_len}."
+            f"{payload.shape[1]} vs {target_seq_len}."
         )
     if pad_len > 0:
-        teacher_logits = torch.nn.functional.pad(teacher_logits, (0, 0, 0, pad_len))
+        # Zero-padding survives the projection (the LM head has no bias), so the
+        # padded positions carry the same uniform logits either way. They are
+        # masked out downstream regardless.
+        payload = torch.nn.functional.pad(payload, (0, 0, 0, pad_len))
     if cp_size > 1:
         cp_rank = torch.distributed.get_rank(context_parallel_group)
-        teacher_logits = _get_tokens_on_this_cp_rank(
-            teacher_logits, cp_rank, cp_size, seq_dim=1
+        payload = _get_tokens_on_this_cp_rank(payload, cp_rank, cp_size, seq_dim=1)
+
+    # contiguous() before the copy: the vocabulary slice above is a view, and the
+    # result is handed to save_for_backward. Without it the whole-vocabulary
+    # payload storage stays resident on the device until backward completes.
+    payload = payload.contiguous().to(device=student_logits.device)
+
+    if teacher_payload == "hidden_states":
+        teacher_logits = torch.matmul(
+            payload.to(dtype=teacher_output_layer_weight.dtype),  # type: ignore[union-attr]
+            teacher_output_layer_weight.t(),  # type: ignore[union-attr]
+        )
+    else:
+        teacher_logits = payload
+
+    if int(teacher_logits.shape[-1]) != vocab_shard_size:
+        raise ValueError(
+            "Reconstructed teacher logits must match the student vocabulary shard "
+            f"width; got {teacher_logits.shape[-1]} vs {vocab_shard_size}."
         )
     return teacher_logits
 

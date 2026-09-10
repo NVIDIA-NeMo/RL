@@ -967,7 +967,13 @@ class TeacherFullPayloadPostProcessor:
 
             return output_tensor.new_zeros(()), {
                 "logprobs": logprob_outputs["logprobs"],
-                "teacher_full_payload": payload_full.to(dtype=self.payload_dtype),
+                # Off the GPU here, inside the schedule: mcore retains every
+                # microbatch's output dict until the whole forward completes, so
+                # a device tensor would accumulate the entire data-parallel
+                # shard's payload rather than one microbatch's.
+                "teacher_full_payload": payload_full.to(
+                    device="cpu", dtype=self.payload_dtype
+                ),
             }
 
         return processor_fn_inner

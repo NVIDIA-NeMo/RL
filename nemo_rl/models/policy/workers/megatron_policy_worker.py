@@ -2203,8 +2203,8 @@ class MegatronPolicyWorkerImpl(
 
         Returns:
             A BatchedDataDict with ``logprobs`` ``[B, S]`` on every rank and
-            ``teacher_full_payload`` ``[B, S, D]`` on the last pipeline stage
-            (``None`` elsewhere).
+            ``teacher_full_payload`` ``[B, S, D]`` on CPU on the last pipeline
+            stage (``None`` elsewhere).
 
         Raises:
             ValueError: If ``payload`` is ``"hidden_states"`` but this teacher
@@ -2298,11 +2298,11 @@ class MegatronPolicyWorkerImpl(
                         value=0.0,
                     )
                 padded_logprobs.append(logprobs_mb)
-                # Concatenating on the GPU would hold a second copy of the whole
-                # DP shard's payload; release each microbatch as it is copied out.
-                padded_payloads.append(payload_mb.to("cpu"))
-                microbatch_output["teacher_full_payload"] = None
+                padded_payloads.append(payload_mb)
             tensors = {"logprobs": torch.cat(padded_logprobs, dim=0)}
+            # Already on CPU: the post-processor moves each microbatch off the
+            # device as it is produced, so this pad-and-concatenate never puts
+            # the payload back on the GPU.
             teacher_full_payload = torch.cat(padded_payloads, dim=0)
         else:
             tensors = {"logprobs": None}
