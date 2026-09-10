@@ -35,12 +35,14 @@ from nemo_rl.algorithms.loss.wrapper import _SEQ_METRIC_MAX, _SEQ_METRIC_MIN
 from nemo_rl.algorithms.opd import (
     OnPolicyDistillationFullConfig,
     get_opd_full_config,
+    opd_full_teacher_index_field,
 )
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import (
     OPD_FULL_FIELDS,
     OPD_FULL_HIDDEN_STATES_FIELD,
     OPD_FULL_LOGITS_FIELD,
+    OPD_FULL_TEACHER_INDEX_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_opd_full,
 )
@@ -119,6 +121,57 @@ def test_fields_with_optional_opd_full_is_a_no_op_when_disabled():
     assert fields_with_optional_opd_full(once, field=OPD_FULL_LOGITS_FIELD) == once
     # The input list is never mutated in place.
     assert base == ["input_ids", "advantages"]
+
+
+def test_teacher_index_field_is_only_needed_by_the_hidden_state_path():
+    """The logits payload ships an already-projected distribution.
+
+    Requesting the routing column there would make every consumer fetch a
+    column no teacher ever wrote.
+    """
+    assert (
+        opd_full_teacher_index_field(_full(teacher_payload="hidden_states"))
+        == OPD_FULL_TEACHER_INDEX_FIELD
+    )
+    assert opd_full_teacher_index_field(_full(teacher_payload="logits")) is None
+
+
+def test_fields_with_optional_opd_full_registers_the_teacher_index_column():
+    """The routing column rides the same helper as the payload column."""
+    base = ["input_ids", "advantages"]
+    both = fields_with_optional_opd_full(
+        base,
+        field=OPD_FULL_HIDDEN_STATES_FIELD,
+        teacher_index_field=OPD_FULL_TEACHER_INDEX_FIELD,
+    )
+    assert both == [*base, OPD_FULL_HIDDEN_STATES_FIELD, OPD_FULL_TEACHER_INDEX_FIELD]
+    # Several call sites wrap overlapping field lists; neither column may be
+    # registered twice.
+    assert (
+        fields_with_optional_opd_full(
+            both,
+            field=OPD_FULL_HIDDEN_STATES_FIELD,
+            teacher_index_field=OPD_FULL_TEACHER_INDEX_FIELD,
+        )
+        == both
+    )
+    # The logits path passes None and must be left exactly as before.
+    assert fields_with_optional_opd_full(
+        base, field=OPD_FULL_LOGITS_FIELD, teacher_index_field=None
+    ) == [*base, OPD_FULL_LOGITS_FIELD]
+    # The input list is never mutated in place.
+    assert base == ["input_ids", "advantages"]
+
+
+def test_teacher_index_column_is_registered_per_sample_not_token_aligned():
+    """One int per row, not per token.
+
+    Declaring it token-aligned would make ``pack_jagged_fields`` trim it to the
+    row's token length, so the routing tag would desynchronize from the rows it
+    routes after any repack.
+    """
+    assert OPD_FULL_TEACHER_INDEX_FIELD in SC_ROLLOUT_SCHEMA_FIELDS
+    assert OPD_FULL_TEACHER_INDEX_FIELD not in TOKEN_ALIGNED_FIELDS
 
 
 def test_opd_full_columns_are_registered_token_aligned():
@@ -482,10 +535,93 @@ def test_reconstruct_projects_hidden_states_through_the_teacher_lm_head():
         student_logits=torch.zeros(2, 6, 5),
         vocab_parallel_rank=0,
         context_parallel_group=None,
-        teacher_output_layer_weight=lm_head,
+        teacher_output_layer_weight_by_index={0: lm_head},
     )
 
     torch.testing.assert_close(teacher_logits, payload @ lm_head.t())
+
+
+def test_reconstruct_routes_each_row_through_its_own_teachers_lm_head():
+    """Multi-teacher: the row's ``teacher_index`` picks the LM head, not the dict.
+
+    Projecting the whole microbatch with one head is the silent failure this
+    guards: the shapes stay right and only the distribution is another
+    teacher's, so the alternating index below is what makes it visible.
+    """
+    payload = torch.randn(3, 4, 3)  # [B, S, H_teacher]
+    heads = {0: torch.randn(5, 3), 1: torch.randn(5, 3)}
+    teacher_index = torch.tensor([1, 0, 1])
+
+    teacher_logits = reconstruct_opd_full_teacher_logits(
+        payload,
+        teacher_payload="hidden_states",
+        student_logits=torch.zeros(3, 4, 5),
+        vocab_parallel_rank=0,
+        context_parallel_group=None,
+        teacher_output_layer_weight_by_index=heads,
+        teacher_index=teacher_index,
+    )
+
+    expected = torch.stack(
+        [payload[row] @ heads[int(teacher_index[row])].t() for row in range(3)]
+    )
+    torch.testing.assert_close(teacher_logits, expected)
+    # Whole-batch projection through either head alone would be wrong.
+    assert not torch.allclose(teacher_logits, payload @ heads[0].t())
+    assert not torch.allclose(teacher_logits, payload @ heads[1].t())
+
+
+@pytest.mark.parametrize("teacher_index", [None, torch.tensor([0, 0])])
+def test_reconstruct_uses_the_only_loaded_head_for_a_single_teacher_run(teacher_index):
+    """One loaded shard needs no routing, with or without the column present."""
+    payload = torch.randn(2, 3, 3)
+    head = torch.randn(5, 3)
+
+    teacher_logits = reconstruct_opd_full_teacher_logits(
+        payload,
+        teacher_payload="hidden_states",
+        student_logits=torch.zeros(2, 3, 5),
+        vocab_parallel_rank=0,
+        context_parallel_group=None,
+        teacher_output_layer_weight_by_index={0: head},
+        teacher_index=teacher_index,
+    )
+
+    torch.testing.assert_close(teacher_logits, payload @ head.t())
+
+
+def test_reconstruct_rejects_a_row_tagged_with_an_unloaded_teacher():
+    """A tag with no shard means the routing and the load disagree."""
+    with pytest.raises(ValueError, match="no teacher LM"):
+        reconstruct_opd_full_teacher_logits(
+            torch.randn(2, 3, 3),
+            teacher_payload="hidden_states",
+            student_logits=torch.zeros(2, 3, 5),
+            vocab_parallel_rank=0,
+            context_parallel_group=None,
+            teacher_output_layer_weight_by_index={
+                0: torch.randn(5, 3),
+                1: torch.randn(5, 3),
+            },
+            teacher_index=torch.tensor([0, 7]),
+        )
+
+
+def test_reconstruct_rejects_a_teacher_whose_hidden_size_disagrees():
+    """Teachers may differ in hidden size; the mismatch must name the culprit."""
+    with pytest.raises(ValueError, match="for teacher_index=1"):
+        reconstruct_opd_full_teacher_logits(
+            torch.randn(2, 3, 3),
+            teacher_payload="hidden_states",
+            student_logits=torch.zeros(2, 3, 5),
+            vocab_parallel_rank=0,
+            context_parallel_group=None,
+            teacher_output_layer_weight_by_index={
+                0: torch.randn(5, 3),
+                1: torch.randn(5, 4),
+            },
+            teacher_index=torch.tensor([0, 1]),
+        )
 
 
 @pytest.mark.parametrize("vocab_parallel_rank", [0, 1, 2])
@@ -500,7 +636,6 @@ def test_reconstruct_slices_this_ranks_vocabulary_window(vocab_parallel_rank):
         student_logits=torch.zeros(1, 3, shard),
         vocab_parallel_rank=vocab_parallel_rank,
         context_parallel_group=None,
-        teacher_output_layer_weight=None,
     )
 
     start = vocab_parallel_rank * shard
@@ -517,7 +652,6 @@ def test_reconstruct_right_pads_a_short_payload_on_the_sequence_dim():
         student_logits=torch.zeros(1, 5, 4),
         vocab_parallel_rank=0,
         context_parallel_group=None,
-        teacher_output_layer_weight=None,
     )
 
     assert teacher_logits.shape == (1, 5, 4)
@@ -555,7 +689,7 @@ def test_reconstruct_takes_the_cp_window_before_projecting(monkeypatch):
         student_logits=torch.zeros(1, 8, 5),
         vocab_parallel_rank=0,
         context_parallel_group=object(),  # opaque: world size and rank are stubbed
-        teacher_output_layer_weight=lm_head,
+        teacher_output_layer_weight_by_index={0: lm_head},
     )
 
     window = _get_tokens_on_this_cp_rank(payload, cp_rank, cp_size, seq_dim=1)
@@ -569,21 +703,21 @@ def test_reconstruct_takes_the_cp_window_before_projecting(monkeypatch):
         (
             {
                 "teacher_payload": "hidden_states",
-                "teacher_output_layer_weight": None,
+                "teacher_output_layer_weight_by_index": None,
             },
             "requires a loaded teacher",
         ),
         (
             {
                 "teacher_payload": "hidden_states",
-                "teacher_output_layer_weight": torch.randn(4, 7),
+                "teacher_output_layer_weight_by_index": {0: torch.randn(4, 7)},
             },
             "do not match the loaded teacher LM head",
         ),
         (
             {
                 "teacher_payload": "hidden_states",
-                "teacher_output_layer_weight": torch.randn(9, 3),
+                "teacher_output_layer_weight_by_index": {0: torch.randn(9, 3)},
             },
             "must match the student vocabulary shard",
         ),
@@ -609,7 +743,6 @@ def test_reconstruct_rejects_a_payload_narrower_than_this_ranks_window():
             student_logits=torch.zeros(1, 3, 4),
             vocab_parallel_rank=1,
             context_parallel_group=None,
-            teacher_output_layer_weight=None,
         )
 
 
@@ -622,7 +755,6 @@ def test_reconstruct_rejects_a_payload_longer_than_the_forward_window():
             student_logits=torch.zeros(1, 3, 4),
             vocab_parallel_rank=0,
             context_parallel_group=None,
-            teacher_output_layer_weight=None,
         )
 
 
@@ -767,7 +899,7 @@ def test_prepare_opd_full_loss_input_projects_the_payload_and_drops_the_last_pos
         context_parallel_group=None,
         sampling_params=None,
         chunk_size=None,
-        teacher_output_layer_weight=lm_head,
+        teacher_output_layer_weight_by_index={0: lm_head},
     )
 
     student_log_probs = torch.log_softmax(student_logits.detach(), dim=-1)
@@ -785,3 +917,53 @@ def test_prepare_opd_full_loss_input_projects_the_payload_and_drops_the_last_pos
     assert loss_input["opd_full_entropy"] is None
     assert loss_input["opd_full_cross_entropy"] is None
     assert "next_token_logprobs" not in loss_input
+
+
+def test_prepare_opd_full_loss_input_routes_rows_by_the_teacher_index_column(
+    _single_rank_collectives,
+):
+    """The routing column is read off the microbatch, not passed in by hand.
+
+    This is the only place ``opd_full_teacher_index_field`` -> ``data[...]`` ->
+    per-row projection is exercised end to end; a column that is configured but
+    never read degrades silently to "everyone gets teacher 0".
+    """
+    torch.manual_seed(13)
+    batch_size, seq_len, hidden, vocab = 2, 4, 3, 6
+    student_logits = torch.randn(batch_size, seq_len, vocab, requires_grad=True)
+    heads = {0: torch.randn(vocab, hidden), 1: torch.randn(vocab, hidden)}
+    payload = torch.randn(batch_size, seq_len, hidden)
+    teacher_index = torch.tensor([1, 0])
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(batch_size, seq_len, dtype=torch.long),
+            OPD_FULL_HIDDEN_STATES_FIELD: payload,
+            OPD_FULL_TEACHER_INDEX_FIELD: teacher_index,
+        }
+    )
+
+    loss_input = prepare_opd_full_loss_input(
+        student_logits,
+        data,
+        _loss_fn(),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=object(),  # opaque: every collective is neutralized
+        context_parallel_group=None,
+        sampling_params=None,
+        chunk_size=None,
+        teacher_output_layer_weight_by_index=heads,
+    )
+
+    teacher_logits = torch.stack(
+        [payload[row] @ heads[int(teacher_index[row])].t() for row in range(batch_size)]
+    )
+    student_log_probs = torch.log_softmax(student_logits.detach(), dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    expected = (student_log_probs.exp() * (student_log_probs - teacher_log_probs)).sum(
+        -1
+    )
+    divergence = loss_input["opd_full_divergence"]
+
+    assert divergence.shape == (batch_size, seq_len - 1)
+    torch.testing.assert_close(divergence, expected[:, :-1], rtol=1e-5, atol=1e-6)
+    assert divergence.requires_grad

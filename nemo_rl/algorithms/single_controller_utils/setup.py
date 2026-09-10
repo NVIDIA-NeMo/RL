@@ -898,7 +898,13 @@ def _load_opd_full_teacher_lm_heads(
     trainer: Any,
     teacher_worker_groups: dict[str, Any],
 ) -> None:
-    """Load the teacher LM head onto every student worker for full-vocabulary MOPD.
+    """Load every unique teacher's LM head onto each student worker.
+
+    One RPC per unique checkpoint (``TeacherWorkerGroup.teacher_index``,
+    assigned by ``create_teacher_worker_groups``), so the student ends up with
+    one LM-head shard per teacher, keyed by that same index -- the key every
+    row's ``OPD_FULL_TEACHER_INDEX_FIELD`` tag resolves against at training
+    time (see ``reconstruct_opd_full_teacher_logits``).
 
     Callers gate this on the ``hidden_states`` payload; the ``logits`` payload
     ships the projected distribution and needs no teacher LM head.
@@ -906,33 +912,31 @@ def _load_opd_full_teacher_lm_heads(
     Args:
         trainer: The driver-side policy whose workers hold the student model.
         teacher_worker_groups: Deduplicated teacher groups, keyed by primary alias.
-
-    Raises:
-        ValueError: If the run does not resolve to exactly one teacher checkpoint.
     """
-    teacher_checkpoints = {
-        teacher.model_name for teacher in teacher_worker_groups.values()
+    # teacher_worker_groups already holds one entry per physical teacher
+    # (aliases sharing a checkpoint were deduplicated upstream), so this only
+    # re-keys it by the index rows are tagged with, to walk the teachers in a
+    # stable index order below.
+    teachers_by_index: dict[int, Any] = {
+        teacher.teacher_index: teacher for teacher in teacher_worker_groups.values()
     }
-    if len(teacher_checkpoints) != 1:
-        raise ValueError(
-            "on_policy_distillation.full currently supports exactly one teacher "
-            f"checkpoint, got {sorted(teacher_checkpoints)}."
+    for teacher_index in sorted(teachers_by_index):
+        teacher = teachers_by_index[teacher_index]
+        # Resolution happens on the student workers, not here: validate_model_paths
+        # imports megatron.bridge at module scope, and only the Megatron worker
+        # actors get the mcore extra.
+        results = ray.get(
+            trainer.worker_group.run_all_workers_single_data(
+                "load_opd_full_teacher_lm_head",
+                teacher_path_config=cast(PolicyConfig, teacher.cfg),
+                teacher_index=teacher_index,
+            )
         )
-
-    teacher = next(iter(teacher_worker_groups.values()))
-    # Resolution happens on the student workers, not here: validate_model_paths
-    # imports megatron.bridge at module scope, and only the Megatron worker
-    # actors get the mcore extra.
-    results = ray.get(
-        trainer.worker_group.run_all_workers_single_data(
-            "load_opd_full_teacher_lm_head",
-            teacher_path_config=cast(PolicyConfig, teacher.cfg),
+        print(
+            f"  ✓ Loaded opd_full teacher LM head [index={teacher_index}, "
+            f"alias={teacher.alias!r}] from {results[0]}",
+            flush=True,
         )
-    )
-    print(
-        f"  ✓ Loaded opd_full teacher LM head from {results[0]}",
-        flush=True,
-    )
 
 
 def setup_single_controller(
@@ -1144,6 +1148,9 @@ def setup_single_controller(
             {
                 **opd_full_config.model_dump(),
                 "payload_field": opd_module.opd_full_payload_field(opd_full_config),
+                "teacher_index_field": opd_module.opd_full_teacher_index_field(
+                    opd_full_config
+                ),
             },
         )
 

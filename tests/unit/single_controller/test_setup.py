@@ -50,7 +50,11 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossInputType
-from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, get_opd_full_config
+from nemo_rl.algorithms.opd import (
+    OnPolicyDistillationConfig,
+    get_opd_full_config,
+    opd_full_teacher_index_field,
+)
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -69,7 +73,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
-from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
+from nemo_rl.data_plane.schema import (
+    OPD_FULL_TEACHER_INDEX_FIELD,
+    SC_ROLLOUT_SCHEMA_FIELDS,
+)
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -2302,27 +2309,37 @@ class TestOPDFullValidation:
         with pytest.raises(ValueError, match="fuse_loss"):
             _validate_opd_full_config(config, config.on_policy_distillation)
 
-    def test_rejects_more_than_one_teacher_checkpoint(self):
-        """One LM head and one payload column exist; a second teacher needs both."""
+    def test_allows_more_than_one_teacher_checkpoint(self):
+        """Each unique checkpoint gets its own LM-head shard and teacher index.
+
+        Rows carry ``OPD_FULL_TEACHER_INDEX_FIELD`` so the student projects each
+        one through its own teacher's shard, so there is no cardinality limit.
+        """
         config = _load_fullvocab_master_config()
         config.on_policy_distillation.teacher_model_by_agent_name = {
             "a": "/ckpt/teacher-a",
             "b": "/ckpt/teacher-b",
         }
-        with pytest.raises(ValueError, match="exactly one unique"):
-            _validate_opd_full_config(config, config.on_policy_distillation)
+        _validate_opd_full_config(config, config.on_policy_distillation)
 
-    def test_rejects_pipeline_parallel_on_the_hidden_state_path(self):
-        """Megatron builds output_layer only on the last pipeline stage.
+        # What makes the second checkpoint legal is the routing column; a run
+        # that dropped the cardinality check without arming it would pass this
+        # validator and then project every row through one teacher's LM head.
+        full_cfg = get_opd_full_config(config)
+        assert full_cfg is not None
+        assert opd_full_teacher_index_field(full_cfg) == OPD_FULL_TEACHER_INDEX_FIELD
 
-        Resolving the teacher checkpoint iteration goes through Megatron-Bridge's
-        read_train_state, whose broadcast spans the whole student world, so
-        earlier stages would raise while the last stage hangs inside it.
+    def test_allows_pipeline_parallel_on_the_hidden_state_path(self):
+        """Only the last pipeline stage owns an output_layer -- and runs the loss.
+
+        Both whole-world collectives stay balanced anyway: every stage resolves
+        the teacher checkpoint together (Megatron-Bridge's ``read_train_state``),
+        and the earlier stages then enter ``dist_checkpointing.load`` with an
+        empty sharded state dict instead of a shard request.
         """
         config = _load_fullvocab_master_config()
         config.policy["megatron_cfg"]["pipeline_model_parallel_size"] = 2
-        with pytest.raises(ValueError, match="pipeline_model_parallel_size > 1"):
-            _validate_opd_full_config(config, config.on_policy_distillation)
+        _validate_opd_full_config(config, config.on_policy_distillation)
 
     def test_rejects_a_sampling_temperature_on_the_hidden_state_path(self):
         """Temperature divides the training logits after the capture hook reads them.
@@ -2361,9 +2378,19 @@ class TestOPDFullValidation:
 
 
 class _FakeTeacherGroup:
-    def __init__(self, model_name: str, cfg: dict):
+    def __init__(
+        self,
+        model_name: str,
+        cfg: dict,
+        teacher_index: int = 0,
+        alias: str = "default_teacher",
+    ):
         self.model_name = model_name
         self.cfg = cfg
+        # Assigned by create_teacher_worker_groups; the loader keys the
+        # student's per-teacher LM-head shards off it.
+        self.teacher_index = teacher_index
+        self.alias = alias
 
 
 def _fake_trainer(result: str = "/resolved/teacher") -> Any:
@@ -2397,20 +2424,42 @@ def test_load_opd_full_teacher_lm_heads_sends_the_teacher_groups_own_config(
     assert "pretrained_checkpoint" not in sent
 
 
-def test_load_opd_full_teacher_lm_heads_rejects_two_teacher_checkpoints(monkeypatch):
+def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkeypatch):
+    """One RPC per physical teacher, under the index its rows are tagged with.
+
+    Two aliases can dedupe onto one checkpoint (one worker group, one index),
+    and re-entering the load collective for it would desynchronize the student
+    ranks. Two distinct checkpoints must each land under their own index, or
+    every row is projected through whichever head arrived last.
+    """
     monkeypatch.setattr(sc_setup_mod, "ray", MagicMock(get=lambda futures: futures))
     trainer = _fake_trainer()
+    shared = _FakeTeacherGroup(
+        "Qwen/teacher-a", {"model_name": "Qwen/teacher-a"}, teacher_index=0, alias="a"
+    )
 
-    with pytest.raises(ValueError, match="exactly one teacher"):
-        sc_setup_mod._load_opd_full_teacher_lm_heads(
-            trainer,
-            {
-                "a": _FakeTeacherGroup(
-                    "Qwen/teacher-a", {"model_name": "Qwen/teacher-a"}
-                ),
-                "b": _FakeTeacherGroup(
-                    "Qwen/teacher-b", {"model_name": "Qwen/teacher-b"}
-                ),
-            },
-        )
-    trainer.worker_group.run_all_workers_single_data.assert_not_called()
+    sc_setup_mod._load_opd_full_teacher_lm_heads(
+        trainer,
+        {
+            "a": shared,
+            # Routing alias onto the same physical group: same index, one load.
+            "a_alias": shared,
+            "b": _FakeTeacherGroup(
+                "Qwen/teacher-b",
+                {"model_name": "Qwen/teacher-b"},
+                teacher_index=1,
+                alias="b",
+            ),
+        },
+    )
+
+    calls = trainer.worker_group.run_all_workers_single_data.call_args_list
+    assert [call.args for call in calls] == [
+        ("load_opd_full_teacher_lm_head",),
+        ("load_opd_full_teacher_lm_head",),
+    ]
+    assert [call.kwargs["teacher_index"] for call in calls] == [0, 1]
+    assert [call.kwargs["teacher_path_config"]["model_name"] for call in calls] == [
+        "Qwen/teacher-a",
+        "Qwen/teacher-b",
+    ]

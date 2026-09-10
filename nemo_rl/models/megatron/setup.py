@@ -2673,9 +2673,9 @@ def setup_reference_model_state(
 def load_teacher_output_layer_weight(
     *,
     teacher_pretrained_path: str,
-    local_vocab_size: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
+    local_vocab_size: Optional[int],
+    dtype: Optional[torch.dtype],
+) -> Optional[torch.Tensor]:
     """Load this rank's shard of a teacher checkpoint's LM-head weight.
 
     Full-vocabulary MOPD ships the teacher's hidden states and projects them on
@@ -2696,20 +2696,38 @@ def load_teacher_output_layer_weight(
     vocabulary entries, so the objective is unaffected in practice -- but this
     is a silent fallback, not a re-sharding mechanism.
 
+    ``dist_checkpointing.load`` is a whole-world collective, so under student
+    pipeline parallelism the stages that own no ``output_layer`` must still call
+    it. They pass ``local_vocab_size=None`` to request nothing: the load runs
+    with an empty sharded state dict, which keeps the collective balanced
+    without materializing a shard those stages would never read.
+    ``validate_access_integrity=False`` is what makes the partial request legal.
+
     Args:
         teacher_pretrained_path: Megatron checkpoint root of the teacher.
-        local_vocab_size: This rank's vocabulary shard width.
-        dtype: Dtype to materialize the shard in.
+        local_vocab_size: This rank's vocabulary shard width, or ``None`` to
+            take part in the collective without requesting a shard.
+        dtype: Dtype to materialize the shard in. Unused, and expected to be
+            ``None``, when ``local_vocab_size`` is ``None``.
 
     Returns:
-        The ``[local_vocab_size, hidden_size]`` weight shard on CPU.
+        The ``[local_vocab_size, hidden_size]`` weight shard on CPU, or ``None``
+        when this rank requested nothing.
 
     Raises:
         FileNotFoundError: If the checkpoint root holds no readable iteration.
         KeyError: If neither an output-layer nor a tied-embedding weight exists.
         TypeError: If the loaded checkpoint entry is not a ``torch.Tensor``.
-        ValueError: If the checkpoint tensor is not a rank-2 matrix.
+        ValueError: If the checkpoint tensor is not a rank-2 matrix, or if
+            exactly one of ``local_vocab_size`` / ``dtype`` is ``None``.
     """
+    if (local_vocab_size is None) != (dtype is None):
+        raise ValueError(
+            "load_teacher_output_layer_weight takes local_vocab_size and dtype "
+            "together: pass both to request a shard, or neither to join the "
+            f"collective without one. Got local_vocab_size={local_vocab_size!r}, "
+            f"dtype={dtype!r}."
+        )
     from megatron.bridge.training.utils.checkpoint_utils import (
         TRACKER_PREFIX,
         get_checkpoint_name,
@@ -2767,22 +2785,29 @@ def load_teacher_output_layer_weight(
         )
     teacher_hidden_size = int(global_shape[1])
 
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    weight_template = torch.empty(
-        (int(local_vocab_size), teacher_hidden_size), dtype=dtype, device="cpu"
-    )
-    sharded_template = make_tp_sharded_tensor_for_checkpoint(
-        weight_template,
-        key=checkpoint_key,
-        allow_shape_mismatch=True,
-        tp_group=pg_collection.tp,
-        dp_cp_group=pg_collection.dp_cp,
-    )
-    loaded = dist_checkpointing.load(
-        {checkpoint_key: sharded_template},
+    sharded_state_dict = {}
+    if local_vocab_size is not None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        weight_template = torch.empty(
+            (int(local_vocab_size), teacher_hidden_size), dtype=dtype, device="cpu"
+        )
+        sharded_state_dict[checkpoint_key] = make_tp_sharded_tensor_for_checkpoint(
+            weight_template,
+            key=checkpoint_key,
+            allow_shape_mismatch=True,
+            tp_group=pg_collection.tp,
+            dp_cp_group=pg_collection.dp_cp,
+        )
+
+    loaded_state_dict = dist_checkpointing.load(
+        sharded_state_dict,
         checkpoint_dir,
         validate_access_integrity=False,
-    )[checkpoint_key]
+    )
+    if local_vocab_size is None:
+        return None
+
+    loaded = loaded_state_dict[checkpoint_key]
     if not isinstance(loaded, torch.Tensor):
         raise TypeError(
             f"Expected a Tensor for {checkpoint_key!r} from {checkpoint_dir!r}, "

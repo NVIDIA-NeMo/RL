@@ -605,9 +605,9 @@ class OnPolicyDistillationFullTransport(TypedDict):
     """Resolved full-vocabulary MOPD settings carried to the policy workers.
 
     A ``model_dump`` of ``OnPolicyDistillationFullConfig`` plus the resolved
-    ``payload_field``. That BaseModel remains the authoritative schema and the
-    only place defaults are declared, so readers must take these keys as
-    required rather than supplying their own fallbacks.
+    ``payload_field`` and ``teacher_index_field``. That BaseModel remains the
+    authoritative schema and the only place defaults are declared, so readers
+    must take these keys as required rather than supplying their own fallbacks.
     """
 
     enabled: bool
@@ -618,6 +618,10 @@ class OnPolicyDistillationFullTransport(TypedDict):
     teacher_lm_head_lifecycle: Literal["none", "offload", "evict"]
     validate_decomposition: bool
     payload_field: str
+    # Per-sample teacher-identity column, routing each row's payload to the
+    # right teacher LM-head shard. Only the hidden-state path needs it; the
+    # logits payload ships an already-projected distribution, so it is None.
+    teacher_index_field: str | None
 
 
 class PolicyConfig(TypedDict):
