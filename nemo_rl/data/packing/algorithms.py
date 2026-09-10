@@ -331,7 +331,7 @@ class BalancedGreedyKnapsackPacker(SequencePacker):
         min_bin_count: Optional[int] = None,
         bin_count_multiple: Optional[int] = None,
         max_sequences_per_bin: Optional[int] = None,
-        balanced_knapsack_delta: int = 20,
+        balanced_knapsack_delta: int = 0,
     ) -> None:
         super().__init__(
             bin_capacity,
