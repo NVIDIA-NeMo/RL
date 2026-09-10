@@ -60,6 +60,7 @@ class DataPlaneEvent(TypedDict):
     status: EventStatus
 
 
+import numpy as np
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 
@@ -127,7 +128,6 @@ _MAX_HASH_MISMATCH_LOGS = 20
 # trip; the rollout actor writes what the policy workers read, and that read
 # is the one worth checking.
 _HASH_SUFFIX = "_hash"
-_U64 = 1 << 64
 
 
 def _hash_field(name: str) -> str:
@@ -145,10 +145,21 @@ def _with_mirrors(fields: Sequence[str]) -> list[str]:
     return [*plain, *(_hash_field(f) for f in plain)]
 
 
-def _as_i64(value: int) -> int:
-    """Wrap a uint64 digest into the signed range ``torch.int64`` accepts."""
-    value &= _U64 - 1
-    return value - _U64 if value >= _U64 >> 1 else value
+def _hash_field(name: str) -> str:
+    return f"{name}{_HASH_SUFFIX}"
+
+
+def _with_mirrors(fields: Sequence[str]) -> list[str]:
+    """``fields`` followed by one mirror column each.
+
+    Idempotent: ``meta.fields`` comes back from ``put_samples`` already
+    carrying the mirrors, and suffixing those would ask for
+    ``tokens_hash_hash``.
+    """
+    plain = [f for f in fields if not f.endswith(_HASH_SUFFIX)]
+    return [*plain, *(_hash_field(f) for f in plain)]
+
+
 
 # Rows a client may write between reconciliations of its live-key accounting
 # against the partition. One metadata call per this many rows put, so a client
@@ -255,7 +266,7 @@ def _leaf_digests(
 
 def _field_digests(
     leaf_digests: dict[str, list[int]], n_rows: int
-) -> dict[str, list[int]]:
+) -> dict[str, torch.Tensor]:
     """Leaf digests folded to one digest per *top-level* field.
 
     ``select_fields`` names top-level fields, so the mirror has to be per
@@ -266,12 +277,20 @@ def _field_digests(
     Sorted leaf order because dict order need not survive a round trip, and
     ``* 31 +`` rather than an XOR so two identical leaves do not cancel --
     the defect the row fold already has, which must not be repeated here.
+
+    Folded on tensors, not in Python: this runs on every put and every get,
+    and a row loop per leaf costs ``n_leaves * n_rows`` interpreted
+    iterations there. ``int64`` arithmetic wraps two's-complement, which is
+    the same modular fold the scalar form spelled out.
     """
-    out: dict[str, list[int]] = {}
+    out: dict[str, torch.Tensor] = {}
     for name, per_row in sorted(leaf_digests.items()):
-        acc = out.setdefault(name.split(".", 1)[0], [0] * n_rows)
-        for row in range(n_rows):
-            acc[row] = _as_i64(acc[row] * 31 + per_row[row])
+        # via uint64: a digest is unsigned and does not fit int64 directly.
+        # ``view`` reinterprets the same bits, which is the wrap we want.
+        column = torch.from_numpy(np.array(per_row, dtype=np.uint64).view(np.int64))
+        top = name.split(".", 1)[0]
+        acc = out.get(top)
+        out[top] = column if acc is None else acc.mul_(31).add_(column)
     return out
 
 
@@ -1485,10 +1504,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # could not attribute per row -- those carry 0, which the reader takes
         # as "no reading". A column that is sometimes absent would make the
         # reader's fetch fail on a partition it has no business failing on.
-        unfolded = [0] * len(sample_ids)
+        unfolded = torch.zeros(len(sample_ids), dtype=torch.int64)
         for name in fields.keys():
-            column = digests.get(name, unfolded)
-            stamped[_hash_field(name)] = torch.tensor(column, dtype=torch.int64)
+            stamped[_hash_field(name)] = digests.get(name, unfolded)
         self._stats.hash_verify.rows_recorded += len(sample_ids)
         return stamped
 
@@ -1516,30 +1534,35 @@ class MetricsDataPlaneClient(DataPlaneClient):
             if isinstance(key, str) and key.endswith(_HASH_SUFFIX):
                 expected_by_field[key[: -len(_HASH_SUFFIX)]] = out.get(key).tolist()
                 del out[key]
-        digests = _field_digests(
-            self._row_fingerprints(out, sample_ids), len(sample_ids)
-        )
+        digests = {
+            name: column.tolist()
+            for name, column in _field_digests(
+                self._row_fingerprints(out, sample_ids), len(sample_ids)
+            ).items()
+        }
         if not digests:
             return
+        # Paired once, not per row: the miss default used to be a fresh
+        # ``[0] * n_rows`` evaluated ``n_rows * n_fields`` times.
+        pairs = [
+            (name, per_row, expected_by_field[name])
+            for name, per_row in digests.items()
+            if name in expected_by_field
+        ]
         stats = self._stats.hash_verify
         for row, sample_id in enumerate(sample_ids):
             # ``0`` is the writer saying it could not fold that field, so it is
             # an abstention rather than a reading. A real digest of 0 is
             # possible and goes unchecked; at one row in 2^64 that is cheaper
             # than a false alarm on every asymmetric fold.
-            comparable = [
-                (name, per_row)
-                for name, per_row in digests.items()
-                if expected_by_field.get(name, [0] * len(sample_ids))[row] != 0
-            ]
+            comparable = [(n, d, e[row]) for n, d, e in pairs if e[row] != 0]
             if not comparable:
                 # Written without the mirror: a put that predates the guard,
                 # or a field the fold could not attribute per row.
                 stats.rows_unverified += 1
                 continue
             stats.rows_checked += 1
-            for name, per_row in comparable:
-                expected = expected_by_field[name][row]
+            for name, per_row, expected in comparable:
                 if expected == per_row[row]:
                     continue
                 stats.mismatches += 1
