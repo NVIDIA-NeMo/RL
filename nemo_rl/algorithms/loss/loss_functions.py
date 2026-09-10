@@ -57,6 +57,9 @@ Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 class DraftCrossEntropyLossConfig(TypedDict):
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
+    # Tokens per FP32 vocab tile in the streaming soft-CE reduction. Defaults to
+    # DEFAULT_DRAFT_TOKEN_CHUNK_SIZE; see policy.draft.token_chunk_size.
+    token_chunk_size: NotRequired[int]
 
 
 class DraftCrossEntropyLossDataDict(TypedDict):
