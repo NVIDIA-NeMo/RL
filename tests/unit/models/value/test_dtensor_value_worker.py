@@ -139,10 +139,12 @@ def _create_value_test_config(
         "dtensor_cfg": {
             "enabled": True,
             "_v2": True,
-            "model_save_format": "safetensors",
-            "save_consolidated": "false",
-            "single_rank_consolidation": False,
-            "consolidation_timeout_minutes": 30,
+            "checkpoint": {
+                "model_save_format": "safetensors",
+                "save_consolidated": "false",
+                "single_rank_consolidation": False,
+                "consolidation_timeout_minutes": 30,
+            },
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
             "sequence_parallel": False,

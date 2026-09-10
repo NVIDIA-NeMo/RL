@@ -60,10 +60,12 @@ def test_build_checkpoint_config_preserves_nemorl_defaults():
 def test_build_checkpoint_config_forwards_explicit_settings():
     config = build_checkpoint_config(
         {
-            "model_save_format": "torch_save",
-            "save_consolidated": "every",
-            "single_rank_consolidation": True,
-            "consolidation_timeout_minutes": 10,
+            "checkpoint": {
+                "model_save_format": "torch_save",
+                "save_consolidated": "every",
+                "single_rank_consolidation": True,
+                "consolidation_timeout_minutes": 10,
+            },
         },
         model_repo_id="org/model",
         dequantize_base_checkpoint=True,
@@ -87,9 +89,21 @@ def test_build_checkpoint_config_forwards_explicit_settings():
 
 @pytest.mark.automodel
 def test_build_checkpoint_config_rejects_null_model_save_format():
-    with pytest.raises(ValueError, match="dtensor_cfg.model_save_format"):
+    with pytest.raises(ValueError, match="dtensor_cfg.checkpoint.model_save_format"):
         build_checkpoint_config(
-            {"model_save_format": None},
+            {"checkpoint": {"model_save_format": None}},
+            model_repo_id="org/model",
+            dequantize_base_checkpoint=False,
+            is_peft=False,
+            is_async=True,
+        )
+
+
+@pytest.mark.automodel
+def test_build_checkpoint_config_rejects_legacy_flat_settings():
+    with pytest.raises(ValueError, match="must be moved under dtensor_cfg.checkpoint"):
+        build_checkpoint_config(
+            {"save_consolidated": "every"},
             model_repo_id="org/model",
             dequantize_base_checkpoint=False,
             is_peft=False,

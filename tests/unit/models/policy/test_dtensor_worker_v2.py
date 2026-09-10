@@ -189,10 +189,12 @@ def create_test_config(
             "enabled": True,
             **(
                 {
-                    "model_save_format": "safetensors",
-                    "save_consolidated": "false",
-                    "single_rank_consolidation": False,
-                    "consolidation_timeout_minutes": 30,
+                    "checkpoint": {
+                        "model_save_format": "safetensors",
+                        "save_consolidated": "false",
+                        "single_rank_consolidation": False,
+                        "consolidation_timeout_minutes": 30,
+                    },
                 }
                 if dtensor_v2
                 else {}

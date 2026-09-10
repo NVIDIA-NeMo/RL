@@ -403,7 +403,7 @@ def test_v1_model_save_format_guard_runs_only_when_saving(mock_ray_worker_group)
     """DTensor v1 construction succeeds; an unsupported actual save fails."""
     config = create_dtensor_config("test/model", tp=1)
     config["dtensor_cfg"]["_v2"] = False
-    config["dtensor_cfg"]["model_save_format"] = "safetensors"
+    config["dtensor_cfg"]["checkpoint"] = {"model_save_format": "safetensors"}
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayQueue"),

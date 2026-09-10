@@ -79,9 +79,8 @@ def build_checkpoint_config(
 
     Args:
         dtensor_cfg: The worker's ``policy.dtensor_cfg`` / ``value.dtensor_cfg``
-            mapping. Only ``model_save_format``, ``save_consolidated``,
-            ``single_rank_consolidation``, and ``consolidation_timeout_minutes``
-            are read from it; all other keys are ignored.
+            mapping. Automodel checkpoint settings are read from its nested
+            ``checkpoint`` block; all other keys are ignored.
         model_repo_id: Forwarded to Automodel's ``CheckpointingConfig.model_repo_id``.
         dequantize_base_checkpoint: Forwarded to
             ``CheckpointingConfig.dequantize_base_checkpoint``; only takes effect
@@ -98,11 +97,23 @@ def build_checkpoint_config(
         accepts, meant to be splatted into
         ``AutomodelCheckpointingConfig(enabled=True, checkpoint_dir="", **result)``.
     """
-    if "model_save_format" in dtensor_cfg:
-        model_save_format = dtensor_cfg["model_save_format"]
+    checkpoint_fields = (
+        "model_save_format",
+        "save_consolidated",
+        "single_rank_consolidation",
+        "consolidation_timeout_minutes",
+    )
+    legacy_fields = [field for field in checkpoint_fields if field in dtensor_cfg]
+    if legacy_fields:
+        fields = ", ".join(f"dtensor_cfg.{field}" for field in legacy_fields)
+        raise ValueError(f"{fields} must be moved under dtensor_cfg.checkpoint.")
+
+    checkpoint_cfg = dtensor_cfg.get("checkpoint", {})
+    if "model_save_format" in checkpoint_cfg:
+        model_save_format = checkpoint_cfg["model_save_format"]
         if model_save_format not in ("torch_save", "safetensors"):
             raise ValueError(
-                "dtensor_cfg.model_save_format must be 'torch_save' or "
+                "dtensor_cfg.checkpoint.model_save_format must be 'torch_save' or "
                 "'safetensors' when using DTensor v2; omit it to use "
                 "'safetensors'."
             )
@@ -112,8 +123,8 @@ def build_checkpoint_config(
     checkpoint_config = {
         "model_save_format": model_save_format,
         "save_consolidated": (
-            dtensor_cfg["save_consolidated"]
-            if "save_consolidated" in dtensor_cfg
+            checkpoint_cfg["save_consolidated"]
+            if "save_consolidated" in checkpoint_cfg
             else "false"
         ),
         "model_repo_id": model_repo_id,
@@ -125,8 +136,8 @@ def build_checkpoint_config(
         "single_rank_consolidation",
         "consolidation_timeout_minutes",
     ):
-        if field in dtensor_cfg:
-            checkpoint_config[field] = dtensor_cfg[field]
+        if field in checkpoint_cfg:
+            checkpoint_config[field] = checkpoint_cfg[field]
 
     if skip_task_head_prefixes_for_base_model is not None:
         checkpoint_config["skip_task_head_prefixes_for_base_model"] = (

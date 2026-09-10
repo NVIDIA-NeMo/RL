@@ -1342,6 +1342,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         constructed. ``weights_path`` selects the destination for each save.
         """
         dtensor_cfg = self.cfg.get("dtensor_cfg", {})
+        checkpoint_cfg = dtensor_cfg.get("checkpoint", {})
         use_v2 = bool(dtensor_cfg.get("enabled", False)) and bool(
             dtensor_cfg.get("_v2", False)
         )
@@ -1357,10 +1358,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         else:
             if (
                 self.cfg.get("dtensor_cfg", {}).get("enabled", False)
-                and self.cfg["dtensor_cfg"].get("model_save_format", None) is not None
+                and checkpoint_cfg.get("model_save_format", None) is not None
             ):
                 raise ValueError(
-                    "policy.dtensor_cfg.model_save_format must be None or omitted "
+                    "policy.dtensor_cfg.checkpoint.model_save_format must be None or "
+                    "omitted "
                     "when using DTensorPolicyWorker (_v2=False)."
                 )
             futures = self.worker_group.run_all_workers_single_data(

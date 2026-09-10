@@ -17,7 +17,8 @@ policy:
     cpu_offload: true
     activation_checkpointing: true
     _v2: false
-    model_save_format: null
+    checkpoint:
+      model_save_format: null
   sequence_packing:
     enabled: false
   optimizer:
