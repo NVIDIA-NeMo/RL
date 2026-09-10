@@ -47,6 +47,15 @@ tensor.
 
 ![ModelOpt real-quant export and online refit flow](../assets/modelopt-real-quant-export-refit.svg)
 
+## Caller Path
+
+The diagram below follows the colocated CUDA IPC path for one refit. Collective
+refit uses `broadcast_weights_for_collective()` and
+`update_weights_from_collective()` instead; the Megatron-Bridge export and
+ModelOpt packing calls are unchanged.
+
+![Function-level ModelOpt real-quant export and refit caller path](../assets/modelopt-real-quant-caller-path.svg)
+
 ## Startup
 
 Real quantization requires policy-first startup:
