@@ -242,8 +242,8 @@ The processor runs inside Energon loader workers and returns the same tokenized 
 The v1 `SFTProcessorAdapter` and `HFMultimodalSFTProcessorAdapter` are narrow integration interfaces. They are planned to be replaced by a more comprehensive modular processor implementation; dataset loading and the policy-facing batch shape should remain stable through that change.
 
 Set `data.energon.packing_buffer_size` and enable fused
-`policy.sequence_packing` with `greedy_knapsack` or
-`balanced_greedy_knapsack` to let Energon form model-ready multimodal packs.
+`policy.sequence_packing` with any supported packing algorithm to let Energon
+form model-ready multimodal packs.
 Without an Energon packing buffer, SFTv2 currently requires fixed batching.
 Dynamic batching and HybridEP flex dispatch are not supported with
 Energon-owned packs.
