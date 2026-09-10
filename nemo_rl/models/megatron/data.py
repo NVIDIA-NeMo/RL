@@ -275,10 +275,25 @@ def get_microbatch_iterator(
     if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
         seq_length_key = "input_lengths"
 
+    prepacked = "cu_seqlens" in data or "cu_seqlens_padded" in data
+    if prepacked and not all(
+        key in data for key in ("cu_seqlens", "cu_seqlens_padded")
+    ):
+        raise ValueError("Prepacked input requires both cumulative boundary fields.")
+    if prepacked and (
+        not cfg["sequence_packing"]["enabled"]
+        or not cfg["sequence_packing"].get("fuse_loss", False)
+        or cfg["dynamic_batching"]["enabled"]
+    ):
+        raise ValueError("Prepacked input requires fused sequence packing only.")
     if not cfg["sequence_packing"]["enabled"]:
         pad_factor = _get_non_packed_sequence_pad_factor(cfg)
 
-    if cfg["dynamic_batching"]["enabled"]:
+    if prepacked:
+        raw_iterator = data.make_microbatch_iterator(1)
+        data_iterator_len = data.size
+        micro_batch_size = 1
+    elif cfg["dynamic_batching"]["enabled"]:
         raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
     elif cfg["sequence_packing"]["enabled"]:
@@ -350,6 +365,57 @@ def get_ltor_masks_and_position_ids(*args: Any, **kwargs: Any) -> Any:
     return _impl(*args, **kwargs)
 
 
+def _prepacked_boundary(
+    data: BatchedDataDict[Any], key: str, device: torch.device
+) -> torch.Tensor:
+    value = data[key]
+    if isinstance(value, list):
+        if len(value) != 1:
+            raise ValueError(f"{key} must describe one physical pack.")
+        value = value[0]
+    elif torch.is_tensor(value) and value.ndim == 2 and value.shape[0] == 1:
+        value = value[0]
+    if not torch.is_tensor(value) or value.ndim != 1:
+        raise ValueError(f"{key} must be a one-dimensional tensor.")
+    return value.to(device=device, dtype=torch.int32)
+
+
+def _prepare_prepacked(
+    data: BatchedDataDict[Any],
+) -> tuple[torch.Tensor, torch.Tensor, PackedSeqParams, torch.Tensor]:
+    input_ids = data["input_ids"]
+    if not torch.is_tensor(input_ids) or input_ids.shape[0] != 1:
+        raise ValueError("Prepacked input_ids must contain one physical row.")
+    cu = _prepacked_boundary(data, "cu_seqlens", input_ids.device)
+    padded = _prepacked_boundary(data, "cu_seqlens_padded", input_ids.device)
+    source_lengths = cu[1:] - cu[:-1]
+    padded_lengths = padded[1:] - padded[:-1]
+    if (
+        cu.shape != padded.shape
+        or cu.numel() < 2
+        or int(cu[0]) != 0
+        or int(padded[0]) != 0
+        or int(padded[-1]) != input_ids.shape[1]
+        or bool((source_lengths <= 0).any())
+        or bool((source_lengths > padded_lengths).any())
+    ):
+        raise ValueError("Invalid prepacked source boundaries.")
+    if get_context_parallel_world_size() != 1:
+        raise NotImplementedError("Energon-owned packing currently requires CP=1.")
+    params = PackedSeqParams(
+        cu_seqlens_q=padded,
+        cu_seqlens_kv=padded,
+        cu_seqlens_q_padded=padded,
+        cu_seqlens_kv_padded=padded,
+        max_seqlen_q=int(padded_lengths.max()),
+        max_seqlen_kv=int(padded_lengths.max()),
+        pad_between_seqs=False,
+        qkv_format="thd",
+        total_tokens=input_ids.shape[1],
+    )
+    return input_ids, input_ids, params, padded
+
+
 def process_microbatch(
     data_dict: BatchedDataDict[Any],
     seq_length_key: Optional[str] = None,
@@ -415,7 +481,19 @@ def process_microbatch(
             # Get sequence lengths and context parallel size
             seq_lengths = data_dict[seq_length_key]
 
-            if delegate_pack_to_model:
+            prepacked = "cu_seqlens" in data_dict
+            if prepacked:
+                if delegate_pack_to_model:
+                    raise ValueError("Prepacked input cannot use model-owned packing.")
+                (
+                    input_ids,
+                    input_ids_cp_sharded,
+                    packed_seq_params,
+                    cu_seqlens_padded,
+                ) = _prepare_prepacked(data_dict)
+                position_ids = None
+                attention_mask = None
+            elif delegate_pack_to_model:
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
                 assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (
                     "MTP training requires a self-packing VLM that advertises "
