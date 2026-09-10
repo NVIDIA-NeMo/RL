@@ -255,6 +255,7 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
             _env_configs(num_gpu_nodes=num_gpu_nodes),
             base_urls=["http://vllm-0"],
             model_name="test-model",
+            generation_backend="vllm",
             tokenizer=tokenizer,
             enable_router_replay=False,
             use_fastokens=True,
