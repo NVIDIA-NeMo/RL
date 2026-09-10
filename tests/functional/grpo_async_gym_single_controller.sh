@@ -17,6 +17,7 @@ JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 CHECKPOINT_DIR=$EXP_DIR/checkpoints
 DATA_DIR=$EXP_DIR/data
+SC_ENTRYPOINT=${SC_TEST_ENTRYPOINT:-$PROJECT_ROOT/examples/run_grpo_single_controller.py}
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
 rm -rf $EXP_DIR $LOG_DIR
@@ -56,7 +57,7 @@ jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/da
 jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_grpo_single_controller.py \
+    $SC_ENTRYPOINT \
     --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
     policy.dtensor_cfg.enabled=false \
@@ -94,11 +95,9 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++data_plane.enabled=true \
     ++data_plane.impl=transfer_queue \
     ++data_plane.backend=simple \
-    ++data_plane.storage_capacity=1000000 \
-    ++data_plane.num_storage_units=2 \
+    ++data_plane.simple.storage_capacity=1000000 \
+    ++data_plane.simple.num_storage_units=2 \
     ++data_plane.claim_meta_poll_interval_s=0.5 \
-    ++data_plane.global_segment_size=549755813888 \
-    ++data_plane.local_buffer_size=68719476736 \
     ++async_rl.sampler.name=in_order \
     ++async_rl.sampler.max_lookahead_versions=0 \
     ++async_rl.min_groups_for_streaming_train=4 \
@@ -107,9 +106,18 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $@ \
     2>&1 | tee $RUN_LOG
 
-uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
+    uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Observed to be between 0.8-1.3
-uv run tests/check_metrics.py $JSON_METRICS \
-    'median(data["train/gen_kl_error"]) < 1.3' \
-    'max(data["train/reward"]) > 0'
+    EXTRA_CHECKS=()
+    if [[ "$*" == *token_capture.enabled=true* ]]; then
+        # Nonzero only when a finalizer actor ran, i.e. capture really was on.
+        EXTRA_CHECKS+=('max(data["train/finalize/total_ms"]) > 0')
+    fi
+
+    # Observed to be between 0.8-1.3
+    uv run tests/check_metrics.py $JSON_METRICS \
+        'median(data["train/gen_kl_error"]) < 1.3' \
+        'max(data["train/reward"]) > 0' \
+        "${EXTRA_CHECKS[@]}"
+fi

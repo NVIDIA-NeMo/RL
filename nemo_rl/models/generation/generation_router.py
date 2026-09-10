@@ -84,6 +84,13 @@ class GenerationRouterImpl:
         self._serving: list[str] = list(backend_urls)
         self._inflight: dict[str, int] = {url: 0 for url in backend_urls}
         self._backend_failures: dict[str, int] = {url: 0 for url in backend_urls}
+        # Counted for the same reason failures are, and drained in the same breath: the
+        # reported streak is what condemns a wedged engine, and without a success signal
+        # it is monotonic. On the router path nothing else clears it -- report_success has
+        # exactly one caller, on the native adapter -- so a healthy shard collecting
+        # unrelated blips days apart walks 1, 2, 3 and is condemned with thousands of
+        # successes in between.
+        self._backend_successes: dict[str, int] = {url: 0 for url in backend_urls}
         self._host = host
         self._port = port
         self._backend_timeout_s = backend_timeout_s
@@ -129,18 +136,41 @@ class GenerationRouterImpl:
         # lock, and swapping it wholesale means a reader always sees a consistent list.
         self._serving = eligible
 
-    def drain_backend_failures(self) -> dict[str, int]:
-        """Hand over the per-backend failure counts and reset them.
+    def drain_backend_outcomes(self) -> dict[str, tuple[int, int]]:
+        """Hand over per-backend ``(successes, failures)`` since the last drain, and reset.
 
         The router sees failures no liveness probe can -- a wedged engine answers
         ``is_alive`` from a healthy worker process. It holds no monitor reference by
-        design, so instead of reporting, it counts, and the controller's probe tick
-        drains these into ``GenerationFleetHealth.report_failure``.
+        design, so instead of reporting, it counts, and the controller's probe tick drains
+        these into the fleet ledger.
+
+        Successes travel with them rather than in a separate call, because the ledger needs
+        both halves of the same window to decide anything: a failure count alone cannot
+        tell a shard that failed three times running from one that failed three times among
+        thousands of successes. Draining them apart would let those windows interleave and
+        reintroduce exactly the bug this fixes.
+
+        Only backends with something to report appear, so a quiet window drains empty.
         """
-        counts = {url: n for url, n in self._backend_failures.items() if n}
-        for url in counts:
+        urls = {
+            url
+            for url, n in (
+                *self._backend_successes.items(),
+                *self._backend_failures.items(),
+            )
+            if n
+        }
+        outcomes = {
+            url: (
+                self._backend_successes.get(url, 0),
+                self._backend_failures.get(url, 0),
+            )
+            for url in urls
+        }
+        for url in urls:
+            self._backend_successes[url] = 0
             self._backend_failures[url] = 0
-        return counts
+        return outcomes
 
     def metrics(self) -> dict[str, float]:
         return {
@@ -272,6 +302,11 @@ class GenerationRouterImpl:
             async for chunk in upstream.content.iter_chunked(_STREAM_CHUNK_BYTES):
                 await response.write(chunk)
             await response.write_eof()
+            # After write_eof, so it means "served a whole response" rather than "accepted
+            # the request".
+            self._backend_successes[backend] = (
+                self._backend_successes.get(backend, 0) + 1
+            )
             return response
 
     def build_app(self) -> Any:

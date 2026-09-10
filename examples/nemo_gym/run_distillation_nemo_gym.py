@@ -28,11 +28,13 @@ from nemo_rl.algorithms.distillation import (
     distillation_train,
     setup,
 )
-from nemo_rl.algorithms.grpo import _should_use_nemo_gym
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    setup_nemo_gym_config,
+    should_use_nemo_gym,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -105,7 +107,7 @@ def main() -> None:
     setup_nemo_gym_config(config, tokenizer)
 
     # We assert here since this is right after the final config has been materialized.
-    assert _should_use_nemo_gym(config)
+    assert should_use_nemo_gym(config)
 
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from
     # student_generation, so we don't setup env here.

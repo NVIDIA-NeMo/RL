@@ -1,0 +1,36 @@
+defaults: ../../../nemo_gym/grpo_nanov3.yaml
+# Async colocated GRPO + gym on Megatron generation with a resharded inference
+# layout: training runs TP2xCP2xEP8 across all 16 GPUs; every wake reshards the
+# weights into TP4xEP4 inference_optimized models on the same GPUs. One nightly
+# covers the async loop with in-flight updates, the gym HTTP ingress, colocated
+# reshard, and (via the suite's save_period=val_period=4) the save-bound
+# deferred-wake path.
+grpo:
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+  overlong_filtering: false
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  train_global_batch_size: 16
+  max_total_sequence_length: 2048
+  megatron_cfg:
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      tensor_model_parallel_size: 4
+      expert_model_parallel_size: 4
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym
+cluster:
+  num_nodes: 2
