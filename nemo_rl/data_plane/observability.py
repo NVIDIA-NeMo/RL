@@ -60,13 +60,11 @@ class DataPlaneEvent(TypedDict):
     status: EventStatus
 
 
-import ray
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 
 from nemo_rl.data_plane.codec import drain_codec_ms
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
-from nemo_rl.data_plane.wire_guard import get_wire_guard
 
 logger = logging.getLogger(__name__)
 
@@ -1162,9 +1160,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # partition -> sample_id -> field -> wire-in fingerprint. Same
         # lifetime as the two above: ``_record_clear`` releases all three.
         self._hash_by_partition: dict[str, dict[str, dict[str, int]]] = {}
-        # Same readings, reachable by the processes that did not write them.
-        # Only the guard needs it, so only the guard pays for the actor.
-        self._wire_guard = get_wire_guard() if verify_tensor_hash else None
         self._hash_mismatches_logged = 0
         # Set by ``_emit`` to the inner client's wall time for the op just
         # run, so the wrapping methods can subtract it and bill the rest to
@@ -1288,8 +1283,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         """
         if self._verify_tensor_hash:
             _pop_partition_keys(self._hash_by_partition, partition_id, keys)
-            if self._wire_guard is not None:
-                self._wire_guard.release.remote(partition_id, keys)
         live = self._keys_by_partition.get(partition_id)
         if live is None:
             return
@@ -1455,18 +1448,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
         digests = self._row_fingerprints(fields, sample_ids)
         if not digests:
             return
-        recorded = {
-            sample_id: {name: per_row[row] for name, per_row in digests.items()}
-            for row, sample_id in enumerate(sample_ids)
-        }
         partition_hashes = self._hash_by_partition.setdefault(partition_id, {})
-        for sample_id, per_field in recorded.items():
-            partition_hashes.setdefault(sample_id, {}).update(per_field)
+        for row, sample_id in enumerate(sample_ids):
+            per_field = partition_hashes.setdefault(sample_id, {})
+            for name, per_row in digests.items():
+                per_field[name] = per_row[row]
         self._stats.hash_verify.rows_recorded += len(sample_ids)
-        if self._wire_guard is not None:
-            # Fire and forget: nobody can read a row back before its put
-            # returns, so the reading cannot be needed before it lands.
-            self._wire_guard.record.remote(partition_id, recorded)
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
         """Compare wire-out fingerprints against what was written. Never raises."""
@@ -1493,22 +1480,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
         if not digests:
             return
         partition_hashes = self._hash_by_partition.get(partition_id, {})
-        # Rows this process did not write -- the rollout actor's, on every
-        # worker read -- have their wire-in reading in the shared store. One
-        # fetch for the whole batch, not one per row.
-        remote_hashes: dict[str, dict[str, int]] = {}
-        if self._wire_guard is not None:
-            absent = [uid for uid in sample_ids if uid not in partition_hashes]
-            if absent:
-                remote_hashes = ray.get(
-                    self._wire_guard.fetch.remote(partition_id, absent)
-                )
         stats = self._stats.hash_verify
         for row, sample_id in enumerate(sample_ids):
-            per_field = partition_hashes.get(sample_id) or remote_hashes.get(sample_id)
+            per_field = partition_hashes.get(sample_id)
             if not per_field:
-                # No wire-in reading anywhere: the put predates the guard, or
-                # the row carried no fingerprintable field.
+                # Written by another process (rollout actor, policy worker):
+                # this client has no wire-in reading to compare against.
                 stats.rows_unverified += 1
                 continue
             stats.rows_checked += 1
