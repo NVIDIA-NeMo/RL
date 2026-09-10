@@ -3390,6 +3390,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     )
 
 
+@pytest.mark.mcore
 def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     monkeypatch, mock_grpo_components
 ):

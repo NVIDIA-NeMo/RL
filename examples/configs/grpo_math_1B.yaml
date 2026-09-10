@@ -415,6 +415,8 @@ policy:
       #   cuda_graph_impl "none"  -> omit inference_cuda_graph_scope
       #   cuda_graph_impl "local" -> inference_cuda_graph_scope "layer" or "block"
       cuda_graph_impl: "local"
+      cuda_graph_sizing_distribution: hybrid  # MCore default: exponential prefill/mixed graphs and linear decode graphs.
+      cuda_graph_max_tokens: 512  # MCore default token ceiling for captured prefill/mixed graphs.
       inference_cuda_graph_scope: "block"
       buffer_size_gb: 10
       num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
@@ -422,6 +424,11 @@ policy:
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
       enable_prefix_caching: false  # Reuse KV blocks across requests sharing a prompt prefix.
+      prefix_caching_mamba_gb: null  # MCore default: no Mamba-state prefix-cache budget.
+      prefix_caching_eviction_policy: lru  # MCore default prefix-cache eviction policy.
+      prefix_caching_coordinator_policy: longest_prefix  # MCore default DP routing policy.
+      prefix_cache_ttl_seconds: 300.0  # MCore default coordinator cache-entry lifetime.
+      prefix_caching_routing_alpha: 1.0  # MCore default load penalty for prefix-affinity routing.
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload", "recompute".
       materialize_only_last_token_logits: true

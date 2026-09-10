@@ -971,6 +971,7 @@ def patched_holder(monkeypatch):
     return _CapturingPortHolder
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "sorted_bundle_indices, model_parallel_size",
     [
@@ -995,8 +996,9 @@ def test_reserve_http_server_addresses_pins_every_frontend_bundle(
     actually perform: if the two ever disagree a holder binds the wrong node,
     the pre-published URL is unreachable, and the served-vs-reserved check fails
     loud at runtime. Pins the prediction to a hand-reconstruction of that
-    placement so the two copies cannot silently drift -- no GPU or mcore extra
-    needed (MegatronGeneration imports without megatron.core).
+    placement so the two copies cannot silently drift. This stays in the MCore
+    lane because the placement prediction mirrors MCore's inference frontend
+    topology.
 
     Reserving one address per frontend is the point: Gym spreads sessions over
     the URLs it is handed, so a single reservation would pin every session to
@@ -1054,6 +1056,7 @@ def test_reserve_http_server_addresses_pins_every_frontend_bundle(
     assert all(port == 4321 for port in rank_to_port.values())
 
 
+@pytest.mark.mcore
 def test_frontend_ranks_uses_dedicated_colocated_inference_layout():
     """A colocated reshard reserves frontends for its serving layout, not training TP."""
     cluster = SimpleNamespace(world_size=lambda: 2)
@@ -1094,6 +1097,7 @@ def _mp_coordinator_ranks(tp: int, pp: int, world_size: int) -> list[int]:
     ]
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "tp, cp, pp, world_size",
     [

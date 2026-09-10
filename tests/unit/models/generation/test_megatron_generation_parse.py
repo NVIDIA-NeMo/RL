@@ -34,21 +34,74 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    CudaGraphSizingDistribution,
     InferenceConfig,
     PrefixCachingCoordinatorPolicy,
+    PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     text_generation_server as mlm_text_gen_server,
 )
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import HeldPortReservation
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
+    _apply_inference_cuda_graph_scope,
+    _apply_optional_inference_config_kwargs,
     _resolve_coordinator_policy,
 )
 
 PAD = 0
+
+
+@pytest.mark.mcore
+def test_inference_cuda_graph_scope_is_applied_when_configured():
+    engine_model = SimpleNamespace(config=SimpleNamespace())
+
+    _apply_inference_cuda_graph_scope(
+        engine_model, {"inference_cuda_graph_scope": "block"}
+    )
+
+    assert (
+        engine_model.config.inference_cuda_graph_scope is InferenceCudaGraphScope.block
+    )
+
+
+@pytest.mark.mcore
+def test_optional_inference_config_kwargs_are_typed_and_forwarded():
+    inference_config_kwargs = {}
+
+    _apply_optional_inference_config_kwargs(
+        inference_config_kwargs,
+        {
+            "cuda_graph_sizing_distribution": "hybrid",
+            "cuda_graph_max_tokens": "512",
+            "async_sched_mode": "async",
+            "vision_embedding_cache_max_bytes": "1024",
+            "allow_stale_multimodal_embeddings": 1,
+            "prefix_caching_eviction_policy": "lru",
+            "prefix_caching_mamba_gb": None,
+            "prefix_cache_ttl_seconds": "300",
+            "prefix_caching_routing_alpha": "0.75",
+            "logging_step_interval": "10",
+        },
+    )
+
+    assert inference_config_kwargs == {
+        "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.HYBRID,
+        "cuda_graph_max_tokens": 512,
+        "async_sched_mode": AsyncScheduleMode.ASYNC,
+        "vision_embedding_cache_max_bytes": 1024,
+        "allow_stale_multimodal_embeddings": True,
+        "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.LRU,
+        "prefix_caching_mamba_gb": None,
+        "prefix_cache_ttl_seconds": 300.0,
+        "prefix_caching_routing_alpha": 0.75,
+        "logging_step_interval": 10,
+    }
 
 
 @pytest.mark.mcore
@@ -377,3 +430,30 @@ def test_http_server_num_replicas_is_forwarded_only_when_set(
         assert "num_replicas" not in started
     else:
         assert started["num_replicas"] == expected_num_replicas
+
+
+@pytest.mark.mcore
+def test_mp_coordinator_starts_exposed_http_server(monkeypatch):
+    coordinator_call = object()
+    future = MagicMock()
+    setup_server = MagicMock(return_value="http://10.0.0.5:5555/v1")
+    worker = SimpleNamespace(
+        cfg={"generation": {"mcore_generation_config": {"expose_http_server": True}}},
+        dynamic_inference_engine=SimpleNamespace(is_mp_coordinator=True),
+        _inference_loop=object(),
+        _start_inference_coordinator=MagicMock(return_value=coordinator_call),
+        _setup_openai_api_server=setup_server,
+    )
+    run_coroutine = MagicMock(return_value=future)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.asyncio.run_coroutine_threadsafe",
+        run_coroutine,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    MegatronGenerationMixin._run_async_coordinator_start(worker)
+
+    run_coroutine.assert_called_once_with(coordinator_call, worker._inference_loop)
+    future.result.assert_called_once_with()
+    setup_server.assert_called_once_with()
+    assert worker.base_url == "http://10.0.0.5:5555/v1"

@@ -224,6 +224,8 @@ policy:
       max_model_len: ${policy.max_total_sequence_length}
       transformer_impl: "inference_optimized"
       cuda_graph_impl: "local"
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
       inference_cuda_graph_scope: "block"
       activation_checkpointing: false
       mamba_inference_ssm_states_dtype: "float32"
@@ -250,6 +252,11 @@ policy:
       offload_policy_before_refit: false
       expose_http_server: true
       enable_prefix_caching: true
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
       http_server_num_replicas: 8
       parsers:
         - deepseek-r1-reasoning

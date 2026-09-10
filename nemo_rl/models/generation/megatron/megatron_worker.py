@@ -99,6 +99,46 @@ def _resolve_coordinator_policy(
     )
 
 
+def _apply_optional_inference_config_kwargs(
+    inference_config_kwargs: dict[str, Any],
+    mcore_generation_config: dict[str, Any],
+) -> None:
+    """Forward configured optional MCore inference settings with validated types."""
+    enum_fields = {
+        "cuda_graph_sizing_distribution": CudaGraphSizingDistribution,
+        "async_sched_mode": AsyncScheduleMode,
+        "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy,
+    }
+    cast_fields = {
+        "cuda_graph_max_tokens": int,
+        "vision_embedding_cache_max_bytes": int,
+        "allow_stale_multimodal_embeddings": bool,
+        "prefix_cache_ttl_seconds": float,
+        "prefix_caching_routing_alpha": float,
+        "logging_step_interval": int,
+    }
+    for key, enum_type in enum_fields.items():
+        if key in mcore_generation_config:
+            inference_config_kwargs[key] = enum_type(mcore_generation_config[key])
+    for key, cast_type in cast_fields.items():
+        if key in mcore_generation_config:
+            inference_config_kwargs[key] = cast_type(mcore_generation_config[key])
+    if "prefix_caching_mamba_gb" in mcore_generation_config:
+        inference_config_kwargs["prefix_caching_mamba_gb"] = mcore_generation_config[
+            "prefix_caching_mamba_gb"
+        ]
+
+
+def _apply_inference_cuda_graph_scope(
+    engine_model: MegatronModule, mcore_generation_config: dict[str, Any]
+) -> None:
+    """Apply the optional CUDA graph scope to the engine model."""
+    if "inference_cuda_graph_scope" in mcore_generation_config:
+        engine_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
+            mcore_generation_config["inference_cuda_graph_scope"]
+        ]
+
+
 class MegatronGenerationMixin:
     """Engine lifecycle, coordinator, HTTP server, and finish-generation machinery.
 
@@ -428,57 +468,13 @@ class MegatronGenerationMixin:
             "image_preprocessing_config": image_preprocessing_config,
             "video_preprocessing_config": video_preprocessing_config,
         }
-        if "cuda_graph_sizing_distribution" in mcore_generation_config:
-            inference_config_kwargs["cuda_graph_sizing_distribution"] = (
-                CudaGraphSizingDistribution(
-                    mcore_generation_config["cuda_graph_sizing_distribution"]
-                )
-            )
-        if "cuda_graph_max_tokens" in mcore_generation_config:
-            inference_config_kwargs["cuda_graph_max_tokens"] = int(
-                mcore_generation_config["cuda_graph_max_tokens"]
-            )
-        if "async_sched_mode" in mcore_generation_config:
-            inference_config_kwargs["async_sched_mode"] = AsyncScheduleMode(
-                mcore_generation_config["async_sched_mode"]
-            )
-        if "vision_embedding_cache_max_bytes" in mcore_generation_config:
-            inference_config_kwargs["vision_embedding_cache_max_bytes"] = int(
-                mcore_generation_config["vision_embedding_cache_max_bytes"]
-            )
-        if "allow_stale_multimodal_embeddings" in mcore_generation_config:
-            inference_config_kwargs["allow_stale_multimodal_embeddings"] = bool(
-                mcore_generation_config["allow_stale_multimodal_embeddings"]
-            )
-        if "prefix_caching_eviction_policy" in mcore_generation_config:
-            inference_config_kwargs["prefix_caching_eviction_policy"] = (
-                PrefixCachingEvictionPolicy(
-                    mcore_generation_config["prefix_caching_eviction_policy"]
-                )
-            )
-        if "prefix_caching_mamba_gb" in mcore_generation_config:
-            inference_config_kwargs["prefix_caching_mamba_gb"] = (
-                mcore_generation_config["prefix_caching_mamba_gb"]
-            )
-        if "prefix_cache_ttl_seconds" in mcore_generation_config:
-            inference_config_kwargs["prefix_cache_ttl_seconds"] = float(
-                mcore_generation_config["prefix_cache_ttl_seconds"]
-            )
-        if "prefix_caching_routing_alpha" in mcore_generation_config:
-            inference_config_kwargs["prefix_caching_routing_alpha"] = float(
-                mcore_generation_config["prefix_caching_routing_alpha"]
-            )
-        if "logging_step_interval" in mcore_generation_config:
-            inference_config_kwargs["logging_step_interval"] = int(
-                mcore_generation_config["logging_step_interval"]
-            )
+        _apply_optional_inference_config_kwargs(
+            inference_config_kwargs, mcore_generation_config
+        )
 
         inference_config = InferenceConfig(**inference_config_kwargs)
 
-        if "inference_cuda_graph_scope" in mcore_generation_config:
-            engine_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
-                mcore_generation_config["inference_cuda_graph_scope"]
-            ]
+        _apply_inference_cuda_graph_scope(engine_model, mcore_generation_config)
 
         self.inference_context = DynamicInferenceContext(
             engine_model.config, inference_config

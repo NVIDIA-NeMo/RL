@@ -1796,6 +1796,7 @@ class TestSetup:
         mc.policy["generation"]["top_k"] = None
         return mc
 
+    @pytest.mark.mcore
     @pytest.mark.parametrize("colocated", [True, False])
     @pytest.mark.parametrize(
         ("scenario", "error_match"),
