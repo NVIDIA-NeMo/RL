@@ -45,17 +45,6 @@ tensor.
 | NeMo RL | Policy-first startup, configuration transfer, tensor transport, and refit lifecycle |
 | vLLM | Native ModelOpt loading, runtime layouts, post-load processing, and kernel selection |
 
-![ModelOpt real-quant export and online refit flow](../assets/modelopt-real-quant-export-refit.svg)
-
-## Caller Path
-
-The diagram below follows the colocated CUDA IPC path for one refit. Collective
-refit uses `broadcast_weights_for_collective()` and
-`update_weights_from_collective()` instead; the Megatron-Bridge export and
-ModelOpt packing calls are unchanged.
-
-![Function-level ModelOpt real-quant export and refit caller path](../assets/modelopt-real-quant-caller-path.svg)
-
 ## Future Offline Export
 
 Offline export can later reuse the same functional per-weight boundary without
@@ -68,8 +57,6 @@ This is a proposed follow-up, not part of the current online-refit change.
 Formats whose state is not yet represented by the functional API, including
 AWQ and SmoothQuant, continue through the existing Transformers export handlers
 until that state is supported.
-
-![Future unified offline export call flow](../assets/modelopt-future-offline-export-call-flow.svg)
 
 ## Startup
 
