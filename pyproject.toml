@@ -153,12 +153,12 @@ vllm = [
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
   # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.28.0
-  "vllm==0.28.0",
+  # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
+  "vllm==0.29.0",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.16.post3",
-  "flashinfer-cubin==0.6.16.post3",
-  "flashinfer-jit-cache==0.6.16.post3",
+  "flashinfer-python==0.6.18",
+  "flashinfer-cubin==0.6.18",
+  "flashinfer-jit-cache==0.6.18",
   "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
 sglang = [
@@ -422,8 +422,14 @@ override-dependencies = [
   "timm<=1.0.22",
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
-  # Match the ABI of the vLLM 0.28.0 CUDA wheels.
+  # Match the ABI of the vLLM 0.29.0 CUDA wheels.
   "torch==2.13.0",
+  # vLLM 0.29 lists instanttensor (the optional `load_format="instanttensor"`
+  # safetensors loader) as an unconditional dependency, but it only publishes
+  # x86_64 wheels and its sdist compiles libaio/liburing/boost. vLLM imports it
+  # lazily and NeMo-RL never selects that load format, so keep the wheel on
+  # x86_64 and skip it on aarch64 (GB200) instead of building it from source.
+  "instanttensor>=0.1.9; platform_machine == 'x86_64'",
   "llguidance>=1.7.0,<1.8.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
