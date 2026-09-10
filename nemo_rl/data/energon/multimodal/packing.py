@@ -15,6 +15,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     message_log_to_flat_messages,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.packing import SequencePacker
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -180,8 +181,10 @@ def prepare_packed_sft_batch(
             "input_lengths": input_lengths,
             "token_mask": flat["token_loss_mask"],
             "sample_mask": flat["token_loss_mask"].bool().any(1).float(),
-            "cu_seqlens": boundaries,
-            "cu_seqlens_padded": padded_boundaries,
+            # TP replica broadcast rejects tensor-bearing Python lists;
+            # PackedTensor carries these jagged per-pack boundaries over NCCL.
+            "cu_seqlens": PackedTensor(boundaries, dim_to_pack=0),
+            "cu_seqlens_padded": PackedTensor(padded_boundaries, dim_to_pack=0),
             "source_ids": source_ids,
         }
     )

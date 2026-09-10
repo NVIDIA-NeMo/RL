@@ -29,7 +29,7 @@ from megatron.core.parallel_state import (
 from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
-from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
@@ -369,7 +369,9 @@ def _prepacked_boundary(
     data: BatchedDataDict[Any], key: str, device: torch.device
 ) -> torch.Tensor:
     value = data[key]
-    if isinstance(value, list):
+    if isinstance(value, PackedTensor):
+        value = value.as_tensor()
+    elif isinstance(value, list):
         if len(value) != 1:
             raise ValueError(f"{key} must describe one physical pack.")
         value = value[0]
