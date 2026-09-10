@@ -60,13 +60,13 @@ def test_configure_nixl_worker_ignores_other_configs(generation_config):
     assert vllm_kwargs == {"additional_config": {"existing": True}}
 
 
-def test_configure_nixl_worker_uses_vllm_extension_points():
-    checkpoint_config = _nixl_config()
+@pytest.mark.parametrize("transport", ["nixl", "model_express"])
+def test_configure_nixl_worker_uses_vllm_extension_points(transport):
     vllm_kwargs = {"additional_config": {"existing": True}}
 
     configure_nixl_worker(
         {
-            "refit_transport": "nixl",
+            "refit_transport": transport,
             "refit_cfg": {
                 "nixl": {
                     "backend_name": "UCX",
@@ -80,7 +80,7 @@ def test_configure_nixl_worker_uses_vllm_extension_points():
     assert vllm_kwargs["worker_cls"] == NIXL_VLLM_WORKER
     assert vllm_kwargs["additional_config"] == {
         "existing": True,
-        "nemo_rl_checkpoint_engine": checkpoint_config,
+        "nemo_rl_checkpoint_engine": _nixl_config(),
     }
 
 
