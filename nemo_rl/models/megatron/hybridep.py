@@ -63,9 +63,7 @@ def configure_hybridep_packed_input_padding(
             )
         return
 
-    if not (
-        sequence_packing_enabled and uses_hybridep_flex_dispatcher(megatron_cfg)
-    ):
+    if not (sequence_packing_enabled and uses_hybridep_flex_dispatcher(megatron_cfg)):
         return
 
     padding_attr = "moe_hybridep_pad_uneven_dispatch_inputs"
