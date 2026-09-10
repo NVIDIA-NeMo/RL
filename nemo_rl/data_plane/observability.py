@@ -1157,7 +1157,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._bytes_by_partition: dict[str, int] = {}
         self._keys_by_partition: dict[str, set[str]] = {}
         self._rows_since_reconcile = 0
-        self._reconcile_failure_logged = False
         # partition -> sample_id -> field -> wire-in fingerprint. Same
         # lifetime as the two above: ``_record_clear`` releases all three.
         self._hash_by_partition: dict[str, dict[str, dict[str, int]]] = {}
@@ -1323,20 +1322,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         """
         try:
             live = set(self._inner.list_sample_ids(partition_id))
-        except Exception as exc:  # noqa: BLE001 - accounting must not fail a put
-            # The put itself already succeeded; only the release is lost, and
-            # the next window retries it. Logged once because whatever makes
-            # the listing raise makes it raise every window.
-            if not self._reconcile_failure_logged:
-                self._reconcile_failure_logged = True
-                logger.warning(
-                    "data-plane accounting could not reconcile partition %s "
-                    "(%s: %s). Transfers are unaffected; bytes_outstanding "
-                    "and n_keys_outstanding may over-report on this process.",
-                    partition_id,
-                    type(exc).__name__,
-                    exc,
-                )
+        except Exception:  # noqa: BLE001 - the put succeeded; retry next window
             return
         stale = self._keys_by_partition.get(partition_id, set()) - live
         if stale:
