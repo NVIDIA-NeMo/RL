@@ -57,6 +57,7 @@ in_flight_weight_updates="${IN_FLIGHT_WEIGHT_UPDATES:-true}"
 recompute_kv_cache_after_weight_updates="${RECOMPUTE_KV_CACHE_AFTER_WEIGHT_UPDATES:-false}"
 length_penalty_enabled="${LENGTH_PENALTY_ENABLED:-false}"
 profile_band_enabled="${PROFILE_BAND_ENABLED:-false}"
+prefetch_gym_venvs="${PREFETCH_GYM_VENVS:-false}"
 train_global_batch_size=$((num_prompts * num_generations))
 
 if (( num_gen_nodes <= 0 || num_gen_nodes >= num_nodes )); then
@@ -162,6 +163,9 @@ export NEMO_GYM_VENV_DIR=${gym_venv_dir}
 export NRL_FORCE_REBUILD_VENVS=false
 export NEMO_RL_VIDEO_MEDIA_ROOT=/
 "\${uv_bin}" run --no-sync python -c "from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${model_path}'; AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('Prewarmed HF dynamic modules cache')"
+if [[ "${prefetch_gym_venvs}" == "true" ]]; then
+  "\${uv_bin}" run --no-sync python examples/nemo_gym/prefetch_venvs.py "${config_in_container}"
+fi
 "\${uv_bin}" run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
   --config "${config_in_container}" \
   checkpointing.checkpoint_dir="${results_dir}/checkpoints" \
@@ -216,6 +220,7 @@ submit_args=(
 
 echo "candidate=${candidate_name}"
 echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} length_penalty=${length_penalty_enabled} profile_band=${profile_band_enabled} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template}"
+echo "prefetch_gym_venvs=${prefetch_gym_venvs} gym_venv_dir=${gym_venv_dir}"
 echo "container=${container}"
 echo "results=${results_dir}"
 
