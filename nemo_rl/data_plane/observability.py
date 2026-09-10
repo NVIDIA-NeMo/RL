@@ -1756,16 +1756,29 @@ class MetricsDataPlaneClient(DataPlaneClient):
         fetch = list(select_fields)
         if self._verify_tensor_hash:
             fetch += [_hash_field(f) for f in select_fields]
-        out = self._run(
-            "get",
-            partition_id,
-            lambda: self._inner.get_samples(
-                sample_ids_list,
+        def read(columns):
+            return self._run(
+                "get",
                 partition_id,
-                select_fields=fetch,
-            ),
-            n_keys=len(sample_ids_list),
-        )
+                lambda: self._inner.get_samples(
+                    sample_ids_list,
+                    partition_id,
+                    select_fields=columns,
+                ),
+                n_keys=len(sample_ids_list),
+            )
+
+        try:
+            out = read(fetch)
+        except Exception as exc:  # noqa: BLE001 - a guard bug must not fail a read
+            if fetch == list(select_fields):
+                raise
+            # The mirror is absent: the put that wrote these rows could not
+            # fold, or predates the guard. Read what the caller asked for and
+            # abstain -- ``_check_hashes`` finds no columns and counts the rows
+            # unverified.
+            self._hash_guard_failed("get", exc)
+            out = read(list(select_fields))
         if self._verify_tensor_hash:
             self._check_hashes(partition_id, sample_ids_list, out)
         self._bill_self(entered)
