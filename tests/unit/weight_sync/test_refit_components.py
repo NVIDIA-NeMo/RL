@@ -227,7 +227,6 @@ def test_native_mxfp8_param_names_requires_canonical_dtype_pair() -> None:
         "model.layers.0.mlp.down_proj.weight"
     }
 
-
 @pytest.mark.parametrize(
     ("param_info", "match"),
     [
