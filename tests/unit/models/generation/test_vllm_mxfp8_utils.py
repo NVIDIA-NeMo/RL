@@ -16,6 +16,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import torch
 
 
 def _load_mxfp8_utils():
@@ -92,3 +93,78 @@ def test_flashinfer_mxfp8_moe_padding_plan_rejects_invalid_sizes(
 
     with pytest.raises(ValueError):
         padding_plan(hidden_size, intermediate_size)
+
+
+def test_pad_tensor_dim_preserves_values_and_fills_padding() -> None:
+    pad_tensor_dim = _load_mxfp8_utils().pad_tensor_dim
+    tensor = torch.tensor([[1, 2], [3, 4]], dtype=torch.uint8)
+
+    padded = pad_tensor_dim(tensor, dim=1, padded_size=4, pad_value=127)
+
+    assert tuple(padded.shape) == (2, 4)
+    torch.testing.assert_close(padded[:, :2], tensor)
+    assert torch.all(padded[:, 2:] == 127)
+
+
+def test_pad_tensor_dim_rejects_smaller_target() -> None:
+    pad_tensor_dim = _load_mxfp8_utils().pad_tensor_dim
+
+    with pytest.raises(ValueError, match="Cannot pad MXFP8 tensor dim"):
+        pad_tensor_dim(torch.ones(2, 3), dim=1, padded_size=2)
+
+
+def test_assign_or_replace_parameter_copies_when_storage_is_compatible() -> None:
+    assign_or_replace_parameter = _load_mxfp8_utils().assign_or_replace_parameter
+    layer = torch.nn.Module()
+    parameter = torch.nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+    parameter.weight_loader = object()
+    layer.register_parameter("weight", parameter)
+
+    assign_or_replace_parameter(layer, "weight", torch.ones(2, 3))
+
+    assert layer.weight is parameter
+    assert layer.weight.weight_loader is parameter.weight_loader
+    assert torch.all(layer.weight == 1)
+
+
+def test_assign_or_replace_parameter_can_force_new_runtime_storage() -> None:
+    assign_or_replace_parameter = _load_mxfp8_utils().assign_or_replace_parameter
+    layer = torch.nn.Module()
+    checkpoint_parameter = torch.nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+    layer.register_parameter("weight", checkpoint_parameter)
+
+    assign_or_replace_parameter(
+        layer,
+        "weight",
+        torch.ones(2, 3),
+        force_replace=True,
+    )
+
+    assert layer.weight is not checkpoint_parameter
+    assert torch.all(checkpoint_parameter == 0)
+    assert torch.all(layer.weight == 1)
+
+
+@pytest.mark.parametrize("is_gated", [False, True])
+def test_pad_w13_intermediate_preserves_gate_halves(is_gated: bool) -> None:
+    pad_w13_intermediate = _load_mxfp8_utils().pad_w13_intermediate
+    rows = 4 if is_gated else 2
+    tensor = torch.arange(rows * 3).reshape(1, rows, 3)
+
+    padded = pad_w13_intermediate(
+        tensor,
+        padded_intermediate_size=4,
+        is_gated=is_gated,
+        pad_value=-1,
+    )
+
+    expected_rows = 8 if is_gated else 4
+    assert tuple(padded.shape) == (1, expected_rows, 3)
+    if is_gated:
+        torch.testing.assert_close(padded[:, :2], tensor[:, :2])
+        torch.testing.assert_close(padded[:, 4:6], tensor[:, 2:])
+        assert torch.all(padded[:, 2:4] == -1)
+        assert torch.all(padded[:, 6:] == -1)
+    else:
+        torch.testing.assert_close(padded[:, :2], tensor)
+        assert torch.all(padded[:, 2:] == -1)

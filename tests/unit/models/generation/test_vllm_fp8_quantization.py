@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import types
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -172,6 +173,317 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
     }
     assert mxfp8_families == {"model.layers.0.mlp.experts"}
     assert not modelopt_config.is_layer_excluded("model.layers.0.mlp.gate_up_proj")
+
+
+@pytest.mark.parametrize(
+    ("num_first_layers_in_bf16", "num_last_layers_in_bf16"),
+    [
+        (0, 0),
+        (5, 0),
+        (0, 4),
+        (1, 1),
+        (2, 6),
+        (3, 5),
+        (1, 3),
+        (7, 3),
+        (26, 26),
+        (30, 30),
+        (40, 0),
+        (0, 40),
+    ],
+)
+@pytest.mark.parametrize(
+    "recipe_case",
+    [
+        pytest.param(
+            types.SimpleNamespace(
+                model_name="dummy-qwen-model",
+                num_hidden_layers=40,
+                nested_text_config=True,
+                hf_layer_prefix="language_model.layers",
+                raw_layer_prefix="model.language_model.layers",
+                vllm_layer_prefix="language_model.model.layers",
+                mapper_prefixes={"model.language_model.": "language_model.model."},
+                hf_target_suffixes=(
+                    "self_attn.q_proj",
+                    "self_attn.k_proj",
+                    "self_attn.v_proj",
+                    "self_attn.o_proj",
+                ),
+                suffixless_hf_target_suffixes=(
+                    "mlp.experts.gate_up_proj",
+                    "mlp.experts.down_proj",
+                ),
+                vllm_target_suffixes=(
+                    "self_attn.qkv_proj",
+                    "self_attn.o_proj",
+                    "mlp.experts",
+                ),
+                non_target_suffixes=(
+                    "mlp.gate",
+                    "mlp.shared_expert.up_proj",
+                    "mlp.shared_expert_gate",
+                ),
+                ignore_patterns=(
+                    "*layers.*.mlp.gate",
+                    "*layers.*.mlp.shared_expert.*",
+                    "*layers.*.mlp.shared_expert_gate",
+                    "lm_head",
+                ),
+            ),
+            id="qwen",
+        ),
+        pytest.param(
+            types.SimpleNamespace(
+                model_name="dummy-nemotron-h-model",
+                num_hidden_layers=52,
+                nested_text_config=False,
+                hf_layer_prefix="backbone.layers",
+                raw_layer_prefix="backbone.layers",
+                vllm_layer_prefix="model.layers",
+                mapper_prefixes={"backbone": "model"},
+                hf_target_suffixes=(
+                    "mixer.q_proj",
+                    "mixer.k_proj",
+                    "mixer.v_proj",
+                    "mixer.o_proj",
+                    "mixer.experts.up_proj",
+                    "mixer.experts.down_proj",
+                ),
+                suffixless_hf_target_suffixes=(),
+                vllm_target_suffixes=(
+                    "mixer.qkv_proj",
+                    "mixer.o_proj",
+                    "mixer.experts",
+                ),
+                non_target_suffixes=(
+                    "mixer.in_proj",
+                    "mixer.shared_experts.up_proj",
+                ),
+                ignore_patterns=(
+                    "*layers.*.mixer.in_proj",
+                    "*layers.*.mixer.shared_experts.*",
+                    "lm_head",
+                ),
+            ),
+            id="nemotron-h",
+        ),
+    ],
+)
+def test_init_fp8_keeps_mixed_recipe_boundary_targets_in_bf16(
+    fp8_module,
+    monkeypatch,
+    num_first_layers_in_bf16,
+    num_last_layers_in_bf16,
+    recipe_case,
+):
+    """Keep boundary QKVO and routed experts BF16 across mixed recipes."""
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    fp8 = fp8_module
+    num_hidden_layers = recipe_case.num_hidden_layers
+    param_names = []
+    for layer_idx in range(num_hidden_layers):
+        param_names.extend(
+            f"{recipe_case.hf_layer_prefix}.{layer_idx}.{suffix}.weight"
+            for suffix in (
+                *recipe_case.hf_target_suffixes,
+                *recipe_case.non_target_suffixes,
+            )
+        )
+        param_names.extend(
+            f"{recipe_case.hf_layer_prefix}.{layer_idx}.{suffix}"
+            for suffix in recipe_case.suffixless_hf_target_suffixes
+        )
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: (
+            types.SimpleNamespace(
+                text_config=types.SimpleNamespace(num_hidden_layers=num_hidden_layers)
+            )
+            if recipe_case.nested_text_config
+            else types.SimpleNamespace(num_hidden_layers=num_hidden_layers)
+        ),
+    )
+    monkeypatch.setattr(
+        fp8.AutoModel,
+        "from_config",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            named_parameters=lambda: [(name, None) for name in param_names]
+        ),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "num_first_layers_in_bf16": num_first_layers_in_bf16,
+            "num_last_layers_in_bf16": num_last_layers_in_bf16,
+            "quantization_ignore_patterns": list(recipe_case.ignore_patterns),
+        },
+        recipe_case.model_name,
+        model_parallel_size=1,
+    )
+
+    quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    modelopt_config = ModelOptMxFp8Config.from_config(quant_config)
+    mapper = WeightsMapper(orig_to_new_prefix=recipe_case.mapper_prefixes)
+    modelopt_config.apply_vllm_mapper(mapper.get_unstacked_mapper())
+    modelopt_config.packed_modules_mapping.update(
+        {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    )
+    boundary_layers = {
+        layer_idx
+        for layer_idx in range(num_hidden_layers)
+        if layer_idx < num_first_layers_in_bf16
+        or layer_idx >= num_hidden_layers - num_last_layers_in_bf16
+    }
+    for layer_idx in range(num_hidden_layers):
+        if layer_idx in boundary_layers:
+            for suffix in recipe_case.hf_target_suffixes:
+                module_name = f"{recipe_case.raw_layer_prefix}.{layer_idx}.{suffix}"
+                assert module_name in quant_config["ignored_layers"]
+            for suffix in recipe_case.suffixless_hf_target_suffixes:
+                module_name = f"{recipe_case.raw_layer_prefix}.{layer_idx}.{suffix}"
+                assert module_name in quant_config["ignored_layers"]
+
+            for suffix in recipe_case.vllm_target_suffixes:
+                module_name = f"{recipe_case.vllm_layer_prefix}.{layer_idx}.{suffix}"
+                assert modelopt_config.is_layer_excluded(module_name)
+        else:
+            for suffix in recipe_case.vllm_target_suffixes:
+                module_name = f"{recipe_case.vllm_layer_prefix}.{layer_idx}.{suffix}"
+                assert not modelopt_config.is_layer_excluded(module_name)
+
+        for suffix in recipe_case.non_target_suffixes:
+            module_name = f"{recipe_case.vllm_layer_prefix}.{layer_idx}.{suffix}"
+            assert modelopt_config.is_layer_excluded(module_name)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["num_first_layers_in_bf16", "num_last_layers_in_bf16"],
+)
+@pytest.mark.parametrize(
+    ("invalid_value", "error_match"),
+    [
+        pytest.param(-1, "must be between 0 and 40", id="negative"),
+        pytest.param(41, "must be between 0 and 40", id="too-large"),
+        pytest.param(1.0, "must be an integer", id="float"),
+        pytest.param("1", "must be an integer", id="string"),
+        pytest.param(True, "must be an integer", id="bool"),
+    ],
+)
+def test_init_fp8_rejects_invalid_bf16_layer_boundaries(
+    fp8_module,
+    monkeypatch,
+    field_name,
+    invalid_value,
+    error_match,
+):
+    fp8 = fp8_module
+    num_hidden_layers = 40
+    config = types.SimpleNamespace(
+        get_text_config=lambda: types.SimpleNamespace(
+            num_hidden_layers=num_hidden_layers
+        )
+    )
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        fp8.AutoModel,
+        "from_config",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            named_parameters=lambda: [
+                (
+                    f"language_model.layers.{layer_idx}.mlp.experts.gate_up_proj",
+                    None,
+                )
+                for layer_idx in range(num_hidden_layers)
+            ]
+        ),
+    )
+    patch_calls = []
+    monkeypatch.setattr(
+        fp8,
+        "monkey_patch_vllm_ray_executor",
+        lambda config: patch_calls.append(config),
+    )
+
+    vllm_cfg = {
+        "precision": "fp8",
+        "kv_cache_dtype": "auto",
+        "async_engine": False,
+        "is_mx": True,
+        "num_first_layers_in_bf16": 0,
+        "num_last_layers_in_bf16": 0,
+    }
+    vllm_cfg[field_name] = invalid_value
+
+    with pytest.raises(ValueError, match=error_match):
+        fp8.init_fp8(vllm_cfg, "dummy-qwen-model", model_parallel_size=1)
+
+    assert patch_calls == []
+    assert fp8.global_fp8_config is None
+
+
+def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    num_hidden_layers = 8
+    param_names = [
+        f"layers.{layer_idx}.mlp.experts.up_proj.weight"
+        for layer_idx in range(num_hidden_layers)
+    ]
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            text_config=types.SimpleNamespace(num_hidden_layers=num_hidden_layers)
+        ),
+    )
+    from_config_calls = []
+
+    def from_config(config, **kwargs):
+        from_config_calls.append((config, kwargs))
+        return types.SimpleNamespace(
+            named_parameters=lambda: [(name, None) for name in param_names]
+        )
+
+    monkeypatch.setattr(fp8.AutoModel, "from_config", from_config)
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "num_first_layers_in_bf16": 2,
+            "num_last_layers_in_bf16": 2,
+        },
+        "dummy-model-with-text-config",
+        model_parallel_size=1,
+    )
+
+    ignored_layers = vllm_kwargs["hf_overrides"]["quantization_config"][
+        "ignored_layers"
+    ]
+    assert "model.layers.0.mlp.experts.up_proj" in ignored_layers
+    assert "model.layers.1.mlp.experts.up_proj" in ignored_layers
+    assert "model.layers.6.mlp.experts.up_proj" in ignored_layers
+    assert "model.layers.7.mlp.experts.up_proj" in ignored_layers
+    assert "model.layers.2.mlp.experts.up_proj" not in ignored_layers
+    assert from_config_calls[0][1] == {"trust_remote_code": True}
 
 
 @pytest.mark.parametrize(
@@ -447,7 +759,9 @@ def test_init_fp8_combines_legacy_and_modelopt_ignore_patterns(fp8_module, monke
         "from_pretrained",
         lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
     )
-    monkeypatch.setattr(fp8.AutoModel, "from_config", lambda *_args: FakeModel())
+    monkeypatch.setattr(
+        fp8.AutoModel, "from_config", lambda *_args, **_kwargs: FakeModel()
+    )
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
     with pytest.warns(
@@ -615,6 +929,46 @@ def test_batched_moe_shuffle_matches_per_expert(
         assert actual.shape == expected.shape
         assert actual.dtype == expected.dtype
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
+    fp8_module, monkeypatch
+):
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.zeros(2, 64), requires_grad=False),
+    )
+    checkpoint_scale = torch.arange(4, dtype=torch.uint8).reshape(2, 2)
+    layer.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(checkpoint_scale.clone(), requires_grad=False),
+    )
+    layer.weight_scale.weight_loader = object()
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "swizzle_mxfp8_scale",
+        lambda scale, M, K: scale + 1,
+    )
+    kernel_type = type("FlashInferCutlassMxfp8LinearKernel", (), {})
+    method = types.SimpleNamespace(kernel=kernel_type())
+
+    fp8_module.process_weights_after_loading_mxfp8_linear(method, layer)
+
+    runtime_parameter = layer.weight_scale
+    runtime_ptr = runtime_parameter.data_ptr()
+    assert runtime_parameter is not layer.weight_scale_from_checkpoint
+    torch.testing.assert_close(layer.weight_scale_from_checkpoint, checkpoint_scale)
+    torch.testing.assert_close(runtime_parameter, checkpoint_scale + 1)
+
+    layer.weight_scale_from_checkpoint.fill_(4)
+    fp8_module.process_weights_after_loading_mxfp8_linear(method, layer)
+
+    assert layer.weight_scale is runtime_parameter
+    assert layer.weight_scale.data_ptr() == runtime_ptr
+    assert torch.all(layer.weight_scale == 5)
 
 
 @pytest.mark.parametrize("is_gated", [True, False])
@@ -890,13 +1244,34 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
     )
     layer._expert_routing_tables = lambda: (None, None, None)
 
-    moe_config = types.SimpleNamespace(
+    post_init_calls = []
+
+    @dataclass
+    class MoeConfig:
+        is_act_and_mul: bool
+        hidden_dim: int
+        intermediate_size: int
+        moe_parallel_config: object
+        hidden_dim_unpadded: int | None = None
+        intermediate_size_per_partition_unpadded: int | None = None
+        intermediate_size_per_partition: int = -1
+
+        def __post_init__(self) -> None:
+            post_init_calls.append((self.hidden_dim, self.intermediate_size))
+            self.intermediate_size_per_partition = (
+                self.intermediate_size // self.moe_parallel_config.tp_size
+            )
+            if self.hidden_dim_unpadded is None:
+                self.hidden_dim_unpadded = self.hidden_dim
+            if self.intermediate_size_per_partition_unpadded is None:
+                self.intermediate_size_per_partition_unpadded = (
+                    self.intermediate_size_per_partition
+                )
+
+    moe_config = MoeConfig(
         is_act_and_mul=is_gated,
         hidden_dim=128,
-        hidden_dim_unpadded=128,
         intermediate_size=32 * tp_size,
-        intermediate_size_per_partition=32,
-        intermediate_size_per_partition_unpadded=32,
         moe_parallel_config=types.SimpleNamespace(tp_size=tp_size),
     )
     kernel = object()
@@ -956,6 +1331,7 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
     assert kernel_configs[0].hidden_dim == 512
     assert kernel_configs[0].intermediate_size_per_partition == 128
     assert kernel_configs[0].intermediate_size == 128 * tp_size
+    assert post_init_calls == [(128, 32 * tp_size), (512, 128 * tp_size)]
 
     x = torch.randn(2, 128)
     padded_x = torch.nn.functional.pad(x, (0, 512 - x.shape[-1]))
@@ -1096,7 +1472,17 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
             calls.append((x, w13, w2, router_logits, kwargs))
             return x + 1
 
-    method = types.SimpleNamespace(is_monolithic=True, moe_kernel=Kernel())
+    padded_hidden_size = 3072 if requires_padding else 2688
+    kernel_moe_config = types.SimpleNamespace(
+        hidden_dim=padded_hidden_size,
+        hidden_dim_unpadded=2688,
+    )
+    method = types.SimpleNamespace(
+        is_monolithic=True,
+        moe_kernel=Kernel(),
+        moe=kernel_moe_config,
+        _mxfp8_kernel_moe_config=kernel_moe_config,
+    )
     layer_kwargs = {
         "w13_weight": torch.tensor([130]),
         "w2_weight": torch.tensor([20]),
@@ -1112,8 +1498,6 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
     if requires_padding:
         layer_kwargs.update(
             {
-                "mxfp8_unpadded_hidden_size": 2688,
-                "mxfp8_padded_hidden_size": 3072,
                 "w13_weight_for_apply": torch.tensor([13]),
                 "w2_weight_for_apply": torch.tensor([2]),
             }
@@ -1148,6 +1532,27 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
     }
     assert tuple(output.shape) == (2, 2688)
     torch.testing.assert_close(output, x + 1)
+
+
+def test_apply_monolithic_mxfp8_moe_rejects_hidden_size_mismatch(fp8_module):
+    kernel_moe_config = types.SimpleNamespace(
+        hidden_dim=512,
+        hidden_dim_unpadded=128,
+    )
+    method = types.SimpleNamespace(
+        is_monolithic=True,
+        moe_kernel=object(),
+        moe=kernel_moe_config,
+        _mxfp8_kernel_moe_config=kernel_moe_config,
+    )
+
+    with pytest.raises(ValueError, match="Expected MXFP8 MoE hidden size 128, got 64"):
+        fp8_module.apply_monolithic_mxfp8_moe(
+            method,
+            object(),
+            torch.zeros(2, 64),
+            torch.zeros(2, 4),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1566,6 +1971,24 @@ GROUPED_EXPERT_KEY_SHAPES = pytest.mark.parametrize(
     [("model.layers", False), ("model.language_model.layers", True)],
     ids=["flat", "vl-wrapper"],
 )
+
+
+def test_load_weights_uses_supplied_model_loader(fp8_module):
+    fp8 = fp8_module
+    model = types.SimpleNamespace(
+        packed_modules_mapping={},
+        load_weights=lambda _weights: pytest.fail("must use the supplied loader"),
+    )
+    source = torch.ones(2, dtype=torch.bfloat16)
+    loaded = []
+
+    fp8.load_weights(
+        [("model.norm.weight", source)],
+        types.SimpleNamespace(model=model),
+        model_load_weights=lambda weights: loaded.extend(weights),
+    )
+
+    assert loaded == [("model.norm.weight", source)]
 
 
 @GROUPED_EXPERT_KEY_SHAPES

@@ -14,9 +14,8 @@
 
 import os
 import warnings
-from collections.abc import Iterable, Iterator, Sequence
-from copy import copy
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any
 from unittest.mock import patch
 
@@ -34,8 +33,11 @@ from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
+    assign_or_replace_parameter,
     flashinfer_mxfp8_moe_padding_plan,
     pad_flashinfer_scale_k,
+    pad_tensor_dim,
+    pad_w13_intermediate,
 )
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
 
@@ -272,9 +274,30 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         quantization_ignore_patterns = [
             pattern.strip() for pattern in quantization_ignore_patterns
         ]
+
+    num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
+    num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = (
+        get_text_config()
+        if callable(get_text_config)
+        else getattr(config, "text_config", config)
+    )
+    num_hidden_layers = text_config.num_hidden_layers
+    for field_name, value in (
+        ("num_first_layers_in_bf16", num_first_layers_in_bf16),
+        ("num_last_layers_in_bf16", num_last_layers_in_bf16),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{field_name} must be an integer")
+        if not 0 <= value <= num_hidden_layers:
+            raise ValueError(
+                f"{field_name} must be between 0 and {num_hidden_layers}, got {value}"
+            )
+
     fp8_config_kwargs = {
-        "num_first_layers_in_bf16": vllm_cfg.get("num_first_layers_in_bf16", 0),
-        "num_last_layers_in_bf16": vllm_cfg.get("num_last_layers_in_bf16", 0),
+        "num_first_layers_in_bf16": num_first_layers_in_bf16,
+        "num_last_layers_in_bf16": num_last_layers_in_bf16,
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
@@ -309,15 +332,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         monkey_patch_vllm_ray_executor(global_fp8_config)
 
     # create fp8 kwargs for vllm's LLM(...)
-    num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
-    num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
     if global_fp8_config.is_mx:
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [name for name, _ in model.named_parameters()]
 
         bf16_params = []
@@ -329,8 +350,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             layers = [
                 l
                 for l in range(
-                    config.num_hidden_layers - num_last_layers_in_bf16,
-                    config.num_hidden_layers,
+                    num_hidden_layers - num_last_layers_in_bf16,
+                    num_hidden_layers,
                 )
             ]
             bf16_params.extend(_get_params_in_layers(param_names, layers))
@@ -346,7 +367,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         )
     if quantization_ignored_layer_kws:
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [
             f"model.{name}".removesuffix(".weight").replace(
                 "model.backbone.", "backbone."
@@ -615,15 +636,17 @@ def get_quantized_weight_iterator(
 
 
 def load_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], model_runner: Any
+    weights: Iterable[tuple[str, torch.Tensor]],
+    model_runner: Any,
+    *,
+    model_load_weights: Callable[..., object] | None = None,
 ) -> None:
     """Quantize weights for the legacy direct model-loading path."""
-    # Finally load the weights into vllm
-    model_runner.model.load_weights(
+    if model_load_weights is None:
+        model_load_weights = model_runner.model.load_weights
+    model_load_weights(
         get_quantized_weight_iterator(
-            weights,
-            model_runner,
-            refit_with_reload_api=False,
+            weights, model_runner, refit_with_reload_api=False
         )
     )
 
@@ -958,7 +981,8 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     weight = layer.weight.data  # [N, K]
     N, K = weight.shape
 
-    if not hasattr(layer, "weight_scale_from_checkpoint"):
+    first_load = not hasattr(layer, "weight_scale_from_checkpoint")
+    if first_load:
         layer.weight_scale_from_checkpoint = ModelWeightParameter(
             data=layer.weight_scale.data,
             input_dim=1,
@@ -969,20 +993,20 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
             "weight_scale_from_checkpoint", layer.weight_scale_from_checkpoint
         )
         weight_scale = layer.weight_scale.data
-        # Swizzle the weight scales
-        scale_k = K // 32
-        weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
-        weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
-        layer.weight_scale = torch.nn.Parameter(
-            weight_scale_swizzled.contiguous(), requires_grad=False
-        )
     else:
         weight_scale = layer.weight_scale_from_checkpoint.data
-        # Swizzle the weight scales
-        scale_k = K // 32
-        weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
-        weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
-        layer.weight_scale.copy_(weight_scale_swizzled.contiguous())
+
+    scale_k = K // 32
+    weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
+    weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
+    # The checkpoint parameter aliases the original storage on first load.
+    # Install separate runtime storage before writing the swizzled scale.
+    assign_or_replace_parameter(
+        layer,
+        "weight_scale",
+        weight_scale_swizzled,
+        force_replace=first_load,
+    )
 
 
 def create_weights_mxfp8_moe(
@@ -1303,55 +1327,6 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             f"got {self.mxfp8_backend}."
         )
 
-    def pad_tensor_dim(
-        tensor: torch.Tensor,
-        dim: int,
-        padded_size: int,
-        pad_value: int | float = 0,
-    ) -> torch.Tensor:
-        current_size = tensor.shape[dim]
-        if current_size == padded_size:
-            return tensor
-        if current_size > padded_size:
-            raise ValueError(
-                f"Cannot pad MXFP8 tensor dim {dim} from {current_size} "
-                f"to {padded_size}."
-            )
-
-        padded_shape = list(tensor.shape)
-        padded_shape[dim] = padded_size
-        padded = tensor.new_full(padded_shape, pad_value)
-        padded.narrow(dim, 0, current_size).copy_(tensor)
-        return padded
-
-    def set_parameter(name: str, value: torch.Tensor) -> None:
-        value = value.contiguous()
-        parameter = getattr(layer, name, None)
-        if parameter is not None and tuple(parameter.shape) == tuple(value.shape):
-            parameter.data.copy_(value)
-            return
-        setattr(layer, name, torch.nn.Parameter(value, requires_grad=False))
-
-    def pad_w13_intermediate(
-        tensor: torch.Tensor,
-        padded_intermediate_size: int,
-        pad_value: int | float = 0,
-    ) -> torch.Tensor:
-        if not is_gated:
-            return pad_tensor_dim(tensor, 1, padded_intermediate_size, pad_value)
-
-        intermediate_size = tensor.shape[1] // 2
-        sharded = tensor.reshape(
-            tensor.shape[0], 2, intermediate_size, *tensor.shape[2:]
-        )
-        padded_shape = list(sharded.shape)
-        padded_shape[2] = padded_intermediate_size
-        padded = tensor.new_full(padded_shape, pad_value)
-        padded[:, :, :intermediate_size].copy_(sharded)
-        return padded.reshape(
-            tensor.shape[0], 2 * padded_intermediate_size, *tensor.shape[2:]
-        )
-
     epilogue_tile_m = 128
     e8m0_unit_scale = 127
     is_gated = self.moe.is_act_and_mul
@@ -1386,19 +1361,19 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             MXFP8_BLOCK_SIZE,
         )
 
-        layer.mxfp8_unpadded_hidden_size = unpadded_hidden_size
-        layer.mxfp8_padded_hidden_size = padded_hidden_size
-        layer.mxfp8_unpadded_intermediate_size_per_partition = (
-            unpadded_intermediate_size
+        w13_weight = pad_w13_intermediate(
+            w13_weight,
+            padded_intermediate_size,
+            is_gated,
         )
-        layer.mxfp8_padded_intermediate_size_per_partition = padded_intermediate_size
-
-        w13_weight = pad_w13_intermediate(w13_weight, padded_intermediate_size)
         w13_weight = pad_tensor_dim(w13_weight, 2, padded_hidden_size)
         w2_weight = pad_tensor_dim(w2_weight, 1, padded_hidden_size)
         w2_weight = pad_tensor_dim(w2_weight, 2, padded_intermediate_size)
         w13_scale = pad_w13_intermediate(
-            w13_scale, padded_intermediate_size, e8m0_unit_scale
+            w13_scale,
+            padded_intermediate_size,
+            is_gated,
+            e8m0_unit_scale,
         )
         w13_scale = pad_tensor_dim(
             w13_scale,
@@ -1469,42 +1444,52 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
         )
 
-        if requires_padding:
-            set_parameter("w13_weight_scale", w13_scale_shuffled)
-            set_parameter("w2_weight_scale", w2_scale_shuffled)
-        else:
-            layer.w13_weight_scale = torch.nn.Parameter(
-                w13_scale_shuffled, requires_grad=False
-            )
-            layer.w2_weight_scale = torch.nn.Parameter(
-                w2_scale_shuffled, requires_grad=False
-            )
-    else:
-        layer.w13_weight_scale.copy_(w13_scale_shuffled)
-        layer.w2_weight_scale.copy_(w2_scale_shuffled)
+    assign_or_replace_parameter(
+        layer,
+        "w13_weight_scale",
+        w13_scale_shuffled,
+        force_replace=first_load,
+    )
+    assign_or_replace_parameter(
+        layer,
+        "w2_weight_scale",
+        w2_scale_shuffled,
+        force_replace=first_load,
+    )
 
     if requires_padding:
-        set_parameter("w13_weight_for_apply", w13_weight_shuffled)
-        set_parameter("w2_weight_for_apply", w2_weight_shuffled)
+        assign_or_replace_parameter(
+            layer,
+            "w13_weight_for_apply",
+            w13_weight_shuffled,
+        )
+        assign_or_replace_parameter(
+            layer,
+            "w2_weight_for_apply",
+            w2_weight_shuffled,
+        )
     else:
-        layer.w13_weight.copy_(w13_weight_shuffled)
-        layer.w2_weight.copy_(w2_weight_shuffled)
+        assign_or_replace_parameter(layer, "w13_weight", w13_weight_shuffled)
+        assign_or_replace_parameter(layer, "w2_weight", w2_weight_shuffled)
 
     if self.moe_kernel is None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
         kernel_moe_config = self.moe
         if requires_padding:
-            kernel_moe_config = copy(self.moe)
-            kernel_moe_config.hidden_dim = padded_hidden_size
-            kernel_moe_config.hidden_dim_unpadded = unpadded_hidden_size
-            kernel_moe_config.intermediate_size_per_partition = padded_intermediate_size
-            kernel_moe_config.intermediate_size_per_partition_unpadded = (
-                unpadded_intermediate_size
+            # TRTLLM consumes the padded fields. The logical fields are kept so
+            # the patched apply path can pad inputs and trim outputs.
+            kernel_moe_config = replace(
+                self.moe,
+                hidden_dim=padded_hidden_size,
+                hidden_dim_unpadded=unpadded_hidden_size,
+                intermediate_size=(
+                    padded_intermediate_size * self.moe.moe_parallel_config.tp_size
+                ),
+                intermediate_size_per_partition=padded_intermediate_size,
+                intermediate_size_per_partition_unpadded=unpadded_intermediate_size,
             )
-            kernel_moe_config.intermediate_size = (
-                padded_intermediate_size * kernel_moe_config.moe_parallel_config.tp_size
-            )
+        self._mxfp8_kernel_moe_config = kernel_moe_config
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
         assert self.experts_cls is not None
@@ -1532,8 +1517,10 @@ def apply_monolithic_mxfp8_moe(
     assert self.is_monolithic
     assert self.moe_kernel is not None
 
-    unpadded_hidden_size = getattr(layer, "mxfp8_unpadded_hidden_size", x.shape[-1])
-    padded_hidden_size = getattr(layer, "mxfp8_padded_hidden_size", x.shape[-1])
+    kernel_moe_config = getattr(self, "_mxfp8_kernel_moe_config", self.moe)
+    unpadded_hidden_size = kernel_moe_config.hidden_dim_unpadded
+    padded_hidden_size = kernel_moe_config.hidden_dim
+    assert unpadded_hidden_size is not None
     if x.shape[-1] != unpadded_hidden_size:
         raise ValueError(
             f"Expected MXFP8 MoE hidden size {unpadded_hidden_size}, got {x.shape[-1]}."

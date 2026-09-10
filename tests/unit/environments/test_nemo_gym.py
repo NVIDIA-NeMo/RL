@@ -77,6 +77,66 @@ from tests.unit.models.generation.test_vllm_generation import (
 )
 
 
+def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
+    capsys,
+) -> None:
+    async def _run() -> None:
+        rows = [
+            {
+                "_rowidx": index,
+                "task_source": "test_resources_server",
+                "responses_create_params": {"input": []},
+            }
+            for index in range(11)
+        ]
+
+        class _RolloutCollectionHelper:
+            def run_examples(self, examples, head_server_config):
+                del head_server_config
+                for row in examples:
+                    row["agent_ref"] = {"name": "resolved_agent"}
+
+                async def _completed_result(row):
+                    return row, {"response": {"output": []}}
+
+                return [_completed_result(row) for row in examples]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _token_capture_enabled = False
+            _tokenizer = object()
+
+            def _require_spinup(self):
+                pass
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(
+                self,
+                row,
+                result,
+                result_tokenizer,
+                *,
+                include_initial_multimodal_data,
+            ):
+                del self, row, result, result_tokenizer, include_initial_multimodal_data
+                return {"message_log": []}
+
+        streamed = []
+        async for result in NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), rows, "test"
+        ):
+            streamed.append(result)
+
+        assert len(streamed) == len(rows)
+
+    asyncio.run(_run())
+
+    captured = capsys.readouterr()
+    assert "1. resolved_agent: 1" in captured.err
+    assert "task-source:test_resources_server" not in captured.err
+
+
 def test_multimodal_content_types_cover_responses_media_aliases():
     assert {
         "input_image",
@@ -1528,7 +1588,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
     async def _run():
         nemo_gym_row = {
             "_rowidx": 7,
-            "agent_ref": {"name": "test_agent"},
+            "agent_ref": {"name": "legacy_test_agent"},
             "responses_create_params": {
                 "input": [
                     {
@@ -1625,6 +1685,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
 
         row = {
             "_rowidx": 3,
+            "task_source": "test_resources_server",
             "agent_ref": {"name": "mock-megatron-agent"},
             "responses_create_params": {
                 "input": [
@@ -1801,6 +1862,7 @@ def test_nemo_gym_sanity(
             "temperature"
         ]
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
+        example["task_source"] = "example_multi_step_resources_server"
         example["_rowidx"] = idx
 
     actual_result = [None] * len(nemo_gym_sanity_test_data["input"])

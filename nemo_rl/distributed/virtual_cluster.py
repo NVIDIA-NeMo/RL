@@ -16,7 +16,7 @@ import os
 import socket
 import sys
 import time
-from typing import NamedTuple, NotRequired, Optional, TypedDict
+from typing import NamedTuple, NotRequired, Optional, Sequence, TypedDict
 
 import ray
 from ray.util.placement_group import (
@@ -55,6 +55,12 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
+    """Command each Ray actor launches under, one entry per uv extra combination.
+
+    Every uv command below is rewritten to SYSTEM when NEMO_RL_PY_EXECUTABLES_SYSTEM
+    is set to 1, so callers never apply that check themselves.
+    """
+
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
@@ -88,6 +94,41 @@ class PY_EXECUTABLES:
 
     # Use NeMo-RL direct dependencies and TRT-LLM.
     TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and ModelOpt.
+    MODELOPT_VLLM = (
+        f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+    )
+    MODELOPT_AUTOMODEL = (
+        f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+    )
+    MODELOPT_MCORE = (
+        f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+    )
+
+    @classmethod
+    def _resolve_system_overrides(cls) -> None:
+        """Rewrite every uv command constant to the system executable when the flag is set."""
+        if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") != "1":
+            return
+        for name in [n for n in vars(cls) if n.isupper()]:
+            setattr(cls, name, cls.SYSTEM)
+
+
+PY_EXECUTABLES._resolve_system_overrides()
+
+
+def uv_py_executable(extras: Sequence[str]) -> str:
+    """py_executable of a uv-managed venv with the given extras (same shape as PY_EXECUTABLES.*).
+
+    Honors NEMO_RL_PY_EXECUTABLES_SYSTEM the same way the PY_EXECUTABLES constants do.
+    The check has to live here as well: _resolve_system_overrides rewrites the class
+    attributes, but this builds a fresh string, so the rewrite cannot reach it.
+    """
+    if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1":
+        return PY_EXECUTABLES.SYSTEM
+    extra_flags = "".join(f"--extra {extra} " for extra in extras)
+    return f"uv run --locked {extra_flags}--directory {git_root}"
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
