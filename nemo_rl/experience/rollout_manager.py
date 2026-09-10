@@ -198,6 +198,10 @@ class RolloutRetryPolicy:
         return min(self.backoff_base_s * 2 ** (attempt - 1), self.max_backoff_s)
 
 
+class _CaptureCleanupError(RuntimeError):
+    """A capture attempt could not release its reservation safely."""
+
+
 @dataclass
 class _RetryState:
     """Per-prompt attempt accounting shared by both dispatch paths."""
@@ -1846,10 +1850,7 @@ class RolloutManager:
                 )
             retry.group_attempt = configured_group_attempt
 
-        # The loop condition is the infrastructure budget, so running out of it exits
-        # here rather than raising from inside the handler. The data budget is tracked
-        # separately and terminates from within, since exhausting it is a statement
-        # about the prompt rather than about the fleet.
+        # Each failure class has an independent budget in the shared retry state.
         while True:
             start_version = self._weight_version
             # A lineage-tracked prompt reuses its durable logical ID only after the
@@ -1949,8 +1950,6 @@ class RolloutManager:
         state: _RetryState,
         error: Exception,
         input_sample: DatumSpec,
-        *,
-        allow_data_skip: bool = True,
     ) -> bool:
         """Account for a cleaned-up attempt; return whether to try again.
 
@@ -1992,7 +1991,7 @@ class RolloutManager:
                 state.group_attempt += 1
                 return True
             self._stats.record_data_failure(reason)
-            if not allow_data_skip or policy.max_skipped_prompts == 0:
+            if policy.max_skipped_prompts == 0:
                 raise error
             if self._skipped_prompts >= policy.max_skipped_prompts:
                 raise RolloutDataFailure(
@@ -2020,9 +2019,9 @@ class RolloutManager:
     ) -> Optional["ReassemblyRequest"]:
         """Capture siblings with stable lineage and configured retry granularity.
 
-        Returns ``None`` when infrastructure retries are exhausted within the
-        configured drop budget. The caller then owns the backpressure permit and
-        target-step shortfall.
+        Returns ``None`` when infrastructure or data retries are exhausted within
+        their configured drop/skip budget. The controller owns replacement and
+        the backpressure permit; standalone calls clean their own recovery group.
         """
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
@@ -2057,17 +2056,28 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
+                if isinstance(error, _CaptureCleanupError) or _contains_post_write_enrichment_error(error):
+                    raise
+
                 if (
                     owns_recovery_group
-                    and classify_rollout_failure(error) is FailureClass.INFRA
-                    and retry.infra_attempts + 1 >= self._retry_policy.max_infra_attempts
+                    and (
+                        (
+                            classify_rollout_failure(error) is FailureClass.INFRA
+                            and retry.infra_attempts + 1
+                            >= self._retry_policy.max_infra_attempts
+                        )
+                        or (
+                            classify_rollout_failure(error) is FailureClass.DATA
+                            and retry.data_attempts + 1
+                            >= self._retry_policy.max_data_attempts
+                        )
+                    )
                 ):
                     # An independent caller has no controller to release its lineage.
                     async with self._recovery_mutation() as cut:
                         await self.discard_recovery_group(cut, recovery_group_id)
-                if await self._retry_after_failure(
-                    retry, error, input_sample, allow_data_skip=False
-                ):
+                if await self._retry_after_failure(retry, error, input_sample):
                     continue
                 return None
 
@@ -2250,13 +2260,18 @@ class RolloutManager:
             # run end (there is no prefix-clear primitive in the data plane
             # yet). Their ledger files are inert — failure rows or missing
             # terminal rows keep any later read fail-closed.
-            self._tq_buffer.abort(group_id)
-            async with self._recovery_mutation() as cut:
-                # Intentional staleness aborts discard the ledger owner before
-                # cancelling this task. Preserve the original cancellation rather
-                # than replacing it with "unknown group" during cleanup.
-                if group_id in self._recovery_ledger:
-                    self._recovery_ledger.abandon_unsealed(cut, group_id)
+            try:
+                self._tq_buffer.abort(group_id)
+                async with self._recovery_mutation() as cut:
+                    # Intentional staleness aborts discard the ledger owner before
+                    # cancelling this task. Preserve the original cancellation rather
+                    # than replacing it with "unknown group" during cleanup.
+                    if group_id in self._recovery_ledger:
+                        self._recovery_ledger.abandon_unsealed(cut, group_id)
+            except Exception as cleanup_error:
+                raise _CaptureCleanupError(
+                    f"capture cleanup failed for group {group_id}; refusing to retry"
+                ) from cleanup_error
             # The capture ledger has no per-rollout fail endpoint. Rows from
             # abandoned attempts are unreferenced and are swept with the
             # staging partition at run teardown.
