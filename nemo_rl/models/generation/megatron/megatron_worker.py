@@ -1981,10 +1981,16 @@ class MegatronGenerationRefitMixin:
         inference_model = self.inference_model
         if inference_model is None:
             return
-        execution_batch_bytes = resolve_refit_execution_batch_bytes(
-            self.cfg["generation"]["mcore_generation_config"][
-                "refit_execution_batch_bytes"
-            ]
+        configured_batch_bytes = self.cfg["generation"]["mcore_generation_config"][
+            "refit_execution_batch_bytes"
+        ]
+        # Preserve MCore's single-submission colocated path unless batching is
+        # explicitly requested. Non-colocated native refit resolves null to a
+        # bounded default when its cross-worker collective is initialized.
+        execution_batch_bytes = (
+            resolve_refit_execution_batch_bytes(configured_batch_bytes)
+            if configured_batch_bytes is not None
+            else None
         )
 
         # Bring the inference weights back to GPU.

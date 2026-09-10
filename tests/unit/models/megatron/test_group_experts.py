@@ -88,6 +88,11 @@ def test_build_hf_to_local_param_map_train_side():
 
     w = object.__new__(MegatronPolicyWorkerImpl)  # no __init__ / no megatron state
     w.my_pp_stage = 0
+    # opd_full off, mirroring __init__ when the config block is absent.
+    w._opd_full_enabled = False
+    w._opd_full_lm_head_lifecycle = None
+    w._opd_full_teacher_lm_head = None
+    w._opd_full_teacher_checkpoint_path = None
     prefix = "model.layers.0.mlp.experts"
     direct = torch.randn(8, 16)  # a dense FFN down_proj local shard view
     e0 = torch.randn(128, 16)  # this rank's local expert 0 gate_proj
