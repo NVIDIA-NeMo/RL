@@ -87,10 +87,10 @@ def _broadcast_batched_data_dict(
     backend = torch.distributed.get_backend(group)
     bcast_device: Any = torch.cuda.current_device() if backend == "nccl" else "cpu"
 
-    # Leader-only: the flat payload of each packed field, kept from the
-    # descriptor pass so ``to_wire``'s ``torch.cat`` of the whole column runs
-    # once, not once per pass (multimodal_utils.py:203 warns about exactly this).
-    leader_flat: dict[str, torch.Tensor] = {}
+    # Leader-only: the flat physical payload of each packed field, kept from
+    # the descriptor pass so coalescing runs once and deduplicated segments
+    # cross the collective only once.
+    packed_payloads: dict[str, torch.Tensor] = {}
     leader_error: Exception | None = None
 
     if is_leader:
@@ -103,38 +103,8 @@ def _broadcast_batched_data_dict(
                         (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
                     )
                 elif isinstance(v, PackedTensor):
-                    nested, shapes = v.to_wire()
-                    if nested is None:
-                        # Every row empty -- a shard holding only media-free
-                        # samples. The key still has to cross: consumers branch on
-                        # the key set (``len(get_multimodal_dict(...)) > 0`` decides
-                        # whether the caller's position_ids are used), and the
-                        # independent-fetch path keeps it. Ship geometry alone.
-                        descriptor.append(
-                            (
-                                k,
-                                "empty_packed",
-                                len(v),
-                                v.dim_to_pack,
-                                v.preprocess_mode,
-                                v.preprocess_kwargs,
-                            )
-                        )
-                        continue
-                    values = nested.values()
-                    leader_flat[k] = values
-                    descriptor.append(
-                        (
-                            k,
-                            "packed_wire",
-                            str(values.dtype),
-                            str(values.device),
-                            nested.offsets().tolist(),
-                            shapes,
-                            v.preprocess_mode,
-                            v.preprocess_kwargs,
-                        )
-                    )
+                    metadata, packed_payloads[k] = v.broadcast_parts(bcast_device)
+                    descriptor.append((k, "packed_tensor", metadata))
                 elif (
                     v is None
                     or isinstance(v, (str, int, float, bool))
@@ -207,48 +177,33 @@ def _broadcast_batched_data_dict(
                 and torch.device(src_device).type != torch.device(bcast_device).type
             ):
                 out[key] = tensor.to(src_device)
-        elif kind == "packed_wire":
-            (
-                dtype_str,
-                src_device,
-                offsets,
-                shapes,
-                preprocess_mode,
-                preprocess_kwargs,
-            ) = entry[2:]
+        elif kind == "packed_tensor":
+            metadata = entry[2]
             if is_leader:
-                flat = leader_flat[key].to(bcast_device)
+                tensor = packed_payloads[key]
             else:
-                dtype = getattr(torch, dtype_str.split(".")[-1])
-                flat = torch.empty(offsets[-1], dtype=dtype, device=bcast_device)
-            torch.distributed.broadcast(flat, src=src, group=group)
-            # Drop the cached CPU concat now it has shipped: holding it to
-            # the end of the loop keeps three copies of the largest column
-            # live at once (segments, concat, device copy).
-            leader_flat.pop(key, None)
+                dtype = getattr(torch, metadata["dtype"].split(".")[-1])
+                numel = sum(
+                    torch.Size(shape).numel()
+                    for shape in metadata["shapes"]
+                    if shape is not None
+                )
+                tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
+            if tensor.numel():
+                if tensor.dtype == torch.int16:
+                    wire = tensor.to(torch.int32)
+                    torch.distributed.broadcast(wire, src=src, group=group)
+                    tensor = wire.to(torch.int16)
+                else:
+                    torch.distributed.broadcast(tensor, src=src, group=group)
+            packed_payloads.pop(key, None)
             if not is_leader:
-                nested = torch.nested.nested_tensor_from_jagged(
-                    flat, torch.tensor(offsets, dtype=torch.int64, device=flat.device)
-                )
-                if torch.device(src_device).type != torch.device(bcast_device).type:
-                    nested = nested.to(src_device)
-                out[key] = PackedTensor.from_wire(
-                    nested,
-                    shapes,
-                    preprocess_mode=preprocess_mode,
-                    preprocess_kwargs=preprocess_kwargs,
-                )
-        elif kind == "empty_packed":
-            # Structural only: no payload, so followers rebuild from the
-            # geometry and land on the leader's key set.
-            n_rows, dim_to_pack, preprocess_mode, preprocess_kwargs = entry[2:]
-            if not is_leader:
-                out[key] = PackedTensor(
-                    [None] * n_rows,
-                    dim_to_pack,
-                    preprocess_mode=preprocess_mode,
-                    preprocess_kwargs=preprocess_kwargs,
-                )
+                if (
+                    torch.device(metadata["source_device"]).type
+                    != torch.device(bcast_device).type
+                ):
+                    tensor = tensor.to(metadata["source_device"])
+                out[key] = PackedTensor.from_broadcast_parts(metadata, tensor)
         else:
             if not is_leader:
                 out[key] = entry[2]

@@ -138,6 +138,50 @@ def _round_trip_body(rank: int):
     assert torch.equal(packed.as_tensor(), expected.as_tensor())
 
 
+def _deduplicated_round_trip_body(rank: int):
+    first_physical_row = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    third_physical_row = torch.arange(3, dtype=torch.float32).reshape(1, 3)
+    physical_rows = [
+        first_physical_row,
+        None,
+        third_physical_row,
+    ]
+    data = (
+        BatchedDataDict(
+            {
+                "pixel_values": PackedTensor(
+                    physical_rows,
+                    dim_to_pack=0,
+                    preprocess_mode="patchify",
+                    preprocess_kwargs={"patch_dim": 2},
+                    _row_offsets=[0, 1, 2, 4],
+                    _segment_indices=[0, 1, 2, 0],
+                    _segment_provenance=[b"a", b"b", b"c"],
+                )
+            }
+        )
+        if rank == 0
+        else None
+    )
+
+    out = _broadcast_batched_data_dict(
+        data, is_leader=(rank == 0), src=0, group=dist.group.WORLD
+    )
+
+    packed = out["pixel_values"]
+    assert isinstance(packed, PackedTensor), type(packed).__name__
+    assert packed.preprocess_mode == "patchify"
+    assert packed.preprocess_kwargs == {"patch_dim": 2}
+    assert packed._row_offsets == [0, 1, 2, 4]
+    assert packed._segment_indices == [0, 1, 2, 0]
+    assert packed._segment_provenance == [b"a", b"b", b"c"]
+    assert packed.tensors[1] is None
+    assert packed.tensors[0] is not None
+    assert packed.tensors[2] is not None
+    assert torch.equal(packed.tensors[0], first_physical_row)
+    assert torch.equal(packed.tensors[2], third_physical_row)
+
+
 def _all_empty_body(rank: int):
     # One DP shard of a mixed image/text batch can hold only media-free
     # samples. ``pixel_values`` is still in ``meta.fields``, so the shard
@@ -180,6 +224,10 @@ def _unsupported_type_body(rank: int):
 
 def test_leader_broadcast_round_trip(tmp_path):
     _run_two_ranks(_round_trip_body, str(tmp_path / "init"))
+
+
+def test_leader_broadcast_preserves_packed_tensor_deduplication(tmp_path):
+    _run_two_ranks(_deduplicated_round_trip_body, str(tmp_path / "init_dedup"))
 
 
 def test_leader_broadcast_keeps_media_free_packed_key(tmp_path):
