@@ -146,6 +146,55 @@ class NcclExtension(WorkerExtension):
             fp8_quantization.validate_fused_expert_layout(state_dict_info)
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
+    def _unwrap_compiled_model_for_refit(self) -> bool:
+        """Unwrap torch.compile before weights are loaded.
+
+        REQUIRED whenever torch.compile is enabled (which
+        ``torch_compile_config.enable_piecewise_cuda_graph: true`` does
+        implicitly). ``torch.compile`` wraps a submodule in an
+        ``OptimizedModule`` whose child is ``_orig_mod``, so every parameter
+        path under the compiled scope gains ``._orig_mod.`` -- e.g.
+        ``llm.model._orig_mod.embed_tokens.weight``. TRT-LLM's
+        ``load_weights`` matches checkpoint tensors by dotted path, and we load
+        with ``allow_partial_loading=True``, so the compiled subtree is
+        silently skipped and keeps its pre-refit weights. Nothing crashes: the
+        refit reports success and training continues on stale weights, which
+        shows up only as corrupted generations and a flat reward curve.
+
+        Returns True when the hook exists (older TRT-LLM releases lack it).
+        """
+        model_engine = self.engine.model_engine
+        # Renamed in TRT-LLM; the old name remains as an alias, so try both.
+        unwrap = getattr(model_engine, "unwrap_compiled_model_for_refit", None) or getattr(
+            model_engine, "release_piecewise_cuda_graphs_for_refit", None
+        )
+        if unwrap is None:
+            return False
+        unwrap()
+        return True
+
+    def _restore_compiled_model_after_refit(self) -> bool:
+        """Re-wrap torch.compile after weights are loaded and finalized.
+
+        Must run after all post-load processing, so the compiled callable is
+        rebuilt over the finalized model. On current TRT-LLM this reuses the
+        cached compiled artifact and leaves the piecewise captures intact
+        (refit does not move any tensor), so it costs a few seconds against
+        ~300 s of weight streaming.
+
+        If this is skipped after a successful unwrap the engine still produces
+        correct output -- it just runs eager, losing the torch.compile/PWCG
+        speedup until the next refit.
+        """
+        model_engine = self.engine.model_engine
+        restore = getattr(model_engine, "restore_compiled_model_after_refit", None) or getattr(
+            model_engine, "recapture_piecewise_cuda_graphs_after_refit", None
+        )
+        if restore is None:
+            return False
+        restore(self.engine.resource_manager)
+        return True
+
     def _finalize_weight_update(self) -> None:
         """Finalize refit using TRT-LLM's CUDA-graph-safe path when available."""
         # WorkerExtension gained this shared path after refit lifecycle hooks.
@@ -252,6 +301,10 @@ class NcclExtension(WorkerExtension):
                 # iter is enqueued, but its GPU forward may still be in flight.
                 # Block here so we don't overwrite weights mid-forward
                 torch.cuda.synchronize()
+                # Must precede any weight loading: while a torch.compile
+                # wrapper is installed, parameter paths carry "_orig_mod" and
+                # load_weights silently matches nothing.
+                self._unwrap_compiled_model_for_refit()
                 _call_model_loader_hook_if_available(
                     model_engine.model_loader, "begin_update_weights"
                 )
@@ -270,6 +323,11 @@ class NcclExtension(WorkerExtension):
                 torch.cuda.current_stream().synchronize()
 
                 self.engine.recompute_active_requests()
+                # After recompute_active_requests, not before: with the full
+                # TRT-LLM lifecycle this replays warmup batches, and doing that
+                # once the in-flight requests have released their KV keeps the
+                # cache state clean.
+                self._restore_compiled_model_after_refit()
             except Exception as e:
                 self._abort_weight_update_after_failure(
                     model, model_engine.model_loader, e
@@ -316,6 +374,8 @@ class NcclExtension(WorkerExtension):
         weights = None
         try:
             self.maybe_init_zmq()
+            # See _unwrap_compiled_model_for_refit: must precede any loading.
+            self._unwrap_compiled_model_for_refit()
             _call_model_loader_hook_if_available(
                 model_engine.model_loader, "begin_update_weights"
             )
@@ -385,6 +445,7 @@ class NcclExtension(WorkerExtension):
             self.engine.reset_prefix_cache()
             gc.collect()
             torch.cuda.empty_cache()
+            self._restore_compiled_model_after_refit()
             return True
         except Exception as e:
             self._abort_weight_update_after_failure(
