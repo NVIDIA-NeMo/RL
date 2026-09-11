@@ -185,15 +185,35 @@ def test_mxfp8_scale_is_ue8m0_exponent_and_round_trips():
     assert quantized.float().abs().max() <= E4M3_MAX
 
 
-def test_mxfp8_moe_backend_requires_cutlass_and_rejects_trtllm():
+@pytest.mark.parametrize("backend", ["CUTLASS", "cutedsl", "CuteDSL"])
+def test_configure_fp8_moe_backend_mxfp8_accepts_cutlass_and_cutedsl(backend):
+    """MXFP8 experts run on CUTLASS or on the fused FC1+FC2 CuTe DSL kernel."""
+    llm_kwargs = {"moe_config": {"backend": backend, "load_balancer_config": {"n": 1}}}
+    configure_fp8_moe_backend(llm_kwargs, _MoeConfig, is_mx=True)
+    assert llm_kwargs["moe_config"].backend == backend.upper()
+    assert llm_kwargs["moe_config"].kwargs == {"load_balancer_config": {"n": 1}}
+
+    llm_kwargs = {"moe_config": _MoeConfig(backend=backend)}
+    configure_fp8_moe_backend(llm_kwargs, _MoeConfig, is_mx=True)
+    assert llm_kwargs["moe_config"].backend == backend
+
+
+def test_configure_fp8_moe_backend_mxfp8_defaults_to_cutlass():
     llm_kwargs = {}
     configure_fp8_moe_backend(llm_kwargs, _MoeConfig, is_mx=True)
     assert llm_kwargs["moe_config"].backend == "CUTLASS"
 
-    with pytest.raises(ValueError, match="backend='CUTLASS'"):
-        configure_fp8_moe_backend(
-            {"moe_config": {"backend": "TRTLLM"}}, _MoeConfig, is_mx=True
-        )
+
+@pytest.mark.parametrize(
+    "moe_config",
+    [
+        {"backend": "TRTLLM"},
+        _MoeConfig(backend="DEEPGEMM"),
+    ],
+)
+def test_configure_fp8_moe_backend_mxfp8_rejects_other_backends(moe_config):
+    with pytest.raises(ValueError, match="backend='CUTLASS' or .*backend='CUTEDSL'"):
+        configure_fp8_moe_backend({"moe_config": moe_config}, _MoeConfig, is_mx=True)
 
 
 def test_mxfp8_llm_kwargs_use_the_mx_quant_contract():
