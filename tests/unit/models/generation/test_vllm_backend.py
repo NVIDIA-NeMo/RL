@@ -249,6 +249,133 @@ def test_refresh_hpc_modules_after_layerwise_reload(monkeypatch):
     hpc_module.process_weights_after_loading.assert_called_once_with(model)
 
 
+@pytest.mark.vllm
+@pytest.mark.parametrize("is_gated_act_gemm", [False, True])
+def test_batched_bf16_trtllm_layout_matches_vllm_expertwise_converter(
+    monkeypatch, is_gated_act_gemm
+):
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        convert_moe_weights_to_flashinfer_trtllm_block_layout,
+    )
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    num_experts = 3
+    w13_rows = 4
+    w2_rows = 3
+    cols = 128
+    w13 = torch.arange(num_experts * w13_rows * cols, dtype=torch.bfloat16).view(
+        num_experts, w13_rows, cols
+    )
+    w2 = torch.arange(num_experts * w2_rows * cols, dtype=torch.bfloat16).view(
+        num_experts, w2_rows, cols
+    )
+    w13_perm = torch.tensor([2, 0, 3, 1])
+    w2_perm = torch.tensor([1, 2, 0])
+
+    def get_w13_perm(cache, weight, tile_m, *, is_gated_act_gemm):
+        return w13_perm
+
+    def get_w2_perm(cache, weight, tile_m):
+        return w2_perm
+
+    monkeypatch.setattr(
+        "flashinfer.fused_moe.core._maybe_get_cached_w3_w1_permute_indices",
+        get_w13_perm,
+    )
+    monkeypatch.setattr(
+        "flashinfer.fused_moe.core.get_w2_permute_indices_with_cache",
+        get_w2_perm,
+    )
+
+    expected_w13, expected_w2 = convert_moe_weights_to_flashinfer_trtllm_block_layout(
+        {}, w13, w2, is_gated_act_gemm=is_gated_act_gemm
+    )
+    actual_w13, actual_w2 = (
+        vllm_backend._convert_bf16_moe_weights_to_trtllm_block_layout_batched(
+            {}, w13, w2, is_gated_act_gemm=is_gated_act_gemm
+        )
+    )
+
+    torch.testing.assert_close(actual_w13, expected_w13)
+    torch.testing.assert_close(actual_w2, expected_w2)
+
+
+@pytest.mark.vllm
+def test_batched_bf16_trtllm_layout_is_scoped_to_reload_finalize(monkeypatch):
+    import threading
+
+    from vllm.model_executor.layers.fused_moe.oracle import unquantized
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    original_result = (object(), object())
+    batched_result = (object(), object())
+    original_converter = MagicMock(return_value=original_result)
+    batched_converter = MagicMock(return_value=batched_result)
+    monkeypatch.setattr(
+        vllm_backend,
+        "_convert_bf16_moe_weights_to_trtllm_block_layout_batched",
+        batched_converter,
+    )
+    monkeypatch.setattr(
+        unquantized,
+        "convert_moe_weights_to_flashinfer_trtllm_block_layout",
+        original_converter,
+    )
+
+    model = _make_unquantized_moe_model("FlashInfer TRTLLM")
+    vllm_config = SimpleNamespace(quant_config=None)
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: None,
+    )
+
+    def finalize_layerwise_reload(_model, _model_config):
+        assert unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        finalize_layerwise_reload,
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        active_converter = (
+            unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
+        )
+        assert active_converter({}, object(), object()) == batched_result
+
+        thread_results = []
+        thread = threading.Thread(
+            target=lambda: thread_results.append(
+                active_converter({}, object(), object())
+            )
+        )
+        thread.start()
+        thread.join()
+        assert thread_results == [original_result]
+        finalize()
+
+    assert (
+        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
+        is original_converter
+    )
+    batched_converter.assert_called_once()
+    original_converter.assert_called_once()
+
+
 class _DeferredReloadLayer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
