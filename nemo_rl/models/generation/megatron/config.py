@@ -27,6 +27,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     """
 
     expose_http_server: bool
+    http_server_num_replicas: NotRequired[int]
     parsers: list[str]
     buffer_size_gb: int
     block_size_tokens: int
@@ -38,6 +39,15 @@ class MCoreGenerationSpecificArgs(TypedDict):
     num_cuda_graphs: int | None
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: str
+    # How the captured CUDA-graph token-count sizes are spaced. Options:
+    # - 'exponential': log-spaced graphs for all request types.
+    # - 'linear': densely spaced graphs for all request types.
+    # - 'hybrid': exponential prefill/mixed graphs and linear decode graphs (MCore default).
+    cuda_graph_sizing_distribution: NotRequired[
+        Literal["exponential", "linear", "hybrid"]
+    ]
+    # Token ceiling for captured prefill/mixed CUDA graphs. MCore default: 512.
+    cuda_graph_max_tokens: NotRequired[int]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
@@ -73,6 +83,19 @@ class MCoreGenerationSpecificArgs(TypedDict):
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
+    # GPU budget for cached Mamba states; null disables it (MCore default).
+    prefix_caching_mamba_gb: NotRequired[float | None]
+
+    # Prefix-cache block eviction policy. MCore default: 'lru'.
+    prefix_caching_eviction_policy: NotRequired[Literal["ref_zero", "lru"]]
+    # DP coordinator routing policy. MCore default: 'longest_prefix'.
+    prefix_caching_coordinator_policy: NotRequired[
+        Literal["load_balanced", "longest_prefix", "first_prefix_block"]
+    ]
+    # Coordinator cache-entry lifetime in seconds. MCore default: 300.0.
+    prefix_cache_ttl_seconds: NotRequired[float]
+    # Prefix-affinity versus load routing penalty. MCore default: 1.0.
+    prefix_caching_routing_alpha: NotRequired[float]
 
     # Raw media preprocessing corresponding with Megatron's
     # ImageProcessingConfig / VideoProcessingConfig.

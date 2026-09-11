@@ -113,6 +113,12 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             self._stale = False
             return {}
 
+        # Native reshard reads policy parameters without running a training
+        # forward, so complete any deferred DDP all-gather before an optional
+        # policy offload can release the backing buffers.
+        with timed_phase("prepare_for_generation/sync_policy_params"):
+            self._policy.sync_params_for_refit()
+
         # The engine serves continuously in non-colocated mode; pause it
         # exactly around the swap.
         with timed_phase("prepare_for_generation/suspend_for_refit"):

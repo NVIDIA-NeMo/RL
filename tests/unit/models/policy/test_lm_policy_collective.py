@@ -16,6 +16,46 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 
 
+def test_policy_syncs_megatron_params_for_refit(monkeypatch):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    waited = []
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get", lambda refs: waited.append(refs)
+    )
+    policy = Policy.__new__(Policy)
+    policy.cfg = {"megatron_cfg": {"enabled": True}}
+    policy.worker_group = WorkerGroup()
+
+    policy.sync_params_for_refit()
+
+    assert calls == [("sync_params_for_refit", {})]
+    assert waited == [["future"]]
+
+
+def test_policy_skips_refit_param_sync_for_dtensor():
+    class WorkerGroup:
+        def run_all_workers_single_data(self, *_args, **_kwargs):
+            raise AssertionError("DTensor policy must not dispatch Megatron param sync")
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    policy = Policy.__new__(Policy)
+    policy.cfg = {"megatron_cfg": {"enabled": False}}
+    policy.worker_group = WorkerGroup()
+
+    policy.sync_params_for_refit()
+
+
 def test_policy_forwards_nccl_peer_to_workers():
     calls = []
 

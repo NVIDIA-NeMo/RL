@@ -528,6 +528,7 @@ class TestCollectiveWeightSynchronizer:
         sync.sync_weights()
         assert not sync.is_stale
 
+        policy.sync_params_for_refit.assert_called_once_with()
         policy.broadcast_weights_for_collective.assert_called_once_with(
             kv_scales=None,
             refit_timeout_s=None,
@@ -628,6 +629,22 @@ class TestCollectiveWeightSynchronizer:
 
 
 class TestNcclReshardWeightSynchronizer:
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_sync_weights_materializes_policy_params_first(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        policy.nccl_reshard_refit.return_value = [MagicMock()]
+        gen = _mock_generation()
+        gen.nccl_reshard_refit.return_value = [MagicMock()]
+        sync = NcclReshardWeightSynchronizer(
+            policy, gen, _mock_cluster(), _mock_cluster()
+        )
+
+        sync.sync_weights()
+
+        policy.sync_params_for_refit.assert_called_once_with()
+        policy.nccl_reshard_refit.assert_called_once()
+
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
     def test_init_communicator_ships_wire_safe_refit_info(self, mock_ray):
         # The train-side refit info carries MeshInfo rank tensors; the copy
@@ -771,6 +788,7 @@ class TestMegatronWeightSynchronizer:
 
         assert sync.sync_weights() == {}
         gen.suspend_for_refit.assert_called_once()
+        policy.sync_params_for_refit.assert_called_once_with()
         policy.offload_before_refit.assert_not_called()
         policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
         gen.update_weights_from_collective.assert_called_once()

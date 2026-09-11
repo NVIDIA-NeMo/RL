@@ -1260,13 +1260,15 @@ def setup(
     # plane exists. Default is the plain Policy class — legacy behavior.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
-    def init_policy(reserved_http_server_port: Optional[int] = None):
+    def init_policy(reserved_http_server_ports: Optional[dict[int, int]] = None):
         """Initialize policy training workers."""
         t0 = time.perf_counter()
         extra_policy_kwargs = {}
-        if reserved_http_server_port is not None:
+        if reserved_http_server_ports is not None:
             # Colocated Megatron generation serves HTTP from the training workers.
-            extra_policy_kwargs["reserved_http_server_port"] = reserved_http_server_port
+            extra_policy_kwargs["reserved_http_server_ports"] = (
+                reserved_http_server_ports
+            )
         p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
@@ -1305,7 +1307,7 @@ def setup(
         return pg, time.perf_counter() - t0
 
     def init_megatron_generation(
-        policy=None, reserved_http_server_port: Optional[int] = None
+        policy=None, reserved_http_server_ports: Optional[dict[int, int]] = None
     ):
         """Initialize Megatron generation."""
         t0 = time.perf_counter()
@@ -1316,7 +1318,7 @@ def setup(
             policy=policy if colocated_inference else None,
             processor=processor,
             skip_weight_load=not colocated_inference,
-            reserved_http_server_port=reserved_http_server_port,
+            reserved_http_server_ports=reserved_http_server_ports,
         )
         return mg, time.perf_counter() - t0
 
@@ -1413,26 +1415,30 @@ def setup(
                 flush=True,
             )
             reserve_t0 = time.perf_counter()
-            reserved_url, reserved_http_server_port, port_holder = (
-                MegatronGeneration.reserve_http_server_address(
+            reserved_urls, reserved_http_server_ports, port_holders = (
+                MegatronGeneration.reserve_http_server_addresses(
                     train_cluster if colocated_inference else inference_cluster,
                     policy_config,
                 )
             )
             reserve_time = time.perf_counter() - reserve_t0
             setup_timing_metrics.generation_init_reserve_time_s = reserve_time
-            print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
+            print(
+                f"  ✓ Reserved {len(reserved_urls)} Megatron server URL(s): "
+                f"{reserved_urls}",
+                flush=True,
+            )
 
             def init_nemo_gym():
-                """Spin up NeMo Gym servers against the reserved URL."""
-                return _spinup_nemo_gym([reserved_url], generation_config["model_name"])
+                """Spin up NeMo Gym servers against the reserved URLs."""
+                return _spinup_nemo_gym(reserved_urls, generation_config["model_name"])
 
             # Exactly one task adopts the reserved port: the policy when colocated
             # (generation wraps it), else the dedicated generation policy.
-            policy_port, generation_port = (
-                (reserved_http_server_port, None)
+            policy_ports, generation_ports = (
+                (reserved_http_server_ports, None)
                 if colocated_inference
-                else (None, reserved_http_server_port)
+                else (None, reserved_http_server_ports)
             )
 
             def init_megatron_generation_task(policy_future):
@@ -1441,7 +1447,7 @@ def setup(
                     p, _ = policy_future.result()
                     return init_megatron_generation(p)
                 return init_megatron_generation(
-                    reserved_http_server_port=generation_port
+                    reserved_http_server_ports=generation_ports
                 )
 
             print("  ⚡ Init tasks: policy, megatron_generation, nemo_gym", flush=True)
@@ -1449,7 +1455,7 @@ def setup(
             try:
                 with ThreadPoolExecutor(max_workers=3) as executor:
                     policy_future = executor.submit(
-                        init_policy, reserved_http_server_port=policy_port
+                        init_policy, reserved_http_server_ports=policy_ports
                     )
                     generation_future = executor.submit(
                         init_megatron_generation_task, policy_future
@@ -1468,7 +1474,8 @@ def setup(
                         init_megatron_weight_synchronizer(policy, policy_generation)
                     nemo_gym_actor, nemo_gym_time = nemo_gym_future.result()
             finally:
-                ray.kill(port_holder)
+                for port_holder in port_holders:
+                    ray.kill(port_holder)
 
             if colocated_inference:
                 setup_timing_metrics.parallel_init_enabled = 0.0
@@ -1741,8 +1748,8 @@ def setup(
         if policy_generation.weight_synchronizer is None:
             init_megatron_weight_synchronizer(policy, policy_generation)
         if enable_nemo_gym:
-            MegatronGeneration.verify_served_address(
-                policy_generation.dp_openai_server_base_urls, reserved_url
+            MegatronGeneration.verify_served_addresses(
+                policy_generation.dp_openai_server_base_urls, reserved_urls
             )
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
@@ -2562,6 +2569,11 @@ def refit_policy_generation(
             "SGLang refits require policy_generation.weight_synchronizer to be "
             "set. Attach one with create_weight_synchronizer(...) during setup."
         )
+
+    if not colocated_inference:
+        # Legacy callers without a WeightSynchronizer still need deferred
+        # Megatron parameter all-gathers completed before the collective reads.
+        policy.sync_params_for_refit()
 
     if colocated_inference:
         policy.offload_before_refit()

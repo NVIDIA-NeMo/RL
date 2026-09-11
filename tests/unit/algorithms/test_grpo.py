@@ -219,6 +219,30 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     )
 
 
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_legacy_noncolocated_refit_syncs_policy_params_first(
+    mock_ray: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    events = []
+    policy = MagicMock()
+    policy.sync_params_for_refit.side_effect = lambda: events.append("sync")
+    policy.broadcast_weights_for_collective.side_effect = lambda **_: (
+        events.append("broadcast") or [MagicMock()]
+    )
+    policy_generation = MagicMock()
+    policy_generation.weight_synchronizer = None
+    policy_generation.update_weights_from_collective.return_value = [MagicMock()]
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=False,
+    )
+
+    assert events == ["sync", "broadcast"]
+
+
 class TestMaskSampleFilter:
     def test_masks_env_flagged_samples(self):
         repeated_batch = BatchedDataDict(
@@ -3390,10 +3414,11 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     )
 
 
+@pytest.mark.mcore
 def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     monkeypatch, mock_grpo_components
 ):
-    """The initial refit must start a skip-load endpoint before Gym can finish."""
+    """The initial refit must start all skip-load endpoints before Gym can finish."""
     from nemo_rl.algorithms import grpo as grpo_mod
 
     events = []
@@ -3404,18 +3429,23 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     checkpointer.load_training_info.return_value = None
     checkpointer.get_resume_paths.return_value = (None, None)
 
-    reserved_url = "http://megatron.example/v1"
-    port_holder = object()
+    reserved_urls = [
+        "http://megatron-a.example/v1",
+        "http://megatron-b.example/v1",
+    ]
+    reserved_http_server_ports = {0: 1234, 2: 5678}
+    port_holders = [object(), object()]
     generation = SimpleNamespace(
         weight_synchronizer=None,
         dp_openai_server_base_urls=[],
     )
     generation_cls = MagicMock(return_value=generation)
-    generation_cls.reserve_http_server_address.return_value = (
-        reserved_url,
-        1234,
-        port_holder,
+    generation_cls.reserve_http_server_addresses.return_value = (
+        reserved_urls,
+        reserved_http_server_ports,
+        port_holders,
     )
+    generation_cls.verify_served_addresses = MegatronGeneration.verify_served_addresses
 
     synchronizer = MagicMock()
     synchronizer.init_communicator.side_effect = lambda: events.append("init")
@@ -3423,14 +3453,16 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     def sync_weights():
         assert gym_started.wait(timeout=5), "NeMo Gym did not start concurrently"
         events.append("sync")
-        generation.dp_openai_server_base_urls = [reserved_url]
+        # The served order is determined by worker completion, not the order
+        # addresses were reserved for Gym.
+        generation.dp_openai_server_base_urls = list(reversed(reserved_urls))
         engine_ready.set()
 
     synchronizer.sync_weights.side_effect = sync_weights
     nemo_gym_actor = object()
 
     def spinup_nemo_gym_actor(_env_configs, **kwargs):
-        assert kwargs["base_urls"] == [reserved_url]
+        assert kwargs["base_urls"] == reserved_urls
         events.append("gym_started")
         gym_started.set()
         assert engine_ready.wait(timeout=5), (
@@ -3499,14 +3531,19 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     result = grpo_mod.setup(master_config, MagicMock(), dataset, None)
 
     assert generation_cls.call_args.kwargs["skip_weight_load"] is True
-    assert generation_cls.call_args.kwargs["reserved_http_server_port"] == 1234
-    assert "reserved_http_server_port" not in policy_cls.call_args.kwargs
+    assert (
+        generation_cls.call_args.kwargs["reserved_http_server_ports"]
+        == reserved_http_server_ports
+    )
+    assert "reserved_http_server_ports" not in policy_cls.call_args.kwargs
     assert events.index("init") < events.index("sync")
     assert events.index("gym_started") < events.index("sync")
     assert events.index("sync") < events.index("gym_ready")
     synchronizer.init_communicator.assert_called_once_with()
     synchronizer.sync_weights.assert_called_once_with()
-    ray_kill.assert_called_once_with(port_holder)
+    assert [call.args for call in ray_kill.call_args_list] == [
+        (port_holder,) for port_holder in port_holders
+    ]
     setup_metrics = next(
         call.args[0]
         for call in logger.log_metrics.call_args_list

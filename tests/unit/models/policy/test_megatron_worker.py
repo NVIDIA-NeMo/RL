@@ -58,6 +58,24 @@ def _disable_opd_full(worker) -> None:
     worker._opd_full_teacher_checkpoint_path = None
 
 
+@pytest.mark.parametrize(
+    ("reserved_ports", "rank", "expected"),
+    [
+        ({0: 5555, 2: 6666}, 0, 5555),
+        ({0: 5555, 2: 6666}, 1, None),
+        (None, 0, None),
+    ],
+)
+def test_reserved_http_server_port_is_selected_by_worker_rank(
+    reserved_ports, rank, expected
+):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _reserved_http_server_port_for_rank,
+    )
+
+    assert _reserved_http_server_port_for_rank(reserved_ports, rank) == expected
+
+
 def test_model_owned_packing_capability_is_detected():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,
@@ -349,6 +367,40 @@ class _ModelWithNonSerializableExtraState(torch.nn.Module):
 
     def get_extra_state(self):
         raise AssertionError("moving a module must not serialize its extra state")
+
+
+def test_sync_params_for_refit_orders_copy_gather_and_device_sync(monkeypatch):
+    """Refit must see updated optimizer shards before it reads model parameters."""
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    events = []
+
+    class FakeDDP:
+        ddp_config = SimpleNamespace(overlap_param_gather=True)
+
+        def start_param_sync(self, *, force_sync):
+            events.append(("start_param_sync", force_sync))
+
+    monkeypatch.setattr(megatron_policy_worker, "DistributedDataParallel", FakeDDP)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: events.append(("cuda_synchronize", None))
+    )
+
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    worker.model = FakeDDP()
+    worker._copy_main_params_to_param_buffer = (
+        lambda *, zero_grad_buffer: events.append(
+            ("copy_main_params", zero_grad_buffer)
+        )
+    )
+
+    worker.sync_params_for_refit()
+
+    assert events == [
+        ("copy_main_params", True),
+        ("start_param_sync", True),
+        ("cuda_synchronize", None),
+    ]
 
 
 def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):

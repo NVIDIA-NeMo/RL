@@ -103,7 +103,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         processor: Optional[AutoProcessor] = None,
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
-        reserved_http_server_port: Optional[int] = None,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
     ):
         self.debug_payload_metrics = False
         configured_extension_fqn = config.get("worker_extension_cls_fqn")
@@ -154,9 +154,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
-        if reserved_http_server_port is not None and not megatron_enable:
+        if reserved_http_server_ports is not None and not megatron_enable:
             raise ValueError(
-                "reserved_http_server_port is only supported by the Megatron "
+                "reserved_http_server_ports is only supported by the Megatron "
                 "worker (policy.megatron_cfg.enabled=true)."
             )
         if draft_enabled and not megatron_enable:
@@ -340,8 +340,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         if skip_weight_load:
             worker_kwargs["skip_weight_load"] = True
-        if reserved_http_server_port is not None:
-            worker_kwargs["reserved_http_server_port"] = reserved_http_server_port
+        if reserved_http_server_ports is not None:
+            worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
         if use_v2:
             # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
@@ -1311,6 +1311,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             refit_timeout_s=refit_timeout_s,
         )
         return futures
+
+    def sync_params_for_refit(self) -> None:
+        """Complete deferred Megatron parameter gathers before direct refit reads."""
+        if not self.cfg["megatron_cfg"]["enabled"]:
+            return
+        futures = self.worker_group.run_all_workers_single_data("sync_params_for_refit")
+        ray.get(futures)
 
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""

@@ -309,6 +309,13 @@ def _meta_tensor_alloc_context():
         torch.zeros_like = real_zeros_like
 
 
+def _reserved_http_server_port_for_rank(
+    reserved_http_server_ports: Optional[dict[int, int]], rank: int
+) -> Optional[int]:
+    """Return this worker rank's reserved frontend port, if one was assigned."""
+    return (reserved_http_server_ports or {}).get(rank)
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
@@ -443,7 +450,7 @@ class MegatronPolicyWorkerImpl(
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
-        reserved_http_server_port: Optional[int] = None,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -484,10 +491,10 @@ class MegatronPolicyWorkerImpl(
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
         # Store the reserved HTTP server port for inference server initialization.
-        # Megatron-LLM's inference server lives on Rank 0 only.
-        # TODO: Multiple inference servers for each MP coordinator.
-        self._reserved_http_server_port = (
-            reserved_http_server_port if self.rank == 0 else None
+        # Megatron-LLM's hosts an inference server on every MP coordinator rank,
+        # effectively one per DP rank.
+        self._reserved_http_server_port = _reserved_http_server_port_for_rank(
+            reserved_http_server_ports, self.rank
         )
 
         # Step 1: Setup distributed
@@ -782,6 +789,20 @@ class MegatronPolicyWorkerImpl(
         for optim_instance in optimizers:
             if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
                 optim_instance._copy_main_params_to_param_buffer()
+
+    @torch.no_grad()
+    def sync_params_for_refit(self) -> None:
+        """Finish deferred DDP parameter gathers before refit reads the model."""
+        if not isinstance(self.model, DistributedDataParallel):
+            return
+        if not self.model.ddp_config.overlap_param_gather:
+            return
+
+        # MXFP8 can share the parameter all-gather and gradient buffers, so copy
+        # the optimizer's updated main parameters before starting the gather.
+        self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
+        self.model.start_param_sync(force_sync=True)
+        torch.cuda.synchronize()
 
     def _uses_mxfp8_overlap_shared_param_buffer(self) -> bool:
         return getattr(
@@ -3128,12 +3149,6 @@ class MegatronPolicyWorkerImpl(
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
     ) -> None:
-        # Refit reads parameters directly, without the forward all-gather hooks.
-        if isinstance(self.model, DistributedDataParallel):
-            if self.model.ddp_config.overlap_param_gather:
-                self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
-                self.model.start_param_sync(force_sync=True)
-                torch.cuda.synchronize()
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
@@ -3782,13 +3797,6 @@ class MegatronPolicyWorkerImpl(
         # those tensors for CPU storage, so the checkpoint references would keep
         # the old CUDA storage alive and defeat the offload.
         self.finalize_async_save()
-
-        # Gather before offloading buffers that may also back parameter storage.
-        if isinstance(self.model, DistributedDataParallel):
-            if self.model.ddp_config.overlap_param_gather:
-                self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
-                self.model.start_param_sync(force_sync=True)
-                torch.cuda.synchronize()
 
         no_grad = torch.no_grad()
         no_grad.__enter__()

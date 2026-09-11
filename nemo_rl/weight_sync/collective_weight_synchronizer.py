@@ -128,6 +128,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        self._policy.sync_params_for_refit()
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None

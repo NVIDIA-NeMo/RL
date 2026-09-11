@@ -180,6 +180,11 @@ class PolicyInterface(ABC):
 
 class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
+    def sync_params_for_refit(self) -> None:
+        """Materialize the latest model parameters before a refit reads them."""
+        pass
+
+    @abstractmethod
     def init_collective(
         self,
         ip: str,
