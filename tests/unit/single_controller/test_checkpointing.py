@@ -300,9 +300,10 @@ class _ExhaustingSampler(_FakeSampler):
 class _RestoredGroupsSampler(_FakeSampler):
     """Drain the exact groups represented by a restored replay metadata file."""
 
-    def __init__(self, groups: list[dict[str, Any]]) -> None:
+    def __init__(self, groups: list[dict[str, Any]], buffer: "_FakeTQBuffer") -> None:
         super().__init__()
         self._groups = list(groups)
+        self._buffer = buffer
 
     async def select(
         self,
@@ -316,6 +317,10 @@ class _RestoredGroupsSampler(_FakeSampler):
         if len(selected) < min_prompt_groups:
             return None, 0
         del self._groups[: len(selected)]
+        # Legacy local-removal contract: a sampler without training claims drops
+        # the rows from the replay index at selection, so a checkpoint taken
+        # after the step cannot list groups whose canonical rows are gone.
+        self._buffer.drop_groups([group["group_id"] for group in selected])
 
         metas = [group["meta"] for group in selected]
         return (
@@ -582,6 +587,21 @@ class _FakeTQBuffer:
         ]
         return state
 
+    def drop_groups(self, group_ids: list[str]) -> None:
+        """Remove groups from the replay index, as a selection or eviction does."""
+        dropped = set(group_ids)
+        remaining = [
+            group
+            for group in self._metadata_state["groups"]
+            if group["group_id"] not in dropped
+        ]
+        unknown = dropped - {
+            group["group_id"] for group in self._metadata_state["groups"]
+        }
+        assert not unknown, f"unknown group_ids={sorted(unknown)!r}"
+        self._metadata_state = {**self._metadata_state, "groups": remaining}
+        self.target_step_list = [group["target_step"] for group in remaining]
+
     def training_owned_replay_groups(self) -> list[dict[str, Any]]:
         return list(self.training_claims)
 
@@ -619,7 +639,9 @@ class _FakeTQBuffer:
                 "expected_manifest_digest": expected_manifest_digest,
             }
         )
-        self._metadata_state = state
+        # A load repopulates rows; the envelope fields are the live buffer's own,
+        # so a later save still emits a complete state dict.
+        self._metadata_state = {**self._metadata_state, "groups": state["groups"]}
         self.target_step_list = [
             group["target_step"] for group in self._metadata_state["groups"]
         ]
@@ -924,7 +946,7 @@ def _run_restore_then_train_pump(
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         await actor._maybe_restore_replay_buffer()
-        actor._sampler = _RestoredGroupsSampler(restored_groups)
+        actor._sampler = _RestoredGroupsSampler(restored_groups, actor._buffer)
         with patch("ray.cluster_resources", return_value={"GPU": 0}):
             await asyncio.wait_for(actor._train_pump(), timeout=60.0)
         actor._checkpointer.shutdown()
