@@ -48,6 +48,16 @@ def flashinfer_mxfp8_moe_padding_plan(
         intermediate_size: Unpadded TP-local MoE intermediate size.
 
     Returns:
+        A ``(padded_hidden_size, padded_intermediate_size)`` tuple, rounded up to the
+        kernel's required alignment (512 / 128 respectively).
+    """
+    """Compute FlashInfer TRTLLM MXFP8 MoE execution dimensions.
+
+    Args:
+        hidden_size: Unpadded model hidden size.
+        intermediate_size: Unpadded TP-local MoE intermediate size.
+
+    Returns:
         The padded hidden and intermediate sizes required by the kernel.
     """
     if hidden_size <= 0:
