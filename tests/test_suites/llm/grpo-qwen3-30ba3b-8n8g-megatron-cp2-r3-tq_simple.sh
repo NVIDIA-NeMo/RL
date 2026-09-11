@@ -28,14 +28,20 @@ uv run examples/run_grpo.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
+    data_plane.observability.verify_tensor_hash=True \
     $@ \
     2>&1 | tee $RUN_LOG
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # The wire guard only counts, so assert it looked and agreed. rows_checked
+# is the load-bearing one: mismatches==0 also holds when nothing was compared,
+# and a guard that stops working stops comparing.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.02'
+        'median(data["train/token_mult_prob_error"]) < 1.02' \
+        'max(data.get("data_plane/cluster/step/hash/mismatches", data.get("data_plane/driver/step/hash/mismatches", {}))) == 0' \
+        'max(data.get("data_plane/cluster/step/hash/rows_checked", data.get("data_plane/driver/step/hash/rows_checked", {}))) > 0'
 
     rm -rf "$CKPT_DIR"
 fi

@@ -41,6 +41,7 @@ uv run examples/run_grpo_single_controller.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=False \
     checkpointing.checkpoint_dir=$CKPT_DIR \
+    data_plane.observability.verify_tensor_hash=True \
     $@ \
     2>&1 | tee $RUN_LOG
 
@@ -48,7 +49,9 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.02'
+        'median(data["train/token_mult_prob_error"]) < 1.02' \
+        'max(data.get("data_plane/cluster/step/hash/mismatches", data.get("data_plane/driver/step/hash/mismatches", {}))) == 0' \
+        'max(data.get("data_plane/cluster/step/hash/rows_checked", data.get("data_plane/driver/step/hash/rows_checked", {}))) > 0'
 
     uv run tools/check_r3_trace.py "$NRL_R3_TRACE_DIR" \
         --require-forward-verify \

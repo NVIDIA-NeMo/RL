@@ -48,6 +48,7 @@ import transfer_queue as tq
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
@@ -743,7 +744,7 @@ def _from_wire(td: TensorDict) -> TensorDict:
     ``codec.materialize`` applies the same exclusion.
     """
     # NonTensorData / NonTensorStack leaves are only visible via td.keys(),
-    # not keys(leaves_only=True) — iterating the latter would silently drop
+    # not keys(leaves_only=True) -- iterating the latter would silently drop
     # them from the rebuilt dict.
     # Deferred: ``multimodal_utils`` pulls PIL, requests and a few hundred
     # transformers submodules, and this adapter is imported by every process
@@ -751,26 +752,28 @@ def _from_wire(td: TensorDict) -> TensorDict:
     # for the same reason.
     from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 
-    new_dict: dict[str, Any] = {}
-    changed = False
-    for k in td.keys():
-        v = td.get(k)
-        field_name = str(k)
-        if (
-            isinstance(v, torch.Tensor)
-            and v.is_nested
-            and field_name not in PACKED_MULTIMODAL_FIELDS
-        ):
-            rows = list(v.unbind())
-            if rows and all(row.shape == rows[0].shape for row in rows[1:]):
-                v = torch.stack(rows)
-                changed = True
-        new_dict[field_name] = v
-    if not changed:
-        return td
-    new_td = TensorDict(new_dict, batch_size=td.batch_size)
-    _assert_no_key_loss(new_dict, new_td, "_from_wire")
-    return new_td
+    with timed_codec("unpack"):
+        new_dict: dict[str, Any] = {}
+        changed = False
+        for k in td.keys():
+            v = td.get(k)
+            field_name = str(k)
+            if (
+                isinstance(v, torch.Tensor)
+                and v.is_nested
+                and field_name not in PACKED_MULTIMODAL_FIELDS
+            ):
+                rows = list(v.unbind())
+                if rows and all(row.shape == rows[0].shape for row in rows[1:]):
+                    v = torch.stack(rows)
+                    changed = True
+            new_dict[field_name] = v
+        if not changed:
+            # The traversal still ran; only the rebuild was skipped.
+            return td
+        new_td = TensorDict(new_dict, batch_size=td.batch_size)
+        _assert_no_key_loss(new_dict, new_td, "_from_wire")
+        return new_td
 
 
 class TQDataPlaneClient(DataPlaneClient):

@@ -119,6 +119,11 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.observability import (
+    MetricsDataPlaneClient,
+    log_step_metrics,
+    metrics_never_fail_the_step,
+)
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
@@ -1519,6 +1524,38 @@ class SingleControllerActor:
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
 
+    def _log_data_plane_metrics(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. Never raises.
+
+        On by default, so this runs every step of every recipe. Mirrors
+        ``grpo_sync._log_data_plane_metrics``.
+        """
+        with metrics_never_fail_the_step(self._train_steps):
+            self._log_data_plane_metrics_impl(total_step_time)
+
+    def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. No-op unless observability is enabled.
+
+        The synchronous loop logs these series from ``_log_data_plane_metrics``
+        in ``grpo_sync``. Without the same call here the single-controller path
+        builds the metrics client, pays for its counters on every op, and emits
+        nothing -- the failure is silent, because an empty dashboard looks the
+        same as a data plane that cost nothing.
+
+        Driver scope only, and the prefix says so. This client issues the
+        advantage stage's get plus the post-train clear; the bulk traffic is
+        the trainer and generation workers' own clients, in their own
+        processes with their own counters, so ``comm_volume_mb`` here is well
+        under what the job actually moved. ``grpo_sync`` gets a cluster view by
+        fanning out over its policy worker group; this loop has no such group to
+        fan out over, so driver scope is all there is here.
+        """
+        if not isinstance(self._dp_client, MetricsDataPlaneClient):
+            return  # observability disabled -> plain adapter
+
+        metrics = self._dp_client.get_step_metrics(total_step_time)
+        log_step_metrics(self._logger, metrics, self._train_steps, "driver")
+
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
         """Return stable prompt-group IDs in canonical sample order."""
@@ -2849,6 +2886,11 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            # Must precede the step_finished=True log below. That log commits
+            # the wandb step, and wandb silently discards anything logged
+            # against a step it has already committed -- no exception, no
+            # failed return, just an empty chart. grpo_sync had the same bug.
+            self._log_data_plane_metrics(total_time)
             # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(
                 timing_metrics,

@@ -25,6 +25,7 @@ uv run examples/run_grpo_single_controller.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
+    data_plane.observability.verify_tensor_hash=True \
     $@ \
     2>&1 | tee $RUN_LOG
 
@@ -46,7 +47,9 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'len(data["train/critic/loss"]) == 40' \
         'max(data["train/critic/loss"]) < 1.5' \
         'mean(data["train/critic/explained_var"], range_start=-10) > 0.5' \
-        'mean(data["train/reward"], range_start=-10) > 0.75'
+        'mean(data["train/reward"], range_start=-10) > 0.75' \
+        'max(data.get("data_plane/cluster/step/hash/mismatches", data.get("data_plane/driver/step/hash/mismatches", {}))) == 0' \
+        'max(data.get("data_plane/cluster/step/hash/rows_checked", data.get("data_plane/driver/step/hash/rows_checked", {}))) > 0'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

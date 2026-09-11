@@ -595,8 +595,9 @@ data_plane:
                                      # serialized groups and cost throughput;
                                      # higher buys little at linear HBM cost.
                                      # GDR needs that headroom to pay off.
-  # observability:                    # NotRequired
-  #   enabled: false
+  observability:                      # per-op data-plane timing/volume
+    enabled: true                     # per-op timing/volume; cost is below measurement noise
+    verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out
 
 # Multi-Teacher On-Policy Distillation (MOPD): distills from one or more teacher
 # models into the policy via token-level teacher-minus-student logprob advantages,
