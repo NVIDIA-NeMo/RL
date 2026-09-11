@@ -21,7 +21,7 @@ checkpointing:
 data_plane:
   enabled: true
   observability:
-    verify_tensor_hash: true
+    verify_tensor_hash: false
 
 # SC async-RL runtime knobs.
 async_rl:
