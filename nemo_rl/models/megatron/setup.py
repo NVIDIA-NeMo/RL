@@ -435,20 +435,15 @@ def enable_zero_train_gen_kl(
                 )
             cfg[key] = value
 
+    # Register before validate_and_set_config (apply_kernels=False) or worker
+    # __init__ (apply_kernels=True) call finalize(); training workers lack
+    # inference_optimized/TE grouped GEMM and must bypass Megatron's MoE+BI+FP8
+    # gate. Generation workers (merged mcore_generation_config) keep it.
+    _skip_megatron_moe_bi_fp8_assert()
+
     if not apply_kernels:
         return
 
-    # Older TE lacks Megatron's FA version pin; no-op the gate, then enable BIK.
-    try:
-        from megatron.core.transformer.custom_layers import (
-            batch_invariant_kernels as bik_mod,
-        )
-    except ImportError:
-        bik_mod = None
-    if bik_mod is not None:
-        bik_mod.assert_te_supports_batch_invariant_attention = lambda: None
-    # TE zero-KL uses MoE+BI+FP8 (e.g. mxfp8); Megatron's config gate is bf16-only.
-    _skip_megatron_moe_bi_fp8_assert()
     enable_batch_invariant_mode(config)
 
 
@@ -470,11 +465,22 @@ def _coerce_mcore_config_enums_to_strings(config: Any) -> None:
 
 
 def _skip_megatron_moe_bi_fp8_assert() -> None:
-    """Allow TE MoE + batch_invariant_mode + FP8 past Megatron's bf16-only gate.
+    """Allow training-path MoE+BI+FP8 to bypass Megatron's inference-only FP8 gate.
 
-    Megatron rejects MoE+BI+FP8 in ``TransformerConfig.__post_init__``. That rule
-    targets DeepGEMM / inference_optimized paths; TE + ``te_native`` zero-KL is
-    intentional. ``inference_optimized`` keeps the upstream assert. Idempotent.
+    Megatron ``TransformerConfig.__post_init__`` rejects MoE + batch_invariant_mode
+    + FP8 unless ``te_mxfp8_inference`` is true (``inference_optimized`` +
+    ``inference_grouped_gemm_backend=te`` + mxfp8 + te_native + SwiGLU/squared-ReLU).
+
+    Zero-KL wiring intentionally splits this across workers:
+
+    - **Training** (``MegatronPolicyWorker`` on the train node): ``megatron_cfg`` has
+      FP8 + ``batch_invariant_backend=te_native`` but no ``inference_optimized`` /
+      ``inference_grouped_gemm_backend`` — TE grouped GEMM is generation-only.
+    - **Generation** (non-colocated dedicated policy): ``merged_inference_megatron_cfg``
+      overlays ``mcore_generation_config`` (``inference_optimized``, backend ``te``,
+      NVLS dispatcher, etc.) and must satisfy the upstream gate unchanged.
+
+    Idempotent.
     """
     global _MOE_BI_FP8_ASSERT_SKIPPED
     if _MOE_BI_FP8_ASSERT_SKIPPED:
@@ -487,9 +493,15 @@ def _skip_megatron_moe_bi_fp8_assert() -> None:
         try:
             orig_post_init(self)
         except AssertionError as e:
-            if "Batch-invariant MoE is bf16-only" not in str(e):
+            msg = str(e)
+            is_moe_bi_fp8_gate = (
+                "Batch-invariant MoE is bf16-only" in msg
+                or "Batch-invariant MoE supports bf16, or native TE MXFP8" in msg
+            )
+            if not is_moe_bi_fp8_gate:
                 raise
-            # Keep Megatron's rule for inference_optimized MoE+BI.
+            # Keep Megatron's rule for inference_optimized MoE+BI+FP8; training
+            # workers use te_native without inference_optimized/TE grouped GEMM.
             if getattr(self, "transformer_impl", None) == "inference_optimized":
                 raise
             # Finish BI MoE checks that follow the bf16-only assert upstream.
@@ -1342,22 +1354,31 @@ def _validate_te_precision_config(
         _quant_recipe_name(fp8_cfg.get("fp8_recipe")) if fp8_cfg_enabled else None
     )
 
-    # A recipe can store primary weights in FP8/FP4 through its own
-    # fp8_param/fp4_param fields, which are separate from fp8_cfg.fp8_param.
-    # NeMo-RL derives sequence padding, refit export, and reshard validation
-    # from fp8_cfg alone, so such weights would reach the inference engine as
-    # if they were BF16. Reject until the refit path understands them.
+    # A matched module's fp8_model_init comes from its own recipe block rather than
+    # from fp8_cfg.fp8_param, so a recipe that quantizes a module must repeat
+    # fp8_param to keep that module's primary weights in FP8. Only the value already
+    # configured in fp8_cfg is accepted: NeMo-RL derives sequence padding, refit
+    # export, and reshard validation from fp8_cfg, and a recipe that disagreed would
+    # send weights to the inference engine in a precision NeMo-RL does not expect.
+    fp8_cfg_param = bool(fp8_cfg_enabled and fp8_cfg.get("fp8_param", False))
     for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
         payload = quant_recipe.configs.get(config_key) or {}
         for block in ("training_recipe", "evaluation_recipe"):
             block_cfg = payload.get(block) or {}
-            if block_cfg.get("fp8_param") or block_cfg.get("fp4_param"):
+            if block_cfg.get("fp4_param"):
                 raise ValueError(
-                    "megatron_cfg.te_precision_config_file sets fp8_param or "
-                    f"fp4_param in '{config_key}.{block}'. NeMo-RL reads "
-                    "megatron_cfg.fp8_cfg for all FP8 behavior, so these "
-                    "weights would be sent to the inference engine as BF16. "
-                    "Use megatron_cfg.fp8_cfg for FP8 parameter storage."
+                    "megatron_cfg.te_precision_config_file sets fp4_param in "
+                    f"'{config_key}.{block}'. NeMo-RL reads megatron_cfg.fp8_cfg "
+                    "for all FP8/FP4 parameter storage, so these weights would be "
+                    "sent to the inference engine as BF16."
+                )
+            if block_cfg.get("fp8_param") and not fp8_cfg_param:
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets fp8_param in "
+                    f"'{config_key}.{block}', but megatron_cfg.fp8_cfg.fp8_param "
+                    "is not enabled. Enable megatron_cfg.fp8_cfg.fp8_param so FP8 "
+                    "parameter storage stays consistent with the padding and refit "
+                    "behavior NeMo-RL derives from fp8_cfg."
                 )
 
             if not fp8_cfg_enabled:

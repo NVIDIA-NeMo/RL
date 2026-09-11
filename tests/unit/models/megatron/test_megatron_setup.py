@@ -1103,6 +1103,100 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.bfloat16)
 
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_allows_fp8_param_matching_fp8_cfg(
+        self, mock_load_recipe, tmp_path
+    ):
+        """A quantized module must repeat fp8_param to keep FP8 primary weights."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        recipe = self._quant_recipe(
+            {
+                "mxfp8": {
+                    "training_recipe": {
+                        "fp8_quantization_recipe": "mxfp8",
+                        "fp8_param": True,
+                    },
+                    "evaluation_recipe": {},
+                }
+            }
+        )
+        mock_load_recipe.return_value = recipe
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": True},
+            }
+        }
+
+        with pytest.warns(UserWarning, match="fp8_cfg"):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.quant_recipe is recipe
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_rejects_fp8_param_without_fp8_cfg_param(
+        self, mock_load_recipe, tmp_path
+    ):
+        """Per-module FP8 storage cannot diverge from the fp8_cfg NeMo-RL derives from."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe(
+            {
+                "mxfp8": {
+                    "training_recipe": {
+                        "fp8_quantization_recipe": "mxfp8",
+                        "fp8_param": True,
+                    }
+                }
+            }
+        )
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": False},
+            }
+        }
+
+        with (
+            pytest.warns(UserWarning, match="fp8_cfg"),
+            pytest.raises(ValueError, match="fp8_cfg.fp8_param is not enabled"),
+        ):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_rejects_fp4_param(self, mock_load_recipe, tmp_path):
+        """FP4 primary weights stay unsupported regardless of fp8_cfg."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe(
+            {"fp4": {"training_recipe": {"fp4_param": True}}}
+        )
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": True},
+            }
+        }
+
+        with (
+            pytest.warns(UserWarning, match="fp8_cfg"),
+            pytest.raises(ValueError, match="sets fp4_param"),
+        ):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_te_precision_config_rejects_fp4_recipe_when_fp8_cfg_enabled(
         self, mock_load_recipe, tmp_path
     ):
@@ -4426,19 +4520,30 @@ def test_zero_train_gen_mismatch_allows_noncolocated_generation():
     assert config["megatron_cfg"]["batch_invariant_mode"] is True
 
 
-def test_skip_megatron_moe_bi_fp8_assert_allows_te_path(monkeypatch):
-    """TE MoE+BI+FP8 skips Megatron's bf16-only gate; infopt keeps it."""
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Batch-invariant MoE is bf16-only. Disable fp8/fp4 to use it.",
+        (
+            "Batch-invariant MoE supports bf16, or native TE MXFP8 squared-ReLU "
+            "or SwiGLU experts with the inference-optimized TE grouped-GEMM and "
+            "te_native batch-invariant backends."
+        ),
+    ],
+)
+def test_skip_megatron_moe_bi_fp8_assert_allows_te_path(monkeypatch, message):
+    """Training-path MoE+BI+FP8 skips Megatron's FP8 gate; infopt keeps it."""
     from types import SimpleNamespace
 
     from nemo_rl.models.megatron import setup as megatron_setup
 
-    def raise_bf16_only(self):
-        raise AssertionError(
-            "Batch-invariant MoE is bf16-only. Disable fp8/fp4 to use it."
-        )
+    def raise_moe_bi_fp8_gate(self):
+        raise AssertionError(message)
 
     megatron_setup._MOE_BI_FP8_ASSERT_SKIPPED = False
-    monkeypatch.setattr(megatron_setup.TransformerConfig, "__post_init__", raise_bf16_only)
+    monkeypatch.setattr(
+        megatron_setup.TransformerConfig, "__post_init__", raise_moe_bi_fp8_gate
+    )
     megatron_setup._skip_megatron_moe_bi_fp8_assert()
     patched = megatron_setup.TransformerConfig.__post_init__
 
@@ -4460,5 +4565,5 @@ def test_skip_megatron_moe_bi_fp8_assert_allows_te_path(monkeypatch):
         moe_pad_experts_for_cuda_graph_inference=False,
         sequence_packing_scheduler=None,
     )
-    with pytest.raises(AssertionError, match="bf16-only"):
+    with pytest.raises(AssertionError, match="Batch-invariant MoE"):
         patched(infopt_cfg)
