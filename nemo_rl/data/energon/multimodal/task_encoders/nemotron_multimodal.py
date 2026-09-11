@@ -948,6 +948,7 @@ class NemotronMultiModalTaskEncoder(GenericSFTTaskEncoder):
             tokenizer=tokenizer,
             sequence_length_pad_multiple=sequence_length_pad_multiple,
             only_unmask_final=only_unmask_final,
+            loss_mask_mode="precomputed",
         )
         self._multimodal_adapter = omni_adapter
 
@@ -958,12 +959,6 @@ class NemotronMultiModalTaskEncoder(GenericSFTTaskEncoder):
     @stateless(restore_seeds=True)
     def postencode_sample(self, sample: EncodedSFTSample) -> EncodedSFTSample:
         return self._multimodal_adapter.postencode(sample)
-
-    @stateless
-    def batch(self, samples: list[Any]) -> Any:
-        batch = super().batch(samples)
-        batch["loss_mask_mode"] = "precomputed"
-        return batch
 
 
 __all__ = [

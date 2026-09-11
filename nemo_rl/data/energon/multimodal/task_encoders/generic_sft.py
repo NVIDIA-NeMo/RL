@@ -256,10 +256,7 @@ class HFMultimodalSFTProcessorAdapter:
 class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
     """Encode, group, and batch complete multimodal SFT conversations."""
 
-    # Energon reads 0 as "disable tolerance checking" (megatron/energon/errors.py),
-    # which would let a systematically broken dataset retry forever. 1 fails on the
-    # first bad sample; raise it to tolerate transient decode errors.
-    __default_failure_tolerance__ = 1
+    __default_failure_tolerance__ = 0
     # Match the existing HF VLM path. Its processor expects PIL RGB images.
     decoder = SampleDecoder(image_decode="pilrgb")
 
@@ -273,6 +270,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         tokenizer: Any | None = None,
         sequence_length_pad_multiple: int = 1,
         only_unmask_final: bool = False,
+        loss_mask_mode: str | None = None,
     ) -> None:
         super().__init__(cooker_functions=cooker_functions)
         self.adapter = adapter
@@ -281,6 +279,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         self.tokenizer = tokenizer
         self.sequence_length_pad_multiple = sequence_length_pad_multiple
         self.only_unmask_final = only_unmask_final
+        self.loss_mask_mode = loss_mask_mode
 
     @stateless
     def preencode_sample(self, sample: CanonicalSFTSample) -> EncodedSFTSample:
@@ -332,6 +331,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
                 cast(list[PackedSFTSample], samples),
                 tokenizer=self.tokenizer,
                 only_unmask_final=self.only_unmask_final,
+                loss_mask_mode=self.loss_mask_mode,
             )
         if not all(isinstance(sample, EncodedSFTSample) for sample in samples):
             raise TypeError("Energon SFT batches accept only encoded samples.")
@@ -345,6 +345,8 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         }
         if self.include_source_ids:
             values["source_ids"] = [sample.sample_key for sample in encoded_samples]
+        if self.loss_mask_mode is not None:
+            values["loss_mask_mode"] = self.loss_mask_mode
         return BatchedDataDict(values)
 
     @stateless
