@@ -4435,6 +4435,14 @@ def async_grpo_train(
                     is_last_step
                     or (step + 1) % master_config.checkpointing["save_period"] == 0
                 )
+                # Deferred (offline) evaluation: the MLPerf rules require a
+                # checkpoint after every step from val_start_at until the stop
+                # step, regardless of save_period.
+                deferred_evaluation = master_config.grpo.get("deferred_evaluation")
+                if deferred_evaluation and deferred_evaluation.get("enabled"):
+                    should_save_by_step = should_save_by_step or (
+                        step + 1 >= master_config.grpo["val_start_at"]
+                    )
                 # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
