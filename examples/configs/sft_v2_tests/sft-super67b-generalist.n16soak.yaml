@@ -62,9 +62,9 @@ data:
     shuffle_buffer_size: 100
     max_samples_per_sequence: 100
     watchdog_timeout_seconds: 1800
-    num_workers: 4
+    num_workers: 2
     prefetch_factor: 2
-    cache_pool_num_workers: 8
+    cache_pool_num_workers: 4
     gc_collect_every_n_steps: 100000
     model_family: nemotron
     task_encoder:
