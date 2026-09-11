@@ -35,6 +35,9 @@ from nemo_rl.data.energon.multimodal.task_encoders.generic_sft import (  # noqa:
 from nemo_rl.data.energon.multimodal.types import EncodedSFTSample  # noqa: E402
 from nemo_rl.data.multimodal_utils import PackedTensor  # noqa: E402
 from nemo_rl.data.packing import PackingAlgorithm, get_packer  # noqa: E402
+from nemo_rl.data_plane.adapters.local import (  # noqa: E402
+    local_batch_to_tensordict,
+)
 
 
 class _Tokenizer:
@@ -160,6 +163,31 @@ def test_preparation_builds_model_ready_pack_and_jagged_boundaries() -> None:
     sliced = prepared.slice(1, 2)
     assert sliced["cu_seqlens"].as_tensor().tolist() == [0, 4]
     assert sliced["cu_seqlens_padded"].as_tensor().tolist() == [0, 12]
+
+
+def test_task_encoder_consumes_precomputed_loss_mask_mode_for_packs() -> None:
+    sample = _sample("s0", 4)
+    sample.message_log[0]["token_loss_mask"] = torch.ones(2, dtype=torch.long)
+    sample.message_log[1]["token_loss_mask"] = torch.zeros(2, dtype=torch.long)
+    packed = pack_selected_samples(
+        [sample], pack_capacity=4, sequence_length_pad_multiple=1
+    )
+    encoder = GenericSFTTaskEncoder(
+        adapter=object(),
+        cooker_functions=[],
+        include_source_ids=True,
+        tokenizer=_Tokenizer(),
+        loss_mask_mode="precomputed",
+    )
+
+    prepared = encoder.batch([packed])
+    unpacked = encoder.batch([sample])
+
+    assert "loss_mask_mode" not in prepared
+    assert prepared["token_mask"].tolist() == [[0, 1, 0, 0]]
+    assert unpacked["loss_mask_mode"] == "precomputed"
+    fields = {key: value for key, value in prepared.items() if key != "source_ids"}
+    assert local_batch_to_tensordict(fields, batch_size=1).batch_size == torch.Size([1])
 
 
 def test_preparation_backfills_multimodal_token_fields() -> None:
