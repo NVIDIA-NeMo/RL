@@ -94,7 +94,6 @@ policy:
       precision: fp8
       kv_cache_dtype: fp8_ds_mla
       env_vars:
-        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: '0'
         VLLM_USE_DEEP_GEMM_E8M0: '1'
       use_deep_gemm: true
       pow2_weight_scaling_factors: true

@@ -127,8 +127,8 @@ dimensions instead of changing `cluster.num_nodes` alone.
   pins the validated FlashMLA sparse attention backend.
 - The policy tokenizer uses `chat_template: deepseek_v4`, while vLLM uses
   `tokenizer_mode: deepseek_v4`. The reference recipe disables thinking mode.
-- The recipe sets `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0` and enables eager
-  execution. Treat both settings as part of the validated configuration.
+- Eager execution (`enforce_eager: true`) remains part of the validated
+  configuration.
 
 ## Reference Training Curves
 

@@ -67,6 +67,7 @@ class FP8Config:
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
     is_mx: bool = False
+    is_deepseek_v4: bool = False
     refit_with_reload_api: bool = False
 
 
@@ -312,6 +313,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
+        "is_deepseek_v4": getattr(config, "model_type", None) == "deepseek_v4",
         "refit_with_reload_api": bool(vllm_cfg.get("refit_with_reload_api")),
     }
     if is_mx:
@@ -1150,8 +1152,9 @@ def create_weights_mxfp8_moe(
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
-    Compared to the original process_weights_after_loading in vllm, compatible
-    Parameters are updated in place while preserving their storage for refit.
+    Compared to the original process_weights_after_loading in vllm, we use .copy_() instead of
+    replace_parameter() to avoid creating new torch.nn.Parameter objects, because that removes
+    the weight_loader attribute which we need for refit.
 
     Updated for vLLM 0.25 which passes a RoutedExperts module as `layer` and
     sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=..., layer=...).
@@ -1180,25 +1183,26 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    # Preserve Parameter storage when compatible; replacement retains the
-    # weight_loader when a backend changes the runtime layout.
-    replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
-    replace_parameter(layer, "w2_weight", w2, prefer_copy=True)
-    replace_parameter(
-        layer,
-        f"w13_{self.weight_scale_name}",
-        w13_scale,
-        prefer_copy=True,
-    )
-    replace_parameter(
-        layer,
-        f"w2_{self.weight_scale_name}",
-        w2_scale,
-        prefer_copy=True,
-    )
+    if global_fp8_config.is_deepseek_v4:
+        # DSV4 restores checkpoint layouts before refit. Preserve compatible
+        # storage and retain loaders when converting to a different layout.
+        replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
+        replace_parameter(layer, "w2_weight", w2, prefer_copy=True)
+        replace_parameter(
+            layer, f"w13_{self.weight_scale_name}", w13_scale, prefer_copy=True
+        )
+        replace_parameter(
+            layer, f"w2_{self.weight_scale_name}", w2_scale, prefer_copy=True
+        )
+    else:
+        # Use .copy_() to preserve weight_loader attribute on Parameters.
+        layer.w13_weight.copy_(w13)
+        layer.w2_weight.copy_(w2)
+        getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
+        getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
 
     # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
-    # using reload-aware replace_parameter). Gate on is None, not hasattr, because
+    # but without replace_parameter). Gate on is None, not hasattr, because
     # FusedMoEMethodBase.__init__ always sets moe_kernel=None. Also skips refit
     # calls (finalize_layerwise_reload) which lack set_current_vllm_config context.
     self.moe_quant_config = self.get_fused_moe_quant_config(layer)

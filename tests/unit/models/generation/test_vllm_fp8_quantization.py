@@ -1468,6 +1468,7 @@ def test_init_fp8_uses_explicit_e8m0_for_dsv4(fp8_module, monkeypatch):
     assert quantization_config["weight_block_size"] == [128, 128]
     assert os.environ["VLLM_USE_DEEP_GEMM"] == "1"
     assert os.environ["VLLM_USE_DEEP_GEMM_E8M0"] == "1"
+    assert fp8.global_fp8_config.is_deepseek_v4 is True
 
 
 def test_init_fp8_keeps_e8m0_disabled_for_other_deep_gemm_models(
@@ -1496,6 +1497,7 @@ def test_init_fp8_keeps_e8m0_disabled_for_other_deep_gemm_models(
     )
 
     assert os.environ["VLLM_USE_DEEP_GEMM_E8M0"] == "0"
+    assert fp8.global_fp8_config.is_deepseek_v4 is False
 
 
 @pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_e4m3"])
@@ -1840,11 +1842,14 @@ def test_mxfp8_reload_iterator_emits_upstream_checkpoint_names(fp8_module, monke
     assert quantized[1][1].dtype == torch.uint8
 
 
-@pytest.mark.parametrize("change_layout", [False, True])
+@pytest.mark.parametrize("is_deepseek_v4", [False, True])
+@pytest.mark.parametrize("change_layout", ["none", "dtype", "shape"])
 def test_process_fp8_moe_preserves_storage_and_loaders(
-    fp8_module, monkeypatch, change_layout
+    fp8_module, monkeypatch, change_layout, is_deepseek_v4
 ):
     from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    fp8_module.global_fp8_config = fp8_module.FP8Config(is_deepseek_v4=is_deepseek_v4)
 
     def weight_loader(*_args, **_kwargs):
         pass
@@ -1861,8 +1866,10 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
         param = torch.nn.Parameter(torch.zeros(shape), requires_grad=False)
         param.weight_loader = weight_loader
         layer.register_parameter(name, param)
-        target_shape = (shape[0], shape[2], shape[1]) if change_layout else shape
-        target_dtype = torch.bfloat16 if change_layout else torch.float32
+        target_shape = (
+            (shape[0], shape[2], shape[1]) if change_layout == "shape" else shape
+        )
+        target_dtype = torch.float32 if change_layout == "none" else torch.bfloat16
         converted[name] = torch.ones(target_shape, dtype=target_dtype)
     layer.w13_input_scale = None
     layer.w2_input_scale = None
@@ -1882,8 +1889,18 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
     params = {name: getattr(layer, name) for name in shapes}
     pointers = {name: param.data_ptr() for name, param in params.items()}
 
+    if not is_deepseek_v4 and change_layout == "shape":
+        # Preserve the old copy_ failure for incompatible shapes rather than
+        # silently replacing Parameters that an existing kernel may reference.
+        with pytest.raises(RuntimeError, match="size of tensor"):
+            fp8_module.process_weights_after_loading_moe(method, layer)
+        for name, param in params.items():
+            assert getattr(layer, name) is param
+            assert param.data_ptr() == pointers[name]
+        return
+
     fp8_module.process_weights_after_loading_moe(method, layer)
-    if change_layout:
+    if is_deepseek_v4 and change_layout != "none":
         for name, param in params.items():
             assert getattr(layer, name) is not param
         params = {name: getattr(layer, name) for name in shapes}
@@ -1895,7 +1912,9 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
             assert param is params[name]
             assert param.data_ptr() == pointers[name]
             assert param.weight_loader is weight_loader
-            torch.testing.assert_close(param, expected)
+            # Non-DSV4 copy_ retains the destination dtype even when the
+            # converter returns another dtype; prefer_copy would replace it.
+            torch.testing.assert_close(param, expected.to(dtype=param.dtype))
     assert method.moe_kernel is kernel
     assert method.moe_quant_config is quant_config
 
@@ -1911,6 +1930,8 @@ def test_deepseek_v4_two_refits_preserve_kernel_fp32_scale_references(
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
     from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+
+    fp8_module.global_fp8_config = fp8_module.FP8Config(is_deepseek_v4=True)
 
     class Experts(torch.nn.Module):
         pass
