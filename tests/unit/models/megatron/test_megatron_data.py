@@ -1617,6 +1617,61 @@ class TestGetMicrobatchIterator:
                 }
             )
 
+    @patch("nemo_rl.models.megatron.data._get_fp8_token_alignment", return_value=64)
+    def test_packed_alignment_uses_shared_fp8_token_alignment(
+        self, _mock_fp8_token_alignment
+    ):
+        from nemo_rl.models.megatron.data import (
+            _get_packed_sequence_alignment_factors,
+        )
+
+        _, kernel_divisor = _get_packed_sequence_alignment_factors(
+            {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            }
+        )
+
+        assert kernel_divisor == 64
+
+    def test_get_microbatch_iterator_rejects_direct_length_before_policy_padding(
+        self,
+    ):
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        data = MagicMock()
+        data.size = 1
+        data.__contains__.side_effect = lambda key: key == "packed_cu_seqlens"
+        data.__getitem__.side_effect = lambda key: (
+            torch.zeros(1, 8, dtype=torch.long) if key == "input_ids" else None
+        )
+        data.make_microbatch_iterator.return_value = iter([])
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            "make_sequence_length_divisible_by": 16,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="Direct packed sequence length 8 must be divisible by 16",
+        ):
+            get_microbatch_iterator(
+                data=data,
+                cfg=cfg,
+                mbs=1,
+                straggler_timer=MagicMock(),
+            )
+
     @pytest.mark.parametrize(
         ("pack_length", "fp8_cfg", "required_multiple"),
         [

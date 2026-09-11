@@ -615,8 +615,7 @@ def test_sft_collate_preserves_packed_row_order_before_data_parallel_sharding():
                 "pipeline_model_parallel_size": 1,
                 "context_parallel_size": 2,
             }
-        },
-        {"num_nodes": 1, "gpus_per_node": 8},
+        }
     )
 
     batch = collate_fn(
@@ -637,8 +636,7 @@ def test_sft_collate_rejects_rows_prepared_for_different_context_parallel_size()
                 "pipeline_model_parallel_size": 1,
                 "context_parallel_size": 2,
             }
-        },
-        {"num_nodes": 1, "gpus_per_node": 2},
+        }
     )
 
     with pytest.raises(

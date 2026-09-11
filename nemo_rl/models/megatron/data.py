@@ -372,7 +372,10 @@ def get_microbatch_iterator(
         domain_factor, kernel_divisor = _get_packed_sequence_alignment_factors(
             cfg["megatron_cfg"]
         )
-        required_multiple = domain_factor * kernel_divisor
+        required_multiple = lcm(
+            cfg["make_sequence_length_divisible_by"],
+            domain_factor * kernel_divisor,
+        )
         if seq_dim_size % required_multiple != 0:
             raise ValueError(
                 f"Direct packed sequence length {seq_dim_size} must be divisible "
@@ -1599,8 +1602,6 @@ def _get_packed_sequence_alignment_factors(
     tp_size = megatron_cfg["tensor_model_parallel_size"]
     sp = megatron_cfg["sequence_parallel"]
     cp_size = megatron_cfg["context_parallel_size"]
-    fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
-    use_fp8 = fp8_cfg.get("enabled", False)
 
     domain_factor = 1
     if cp_size > 1:
@@ -1608,14 +1609,7 @@ def _get_packed_sequence_alignment_factors(
     if tp_size > 1 and sp:
         domain_factor *= tp_size
 
-    kernel_divisor = 1
-    if use_fp8:
-        if fp8_cfg["fp8_recipe"] == "blockwise":
-            kernel_divisor = max(kernel_divisor, 128)
-        elif fp8_cfg["fp8_recipe"] == "mxfp8":
-            kernel_divisor = max(kernel_divisor, 32)
-        else:
-            kernel_divisor = max(kernel_divisor, 16)
+    kernel_divisor = _get_fp8_token_alignment(megatron_cfg)
     if (
         megatron_cfg.get("moe_token_dispatcher_type") == "flex"
         and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"

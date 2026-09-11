@@ -15,6 +15,8 @@ from nemo_rl.data.megatron_sft_packed import (
     IGNORE_INDEX,
     NEMOTRON_NANO_V2_TEMPLATE,
     MegatronSFTPackedDatumSpec,
+    _PromptConfig,
+    _resolve_pad_token_id,
     megatron_sft_packed_preprocessor,
     split_megatron_sft_conversations,
 )
@@ -93,6 +95,68 @@ class _MegatronLowLevelDataset:
 
     def __getitem__(self, _idx: int) -> list[dict[str, str]]:
         return self.messages
+
+
+class _PadResolvingTokenizer:
+    eos_token_id = 2
+
+    def __init__(self, pad_token_id: int | None) -> None:
+        self.pad_token_id = pad_token_id
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return {"<custom-pad>": 77, "<eos>": self.eos_token_id}[token]
+
+
+def _prompt_config_with_pad_token(pad_token: str | None) -> _PromptConfig:
+    return _PromptConfig(
+        assistant_prefix_len=0,
+        pad_token=pad_token,
+        chat_template="",
+    )
+
+
+@pytest.mark.parametrize(
+    ("configured_pad_token", "tokenizer_pad_token_id", "expected_pad_token_id"),
+    [
+        pytest.param("<custom-pad>", 99, 77, id="explicit-custom-pad"),
+        pytest.param(None, 99, 99, id="tokenizer-pad-fallback"),
+    ],
+)
+def test_resolve_packed_pad_token_accepts_non_eos_pad(
+    configured_pad_token: str | None,
+    tokenizer_pad_token_id: int | None,
+    expected_pad_token_id: int,
+) -> None:
+    tokenizer = _PadResolvingTokenizer(tokenizer_pad_token_id)
+
+    assert (
+        _resolve_pad_token_id(
+            tokenizer,
+            _prompt_config_with_pad_token(configured_pad_token),
+        )
+        == expected_pad_token_id
+    )
+
+
+@pytest.mark.parametrize(
+    ("configured_pad_token", "tokenizer_pad_token_id"),
+    [
+        pytest.param("<eos>", 99, id="explicit-pad-resolves-to-eos"),
+        pytest.param(None, 2, id="tokenizer-pad-equals-eos"),
+        pytest.param(None, None, id="eos-only-fallback"),
+    ],
+)
+def test_resolve_packed_pad_token_rejects_eos(
+    configured_pad_token: str | None,
+    tokenizer_pad_token_id: int | None,
+) -> None:
+    tokenizer = _PadResolvingTokenizer(tokenizer_pad_token_id)
+
+    with pytest.raises(ValueError, match="pad token.*EOS"):
+        _resolve_pad_token_id(
+            tokenizer,
+            _prompt_config_with_pad_token(configured_pad_token),
+        )
 
 
 def _preprocess(

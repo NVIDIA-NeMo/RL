@@ -208,12 +208,21 @@ def _tokenize_megatron_sft_conversation(
 
 def _resolve_pad_token_id(tokenizer: Any, prompt_config: _PromptConfig) -> int:
     if prompt_config.pad_token is not None:
-        return int(tokenizer.convert_tokens_to_ids(prompt_config.pad_token))
-    if tokenizer.pad_token_id is not None:
-        return int(tokenizer.pad_token_id)
-    if tokenizer.eos_token_id is not None:
-        return int(tokenizer.eos_token_id)
-    raise ValueError("Megatron SFT packed data requires a pad token")
+        pad_token_id = int(tokenizer.convert_tokens_to_ids(prompt_config.pad_token))
+    elif tokenizer.pad_token_id is not None:
+        pad_token_id = int(tokenizer.pad_token_id)
+    else:
+        raise ValueError(
+            "Megatron SFT packed data requires a pad token distinct from EOS"
+        )
+
+    if tokenizer.eos_token_id is not None and pad_token_id == int(
+        tokenizer.eos_token_id
+    ):
+        raise ValueError(
+            "Megatron SFT packed data requires a pad token distinct from EOS"
+        )
+    return pad_token_id
 
 
 def megatron_sft_packed_preprocessor(

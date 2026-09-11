@@ -213,7 +213,6 @@ def _validate_direct_megatron_sft_setup(
 
 def _build_sft_collate_fn(
     policy_config: PolicyConfig,
-    cluster_config: ClusterConfig,
 ) -> Callable[[list[DatumSpec]], BatchedDataDict[Any]]:
     megatron_cfg = policy_config.get("megatron_cfg")
     context_parallel_size = None
@@ -303,7 +302,7 @@ def setup(
     # ==========================
     #           Data
     # ==========================
-    sft_collate_fn = _build_sft_collate_fn(policy_config, cluster_config)
+    sft_collate_fn = _build_sft_collate_fn(policy_config)
     train_dataloader = StatefulDataLoader(
         train_dataset,
         batch_size=policy_config["train_global_batch_size"],
