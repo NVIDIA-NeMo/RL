@@ -87,10 +87,9 @@ def _broadcast_batched_data_dict(
     backend = torch.distributed.get_backend(group)
     bcast_device: Any = torch.cuda.current_device() if backend == "nccl" else "cpu"
 
-    # Leader-only: the flat physical payload of each packed field, kept from
-    # the descriptor pass so coalescing runs once and deduplicated segments
-    # cross the collective only once.
-    packed_payloads: dict[str, torch.Tensor] = {}
+    # Leader-only: keep physical segments uncoalesced until their broadcast
+    # turn so only one packed payload is staged on the GPU at a time.
+    packed_segments: dict[str, list[torch.Tensor]] = {}
     leader_error: Exception | None = None
 
     if is_leader:
@@ -103,8 +102,8 @@ def _broadcast_batched_data_dict(
                         (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
                     )
                 elif isinstance(v, PackedTensor):
-                    header, shapes, dtype, source_device, packed_payloads[k] = (
-                        v.broadcast_parts(bcast_device)
+                    header, shapes, dtype, source_device, packed_segments[k] = (
+                        v.broadcast_parts()
                     )
                     descriptor.append(
                         (k, "packed_tensor", header, shapes, dtype, source_device)
@@ -184,7 +183,18 @@ def _broadcast_batched_data_dict(
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
-                tensor = packed_payloads[key]
+                segments = packed_segments.pop(key)
+                flat_payload = (
+                    torch.cat([segment.contiguous().view(-1) for segment in segments])
+                    if segments
+                    else torch.empty(
+                        0,
+                        dtype=getattr(torch, dtype_str.split(".")[-1]),
+                        device=source_device,
+                    )
+                )
+                tensor = flat_payload.to(bcast_device)
+                del flat_payload
             else:
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 numel = sum(
@@ -196,13 +206,14 @@ def _broadcast_batched_data_dict(
                     wire = tensor.to(torch.int32)
                     torch.distributed.broadcast(wire, src=src, group=group)
                     tensor = wire.to(torch.int16)
+                    del wire
                 else:
                     torch.distributed.broadcast(tensor, src=src, group=group)
-            packed_payloads.pop(key, None)
             if not is_leader:
                 if torch.device(source_device).type != torch.device(bcast_device).type:
                     tensor = tensor.to(source_device)
                 out[key] = header.rebuild_from_broadcast_parts(shapes, tensor)
+            del tensor
         else:
             if not is_leader:
                 out[key] = entry[2]
