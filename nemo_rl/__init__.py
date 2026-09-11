@@ -209,11 +209,13 @@ def _check_container_fingerprint():
             )
 
             # Check if user wants to ignore the mismatch
-            if not bool(os.environ.get("NRL_IGNORE_VERSION_MISMATCH")):
+            if bool(os.environ.get("NRL_IGNORE_VERSION_MISMATCH")):
                 logging.warning(
                     warning_msg
                     + "Proceeding anyway (NRL_IGNORE_VERSION_MISMATCH is set)..."
                 )
+            else:
+                raise RuntimeError(warning_msg)
         else:
             logging.debug("Container fingerprint matches code fingerprint")
 
