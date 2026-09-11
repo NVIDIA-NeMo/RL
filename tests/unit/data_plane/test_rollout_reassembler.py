@@ -833,7 +833,7 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
 def test_penalties_use_only_verified_selected_generations(
     tq_client, partitions, unwanted, expected_reward
 ):
-    from nemo_rl.experience.reward_penalties import CaptureRewardPenaltyConfig
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
     from tests.unit.data_plane.token_capture_test_fixtures import _manifest, _record
 
     records, receipt, expected = build_fixture_artifacts(
@@ -859,7 +859,9 @@ def test_penalties_use_only_verified_selected_generations(
         assert sink.stage(record).ok
     finalizer = _finalizer(
         tq_client,
-        reward_penalty_config=CaptureRewardPenaltyConfig(False, False, (unwanted,)),
+        reward_penalty_config=RewardPenaltyConfig(
+            penalize_unwanted_tokens=True, token_ids={"unwanted": [unwanted]}
+        ),
     )
     for _ in range(2):
         row = finalizer.finalize_rollout("r", receipt.model_dump(), reward=-2.0)
@@ -875,43 +877,31 @@ def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
     tq_client, partitions
 ):
     from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
-    from nemo_rl.experience.effort_shaping import (
-        EffortLevelsConfig,
-        aggregate_capture_effort_metrics,
-        compute_effort_context,
-    )
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
     from nemo_rl.experience.reward_penalties import (
-        CaptureRewardPenaltyConfig,
         aggregate_capture_reward_metrics,
-        compute_text_penalty_evidence,
+        compute_reward_checks,
     )
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
 
     effort = EffortLevelsConfig(
         low_weight=1, low_penalty=1, low_ub=4, low_string="budget"
     )
-    config = CaptureRewardPenaltyConfig(True, True, ())
+    config = RewardPenaltyConfig(
+        penalize_duplicated_reasoning=True, penalize_empty_final_answer=True
+    )
     ids = ["penalty_g0", "penalty_g1", "penalty_g2"]
     receipts, expected = [], []
     for rid in ids[:2]:
         receipt, row = _stage_fixture(tq_client, "worked_example", rollout_id=rid)
         receipts.append(receipt)
         expected.append(row)
-    evidence = [
-        compute_text_penalty_evidence(ids[0], [], config),
-        compute_text_penalty_evidence(ids[1], [{"content": "ok"}], config),
-        None,
-    ]
-    contexts = [
-        compute_effort_context(
-            rid,
-            {
-                "responses_create_params": {
-                    "input": [{"role": "user", "content": "budget"}]
-                }
-            },
-            effort,
-        )
-        for rid in ids
+    prompt = {
+        "responses_create_params": {"input": [{"role": "user", "content": "budget"}]}
+    }
+    checks = [
+        compute_reward_checks({"response": {"output": output}}, prompt, effort)
+        for output in ([], [{"content": "ok"}], [])
     ]
     finalizer = _finalizer(
         tq_client, reward_penalty_config=config, effort_config=effort
@@ -924,8 +914,7 @@ def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
         mask_sample=[False] * 3,
         fallback_weight_version=4,
         prompt_idx=7,
-        text_penalty_evidence=evidence,
-        effort_contexts=contexts,
+        reward_checks=checks,
     )
     assert finalized.valid_row_count == 2
     rows = _fetch_rows(tq_client, ids)
@@ -955,38 +944,30 @@ def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
     )
     assert metrics["empty_final_answer_rate"] == 0.5
     assert metrics["total_reward/mean"] == 1.5
-    effort_metrics = aggregate_capture_effort_metrics(
-        {k: [v] for k, v in finalized.metrics.items()}
-    )
-    assert effort_metrics["mean_reward_low"] == 0.0  # -3 and +3, before zeroing.
-    assert effort_metrics["mean_length_low"] == 2
-    assert effort_metrics["median_length_low"] == 2
+    assert metrics["mean_reward_low"] == 0.0  # -3 and +3, before zeroing.
+    assert metrics["mean_length_low"] == 2
+    assert metrics["median_length_low"] == 2
 
 
-@pytest.mark.parametrize(
-    "kind", ["missing", "version", "fingerprint", "identity", "unevaluated"]
-)
-def test_finalizer_rejects_incompatible_text_evidence(tq_client, partitions, kind):
-    from nemo_rl.experience.reward_penalties import (
-        CaptureRewardPenaltyConfig,
-        compute_text_penalty_evidence,
-    )
+@pytest.mark.parametrize("shaping", [False, True])
+def test_missing_reward_checks_reject_before_publication(
+    tq_client, partitions, shaping
+):
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
 
-    config = CaptureRewardPenaltyConfig(True, True, ())
     receipt, _ = _stage_fixture(tq_client, "single_call", rollout_id="r")
-    evidence = compute_text_penalty_evidence("r", [], config)
-    evidence = {
-        "missing": None,
-        "version": replace(evidence, schema_version=2),
-        "fingerprint": replace(evidence, semantics_fingerprint="old"),
-        "identity": replace(evidence, rollout_id="wrong"),
-        "unevaluated": replace(evidence, empty_final_answer=None),
-    }[kind]
-    row = _finalizer(tq_client, reward_penalty_config=config).finalize_rollout(
-        "r", receipt, reward=1.0, text_penalty_evidence=evidence
-    )
+    row = _finalizer(
+        tq_client,
+        reward_penalty_config=None
+        if shaping
+        else RewardPenaltyConfig(penalize_empty_final_answer=True),
+        effort_config=EffortLevelsConfig(low_weight=1, low_string="budget")
+        if shaping
+        else None,
+    ).finalize_rollout("r", receipt, reward=1.0)
     assert not row.valid
-    assert row.rejection_reason.startswith("reward_penalty:")
+    assert row.rejection_reason == "reward_processing:missing_reward_checks"
 
 
 @pytest.mark.parametrize("flags", range(8))
@@ -995,15 +976,12 @@ def test_finalizer_rejects_incompatible_text_evidence(tq_client, partitions, kin
 def test_staged_penalties_match_non_capture_all_flags(
     tq_client, partitions, flags, incoming_reward, effort_mode
 ):
-    from nemo_rl.experience.effort_shaping import (
-        EffortLevelsConfig,
-        compute_effort_context,
-    )
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
     from nemo_rl.experience.reward_penalties import (
-        CaptureRewardPenaltyConfig,
-        compute_text_penalty_evidence,
+        compute_reward_checks,
     )
     from nemo_rl.experience.rollouts import (
+        EffortLevelsConfig,
         _apply_effort_shaping,
         apply_reward_penalties,
         resolve_reward_penalty_config,
@@ -1026,7 +1004,6 @@ def test_staged_penalties_match_non_capture_all_flags(
             ]
         }
     }
-    context = compute_effort_context("parity", prompt, effort)
     output = [
         {"type": "reasoning", "summary": [{"text": " same "}]},
         {"content": "same"},
@@ -1041,7 +1018,7 @@ def test_staged_penalties_match_non_capture_all_flags(
         },
         None,
     )
-    config = CaptureRewardPenaltyConfig.from_resolved(resolved)
+    config = RewardPenaltyConfig.model_validate(resolved)
     receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id="parity")
     inline = {
         "full_result": {"reward": incoming_reward, "response": {"output": output}},
@@ -1054,15 +1031,14 @@ def test_staged_penalties_match_non_capture_all_flags(
     }
     _apply_effort_shaping([inline], [prompt], effort)
     counts = apply_reward_penalties([inline], resolved)
-    evidence = compute_text_penalty_evidence("parity", output, config)
+    checks = compute_reward_checks(inline["full_result"], prompt, effort)
     actual = _finalizer(
         tq_client, reward_penalty_config=config, effort_config=effort
     ).finalize_rollout(
         "parity",
         receipt,
         reward=incoming_reward,
-        text_penalty_evidence=evidence,
-        effort_context=context,
+        reward_checks=checks,
     )
     assert actual.valid, actual.rejection_reason
     assert actual.reward == inline["full_result"]["reward"]
@@ -1078,11 +1054,8 @@ def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
 ):
     from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-    from nemo_rl.experience.effort_shaping import (
-        EffortLevelsConfig,
-        compute_effort_context,
-    )
-    from nemo_rl.experience.rollouts import _apply_effort_shaping
+    from nemo_rl.experience.reward_penalties import compute_reward_checks
+    from nemo_rl.experience.rollouts import EffortLevelsConfig, _apply_effort_shaping
     from tests.unit.data_plane.token_capture_test_fixtures import _manifest, _record
 
     records, full_tokens, messages, masks, logprobs = [], [], [], [], []
@@ -1141,40 +1114,18 @@ def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
     inline = {"message_log": messages, "full_result": {"reward": raw_reward}}
     shaping = _apply_effort_shaping([inline], [prompt], config)
     finalizer = _finalizer(tq_client, effort_config=config)
-    context = compute_effort_context("effort", prompt, config)
+    checks = compute_reward_checks(inline["full_result"], prompt, config)
     for _ in range(2):
         actual = finalizer.finalize_rollout(
-            "effort", receipt.model_dump(), reward=raw_reward, effort_context=context
+            "effort", receipt.model_dump(), reward=raw_reward, reward_checks=checks
         )
         assert actual.valid, actual.rejection_reason
         assert actual.reward == inline["full_result"]["reward"]
-        assert actual.effort_metrics == shaping
-        assert actual.effort_metrics.low_lengths == [generations[-1]]
+        assert actual.reward_metrics == {
+            f"finalize/effort/low/{generations[-1]}": 1.0,
+            "finalize/effort/length_reward_sum": shaping.length_rewards_low[0],
+            "finalize/effort/reward_sum": shaping.rewards_low[0],
+        }
         assert actual.token_ids == full_tokens
         assert actual.token_mask == masks
         assert actual.logprobs == logprobs
-
-
-@pytest.mark.parametrize("kind", ["missing", "identity", "version", "config"])
-def test_effort_context_errors_reject_before_publication(tq_client, partitions, kind):
-    from nemo_rl.experience.effort_shaping import (
-        EffortLevelsConfig,
-        compute_effort_context,
-    )
-
-    config = EffortLevelsConfig(low_weight=1, low_string="budget")
-    context = compute_effort_context(
-        "r", {"responses_create_params": {"input": []}}, config
-    )
-    context = {
-        "missing": None,
-        "identity": replace(context, rollout_id="other"),
-        "version": replace(context, schema_version=99),
-        "config": replace(context, semantics_fingerprint="wrong"),
-    }[kind]
-    receipt, _ = _stage_fixture(tq_client, "single_call", rollout_id="r")
-    actual = _finalizer(tq_client, effort_config=config).finalize_rollout(
-        "r", receipt, reward=1, effort_context=context
-    )
-    assert not actual.valid
-    assert actual.rejection_reason.startswith("effort_shaping:")

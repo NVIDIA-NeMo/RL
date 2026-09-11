@@ -30,15 +30,14 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
-from nemo_rl.experience.effort_shaping import RolloutEffortContext
-from nemo_rl.experience.reward_penalties import RolloutTextPenaltyEvidence
+from nemo_rl.experience.reward_penalties import RewardChecks
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
-SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 5
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -48,6 +47,7 @@ _SIDECAR_STATE_FIELDS = frozenset(
         *_LEDGER_STATE_FIELDS,
         "batch_shortfall",
         "finalizer_metrics_by_group",
+        "reward_settings",
         "sampler_stamps_target_steps",
     }
 )
@@ -76,8 +76,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "receipt",
         "reward",
         "mask_sample",
-        "text_penalty_evidence",
-        "effort_context",
+        "reward_checks",
         "staging_keys",
     }
 )
@@ -183,8 +182,7 @@ class RolloutAttemptRecord:
     receipt: Optional[dict[str, Any]] = None
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
-    text_penalty_evidence: RolloutTextPenaltyEvidence | None = None
-    effort_context: RolloutEffortContext | None = None
+    reward_checks: RewardChecks | None = None
     staging_keys: list[str] = field(default_factory=list)
 
     @property
@@ -291,30 +289,7 @@ class SiblingSealResult:
     receipt: Optional[dict[str, Any]]
     reward: float
     mask_sample: bool
-    text_penalty_evidence: RolloutTextPenaltyEvidence | None = None
-    effort_context: RolloutEffortContext | None = None
-
-
-def _validate_text_evidence_identity(
-    evidence: RolloutTextPenaltyEvidence | None, rollout_id: str
-) -> None:
-    if evidence is not None:
-        if not isinstance(evidence, RolloutTextPenaltyEvidence):
-            raise TypeError(
-                "text_penalty_evidence must be RolloutTextPenaltyEvidence or None"
-            )
-        if evidence.rollout_id != rollout_id:
-            raise ValueError("text penalty evidence rollout identity mismatch")
-
-
-def _validate_effort_context_identity(
-    context: RolloutEffortContext | None, rollout_id: str
-) -> None:
-    if context is not None:
-        if not isinstance(context, RolloutEffortContext):
-            raise TypeError("effort_context must be RolloutEffortContext or None")
-        if context.rollout_id != rollout_id:
-            raise ValueError("effort context rollout identity mismatch")
+    reward_checks: RewardChecks | None = None
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -482,8 +457,7 @@ class RolloutRecoveryLedger:
             attempt.receipt = None
             attempt.reward = None
             attempt.mask_sample = None
-            attempt.text_penalty_evidence = None
-            attempt.effort_context = None
+            attempt.reward_checks = None
             attempt.staging_keys.clear()
         record.status = PromptGroupStatus.GENERATING
 
@@ -614,8 +588,7 @@ class RolloutRecoveryLedger:
         receipt: Optional[dict[str, Any]],
         reward: float,
         mask_sample: bool,
-        text_penalty_evidence: RolloutTextPenaltyEvidence | None = None,
-        effort_context: RolloutEffortContext | None = None,
+        reward_checks: RewardChecks | None = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -626,8 +599,6 @@ class RolloutRecoveryLedger:
         attempt = sibling.current_attempt
         expected_gate_rollout_id = record.gate_rollout_id(generation_index)
         staging_keys = _receipt_staging_keys(receipt)
-        _validate_text_evidence_identity(text_penalty_evidence, gate_rollout_id)
-        _validate_effort_context_identity(effort_context, gate_rollout_id)
         if not isinstance(mask_sample, bool):
             raise TypeError("mask_sample must be a bool")
         if gate_rollout_id != expected_gate_rollout_id:
@@ -645,8 +616,7 @@ class RolloutRecoveryLedger:
                 attempt.receipt == receipt
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
-                and attempt.text_penalty_evidence == text_penalty_evidence
-                and attempt.effort_context == effort_context
+                and attempt.reward_checks == reward_checks
                 and attempt.staging_keys == staging_keys
             ):
                 return
@@ -664,8 +634,7 @@ class RolloutRecoveryLedger:
         attempt.receipt = copy.deepcopy(receipt)
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
-        attempt.text_penalty_evidence = text_penalty_evidence
-        attempt.effort_context = effort_context
+        attempt.reward_checks = reward_checks
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
@@ -725,12 +694,6 @@ class RolloutRecoveryLedger:
                     f"receipt={result.receipt.get('rollout_id')!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
-            _validate_text_evidence_identity(
-                result.text_penalty_evidence, expected_gate_rollout_id
-            )
-            _validate_effort_context_identity(
-                result.effort_context, expected_gate_rollout_id
-            )
             if not isinstance(result.mask_sample, bool):
                 raise TypeError("mask_sample must be a bool")
             validated.append((attempt, result, _receipt_staging_keys(result.receipt)))
@@ -741,8 +704,7 @@ class RolloutRecoveryLedger:
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
-            attempt.text_penalty_evidence = result.text_penalty_evidence
-            attempt.effort_context = result.effort_context
+            attempt.reward_checks = result.reward_checks
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
@@ -786,8 +748,7 @@ class RolloutRecoveryLedger:
         list[Optional[dict[str, Any]]],
         list[float],
         list[bool],
-        list[RolloutTextPenaltyEvidence | None],
-        list[RolloutEffortContext | None],
+        list[RewardChecks | None],
     ]:
         """Return sealed finalization inputs in stable sibling order."""
         record = self._require_group(group_id)
@@ -798,8 +759,7 @@ class RolloutRecoveryLedger:
         receipts: list[Optional[dict[str, Any]]] = []
         rewards: list[float] = []
         mask_sample: list[bool] = []
-        evidence: list[RolloutTextPenaltyEvidence | None] = []
-        effort_contexts: list[RolloutEffortContext | None] = []
+        checks: list[RewardChecks | None] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if (
@@ -815,16 +775,14 @@ class RolloutRecoveryLedger:
             receipts.append(copy.deepcopy(attempt.receipt))
             rewards.append(attempt.reward)
             mask_sample.append(attempt.mask_sample)
-            evidence.append(attempt.text_penalty_evidence)
-            effort_contexts.append(attempt.effort_context)
+            checks.append(attempt.reward_checks)
         return (
             record.gate_rollout_ids,
             record.logical_rollout_ids,
             receipts,
             rewards,
             mask_sample,
-            evidence,
-            effort_contexts,
+            checks,
         )
 
     def mark_finalization_started(
@@ -926,11 +884,10 @@ class RolloutRecoveryLedger:
                                     "receipt": copy.deepcopy(attempt.receipt),
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
-                                    "effort_context": attempt.effort_context.state_dict()
-                                    if attempt.effort_context is not None
-                                    else None,
-                                    "text_penalty_evidence": attempt.text_penalty_evidence.state_dict()
-                                    if attempt.text_penalty_evidence is not None
+                                    "reward_checks": dataclasses.asdict(
+                                        attempt.reward_checks
+                                    )
+                                    if attempt.reward_checks is not None
                                     else None,
                                     "staging_keys": list(attempt.staging_keys),
                                 }
@@ -1119,20 +1076,8 @@ class RolloutRecoveryLedger:
                 receipt = attempt_state.get("receipt")
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
-                raw_evidence = attempt_state.get("text_penalty_evidence")
-                evidence = (
-                    RolloutTextPenaltyEvidence.from_state_dict(raw_evidence)
-                    if raw_evidence is not None
-                    else None
-                )
-                _validate_text_evidence_identity(evidence, gate_id)
-                raw_effort_context = attempt_state.get("effort_context")
-                effort_context = (
-                    RolloutEffortContext.from_state_dict(raw_effort_context)
-                    if raw_effort_context is not None
-                    else None
-                )
-                _validate_effort_context_identity(effort_context, gate_id)
+                raw_checks = attempt_state.get("reward_checks")
+                checks = RewardChecks(**raw_checks) if raw_checks is not None else None
                 staging_keys = attempt_state.get("staging_keys")
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
@@ -1163,8 +1108,7 @@ class RolloutRecoveryLedger:
                     receipt is not None
                     or reward is not None
                     or mask_sample is not None
-                    or evidence is not None
-                    or effort_context is not None
+                    or checks is not None
                     or staging_keys
                 ):
                     raise ValueError("only sealed attempts may retain receipt data")
@@ -1175,8 +1119,7 @@ class RolloutRecoveryLedger:
                         receipt=copy.deepcopy(receipt),
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
-                        text_penalty_evidence=evidence,
-                        effort_context=effort_context,
+                        reward_checks=checks,
                         staging_keys=list(staging_keys),
                     )
                 )

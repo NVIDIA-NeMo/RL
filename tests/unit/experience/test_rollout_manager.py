@@ -2059,28 +2059,24 @@ class TestGenerateForFinalizationFlow:
         )
 
 
-def test_capture_completion_preserves_evidence_and_shaped_reward_until_finalization():
-    from nemo_rl.experience.reward_penalties import (
-        CaptureRewardPenaltyConfig,
-        compute_text_penalty_evidence,
-    )
+def test_capture_completion_preserves_checks_and_raw_reward_until_finalization():
+    from nemo_rl.experience.reward_penalties import RewardChecks
 
-    config = {"penalize_empty_final_answer": True}
-    impl = _nemo_gym_impl(True, config, log_full_result_tables=True)
-    evidence = compute_text_penalty_evidence(
-        "r", [], CaptureRewardPenaltyConfig.from_resolved(config)
+    impl = _nemo_gym_impl(
+        True, {"penalize_empty_final_answer": True}, log_full_result_tables=True
     )
+    checks = RewardChecks(False, True, True)
     result = {
         "rollout_id": "r",
         "receipt": {"rollout_id": "r", "manifest": []},
-        "text_penalty_evidence": evidence,
+        "reward_checks": checks,
         "message_log": [],
         "input_message_log": [],
         "full_result": {"reward": -2.0, "response": {"output": []}},
     }
     completions, counts = impl._results_to_completions([result])
     assert completions[0].reward == -2.0
-    assert completions[0].env_extras["ng_text_penalty_evidence"] == evidence
+    assert completions[0].env_extras["ng_reward_checks"] == checks
     assert sum(counts.values()) == 0
     assert impl._compute_reward_penalty_metrics(counts, 0) == {}
     metrics = impl._compute_rollout_metrics(completions, "agent")
@@ -2088,61 +2084,30 @@ def test_capture_completion_preserves_evidence_and_shaped_reward_until_finalizat
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
-def test_capture_manager_seals_evidence_and_forwards_it_to_reassembly(
+def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
     monkeypatch, granularity
 ):
-    from nemo_rl.experience.effort_shaping import (
-        EffortLevelsConfig,
-        compute_effort_context,
-    )
-    from nemo_rl.experience.reward_penalties import (
-        CaptureRewardPenaltyConfig,
-        compute_text_penalty_evidence,
-    )
+    from nemo_rl.experience.reward_penalties import RewardChecks
 
-    effort = EffortLevelsConfig(low_weight=1, low_string="budget")
+    checks = RewardChecks(True, True, True)
     original = _receipt_record
 
-    def with_evidence(*args, **kwargs):
+    def with_checks(*args, **kwargs):
         record = original(*args, **kwargs)
         for completion in record.completions:
-            extras = completion.env_extras
-            extras["ng_effort_context"] = compute_effort_context(
-                extras["ng_rollout_id"],
-                {
-                    "responses_create_params": {
-                        "input": [{"role": "user", "content": "budget"}]
-                    }
-                },
-                effort,
-            )
-            extras["ng_text_penalty_evidence"] = compute_text_penalty_evidence(
-                extras["ng_rollout_id"], [], CaptureRewardPenaltyConfig(True, True, ())
-            )
+            completion.env_extras["ng_reward_checks"] = checks
         return record
 
-    monkeypatch.setattr(f"{__name__}._receipt_record", with_evidence)
+    monkeypatch.setattr(f"{__name__}._receipt_record", with_checks)
     mgr = _make_capture_manager(
         _FakeCaptureBuffer(),
         recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
     )
     request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
     assert request.rewards == (0.5, 0.5)
-    assert len(request.text_penalty_evidence) == 2
-    for rid, evidence in zip(request.rollout_ids, request.text_penalty_evidence):
-        assert evidence.rollout_id == rid
-        assert evidence.empty_final_answer is True
+    assert request.reward_checks == (checks, checks)
     restored = RolloutRecoveryLedger.from_state_dict(mgr.recovery_ledger.state_dict())
     assert (
         tuple(restored.finalization_inputs(request.group_id)[5])
-        == request.text_penalty_evidence
-    )
-
-    assert len(request.effort_contexts) == 2
-    for rid, context in zip(request.rollout_ids, request.effort_contexts):
-        assert context.rollout_id == rid
-        assert context.is_low_effort is True
-    assert (
-        tuple(restored.finalization_inputs(request.group_id)[6])
-        == request.effort_contexts
+        == request.reward_checks
     )

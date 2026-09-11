@@ -87,42 +87,18 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
 
-## Reward penalties with token capture
+## Reward penalties and effort shaping with token capture
 
-With NeMo-Gym and `token_capture.enabled: true`, Single-Controller supports
-`reward_penalties.penalize_duplicated_reasoning`, `penalize_empty_final_answer`,
-and `penalize_unwanted_tokens`. These use the same penalty transformation as
-non-capture rollouts: any enabled violation replaces the reward with `0.0`,
-including a negative reward. Overlapping categories count separately but do not
-accumulate a numerical penalty.
+With NeMo-Gym and `token_capture.enabled: true`, the following existing settings
+work the same way as in non-capture rollouts:
 
 ```yaml
 reward_penalties:
   penalize_duplicated_reasoning: true
   penalize_empty_final_answer: true
   penalize_unwanted_tokens: true
-  penalize_malformed_think_tag: false
   token_ids:
-    unwanted: [12345]  # Replace with unwanted IDs from your model's tokenizer.
-```
-
-The environment checks the ordered scored `response.output` for duplicated
-reasoning and empty final answers, preserving the final-function-call exception.
-It produces versioned Boolean evidence bound to the physical rollout. The rollout
-manager seals this evidence alongside the raw Gym reward and, when effort shaping
-is active, the original prompt's low/high-effort classification.
-
-The finalizer verifies the selected token chain, applies effort shaping using the
-terminal call's generated length, and then applies all three enabled penalties
-before publishing `total_reward` for advantage estimation. Any violation sets the
-reward to exactly zero, including when the shaped reward was negative. Unwanted
-IDs are checked across generated spans, including terminal tokens; prompt tokens,
-tool responses, and abandoned branches do not trigger this penalty. Capture token
-IDs, logprobs, and training masks retain their existing behavior.
-
-Effort shaping uses the existing `env.nemo_gym.effort_levels` configuration:
-
-```yaml
+    unwanted: [12345]  # Replace with IDs from your model's tokenizer.
 env:
   nemo_gym:
     effort_levels:
@@ -132,47 +108,37 @@ env:
       low_string: "<budget>"
 ```
 
-These are example overrides; defaults remain unchanged. Setting `low_weight <= 0`
-or leaving `low_string` empty disables shaping. An active configuration requires
-`low_ub > 0`. Both paths use the same last-user-message classification and formula:
+The manager checks the scored `response.output` and classifies the original
+prompt using the last user message. The finalizer shapes the raw reward using
+**the terminal call's generated length**, then sets it to `0.0` if any enabled
+penalty matches, including when the shaped reward is negative. Unwanted IDs are
+checked across all selected generated spans, including terminal tokens; prompt,
+tool, and abandoned-branch tokens do not count. The final-function-call exception
+for empty answers is preserved. Token IDs, logprobs, and training masks keep their
+existing behavior.
+
+Both paths share the classification, text checks, token membership check, and
+shaping formula. For low-effort prompts:
 
 ```text
-length_reward = min(1, low_weight * (1 - terminal_generation_length / low_ub))
-reward = raw_reward + raw_reward * max(length_reward, 0)
-                    + low_penalty * min(length_reward, 0)
+term = min(1, low_weight * (1 - terminal_generation_length / low_ub))
+reward = raw_reward + raw_reward * max(term, 0) + low_penalty * min(term, 0)
 ```
 
-Capture reads the verified terminal generation span, excluding carry tokens and
-previous calls. It does not use accumulated response usage. Thus a 900-token call
-followed by a 100-token final call is shaped using 100 tokens in both paths.
-The full generated call counts, including reasoning and terminal tokens.
-High-effort prompts retain their raw rewards.
+Setting `low_weight <= 0` or an empty `low_string` disables shaping. Active
+shaping requires `low_ub > 0`. High-effort rewards remain unchanged. A 900-token
+call followed by a 100-token call uses 100 tokens for shaping in both paths.
 
-Recovery schema 4 saves raw rewards, text evidence, and effort context for
-unfinished rollouts in both sibling and prompt-group recovery modes. The context
-includes a configuration/semantics fingerprint and rollout identity. Finalization
-uses these saved inputs without reclassifying a rehydrated prompt. Missing or
-incompatible required context rejects a row through the existing masked-placeholder
-path. Already-finalized canonical rows retain their saved rewards, so recovery
-does not shape them again. Migration of checkpoints predating this effort-shaping
-change is outside scope.
+Recovery saves raw rewards and three Boolean checks per unfinished rollout, and
+reward settings once per checkpoint. Restoring with different reward settings
+fails before replay. Finalized rows retain their saved rewards. Migration of
+older capture checkpoints is outside scope.
 
-`reasoning_equal_to_final_answer_rate`, `empty_final_answer_rate`, and
-`unwanted_token_rate` count each enabled category once per valid finalized
-rollout. Counts and valid-row denominators are pooled across groups. Final reward
-mean, minimum, maximum, and sample standard deviation use the same population;
-infrastructure rejections are reported separately.
-
-Capture retains `mean_length_reward_low`, `mean_reward_low`, and the low/high
-length means and medians. `mean_reward_low` measures the effort-shaped reward
-before reward zeroing. Exact length frequencies preserve medians across unequal
-groups. Pending group statistics survive checkpoints and are consumed once when
-training commits; capture suppresses rollout-stage duplicates.
-
-Malformed-thinking reward penalties and both message-level advantage overrides
-remain unsupported with capture and fail at setup. Reward parity applies to
-matching scored output and valid selected trajectories with the same raw reward
-and configuration, including when effort shaping is enabled.
+Penalty rates and final reward statistics use valid finalized rows. Existing
+low/high effort means and exact length medians are preserved; `mean_reward_low`
+measures the shaped reward before penalties. Pending statistics survive recovery
+and are consumed once. Malformed-thinking penalties and message-level advantage
+overrides remain unsupported with capture and fail at setup.
 
 ## Checkpointing and Replay Recovery
 

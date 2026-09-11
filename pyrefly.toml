@@ -25,7 +25,6 @@ replace-imports-with-any = [
 ]
 project-includes = [
   "nemo_rl/experience/reward_penalties.py",
-    "nemo_rl/experience/effort_shaping.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
   #"examples/**/*.py",

@@ -29,9 +29,7 @@ pytestmark = pytest.mark.nemo_gym
 
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
-    env = object.__new__(env_cls)
-    env.cfg = {}
-    return env
+    return object.__new__(env_cls)
 
 
 def _digest(label: str) -> str:
@@ -400,39 +398,3 @@ def test_postprocess_passes_the_scored_response_to_attribution() -> None:
     receipt = result["receipt"]
     assert receipt["terminal_model_call_id"] == "c2"
     assert receipt["terminal_selection"] == "response_id"
-
-
-def test_receipt_postprocessing_records_text_evidence_without_zeroing_reward():
-    from nemo_rl.experience.reward_penalties import CaptureRewardPenaltyConfig
-
-    env = _capture_env()
-    env.cfg = {"capture_reward_penalties": CaptureRewardPenaltyConfig(True, True, ())}
-    env._control = AsyncMock(
-        return_value={
-            "rollout_id": "r0",
-            "records": [_manifest_record("c1")],
-            "failures": [],
-        }
-    )
-    result = asyncio.run(
-        env._postprocess_receipt_mode(
-            {"_ng_rollout_id": "r0"},
-            {
-                "reward": -2.0,
-                "response": {
-                    "output": [
-                        {"type": "reasoning", "summary": [{"text": "a"}]},
-                        {"content": "a"},
-                        {"content": " "},
-                    ]
-                },
-            },
-        )
-    )
-    evidence = result["text_penalty_evidence"]
-    assert evidence.rollout_id == "r0"
-    assert evidence.duplicated_reasoning is True
-    assert evidence.empty_final_answer is True
-    assert result["full_result"]["reward"] == -2.0
-    assert result["receipt"]["reward"] == -2.0
-    assert result["message_log"] == []

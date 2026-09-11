@@ -40,7 +40,6 @@ from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.experience.effort_shaping import compute_effort_context
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -59,6 +58,7 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.reward_penalties import compute_reward_checks
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
@@ -1149,10 +1149,8 @@ class AsyncNemoGymRolloutImpl:
             received.add(rowidx)
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
             if "receipt" in result:
-                # Seal raw capture rewards and original prompt classification.
-                # The finalizer shapes once, using verified terminal length.
-                result["effort_context"] = compute_effort_context(
-                    result["rollout_id"], inputs_by_rowidx[rowidx], self._effort_config
+                result["reward_checks"] = compute_reward_checks(
+                    result["full_result"], inputs_by_rowidx[rowidx], self._effort_config
                 )
             else:
                 shaping_by_rowidx[rowidx] = _apply_effort_shaping(
@@ -1377,10 +1375,7 @@ class AsyncNemoGymRolloutImpl:
                 env_extras = dict(result["full_result"])
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
-                env_extras["ng_effort_context"] = result.get("effort_context")
-                env_extras["ng_text_penalty_evidence"] = result.get(
-                    "text_penalty_evidence"
-                )
+                env_extras["ng_reward_checks"] = result.get("reward_checks")
                 completions.append(
                     Completion(
                         message_log=result["message_log"],
@@ -1514,8 +1509,7 @@ class AsyncNemoGymRolloutImpl:
             {
                 k: v
                 for k, v in (c.env_extras or {}).items()
-                if k
-                not in ("ng_receipt", "ng_text_penalty_evidence", "ng_effort_context")
+                if k not in ("ng_receipt", "ng_reward_checks")
                 and not (receipt_mode and k == "reward")
             }
             for c in completions
@@ -2226,8 +2220,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
-                    text_penalty_evidence=env_extras.get("ng_text_penalty_evidence"),
-                    effort_context=env_extras.get("ng_effort_context"),
+                    reward_checks=env_extras.get("ng_reward_checks"),
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2257,8 +2250,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
-                    text_penalty_evidence=env_extras.get("ng_text_penalty_evidence"),
-                    effort_context=env_extras.get("ng_effort_context"),
+                    reward_checks=env_extras.get("ng_reward_checks"),
                 )
 
         try:
@@ -2290,16 +2282,14 @@ class RolloutManager:
                 receipts,
                 rewards,
                 mask_sample,
-                text_penalty_evidence,
-                effort_contexts,
+                reward_checks,
             ) = self._recovery_ledger.finalization_inputs(group_id)
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
                 canonical_sample_ids=tuple(canonical_sample_ids),
                 receipts=tuple(receipts),
-                text_penalty_evidence=tuple(text_penalty_evidence),
-                effort_contexts=tuple(effort_contexts),
+                reward_checks=tuple(reward_checks),
                 rewards=tuple(rewards),
                 fallback_weight_version=start_version,
                 prompt_idx=int(recovery_group.prompt_id),

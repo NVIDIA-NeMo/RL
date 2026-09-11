@@ -1,20 +1,20 @@
-"""Differential reward semantics and evidence compatibility without token decoding."""
+"""Capture reward parity with the standard path, without token decoding."""
 
-from dataclasses import replace
 from itertools import product
 
 import pytest
 
+from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.experience.reward_penalties import (
-    CaptureRewardPenaltyConfig,
-    RolloutTextPenaltyEvidence,
     aggregate_capture_reward_metrics,
-    compute_text_penalty_evidence,
-    finalize_reward_penalties,
+    compute_reward_checks,
+    finalize_capture_reward,
     has_duplicated_reasoning,
     has_empty_final_answer,
 )
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
+    _apply_effort_shaping,
     apply_reward_penalties,
     resolve_reward_penalty_config,
 )
@@ -81,7 +81,7 @@ def test_inline_and_capture_reward_parity(flags, reward, output, duplicated, emp
         },
         None,
     )
-    config = CaptureRewardPenaltyConfig.from_resolved(resolved)
+    config = RewardPenaltyConfig.model_validate(resolved)
     result = {
         "full_result": {"reward": reward, "response": {"output": output}},
         "message_log": [
@@ -92,15 +92,14 @@ def test_inline_and_capture_reward_parity(flags, reward, output, duplicated, emp
         ],
     }
     expected = apply_reward_penalties([result], resolved)
-    evidence = compute_text_penalty_evidence("r", output, config)
-    evidence = RolloutTextPenaltyEvidence.from_state_dict(evidence.state_dict())
-    actual_reward, counts = finalize_reward_penalties(
-        "r",
+    checks = compute_reward_checks(result["full_result"], {}, None)
+    actual_reward, counts, _ = finalize_capture_reward(
         reward,
-        evidence,
-        config,
-        [99, 10, 11, 99, 12, 99],
-        [("c1", 2, 1), ("c2", 1, 2)],
+        checks=checks,
+        penalty_config=config,
+        effort_config=None,
+        token_ids=[99, 10, 11, 99, 12, 99],
+        link_spans=[("c1", 2, 1), ("c2", 1, 2)],
     )
     assert actual_reward == result["full_result"]["reward"]
     assert counts == {k: expected[k] for k in counts}
@@ -115,59 +114,18 @@ def test_inline_and_capture_reward_parity(flags, reward, output, duplicated, emp
     ],
 )
 def test_generated_spans_only_including_each_terminal(ids, expected):
-    reward, counts = finalize_reward_penalties(
-        "r",
+    reward, counts, _ = finalize_capture_reward(
         -1.0,
-        None,
-        CaptureRewardPenaltyConfig(False, False, (99,)),
-        ids,
-        [("c1", 2, 1), ("c2", 1, 2)],
+        checks=None,
+        effort_config=None,
+        penalty_config=RewardPenaltyConfig(
+            penalize_unwanted_tokens=True, token_ids={"unwanted": [99]}
+        ),
+        token_ids=ids,
+        link_spans=[("c1", 2, 1), ("c2", 1, 2)],
     )
     assert reward == (0.0 if expected else -1.0)
     assert counts["unwanted_token"] == int(expected)
-
-
-@pytest.mark.parametrize(
-    "change,reason",
-    [
-        ({"schema_version": 2}, "incompatible"),
-        ({"semantics_fingerprint": "future"}, "incompatible"),
-        ({"rollout_id": "other"}, "identity"),
-        ({"duplicated_reasoning": None}, "unevaluated"),
-        ({"empty_final_answer": None}, "unevaluated"),
-    ],
-)
-def test_incompatible_evidence_rejected(change, reason):
-    config = CaptureRewardPenaltyConfig(True, True, ())
-    evidence = replace(compute_text_penalty_evidence("r", [], config), **change)
-    with pytest.raises(ValueError, match=reason):
-        finalize_reward_penalties("r", 1.0, evidence, config, [], [])
-
-
-def test_old_checkpoints_require_evidence_only_when_text_checks_enabled():
-    with pytest.raises(ValueError, match="missing_text_evidence"):
-        finalize_reward_penalties(
-            "r", 1.0, None, CaptureRewardPenaltyConfig(True, False, ()), [], []
-        )
-    assert (
-        finalize_reward_penalties(
-            "r",
-            1.0,
-            None,
-            CaptureRewardPenaltyConfig(False, False, (99,)),
-            [99],
-            [("c", 0, 1)],
-        )[0]
-        == 0.0
-    )
-
-
-@pytest.mark.parametrize("spans", [[("c", -1, 2)], [("c", 0, 2)], [("c", 0, 0)], []])
-def test_span_coverage_is_validated(spans):
-    with pytest.raises(ValueError, match="span"):
-        finalize_reward_penalties(
-            "r", 1.0, None, CaptureRewardPenaltyConfig(False, False, (99,)), [99], spans
-        )
 
 
 def test_metric_pooling_uses_valid_rollouts_and_legacy_names():
@@ -193,13 +151,96 @@ def test_metric_pooling_uses_valid_rollouts_and_legacy_names():
     assert aggregate_capture_reward_metrics({"finalize/reward_count": [0]}) == {}
 
 
+def _input(*messages):
+    return {"responses_create_params": {"input": list(messages)}}
+
+
+LOW = _input({"role": "user", "content": "budget"})
+CONFIG = EffortLevelsConfig(
+    low_weight=1, low_penalty=1, low_ub=1000, low_string="budget"
+)
+
+
+@pytest.mark.parametrize("reward", [-2.0, 0.0, 2.0])
+@pytest.mark.parametrize("length", [1, 100, 900, 1000, 1200, 2500])
+@pytest.mark.parametrize("weight", [0.0, -1.0, 1.0, 3.0])
+@pytest.mark.parametrize("low", [True, False])
+def test_finalized_effort_matches_inline_formula_and_metrics(
+    reward, length, weight, low
+):
+    config = CONFIG.model_copy(update={"low_weight": weight})
+    prompt = LOW if low else _input({"role": "user", "content": "explain fully"})
+    inline = {
+        "message_log": [
+            {"role": "assistant", "token_ids": [9] * 900},
+            {"role": "user", "token_ids": [4] * 17},
+            {"role": "assistant", "token_ids": [8] * length},
+        ],
+        "full_result": {"reward": reward},
+    }
+    expected_metrics = _apply_effort_shaping([inline], [prompt], config)
+    checks = compute_reward_checks({}, prompt, config)
+    actual, _, metrics = finalize_capture_reward(
+        reward,
+        checks=checks,
+        effort_config=config,
+        penalty_config=None,
+        token_ids=[9] * 900 + [8] * length,
+        link_spans=[("c1", 0, 900), ("c2", 0, length)],
+    )
+    assert actual == inline["full_result"]["reward"]
+    if weight > 0:
+        bucket = "low" if low else "high"
+        assert metrics[f"finalize/effort/{bucket}/{length}"] == 1
+        if low:
+            assert (
+                metrics["finalize/effort/reward_sum"] == expected_metrics.rewards_low[0]
+            )
+            assert (
+                metrics["finalize/effort/length_reward_sum"]
+                == expected_metrics.length_rewards_low[0]
+            )
+    else:
+        assert metrics == {}
+    if weight > 0 and low:
+        term = min(1, weight * (1 - length / 1000))
+        assert actual == reward + reward * max(term, 0) + min(term, 0)
+
+
 @pytest.mark.parametrize(
-    "config,reason",
+    "messages,expected",
     [
-        ({"penalize_malformed_think_tag": True}, "does not support"),
-        ({"penalize_unwanted_tokens": True}, "must be set"),
+        (
+            [
+                {"role": "user", "content": "budget"},
+                {"role": "assistant", "content": "tools"},
+            ],
+            True,
+        ),
+        (
+            [
+                {"role": "user", "content": "budget"},
+                {"role": "user", "content": "long"},
+            ],
+            False,
+        ),
+        ([{"role": "user", "content": "budget"}, {"role": "user"}], True),
+        ([{"role": "system", "content": "budget"}], False),
+        (
+            [{"role": "user", "content": [{"type": "input_text", "text": "budget"}]}],
+            False,
+        ),
     ],
 )
-def test_capture_config_rejects_unsupported_or_unresolved_options(config, reason):
-    with pytest.raises(ValueError, match=reason):
-        CaptureRewardPenaltyConfig.from_resolved(config)
+def test_classification_retains_original_last_user_membership_rule(messages, expected):
+    assert compute_reward_checks({}, _input(*messages), CONFIG).low_effort is expected
+
+
+@pytest.mark.parametrize("bound", [0, -1])
+def test_active_effort_requires_positive_bound(bound):
+    with pytest.raises(ValueError, match="low_ub"):
+        EffortLevelsConfig(low_weight=1, low_string="budget", low_ub=bound)
+    assert (
+        EffortLevelsConfig(low_weight=0, low_string="budget", low_ub=bound).low_ub
+        == bound
+    )

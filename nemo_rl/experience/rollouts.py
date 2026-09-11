@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import json
+import statistics
 import uuid
 import warnings
 from collections import defaultdict
@@ -27,7 +28,7 @@ from typing import Any, Optional
 
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
@@ -60,20 +61,6 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.experience.effort_shaping import (
-    EffortLevelsConfig as EffortLevelsConfig,
-)
-from nemo_rl.experience.effort_shaping import (
-    EffortShapingMetrics as _EffortShapingMetrics,
-)
-from nemo_rl.experience.effort_shaping import (
-    effort_shaping_enabled,
-    is_low_effort,
-    shape_effort_reward,
-)
-from nemo_rl.experience.effort_shaping import (
-    effort_shaping_metrics as _effort_shaping_metrics,
-)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -82,8 +69,12 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.reward_penalties import (
+    effort_shaping_enabled,
     has_duplicated_reasoning,
     has_empty_final_answer,
+    has_unwanted_tokens,
+    is_low_effort,
+    shape_effort_reward,
 )
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -417,6 +408,46 @@ def backfill_missing_routed_experts(
     return backfilled_counts
 
 
+class EffortLevelsConfig(BaseModel, extra="allow"):
+    """Controls length-based reward shaping for low-effort prompts.
+
+    When a prompt contains ``low_string``, the final reward is adjusted by a
+    length-reward term that penalises overly long responses.  The reward formula
+    is::
+
+        length_reward = min(1, low_weight * (1 - response_len / low_ub))
+        new_reward    = orig_reward
+                      + orig_reward * max(length_reward, 0)
+                      + low_penalty * min(length_reward, 0)
+
+    Setting ``low_weight = 0`` or leaving ``low_string`` empty disables the
+    shaping entirely.
+    """
+
+    low_weight: float = 0.0
+    """Weight applied to the length-reward term.  Set to 0 to disable."""
+    low_penalty: float = 1.0
+    """Coefficient for the negative length-reward penalty."""
+    low_ub: int = 64000
+    """Response-length upper bound (in tokens) used to normalise the term."""
+    low_string: str = ""
+    """Substring that must appear in the user prompt to trigger shaping."""
+
+    @model_validator(mode="after")
+    def validate_length_bound(self) -> "EffortLevelsConfig":
+        if self.low_weight > 0 and self.low_string and self.low_ub <= 0:
+            raise ValueError("active effort shaping requires low_ub > 0")
+        return self
+
+
+@dataclass
+class _EffortShapingMetrics:
+    length_rewards_low: list[float]
+    rewards_low: list[float]
+    low_lengths: list[int]
+    high_lengths: list[int]
+
+
 def _terminal_completion_length(result: dict) -> Optional[int]:
     """Return inline terminal assistant length; capture is shaped after verification."""
     message_log = result.get("message_log") or []
@@ -474,6 +505,38 @@ def _apply_effort_shaping(
     return _EffortShapingMetrics(
         length_rewards_low, rewards_low, low_lengths, high_lengths
     )
+
+
+def _effort_shaping_metrics(shaping: _EffortShapingMetrics) -> dict[str, float]:
+    """Build the rollout-metric entries for one group's effort-shaping lists.
+
+    Shared by the batched v1 path and the SingleController rollout manager so the
+    two cannot drift apart.
+
+    Args:
+        shaping: Per-sample tracking lists returned by ``_apply_effort_shaping``.
+
+    Returns:
+        Metric name to value. Empty only when shaping was disabled; callers
+        ``update`` an existing dict, so an absent key leaves the metric unreported
+        rather than reporting a zero.
+    """
+    metrics: dict[str, float] = {}
+    if shaping.length_rewards_low:
+        metrics["mean_length_reward_low"] = sum(shaping.length_rewards_low) / len(
+            shaping.length_rewards_low
+        )
+    if shaping.rewards_low:
+        metrics["mean_reward_low"] = sum(shaping.rewards_low) / len(shaping.rewards_low)
+    if shaping.low_lengths:
+        metrics["mean_length_low"] = sum(shaping.low_lengths) / len(shaping.low_lengths)
+        metrics["median_length_low"] = float(statistics.median(shaping.low_lengths))
+    if shaping.high_lengths:
+        metrics["mean_length_high"] = sum(shaping.high_lengths) / len(
+            shaping.high_lengths
+        )
+        metrics["median_length_high"] = float(statistics.median(shaping.high_lengths))
+    return metrics
 
 
 def generate_responses(
@@ -2114,15 +2177,14 @@ def apply_reward_penalties(
             reward_penalty_config, "unwanted"
         )
         for result in results:
-            has_unwanted_token = False
-            for msg in result["message_log"]:
-                if msg["role"] != "assistant":
-                    continue
-                # Penalize any configured unwanted token in the assistant generation,
-                # including the terminal position.
-                if any(token_id in msg["token_ids"] for token_id in unwanted_token_ids):
-                    has_unwanted_token = True
-                    break
+            has_unwanted_token = has_unwanted_tokens(
+                (
+                    msg["token_ids"]
+                    for msg in result["message_log"]
+                    if msg["role"] == "assistant"
+                ),
+                unwanted_token_ids,
+            )
             if has_unwanted_token:
                 result["full_result"]["reward"] = 0.0
 
