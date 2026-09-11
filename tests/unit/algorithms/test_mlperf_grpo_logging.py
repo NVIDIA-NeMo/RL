@@ -145,6 +145,21 @@ def test_mlperf_grpo_logger_tracks_lifecycle_and_target() -> None:
     logger.start_eval(2)
     logger.end_eval(2, {"accuracy": 0.8})
 
+    # The train block is open, so the eval is held until the step's train
+    # metrics are logged: they land before BLOCK_STOP and run_stop.
+    assert not logger.run_stopped
+    logger.observe_metrics(
+        {"loss": 0.1, "reward": 0.1},
+        step=2,
+        prefix="train",
+    )
+    logger.observe_metrics(
+        {"total_step_time": 1.0},
+        step=2,
+        prefix="timing/train",
+        step_finished=True,
+    )
+
     assert logger.target_reached
     assert logger.run_stopped
     assert not logger.block_started
@@ -284,3 +299,90 @@ def test_mlperf_final_eval_defers_run_stop_until_train_metrics() -> None:
         "samples_count": final_step * config["policy"]["train_global_batch_size"],
         "status": "aborted",
     }
+
+
+def test_mlperf_held_eval_orders_train_stats_before_block_stop() -> None:
+    """A target-reaching eval must not suppress the final step's train stats."""
+    config = _config()
+    fake = _FakeMLLogger()
+    logger = MLPerfGRPOLogger(config, mllogger=fake)
+    logger.log_init_stop_run_start()
+    logger.start_train_block(0)
+
+    # The trainers validate mid-step and log the step's train metrics after.
+    logger.start_eval(2)
+    assert not any(
+        method == "start" and kwargs.get("key") == "eval_start"
+        for method, kwargs in fake.calls
+    ), "held eval must not open the eval interval while a train block is open"
+    logger.end_eval(2, {"accuracy": 0.9}, {"total_validation_time": 2.0})
+    logger.observe_metrics(
+        {"loss": 0.2, "reward": 0.4}, step=2, prefix="train"
+    )
+    logger.observe_metrics(
+        {"total_step_time": 3.0}, step=2, prefix="timing/train", step_finished=True
+    )
+
+    def _index(method: str, key: str) -> int:
+        return next(
+            index
+            for index, (m, kwargs) in enumerate(fake.calls)
+            if m == method and kwargs.get("key") == key
+        )
+
+    train_stats_index = next(
+        index
+        for index, (m, kwargs) in enumerate(fake.calls)
+        if m == "event"
+        and kwargs.get("key") == "tracked_stats"
+        and kwargs.get("value", {}).get("reward") == 0.4
+    )
+    block_stop_index = _index("end", "block_stop")
+    assert train_stats_index < block_stop_index
+    assert block_stop_index < _index("start", "eval_start")
+    assert _index("event", "eval_accuracy") < _index("end", "eval_stop")
+    assert _index("end", "eval_stop") < _index("end", "run_stop")
+    # Held eval events are backdated by the validation duration.
+    assert fake.calls[_index("start", "eval_start")][1].get("time_ms")
+    assert fake.calls[block_stop_index][1].get("time_ms")
+    assert logger.run_stopped
+    assert fake.calls[-1] == (
+        "end",
+        {"key": "run_stop", "metadata": {"samples_count": 16, "status": "success"}},
+    )
+
+
+def test_mlperf_defer_run_stop_suppresses_terminal_events() -> None:
+    """Deferred (offline) evaluation: training emits no run_stop."""
+    config = _config()
+    config["logger"]["mlperf"]["defer_run_stop"] = True
+    fake = _FakeMLLogger()
+    logger = MLPerfGRPOLogger(config, mllogger=fake)
+    logger.log_init_stop_run_start()
+    logger.start_train_block(0)
+    logger.observe_metrics({"loss": 0.2, "reward": 0.4}, step=1, prefix="train")
+
+    # Trainer epilogue: finalize is a no-op while deferred.
+    logger.finalize()
+    assert not logger.run_stopped
+    assert logger.block_started
+
+    # The driver closes the train block at the final weight-update time; the
+    # offline evaluator owns run_stop.
+    logger.stop_train_block(3, time_ms=1_700_000_000_000)
+    block_stop = fake.calls[-1]
+    assert block_stop[0] == "end" and block_stop[1]["key"] == "block_stop"
+    assert block_stop[1]["time_ms"] == 1_700_000_000_000
+    assert block_stop[1]["metadata"]["samples_count"] == 24
+    assert not any(
+        method == "end" and kwargs.get("key") == "run_stop"
+        for method, kwargs in fake.calls
+    )
+
+    # Failure path: the driver flips the flag and finalizes normally.
+    logger.defer_run_stop = False
+    logger.finalize()
+    assert fake.calls[-1] == (
+        "end",
+        {"key": "run_stop", "metadata": {"samples_count": 24, "status": "aborted"}},
+    )
