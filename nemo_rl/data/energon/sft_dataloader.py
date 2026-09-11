@@ -34,6 +34,7 @@ from megatron.energon import (
     get_train_dataset,
     get_val_dataset,
 )
+from megatron.energon.epathlib import epath as energon_epath
 
 from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonSourceConfig
 from nemo_rl.data.energon.multimodal.registry import (
@@ -50,6 +51,12 @@ from nemo_rl.data.packing import get_packer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 _V2_STATE_FORMAT_VERSION = 2
+
+
+def _set_nvdataset_cache_dir(path: str) -> None:
+    """Update both forms of Energon's process-local DSS cache setting."""
+    os.environ["NVDATASET_CACHE_DIR"] = path
+    energon_epath.NVDATASET_CACHE_DIR = energon_epath.EPath(path)
 
 
 def compact_sample_error_handler(
@@ -219,7 +226,10 @@ def _loader_config(value: Any) -> EnergonLoaderConfig:
         raise ValueError(
             f"Unknown data-loader topology mapper {config.topology_mapper!r}."
         )
-    if config.task_encoder.name == "generic_sft" and config.task_encoder.options:
+    if (
+        config.task_encoder.name == "generic_sft"
+        and config.task_encoder.options.model_fields_set
+    ):
         raise ValueError(
             f"Task encoder {config.task_encoder.name!r} has no configurable options."
         )
@@ -371,7 +381,11 @@ def _task_encoder(
     encoder_type = cast(
         Any, TASK_ENCODER_REGISTRY.resolve(loader_config.task_encoder.name)
     )
-    encoder_options: dict[str, Any] = dict(loader_config.task_encoder.options)
+    encoder_options = (
+        loader_config.task_encoder.options.model_dump()
+        if loader_config.task_encoder.name == "nemotron_multimodal"
+        else {}
+    )
     packer = (
         get_packer(
             packing_algorithm,
@@ -425,6 +439,8 @@ def build_energon_sft_loader(
 
     resolved_source = _source_config(source, name=split_role)
     loader_config = _loader_config(data_config["energon"])
+    if loader_config.nvdataset_cache_dir is not None:
+        _set_nvdataset_cache_dir(loader_config.nvdataset_cache_dir)
     if loader_config.packing_buffer_size is not None and packing_algorithm is None:
         raise ValueError("Energon packing requires a packing algorithm.")
     adapter = build_processor_adapter(
@@ -485,8 +501,16 @@ def build_energon_sft_loader(
             task_encoder=task_encoder,
         )
 
+    cache_pool_kwargs: dict[str, Any] = {
+        "method": "raw",
+        "num_workers": loader_config.cache_pool_num_workers,
+    }
+    if loader_config.cache_pool_max_gbytes is not None:
+        cache_pool_kwargs["max_cache_size_gbytes"] = (
+            loader_config.cache_pool_max_gbytes
+        )
     cache_pool = (
-        FileStoreCachePool(method="raw")
+        FileStoreCachePool(**cache_pool_kwargs)
         if any(cooker.need_cache for cooker in task_encoder.cookers)
         else None
     )
@@ -496,6 +520,7 @@ def build_energon_sft_loader(
         checkpoint_every_sec=loader_config.checkpoint_every_sec,
         prefetch_factor=loader_config.prefetch_factor,
         watchdog_timeout_seconds=loader_config.watchdog_timeout_seconds,
+        gc_collect_every_n_steps=loader_config.gc_collect_every_n_steps,
         fail_on_timeout=True,
     )
     return EnergonSFTDataLoader(

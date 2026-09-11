@@ -134,6 +134,83 @@ COOKER_REGISTRY.register(
     import_path=("nemo_rl.data.energon.multimodal.cookers.generic:cook_conversation"),
     version="1",
 )
+COOKER_REGISTRY.register(
+    "nemotron_conversation",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:cook_nemotron_conversation"
+    ),
+    version="1",
+)
+COOKER_REGISTRY.register(
+    "nemotron_general_conversations_webdataset",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:"
+        "cook_general_conversations_webdataset"
+    ),
+    version="1",
+)
+COOKER_REGISTRY.register(
+    "nemotron_general_conversations_jsonl",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:"
+        "cook_general_conversations_jsonl"
+    ),
+    version="1",
+)
+COOKER_REGISTRY.register(
+    "nemotron_general_conversations_jsonl_explicit_loss_v1",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:"
+        "cook_general_conversations_jsonl_explicit_loss_v1"
+    ),
+    version="1",
+)
+COOKER_REGISTRY.register(
+    "nemotron_granary_english_webdataset",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:"
+        "cook_granary_english_webdataset"
+    ),
+    version="1",
+)
+COOKER_REGISTRY.register(
+    "nemotron_granary_english_jsonl",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:cook_granary_english_jsonl"
+    ),
+    version="1",
+)
+COOKER_REGISTRY.register(
+    "nemotron_nano_openai_messages_jsonl",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:"
+        "cook_nano_openai_messages_jsonl"
+    ),
+    version="1",
+)
+COOKER_REGISTRY.register(
+    "nemotron_nano_openai_messages_offline_packed_jsonl",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:"
+        "cook_nano_openai_messages_offline_packed_jsonl"
+    ),
+    version="1",
+)
+COOKER_REGISTRY.register(
+    "nemotron_audio_conversation_jsonl",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:cook_audio_conversation_jsonl"
+    ),
+    version="1",
+)
+COOKER_REGISTRY.register(
+    "nemotron_omcat_legacy_conversation_monolithic",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.cookers.nemotron:"
+        "cook_omcat_legacy_conversation_monolithic"
+    ),
+    version="1",
+)
 
 TASK_ENCODER_REGISTRY = LazyRegistry("task_encoder")
 TASK_ENCODER_REGISTRY.register(
@@ -141,6 +218,14 @@ TASK_ENCODER_REGISTRY.register(
     import_path=(
         "nemo_rl.data.energon.multimodal.task_encoders.generic_sft:"
         "GenericSFTTaskEncoder"
+    ),
+    version="1",
+)
+TASK_ENCODER_REGISTRY.register(
+    "nemotron_multimodal",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.task_encoders.nemotron_multimodal:"
+        "NemotronMultiModalTaskEncoder"
     ),
     version="1",
 )

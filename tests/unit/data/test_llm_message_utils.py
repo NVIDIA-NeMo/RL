@@ -1049,3 +1049,85 @@ def test_get_formatted_message_log_debug_enabled(
     captured = capsys.readouterr()
     assert "DEBUG: Individual message turns from apply_chat_template" in captured.out
     assert "DEBUG: Complete formatted conversation:" in captured.out
+
+
+class _CharacterTokenizer:
+    """Small tokenizer that exposes offsets without applying a chat template."""
+
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        assert not add_special_tokens
+        return [ord(character) for character in text]
+
+    def __call__(
+        self,
+        text: str,
+        *,
+        add_special_tokens: bool,
+        return_offsets_mapping: bool = False,
+    ) -> dict[str, list[Any]]:
+        assert not add_special_tokens
+        result: dict[str, list[Any]] = {
+            "input_ids": self.encode(text, add_special_tokens=False)
+        }
+        if return_offsets_mapping:
+            result["offset_mapping"] = [
+                (index, index + 1) for index in range(len(text))
+            ]
+        return result
+
+
+def test_get_formatted_message_log_can_skip_chat_template():
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": "<user>hi"},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "<assistant>hello"}],
+        },
+    ]
+
+    result = get_formatted_message_log(
+        message_log,
+        _CharacterTokenizer(),
+        TaskDataSpec(task_name="test"),
+        skip_chat_template=True,
+    )
+
+    assert [message["content"] for message in result] == [
+        "<user>hi",
+        "<assistant>hello",
+    ]
+    assert [message["token_ids"].tolist() for message in result] == [
+        [ord(character) for character in "<user>hi"],
+        [ord(character) for character in "<assistant>hello"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("message_log", "kwargs", "error"),
+    [
+        (
+            [{"role": "user", "content": "already rendered"}],
+            {"add_generation_prompt": True},
+            "add_generation_prompt",
+        ),
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": "image.png"}],
+                }
+            ],
+            {},
+            "text-only",
+        ),
+    ],
+)
+def test_skip_chat_template_rejects_unsupported_input(message_log, kwargs, error):
+    with pytest.raises(ValueError, match=error):
+        get_formatted_message_log(
+            message_log,
+            _CharacterTokenizer(),
+            TaskDataSpec(task_name="test"),
+            skip_chat_template=True,
+            **kwargs,
+        )
