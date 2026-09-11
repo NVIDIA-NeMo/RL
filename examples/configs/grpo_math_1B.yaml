@@ -398,6 +398,8 @@ policy:
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
     # Non-colocated vLLM or Megatron generation supports nccl_reshard (M-to-N).
     refit_transport: null
+    # Optional deadline for one legacy GRPO refit. null keeps the unbounded wait.
+    refit_timeout_s: null
     # vLLM backend only - sglang/megatron/trtllm/dynamo require this to remain null.
     # Selects the NeMo-RL Ray actor class, NOT vLLM's own `worker_extension_cls`.
     worker_extension_cls_fqn: null # optional registered vLLM generation-worker subclass; mutually exclusive with quant_cfg
