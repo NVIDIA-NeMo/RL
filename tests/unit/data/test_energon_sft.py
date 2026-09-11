@@ -490,14 +490,30 @@ def test_energon_config_validates_sequence_packing():
     )
     assert source.virtual_epoch_length == 10
     packed = EnergonLoaderConfig(
-        model_family="qwen", packing_buffer_size=10, max_samples_per_sequence=2
+        model_family="qwen",
+        max_samples_per_sequence=2,
+        task_encoder={
+            "packing": {
+                "name": "balanced_greedy_knapsack",
+                "buffer_size": 10,
+                "options": {
+                    "max_sequence_length": 128,
+                    "sequence_length_pad_multiple": 8,
+                    "balanced_knapsack_delta": 5,
+                },
+            }
+        },
     )
-    assert packed.packing_buffer_size == 10
+    assert packed.packing_buffer_size is None
+    assert packed.task_encoder.packing is not None
+    assert packed.task_encoder.packing.buffer_size == 10
     assert packed.max_samples_per_sequence == 2
-    for field in ("packing_buffer_size", "max_samples_per_sequence"):
+    for field in ("max_samples_per_sequence",):
         for value in (0, -1):
             with pytest.raises(ValueError):
                 EnergonLoaderConfig(model_family="qwen", **{field: value})
+    with pytest.raises(ValueError):
+        EnergonLoaderConfig(model_family="qwen", packing_buffer_size=10)
     with pytest.raises(ValueError):
         EnergonLoaderConfig.model_validate({})
     with pytest.raises(ValueError):
@@ -631,9 +647,6 @@ def test_train_loader_rejects_shuffle_false():
             logical_rank=0,
             logical_world_size=1,
             placement_fingerprint="same-placement",
-            packing_algorithm=None,
-            max_sequences_per_bin=None,
-            sequence_length_pad_multiple=1,
             only_unmask_final=False,
         )
 

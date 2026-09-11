@@ -361,10 +361,7 @@ def _task_encoder(
     loader_config: EnergonLoaderConfig,
     adapter: Any,
     include_source_ids: bool,
-    packing_algorithm: str | None,
-    max_sequences_per_bin: int | None,
     max_sequence_length: int,
-    sequence_length_pad_multiple: int,
     tokenizer: Any,
     only_unmask_final: bool,
 ) -> BaseSFTTaskEncoder:
@@ -386,16 +383,23 @@ def _task_encoder(
         if loader_config.task_encoder.name == "nemotron_multimodal"
         else {}
     )
-    packer = (
-        get_packer(
-            packing_algorithm,
-            max_sequence_length,
-            max_sequences_per_bin=max_sequences_per_bin,
+    packing = loader_config.task_encoder.packing
+    if (
+        packing is not None
+        and packing.options.max_sequence_length != max_sequence_length
+    ):
+        raise ValueError(
+            "Energon pack capacity must match the SFT maximum sequence length."
         )
-        if loader_config.packing_buffer_size is not None
-        and packing_algorithm is not None
-        else None
-    )
+    packer = None
+    sequence_length_pad_multiple = 1
+    if packing is not None:
+        packer = get_packer(
+            packing.name,
+            packing.options.max_sequence_length,
+            balanced_knapsack_delta=packing.options.balanced_knapsack_delta,
+        )
+        sequence_length_pad_multiple = packing.options.sequence_length_pad_multiple
     return cast(
         BaseSFTTaskEncoder,
         encoder_type(
@@ -422,9 +426,6 @@ def build_energon_sft_loader(
     logical_rank: int,
     logical_world_size: int,
     placement_fingerprint: str,
-    packing_algorithm: str | None,
-    max_sequences_per_bin: int | None,
-    sequence_length_pad_multiple: int,
     only_unmask_final: bool,
 ) -> EnergonSFTDataLoader:
     """Build one loader for an explicit logical data shard and split."""
@@ -441,8 +442,7 @@ def build_energon_sft_loader(
     loader_config = _loader_config(data_config["energon"])
     if loader_config.nvdataset_cache_dir is not None:
         _set_nvdataset_cache_dir(loader_config.nvdataset_cache_dir)
-    if loader_config.packing_buffer_size is not None and packing_algorithm is None:
-        raise ValueError("Energon packing requires a packing algorithm.")
+    packing = loader_config.task_encoder.packing
     adapter = build_processor_adapter(
         processor_adapter=loader_config.processor_adapter,
         processor=processor,
@@ -455,10 +455,7 @@ def build_energon_sft_loader(
         loader_config=loader_config,
         adapter=adapter,
         include_source_ids=True,
-        packing_algorithm=packing_algorithm,
-        max_sequences_per_bin=max_sequences_per_bin,
         max_sequence_length=max_sequence_length,
-        sequence_length_pad_multiple=sequence_length_pad_multiple,
         tokenizer=processor.tokenizer,
         only_unmask_final=only_unmask_final,
     )
@@ -482,7 +479,7 @@ def build_energon_sft_loader(
             worker_config=worker_config,
             batch_size=batch_size,
             batch_drop_last=True,
-            packing_buffer_size=loader_config.packing_buffer_size,
+            packing_buffer_size=None if packing is None else packing.buffer_size,
             shuffle_buffer_size=(loader_config.shuffle_buffer_size),
             shuffle_over_epochs_multiplier=1,
             max_samples_per_sequence=loader_config.max_samples_per_sequence,
@@ -496,7 +493,7 @@ def build_energon_sft_loader(
             worker_config=worker_config,
             batch_size=batch_size,
             batch_drop_last=False,
-            packing_buffer_size=loader_config.packing_buffer_size,
+            packing_buffer_size=None if packing is None else packing.buffer_size,
             limit=resolved_source.limit,
             task_encoder=task_encoder,
         )
@@ -538,9 +535,11 @@ def build_energon_sft_loader(
                 logical_rank=logical_rank,
                 logical_world_size=logical_world_size,
             ),
-            packing_algorithm=packing_algorithm,
-            max_sequences_per_bin=max_sequences_per_bin,
-            sequence_length_pad_multiple=sequence_length_pad_multiple,
+            packing_algorithm=None if packing is None else packing.name,
+            max_sequences_per_bin=None,
+            sequence_length_pad_multiple=(
+                1 if packing is None else packing.options.sequence_length_pad_multiple
+            ),
             only_unmask_final=only_unmask_final,
         ),
     )
