@@ -74,7 +74,7 @@ checkpointing:
   # intentionally storage-heavy, but preserves earlier MCore steps for HF
   # conversion after resumed Slurm windows.
   save_period: 5
-  keep_top_k: 1000000
+  keep_top_k: null
   save_optimizer: true
   save_replay_buffer: false
 
