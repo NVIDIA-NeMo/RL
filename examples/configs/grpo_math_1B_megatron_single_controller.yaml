@@ -183,12 +183,6 @@ policy:
       http_server_num_replicas: 8
     vllm_cfg:
       async_engine: true
-      # Reuse native GPU outputs for GDR token capture.
-      # Router reuse needs generation.vllm_kwargs.async_scheduling=true.
-      # Prefix cache hits copy only missing historical router rows from CPU.
-      # gpu_output_capture:
-      #   enabled: true
-      #   max_retained_mb: 1024
     colocated:
       enabled: false
       resources:

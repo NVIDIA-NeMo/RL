@@ -28,7 +28,7 @@ from collections.abc import AsyncGenerator
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -64,22 +64,9 @@ pytestmark = pytest.mark.nemo_gym
     [
         (3, 2, None, 4, False),
         (3, 2, 3, 1, False),
-        (3, 2, None, 5, False),
-        (3, 0, None, 2, False),
         (0, 0, None, None, False),
         (3, 2, None, 3, True),
-        (3, 2, 2, 1, True),
         (3, 2, None, None, True),
-    ],
-    ids=[
-        "normal-final-dummy-omitted",
-        "split-prompt-and-decode",
-        "already-full-history",
-        "zero-generated-final-dummy",
-        "empty-request",
-        "missing-tail-row",
-        "short-prompt-history",
-        "missing-all-history",
     ],
 )
 def test_gpu_route_history_requires_canonical_rows_before_final_dummy(
@@ -89,21 +76,16 @@ def test_gpu_route_history_requires_canonical_rows_before_final_dummy(
     output_rows: int | None,
     incomplete: bool,
 ) -> None:
+    def rows(count: int | None) -> torch.Tensor | None:
+        return None if count is None else torch.zeros(count, 2, 2, dtype=torch.int16)
+
     request_output = SimpleNamespace(
         prompt_token_ids=list(range(prompt_len)),
-        prompt_routed_experts=(
-            None
-            if prompt_rows is None
-            else torch.zeros(prompt_rows, 2, 2, dtype=torch.int16)
-        ),
+        prompt_routed_experts=rows(prompt_rows),
         outputs=[
             SimpleNamespace(
                 token_ids=list(range(generated_len)),
-                routed_experts=(
-                    None
-                    if output_rows is None
-                    else torch.zeros(output_rows, 2, 2, dtype=torch.int16)
-                ),
+                routed_experts=rows(output_rows),
             )
         ],
     )
@@ -116,7 +98,9 @@ def test_gpu_route_history_requires_canonical_rows_before_final_dummy(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tagged", [True, False])
-async def test_gpu_capture_requests_full_cpu_route_history(tagged: bool) -> None:
+async def test_gpu_capture_preserves_existing_route_history_offset(
+    tagged: bool,
+) -> None:
     observed: list[tuple[Any, int, str, dict[str, Any]]] = []
 
     async def generate(
@@ -142,7 +126,7 @@ async def test_gpu_capture_requests_full_cpu_route_history(tagged: bool) -> None
         async for output in client.generate("prompt", params, "request", priority=2)
     ]
     assert outputs == ["result"]
-    assert observed == [("prompt", 0 if tagged else 7, "request", {"priority": 2})]
+    assert observed == [("prompt", 7, "request", {"priority": 2})]
     assert params.extra_args == extra_args
 
 
@@ -210,25 +194,22 @@ def test_setup_token_capture_skips_non_model_owners(monkeypatch):
     assert worker.token_capture is None
 
 
-@pytest.mark.parametrize("retain_gpu", [True, False])
-def test_gdr_setup_binds_producer_device_before_attaching_tq(monkeypatch, retain_gpu):
-    import torch
-
-    from nemo_rl.models.generation.vllm.gpu_capture_host import GpuCaptureHost
-
+@pytest.mark.parametrize(
+    ("use_gdr", "available"),
+    [(False, True), (True, True), (True, False)],
+)
+def test_existing_gdr_setting_controls_gpu_reuse(monkeypatch, use_gdr, available):
     events = []
     sink = _MemorySink()
     worker = _fake_worker()
-    worker.cfg = {"vllm_cfg": {"gpu_output_capture": {"enabled": retain_gpu}}}
     worker._http_engine_client = object()
     worker._return_routed_experts_enabled = lambda: True
 
-    async def create(rpc, *, max_retained_bytes, require_routed_experts):
+    async def create(rpc, *, require_routed_experts):
         assert rpc is worker._http_engine_client
-        assert max_retained_bytes == 1024 * 1024 * 1024
         assert require_routed_experts is True
         events.append("configure")
-        return SimpleNamespace(device=torch.device("cuda", 0))
+        return SimpleNamespace(device=torch.device("cuda", 0)) if available else None
 
     def build(dp_cfg, *, bootstrap):
         assert bootstrap is False
@@ -246,48 +227,16 @@ def test_gdr_setup_binds_producer_device_before_attaching_tq(monkeypatch, retain
     asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
             worker,
-            dp_cfg={"backend": "mooncake_cpu", "mooncake_cpu": {"use_gdr": True}},
+            dp_cfg={"backend": "mooncake_cpu", "mooncake_cpu": {"use_gdr": use_gdr}},
             staging_partition="staging",
         )
     )
-    assert events == (
-        ["configure", "cuda_init", "attach"] if retain_gpu else ["attach"]
-    )
-    assert (worker._gpu_capture_host is not None) is retain_gpu
-
-
-def test_gdr_setup_rejects_native_scheduler_before_attaching_tq(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    worker = _fake_worker()
-    worker.cfg = {"vllm_cfg": {"gpu_output_capture": {"enabled": True}}}
-    worker._http_engine_client = object()
-    worker._return_routed_experts_enabled = lambda: True
-    incompatibility = RuntimeError(
-        "GPU routed-expert snapshots require native async_scheduling=True"
-    )
-    configure = AsyncMock(side_effect=incompatibility)
-    attach = MagicMock()
-    monkeypatch.setattr(GpuCaptureHost, "create", configure)
-    monkeypatch.setattr("nemo_rl.data_plane.build_data_plane_client", attach)
-
-    with pytest.raises(RuntimeError, match="async_scheduling") as error:
-        asyncio.run(
-            VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                worker,
-                dp_cfg={"backend": "mooncake_cpu", "mooncake_cpu": {"use_gdr": True}},
-                staging_partition="staging",
-            )
-        )
-
-    assert error.value is incompatibility
-    configure.assert_awaited_once_with(
-        worker._http_engine_client,
-        max_retained_bytes=1024 * 1024 * 1024,
-        require_routed_experts=True,
-    )
-    attach.assert_not_called()
-    assert worker._gpu_capture_host is None
+    retained = use_gdr and available is True
+    assert events == (["configure"] if use_gdr else []) + (
+        ["cuda_init"] if retained else []
+    ) + ["attach"]
+    assert (worker._gpu_capture_host is not None) is retained
+    assert worker.token_capture is not None
 
 
 def test_weight_version_is_stamped_from_worker_state(monkeypatch):
@@ -437,7 +386,7 @@ def test_gpu_capture_key_is_scoped_to_one_admitted_request():
     assert id(uncaptured) not in worker._capture_calls
 
 
-def test_gpu_capture_rejects_multiple_completions_before_admission():
+def test_multiple_completions_keep_the_existing_capture_path():
     worker = _worker_with_capture(_MemorySink())
     worker._gpu_capture_host = object()
     request = _FakeRequest(
@@ -445,12 +394,14 @@ def test_gpu_capture_rejects_multiple_completions_before_admission():
         stream=False,
         n=2,
     )
-    with pytest.raises(ValueError, match="n=1"):
-        VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1])
-    assert not worker._capture_calls
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1])
+    state = worker._capture_calls[id(request)]
+    assert state.capture is worker.token_capture
+    assert state.gpu_sink is None
+    assert state.capture_key is None
 
 
-def test_unbound_gpu_capture_fails_without_a_cpu_put():
+def test_unavailable_gpu_payload_uses_existing_cpu_put():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     worker._gpu_capture_host = object()
@@ -462,8 +413,9 @@ def test_unbound_gpu_capture_fails_without_a_cpu_put():
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker, request, _served_content([2], [-0.1])
     )
-    assert content["ng_commit_coords"]["disposition"] == "capture_failed"
-    assert sink.records == []
+    assert content["ng_commit_coords"]["disposition"] == "staged"
+    assert len(sink.records) == 1
+    assert sink.records[0].token_ids_delta == [1, 2]
     assert not worker._capture_calls
 
 

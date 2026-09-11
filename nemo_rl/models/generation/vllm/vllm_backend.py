@@ -345,13 +345,11 @@ class VllmInternalWorkerExtension:
 
     def configure_gpu_output_capture(
         self,
-        max_retained_bytes: int,
         frontend_hostname: str,
         require_routed_experts: bool,
-    ) -> GpuOutputCaptureCapabilities:
+    ) -> GpuOutputCaptureCapabilities | None:
         return configure_gpu_output_capture(
             self,
-            max_retained_bytes=max_retained_bytes,
             frontend_hostname=frontend_hostname,
             require_routed_experts=require_routed_experts,
         )

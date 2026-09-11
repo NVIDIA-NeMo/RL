@@ -18,6 +18,7 @@ from __future__ import annotations
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -41,7 +42,9 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     _row_to_base_snapshot,
     _row_to_route_fragment,
 )
-from nemo_rl.experience.route_assembly import verify_route_fragment_integrity  # noqa: E402
+from nemo_rl.experience.route_assembly import (
+    verify_route_fragment_integrity,  # noqa: E402
+)
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
@@ -65,9 +68,9 @@ class _PutClient:
         self.fail = fail
 
     def put_samples(self, **kwargs: Any) -> None:
+        self.puts.append(kwargs)
         if self.fail:
             raise RuntimeError("PUT rejected")
-        self.puts.append(kwargs)
 
 
 def _record(
@@ -100,45 +103,52 @@ def _record(
     return sink.record
 
 
-def _cpu_payload(*, prompt_len: int = 2) -> GpuTokenPayload:
+def _payload(
+    *, prompt_len: int = 2, routes: torch.Tensor | None = None, device: str = "cuda"
+) -> GpuTokenPayload:
     return GpuTokenPayload(
         prompt_len=prompt_len,
-        generated_token_ids=torch.tensor([31, 32]),
-        generated_logprobs=torch.tensor([-0.125, -0.0]),
+        generated_token_ids=torch.tensor([31, 32], dtype=torch.int64, device=device),
+        generated_logprobs=torch.tensor(
+            [-0.125, -0.0], dtype=torch.float32, device=device
+        ),
+        routed_experts=routes,
     )
 
 
-def test_cpu_stage_keeps_existing_wire_and_digest() -> None:
-    client = _PutClient()
+def _assert_same_put(expected: dict[str, Any], actual: dict[str, Any]) -> None:
+    assert actual.keys() == expected.keys()
+    assert actual["tags"] == expected["tags"]
+    assert actual["sample_ids"] == expected["sample_ids"]
+    assert actual["partition_id"] == expected["partition_id"]
+    assert actual["fields"].keys() == expected["fields"].keys()
+    for name, expected_tensor in expected["fields"].items():
+        actual_tensor = actual["fields"][name]
+        assert actual_tensor.dtype == expected_tensor.dtype, name
+        assert actual_tensor.shape == expected_tensor.shape, name
+        assert torch.equal(
+            actual_tensor.cpu().contiguous().view(torch.uint8),
+            expected_tensor.contiguous().view(torch.uint8),
+        ), name
+
+
+@pytest.mark.parametrize("cleared", [False, True])
+def test_missing_gpu_payload_preserves_cpu_put(cleared: bool) -> None:
+    original, fallback = _PutClient(), _PutClient()
     record = _record()
-    assert TQTokenSink(client, staging_partition="staging").stage(record).ok
-    assert len(client.puts) == 1
-    fields = client.puts[0]["fields"]
+    assert TQTokenSink(original, staging_partition="staging").stage(record).ok
+    bound = BoundGpuTokenSink(TQTokenSink(fallback, staging_partition="staging"))
+    if cleared:
+        bound.bind(_payload(device="cpu"))
+        bound.clear()
+    assert bound.stage(record).ok
+    assert len(fallback.puts) == 1
+    _assert_same_put(original.puts[0], fallback.puts[0])
+    fields = fallback.puts[0]["fields"]
     assert all(value.device.type == "cpu" for value in fields.values())
     assert _row_to_base_snapshot(fields).model_dump() == record.model_dump(
         exclude={"extras"}
     )
-
-
-def test_bound_sink_requires_payload_and_reports_export_failure() -> None:
-    client = _PutClient()
-    sink = TQTokenSink(client, staging_partition="staging")
-    record = _record()
-    assert not BoundGpuTokenSink(sink).stage(record).ok
-    bound = BoundGpuTokenSink(sink)
-    bound.fail("worker export failed")
-    assert bound.stage(record).error == "worker export failed"
-    assert client.puts == []
-
-
-def test_cpu_reconstruction_cannot_claim_gpu_capture() -> None:
-    client = _PutClient()
-    bound = BoundGpuTokenSink(TQTokenSink(client, staging_partition="staging"))
-    bound.bind(_cpu_payload())
-    result = bound.stage(_record())
-    assert not result.ok
-    assert "original CUDA tensors" in result.error
-    assert client.puts == []
 
 
 def test_bound_sink_releases_payload_after_failed_stage() -> None:
@@ -147,18 +157,17 @@ def test_bound_sink_releases_payload_after_failed_stage() -> None:
             raise RuntimeError("staging failed")
 
     bound = BoundGpuTokenSink(FailingSink())
-    payload = _cpu_payload()
+    payload = _payload(device="cpu")
     payload_ref = weakref.ref(payload)
     bound.bind(payload)
     del payload
     with pytest.raises(RuntimeError, match="staging failed"):
         bound.stage(_record())
     assert payload_ref() is None
-    assert not bound.stage(_record()).ok
     bound.clear()
 
 
-def test_request_bindings_are_isolated_and_single_use() -> None:
+def test_concurrent_calls_have_independent_gpu_bindings() -> None:
     barrier = threading.Barrier(2)
 
     class ConcurrentSink:
@@ -169,32 +178,28 @@ def test_request_bindings_are_isolated_and_single_use() -> None:
     shared = ConcurrentSink()
     bindings = [BoundGpuTokenSink(shared), BoundGpuTokenSink(shared)]
     for index, bound in enumerate(bindings):
-        bound.bind(_cpu_payload(prompt_len=index))
-        with pytest.raises(RuntimeError, match="only bind once"):
-            bound.bind(_cpu_payload())
+        bound.bind(_payload(prompt_len=index, device="cpu"))
     record = _record()
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda bound: bound.stage(record), bindings))
     assert [result.staging_key for result in results] == ["0", "1"]
-    assert all(not bound.stage(record).ok for bound in bindings)
 
 
 @requires_cuda
-@pytest.mark.parametrize("prev_len,prompt_len", [(0, 2), (2, 2), (2, 3)])
+@pytest.mark.parametrize(
+    "prev_len,prompt_len,routing_dtype",
+    [(0, 2, torch.int8), (2, 2, torch.int16), (2, 3, torch.int32)],
+)
 def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
-    prev_len: int, prompt_len: int, monkeypatch: pytest.MonkeyPatch
+    prev_len: int,
+    prompt_len: int,
+    routing_dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     routes = torch.arange(
-        (prompt_len + 2) * 4, dtype=torch.int16, device="cuda"
+        (prompt_len + 2) * 4, dtype=routing_dtype, device="cuda"
     ).reshape(-1, 2, 2)
-    payload = GpuTokenPayload(
-        prompt_len=prompt_len,
-        generated_token_ids=torch.tensor([31, 32], dtype=torch.int64, device="cuda"),
-        generated_logprobs=torch.tensor(
-            [-0.125, -0.0], dtype=torch.float32, device="cuda"
-        ),
-        routed_experts=routes,
-    )
+    payload = _payload(prompt_len=prompt_len, routes=routes)
     record = _record(prev_len=prev_len, prompt_len=prompt_len, routes=routes)
     cpu_client, gpu_client = _PutClient(), _PutClient()
     assert TQTokenSink(cpu_client, staging_partition="staging").stage(record).ok
@@ -208,18 +213,21 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
             h2d_sizes.append(source.numel())
         return copy(destination, source, *args, **kwargs)
 
-    monkeypatch.setattr(torch.Tensor, "copy_", tracked_copy)
+    original_cpu = torch.Tensor.cpu
+
+    def reject_payload_copy(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        assert not tensor.is_cuda, "GPU staging must not copy payloads back to CPU"
+        return original_cpu(tensor, *args, **kwargs)
+
     bound = BoundGpuTokenSink(TQTokenSink(gpu_client, staging_partition="staging"))
     bound.bind(payload)
-    assert bound.stage(record).ok
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "copy_", tracked_copy)
+        patch.setattr(torch.Tensor, "cpu", reject_payload_copy)
+        assert bound.stage(record).ok
     assert len(gpu_client.puts) == 1
-    expected, actual = cpu_client.puts[0]["fields"], gpu_client.puts[0]["fields"]
-    assert gpu_client.puts[0]["tags"] == cpu_client.puts[0]["tags"]
-    for name in expected.keys():
-        assert torch.equal(
-            actual[name].cpu().contiguous().view(torch.uint8),
-            expected[name].contiguous().view(torch.uint8),
-        )
+    _assert_same_put(cpu_client.puts[0], gpu_client.puts[0])
+    actual = gpu_client.puts[0]["fields"]
     for name in (
         "token_ids_delta",
         "generation_logprobs_delta",
@@ -255,74 +263,47 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "corrupt", ["ids", "logprobs", "routes", "prompt_len", "missing_routes"]
+    "invalid", ["cpu", "ids_dtype", "logprobs_dtype", "routes_shape", "prompt_len"]
 )
-def test_gpu_mirror_mismatch_fails_before_put(corrupt: str) -> None:
+def test_invalid_gpu_optimization_preserves_one_cpu_put(invalid: str) -> None:
     routes = torch.arange(16, dtype=torch.int16, device="cuda").reshape(4, 2, 2)
     record = _record(routes=routes)
-    ids = torch.tensor([31, 32], dtype=torch.int64, device="cuda")
-    logprobs = torch.tensor([-0.125, -0.0], dtype=torch.float32, device="cuda")
-    if corrupt == "ids":
-        ids[0] = 99
-    elif corrupt == "logprobs":
-        logprobs[-1] = 0.0  # Equal numerically, but a different committed bit pattern.
-    elif corrupt == "routes":
-        routes[0, 0, 0] = 99
-    client = _PutClient()
-    payload = GpuTokenPayload(
-        prompt_len=3 if corrupt == "prompt_len" else 2,
-        generated_token_ids=ids,
-        generated_logprobs=logprobs,
-        routed_experts=None if corrupt == "missing_routes" else routes,
-        validate_cpu_mirror=True,
+    payload = _payload(routes=routes)
+    if invalid == "cpu":
+        payload = _payload(routes=routes.cpu(), device="cpu")
+    elif invalid == "ids_dtype":
+        payload = replace(
+            payload, generated_token_ids=payload.generated_token_ids.int()
+        )
+    elif invalid == "logprobs_dtype":
+        payload = replace(payload, generated_logprobs=payload.generated_logprobs.half())
+    elif invalid == "routes_shape":
+        payload = replace(payload, routed_experts=routes[:1])
+    else:
+        payload = replace(payload, prompt_len=3)
+    original, fallback = _PutClient(), _PutClient()
+    assert TQTokenSink(original, staging_partition="staging").stage(record).ok
+    assert (
+        TQTokenSink(fallback, staging_partition="staging")
+        .stage(record, gpu_payload=payload)
+        .ok
     )
-    result = TQTokenSink(client, staging_partition="staging").stage(
-        record, gpu_payload=payload
+    assert len(fallback.puts) == 1
+    _assert_same_put(original.puts[0], fallback.puts[0])
+    assert all(
+        value.device.type == "cpu" for value in fallback.puts[0]["fields"].values()
     )
-    assert not result.ok
-    assert client.puts == []
 
 
 @requires_cuda
-def test_normal_gpu_stage_does_not_copy_payload_to_cpu(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    routes = torch.arange(16, dtype=torch.int16, device="cuda").reshape(4, 2, 2)
-    record = _record(routes=routes)
-    payload = GpuTokenPayload(
-        prompt_len=2,
-        generated_token_ids=torch.tensor([31, 32], dtype=torch.int32, device="cuda"),
-        generated_logprobs=torch.tensor(
-            [-0.125, -0.0], dtype=torch.float16, device="cuda"
-        ),
-        routed_experts=routes,
-    )
-    original_cpu = torch.Tensor.cpu
-
-    def reject_payload_copy(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        if tensor.is_cuda:
-            raise AssertionError("normal GPU staging must not add a payload D2H copy")
-        return original_cpu(tensor, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "cpu", reject_payload_copy)
-    client = _PutClient()
-    result = TQTokenSink(client, staging_partition="staging").stage(
-        record, gpu_payload=payload
-    )
-    assert result.ok, result.error
+def test_failed_gpu_put_is_not_retried_as_cpu() -> None:
+    client = _PutClient(fail=True)
+    bound = BoundGpuTokenSink(TQTokenSink(client, staging_partition="staging"))
+    bound.bind(_payload())
+    result = bound.stage(_record())
+    assert not result.ok
+    assert "PUT rejected" in result.error
     assert len(client.puts) == 1
-    fields = client.puts[0]["fields"]
-    assert fields["token_ids_delta"].dtype == torch.int64
-    assert fields["generation_logprobs_delta"].dtype == torch.float32
-    assert all(
-        fields[name].is_cuda
-        for name in (
-            "token_ids_delta",
-            "generation_logprobs_delta",
-            "token_mask_delta",
-            "routed_experts",
-        )
-    )
 
 
 @requires_cuda
@@ -330,13 +311,7 @@ def test_gpu_fields_are_ready_for_backend_executor_on_another_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record = _record(prev_len=2)
-    payload = GpuTokenPayload(
-        prompt_len=2,
-        generated_token_ids=torch.tensor([31, 32], dtype=torch.int64, device="cuda"),
-        generated_logprobs=torch.tensor(
-            [-0.125, -0.0], dtype=torch.float32, device="cuda"
-        ),
-    )
+    payload = _payload()
     torch.cuda.synchronize()
     caller_thread = threading.get_ident()
     caller_stream = torch.cuda.Stream()

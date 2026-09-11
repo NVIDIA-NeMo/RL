@@ -469,71 +469,21 @@ SingleController, however, each individual tensor must currently fit because
 the CPU PUT path does not create the chunk metadata required by an oversized
 GDR GET.
 
-With Gym token capture on the async vLLM HTTP server, `use_gdr: true` also
-retains the original generated token IDs and logprobs on the producing GPU.
-Routed-expert capture reuses vLLM's existing GPU snapshot for that forward.
-Capture keeps read-only views instead of making separate per-request copies;
-the snapshot is independent of the router working buffer that the next
-forward reuses. The request and token-position mapping is saved with each
-step so later batch changes cannot change which data belongs to a request.
-At the existing completion-time PUT, the worker assembles the accepted
-payload on GPU and hands it to the serving process through a CUDA IPC lease.
-Only a request admitted by the capture ledger receives a retention key. PUT
-timing, staged keys, wire fields, and Gym digest versions remain unchanged.
+With Gym token capture, the existing `use_gdr: true` setting also reuses vLLM's
+native GPU token IDs, logprobs, and async router snapshots for the same PUT.
+The worker retains views without extra capture copies, assembles the request
+payload on GPU, and shares it with the serving process through CUDA IPC until
+PUT completes. A shared batch allocation stays alive until its last retained
+view is released. PUT still runs at call completion with the same fields, keys,
+and digests.
 
-CPU copies remain for serving and the existing integrity digests. The sink
-checks device, shape, and alignment without copying the generated payload
-back to CPU again. Tests verify that the retained tensors match the existing
-CPU representation. This removes the generated payload's H2D staging input;
-it does **not** eliminate D2H used by serving/validation, CPU-origin
-prompt-carry, cached-prefix router history and metadata transfers, the GPU
-staging D2D copy, or Mooncake's host-backed storage. Keeping a tensor on GPU
-does not make this an end-to-end zero-copy transport.
-
-The initial implementation supports vLLM **0.25.1**, one completion per
-request, no speculative decoding, PP=1, and no context parallelism. The TP
-output owner must be on the frontend host and its physical GPU must be
-mapped to frontend `cuda:0` (the current TQ executor's default device).
-Router snapshot reuse requires native
-`policy.generation.vllm_kwargs.async_scheduling: true`. Setting
-`vllm_cfg.async_engine: true` alone does not ensure native async scheduling;
-the synchronous scheduler does not create a GPU router snapshot to reuse.
-Prefix caching remains supported with the configured
-`policy.generation.vllm_cfg.enable_prefix_caching` setting. vLLM's scheduler
-stores router history by KV-cache slot in CPU memory. On a cache hit, the
-adapter copies only cached-prefix routing rows absent from the retained GPU
-snapshots into the assembled GPU payload. Newly computed routes, token IDs,
-and logprobs keep their GPU sources. Missing routes outside the proven
-cached prefix fail capture. This router-history backfill runs in the serving
-process before PUT; the KV cache stays in place. Captured calls request the
-full CPU routing record before Gym applies multi-turn delta alignment. An
-incomplete CPU routing record also fails GPU capture, because its missing-row
-fallback may differ from the retained GPU routes and their expected digest.
-Unsupported engine/device configurations fail during setup; an individual
-retention/validation failure produces `capture_failed` coordinates instead of
-silently using a CPU PUT or crashing generation.
-
-Optional controls live under `policy.generation.vllm_cfg`:
-
-```yaml
-gpu_output_capture:
-  enabled: true          # only active with GDR + Gym token capture
-  max_retained_mb: 1024  # retained backing storage + assembly, in MiB per worker
-```
-
-The budget counts each retained CUDA backing storage once, including unused
-rows and columns kept alive by a view, plus peak assembly of exported leases.
-A batch snapshot stays allocated until its last retained slice is consumed;
-requests that finish at different times can therefore keep completed
-requests' data in memory. CUDA allocator padding, vLLM working memory, TQ's
-separate staging buffer, and Python metadata require additional memory.
-Source views are released after GPU assembly has finished reading them. The
-producer keeps the assembled IPC payload alive until PUT completes,
-including cancellation while staging. Set `enabled: false` to use the
-previous CPU-produced GDR path on configurations outside the supported scope.
-CPU RDMA and Simple are unchanged. Like other PyTorch CUDA IPC users, an
-unrecoverable receiver or RPC failure can leave shared storage retained until
-the producer exits.
+Prefix caching keeps its existing behavior and CPU router history. Only cached
+prefix rows missing from the GPU snapshots are uploaded for PUT; fresh rows
+keep their GPU sources. CPU serving/digest copies, CPU-origin prompt tokens,
+and TQ's GPU staging copy remain. When the execution path or device placement
+cannot provide reusable GPU outputs, or preemption invalidates retained
+history, the existing CPU-produced PUT is used. No additional configuration
+is required.
 
 Capacity rule of thumb (any backend):
 

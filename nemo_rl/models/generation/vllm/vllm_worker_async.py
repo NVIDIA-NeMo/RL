@@ -46,7 +46,6 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
-from nemo_rl.models.generation.vllm.config import VllmGpuOutputCaptureConfig
 from nemo_rl.models.generation.vllm.gpu_capture_host import (
     CapturedModelCall,
     GpuCaptureHost,
@@ -138,12 +137,6 @@ class _AsyncLLMHTTPClient:
         async def next_output() -> Any:
             nonlocal iterator
             if iterator is None:
-                if (getattr(sampling_params, "extra_args", None) or {}).get(
-                    GPU_CAPTURE_KEY
-                ):
-                    # Captured calls need the full CPU routing record for
-                    # cached-prefix backfill and Gym's later delta alignment.
-                    sampling_params.routed_experts_prompt_start = 0
                 iterator = self._engine_client.generate(
                     prompt, sampling_params, request_id, **kwargs
                 )
@@ -504,23 +497,13 @@ class VllmAsyncGenerationWorkerImpl(
         if (
             dp_config.get("backend") == "mooncake_cpu"
             and backend_config(dp_config).use_gdr
+            and self._http_engine_client is not None
         ):
-            raw_capture_config = self.cfg["vllm_cfg"].get("gpu_output_capture")
-            capture_config = (
-                VllmGpuOutputCaptureConfig()
-                if raw_capture_config is None
-                else VllmGpuOutputCaptureConfig.model_validate(raw_capture_config)
+            self._gpu_capture_host = await GpuCaptureHost.create(
+                self._http_engine_client,
+                require_routed_experts=self._return_routed_experts_enabled(),
             )
-            if capture_config.enabled:
-                if self._http_engine_client is None:
-                    raise RuntimeError(
-                        "GPU token capture requires the vLLM HTTP engine client"
-                    )
-                self._gpu_capture_host = await GpuCaptureHost.create(
-                    self._http_engine_client,
-                    max_retained_bytes=capture_config.max_retained_mb * 1024 * 1024,
-                    require_routed_experts=self._return_routed_experts_enabled(),
-                )
+            if self._gpu_capture_host is not None:
                 LOGGER.info(
                     "GDR token capture retains generated payloads on %s until PUT",
                     self._gpu_capture_host.device,
@@ -601,15 +584,14 @@ class VllmAsyncGenerationWorkerImpl(
                 return
         gpu_sink = None
         capture_key = None
-        if self._gpu_capture_host is not None:
+        if self._gpu_capture_host is not None and getattr(request, "n", None) in (
+            None,
+            1,
+        ):
             # Gym is optional outside token capture; retain its existing record
             # validation and completion lock in a request-owned capture object.
             from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
 
-            if getattr(request, "n", None) not in (None, 1):
-                raise ValueError(
-                    "GPU token capture requires one completion per request (n=1)"
-                )
             if self._token_sink is None:
                 raise RuntimeError(
                     "GPU token capture requires a configured staging sink"
@@ -1175,11 +1157,9 @@ class VllmAsyncGenerationWorkerImpl(
                             routed_experts_cpu=routed_experts_cpu,
                         )
                     except Exception as error:
-                        # Keep serving failure behavior identical to a failed
-                        # staging PUT; Gym will return capture_failed coords.
-                        state.gpu_sink.fail(f"GPU payload capture failed: {error}")
-                        LOGGER.exception(
-                            "Failed to retain GPU payload for %s", state.capture_key
+                        state.gpu_sink.clear()
+                        LOGGER.warning(
+                            "Using CPU payload for %s: %s", state.capture_key, error
                         )
 
                 return response
