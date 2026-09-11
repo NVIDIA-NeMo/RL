@@ -499,16 +499,30 @@ step/percent_of_dataplane/by_op/put                 42.1   within it, put is the
 
 `by_op` sums to 100 by construction.
 
-**`frac_of_step` and `wall_s` report the busiest process, not the sum.**
-The denominator is one step's wall clock, so the numerator has to be wall time
-too. These processes run concurrently inside that window: summing them
-exceeds the step itself (measured 1.054 across ten processes), and averaging
-them dilutes the busiest process with idle ones. The step waits on one
-process, so the max is what was exposed. It is a lower bound -- if the
-driver's ops are serial with the workers' fetches, the real figure is
-`driver + max(workers)` -- but it is a bound in the right direction, where the
-sum was neither. `by_op` percentages still sum, because "where did the time
-go" is a process-time question.
+**`frac_of_step` and `wall_s` report the slowest process's data-plane time,
+which the collective makes everyone wait for.** The denominator is one step's
+wall clock, so the numerator has to be wall time too. The DP ranks fetch in
+parallel and then meet at the gradient all-reduce, so no rank passes the
+barrier until the straggler has its shard: the phase costs what the *slowest*
+rank paid. Summing the ranks gives process-time, which exceeded the step
+itself (measured 1.054 across ten processes); averaging them reports a cost no
+rank ever paid. `by_op` percentages still sum, because "where did the time go"
+is a process-time question, not an elapsed one.
+
+Two things it still understates, both independent of the reduction:
+
+- The driver's ops and the workers' fetches are *serial* with each other, so
+  the exposed total is `driver + max(workers)` and a max over all processes
+  keeps only the larger. The driver issues about one op of each kind per step
+  against the workers' bulk fetches, so the dropped term is small.
+- **The rollout actor is in no scope at all** (see below), so `kv_first_write`
+  -- the largest write in the step -- is missing from this number. On the sync
+  path that write is on the critical path.
+
+The barrier is also at the all-reduce rather than at the end of the fetch: a
+fast rank can start forward while a slow one is still fetching, so what leaks
+through is the straggler's *excess*. `max` is therefore a slight
+over-statement of the fetch phase and an under-statement overall.
 
 `volume_mb` counts *transfers*, not data size, and two things follow from
 that. A byte written and later read is counted on both sides. And every
