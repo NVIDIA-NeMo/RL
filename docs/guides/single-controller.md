@@ -87,6 +87,58 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
 
+## Reward penalties with token capture
+
+With NeMo-Gym and `token_capture.enabled: true`, Single-Controller supports
+`reward_penalties.penalize_duplicated_reasoning`, `penalize_empty_final_answer`,
+and `penalize_unwanted_tokens`. These use the same penalty transformation as
+non-capture rollouts: any enabled violation replaces the reward with `0.0`,
+including a negative reward. Overlapping categories count separately but do not
+accumulate a numerical penalty.
+
+```yaml
+reward_penalties:
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: false
+  token_ids:
+    unwanted: [12345]  # Replace with unwanted IDs from your model's tokenizer.
+```
+
+The environment checks the ordered scored `response.output` for duplicated
+reasoning and empty final answers, preserving the final-function-call exception.
+It seals versioned Boolean evidence alongside the reward after effort shaping.
+The finalizer verifies the selected token chain, checks its generated tokens for
+unwanted IDs (including terminal tokens), and applies all enabled penalties
+before publishing `total_reward` for advantage estimation. Prompt tokens, tool
+responses, and abandoned branches do not trigger the token penalty. Capture token
+IDs, logprobs, and training masks retain their existing behavior.
+
+Recovery retains the evidence and the reward before penalties, so finalization
+retries do not repeat effort shaping. Recovery schema 3 reads schema 2
+checkpoints; old sealed rollouts without evidence can still finalize with text
+checks disabled, including unwanted-token checks. Enabled text checks reject
+missing or incompatible evidence through capture's existing masked-placeholder
+path; regenerate such rollouts to use the checks. Existing configuration
+fingerprint compatibility checks still apply. As with non-capture replay,
+already-finalized canonical rows retain their saved rewards; changing the penalty
+configuration does not retroactively rescore them.
+
+`reasoning_equal_to_final_answer_rate`, `empty_final_answer_rate`, and
+`unwanted_token_rate` count each enabled category once per valid finalized
+rollout. Counts and valid-row denominators are pooled across groups. Final reward
+mean, minimum, maximum, and sample standard deviation use the same population;
+infrastructure rejections are reported separately. Pending group statistics
+survive checkpoints and are consumed once when training commits. Capture does
+not emit rollout-stage penalty rates or pre-penalty reward summaries.
+
+Malformed-thinking reward penalties and both message-level advantage overrides
+remain unsupported with capture and fail at setup. Effort shaping is unchanged:
+its existing multi-turn length accounting differs between capture and standard
+rollouts. Penalty parity therefore assumes equal incoming rewards, or disabled
+effort shaping.
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:

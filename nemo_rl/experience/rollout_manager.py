@@ -1329,7 +1329,8 @@ class AsyncNemoGymRolloutImpl:
             rollout_metrics.update(_effort_shaping_metrics(shaping))
             rollout_metrics.update(
                 self._compute_reward_penalty_metrics(
-                    penalty_counts, len(completed_results)
+                    penalty_counts,
+                    sum("receipt" not in result for result in completed_results),
                 )
             )
 
@@ -1375,6 +1376,9 @@ class AsyncNemoGymRolloutImpl:
                 env_extras = dict(result["full_result"])
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
+                env_extras["ng_text_penalty_evidence"] = result.get(
+                    "text_penalty_evidence"
+                )
                 completions.append(
                     Completion(
                         message_log=result["message_log"],
@@ -1481,7 +1485,11 @@ class AsyncNemoGymRolloutImpl:
         # Aggregate metrics across all samples.
         n = len(completions)
         rollout_metrics: dict[str, Any] = {
-            **calculate_single_metric(total_reward, n, "total_reward"),
+            **(
+                calculate_single_metric(total_reward, n, "total_reward")
+                if not receipt_mode
+                else {}
+            ),
             # turn metrics
             **calculate_single_metric(turn_count, n, "turns_per_sample"),
             "turns_per_sample/p95": pct(turn_count, 95),
@@ -1501,7 +1509,12 @@ class AsyncNemoGymRolloutImpl:
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
         agent_extras = [
-            {k: v for k, v in (c.env_extras or {}).items() if k not in ("ng_receipt",)}
+            {
+                k: v
+                for k, v in (c.env_extras or {}).items()
+                if k not in ("ng_receipt", "ng_text_penalty_evidence")
+                and not (receipt_mode and k == "reward")
+            }
             for c in completions
         ]
         for key in agent_extras[0].keys():
@@ -2210,6 +2223,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    text_penalty_evidence=env_extras.get("ng_text_penalty_evidence"),
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2239,6 +2253,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    text_penalty_evidence=env_extras.get("ng_text_penalty_evidence"),
                 )
 
         try:
@@ -2270,12 +2285,14 @@ class RolloutManager:
                 receipts,
                 rewards,
                 mask_sample,
+                text_penalty_evidence,
             ) = self._recovery_ledger.finalization_inputs(group_id)
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
                 canonical_sample_ids=tuple(canonical_sample_ids),
                 receipts=tuple(receipts),
+                text_penalty_evidence=tuple(text_penalty_evidence),
                 rewards=tuple(rewards),
                 fallback_weight_version=start_version,
                 prompt_idx=int(recovery_group.prompt_id),

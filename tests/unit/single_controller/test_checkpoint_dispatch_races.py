@@ -868,7 +868,10 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
     asyncio.run(exercise())
 
 
-def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None:
+@pytest.mark.parametrize("schema_version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_recovery_replays_step_7_without_readmitting_the_batch(
+    tmp_path, schema_version
+) -> None:
     """An admitted batch keeps target_step=7 across a process restart."""
 
     async def exercise() -> None:
@@ -904,6 +907,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
             batch_shortfall={6: 1},
             sampler_stamps_target_steps=True,
         )
+        saved_state["schema_version"] = schema_version
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_state, recovery_path)
         payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
@@ -920,7 +924,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
-            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_schema_version": schema_version,
             "rollout_recovery_payload_sha256": payload_sha256,
             "rollout_recovery_group_count": 1,
         }

@@ -632,6 +632,16 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_capture_rejects_malformed_thinking_reward_penalty(self, patched_factories):
+        mc = _make_master_config()
+        mc.env["should_use_nemo_gym"] = True
+        mc.token_capture.enabled = True
+        mc.reward_penalties = RewardPenaltyConfig(penalize_malformed_think_tag=True)
+        with pytest.raises(
+            ValueError, match="does not support.*penalize_malformed_think_tag"
+        ):
+            validate_single_controller_config(mc)
+
     def test_resolves_and_passes_reward_penalties(self, patched_factories):
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=0)
@@ -1574,6 +1584,7 @@ class TestSetup:
             enable_router_replay=False,
             use_fastokens=False,
             token_capture=None,
+            capture_reward_penalties=None,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
         warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[

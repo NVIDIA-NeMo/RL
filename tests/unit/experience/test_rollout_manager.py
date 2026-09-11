@@ -2057,3 +2057,69 @@ class TestGenerateForFinalizationFlow:
         assert (
             restored._impl.seen_recovery_granularity is RecoveryGranularity.PROMPT_GROUP
         )
+
+
+def test_capture_completion_preserves_evidence_and_shaped_reward_until_finalization():
+    from nemo_rl.experience.reward_penalties import (
+        CaptureRewardPenaltyConfig,
+        compute_text_penalty_evidence,
+    )
+
+    config = {"penalize_empty_final_answer": True}
+    impl = _nemo_gym_impl(True, config, log_full_result_tables=True)
+    evidence = compute_text_penalty_evidence(
+        "r", [], CaptureRewardPenaltyConfig.from_resolved(config)
+    )
+    result = {
+        "rollout_id": "r",
+        "receipt": {"rollout_id": "r", "manifest": []},
+        "text_penalty_evidence": evidence,
+        "message_log": [],
+        "input_message_log": [],
+        "full_result": {"reward": -2.0, "response": {"output": []}},
+    }
+    completions, counts = impl._results_to_completions([result])
+    assert completions[0].reward == -2.0
+    assert completions[0].env_extras["ng_text_penalty_evidence"] == evidence
+    assert sum(counts.values()) == 0
+    assert impl._compute_reward_penalty_metrics(counts, 0) == {}
+    metrics = impl._compute_rollout_metrics(completions, "agent")
+    assert not any(k.startswith(("total_reward/", "agent/reward/")) for k in metrics)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_capture_manager_seals_evidence_and_forwards_it_to_reassembly(
+    monkeypatch, granularity
+):
+    from nemo_rl.experience.reward_penalties import (
+        CaptureRewardPenaltyConfig,
+        compute_text_penalty_evidence,
+    )
+
+    original = _receipt_record
+
+    def with_evidence(*args, **kwargs):
+        record = original(*args, **kwargs)
+        for completion in record.completions:
+            extras = completion.env_extras
+            extras["ng_text_penalty_evidence"] = compute_text_penalty_evidence(
+                extras["ng_rollout_id"], [], CaptureRewardPenaltyConfig(True, True, ())
+            )
+        return record
+
+    monkeypatch.setattr(f"{__name__}._receipt_record", with_evidence)
+    mgr = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+    )
+    request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+    assert request.rewards == (0.5, 0.5)
+    assert len(request.text_penalty_evidence) == 2
+    for rid, evidence in zip(request.rollout_ids, request.text_penalty_evidence):
+        assert evidence.rollout_id == rid
+        assert evidence.empty_final_answer is True
+    restored = RolloutRecoveryLedger.from_state_dict(mgr.recovery_ledger.state_dict())
+    assert (
+        tuple(restored.finalization_inputs(request.group_id)[5])
+        == request.text_penalty_evidence
+    )

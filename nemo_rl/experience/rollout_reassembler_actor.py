@@ -22,6 +22,10 @@ import ray
 import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
+from nemo_rl.experience.reward_penalties import (
+    CaptureRewardPenaltyConfig,
+    RolloutTextPenaltyEvidence,
+)
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 
 # Field names whose values are per-token and therefore large, but whose Python
@@ -66,6 +70,7 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    text_penalty_evidence: tuple[RolloutTextPenaltyEvidence | None, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,7 @@ class RolloutReassemblerActorConfig:
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
     max_seq_len: int
+    reward_penalty_config: CaptureRewardPenaltyConfig | None = None
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -132,6 +138,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
+            reward_penalty_config=config.reward_penalty_config,
         )
 
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
@@ -158,6 +165,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
+            text_penalty_evidence=list(request.text_penalty_evidence)
+            if request.text_penalty_evidence is not None
+            else None,
         )
         assert_metadata_only(result)
         return result

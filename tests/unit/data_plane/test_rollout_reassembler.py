@@ -824,3 +824,188 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
     )
     assert not row.valid
     assert (row.rejection_reason or "").startswith("rebuild_failed:chain_hash_mismatch")
+
+
+@pytest.mark.parametrize(
+    "unwanted,expected_reward",
+    [(10, -2.0), (20, -2.0), (12, 0.0), (13, 0.0), (21, 0.0), (22, 0.0), (99, -2.0)],
+)
+def test_penalties_use_only_verified_selected_generations(
+    tq_client, partitions, unwanted, expected_reward
+):
+    from nemo_rl.experience.reward_penalties import CaptureRewardPenaltyConfig
+    from tests.unit.data_plane.token_capture_test_fixtures import _manifest, _record
+
+    records, receipt, expected = build_fixture_artifacts(
+        "worked_example", rollout_id="r"
+    )
+    # A committed but abandoned root is verified and cleaned; it is not scored.
+    dead = _record(
+        rollout_id="r",
+        model_call_id="dead",
+        parent_call_id=None,
+        prev_len=0,
+        token_ids=[30, 99],
+        token_mask=[0.0, 1.0],
+        logprobs=[0.0, -0.5],
+        weight_version=4,
+    )
+    records.append(dead)
+    receipt = receipt.model_copy(
+        update={"manifest": [*receipt.manifest, _manifest(dead)]}
+    )
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION)
+    for record in records:
+        assert sink.stage(record).ok
+    finalizer = _finalizer(
+        tq_client,
+        reward_penalty_config=CaptureRewardPenaltyConfig(False, False, (unwanted,)),
+    )
+    for _ in range(2):
+        row = finalizer.finalize_rollout("r", receipt.model_dump(), reward=-2.0)
+        assert row.valid, row.rejection_reason
+        assert row.reward == expected_reward
+        assert row.token_ids == expected.token_ids
+        assert row.logprobs == expected.logprobs
+        assert row.token_mask == expected.token_mask
+        assert row.penalty_counts["unwanted_token"] == int(expected_reward == 0.0)
+
+
+def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
+    tq_client, partitions
+):
+    from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+    from nemo_rl.experience.reward_penalties import (
+        CaptureRewardPenaltyConfig,
+        aggregate_capture_reward_metrics,
+        compute_text_penalty_evidence,
+    )
+
+    config = CaptureRewardPenaltyConfig(True, True, ())
+    ids = ["penalty_g0", "penalty_g1", "penalty_g2"]
+    receipts, expected = [], []
+    for rid in ids[:2]:
+        receipt, row = _stage_fixture(tq_client, "worked_example", rollout_id=rid)
+        receipts.append(receipt)
+        expected.append(row)
+    evidence = [
+        compute_text_penalty_evidence(ids[0], [], config),
+        compute_text_penalty_evidence(ids[1], [{"content": "ok"}], config),
+        None,
+    ]
+    finalizer = _finalizer(tq_client, reward_penalty_config=config)
+    finalized = finalizer.finalize_group(
+        "penalty",
+        ids,
+        [*receipts, None],
+        [-2.0, 2.0, 9.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=4,
+        prompt_idx=7,
+        text_penalty_evidence=evidence,
+    )
+    assert finalized.valid_row_count == 2
+    rows = _fetch_rows(tq_client, ids)
+    rewards = torch.as_tensor(rows["total_reward"]).flatten()
+    assert rewards[:2].tolist() == [0.0, 2.0]
+    for i in range(2):
+        assert torch.as_tensor(rows["input_ids"][i]).tolist() == expected[i].token_ids
+        assert (
+            torch.as_tensor(rows["generation_logprobs"][i]).tolist()
+            == expected[i].logprobs
+        )
+        assert torch.as_tensor(rows["token_mask"][i]).tolist() == expected[i].token_mask
+    estimator = object.__new__(GRPOAdvantageEstimator)
+    estimator.use_leave_one_out_baseline = False
+    estimator.normalize_rewards = False
+    advantages = estimator.compute_advantage(
+        torch.stack(
+            [torch.as_tensor(prompt).flatten() for prompt in rows["prompt_ids_for_adv"]]
+        ),
+        rewards,
+        torch.ones(3, 7),
+        valid_mask=torch.tensor([1, 1, 0]),
+    )
+    assert advantages[:2, 0].tolist() == [-1.0, 1.0]
+    metrics = aggregate_capture_reward_metrics(
+        {k: [v] for k, v in finalized.metrics.items()}
+    )
+    assert metrics["empty_final_answer_rate"] == 0.5
+    assert metrics["total_reward/mean"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "kind", ["missing", "version", "fingerprint", "identity", "unevaluated"]
+)
+def test_finalizer_rejects_incompatible_text_evidence(tq_client, partitions, kind):
+    from nemo_rl.experience.reward_penalties import (
+        CaptureRewardPenaltyConfig,
+        compute_text_penalty_evidence,
+    )
+
+    config = CaptureRewardPenaltyConfig(True, True, ())
+    receipt, _ = _stage_fixture(tq_client, "single_call", rollout_id="r")
+    evidence = compute_text_penalty_evidence("r", [], config)
+    evidence = {
+        "missing": None,
+        "version": replace(evidence, schema_version=2),
+        "fingerprint": replace(evidence, semantics_fingerprint="old"),
+        "identity": replace(evidence, rollout_id="wrong"),
+        "unevaluated": replace(evidence, empty_final_answer=None),
+    }[kind]
+    row = _finalizer(tq_client, reward_penalty_config=config).finalize_rollout(
+        "r", receipt, reward=1.0, text_penalty_evidence=evidence
+    )
+    assert not row.valid
+    assert row.rejection_reason.startswith("reward_penalty:")
+
+
+@pytest.mark.parametrize("flags", range(8))
+@pytest.mark.parametrize("incoming_reward", [-2.0, 0.0, 2.0])
+def test_staged_penalties_match_non_capture_all_flags(
+    tq_client, partitions, flags, incoming_reward
+):
+    from nemo_rl.experience.reward_penalties import (
+        CaptureRewardPenaltyConfig,
+        compute_text_penalty_evidence,
+    )
+    from nemo_rl.experience.rollouts import (
+        apply_reward_penalties,
+        resolve_reward_penalty_config,
+    )
+
+    output = [
+        {"type": "reasoning", "summary": [{"text": " same "}]},
+        {"content": "same"},
+        {"content": "  "},
+    ]
+    resolved = resolve_reward_penalty_config(
+        {
+            "penalize_duplicated_reasoning": bool(flags & 1),
+            "penalize_empty_final_answer": bool(flags & 2),
+            "penalize_unwanted_tokens": bool(flags & 4),
+            "token_ids": {"unwanted": [22]},
+        },
+        None,
+    )
+    config = CaptureRewardPenaltyConfig.from_resolved(resolved)
+    receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id="parity")
+    inline = {
+        "full_result": {"reward": incoming_reward, "response": {"output": output}},
+        "message_log": [
+            {"role": "user", "token_ids": [10, 11]},
+            {"role": "assistant", "token_ids": [12, 13]},
+            {"role": "user", "token_ids": [20]},
+            {"role": "assistant", "token_ids": [21, 22]},
+        ],
+    }
+    counts = apply_reward_penalties([inline], resolved)
+    evidence = compute_text_penalty_evidence("parity", output, config)
+    actual = _finalizer(tq_client, reward_penalty_config=config).finalize_rollout(
+        "parity", receipt, reward=incoming_reward, text_penalty_evidence=evidence
+    )
+    assert actual.valid, actual.rejection_reason
+    assert actual.reward == inline["full_result"]["reward"]
+    assert actual.penalty_counts == {key: counts[key] for key in actual.penalty_counts}
+    assert actual.token_ids == expected.token_ids
+    assert actual.logprobs == expected.logprobs

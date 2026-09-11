@@ -98,6 +98,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.experience.reward_penalties import CaptureRewardPenaltyConfig
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
@@ -686,6 +687,13 @@ def _spinup_gym(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        capture_reward_penalties=(
+            CaptureRewardPenaltyConfig.from_resolved(
+                resolve_reward_penalty_config(master_config.reward_penalties, tokenizer)
+            )
+            if master_config.token_capture.enabled
+            else None
+        ),
         # Ledger config rides into Gym's policy model server.
         token_capture=(
             master_config.token_capture.model_dump()
@@ -1731,6 +1739,9 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                reward_penalty_config=CaptureRewardPenaltyConfig.from_resolved(
+                    resolved_reward_penalty_config
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

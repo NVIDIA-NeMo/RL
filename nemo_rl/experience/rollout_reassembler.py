@@ -45,6 +45,11 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.reward_penalties import (
+    CaptureRewardPenaltyConfig,
+    RolloutTextPenaltyEvidence,
+    finalize_reward_penalties,
+)
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
@@ -79,6 +84,7 @@ class FinalizedRollout:
     # the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
+    penalty_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -115,9 +121,11 @@ class RolloutReassembler:
         staging_partition: str,
         pad_token_id: int,
         max_seq_len: int,
+        reward_penalty_config: CaptureRewardPenaltyConfig | None = None,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
     ) -> None:
+        self._reward_penalty_config = reward_penalty_config
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
@@ -141,7 +149,12 @@ class RolloutReassembler:
     # ── per rollout ─────────────────────────────────────────────────────────
 
     def finalize_rollout(
-        self, rollout_id: str, receipt: Optional[dict[str, Any]], *, reward: float
+        self,
+        rollout_id: str,
+        receipt: Optional[dict[str, Any]],
+        *,
+        reward: float,
+        text_penalty_evidence: RolloutTextPenaltyEvidence | None = None,
     ) -> FinalizedRollout:
         """Verify one receipt against its staged rows and linearize the main chain.
 
@@ -232,6 +245,19 @@ class RolloutReassembler:
             NotImplementedError,
         ) as error:
             return rejected(f"rebuild_failed:{error}", staging_keys)
+        penalty_counts: dict[str, int] = {}
+        if self._reward_penalty_config is not None:
+            try:
+                reward, penalty_counts = finalize_reward_penalties(
+                    rollout_id,
+                    reward,
+                    text_penalty_evidence,
+                    self._reward_penalty_config,
+                    row.token_ids,
+                    row.link_spans,
+                )
+            except ValueError as error:
+                return rejected(f"reward_penalty:{error}", staging_keys)
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
@@ -315,6 +341,7 @@ class RolloutReassembler:
             max_wv=max_wv,
             routed_experts=routed_experts,
             route_plan=route_plan,
+            penalty_counts=penalty_counts,
         )
 
     def _execute_direct_plan(
@@ -366,6 +393,7 @@ class RolloutReassembler:
         prompt_idx: int,
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
+        text_penalty_evidence: Optional[list[RolloutTextPenaltyEvidence | None]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -391,10 +419,21 @@ class RolloutReassembler:
         assert len(canonical_sample_ids) == len(rollout_ids), (
             "canonical_sample_ids must be one per rollout"
         )
+        evidence_by_rollout: tuple[RolloutTextPenaltyEvidence | None, ...] = (
+            tuple(text_penalty_evidence)
+            if text_penalty_evidence is not None
+            else (None,) * len(rollout_ids)
+        )
+        if len(evidence_by_rollout) != len(rollout_ids):
+            raise ValueError("text_penalty_evidence must be one per rollout")
         _group_t0 = time.perf_counter()
         rows = [
-            self.finalize_rollout(rollout_id, receipt, reward=reward)
-            for rollout_id, receipt, reward in zip(rollout_ids, receipts, rewards)
+            self.finalize_rollout(
+                rollout_id, receipt, reward=reward, text_penalty_evidence=evidence
+            )
+            for rollout_id, receipt, reward, evidence in zip(
+                rollout_ids, receipts, rewards, evidence_by_rollout
+            )
         ]
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
         valid_rows = [row for row in rows if row.valid]
@@ -405,6 +444,32 @@ class RolloutReassembler:
                 sum(len(row.staging_keys) for row in rows) / len(rows)
             ),
         }
+        # Sufficient statistics are pooled by the consuming controller once per
+        # committed group; rejected placeholders never enter this population.
+        metrics["finalize/reward_count"] = float(len(valid_rows))
+        if valid_rows:
+            final_rewards = [row.reward for row in valid_rows]
+            metrics.update(
+                {
+                    "finalize/reward_sum": sum(final_rewards),
+                    "finalize/reward_sumsq": sum(
+                        value * value for value in final_rewards
+                    ),
+                    "finalize/reward_min": min(final_rewards),
+                    "finalize/reward_max": max(final_rewards),
+                }
+            )
+        config = self._reward_penalty_config
+        if config is not None:
+            for category, enabled in (
+                ("duplicated_reasoning", config.duplicated_reasoning),
+                ("empty_final_answer", config.empty_final_answer),
+                ("unwanted_token", bool(config.unwanted_token_ids)),
+            ):
+                if enabled:
+                    metrics[f"finalize/penalty_count/{category}"] = float(
+                        sum(row.penalty_counts[category] for row in valid_rows)
+                    )
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
         # health signal (a text root only opens each chain); this replaces the
