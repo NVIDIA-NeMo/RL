@@ -290,7 +290,7 @@ class VllmSparseRefitReceiver:
                 )
             except Exception:
                 # Drain peers before removing shared batch files.
-                self._refit_collective_rpc("synchronize_device", ())
+                self._refit_collective_rpc("synchronize_sparse_refit_device", ())
                 raise
         finally:
             for payload in staged:
