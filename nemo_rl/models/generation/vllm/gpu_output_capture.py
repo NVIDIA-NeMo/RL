@@ -75,6 +75,9 @@ class GpuOutputLease:
     generated_token_ids: CudaTensorIpc
     generation_logprobs: CudaTensorIpc
     routed_experts: CudaTensorIpc | None
+    # Exclusive-end intervals that must be filled from canonical CPU routes
+    # before PUT. These contain only historical cached-prefix positions.
+    routed_experts_prefix_backfill_ranges: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -236,6 +239,8 @@ class _StepRequest:
     token_id: torch.Tensor | None
     logprob: torch.Tensor | None
     logprob_by_token: bool
+    cached_prefix_tokens: int | None
+    resumed_output_token_count: int | None
 
 
 @dataclass
@@ -252,6 +257,7 @@ class _RequestCapture:
     fragments: list[_Fragment] = field(default_factory=list)
     committed_route_end: int = 0
     storage_keys: set[int] = field(default_factory=set)
+    proven_cached_prefix_tokens: int = 0
 
 
 @dataclass
@@ -470,6 +476,21 @@ class GpuOutputCapture:
         sampled = sampler_output.sampled_token_ids
         offset = 0
         entries = []
+        # In pinned MRV1, first admissions are scheduled_new_reqs; resumed
+        # requests use scheduled_cached_reqs. A later positive batch position
+        # alone must never authorize filling a missed GPU capture from CPU.
+        new_requests = {
+            request.req_id: request for request in scheduler_output.scheduled_new_reqs
+        }
+        cached_requests = scheduler_output.scheduled_cached_reqs
+        resumed_requests = {
+            request_id: (
+                int(cached_requests.num_computed_tokens[index]),
+                int(cached_requests.num_output_tokens[index]),
+            )
+            for index, request_id in enumerate(cached_requests.req_ids)
+            if request_id in cached_requests.resumed_req_ids
+        }
         with self._lock:
             for index, request_id in enumerate(batch.req_ids):
                 count = int(scheduler_output.num_scheduled_tokens[request_id])
@@ -492,6 +513,36 @@ class GpuOutputCapture:
                     )
                 prompt_count = int(request.num_prompt_tokens)
                 start = int(batch.num_computed_tokens_cpu[index])
+                cached_prefix = None
+                resumed_output_token_count = None
+                if self.require_routed_experts:
+                    if getattr(params, "routed_experts_prompt_start", None) not in (
+                        None,
+                        0,
+                    ):
+                        raise RuntimeError(
+                            "GPU route capture requires the full canonical prompt routes"
+                        )
+                    new_request = new_requests.get(request_id)
+                    resumed = resumed_requests.get(request_id)
+                    if resumed is not None:
+                        resumed_output_token_count = resumed[1]
+                        if resumed[0] != start or resumed_output_token_count < 0:
+                            raise RuntimeError(
+                                "Resumed GPU request metadata is inconsistent"
+                            )
+                    if new_request is not None:
+                        cached_prefix = int(new_request.num_computed_tokens)
+                    elif resumed is not None and resumed[1] == 0:
+                        cached_prefix = resumed[0]
+                    if cached_prefix is not None:
+                        if (
+                            not 0 <= cached_prefix <= prompt_count
+                            or start != cached_prefix
+                        ):
+                            raise RuntimeError(
+                                "Proven cached-prefix metadata disagrees with GPU request positions"
+                            )
                 valid = not bool(runner.discard_request_mask.np[index])
                 token_view = sampled[index, :1] if valid else None
                 logprob_view = None
@@ -531,6 +582,8 @@ class GpuOutputCapture:
                         token_view,
                         logprob_view,
                         by_token,
+                        cached_prefix,
+                        resumed_output_token_count,
                     )
                 )
         return tuple(entries)
@@ -563,7 +616,30 @@ class GpuOutputCapture:
                         )
                     if state is None:
                         state = _RequestCapture(
-                            entry.native_request_id, entry.prompt_token_count
+                            entry.native_request_id,
+                            entry.prompt_token_count,
+                            proven_cached_prefix_tokens=(
+                                entry.cached_prefix_tokens or 0
+                            ),
+                        )
+                    elif entry.resumed_output_token_count == 0:
+                        # The resumed KV blocks may contain a different cached
+                        # routing history. None of the old prefill has been
+                        # emitted, so discard its GPU provenance and rebuild
+                        # from this admission's prefix plus fresh snapshots.
+                        self._release_request(state)
+                        state.storage_keys.clear()
+                        state.fragments.clear()
+                        # The scheduler's zero-output resume also supersedes
+                        # an optimistic sample it discarded during an async
+                        # cache reset, before accepting that sample's output.
+                        state.committed_route_end = 0
+                        state.proven_cached_prefix_tokens = (
+                            entry.cached_prefix_tokens or 0
+                        )
+                    elif entry.resumed_output_token_count is not None:
+                        self._trim_resumed_history(
+                            state, entry.resumed_output_token_count
                         )
                     # Preserve routes already emitted before preemption. Only
                     # pending prefill positions may be replaced by a later step.
@@ -597,6 +673,45 @@ class GpuOutputCapture:
                         )
                 except Exception as error:
                     self.fail_keys((entry.key,), error)
+
+    def _trim_resumed_history(self, state: _RequestCapture, output_count: int) -> None:
+        """Drop optimistic output the scheduler discarded before resumption."""
+        route_end = state.prompt_token_count + output_count - 1
+        fragments = []
+        storage_keys = set()
+        for fragment in state.fragments:
+            routes = fragment.routes
+            if routes is not None:
+                remaining = route_end - fragment.start
+                routes = routes[:remaining] if remaining > 0 else None
+            position = fragment.generated_position
+            if position is not None and position >= output_count:
+                position = None
+            token_id = fragment.token_id if position is not None else None
+            logprob = fragment.logprob if position is not None else None
+            if routes is None and token_id is None and logprob is None:
+                continue
+            fragments.append(
+                _Fragment(
+                    fragment.start,
+                    routes,
+                    position,
+                    token_id,
+                    logprob,
+                    fragment.ready,
+                    fragment.logprob_by_token,
+                )
+            )
+            storage_keys.update(
+                tensor.untyped_storage()._cdata
+                for tensor in (routes, token_id, logprob)
+                if tensor is not None and tensor.numel()
+            )
+        # Trimming makes only views of existing storages; it cannot add any.
+        self._release_storage_keys(state.storage_keys - storage_keys)
+        state.storage_keys.intersection_update(storage_keys)
+        state.fragments = fragments
+        state.committed_route_end = route_end
 
     def export(
         self, capture_key: str, *, generated_token_count: int, prompt_token_count: int
@@ -700,12 +815,29 @@ class GpuOutputCapture:
                             route_coverage[fragment.start : end] = [True] * (
                                 end - fragment.start
                             )
-                if not all(token_coverage) or (
-                    route_shape is not None and not all(route_coverage)
-                ):
+                if not all(token_coverage):
                     raise RuntimeError(
                         "GPU output does not cover the final accepted token/route positions"
                     )
+                prefix_backfill_ranges = []
+                if route_shape is not None:
+                    # Only proven admission/resumed-prefix cache hits may
+                    # lack GPU history. Report exact holes and preserve every
+                    # fresh GPU row from the current computation history.
+                    index = 0
+                    while index < len(route_coverage):
+                        if route_coverage[index]:
+                            index += 1
+                            continue
+                        missing_start = index
+                        while index < len(route_coverage) and not route_coverage[index]:
+                            index += 1
+                        if index > state.proven_cached_prefix_tokens:
+                            raise RuntimeError(
+                                "GPU output does not cover the final accepted token/route "
+                                "positions outside the proven cached prefix"
+                            )
+                        prefix_backfill_ranges.append((missing_start, index))
                 # The OpenAI serving adapter applies max(raw, VLLM_LOGPROB_FLOOR).
                 # Match that normalization on device to preserve committed bytes.
                 logprobs.clamp_min_(VLLM_LOGPROB_FLOOR)
@@ -727,6 +859,7 @@ class GpuOutputCapture:
                         handles[0],
                         handles[1],
                         handles[2] if assembled_routes is not None else None,
+                        tuple(prefix_backfill_ranges),
                     )
                 except Exception:
                     # None of these descriptors has left the producer yet.
@@ -824,8 +957,6 @@ def configure_gpu_output_capture(
         raise RuntimeError(
             "GPU output capture does not yet support speculative decoding"
         )
-    if require_routed_experts and config.cache_config.enable_prefix_caching:
-        raise RuntimeError("GPU routed-expert capture requires prefix caching disabled")
     if any(
         getattr(parallel, name, 1) != 1
         for name in ("decode_context_parallel_size", "prefill_context_parallel_size")

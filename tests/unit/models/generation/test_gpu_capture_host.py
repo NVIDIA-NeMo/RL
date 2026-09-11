@@ -6,6 +6,7 @@ import asyncio
 import socket
 import threading
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,6 +21,7 @@ from nemo_rl.data_plane.gpu_token_payload import (  # noqa: E402
     BoundGpuTokenSink,
     GpuTokenPayload,
 )
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD  # noqa: E402
 from nemo_rl.models.generation.vllm import gpu_capture_host as hosting  # noqa: E402
 from nemo_rl.models.generation.vllm.gpu_output_capture import (  # noqa: E402
     CudaTensorIpc,
@@ -28,6 +30,7 @@ from nemo_rl.models.generation.vllm.gpu_output_capture import (  # noqa: E402
     GpuOutputLease,
     GpuOutputTensors,
 )
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts  # noqa: E402
 
 pytestmark = [pytest.mark.nemo_gym, pytest.mark.asyncio]
 
@@ -238,6 +241,277 @@ async def test_bind_rejects_foreign_model_call_lease(cpu_cuda: list[str]) -> Non
     ]
     assert not cpu_cuda
     assert state.lease is None and state.capture_key is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("routing_dtype", [torch.int8, torch.int16, torch.int32])
+async def test_cached_prefix_uploads_only_missing_intervals(
+    monkeypatch: pytest.MonkeyPatch, routing_dtype: torch.dtype
+) -> None:
+    rpc, sink = _Rpc(), _Sink()
+    state = _state("cached-call", sink)
+    state.prompt_token_ids = [11, 12, 13, 14, 15]
+    ranges = ((0, 2), (3, 4))
+    lease = replace(_lease("cached-call"), routed_experts_prefix_backfill_ranges=ranges)
+    rpc.responses["export_gpu_output_capture"] = [lease]
+    fresh_routes = torch.arange(28, dtype=torch.int16).reshape(7, 2, 2)
+    routes = fresh_routes.to(device="cuda:0", dtype=torch.uint16)
+    ids = torch.tensor([21, 22], device="cuda:0")
+    logprobs = torch.tensor([-0.25, -0.5], device="cuda:0")
+    # CPU fresh rows deliberately disagree: only cached history may replace GPU rows.
+    cpu_routes = fresh_routes + 50
+    cpu_routes[0, 0, 0] = -1
+    envelope = encode_routed_experts(cpu_routes)
+    expected = fresh_routes.to(dtype=routing_dtype, copy=True)
+    for start, end in ranges:
+        expected[start:end] = cpu_routes[start:end].to(dtype=routing_dtype)
+    monkeypatch.setattr(
+        hosting,
+        "import_gpu_output_lease",
+        lambda descriptor, device: GpuOutputTensors(ids, logprobs, routes),
+    )
+    transfers: list[tuple[int, tuple[int, ...], int]] = []
+    original_copy = torch.Tensor.copy_
+
+    def copy_with_accounting(
+        destination: torch.Tensor, source: torch.Tensor, non_blocking: bool = False
+    ) -> torch.Tensor:
+        if destination.is_cuda and source.device.type == "cpu":
+            transfers.append(
+                (
+                    destination.storage_offset(),
+                    tuple(source.shape),
+                    source.numel() * source.element_size(),
+                )
+            )
+        return original_copy(destination, source, non_blocking=non_blocking)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_with_accounting)
+    host = hosting.GpuCaptureHost(rpc, torch.device("cuda:0"))
+    try:
+        await host.bind(
+            state,
+            generated_token_count=2,
+            routed_experts_dtype=routing_dtype,
+            routed_experts_cpu=envelope,
+        )
+        await host.finish(
+            state, lambda: state.gpu_sink.stage(SimpleNamespace(staging_key="cached"))
+        )
+    finally:
+        await host.release(state)
+
+    payload = sink.payloads["cached"]
+    assert payload.generated_token_ids is ids
+    assert payload.generated_logprobs is logprobs
+    assert payload.routed_experts.is_cuda
+    assert payload.routed_experts.dtype == routing_dtype
+    assert torch.equal(payload.routed_experts.cpu(), expected)
+    assert torch.equal(routes.cpu(), fresh_routes.to(dtype=torch.uint16))
+    assert transfers == [
+        (0, (2, 2, 2), 8 * routing_dtype.itemsize),
+        (12, (1, 2, 2), 4 * routing_dtype.itemsize),
+    ]
+    assert rpc.calls == [
+        ("export_gpu_output_capture", ("cached-call", 2, 5)),
+        ("release_gpu_output_capture", ("lease-cached-call",)),
+        ("discard_gpu_output_capture", ("cached-call",)),
+    ]
+    assert state.lease is None and state.capture_key is None
+    assert not state.ipc_handles_consumed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("routing_dtype", [torch.int8, torch.int16, torch.int32])
+@pytest.mark.parametrize("prev_len", [0, 3], ids=["first-turn", "continuation"])
+async def test_cached_prefix_put_fields_equal_canonical_cpu_mirror(
+    monkeypatch: pytest.MonkeyPatch, routing_dtype: torch.dtype, prev_len: int
+) -> None:
+    rpc = _Rpc()
+    canonical_routes = torch.arange(28, dtype=routing_dtype).reshape(7, 2, 2)
+    canonical_routes[0, 0, 0] = -1
+    canonical_routes[-1] = torch.tensor([[0, 1], [0, 1]], dtype=routing_dtype)
+    native_routes = canonical_routes.to(dtype=torch.uint16, device="cuda:0")
+    native_routes[:2] = 0
+    native_routes[3:4] = 0
+    cpu_fields = {
+        "token_ids_delta": torch.tensor([[11, 12, 13, 14, 15, 21, 22]])[:, prev_len:],
+        "token_mask_delta": torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]])[
+            :, prev_len:
+        ],
+        "generation_logprobs_delta": torch.tensor(
+            [[0.0, 0.0, 0.0, 0.0, 0.0, -0.25, -0.5]]
+        )[:, prev_len:],
+        ROUTED_EXPERTS_FIELD: canonical_routes[prev_len:].unsqueeze(0),
+    }
+    staged_fields: dict[str, torch.Tensor] = {}
+
+    class MirrorSink(_Sink):
+        def stage(self, record: Any, *, gpu_payload: GpuTokenPayload) -> StageResult:
+            staged_fields.update(
+                replace(gpu_payload, validate_cpu_mirror=True).staging_fields(
+                    record, cpu_fields
+                )
+            )
+            return super().stage(record, gpu_payload=gpu_payload)
+
+    state = _state("mirror-call", MirrorSink())
+    state.prompt_token_ids = [11, 12, 13, 14, 15]
+    rpc.responses["export_gpu_output_capture"] = [
+        replace(
+            _lease("mirror-call"),
+            routed_experts_prefix_backfill_ranges=((0, 2), (3, 4)),
+        )
+    ]
+    monkeypatch.setattr(
+        hosting,
+        "import_gpu_output_lease",
+        lambda descriptor, device: GpuOutputTensors(
+            torch.tensor([21, 22], dtype=torch.int32, device="cuda:0"),
+            torch.tensor([-0.25, -0.5], dtype=torch.float32, device="cuda:0"),
+            native_routes,
+        ),
+    )
+    record = SimpleNamespace(
+        staging_key="mirror", prev_len=prev_len, delta_len=7 - prev_len, cum_len=7
+    )
+    host = hosting.GpuCaptureHost(rpc, torch.device("cuda:0"))
+    try:
+        await host.bind(
+            state,
+            generated_token_count=2,
+            routed_experts_dtype=routing_dtype,
+            routed_experts_cpu=encode_routed_experts(canonical_routes),
+        )
+        result = await host.finish(state, lambda: state.gpu_sink.stage(record))
+    finally:
+        await host.release(state)
+
+    assert result.ok
+    assert staged_fields.keys() == cpu_fields.keys()
+    for name, expected in cpu_fields.items():
+        actual = staged_fields[name]
+        assert actual.is_cuda
+        assert actual.dtype == expected.dtype
+        assert actual.shape == expected.shape
+        assert torch.equal(
+            actual.cpu().contiguous().view(torch.uint8),
+            expected.contiguous().view(torch.uint8),
+        ), name
+
+
+@pytest.mark.parametrize(
+    ("ranges", "generated_count", "source_kind", "error"),
+    [
+        (((0, 1),), 1, "missing", "require the CPU routing record"),
+        (((0, 1),), 1, "invalid", "not a valid"),
+        (((0, 1),), 1, "wrong_shape", "shapes do not match"),
+        (((0, 2), (1, 2)), 1, "valid", "ordered prompt slices"),
+        (((1, 2), (0, 1)), 1, "valid", "ordered prompt slices"),
+        (((0, 0),), 1, "valid", "ordered prompt slices"),
+        (((-1, 1),), 1, "valid", "ordered prompt slices"),
+        (((False, 1),), 1, "valid", "ordered prompt slices"),
+        (((2, 3),), 1, "valid", "ordered prompt slices"),
+        (((1, 2),), 0, "valid", "ordered prompt slices"),
+    ],
+    ids=[
+        "missing-envelope",
+        "invalid-envelope",
+        "delta-aligned-envelope",
+        "overlapping-ranges",
+        "out-of-order-ranges",
+        "empty-range",
+        "negative-start",
+        "boolean-start",
+        "generated-row",
+        "final-dummy-row",
+    ],
+)
+async def test_cached_prefix_validation_failure_releases_imported_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_cuda: list[str],
+    ranges: tuple[tuple[int, int], ...],
+    generated_count: int,
+    source_kind: str,
+    error: str,
+) -> None:
+    rpc, sink = _Rpc(), _Sink()
+    state = _state("cached-call", sink)
+    rpc.responses["export_gpu_output_capture"] = [
+        replace(_lease("cached-call"), routed_experts_prefix_backfill_ranges=ranges)
+    ]
+    routes = torch.arange(2 + generated_count, dtype=torch.int16).reshape(-1, 1, 1)
+    original_routes = routes.clone()
+    envelope = {
+        "missing": None,
+        "invalid": "invalid-envelope",
+        "wrong_shape": encode_routed_experts(routes[1:]),
+        "valid": encode_routed_experts(routes),
+    }[source_kind]
+    monkeypatch.setattr(
+        hosting,
+        "import_gpu_output_lease",
+        lambda descriptor, device: GpuOutputTensors(
+            torch.tensor([21]), torch.tensor([-0.25]), routes
+        ),
+    )
+    host = hosting.GpuCaptureHost(rpc, torch.device("cuda:0"))
+    try:
+        with pytest.raises(ValueError, match=error):
+            await host.bind(
+                state,
+                generated_token_count=generated_count,
+                routed_experts_dtype=torch.int16,
+                routed_experts_cpu=envelope,
+            )
+    finally:
+        await host.release(state)
+
+    assert torch.equal(routes, original_routes)
+    assert not sink.payloads
+    assert rpc.calls == [
+        ("export_gpu_output_capture", ("cached-call", generated_count, 2)),
+        ("release_gpu_output_capture", ("lease-cached-call",)),
+        ("discard_gpu_output_capture", ("cached-call",)),
+    ]
+    assert cpu_cuda == ["sync"]
+    assert state.lease is None and state.capture_key is None
+    assert not state.ipc_handles_consumed
+
+
+async def test_no_cache_hit_never_decodes_cpu_routing_record(
+    monkeypatch: pytest.MonkeyPatch, cpu_cuda: list[str]
+) -> None:
+    rpc, sink = _Rpc(), _Sink()
+    state = _state("uncached-call", sink)
+    rpc.responses["export_gpu_output_capture"] = [_lease("uncached-call")]
+    routes = torch.tensor([[[1]], [[2]], [[0]]], dtype=torch.int16)
+
+    def reject_decode(*args: Any, **kwargs: Any) -> torch.Tensor:
+        pytest.fail("An uncached request must not decode or upload CPU routing data")
+
+    monkeypatch.setattr(hosting, "decode_routed_experts", reject_decode)
+    monkeypatch.setattr(
+        hosting,
+        "import_gpu_output_lease",
+        lambda descriptor, device: GpuOutputTensors(
+            torch.tensor([21]), torch.tensor([-0.25]), routes
+        ),
+    )
+    host = hosting.GpuCaptureHost(rpc, torch.device("cuda:0"))
+    try:
+        await host.bind(
+            state,
+            generated_token_count=1,
+            routed_experts_dtype=torch.int16,
+            routed_experts_cpu="unused-invalid-envelope",
+        )
+        await host.finish(
+            state, lambda: state.gpu_sink.stage(SimpleNamespace(staging_key="uncached"))
+        )
+    finally:
+        await host.release(state)
+    assert sink.payloads["uncached"].routed_experts is routes
 
 
 @pytest.mark.parametrize(

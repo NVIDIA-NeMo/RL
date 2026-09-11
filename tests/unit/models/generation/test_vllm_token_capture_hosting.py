@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import AsyncGenerator
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -43,12 +46,104 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 )
 
 from nemo_rl.models.generation.vllm.gpu_capture_host import GpuCaptureHost  # noqa: E402
+from nemo_rl.models.generation.vllm.gpu_output_capture import (
+    GPU_CAPTURE_KEY,  # noqa: E402
+)
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
+    _AsyncLLMHTTPClient,
+    _validate_gpu_route_history,
 )
 
 pytestmark = pytest.mark.nemo_gym
+
+
+@pytest.mark.parametrize(
+    ("prompt_len", "generated_len", "prompt_rows", "output_rows", "incomplete"),
+    [
+        (3, 2, None, 4, False),
+        (3, 2, 3, 1, False),
+        (3, 2, None, 5, False),
+        (3, 0, None, 2, False),
+        (0, 0, None, None, False),
+        (3, 2, None, 3, True),
+        (3, 2, 2, 1, True),
+        (3, 2, None, None, True),
+    ],
+    ids=[
+        "normal-final-dummy-omitted",
+        "split-prompt-and-decode",
+        "already-full-history",
+        "zero-generated-final-dummy",
+        "empty-request",
+        "missing-tail-row",
+        "short-prompt-history",
+        "missing-all-history",
+    ],
+)
+def test_gpu_route_history_requires_canonical_rows_before_final_dummy(
+    prompt_len: int,
+    generated_len: int,
+    prompt_rows: int | None,
+    output_rows: int | None,
+    incomplete: bool,
+) -> None:
+    request_output = SimpleNamespace(
+        prompt_token_ids=list(range(prompt_len)),
+        prompt_routed_experts=(
+            None
+            if prompt_rows is None
+            else torch.zeros(prompt_rows, 2, 2, dtype=torch.int16)
+        ),
+        outputs=[
+            SimpleNamespace(
+                token_ids=list(range(generated_len)),
+                routed_experts=(
+                    None
+                    if output_rows is None
+                    else torch.zeros(output_rows, 2, 2, dtype=torch.int16)
+                ),
+            )
+        ],
+    )
+    if incomplete:
+        with pytest.raises(ValueError, match="complete canonical CPU route history"):
+            _validate_gpu_route_history(request_output)
+    else:
+        _validate_gpu_route_history(request_output)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tagged", [True, False])
+async def test_gpu_capture_requests_full_cpu_route_history(tagged: bool) -> None:
+    observed: list[tuple[Any, int, str, dict[str, Any]]] = []
+
+    async def generate(
+        prompt: Any, params: Any, request_id: str, **kwargs: Any
+    ) -> AsyncGenerator[str, None]:
+        observed.append(
+            (prompt, params.routed_experts_prompt_start, request_id, kwargs)
+        )
+        yield "result"
+
+    engine = SimpleNamespace(
+        model_config=None,
+        renderer=None,
+        input_processor=None,
+        vllm_config=None,
+        generate=generate,
+    )
+    client = _AsyncLLMHTTPClient(engine, asyncio.get_running_loop())
+    extra_args = {GPU_CAPTURE_KEY: "call"} if tagged else {"other": "value"}
+    params = SimpleNamespace(extra_args=extra_args, routed_experts_prompt_start=7)
+    outputs = [
+        output
+        async for output in client.generate("prompt", params, "request", priority=2)
+    ]
+    assert outputs == ["result"]
+    assert observed == [("prompt", 0 if tagged else 7, "request", {"priority": 2})]
+    assert params.extra_args == extra_args
 
 
 class _MemorySink:

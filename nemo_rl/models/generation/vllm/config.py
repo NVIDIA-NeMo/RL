@@ -48,7 +48,8 @@ class VllmGpuOutputCaptureConfig(BaseModel, extra="allow"):
     mirrors remain available. The budget counts unique retained CUDA backing
     storages (including unused rows in shared batches) and peak IPC payload
     assembly. Exceeding it fails capture instead of silently copying through CPU.
-    Router snapshot reuse requires native vLLM async scheduling.
+    Router snapshot reuse requires native vLLM async scheduling. Prefix cache
+    hits backfill only missing historical router rows from vLLM's CPU record.
     """
 
     enabled: bool = True

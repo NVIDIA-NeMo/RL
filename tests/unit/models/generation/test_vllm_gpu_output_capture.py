@@ -92,6 +92,9 @@ def _step(
     logprob: float,
     route_values: list[int],
     discard: bool = False,
+    initial_cached_prefix: int | None = None,
+    resumed_cached_prefix: int | None = None,
+    resumed_output_tokens: int = 0,
 ) -> SimpleNamespace:
     runner.input_batch.num_computed_tokens_cpu[0] = start
     runner.discard_request_mask.np[0] = discard
@@ -104,7 +107,28 @@ def _step(
     sampler = SimpleNamespace(
         sampled_token_ids=ids, logprobs_tensors=SimpleNamespace(logprobs=logs)
     )
-    scheduler = SimpleNamespace(num_scheduled_tokens={"native": count})
+    scheduler = SimpleNamespace(
+        num_scheduled_tokens={"native": count},
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["native"] if resumed_cached_prefix is not None else [],
+            resumed_req_ids={"native"} if resumed_cached_prefix is not None else set(),
+            num_computed_tokens=[resumed_cached_prefix]
+            if resumed_cached_prefix is not None
+            else [],
+            num_output_tokens=[resumed_output_tokens]
+            if resumed_cached_prefix is not None
+            else [],
+        ),
+        scheduled_new_reqs=(
+            [
+                SimpleNamespace(
+                    req_id="native", num_computed_tokens=initial_cached_prefix
+                )
+            ]
+            if initial_cached_prefix is not None
+            else []
+        ),
+    )
     if runner._bookkeeping_sync is capture._original_bookkeeping:
         capture.install()
     runner.native_step = (scheduler, sampler, routes)
@@ -163,7 +187,14 @@ def _batched_step(
     )
     # Native input-batch order, rather than dict insertion order, owns row offsets.
     scheduler = SimpleNamespace(
-        num_scheduled_tokens={"untagged": 2, "native-b": 1, "native-a": 3}
+        num_scheduled_tokens={"untagged": 2, "native-b": 1, "native-a": 3},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            resumed_req_ids=set(),
+            num_computed_tokens=[],
+            num_output_tokens=[],
+        ),
     )
     runner.native_step = (scheduler, sampler, scratch)
     if runner._bookkeeping_sync is capture._original_bookkeeping:
@@ -760,3 +791,445 @@ def test_raw_vocabulary_logprob_selection_is_deferred_to_assembly() -> None:
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
     assert capture._leases[lease.lease_id].tensors.generation_logprobs.item() == -9
     capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+def test_prefix_cached_by_untagged_request_needs_only_historical_route_backfill() -> (
+    None
+):
+    runner = _runner()
+    runner.requests["native"].sampling_params.extra_args = {}
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+    historical = _step(
+        runner,
+        capture,
+        start=0,
+        count=3,
+        token=7,
+        logprob=-0.7,
+        route_values=[10, 11, 12, 13, 14, 15],
+        initial_cached_prefix=0,
+    )
+    assert capture.retained_bytes == 0
+    del historical, runner.native_step
+    # A subsequent request hits two cached prompt positions. Their routing
+    # exists only in the native CPU cache, with no previous tagged capture.
+    runner.requests["native"] = SimpleNamespace(
+        sampling_params=SimpleNamespace(n=1, extra_args={GPU_CAPTURE_KEY: "call"}),
+        num_prompt_tokens=3,
+    )
+    output = _step(
+        runner,
+        capture,
+        start=2,
+        count=1,
+        token=8,
+        logprob=-0.8,
+        route_values=[20, 21],
+        initial_cached_prefix=2,
+    )
+    fragment = capture._requests["call"].fragments[0]
+    assert fragment.routes.data_ptr() == output._routed_experts.routing_data.data_ptr()
+    assert fragment.token_id.data_ptr() == output._sampled_token_ids.data_ptr()
+    assert fragment.logprob.data_ptr() == output._logprobs_tensors.logprobs.data_ptr()
+    lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
+    assert lease.routed_experts_prefix_backfill_ranges == ((0, 2),)
+    tensors = capture._leases[lease.lease_id].tensors
+    assert tensors.generated_token_ids.tolist() == [8]
+    assert tensors.generation_logprobs.tolist() == pytest.approx([-0.8])
+    assert tensors.routed_experts[2:].tolist() == [[[20, 21]], [[0, 1]]]
+    del tensors
+    capture.abandon_unimported(lease.lease_id)
+    torch.cuda.synchronize()
+    assert capture.retained_bytes == 0
+
+
+@cuda_required
+def test_cached_prefix_length_is_frozen_before_bookkeeping_and_chunked_prefill() -> (
+    None
+):
+    runner = _runner()
+    runner.requests["native"].num_prompt_tokens = 5
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+
+    def mutate_admission_metadata() -> None:
+        runner.native_step[0].scheduled_new_reqs[0].num_computed_tokens = 4
+        runner.input_batch.num_computed_tokens_cpu[0] = 4
+
+    runner.after_bookkeeping = mutate_admission_metadata
+    _step(
+        runner,
+        capture,
+        start=2,
+        count=1,
+        token=0,
+        logprob=0,
+        route_values=[20, 21],
+        discard=True,
+        initial_cached_prefix=2,
+    )
+    del runner.after_bookkeeping
+    _step(
+        runner,
+        capture,
+        start=3,
+        count=2,
+        token=7,
+        logprob=-0.7,
+        route_values=[30, 31, 40, 41],
+    )
+    assert capture._requests["call"].proven_cached_prefix_tokens == 2
+    lease = capture.export("call", generated_token_count=1, prompt_token_count=5)
+    assert lease.routed_experts_prefix_backfill_ranges == ((0, 2),)
+    tensors = capture._leases[lease.lease_id].tensors
+    assert tensors.routed_experts[2:].tolist() == [
+        [[20, 21]],
+        [[30, 31]],
+        [[40, 41]],
+        [[0, 1]],
+    ]
+    del tensors
+    capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+@pytest.mark.parametrize("resumed_prefix", [0, 1, 4])
+def test_prefill_resume_replaces_old_routes_with_current_cache_and_gpu_history(
+    resumed_prefix: int,
+) -> None:
+    runner = _runner()
+    runner.requests["native"].num_prompt_tokens = 6
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+    _step(
+        runner,
+        capture,
+        start=2,
+        count=1,
+        token=0,
+        logprob=0,
+        route_values=[20, 21],
+        discard=True,
+        initial_cached_prefix=2,
+    )
+    old_storage_keys = set(capture._requests["call"].storage_keys)
+    # Before the first output, resumed block IDs can refer to a different
+    # cache history, including a longer prefix computed by another request.
+    new_values = list(range(100 + 2 * resumed_prefix, 110))
+    output = _step(
+        runner,
+        capture,
+        start=resumed_prefix,
+        count=5 - resumed_prefix,
+        token=0,
+        logprob=0,
+        route_values=new_values,
+        discard=True,
+        resumed_cached_prefix=resumed_prefix,
+    )
+    state = capture._requests["call"]
+    assert state.proven_cached_prefix_tokens == resumed_prefix
+    assert len(state.fragments) == 1
+    assert not old_storage_keys.intersection(state.storage_keys)
+    assert (
+        state.fragments[0].routes.data_ptr()
+        == output._routed_experts.routing_data.data_ptr()
+    )
+    _step(
+        runner,
+        capture,
+        start=5,
+        count=1,
+        token=7,
+        logprob=-0.7,
+        route_values=[110, 111],
+    )
+    lease = capture.export("call", generated_token_count=1, prompt_token_count=6)
+    assert lease.routed_experts_prefix_backfill_ranges == (
+        ((0, resumed_prefix),) if resumed_prefix else ()
+    )
+    tensors = capture._leases[lease.lease_id].tensors
+    assert tensors.routed_experts[resumed_prefix:6].flatten().tolist() == new_values + [
+        110,
+        111,
+    ]
+    del tensors
+    capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+def test_resume_after_emitted_sample_keeps_frozen_prompt_routes() -> None:
+    runner = _runner()
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+    _step(
+        runner,
+        capture,
+        start=1,
+        count=2,
+        token=7,
+        logprob=-0.7,
+        route_values=[10, 11, 20, 21],
+        initial_cached_prefix=1,
+    )
+    _step(
+        runner,
+        capture,
+        start=0,
+        count=4,
+        token=8,
+        logprob=-0.8,
+        route_values=[90, 91, 92, 93, 94, 95, 30, 31],
+        resumed_cached_prefix=0,
+        resumed_output_tokens=1,
+    )
+    lease = capture.export("call", generated_token_count=2, prompt_token_count=3)
+    assert lease.routed_experts_prefix_backfill_ranges == ((0, 1),)
+    tensors = capture._leases[lease.lease_id].tensors
+    assert tensors.routed_experts[1:].tolist() == [
+        [[10, 11]],
+        [[20, 21]],
+        [[30, 31]],
+        [[0, 1]],
+    ]
+    del tensors
+    capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+def test_zero_output_resume_discards_sample_rejected_by_async_cache_reset() -> None:
+    runner = _runner()
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+    _step(
+        runner,
+        capture,
+        start=1,
+        count=2,
+        token=7,
+        logprob=-0.7,
+        route_values=[10, 11, 20, 21],
+        initial_cached_prefix=1,
+    )
+    assert capture._requests["call"].committed_route_end == 3
+    # The native hook observed a sample, but authoritative scheduler metadata
+    # says the reset discarded it and restarted before any accepted output.
+    _step(
+        runner,
+        capture,
+        start=2,
+        count=1,
+        token=8,
+        logprob=-0.8,
+        route_values=[40, 41],
+        resumed_cached_prefix=2,
+        resumed_output_tokens=0,
+    )
+    assert len(capture._requests["call"].fragments) == 1
+    lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
+    assert lease.routed_experts_prefix_backfill_ranges == ((0, 2),)
+    tensors = capture._leases[lease.lease_id].tensors
+    assert tensors.generated_token_ids.tolist() == [8]
+    assert tensors.generation_logprobs.tolist() == pytest.approx([-0.8])
+    assert tensors.routed_experts[2:].tolist() == [[[40, 41]], [[0, 1]]]
+    del tensors
+    capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+def test_resume_trims_discarded_async_suffix_but_keeps_accepted_history() -> None:
+    runner = _runner()
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+    _step(
+        runner,
+        capture,
+        start=1,
+        count=2,
+        token=7,
+        logprob=-0.7,
+        route_values=[10, 11, 20, 21],
+        initial_cached_prefix=1,
+    )
+    _step(
+        runner, capture, start=3, count=1, token=8, logprob=-0.8, route_values=[30, 31]
+    )
+    old_suffix_keys = {
+        tensor.untyped_storage()._cdata
+        for tensor in (
+            capture._requests["call"].fragments[-1].routes,
+            capture._requests["call"].fragments[-1].token_id,
+            capture._requests["call"].fragments[-1].logprob,
+        )
+    }
+    # Only the first sampled output survived a forced cache reset. The
+    # pending second token and its optimistic routes were discarded natively.
+    output = _step(
+        runner,
+        capture,
+        start=0,
+        count=4,
+        token=9,
+        logprob=-0.9,
+        route_values=[90, 91, 92, 93, 94, 95, 40, 41],
+        resumed_cached_prefix=0,
+        resumed_output_tokens=1,
+    )
+    assert not old_suffix_keys.intersection(capture._requests["call"].storage_keys)
+    fresh = capture._requests["call"].fragments[-1]
+    assert (
+        fresh.routes.untyped_storage()._cdata
+        == output._routed_experts.routing_data.untyped_storage()._cdata
+    )
+    lease = capture.export("call", generated_token_count=2, prompt_token_count=3)
+    assert lease.routed_experts_prefix_backfill_ranges == ((0, 1),)
+    tensors = capture._leases[lease.lease_id].tensors
+    assert tensors.generated_token_ids.tolist() == [7, 9]
+    assert tensors.generation_logprobs.tolist() == pytest.approx([-0.7, -0.9])
+    assert tensors.routed_experts[1:].tolist() == [
+        [[10, 11]],
+        [[20, 21]],
+        [[40, 41]],
+        [[0, 1]],
+    ]
+    del tensors
+    capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+@pytest.mark.parametrize(
+    "gap_kind", ["uncached_prompt", "generated_route", "generated_id"]
+)
+def test_prefix_authorization_never_covers_missing_fresh_outputs(gap_kind: str) -> None:
+    runner = _runner()
+    runner.requests["native"].num_prompt_tokens = 5
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+    _step(
+        runner,
+        capture,
+        start=2,
+        count=1 if gap_kind == "uncached_prompt" else 3,
+        token=7,
+        logprob=-0.7,
+        route_values=[20, 21]
+        if gap_kind == "uncached_prompt"
+        else [20, 21, 30, 31, 40, 41],
+        discard=gap_kind == "uncached_prompt",
+        initial_cached_prefix=2,
+    )
+    if gap_kind == "uncached_prompt":
+        # Position 3 was not in the cache and its scheduled chunk is missing.
+        _step(
+            runner,
+            capture,
+            start=4,
+            count=1,
+            token=7,
+            logprob=-0.7,
+            route_values=[40, 41],
+        )
+        generated = 1
+    elif gap_kind == "generated_route":
+        # Token IDs can be present while a post-prompt route fragment is lost.
+        _step(
+            runner,
+            capture,
+            start=5,
+            count=1,
+            token=8,
+            logprob=-0.8,
+            route_values=[50, 51],
+        )
+        capture._requests["call"].fragments[-1].routes = None
+        generated = 2
+    else:
+        generated = 2
+    with pytest.raises(RuntimeError, match="does not cover"):
+        capture.export("call", generated_token_count=generated, prompt_token_count=5)
+    capture.discard("call")
+    torch.cuda.synchronize()
+    assert capture.retained_bytes == 0
+
+
+@cuda_required
+@pytest.mark.parametrize("cached_prefix", [-1, 4, 1])
+def test_invalid_admission_cache_metadata_fails_capture_only(
+    cached_prefix: int,
+) -> None:
+    runner = _runner()
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+    _step(
+        runner,
+        capture,
+        start=2,
+        count=1,
+        token=7,
+        logprob=-0.7,
+        route_values=[20, 21],
+        initial_cached_prefix=cached_prefix,
+    )
+    with pytest.raises(RuntimeError, match="cached-prefix metadata"):
+        capture.export("call", generated_token_count=1, prompt_token_count=3)
+    assert capture.retained_bytes == 0
+
+
+@cuda_required
+def test_later_positive_start_does_not_expand_proven_cached_prefix() -> None:
+    runner = _runner()
+    runner.requests["native"].num_prompt_tokens = 5
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+    _step(
+        runner,
+        capture,
+        start=1,
+        count=1,
+        token=0,
+        logprob=0,
+        route_values=[10, 11],
+        discard=True,
+        initial_cached_prefix=1,
+    )
+    # A resumed request has no NewRequestData. Its later start cannot turn
+    # missing freshly computed positions 2 and 3 into authorized cache holes.
+    _step(
+        runner, capture, start=4, count=1, token=7, logprob=-0.7, route_values=[40, 41]
+    )
+    assert capture._requests["call"].proven_cached_prefix_tokens == 1
+    with pytest.raises(RuntimeError, match="outside the proven cached prefix"):
+        capture.export("call", generated_token_count=1, prompt_token_count=5)
+    capture.discard("call")
+
+
+@cuda_required
+def test_native_capture_rejects_truncated_canonical_cpu_route_envelope() -> None:
+    runner = _runner()
+    runner.requests["native"].sampling_params.routed_experts_prompt_start = 2
+    capture = GpuOutputCapture(
+        runner, max_retained_bytes=4096, require_routed_experts=True
+    )
+    _step(
+        runner,
+        capture,
+        start=2,
+        count=1,
+        token=7,
+        logprob=-0.7,
+        route_values=[20, 21],
+        initial_cached_prefix=2,
+    )
+    with pytest.raises(RuntimeError, match="full canonical prompt routes"):
+        capture.export("call", generated_token_count=1, prompt_token_count=3)

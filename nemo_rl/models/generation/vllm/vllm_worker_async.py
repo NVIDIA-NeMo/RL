@@ -71,6 +71,25 @@ LOGGER = logging.getLogger(__name__)
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 
 
+def _validate_gpu_route_history(request_output: Any) -> None:
+    """Reject GPU capture when CPU route omission prevents identical PUT bytes."""
+    prompt_len = len(getattr(request_output, "prompt_token_ids", None) or [])
+    prompt_routes = getattr(request_output, "prompt_routed_experts", None)
+    for output in request_output.outputs:
+        routes = getattr(output, "routed_experts", None)
+        actual = sum(len(rows) for rows in (prompt_routes, routes) if rows is not None)
+        expected = max(prompt_len + len(output.token_ids) - 1, 0)
+        if actual < expected:
+            # The CPU adapter pads missing rows with -1. A short chunk can
+            # also shift later rows, so native GPU values may not match that
+            # record. Preserve serving's fallback but do not stage different
+            # bytes under its digest. The normal final dummy row is excluded.
+            raise ValueError(
+                "GPU capture requires complete canonical CPU route history: "
+                f"received {actual} rows, expected at least {expected}"
+            )
+
+
 class _AsyncLLMHTTPClient:
     """Keep HTTP generation on the loop that owns AsyncLLM request state.
 
@@ -119,6 +138,12 @@ class _AsyncLLMHTTPClient:
         async def next_output() -> Any:
             nonlocal iterator
             if iterator is None:
+                if (getattr(sampling_params, "extra_args", None) or {}).get(
+                    GPU_CAPTURE_KEY
+                ):
+                    # Captured calls need the full CPU routing record for
+                    # cached-prefix backfill and Gym's later delta alignment.
+                    sampling_params.routed_experts_prompt_start = 0
                 iterator = self._engine_client.generate(
                     prompt, sampling_params, request_id, **kwargs
                 )
@@ -1131,10 +1156,23 @@ class VllmAsyncGenerationWorkerImpl(
                             raise ValueError(
                                 "GPU token capture requires exactly one final output"
                             )
+                        routed_experts_cpu = None
+                        if worker_self._return_routed_experts_enabled():
+                            _validate_gpu_route_history(final_res)
+                            output_index = final_res.outputs[0].index
+                            choice = next(
+                                choice
+                                for choice in response.choices
+                                if choice.index == output_index
+                            )
+                            routed_experts_cpu = getattr(
+                                choice.message, "routed_experts", None
+                            )
                         await worker_self._gpu_capture_host.bind(
                             state,
                             generated_token_count=len(final_res.outputs[0].token_ids),
                             routed_experts_dtype=worker_self.routed_experts_dtype,
+                            routed_experts_cpu=routed_experts_cpu,
                         )
                     except Exception as error:
                         # Keep serving failure behavior identical to a failed

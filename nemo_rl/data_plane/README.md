@@ -486,24 +486,29 @@ checks device, shape, and alignment without copying the generated payload
 back to CPU again. Tests verify that the retained tensors match the existing
 CPU representation. This removes the generated payload's H2D staging input;
 it does **not** eliminate D2H used by serving/validation, CPU-origin
-prompt-carry and metadata transfers, the GPU staging D2D copy, or Mooncake's
-host-backed storage. Keeping a tensor on GPU does not make this an end-to-end
-zero-copy transport.
+prompt-carry, cached-prefix router history and metadata transfers, the GPU
+staging D2D copy, or Mooncake's host-backed storage. Keeping a tensor on GPU
+does not make this an end-to-end zero-copy transport.
 
 The initial implementation supports vLLM **0.25.1**, one completion per
 request, no speculative decoding, PP=1, and no context parallelism. The TP
 output owner must be on the frontend host and its physical GPU must be
 mapped to frontend `cuda:0` (the current TQ executor's default device).
-This GPU capture adapter's routed-expert retention currently requires
-`policy.generation.vllm_cfg.enable_prefix_caching: false` and native
+Router snapshot reuse requires native
 `policy.generation.vllm_kwargs.async_scheduling: true`. Setting
 `vllm_cfg.async_engine: true` alone does not ensure native async scheduling;
 the synchronous scheduler does not create a GPU router snapshot to reuse.
-R3 itself can use prefix caching: vLLM's scheduler stores router indices by
-KV-cache slot in CPU memory and retrieves the cached prompt routes on a hit.
-The GPU capture adapter retains newly computed step outputs but does not yet
-retain those cached prefix routes, so its prefix-caching restriction is a
-limitation of this adapter, not of R3 or GDR.
+Prefix caching remains supported with the configured
+`policy.generation.vllm_cfg.enable_prefix_caching` setting. vLLM's scheduler
+stores router history by KV-cache slot in CPU memory. On a cache hit, the
+adapter copies only cached-prefix routing rows absent from the retained GPU
+snapshots into the assembled GPU payload. Newly computed routes, token IDs,
+and logprobs keep their GPU sources. Missing routes outside the proven
+cached prefix fail capture. This router-history backfill runs in the serving
+process before PUT; the KV cache stays in place. Captured calls request the
+full CPU routing record before Gym applies multi-turn delta alignment. An
+incomplete CPU routing record also fails GPU capture, because its missing-row
+fallback may differ from the retained GPU routes and their expected digest.
 Unsupported engine/device configurations fail during setup; an individual
 retention/validation failure produces `capture_failed` coordinates instead of
 silently using a CPU PUT or crashing generation.

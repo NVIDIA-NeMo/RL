@@ -30,8 +30,44 @@ from nemo_rl.models.generation.vllm.gpu_output_capture import (
     GpuOutputLease,
     import_gpu_output_lease,
 )
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 
 _Result = TypeVar("_Result")
+
+
+def _backfill_cached_prefix_routes(
+    routes: torch.Tensor | None,
+    ranges: tuple[tuple[int, int], ...],
+    cpu_envelope: str | None,
+    *,
+    prompt_token_count: int,
+    generated_token_count: int,
+) -> None:
+    """Fill only proven cached-prefix holes from the canonical CPU response."""
+    if not ranges:
+        return
+    total = prompt_token_count + generated_token_count
+    if routes is None or routes.ndim != 3 or routes.shape[0] != total:
+        raise ValueError("Cached-prefix backfill requires full aligned GPU routes")
+    previous_end = 0
+    prefix_end = min(prompt_token_count, max(total - 1, 0))
+    for start, end in ranges:
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not previous_end <= start < end <= prefix_end
+        ):
+            raise ValueError("GPU route backfill ranges must be ordered prompt slices")
+        previous_end = end
+    if not isinstance(cpu_envelope, str):
+        raise ValueError("Cached-prefix GPU routes require the CPU routing record")
+    cpu_routes = decode_routed_experts(cpu_envelope, routes.dtype)
+    if cpu_routes.shape != routes.shape:
+        raise ValueError("Cached-prefix CPU and GPU routing shapes do not match")
+    for start, end in ranges:
+        # Only history absent from the current GPU snapshots crosses H2D.
+        # Fresh routes and sampled outputs retain their GPU sources.
+        routes[start:end].copy_(cpu_routes[start:end])
 
 
 async def _await_completion(task: asyncio.Task[_Result]) -> _Result:
@@ -130,6 +166,7 @@ class GpuCaptureHost:
         *,
         generated_token_count: int,
         routed_experts_dtype: torch.dtype,
+        routed_experts_cpu: str | None = None,
     ) -> None:
         """Bind original device tensors to the call's completion-time sink."""
         await _await_completion(
@@ -138,6 +175,7 @@ class GpuCaptureHost:
                     state,
                     generated_token_count=generated_token_count,
                     routed_experts_dtype=routed_experts_dtype,
+                    routed_experts_cpu=routed_experts_cpu,
                 )
             )
         )
@@ -148,6 +186,7 @@ class GpuCaptureHost:
         *,
         generated_token_count: int,
         routed_experts_dtype: torch.dtype,
+        routed_experts_cpu: str | None,
     ) -> None:
         if state.capture_key is None or state.gpu_sink is None:
             raise ValueError(
@@ -184,6 +223,13 @@ class GpuCaptureHost:
                 routes = tensors.routed_experts
                 if routes is not None:
                     routes = routes.to(dtype=routed_experts_dtype)
+                _backfill_cached_prefix_routes(
+                    routes,
+                    lease.routed_experts_prefix_backfill_ranges,
+                    routed_experts_cpu,
+                    prompt_token_count=len(state.prompt_token_ids),
+                    generated_token_count=generated_token_count,
+                )
                 # Staging executes on a different executor thread. Complete
                 # the IPC wait and casts before handing the payload to it.
                 torch.cuda.current_stream(self.device).synchronize()

@@ -88,9 +88,10 @@ class GpuTokenPayload:
     ) -> dict[str, torch.Tensor]:
         """Build device fields with the same layout as Gym's committed mirror.
 
-        Only prompt-carry IDs, which originate on CPU, cross H2D. Generated
-        values use their retained CUDA storage; masks and prompt logprobs are
-        constructed on CUDA. Routes remain views of the original CUDA payload.
+        This step copies CPU-origin prompt-carry IDs H2D. Generated values use
+        retained CUDA storage; masks and prompt logprobs are constructed on CUDA.
+        Routes view the assembled GPU payload, which the host has already filled
+        with any missing cached-prefix rows from vLLM's CPU router history.
         Shape and dtype checks run without transferring payloads to CPU. Full
         mirror comparisons are available through ``validate_cpu_mirror``.
         """
