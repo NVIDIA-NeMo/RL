@@ -27,6 +27,7 @@ nemo_rl.models.megatron.setup, focusing on:
 import os
 import warnings
 from dataclasses import dataclass, field
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -56,6 +57,49 @@ class _SerializableModelConfig:
 
     def finalize(self) -> None:
         self.finalized = True
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("timeout_value", "expected_kwargs"),
+    [(None, {}), ("45.5", {"timeout": timedelta(minutes=45.5)})],
+)
+def test_setup_distributed_honors_timeout_environment(
+    monkeypatch, timeout_value, expected_kwargs
+):
+    from nemo_rl.models.megatron.setup import setup_distributed
+
+    if timeout_value is None:
+        monkeypatch.delenv("NRL_DIST_TIMEOUT_MINUTES", raising=False)
+    else:
+        monkeypatch.setenv("NRL_DIST_TIMEOUT_MINUTES", timeout_value)
+
+    with (
+        patch("nemo_rl.models.megatron.setup.configure_refit_environment"),
+        patch("nemo_rl.models.megatron.setup.configure_dynamo_cache"),
+        patch("nemo_rl.models.megatron.setup.destroy_parallel_state"),
+        patch(
+            "nemo_rl.models.megatron.setup.torch.distributed.init_process_group"
+        ) as init_process_group,
+    ):
+        setup_distributed({})
+
+    init_process_group.assert_called_once_with("nccl", **expected_kwargs)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("timeout_value", ["invalid", "0", "-1"])
+def test_setup_distributed_rejects_invalid_timeout(monkeypatch, timeout_value):
+    from nemo_rl.models.megatron.setup import setup_distributed
+
+    monkeypatch.setenv("NRL_DIST_TIMEOUT_MINUTES", timeout_value)
+    with (
+        patch("nemo_rl.models.megatron.setup.configure_refit_environment"),
+        patch("nemo_rl.models.megatron.setup.configure_dynamo_cache"),
+        patch("nemo_rl.models.megatron.setup.destroy_parallel_state"),
+        pytest.raises(ValueError, match="must be a positive number"),
+    ):
+        setup_distributed({})
 
 
 @pytest.mark.mcore
@@ -771,6 +815,18 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
 
+    @pytest.mark.parametrize("coefficient", [0.0, 0.0001, [0.0, 0.0001]])
+    def test_moe_aux_loss_coeff_is_applied_when_configured(self, coefficient):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        config = {"megatron_cfg": self._base_moe_megatron_cfg()}
+        config["megatron_cfg"]["moe_aux_loss_coeff"] = coefficient
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_aux_loss_coeff == coefficient
+
     @staticmethod
     def _base_moe_megatron_cfg() -> dict:
         return {
@@ -839,6 +895,7 @@ class TestApplyMoeConfig:
         _apply_moe_config(model_cfg, config)
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
+        assert not hasattr(model_cfg, "moe_aux_loss_coeff")
 
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup

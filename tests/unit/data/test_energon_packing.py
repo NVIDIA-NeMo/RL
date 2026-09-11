@@ -22,10 +22,15 @@ pytest.importorskip("megatron.core")
 
 pytestmark = pytest.mark.mcore
 
+from megatron.energon import WorkerConfig  # noqa: E402
+
 from nemo_rl.data.energon.multimodal.packing import (  # noqa: E402
     pack_selected_samples,
     prepare_packed_sft_batch,
     select_samples_to_pack,
+)
+from nemo_rl.data.energon.multimodal.task_encoders.generic_sft import (  # noqa: E402
+    GenericSFTTaskEncoder,
 )
 from nemo_rl.data.energon.multimodal.types import EncodedSFTSample  # noqa: E402
 from nemo_rl.data.multimodal_utils import PackedTensor  # noqa: E402
@@ -60,6 +65,49 @@ def _sample(
         group_key=(group,),
         sample_key=key,
     )
+
+
+def _select_with_worker(
+    encoder: GenericSFTTaskEncoder,
+    samples: list[EncodedSFTSample],
+    *,
+    sample_index: int,
+) -> list[list[EncodedSFTSample]]:
+    worker_config = WorkerConfig(
+        rank=0,
+        world_size=1,
+        num_workers=0,
+        seed_offset=0,
+    )
+    worker_config.worker_activate(sample_index)
+    try:
+        return encoder.select_samples_to_pack(samples)
+    finally:
+        worker_config.worker_deactivate()
+
+
+def test_task_encoder_randomizes_pack_order_from_worker_seed() -> None:
+    encoder = GenericSFTTaskEncoder(
+        adapter=object(),
+        cooker_functions=[],
+        include_source_ids=True,
+        packer=get_packer(PackingAlgorithm.FIRST_FIT_DECREASING, 1),
+        tokenizer=_Tokenizer(),
+    )
+    sources = [_sample(f"s{index}", 1) for index in range(8)]
+
+    first = _select_with_worker(encoder, sources, sample_index=17)
+    repeated = _select_with_worker(encoder, sources, sample_index=17)
+    different_index = _select_with_worker(encoder, sources, sample_index=18)
+
+    first_keys = [[sample.sample_key for sample in pack] for pack in first]
+    repeated_keys = [[sample.sample_key for sample in pack] for pack in repeated]
+    different_keys = [
+        [sample.sample_key for sample in pack] for pack in different_index
+    ]
+    assert first_keys == repeated_keys
+    assert first_keys != [[sample.sample_key] for sample in sources]
+    assert first_keys != different_keys
 
 
 @pytest.mark.parametrize("algorithm", list(PackingAlgorithm))

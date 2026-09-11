@@ -21,6 +21,7 @@ import time
 import warnings
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
+from datetime import timedelta
 from typing import Any, Callable, Optional, TypeVar, cast
 
 import torch
@@ -437,8 +438,22 @@ def setup_distributed(config) -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Initialize process group
-    torch.distributed.init_process_group("nccl")
+    # Long-sequence MoE jobs may need more than torch's default timeout.
+    timeout_minutes = os.environ.get("NRL_DIST_TIMEOUT_MINUTES")
+    if timeout_minutes:
+        try:
+            timeout = float(timeout_minutes)
+        except ValueError as error:
+            raise ValueError(
+                "NRL_DIST_TIMEOUT_MINUTES must be a positive number."
+            ) from error
+        if timeout <= 0:
+            raise ValueError("NRL_DIST_TIMEOUT_MINUTES must be a positive number.")
+        torch.distributed.init_process_group(
+            "nccl", timeout=timedelta(minutes=timeout)
+        )
+    else:
+        torch.distributed.init_process_group("nccl")
 
 
 def validate_and_set_config(
@@ -1256,6 +1271,8 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
         "moe_router_bias_update_rate"
     ]
+    if "moe_aux_loss_coeff" in config["megatron_cfg"]:
+        model_cfg.moe_aux_loss_coeff = config["megatron_cfg"]["moe_aux_loss_coeff"]
 
     model_cfg.moe_enable_deepep = config["megatron_cfg"]["moe_enable_deepep"]
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
