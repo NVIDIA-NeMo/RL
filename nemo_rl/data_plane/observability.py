@@ -866,7 +866,7 @@ def cluster_step_metrics(
         collect_ms: Wall time the caller spent gathering and merging.
     """
     n_procs = max(merged.get("n_processes", 1), 1)
-    metrics = _step_metrics(merged, prev, step_time_s, n_procs, collect_ms)
+    metrics = _step_metrics(merged, prev, step_time_s, collect_ms)
     metrics["now/n_processes"] = n_procs
     return metrics
 
@@ -875,12 +875,11 @@ def _step_metrics(
     snap: dict[str, Any],
     prev: dict[str, Any],
     step_time_s: float,
-    n_procs: int = 1,
     collect_ms: float = 0.0,
 ) -> dict[str, float]:
     """One step's metrics from two snapshots, cluster-wide or single-process.
 
-    Both callers difference the same counters; only ``n_procs`` (1 off a
+    Both callers difference the same counters; only the scope (1 process off a
     single client) and ``collect_ms`` (0 when there was no fan-out to pay
     for) differ, so the arithmetic lives here once.
 
@@ -888,7 +887,6 @@ def _step_metrics(
         snap: This step's snapshot, merged or per-client.
         prev: The previous one, for differencing.
         step_time_s: Step wall time, for ``frac_of_step``.
-        n_procs: Processes the snapshot covers.
         collect_ms: Wall time spent gathering and merging, if any.
 
     Returns:
@@ -896,7 +894,12 @@ def _step_metrics(
     """
     wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
     overhead_ms = snap["self_ms"] - prev.get("self_ms", 0.0) + collect_ms
-    exposed_ms = snap.get("max_process_wall_ms", wall_ms / n_procs) - prev.get(
+    # The slowest single process. ``merge_snapshots`` computes it; the
+    # single-process path has no such key and for one process the max is the
+    # sum, so ``wall_ms`` is the fallback -- not ``wall_ms / n_procs``, which
+    # is the per-process mean this reduction replaced and would only be right
+    # by accident at ``n_procs == 1``.
+    slowest_ms = snap.get("max_process_wall_ms", wall_ms) - prev.get(
         "max_process_wall_ms", 0.0
     )
     # step/ is a delta over this step; now/ is a level at this instant.
@@ -917,11 +920,11 @@ def _step_metrics(
             # serial with the fetches, and it counts time that overlapped
             # compute on the async path. ``README.md`` records both.
             "step/frac_of_step": (
-                exposed_ms / (step_time_s * 1e3) if step_time_s > 0 else 0.0
+                slowest_ms / (step_time_s * 1e3) if step_time_s > 0 else 0.0
             ),
             # Same reduction, same reason: the step waited on one process,
             # not on all of them added together. ``_step_deltas`` summed it.
-            "step/wall_s": exposed_ms / 1e3,
+            "step/wall_s": slowest_ms / 1e3,
             "step/self/overhead_ms": overhead_ms,
             # Both terms are summed across processes, so this is the wrapper's
             # share of data-plane *process-time*. Deliberately not the max:
