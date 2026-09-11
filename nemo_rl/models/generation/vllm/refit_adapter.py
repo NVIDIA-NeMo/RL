@@ -303,7 +303,6 @@ class Vllm0251RefitAdapter:
             self._load_local_component(
                 binding=resolved_binding,
                 role=role,
-                target_name=target_name,
                 target=resolved_target,
                 loaded_weight=ctx.buf,
             )
@@ -563,7 +562,6 @@ class Vllm0251RefitAdapter:
         *,
         binding: _NativeDestinationBinding,
         role: str,
-        target_name: str,
         target: torch.Tensor,
         loaded_weight: torch.Tensor,
     ) -> None:
@@ -578,41 +576,20 @@ class Vllm0251RefitAdapter:
                     f"vLLM checkpoint parameter for {component!r} has no weight_loader"
                 )
             owned_weight = loaded_weight.detach().clone()
-            if binding.grouped_expert_proj is not None:
-                shard_id = {
-                    "gate_proj": "w1",
-                    "up_proj": "w3",
-                    "down_proj": "w2",
-                }[binding.grouped_expert_proj]
-                base_region: list[Any] = list(
-                    binding.merged_slice
-                    or tuple(slice(None) for _ in range(target.ndim))
-                )
-                for expert_id in range(owned_weight.shape[0]):
-                    expert_region = list(base_region)
-                    expert_region[0] = expert_id
-                    weight_loader(
-                        target,
-                        owned_weight[expert_id],
-                        region=tuple(expert_region),
-                        logical_name=binding.logical_name,
-                        role=role,
-                        weight_name=target_name.rsplit(".", 1)[-1],
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-            else:
-                loader_kwargs: dict[str, Any] = {
-                    "region": binding.merged_slice
-                    or tuple(slice(None) for _ in range(target.ndim)),
-                    "logical_name": binding.logical_name,
-                    "role": role,
-                }
+            # Reshard already produced the local shard, including its expert axis.
+            # The bridge copies this whole region; vLLM still counts and finalizes it.
+            loader_kwargs: dict[str, Any] = {
+                "region": binding.merged_slice
+                or tuple(slice(None) for _ in range(target.ndim)),
+                "logical_name": binding.logical_name,
+                "role": role,
+            }
+            if binding.grouped_expert_proj is None:
                 if binding.logical_name.endswith("gate_proj.weight"):
                     loader_kwargs["loaded_shard_id"] = 0
                 elif binding.logical_name.endswith("up_proj.weight"):
                     loader_kwargs["loaded_shard_id"] = 1
-                weight_loader(target, owned_weight, **loader_kwargs)
+            weight_loader(target, owned_weight, **loader_kwargs)
             self._loaded_components.add(component)
         except BaseException as error:
             self.abort_update(error)

@@ -1075,11 +1075,27 @@ def test_0251_adapter_binds_dense_and_routed_checkpoint_components(
     assert ctx.buf.dtype == (torch.float8_e4m3fn if role == "weight" else torch.uint8)
     assert spec.post is not None
     ctx.buf.fill_(3 if role == "weight" else 7)
+    routed = ".experts." in logical_name
+    if routed:
+        spec.base.zero_()
+        payload_bytes = (
+            torch.arange(ctx.buf.numel(), dtype=torch.int32)
+            .remainder(120)
+            .to(torch.uint8)
+            .reshape(expected_shape)
+        )
+        ctx.buf.view(torch.uint8).copy_(payload_bytes)
+        if logical_name.endswith("gate_proj.weight"):
+            expected_region = (slice(None), slice(0, 32), slice(None))
+        elif logical_name.endswith("up_proj.weight"):
+            expected_region = (slice(None), slice(32, 64), slice(None))
+        else:
+            expected_region = (slice(None), slice(None), slice(None))
+        expected = torch.zeros_like(spec.base)
+        expected[expected_region].copy_(ctx.buf)
     spec.post(ctx)
 
-    routed = ".experts." in logical_name
-    expected_calls = expected_shape[0] if routed else 1
-    assert len(retained_loads) == expected_calls
+    assert len(retained_loads) == 1
     assert (
         sum(
             bound.arguments["loaded_weight"].numel()
@@ -1091,11 +1107,16 @@ def test_0251_adapter_binds_dense_and_routed_checkpoint_components(
         assert bound.arguments["logical_name"] == logical_name
         assert bound.arguments["role"] == role
         if routed:
-            assert bound.arguments["weight_name"].endswith(
-                "weight" if role == "weight" else "weight_scale"
+            payload = bound.arguments["loaded_weight"]
+            assert tuple(payload.shape) == expected_shape
+            assert bound.arguments["region"] == expected_region
+            assert torch.equal(
+                spec.base.contiguous().view(torch.uint8),
+                expected.contiguous().view(torch.uint8),
             )
-            assert bound.arguments["shard_id"] in {"w1", "w2", "w3"}
-            assert isinstance(bound.arguments["expert_id"], int)
+            assert payload.data_ptr() != ctx.buf.data_ptr()
+            ctx.buf.zero_()
+            assert torch.equal(payload.view(torch.uint8), payload_bytes)
         elif logical_name.endswith(("gate_proj.weight", "up_proj.weight")):
             assert bound.arguments["loaded_shard_id"] in {0, 1}
 
@@ -1299,8 +1320,10 @@ def test_0251_adapter_repeated_refits_change_bytes_and_preserve_runtime_pointers
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("hidden_size", [128, 512])
 def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
     tmp_path: Path,
+    hidden_size: int,
 ) -> None:
     vllm = pytest.importorskip("vllm")
     if vllm.__version__ != "0.25.1":
@@ -1312,16 +1335,19 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
 
     from unittest.mock import patch
 
-    from vllm.config import VllmConfig
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.fused_moe import FusedMoE
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptMxFp8Config,
         ModelOptMxFp8FusedMoE,
         ModelOptMxFp8LinearMethod,
     )
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        initialize_online_processing,
+    )
 
     from nemo_rl.models.generation.vllm.quantization.fp8 import (
         create_weights_mxfp8_moe,
@@ -1342,7 +1368,7 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
             mlp = torch.nn.Module()
             self.model.layers[0].mlp = mlp
             mlp.gate_up_proj = MergedColumnParallelLinear(
-                input_size=128,
+                input_size=hidden_size,
                 output_sizes=[128, 128],
                 bias=False,
                 params_dtype=torch.bfloat16,
@@ -1353,7 +1379,7 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
             mlp.experts = FusedMoE(
                 num_experts=2,
                 top_k=1,
-                hidden_size=128,
+                hidden_size=hidden_size,
                 intermediate_size=128,
                 params_dtype=torch.bfloat16,
                 quant_config=quant_config,
@@ -1402,32 +1428,51 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
         "layer_names": ["model.layers.0"],
         "per_layer_params": {
             "model.layers.0": [
-                parameter(f"{prefix}.gate_proj.weight", (128, 128)),
-                parameter(f"{prefix}.up_proj.weight", (128, 128)),
+                parameter(f"{prefix}.gate_proj.weight", (128, hidden_size)),
+                parameter(f"{prefix}.up_proj.weight", (128, hidden_size)),
                 parameter(
                     f"{prefix}.experts.gate_proj.weight",
-                    (2, 128, 128),
+                    (2, 128, hidden_size),
                     grouped_expert_proj="gate_proj",
                 ),
                 parameter(
                     f"{prefix}.experts.up_proj.weight",
-                    (2, 128, 128),
+                    (2, 128, hidden_size),
                     grouped_expert_proj="up_proj",
                 ),
                 parameter(
                     f"{prefix}.experts.down_proj.weight",
-                    (2, 128, 128),
+                    (2, hidden_size, 128),
                     grouped_expert_proj="down_proj",
                 ),
             ]
         },
     }
     vllm_config = VllmConfig()
-    quant_config = ModelOptMxFp8Config(
-        is_checkpoint_mxfp8_serialized=True,
-        kv_cache_quant_algo=None,
-        exclude_modules=[],
-    )
+
+    def new_model(config: VllmConfig) -> NativeModel:
+        with set_current_vllm_config(config):
+            return NativeModel(
+                vllm_config=config,
+                quant_config=ModelOptMxFp8Config(
+                    is_checkpoint_mxfp8_serialized=True,
+                    kv_cache_quant_algo=None,
+                    exclude_modules=[],
+                ),
+            )
+
+    def first_load(model: NativeModel, config: VllmConfig) -> None:
+        with set_current_vllm_config(config):
+            mlp = model.model.layers[0].mlp
+            for owner in (mlp.gate_up_proj, mlp.experts.routed_experts):
+                initialize_online_processing(owner)
+            finalize_layerwise_reload(model, config.model_config)
+
+    def byte_snapshot(model: NativeModel) -> dict[str, torch.Tensor]:
+        return {
+            name: tensor.detach().contiguous().reshape(-1).view(torch.uint8).clone()
+            for name, tensor in model.named_parameters()
+        }
 
     with (
         patch.object(
@@ -1448,13 +1493,10 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
         _single_rank_vllm_model_parallel(tmp_path=tmp_path, vllm_config=vllm_config),
         torch.device("cuda"),
     ):
-        model = NativeModel(vllm_config=vllm_config, quant_config=quant_config)
+        model = new_model(vllm_config)
         for parameter_value in model.parameters():
             parameter_value.fill_(1)
-        for module in model.modules():
-            quant_method = getattr(module, "quant_method", None)
-            if isinstance(quant_method, QuantizeMethodBase):
-                quant_method.process_weights_after_loading(module)
+        first_load(model, vllm_config)
 
         runner = SimpleNamespace(model=model, vllm_config=vllm_config)
         adapter = refit_adapter.Vllm0251RefitAdapter(
@@ -1464,20 +1506,14 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
         )
         adapter.prepare(refit_info)
         runtime_parameters = dict(model.named_parameters())
-        tracked_names = (
-            "model.layers.0.mlp.gate_up_proj.weight",
-            "model.layers.0.mlp.gate_up_proj.weight_scale",
-            "model.layers.0.mlp.experts.routed_experts.w13_weight",
-            "model.layers.0.mlp.experts.routed_experts.w13_weight_scale",
-            "model.layers.0.mlp.experts.routed_experts.w2_weight",
-            "model.layers.0.mlp.experts.routed_experts.w2_weight_scale",
-        )
+        tracked_names = tuple(runtime_parameters)
         pointers = {name: runtime_parameters[name].data_ptr() for name in tracked_names}
         snapshots: list[dict[str, torch.Tensor]] = []
 
-        for refit_seed in (2, 18):
+        for refit_seed in (2, 19, 36):
             adapter.begin_update()
             component_seed = refit_seed
+            payloads: dict[tuple[str, str], torch.Tensor] = {}
             for param_info in refit_info["per_layer_params"]["model.layers.0"]:
                 for component in param_info["components"]:
                     role = component["role"]
@@ -1486,19 +1522,76 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
                     )
                     assert spec.pre is not None and spec.post is not None
                     ctx = spec.pre(spec.base)
-                    ctx.buf.fill_(component_seed)
+                    pattern = torch.full(
+                        ctx.buf.shape, component_seed, device="cuda", dtype=torch.int32
+                    )
+                    for axis, size in enumerate(ctx.buf.shape):
+                        shape = [1] * ctx.buf.ndim
+                        shape[axis] = size
+                        pattern += (11, 37, 53)[axis] * torch.arange(
+                            size, device="cuda", dtype=torch.int32
+                        ).reshape(shape)
+                    modulus, offset = (112, 0) if role == "weight" else (16, 120)
+                    payload = (pattern.remainder(modulus) + offset).to(torch.uint8)
+                    payloads[param_info["name"], role] = payload
+                    ctx.buf.view(torch.uint8).copy_(payload)
                     spec.post(ctx)
+                    ctx.buf.view(torch.uint8).zero_()
                     component_seed += 1
             adapter.finish_update()
             torch.cuda.synchronize()
-            snapshots.append(
-                {name: runtime_parameters[name].clone() for name in tracked_names}
-            )
+            snapshots.append(byte_snapshot(model))
+            runtime_parameters = dict(model.named_parameters())
             assert {
                 name: runtime_parameters[name].data_ptr() for name in tracked_names
             } == pointers
 
+            # Independent checkpoint assembly: no refit binding or receive loader.
+            reference_config = VllmConfig()
+            reference = new_model(reference_config)
+            dense = reference.model.layers[0].mlp.gate_up_proj
+            experts = reference.model.layers[0].mlp.experts.routed_experts
+            for role, suffix in (
+                ("weight", "weight"),
+                ("weight_scale", "weight_scale"),
+            ):
+                getattr(dense, suffix).view(torch.uint8).copy_(
+                    torch.cat(
+                        [
+                            payloads[f"{prefix}.{proj}.weight", role]
+                            for proj in ("gate_proj", "up_proj")
+                        ],
+                        dim=0,
+                    )
+                )
+                getattr(experts, f"w13_{suffix}").view(torch.uint8).copy_(
+                    torch.cat(
+                        [
+                            payloads[f"{prefix}.experts.{proj}.weight", role]
+                            for proj in ("gate_proj", "up_proj")
+                        ],
+                        dim=1,
+                    )
+                )
+                getattr(experts, f"w2_{suffix}").view(torch.uint8).copy_(
+                    payloads[f"{prefix}.experts.down_proj.weight", role]
+                )
+            first_load(reference, reference_config)
+            expected = byte_snapshot(reference)
+            assert expected.keys() == snapshots[-1].keys()
+            reference_parameters = dict(reference.named_parameters())
+            for name, actual in runtime_parameters.items():
+                fresh = reference_parameters[name]
+                assert (actual.shape, actual.dtype, actual.stride()) == (
+                    fresh.shape,
+                    fresh.dtype,
+                    fresh.stride(),
+                ), name
+                assert torch.equal(snapshots[-1][name], expected[name]), name
+            del reference
+
         assert all(
-            not torch.equal(snapshots[0][name], snapshots[1][name])
+            not torch.equal(before[name], after[name])
+            for before, after in zip(snapshots, snapshots[1:])
             for name in tracked_names
         )
