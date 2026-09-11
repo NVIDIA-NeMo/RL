@@ -188,6 +188,12 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
+# Coordinated Gym participant + TQ checkpoint at a deterministic post-mutation
+# turn boundary, followed by a full process restart and exact continuation.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh
+# The same recovery contract against Workplace Assistant's real DataFrame-backed
+# state adapter, including an exactly-once calendar mutation across restart.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_workplace_turn_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
