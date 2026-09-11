@@ -158,6 +158,7 @@ def cpu_cuda(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     [
         "available",
         "nondefault_device",
+        "invisible_device",
         "no_owner",
         "two_owners",
         "remote_host",
@@ -174,6 +175,7 @@ async def test_create_uses_visible_owner_or_preserves_cpu_path(
     case.rpc.responses["configure_gpu_output_capture"] = {
         "available": [replace(owner, owner=False), owner],
         "nondefault_device": [replace(owner, gpu_uuid="gpu-1")],
+        "invisible_device": [replace(owner, gpu_uuid="gpu-2")],
         "no_owner": [None],
         "two_owners": [owner, owner],
         "remote_host": [replace(owner, hostname="remote-host")],
@@ -187,9 +189,11 @@ async def test_create_uses_visible_owner_or_preserves_cpu_path(
         torch.cuda, "get_device_properties", lambda i: SimpleNamespace(uuid=f"gpu-{i}")
     )
     host = await hosting.GpuCaptureHost.create(case.rpc, require_routed_experts=True)
-    assert (host.device if host else None) == (
-        torch.device("cuda:0") if topology == "available" else None
-    )
+    expected_device = {
+        "available": torch.device("cuda:0"),
+        "nondefault_device": torch.device("cuda:1"),
+    }.get(topology)
+    assert (host.device if host else None) == expected_device
     assert case.rpc.calls == [
         ("configure_gpu_output_capture", (socket.gethostname(), True))
     ]

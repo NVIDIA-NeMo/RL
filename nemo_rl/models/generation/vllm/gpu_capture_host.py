@@ -142,15 +142,15 @@ class GpuCaptureHost:
                 if isinstance(capability, GpuOutputCaptureCapabilities)
                 and capability.owner
             ]
-            # The current TQ executor uses its thread-default CUDA device.
-            # Resolve physical identity rather than comparing worker ordinals.
-            if (
-                len(owners) == 1
-                and owners[0].hostname == socket.gethostname()
-                and torch.cuda.device_count()
-                and str(torch.cuda.get_device_properties(0).uuid) == owners[0].gpu_uuid
-            ):
-                return cls(rpc, torch.device("cuda", 0))
+            if len(owners) == 1 and owners[0].hostname == socket.gethostname():
+                # TP workers and the frontend can use different CUDA ordinals.
+                # TQ binds its transfer threads to this device when attaching.
+                for index in range(torch.cuda.device_count()):
+                    if (
+                        str(torch.cuda.get_device_properties(index).uuid)
+                        == owners[0].gpu_uuid
+                    ):
+                        return cls(rpc, torch.device("cuda", index))
         except Exception as error:
             LOGGER.debug(
                 "GPU output reuse unavailable; using existing CPU PUT: %s", error

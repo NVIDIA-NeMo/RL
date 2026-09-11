@@ -25,8 +25,13 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+import torch
 
 from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
 
@@ -224,3 +229,75 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
     # Identity, not storage location: every caller must get the one pool that
     # was actually constructed.
     assert seen == [constructed[0]] * n_threads
+
+
+@pytest.mark.parametrize("method_name", ["put", "get", "close"])
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("use_gdr", [False, True])
+def test_gdr_transfer_threads_keep_attach_device(
+    monkeypatch: pytest.MonkeyPatch, method_name: str, fail: bool, use_gdr: bool
+) -> None:
+    """A TP2 frontend on GPU 2 must not allocate staging on executor GPU 0."""
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+        "mooncake_cpu": {"use_gdr": use_gdr},
+    }
+    current = threading.local()
+    current.device = 2
+
+    @contextmanager
+    def cuda_device(device: torch.device):
+        previous = getattr(current, "device", 0)
+        current.device = device.index
+        try:
+            yield
+        finally:
+            current.device = previous
+
+    def transfer(*args: Any, **kwargs: Any) -> tuple:
+        assert torch.cuda.current_device() == (2 if use_gdr else 0)
+        if fail:
+            raise RuntimeError("transfer failed")
+        return args, kwargs
+
+    storage_client = SimpleNamespace(
+        _gdr_staging=object(), put=transfer, get=transfer, close=transfer
+    )
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "current_device", lambda: getattr(current, "device", 0)
+    )
+    monkeypatch.setattr(torch.cuda, "device", cuda_device)
+    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(tq_adapter, "_patch_mooncake_staging_buffers", lambda _: None)
+    monkeypatch.setattr(
+        tq_adapter.tq,
+        "get_client",
+        lambda: SimpleNamespace(
+            storage_manager=SimpleNamespace(storage_client=storage_client)
+        ),
+    )
+    tq_adapter.TQDataPlaneClient(cfg, bootstrap=False)
+    bound_put = storage_client.put
+    # Later construction reuses the process-local TQ client and its GPU.
+    current.device = 0
+    tq_adapter.TQDataPlaneClient(cfg, bootstrap=False)
+    assert storage_client.put is bound_put
+
+    def run_in_transfer_thread() -> None:
+        assert torch.cuda.current_device() == 0
+        method = getattr(storage_client, method_name)
+        if fail:
+            with pytest.raises(RuntimeError, match="transfer failed"):
+                method("key", value=3)
+        else:
+            assert method("key", value=3) == (("key",), {"value": 3})
+        assert torch.cuda.current_device() == 0
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(run_in_transfer_thread).result(timeout=10)

@@ -35,6 +35,8 @@ import threading
 import time
 import warnings
 import weakref
+from collections.abc import Callable
+from functools import partial
 from importlib import resources
 from pathlib import Path
 from queue import Empty, SimpleQueue
@@ -606,6 +608,36 @@ def _connect_existing() -> None:
     tq.init()
 
 
+def _call_on_cuda_device(
+    device: torch.device, method: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    with torch.cuda.device(device):
+        return method(*args, **kwargs)
+
+
+def _bind_mooncake_cuda_device() -> None:
+    """Keep lazy GDR allocation and transfers on the attaching worker's GPU."""
+    storage_client = tq.get_client().storage_manager.storage_client
+    if storage_client._gdr_staging is None:
+        return
+    # TQ is a process singleton. Another adapter must not retarget its existing
+    # allocation, and the bound methods stay local rather than entering RPCs.
+    if (
+        isinstance(storage_client.put, partial)
+        and storage_client.put.func is _call_on_cuda_device
+    ):
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    # PUT runs in TQ's executor; GET runs on its asyncio thread. Both would
+    # otherwise allocate/use staging on their thread-default device (GPU 0).
+    for name in ("put", "get", "close"):
+        setattr(
+            storage_client,
+            name,
+            partial(_call_on_cuda_device, device, getattr(storage_client, name)),
+        )
+
+
 def _init_tq(cfg: DataPlaneConfig) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
@@ -839,6 +871,8 @@ class TQDataPlaneClient(DataPlaneClient):
             _init_tq(cfg)
         else:
             _connect_existing()
+        if self._gdr_requested and torch.cuda.is_initialized():
+            _bind_mooncake_cuda_device()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # TQ restore is non-transactional and requires a globally clean system.
