@@ -2967,6 +2967,8 @@ class MegatronPolicyWorkerImpl(
 
     def _is_native_mxfp8_export(self) -> bool:
         """Return whether both endpoints use native MXFP8 parameter storage."""
+        if getattr(self, "refit_payload_mode", "hf_export") == "logical_weights":
+            return False
         if getattr(self, "fp8_cfg", None) is None:
             return False
         generation_cfg = cast(dict[str, Any], self.cfg["generation"])
