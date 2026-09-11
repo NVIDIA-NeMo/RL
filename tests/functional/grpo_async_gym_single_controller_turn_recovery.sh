@@ -159,9 +159,9 @@ cp "$BASE_RUN_LOG" "$PHASE2_LOG"
 
 grep -Fq "Selected rollout recovery snapshot: $SNAPSHOT_DIR" "$PHASE2_LOG"
 grep -q "Native TQ checkpoint restored and validated" "$PHASE2_LOG"
-grep -q "/ng-control/v1/model-checkpoint/restore" "$PHASE2_LOG"
-grep -q "/ng-control/v1/agent-checkpoint/restore" "$PHASE2_LOG"
-grep -q "/ng-control/v1/resources-checkpoint/restore" "$PHASE2_LOG"
+grep -q \
+    "Gym participant checkpoint restored and validated: .*components=resources_servers,responses_api_agents,responses_api_models" \
+    "$PHASE2_LOG"
 grep -q "train step $MAX_STEPS/$MAX_STEPS" "$PHASE2_LOG"
 
 uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" \
