@@ -728,15 +728,20 @@ GB300, TQ `simple`, 24 MB/step) differing only in `verify_tensor_hash`:
 | | guard on | guard off |
 |---|---|---|
 | `step/self/overhead_ms` | ~123 ms | ~4.4 ms |
-| `total_step_time` (mean, steps 8-15) | 16.8 s | 15.1 s |
+| `step/wall_s` | ~1.35 s | ~1.05 s |
+| `total_step_time` (mean, steps 8-15) | 16.8 s | 15.1 s (see below) |
 | `step/hash/rows_checked` | 2560 | — |
 
 The wrapper's own accounting is ~4 ms; the guard is essentially all of the
-~119 ms difference. The end-to-end step moved 1.7 s, far more than
-`self/overhead_ms` bills -- the `<field>_hash` columns are extra payload, and
-what TQ spends carrying them lands in the op's `wall_ms`, not in the wrapper's
-self time. The two runs were on different nodes, so treat 1.7 s as an upper
-bound until it is reproduced on one.
+~119 ms difference, and the data plane's own wall time rose 297 ms.
+
+The end-to-end step moved 1.67 s, which those two do **not** explain, and it
+should not be read as the guard's cost. `comm_volume_mb` was unchanged
+(24.42 vs 24.58 MB), step time varied 14.3-20.3 s *within* each run, and at
+step 10 the guard-off run was the slower of the two. The two runs were also on
+different nodes. Against that spread a 1.67 s mean difference is not
+attributable; a same-node A/B is needed before any end-to-end figure is
+quoted.
 
 **The accepted limit: a within-row permutation is not detected.** XOR cannot
 see its own operands reordered, and no seed fixes it — the seed covers dtype
