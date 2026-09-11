@@ -369,8 +369,15 @@ set +e
 # and churning it here would copy files up into this layer.
 # The throwaway venv must be symlink-mode: hardlinks to files in the dependency layer's uv
 # cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
+# TRTLLM_WHEEL_CACHE_MIRROR_DIR keeps a copy of the wheel in this image layer.
+# CI creates a fresh buildx builder for every job, so the cache mount above only
+# lives for the duration of one build: when a later build reuses this layer from
+# the registry cache and re-executes the release stage (any NeMo-RL source
+# change does that), the mount is empty there. The release stage re-seeds it
+# from this mirror instead of failing on TRTLLM_REQUIRE_CACHED_WHEEL.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+    TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \
     UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
     uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
@@ -493,6 +500,13 @@ RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=tr
 export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
 export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
+# The cache mount is builder-local and CI's builder is per job. When the
+# hermetic layer above came from the registry cache, the mount is empty here;
+# re-seed it from the mirror the hermetic stage wrote into the image so the
+# trtllm venv prefetch below finds the wheel instead of refusing to compile.
+if [[ -d "${TRTLLM_WHEEL_CACHE_MIRROR_DIR}" ]]; then
+    rsync -a --ignore-existing "${TRTLLM_WHEEL_CACHE_MIRROR_DIR}/" "${TRTLLM_WHEEL_CACHE_DIR}/"
+fi
 # Worker-venv prefetch, phase 2: the nemo_rl project itself.
 #
 # The other half of the split described in the dependency stage. Every venv already holds
