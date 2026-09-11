@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -79,6 +80,14 @@ class MLPerfGRPOLogger:
         self.block_start_step = 0
         self.last_step = 0
         self.pending_run_stop_status: Optional[str] = None
+        # Evaluations started while a train block is open are held until the
+        # step's train metrics (logged after validation) have been emitted, so
+        # they land before BLOCK_STOP. Maps step -> validation payload.
+        self._held_evals: dict[int, dict[str, Any]] = {}
+        # Deferred (offline) evaluation: training emits no terminal events;
+        # the driver closes the train block with the final weight-update
+        # timestamp and the offline evaluator emits run_stop.
+        self.defer_run_stop = bool(self.mlperf_config.get("defer_run_stop", False))
 
         log_file = self.mlperf_config.get("log_file")
         if log_file:
@@ -125,13 +134,30 @@ class MLPerfGRPOLogger:
             method(*args, **kwargs)
         except TypeError:
             kwargs.pop("unique", None)
+            kwargs.pop("time_ms", None)
             method(*args, **kwargs)
 
-    def _start(self, key: str, metadata: Optional[dict[str, Any]] = None) -> None:
-        self._call("start", key=key, metadata=metadata or {})
+    def _start(
+        self,
+        key: str,
+        metadata: Optional[dict[str, Any]] = None,
+        time_ms: Optional[float] = None,
+    ) -> None:
+        kwargs: dict[str, Any] = {"key": key, "metadata": metadata or {}}
+        if time_ms is not None:
+            kwargs["time_ms"] = int(time_ms)
+        self._call("start", **kwargs)
 
-    def _end(self, key: str, metadata: Optional[dict[str, Any]] = None) -> None:
-        self._call("end", key=key, metadata=metadata or {})
+    def _end(
+        self,
+        key: str,
+        metadata: Optional[dict[str, Any]] = None,
+        time_ms: Optional[float] = None,
+    ) -> None:
+        kwargs: dict[str, Any] = {"key": key, "metadata": metadata or {}}
+        if time_ms is not None:
+            kwargs["time_ms"] = int(time_ms)
+        self._call("end", **kwargs)
 
     def _event(
         self,
@@ -305,7 +331,7 @@ class MLPerfGRPOLogger:
             },
         )
 
-    def stop_train_block(self, step: int) -> None:
+    def stop_train_block(self, step: int, time_ms: Optional[float] = None) -> None:
         if not self.block_started:
             return
         step = int(step)
@@ -317,21 +343,79 @@ class MLPerfGRPOLogger:
                 self.constants.SAMPLES_COUNT: block_samples,
                 "step": step,
             },
+            time_ms=time_ms,
         )
         self.block_started = False
 
     def start_eval(self, step: int) -> None:
         step = int(step)
-        self.stop_train_block(step)
+        if self.block_started:
+            # The trainers log a step's validation metrics before its train
+            # metrics. Hold the eval while a train block is open so the step's
+            # train stats still land inside the block, before BLOCK_STOP; the
+            # flush happens in observe_metrics (once the step's logging
+            # completes) or finalize.
+            self._held_evals.setdefault(step, {})
+            return
+        self._start_eval_events(step)
+
+    def _start_eval_events(self, step: int, time_ms: Optional[float] = None) -> None:
+        step = int(step)
+        self.stop_train_block(step, time_ms=time_ms)
         self._start(
             self.constants.EVAL_START,
             metadata={
                 self.constants.SAMPLES_COUNT: self.sample_count(step),
                 "step": step,
             },
+            time_ms=time_ms,
         )
 
     def end_eval(
+        self,
+        step: int,
+        val_metrics: Mapping[str, Any],
+        validation_timings: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        step = int(step)
+        if step in self._held_evals:
+            # Buffer the completed eval; observe_metrics flushes it after the
+            # step's train metrics. Backdate BLOCK_STOP/EVAL_START by the
+            # validation duration so work between validation and the step's
+            # final log call (e.g. checkpointing) is not charged to either.
+            validation_time = self._to_scalar(
+                (validation_timings or {}).get("total_validation_time")
+            )
+            eval_start_ms = None
+            if validation_time is not None:
+                eval_start_ms = (time.time() - float(validation_time)) * 1000.0
+            self._held_evals[step] = {
+                "val_metrics": dict(val_metrics),
+                "validation_timings": dict(validation_timings or {}),
+                "eval_start_ms": eval_start_ms,
+            }
+            return
+        self._log_eval_events(step, val_metrics, validation_timings)
+        self._conclude_eval(step, val_metrics)
+
+    def _flush_held_evals(self, up_to_step: Optional[int] = None) -> None:
+        for step in sorted(list(self._held_evals)):
+            if up_to_step is not None and step > up_to_step:
+                break
+            if self.run_stopped:
+                break
+            payload = self._held_evals.pop(step)
+            if not payload:
+                # start_eval without a matching end_eval (validation raised);
+                # end_eval_with_error emitted the terminal events already.
+                continue
+            self._start_eval_events(step, time_ms=payload["eval_start_ms"])
+            self._log_eval_events(
+                step, payload["val_metrics"], payload["validation_timings"]
+            )
+            self._conclude_eval(step, payload["val_metrics"])
+
+    def _log_eval_events(
         self,
         step: int,
         val_metrics: Mapping[str, Any],
@@ -367,19 +451,27 @@ class MLPerfGRPOLogger:
             },
         )
 
+    def _conclude_eval(self, step: int, val_metrics: Mapping[str, Any]) -> None:
+        step = int(step)
+        accuracy = self._to_scalar(val_metrics.get("accuracy", 0.0))
         if (
             accuracy is not None
             and self.target_accuracy is not None
             and accuracy >= self.target_accuracy
         ):
             self.config["grpo"]["max_num_steps"] = step
-            self.stop_run(status="success", samples_count=samples_count)
+            self.stop_run(status="success", samples_count=self.sample_count(step))
         elif step >= int(self.config["grpo"].get("max_num_steps", step)):
             self.pending_run_stop_status = "aborted"
         else:
             self.start_train_block(step)
 
     def end_eval_with_error(self, step: int) -> None:
+        step = int(step)
+        if self._held_evals.pop(step, None) is not None:
+            # The eval was held with a train block open; emit the interval so
+            # EVAL_STOP is balanced before the terminal run_stop.
+            self._start_eval_events(step)
         self._end(
             self.constants.EVAL_STOP,
             metadata={
@@ -401,6 +493,11 @@ class MLPerfGRPOLogger:
         if not self.run_started or self.run_stopped:
             return
 
+        # A held eval flushes once the trainer moves past its step.
+        self._flush_held_evals(up_to_step=step - 1)
+        if self.run_stopped:
+            return
+
         if prefix == "train":
             tracked = self._extract_train_stats(metrics)
         elif prefix == "timing/train":
@@ -420,6 +517,11 @@ class MLPerfGRPOLogger:
                 value=tracked,
                 unique=False,
             )
+
+        if step_finished:
+            # The step's metrics are all logged; a held eval can close the
+            # block now: BLOCK_STOP, then EVAL_START..EVAL_STOP.
+            self._flush_held_evals(up_to_step=step)
 
     def _extract_train_stats(self, metrics: Mapping[str, Any]) -> dict[str, Any]:
         key_map = {
@@ -469,7 +571,12 @@ class MLPerfGRPOLogger:
                 return None
         return None
 
-    def stop_run(self, status: str, samples_count: Optional[int] = None) -> None:
+    def stop_run(
+        self,
+        status: str,
+        samples_count: Optional[int] = None,
+        time_ms: Optional[float] = None,
+    ) -> None:
         if self.run_stopped:
             return
         self.pending_run_stop_status = None
@@ -483,6 +590,7 @@ class MLPerfGRPOLogger:
                 self.constants.SAMPLES_COUNT: samples_count,
                 "status": status,
             },
+            time_ms=time_ms,
         )
         self.target_reached = status == "success"
         self.run_stopped = True
@@ -490,6 +598,14 @@ class MLPerfGRPOLogger:
 
     def finalize(self, status: str = "aborted") -> None:
         if not self.run_started or self.run_stopped:
+            return
+        self._flush_held_evals()
+        if self.run_stopped:
+            return
+        if self.defer_run_stop:
+            # Offline evaluation owns the terminal events: the driver closes
+            # the train block with the final weight-update timestamp and the
+            # deferred evaluator emits run_stop after scoring the checkpoints.
             return
         status = self.pending_run_stop_status or status
         self.stop_train_block(self.last_step)

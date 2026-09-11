@@ -34,6 +34,12 @@ set -e
 : "${MLPERF_BENCHMARK_NAME:=qwen35_397b_grpo}"
 : "${EXP_NAME:=${SPREFIX:-qwen35_397b_grpo}}"
 : "${EXTRA_ARGS:=$@}"
+: "${DEFERRED_OFFLINE_EVAL:=0}"
+export DEFERRED_OFFLINE_EVAL
+case "${DEFERRED_OFFLINE_EVAL}" in
+    0|1) ;;
+    *) echo "ERROR: DEFERRED_OFFLINE_EVAL must be 0 or 1" >&2; exit 1 ;;
+esac
 
 [ "${DEBUG:-0}" = "0" ] || set -x
 
@@ -58,6 +64,17 @@ export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export MLPERF_SUBMISSION_ORG="${MLPERF_SUBMITTER:-reference}"
 export MLPERF_SUBMISSION_PLATFORM="${MLPERF_SYSTEM_NAME:-reference}"
+
+if [[ "${1:-}" == "--deferred-eval" ]]; then
+    # Second phase of a DEFERRED_OFFLINE_EVAL=1 run: training released its
+    # Ray actors and clusters; evaluate the saved checkpoints in the same
+    # allocation and append the eval events + backdated run_stop to the log.
+    [[ "${DEFERRED_OFFLINE_EVAL}" == "1" ]] || { echo "Deferred evaluation is not enabled" >&2; exit 1; }
+    export NEMO_GYM_SWE_WORKSPACE_ROOT="/logs/nemo_gym/deferred-workspace"
+    exec uv run python -m nemo_rl.algorithms.mlperf_grpo_deferred \
+        --checkpoint-root "/checkpoint/${_experiment_index:-01}" \
+        --log-dir "/logs/deferred-evaluation"
+fi
 
 if [ "${FORCE_SUCCESS_STATUS:-0}" -eq 1 ]; then
     _force_success=True

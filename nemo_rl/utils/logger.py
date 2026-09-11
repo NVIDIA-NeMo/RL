@@ -81,6 +81,9 @@ class MLPerfLoggerConfig(TypedDict):
     target_accuracy: NotRequired[float | None]
     force_success_status: NotRequired[bool]
     log_file: NotRequired[str]
+    # Deferred (offline) evaluation: the trainer emits no terminal events;
+    # run_stop belongs to the offline checkpoint evaluator.
+    defer_run_stop: NotRequired[bool]
 
 
 class LoggerConfig(TypedDict):

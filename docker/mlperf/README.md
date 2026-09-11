@@ -216,6 +216,37 @@ sources); use that mode separately from `NRL_RUNTIME_PATCH`.
 The patch and source-overlay controls above are development facilities only.
 The authoritative launch leaves them unset and does not mount `/workspace/llm`.
 
+## Offline (deferred) evaluation
+
+With `DEFERRED_OFFLINE_EVAL=1` the run evaluates offline from checkpoints
+instead of inline validation. Training runs uninterrupted at full capacity to
+`max_num_steps` and saves a weights-only checkpoint after every step from the
+validation start step (`val_start_at`) on, including the final step. Each
+checkpoint's `training_info.json` records the end time of its weight update.
+
+When training stops, the launcher keeps the allocation and Ray cluster and
+starts a second driver (`run_and_time.sh --deferred-eval`, implemented in
+`nemo_rl/algorithms/mlperf_grpo_deferred.py`). It restores each checkpoint in
+step order without optimizer state, refits vLLM, runs the configured
+validation (pass@4 with the reference recipe), and stops at the first
+checkpoint that reaches the target accuracy. The single `run_stop` MLPerf
+event is emitted with the passing checkpoint's weight-update timestamp, so
+checkpoint writing and evaluation time are excluded from the score. If no
+checkpoint crosses the target, `run_stop` carries `status=aborted` at the
+final checkpoint's weight-update timestamp; operational failures fail the job.
+
+The mode requires a fresh experiment (`NEXP=1`, empty per-experiment
+checkpoint directory) and `FORCE_SUCCESS_STATUS=0`. Budget the evaluation
+window with `WALLTIME_OFFLINE_EVAL` (default 240 minutes), added to the job
+walltime by the GB300 profiles:
+
+```bash
+export DEFERRED_OFFLINE_EVAL=1
+source config_GB300_64x4_t16g48_tp4pp2ep32gtp8.sh
+sbatch --segment=${SEGMENT} -N ${DGXNNODES} --gpus-per-node=${DGXNGPU} \
+    --time=${WALLTIME} -A <account> run.sub
+```
+
 ## Authoritative multi-GBS profiles
 
 One full common YAML owns the qualified algorithm and system behavior. Four

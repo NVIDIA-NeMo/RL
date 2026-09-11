@@ -194,6 +194,10 @@ class GRPOConfig(TypedDict):
     validation_generation: NotRequired[ValidationGenerationConfig | None]
     # Number of independent validation rollouts generated for each prompt.
     num_val_generations_per_prompt: NotRequired[int]
+    # MLPerf offline (deferred) evaluation: train without inline validation,
+    # checkpoint every step from val_start_at, and evaluate the checkpoints
+    # after training. See nemo_rl.algorithms.mlperf_grpo_deferred.
+    deferred_evaluation: NotRequired[dict[str, Any]]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -233,6 +237,9 @@ class GRPOSaveState(TypedDict):
     val_reward: NotRequired[
         float
     ]  # Optional field - may not be present during training
+    # End time (unix ms) of the latest policy weight update; persisted in
+    # training_info.json for MLPerf deferred (offline) evaluation.
+    training_step_end_time_ms: NotRequired[int]
 
 
 def _default_grpo_save_state() -> GRPOSaveState:
@@ -243,6 +250,7 @@ def _default_grpo_save_state() -> GRPOSaveState:
         "total_steps": 0,
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
+        "training_step_end_time_ms": 0,
     }
 
 
@@ -2911,8 +2919,10 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
-                    if mlperf_logger is not None and mlperf_logger.target_reached:
-                        return
+                    # No early return on mlperf_logger.target_reached here: the
+                    # step's train metrics are logged below, and the MLPerf
+                    # logger emits the held eval block once they are recorded.
+                    # The loop exits on target_reached at the end of the step.
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -3256,6 +3266,9 @@ def grpo_train(
             timer.reset()
             current_step += 1
             total_steps += 1
+            if mlperf_logger is not None and mlperf_logger.target_reached:
+                print("Validation target reached, stopping training", flush=True)
+                return
             if should_save_by_timeout:
                 memory_tracker.snapshot_start_of_stage("", dir())
                 if mlperf_logger is not None:
@@ -4237,6 +4250,9 @@ def async_grpo_train(
                         loss_fn,
                         timer=timer,
                     )
+                # Record when this step's weight update completed. Saved with
+                # each checkpoint; offline evaluation backdates run_stop to it.
+                grpo_save_state["training_step_end_time_ms"] = time.time_ns() // 1_000_000
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
@@ -4329,8 +4345,10 @@ def async_grpo_train(
                         validation_timings, step + 1, prefix="timing/validation"
                     )
                     logger.log_metrics(val_metrics, step + 1, prefix="validation")
-                    if mlperf_logger is not None and mlperf_logger.target_reached:
-                        return
+                    # No early return on mlperf_logger.target_reached here: the
+                    # step's train metrics are logged below, and the MLPerf
+                    # logger emits the held eval block once they are recorded.
+                    # The loop exits on target_reached at the end of the step.
 
                     # Explicit GPU memory cleanup after validation in async mode
                     import gc
@@ -4613,6 +4631,9 @@ def async_grpo_train(
 
             timer.reset()
             step += 1
+            if mlperf_logger is not None and mlperf_logger.target_reached:
+                print("Validation target reached, stopping training", flush=True)
+                return
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
