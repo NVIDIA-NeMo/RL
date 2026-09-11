@@ -187,7 +187,9 @@ def read_checkpoint(checkpoint: Path, step: int) -> tuple[dict, dict]:
     with (checkpoint / "training_info.json").open() as stream:
         info = json.load(stream)
     if info["current_step"] != step:
-        raise ValueError(f"{checkpoint}: training_info.current_step differs from {step}")
+        raise ValueError(
+            f"{checkpoint}: training_info.current_step differs from {step}"
+        )
     if info["training_step_end_time_ms"] <= 0 or info["consumed_samples"] <= 0:
         raise ValueError(f"{checkpoint}: missing training timestamp or sample count")
     if not (checkpoint / "policy" / "weights").is_dir():
@@ -388,9 +390,7 @@ def main() -> None:
     mllog.config(filename=log_file)
     register_omegaconf_resolvers()
     init_ray()
-    evaluate_endpoints(
-        args.checkpoint_root, args.log_dir, config, mllog.get_mllogger()
-    )
+    evaluate_endpoints(args.checkpoint_root, args.log_dir, config, mllog.get_mllogger())
 
 
 if __name__ == "__main__":

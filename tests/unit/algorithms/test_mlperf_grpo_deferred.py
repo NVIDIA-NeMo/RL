@@ -151,7 +151,9 @@ def _run_endpoints(monkeypatch, tmp_path, accuracies):
     return seen, mllogger
 
 
-def test_endpoints_stop_at_first_pass_and_backdate_run_stop(monkeypatch, tmp_path) -> None:
+def test_endpoints_stop_at_first_pass_and_backdate_run_stop(
+    monkeypatch, tmp_path
+) -> None:
     seen, mllogger = _run_endpoints(monkeypatch, tmp_path, {2: 0.8, 3: 0.0})
     assert seen == [(2, 16 * 16)]  # step 3 never evaluated
     run_stop = mllogger.calls[-1]
