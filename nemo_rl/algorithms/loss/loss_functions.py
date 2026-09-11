@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import math
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar
+import warnings
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
 from pydantic import BaseModel, Field
@@ -49,6 +50,11 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_log_softmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
+
+if TYPE_CHECKING:
+    # Import-time only: nemo_rl.algorithms.opd imports the data plane, which
+    # would pull a heavy dependency chain into every loss-function consumer.
+    from nemo_rl.algorithms.opd import OnPolicyDistillationFullConfig
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -237,7 +243,10 @@ class ClippedPGLossFn(LossFunction):
     input_type = LossInputType.LOGPROB
 
     def __init__(
-        self, cfg: ClippedPGLossConfig, use_fused_linear_logprobs: bool = False
+        self,
+        cfg: ClippedPGLossConfig,
+        use_fused_linear_logprobs: bool = False,
+        opd_full: Optional["OnPolicyDistillationFullConfig"] = None,
     ):
         # When True, the model forward is patched to return precomputed next-token
         # logprobs (via chunked linear CE fusion) instead of full logits. This is
@@ -251,6 +260,18 @@ class ClippedPGLossFn(LossFunction):
                 f"are: {', '.join(_CLIPPED_PG_LOSS_MODES)}."
             )
         self.is_dppo_binary_tv = self.loss_mode == "dppo_binary_tv"
+        self.opd_full = opd_full if opd_full is not None and opd_full.enabled else None
+        self.input_type = (
+            LossInputType.OPD_FULL
+            if self.opd_full is not None
+            else LossInputType.LOGPROB
+        )
+        if self.opd_full is not None:
+            if self.is_dppo_binary_tv:
+                raise ValueError(
+                    "loss_fn.loss_mode='dppo_binary_tv' is incompatible with opd_full."
+                )
+            _validate_opd_full_loss_config(cfg, use_fused_linear_logprobs)
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
@@ -431,6 +452,25 @@ class ClippedPGLossFn(LossFunction):
                     "dppo/prob_diff_max": MetricNormalizer.NONE,
                 }
             )
+        if self.opd_full is not None:
+            # opd_full returns its own metric set from _opd_full_call; the
+            # policy-gradient diagnostics above are never produced there.
+            self.metric_normalizations = {
+                "loss": grad_normalizer,
+                "kl_penalty": grad_normalizer,
+                "num_valid_samples": MetricNormalizer.NONE,
+                "opd_full_reverse_kl": MetricNormalizer.TOKENS,
+                "opd_full_reverse_kl_min": MetricNormalizer.NONE,
+                "opd_full_reverse_kl_max": MetricNormalizer.NONE,
+            }
+            if self.opd_full.validate_decomposition:
+                self.metric_normalizations.update(
+                    {
+                        "opd_full_entropy": MetricNormalizer.TOKENS,
+                        "opd_full_cross_entropy": MetricNormalizer.TOKENS,
+                        "opd_full_decomposition_error": MetricNormalizer.NONE,
+                    }
+                )
 
     @torch.no_grad()
     def _compute_binary_tv_mask(
@@ -683,12 +723,53 @@ class ClippedPGLossFn(LossFunction):
 
     def __call__(
         self,
-        next_token_logprobs: Tensor,
-        data: BatchedDataDict[ClippedPGLossDataDict],
-        global_valid_seqs: torch.Tensor,
-        global_valid_toks: torch.Tensor,
+        next_token_logprobs: Optional[Tensor] = None,
+        data: Optional[BatchedDataDict[ClippedPGLossDataDict]] = None,
+        global_valid_seqs: Optional[torch.Tensor] = None,
+        global_valid_toks: Optional[torch.Tensor] = None,
+        opd_full_divergence: Optional[Tensor] = None,
+        opd_full_entropy: Optional[Tensor] = None,
+        opd_full_cross_entropy: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
-        """Clipped Policy Gradient RL loss function."""
+        """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
+
+        Which objective runs is fixed at construction by ``opd_full``.
+
+        Args:
+            next_token_logprobs: Sampled-token log-probabilities ``[B, S - 1]``.
+                Required on the policy-gradient branch; on the ``opd_full``
+                branch only when ``reference_policy_kl_penalty`` is non-zero.
+            data: Microbatch with masks, advantages, and prior log-probabilities.
+            global_valid_seqs: Global valid-sequence count for normalization.
+            global_valid_toks: Global valid-token count for normalization.
+            opd_full_divergence: Per-token reverse KL ``[B, S - 1]``, required on
+                the ``opd_full`` branch.
+            opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
+            opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+
+        Returns:
+            Tuple of the scalar loss and its metric dict.
+        """
+        assert data is not None, "ClippedPGLossFn requires data"
+        assert global_valid_seqs is not None, (
+            "ClippedPGLossFn requires global_valid_seqs"
+        )
+        assert global_valid_toks is not None, (
+            "ClippedPGLossFn requires global_valid_toks"
+        )
+        if self.opd_full is not None:
+            return self._opd_full_call(
+                data=data,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                next_token_logprobs=next_token_logprobs,
+                opd_full_divergence=opd_full_divergence,
+                opd_full_entropy=opd_full_entropy,
+                opd_full_cross_entropy=opd_full_cross_entropy,
+            )
+        assert next_token_logprobs is not None, (
+            "ClippedPGLossFn requires next_token_logprobs"
+        )
         if self.is_dppo_binary_tv:
             return self._call_dppo_binary_tv(
                 next_token_logprobs=next_token_logprobs,
@@ -1103,6 +1184,245 @@ class ClippedPGLossFn(LossFunction):
                 **_is_filter_metrics,
                 "positive_nll_loss": nll_loss.item(),
             },
+        )
+
+    def _opd_full_call(
+        self,
+        *,
+        data: BatchedDataDict[ClippedPGLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        next_token_logprobs: Optional[Tensor],
+        opd_full_divergence: Optional[Tensor],
+        opd_full_entropy: Optional[Tensor],
+        opd_full_cross_entropy: Optional[Tensor],
+    ) -> tuple[torch.Tensor, dict]:
+        """Full-vocabulary MOPD objective: the exact reverse KL is the whole loss.
+
+        ``prepare_loss_input`` reconstructs the teacher distribution and runs the
+        distributed divergence kernel, so this only masks and normalizes. No
+        policy-gradient ratio, advantage, or importance-sampling term applies:
+        the reverse KL is an exact expectation over the student distribution and
+        does not depend on which token was sampled.
+
+        Args:
+            data: Microbatch with ``token_mask`` and ``sample_mask``.
+            global_valid_seqs: Global valid-sequence count for normalization.
+            global_valid_toks: Global valid-token count for normalization.
+            next_token_logprobs: Current-policy sampled-token log-probabilities,
+                only needed when ``reference_policy_kl_penalty`` is non-zero.
+            opd_full_divergence: Per-token reverse KL ``[B, S - 1]``.
+            opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
+            opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+
+        Returns:
+            Tuple of the scalar loss and its metric dict.
+
+        Raises:
+            ValueError: If the divergence tensor is missing.
+        """
+        if opd_full_divergence is None:
+            raise ValueError(
+                "opd_full requires opd_full_divergence from prepare_loss_input."
+            )
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        def reduce_like_loss(per_token_values: Tensor) -> torch.Tensor:
+            """Reduce a per-token tensor the way the gradient is normalized.
+
+            SEQUENCE_LEVEL averages within each sequence first, so every sequence
+            contributes equally regardless of length; a flat masked_mean against
+            ``global_valid_seqs`` would instead divide a token sum by a sequence
+            count and scale the loss by the mean sequence length.
+            """
+            if self.loss_type == LossType.TOKEN_LEVEL:
+                return masked_mean(
+                    per_token_values,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            return masked_mean(
+                masked_mean(per_token_values, token_mask, dim=-1),
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            )
+
+        actor_loss = reduce_like_loss(opd_full_divergence)
+
+        kl = torch.tensor(0.0, device=actor_loss.device)
+        if self.reference_policy_kl_penalty != 0:
+            if next_token_logprobs is None:
+                raise ValueError(
+                    "opd_full with reference_policy_kl_penalty != 0 requires "
+                    "next_token_logprobs from prepare_loss_input: the penalty must "
+                    "be differentiable through the current policy."
+                )
+            # Unlike the exact divergence above, this penalty is sampled, so its
+            # gradient needs the score-function term through the sampling
+            # probability, as in the policy-gradient branch.
+            # exp(x - x.detach()) is 1 in the forward pass and supplies it.
+            kl_importance_weights = torch.nan_to_num(
+                torch.exp(next_token_logprobs - next_token_logprobs.detach()),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            kl = self.reference_policy_kl_penalty * calculate_kl(
+                logprobs=next_token_logprobs,
+                logprobs_reference=data["reference_policy_logprobs"][:, 1:],
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+                importance_sampling_weights=kl_importance_weights,
+            )
+            kl = reduce_like_loss(kl)
+
+        loss = actor_loss + kl
+
+        with torch.no_grad():
+            masked_divergence = opd_full_divergence.detach()[mask.bool()]
+            # Token-normalized diagnostics use global_valid_toks regardless of
+            # loss_type, matching their declared MetricNormalizer.TOKENS.
+            reverse_kl_metric = masked_mean(
+                opd_full_divergence.detach(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+            metrics: dict[str, Any] = {
+                "loss": loss.item(),
+                # Report the raw KL, undoing the coefficient. Guard on the
+                # coefficient: `kl` is 0-dim, so its `numel()` is always 1 and
+                # cannot stand in for "the penalty is active".
+                "kl_penalty": (
+                    kl.item() / self.reference_policy_kl_penalty
+                    if self.reference_policy_kl_penalty
+                    else 0
+                ),
+                "num_valid_samples": sample_mask.sum().item(),
+                "opd_full_reverse_kl": reverse_kl_metric.item(),
+                "opd_full_reverse_kl_min": (
+                    masked_divergence.min().item()
+                    if masked_divergence.numel() > 0
+                    else float("inf")
+                ),
+                "opd_full_reverse_kl_max": (
+                    masked_divergence.max().item()
+                    if masked_divergence.numel() > 0
+                    else float("-inf")
+                ),
+            }
+            if (
+                opd_full_entropy is not None
+                and opd_full_cross_entropy is not None
+                and self.opd_full is not None
+                and self.opd_full.validate_decomposition
+            ):
+                # reverse_kl == sum_v p_s log p_s + (-sum_v p_s log p_t)
+                decomposition = (
+                    opd_full_entropy.detach() + opd_full_cross_entropy.detach()
+                )
+                metrics["opd_full_entropy"] = masked_mean(
+                    -opd_full_entropy.detach(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                metrics["opd_full_cross_entropy"] = masked_mean(
+                    opd_full_cross_entropy.detach(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                metrics["opd_full_decomposition_error"] = (
+                    (decomposition - opd_full_divergence.detach())
+                    .abs()
+                    .mul(mask)
+                    .max()
+                    .item()
+                )
+
+        return loss, metrics
+
+
+def _validate_opd_full_loss_config(
+    cfg: ClippedPGLossConfig, use_fused_linear_logprobs: bool
+) -> None:
+    """Reject loss knobs that have no code path under the full-vocabulary objective.
+
+    ``opd_full`` replaces the whole policy-gradient objective with an exact
+    reverse KL, so the ratio, CISPO, and importance-sampling machinery is dead
+    code on that branch. Erroring out beats silently ignoring user config.
+
+    Args:
+        cfg: The clipped-PG loss config supplied by the user.
+        use_fused_linear_logprobs: Whether the fused linear-CE forward is on.
+
+    Raises:
+        ValueError: If any incompatible option is set.
+    """
+    if use_fused_linear_logprobs:
+        raise ValueError(
+            "opd_full is incompatible with use_fused_linear_logprobs: the fused "
+            "forward returns precomputed logprobs, but the full-vocabulary "
+            "reverse KL needs the raw vocabulary-parallel logits."
+        )
+
+    # Policy-gradient ratio machinery: no ratio exists under opd_full.
+    if not cfg.disable_ppo_ratio:
+        raise ValueError("opd_full requires loss_fn.disable_ppo_ratio=true.")
+    if cfg.ratio_clip_c is not None:
+        raise ValueError("opd_full is incompatible with dual PPO clipping.")
+    if cfg.use_cispo:
+        raise ValueError("opd_full is incompatible with CISPO.")
+    if cfg.force_on_policy_ratio:
+        raise ValueError("opd_full is incompatible with force_on_policy_ratio.")
+    if cfg.use_on_policy_kl_approximation:
+        raise ValueError(
+            "opd_full is incompatible with use_on_policy_kl_approximation: it "
+            "reweights the reference-KL term by a generation-to-current ratio "
+            "that only the policy-gradient branch computes. The opd_full branch "
+            "never reads it, so leaving it on would be silently ignored."
+        )
+    if cfg.sequence_level_importance_ratios:
+        raise ValueError(
+            "opd_full is incompatible with sequence_level_importance_ratios."
+        )
+
+    # Importance-sampling machinery: the reverse KL is an exact expectation over
+    # the student distribution, so no sampling-distribution correction applies.
+    if cfg.use_importance_sampling_correction:
+        raise ValueError(
+            "opd_full is incompatible with use_importance_sampling_correction: the "
+            "full-vocabulary reverse KL is an exact expectation and carries no "
+            "sampled-token score-function term to correct."
+        )
+    if cfg.truncated_importance_sampling_type is not None:
+        raise ValueError(
+            "opd_full is incompatible with truncated_importance_sampling_type."
+        )
+
+    # Advantage/reward-shaped terms: opd_full never reads advantages or rewards.
+    if cfg.positive_example_nll_weight != 0:
+        raise ValueError(
+            "opd_full is incompatible with a non-zero positive_example_nll_weight."
+        )
+
+    if cfg.use_kl_in_reward:
+        raise ValueError(
+            "opd_full is incompatible with use_kl_in_reward: it routes the "
+            "reference KL through the reward, which reaches the objective only "
+            "via advantages, and opd_full ignores advantages entirely. It also "
+            "zeroes the loss-side reference_policy_kl_penalty, so the penalty "
+            "would be dropped on both paths. Set use_kl_in_reward=false; the "
+            "loss-side penalty is applied directly."
+        )
+
+    if cfg.reference_policy_kl_penalty != 0:
+        warnings.warn(
+            "opd_full is already a KL objective against the teacher; "
+            "reference_policy_kl_penalty adds a second KL against the frozen "
+            "reference policy on top of it.",
+            stacklevel=3,
         )
 
 
