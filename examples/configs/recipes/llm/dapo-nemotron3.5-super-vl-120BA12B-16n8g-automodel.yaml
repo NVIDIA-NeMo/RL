@@ -6,7 +6,7 @@ defaults: ../../grpo_math_1B.yaml
 # parallelism follows grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.yaml.
 #
 # Requirements (see pyproject.toml):
-#   - Automodel pinned at huiyingl/nemotron-super-3.5-vision (992a9b64+), which
+#   - Automodel pinned at main @ 6ae5ca23 (Nemotron 3.5 Super VL, #3801), which
 #     registers NemotronH_Omni_Reasoning_V3 and the transformers-native RADIO
 #     checkpoint layout this checkpoint ships.
 #   - vLLM from the super_vl_rl_v0.25.1 fork: stock 0.25.1 does not know this
@@ -62,9 +62,9 @@ checkpointing:
   checkpoint_must_save_by: 00:03:20:00
   keep_top_k: 2
 policy:
-  model_name: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  model_name: nvidia/nemotron-3.5-super-pre-ea-text-08282026
   tokenizer:
-    name: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+    name: nvidia/nemotron-3.5-super-pre-ea-text-08282026
   hf_config_overrides:
     num_nextn_predict_layers: 0
   train_micro_batch_size: 1
