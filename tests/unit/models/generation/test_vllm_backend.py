@@ -550,6 +550,9 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
     ext.model_config = model_config
     ext.device = torch.device("cpu")
+    ext._maybe_process_draft_after_loading = lambda process: call_order.append(
+        ("draft", process)
+    )
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
     ext._maybe_process_fp8_kv_cache = MagicMock()
 
@@ -580,17 +583,16 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         "_refresh_hpc_modules_after_layerwise_reload",
         lambda reload_model: call_order.append(("hpc", reload_model)),
     )
+    process_weights_after_loading = MagicMock()
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
-        lambda *_args: pytest.fail(
-            "unquantized refit must use vLLM's native layerwise reload lifecycle"
-        ),
+        process_weights_after_loading,
     )
 
     for _ in range(2):
         with ext._weight_update_lifecycle("collective") as finalize:
             call_order.append("load")
-            finalize()
+            finalize(True)
         assert ext._nrl_layerwise_reload_active is False
 
     expected_cycle = [
@@ -599,10 +601,12 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         "load",
         ("finalize", model, model_config),
         ("hpc", model),
+        ("draft", process_weights_after_loading),
         "mtp",
         "config_exit",
     ]
     assert call_order == expected_cycle * 2
+    process_weights_after_loading.assert_not_called()
     ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
@@ -704,7 +708,7 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
 
     with ext._weight_update_lifecycle(transport) as finalize:
         call_order.append("transfer")
-        finalize()
+        finalize(False)
 
     assert call_order == [
         "config_enter",
@@ -872,7 +876,7 @@ def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypa
 
         transport_buffer.copy_(torch.tensor([7.0, 8.0]))
         ext._load_full_hf_weights([("layer.second", transport_buffer)])
-        finalize()
+        finalize(False)
 
     torch.testing.assert_close(model.layer.first, torch.tensor([1.0, 2.0]))
     torch.testing.assert_close(model.layer.second, torch.tensor([7.0, 8.0]))
@@ -986,7 +990,7 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     )
 
     with ext._weight_update_lifecycle("collective") as finalize:
-        finalize()
+        finalize(False)
 
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
@@ -1320,7 +1324,7 @@ def test_native_collective_refit_uses_one_transport_buffer(monkeypatch):
 
     @contextlib.contextmanager
     def lifecycle(_transport):
-        yield lambda: None
+        yield lambda _finalize_draft: None
 
     ext._weight_update_lifecycle = lifecycle
     observed_num_buffers = None
@@ -1366,7 +1370,7 @@ def test_update_weights_from_collective_uses_legacy_loader_by_default(monkeypatc
     def lifecycle(transport):
         assert transport == "collective"
         call_order.append("lifecycle")
-        yield lambda: call_order.append("finalize")
+        yield lambda _finalize_draft: call_order.append("finalize")
 
     def load_weights(weights):
         call_order.append("load")
@@ -1892,7 +1896,9 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
 
     @contextlib.contextmanager
     def lifecycle(_transport):
-        yield lambda: pytest.fail("an incomplete transfer must not be finalized")
+        yield lambda _finalize_draft: pytest.fail(
+            "an incomplete transfer must not be finalized"
+        )
 
     ext._weight_update_lifecycle = lifecycle
 

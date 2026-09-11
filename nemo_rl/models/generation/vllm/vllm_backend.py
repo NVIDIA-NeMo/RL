@@ -1154,13 +1154,21 @@ class VllmInternalWorkerExtension:
             reload_targets = _unquantized_flashinfer_trtllm_modules(model)
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
 
-            def finalize() -> None:
+            def finalize(finalize_draft: bool) -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
                     _process_mxfp8_modules_after_native_reload(
                         model, reloaded_module_ids
                     )
                     _refresh_hpc_modules_after_layerwise_reload(model)
+                    if finalize_draft:
+                        from vllm.model_executor.model_loader.utils import (
+                            process_weights_after_loading,
+                        )
+
+                        self._maybe_process_draft_after_loading(
+                            process_weights_after_loading
+                        )
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
 
