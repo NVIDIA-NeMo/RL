@@ -70,11 +70,11 @@ checkpointing:
   enabled: true
   metric_name: null
   higher_is_better: true
-  # ~1.4 TB per checkpoint with optimizer state: save_period=1/keep_top_k=20
-  # filled the project quota in 12 steps (window 0 of the v2 run died on
-  # "Disk quota exceeded"). Save sparsely and keep only two.
+  # Retain every checkpoint saved at the five-step cadence.  This is
+  # intentionally storage-heavy, but preserves earlier MCore steps for HF
+  # conversion after resumed Slurm windows.
   save_period: 5
-  keep_top_k: 2
+  keep_top_k: 1000000
   save_optimizer: true
   save_replay_buffer: false
 

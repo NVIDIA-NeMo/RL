@@ -52,7 +52,10 @@ num_prompts="${NUM_PROMPTS:-128}"
 num_generations="${NUM_GENERATIONS:-16}"
 max_steps="${MAX_STEPS:-60}"
 save_period="${SAVE_PERIOD:-5}"
-checkpoint_keep_top_k="${CHECKPOINT_KEEP_TOP_K:-2}"
+# Retain every saved MCore checkpoint by default.  A lower value silently
+# prunes older steps across resumed Slurm windows and makes retrospective HF
+# conversion impossible.
+checkpoint_keep_top_k="${CHECKPOINT_KEEP_TOP_K:-1000000}"
 in_flight_weight_updates="${IN_FLIGHT_WEIGHT_UPDATES:-true}"
 recompute_kv_cache_after_weight_updates="${RECOMPUTE_KV_CACHE_AFTER_WEIGHT_UPDATES:-false}"
 length_penalty_enabled="${LENGTH_PENALTY_ENABLED:-false}"
