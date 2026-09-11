@@ -275,32 +275,33 @@ def _aux_store_and_path(
     missing_aux_source_is_error: bool,
 ) -> tuple[FileStore | None, str]:
     store = media_source
-    if store is not None:
-        media_path = path
-        if (
-            basename_missing_absolute
-            and Path(media_path).is_absolute()
-            and not Path(media_path).is_file()
-        ):
-            media_path = PurePosixPath(media_path).name
-        return store, media_path
-
-    clean_path = re.sub(r"(?:^\./|/\.(?=/))", "", path)
-    prefixes = (sample.get("__subflavors__") or {}).get("aux_data_prefixes", {})
-    for prefix, aux_key in prefixes.items():
-        if clean_path.startswith(prefix):
+    media_path = path
+    if store is None:
+        clean_path = re.sub(r"(?:^\./|/\.(?=/))", "", path)
+        prefixes = (sample.get("__subflavors__") or {}).get("aux_data_prefixes", {})
+        for prefix, aux_key in prefixes.items():
+            if not clean_path.startswith(prefix):
+                continue
             try:
-                media_path = (
-                    clean_path[len(prefix) :] if strip_matched_prefix else path
-                )
-                return media_sources[aux_key], media_path
+                store = media_sources[aux_key]
             except KeyError as error:
                 if not missing_aux_source_is_error:
                     return None, path
                 raise ValueError(
                     f"Auxiliary media source {aux_key!r} is not available for {path!r}."
                 ) from error
-    return None, path
+            media_path = clean_path[len(prefix) :] if strip_matched_prefix else path
+            break
+
+    local_path = Path(media_path)
+    if (
+        store is not None
+        and basename_missing_absolute
+        and local_path.is_absolute()
+        and not local_path.is_file()
+    ):
+        media_path = PurePosixPath(media_path).name
+    return store, media_path
 
 
 def _aux_media(
