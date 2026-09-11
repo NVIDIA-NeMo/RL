@@ -44,3 +44,7 @@ export DGXSYSTEM=$(basename $(readlink -f ${BASH_SOURCE[0]}) | sed 's/^config_//
 
 export WALLTIME_RUNANDTIME=120
 export WALLTIME=$((20 + ${NEXP:-1} * ($WALLTIME_RUNANDTIME + 10)))
+if [[ "${DEFERRED_OFFLINE_EVAL:-0}" == "1" ]]; then
+    # Checkpoint evaluation reuses the allocation after training stops.
+    export WALLTIME=$((WALLTIME + ${WALLTIME_OFFLINE_EVAL:-240}))
+fi

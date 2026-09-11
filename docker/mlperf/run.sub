@@ -41,7 +41,7 @@ echo "PROLOG_START $(date +%s)"
 : "${GEN_NODES:?GEN_NODES not set}"
 
 # Vars with defaults
-: "${MLPERF_RULESET:=6.0.0}"
+: "${MLPERF_RULESET:=6.1.0}"
 : "${MLPERF_SCALE:='unknown'}"
 : "${MLPERF_CLUSTER_NAME:='unknown'}"
 : "${MILESTONE_YML:=unknown}"
@@ -60,6 +60,21 @@ echo "PROLOG_START $(date +%s)"
 : "${USER_DROPCACHE:=}"
 : "${EXTRA_ASSETS:=}"
 : "${SRUN_KILL_ON_BAD_EXIT:=0}"
+: "${DEFERRED_OFFLINE_EVAL:=0}"
+: "${WALLTIME_OFFLINE_EVAL:=240}"
+export DEFERRED_OFFLINE_EVAL
+case "${DEFERRED_OFFLINE_EVAL}" in
+    0|1) ;;
+    *) echo "ERROR: DEFERRED_OFFLINE_EVAL must be 0 or 1" >&2; exit 1 ;;
+esac
+if [[ "${DEFERRED_OFFLINE_EVAL}" == "1" ]]; then
+    # Checkpoint evaluation runs as a second driver in the same allocation;
+    # the mllog must describe exactly one fresh experiment.
+    if [[ "${NEXP}" != "1" || "${FORCE_SUCCESS_STATUS:-0}" != "0" ]]; then
+        echo "ERROR: deferred evaluation requires NEXP=1 and FORCE_SUCCESS_STATUS=0" >&2
+        exit 1
+    fi
+fi
 
 # Ray ports: all below the ephemeral range (see port layout in nemo-rl ray.sub)
 : "${OMP_NUM_THREADS:=16}"
@@ -505,6 +520,20 @@ mllogger.event(key=mllogger.constants.CACHE_CLEAR, value=True)"
              bash /workspace/llm/run_and_time.sh
         RUN_AND_TIME_EXIT_STATUS=$?
         echo "RUNANDTIME_STOP $(date +%s)"
+        if [[ "${DEFERRED_OFFLINE_EVAL}" == "1" && "${RUN_AND_TIME_EXIT_STATUS}" -eq 0 ]]; then
+            # Training flushed its checkpoints and released its Ray actors.
+            # Keep the allocation and Ray cluster for MCore restore/refit/eval.
+            echo "DEFERRED_EVAL_START $(date +%s)"
+            srun -N1 -n1 --overlap \
+                 --time="${WALLTIME_OFFLINE_EVAL}" \
+                 --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" \
+                 --container-mounts="${_cont_mounts}" \
+                 --container-workdir=${WORK_DIR} \
+                 -w "$head_node" \
+                 bash /workspace/llm/run_and_time.sh --deferred-eval
+            RUN_AND_TIME_EXIT_STATUS=$?
+            echo "DEFERRED_EVAL_STOP status=${RUN_AND_TIME_EXIT_STATUS} $(date +%s)"
+        fi
         echo "${RUN_AND_TIME_EXIT_STATUS}" > "/tmp/run_and_time_exit_status_${SLURM_JOB_ID}_${_experiment_index}.txt"
         set -e
 

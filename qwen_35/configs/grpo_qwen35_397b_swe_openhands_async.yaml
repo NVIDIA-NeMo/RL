@@ -21,6 +21,11 @@ grpo:
   val_start_at: 20
   val_at_start: false
   val_at_end: false
+  # MLPerf offline evaluation: DEFERRED_OFFLINE_EVAL=1 disables inline
+  # validation and checkpoints every step from val_start_at; the checkpoints
+  # are evaluated after training stops (docker/mlperf/README.md).
+  deferred_evaluation:
+    enabled: ${oc.decode:${oc.env:DEFERRED_OFFLINE_EVAL,0}}
   overlong_filtering: true
   max_val_samples: null
   val_batch_size: null

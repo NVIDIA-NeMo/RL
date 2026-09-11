@@ -37,6 +37,10 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     setup,
 )
+from nemo_rl.algorithms.mlperf_grpo_deferred import (
+    configure_deferred_evaluation,
+    teardown_run_resources,
+)
 from nemo_rl.algorithms.mlperf_grpo_logging import create_mlperf_logger
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
@@ -135,6 +139,9 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
+    # Deferred (offline) evaluation switches the config to checkpoint-only
+    # validation; it must run before the MLPerf logger reads the config.
+    deferred_evaluation = configure_deferred_evaluation(config)
     # create_mlperf_logger expects the raw config mapping; call it before the
     # pydantic MasterConfig conversion.
     mlperf_logger = create_mlperf_logger(config)
@@ -305,8 +312,36 @@ The validation set you pass in will directly be used for validation with no addi
             )
         except Exception:
             if mlperf_logger is not None:
+                if deferred_evaluation is not None:
+                    # Operational failure: no checkpoint evaluation runs; emit
+                    # the terminal events instead of deferring them.
+                    mlperf_logger.defer_run_stop = False
                 mlperf_logger.finalize()
             raise
+        if deferred_evaluation is not None:
+            # async_grpo_train swallows in-loop exceptions; the final
+            # checkpoint step is the reliable success signal.
+            if grpo_state["current_step"] != config.grpo["max_num_steps"]:
+                if mlperf_logger is not None:
+                    mlperf_logger.defer_run_stop = False
+                    mlperf_logger.finalize()
+                raise RuntimeError(
+                    "deferred training stopped before the final checkpoint step: "
+                    f"current_step={grpo_state['current_step']} "
+                    f"max_num_steps={config.grpo['max_num_steps']}"
+                )
+            # Checkpoints are synchronously written and the trainer's epilogue
+            # stopped its actors; release the clusters/placement groups so the
+            # deferred evaluation phase can reuse this allocation and the
+            # running Ray cluster.
+            teardown_run_resources(clusters=cluster)
+            if mlperf_logger is not None:
+                # Close the train block at the final weight update; the
+                # deferred evaluator appends the eval events and run_stop.
+                mlperf_logger.stop_train_block(
+                    grpo_state["current_step"],
+                    time_ms=grpo_state.get("training_step_end_time_ms") or None,
+                )
     else:
         print("🚀 Running synchronous GRPO training")
 
