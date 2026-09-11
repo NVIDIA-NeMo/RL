@@ -104,3 +104,58 @@ def test_models_without_expert_modules_pass_everything_through():
     model = torch.nn.Sequential(torch.nn.Linear(2, 2))
     weights = [("0.input_quantizer._amax", torch.tensor(1.0))]
     assert route_moe_input_quantizer_amax(model, weights) == weights
+
+
+class _BackboneMapper:
+    """Stands in for vLLM's WeightsMapper: Nemotron-H maps `backbone.` -> `model.`."""
+
+    def _map_name(self, key: str) -> str | None:
+        if key.startswith("mtp."):
+            return None
+        return key.replace("backbone.", "model.", 1)
+
+
+def test_checkpoint_names_are_mapped_to_vllm_names_before_matching():
+    """Nemotron-H exports `backbone.layers.*`; vLLM's layer_name is `model.layers.*`.
+
+    Without the mapper the amax passed straight through to vLLM's loader, which
+    then failed with `Layer model.layers.N.mixer.experts has no parameter
+    'w13_input_quantizer._amax'` on the nano3 fakequant nightlies.
+    """
+    model = _Model()
+    experts = model.layers[0].experts
+    weights = [
+        (
+            "backbone.layers.0.experts.2.up_proj.input_quantizer._amax",
+            torch.tensor(5.0),
+        ),
+        (
+            "backbone.layers.0.experts.1.down_proj.input_quantizer._amax",
+            torch.tensor(4.0),
+        ),
+        ("mtp.layers.0.experts.0.up_proj.input_quantizer._amax", torch.tensor(9.0)),
+        ("backbone.layers.0.experts.w13_weight", torch.zeros(3, 4, 2)),
+    ]
+
+    remaining = route_moe_input_quantizer_amax(model, weights, mapper=_BackboneMapper())
+
+    assert experts.w13_input_quantizer._amax.item() == 5.0
+    assert experts.w2_input_quantizer._amax.item() == 4.0
+    # Dropped-by-mapper names and non-amax weights are left for vLLM's loader.
+    assert [name for name, _ in remaining] == [
+        "mtp.layers.0.experts.0.up_proj.input_quantizer._amax",
+        "backbone.layers.0.experts.w13_weight",
+    ]
+
+
+def test_unmapped_checkpoint_prefix_passes_through_without_a_mapper():
+    """Documents the pass-3/5 failure mode: no mapper, no match, vLLM gets the name."""
+    model = _Model()
+    weights = [
+        (
+            "backbone.layers.0.experts.2.up_proj.input_quantizer._amax",
+            torch.tensor(5.0),
+        ),
+    ]
+    assert route_moe_input_quantizer_amax(model, weights) == weights
+    assert model.layers[0].experts.w13_input_quantizer._amax.item() == 1.0

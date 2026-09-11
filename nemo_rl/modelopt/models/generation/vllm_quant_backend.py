@@ -687,7 +687,13 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         # single ``getattr`` and therefore cannot reach the dotted quantizer
         # buffers (``w13_input_quantizer._amax``). Fan the per-expert amax values
         # into the fused quantizers here and keep them away from vLLM's loader.
-        weights = route_moe_input_quantizer_amax(self.model_runner.model, weights)
+        # Checkpoint names (e.g. Nemotron-H's ``backbone.*``) only turn into the
+        # module's vLLM ``layer_name`` through the model's hf_to_vllm_mapper.
+        weights = route_moe_input_quantizer_amax(
+            self.model_runner.model,
+            weights,
+            mapper=getattr(self.model_runner.model, "hf_to_vllm_mapper", None),
+        )
 
         # MBridge exports K/V amax with the HF-semantic attention path, such as
         # ``self_attn.k_bmm_quantizer._amax``. ModelOpt installs these quantizers
