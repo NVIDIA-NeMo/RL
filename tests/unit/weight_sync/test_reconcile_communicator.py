@@ -40,15 +40,41 @@ from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
 )
 
 
+def _minimal_generation(dp_size=2):
+    """Enough of a fleet for reconcile to compute a desired membership.
+
+    Reconcile now always computes one, rather than short-circuiting on an empty absent
+    set -- that is what lets a restarted shard be re-admitted -- so even the no-op path
+    needs a worker group.
+    """
+    return SimpleNamespace(
+        worker_group=SimpleNamespace(
+            workers=[object()] * dp_size,
+            dp_size=dp_size,
+            get_dp_leader_worker_idx=lambda shard: shard,
+        ),
+    )
+
+
+def _minimal_cluster(train_world_size=4):
+    return SimpleNamespace(world_size=lambda: train_world_size)
+
+
 def _collective() -> CollectiveWeightSynchronizer:
     return CollectiveWeightSynchronizer(
-        policy=object(), generation=object(), train_cluster=None, inference_cluster=None
+        policy=object(),
+        generation=_minimal_generation(),
+        train_cluster=_minimal_cluster(),
+        inference_cluster=None,
     )
 
 
 def _reshard() -> NcclReshardWeightSynchronizer:
     return NcclReshardWeightSynchronizer(
-        policy=object(), generation=object(), train_cluster=None, inference_cluster=None
+        policy=object(),
+        generation=_minimal_generation(),
+        train_cluster=_minimal_cluster(),
+        inference_cluster=None,
     )
 
 
@@ -105,7 +131,11 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
             workers.append(_FakeWorker(len(workers), dead=shard in set(dead_shards)))
     generation = SimpleNamespace(
         cfg={"vllm_cfg": {"async_engine": True}},
-        worker_group=SimpleNamespace(workers=workers, dp_size=dp_size),
+        worker_group=SimpleNamespace(
+            workers=workers,
+            dp_size=dp_size,
+            get_dp_leader_worker_idx=lambda shard: shard * workers_per_shard,
+        ),
         # The rebuild bootstraps with the same peer protocol as the first build, so it
         # asks the backend which one that is. A stand-in has to carry every hook the code
         # under test reads, or it tests a shape the product never has.
@@ -116,6 +146,10 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     generation.set_refit_membership = lambda membership: setattr(
         generation, "_refit_membership", membership
     )
+    # A rebuild redistributes refit metadata, because a restarted engine has none and
+    # update_weights_from_collective asserts on it.
+    refit_info_pushes = []
+    generation.prepare_refit_info = lambda info: refit_info_pushes.append(info)
     generation.rebuild_collective = (
         lambda membership, ip, port: vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
@@ -123,6 +157,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     )
     policy_calls = []
     policy = SimpleNamespace(
+        prepare_refit_info=lambda: {"model.weight": object()},
         init_collective=lambda ip,
         port,
         world_size,
@@ -138,7 +173,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
                 }
             )
             or ["train-future"]
-        )
+        ),
     )
     ports = iter(range(7001, 7100))
     train_cluster = SimpleNamespace(
@@ -196,17 +231,47 @@ class TestRebuildDispatch:
         gen_ports = {c["port"] for w in workers for c in w.calls}
         assert gen_ports == {policy_calls[0]["port"]}
 
-    def test_each_rebuild_takes_a_fresh_port(self, monkeypatch):
-        """The previous world's store may still be bound."""
+    def test_reconciling_the_same_membership_twice_is_a_no_op(self, monkeypatch):
+        """Called before every refit, so repeating must not rebuild every time."""
         monkeypatch.setattr("ray.get", lambda futures: futures)
         sync, _, policy_calls = _rebuildable(dead_shards=(3,))
 
+        assert sync.reconcile_communicator([3]) is True
+        assert sync.reconcile_communicator([3]) is False
+        assert len(policy_calls) == 1
+
+    def test_each_distinct_rebuild_takes_a_fresh_port(self, monkeypatch):
+        """The previous world's rendezvous store may still be bound."""
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        # No worker flagged dead: this test is about ports, and flagging shard 2 dead
+        # would trip the dispatch guard during the first rebuild, which still includes it.
+        sync, _, policy_calls = _rebuildable(dp_size=4)
+
         sync.reconcile_communicator([3])
-        # force, because an unchanged absent set is now skipped. What is under test is that
-        # each rebuild that DOES happen takes a fresh port, not that every call rebuilds.
-        sync.reconcile_communicator([3], force=True)
+        # A different absent set, so this rebuilds without needing force. What is under
+        # test is that each rebuild that DOES happen takes a fresh port.
+        sync.reconcile_communicator([2, 3])
 
         assert policy_calls[0]["port"] != policy_calls[1]["port"]
+
+    def test_a_recovered_shard_is_re_admitted(self, monkeypatch):
+        """The direction that keyed-off-absent could never express.
+
+        Without comparing against what was built, an emptying absent set reads as
+        "nothing to do" and the restarted shard stays excluded for the rest of the run,
+        so capacity only ever ratchets down.
+        """
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, policy_calls = _rebuildable(dp_size=4)
+
+        assert sync.reconcile_communicator([2]) is True
+        assert sync.reconcile_communicator([]) is True, "shard 2 must be able to rejoin"
+
+        assert policy_calls[-1]["world_size"] == 8 + 4
+        for w in workers:
+            w.calls.clear()
+        sync._generation.update_weights_from_collective = None  # not needed here
+        assert sync._built_membership.surviving_shards == [0, 1, 2, 3]
 
     def test_trainers_are_all_kept(self, monkeypatch):
         monkeypatch.setattr("ray.get", lambda futures: futures)
@@ -442,13 +507,20 @@ class TestAnUnchangedMembershipIsNotRebuiltAgain:
             "force must actually rebuild, not just return True"
         )
 
-    def test_nothing_absent_still_short_circuits_first(self, monkeypatch):
-        """An empty absent set is 'nothing to do', not 'same as last time'."""
+    def test_force_with_nothing_absent_does_not_rebuild(self, monkeypatch):
+        """The frozen-rank case, and the one where forcing would recreate the hang.
+
+        A rank that is alive but not participating never becomes absent. Forcing a rebuild
+        there would produce a communicator that still contains it, and the retry would hang
+        exactly as the first attempt did. Falling through to False is what lets the caller
+        report "no generation shard could be identified as absent" and stop.
+        """
         monkeypatch.setattr("ray.get", lambda futures: futures)
-        sync, _, _ = _rebuildable(dead_shards=(2,))
+        sync, workers, _ = _rebuildable(dead_shards=(2,))
 
         assert sync.reconcile_communicator([]) is False
         assert sync.reconcile_communicator([], force=True) is False
+        assert not any(w.calls for w in workers), "no rebuild may have been dispatched"
 
 
 class TestStragglersAreWaitedForBeforeARebuild:
@@ -522,3 +594,53 @@ class TestStragglersAreWaitedForBeforeARebuild:
         sync = _collective()
         sync._refit_timeout_s = None
         assert 0 < sync._settle_budget_s() < 600
+
+
+class TestBackendsWithoutAWorkerGroup:
+    """CollectiveWeightSynchronizer holds a GenerationInterface, not a VllmGeneration.
+
+    Only some implementations own a Ray worker group with DP shards -- vLLM and TRT-LLM do;
+    Dynamo, Megatron and SGLang do not, and the interface declares nothing either way. Of
+    those, Dynamo reaches this synchronizer through the ordinary non-colocated branch of
+    the factory, so reading self._generation.worker_group broke it on the plain grpo.py
+    path:
+
+        grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
+        AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
+
+    Membership tracking is only meaningful where shards exist, so a backend without one
+    records None and every reconcile falls through to "nothing to do" -- which is exactly
+    how this method behaved before membership tracking was added.
+    """
+
+    @staticmethod
+    def _synchronizer(*, has_worker_group: bool):
+        from nemo_rl.weight_sync.collective_weight_synchronizer import (
+            CollectiveWeightSynchronizer,
+        )
+
+        sync = CollectiveWeightSynchronizer.__new__(CollectiveWeightSynchronizer)
+        generation = SimpleNamespace()
+        if has_worker_group:
+            generation.worker_group = SimpleNamespace(
+                dp_size=2, workers=[object(), object()]
+            )
+        sync._generation = generation
+        sync._train_cluster = SimpleNamespace(world_size=lambda: 2)
+        sync._built_membership = None
+        return sync
+
+    def test_a_backend_without_shards_records_no_membership(self):
+        sync = self._synchronizer(has_worker_group=False)
+        assert sync._desired_membership([], 2) is None
+
+    def test_and_its_reconcile_is_inert_rather_than_raising(self):
+        sync = self._synchronizer(has_worker_group=False)
+        assert sync.reconcile_communicator([], force=False) is False
+        assert sync.reconcile_communicator([0], force=True) is False
+
+    def test_a_sharded_backend_still_records_membership(self):
+        sync = self._synchronizer(has_worker_group=True)
+        membership = sync._desired_membership([], 2)
+        assert membership is not None
+        assert membership.train_world_size == 2

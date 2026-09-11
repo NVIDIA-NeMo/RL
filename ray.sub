@@ -381,6 +381,29 @@ export RAY_ray_syncer_message_refresh_interval_ms="${RAY_ray_syncer_message_refr
 export RAY_core_worker_internal_heartbeat_ms="${RAY_core_worker_internal_heartbeat_ms:-5000}"
 export RAY_health_check_period_ms="${RAY_health_check_period_ms:-10000}"
 
+# ---------------------------------------------------------------------------
+# Reap a dead worker's orphaned child processes
+#
+# Not a scale knob — it is here because this is the last point before `ray start`.
+# The raylet reads process_group_cleanup_enabled when it forks a worker
+# (worker_pool.cc) and acts on it when it kills one (node_manager.cc), so it must
+# be in the raylet's environment, and the raylet starts here, long before any
+# recipe has been read. A driver that sets it after the fact changes nothing.
+#
+# What it buys: a vLLM generation worker spawns its EngineCore as a plain
+# multiprocessing child that owns the CUDA context and the KV cache. Every cleanup
+# path vLLM and Ray provide runs inside the dying process, so a SIGKILLed worker
+# leaves that child holding its GPU for the rest of the job — measured at 114.95
+# GiB still held on a GB200 after one shard was killed, which is enough that the
+# replacement cannot fit. Because the EngineCore never calls setsid it stays in the
+# worker's process group, which is exactly what this reaches.
+#
+# Unconditional here, unlike the driver-side scoping in
+# nemo_rl.models.generation.maybe_configure_engine_reaping_env: the raylet is up
+# before anything knows whether this run tolerates a dead shard. `:-` keeps an
+# operator's explicit 0 — someone debugging a wedged engine may want the corpse.
+export RAY_process_group_cleanup_enabled="${RAY_process_group_cleanup_enabled:-1}"
+
 # The head is retried a few times. Workers may need more attempts since they can
 # race the head's GCS coming up: `ray start --address` fails until GCS is listening.
 num_retries=3

@@ -140,6 +140,7 @@ from nemo_rl.experience.rollout_recovery import (
     parse_rollout_recovery_state,
 )
 from nemo_rl.experience.route_plan import decode_route_plan
+from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -159,6 +160,12 @@ Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
+
+# How long teardown waits for an in-flight engine restart. Short, and not the restart's own
+# budget: at this point the run is over, so the only thing a completed restart buys is a
+# cleaner exit. Not configurable for the same reason.
+_SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
+
 
 _MAX_CONSECUTIVE_ROLLOUT_CHECKPOINT_FAILURES = 3
 
@@ -331,6 +338,19 @@ class SingleControllerActor:
             self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
         else:
             self._teacher_coordinator = None
+        # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
+        # is nothing for a supervisor to restart.
+        _fleet_health_cfg = master_config.async_rl.generation_fleet_health
+        self._engine_supervisor = (
+            EngineSupervisor(
+                generation=self._gen,
+                monitor=self._gen_fleet,
+                restart_timeout_s=_fleet_health_cfg.restart_timeout_s,
+                restart_backoff_s=_fleet_health_cfg.restart_backoff_s,
+            )
+            if self._gen_fleet is not None and _fleet_health_cfg.restart_dead_shards
+            else None
+        )
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -603,6 +623,15 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self._engine_supervisor is not None:
+                # Not in `tasks`: the supervisor creates a task per restart, on demand, so
+                # there is nothing to cancel in that list. Without this an in-flight
+                # restart at shutdown is simply abandoned mid-way. Bounded, because the
+                # thread underneath cannot be cancelled -- giving up is what lets the
+                # process exit, and the thread being a daemon is what makes that safe.
+                await self._engine_supervisor.drain(
+                    timeout_s=_SUPERVISOR_DRAIN_TIMEOUT_S
+                )
             for actor in self._finalizer_actors:
                 try:
                     ray.kill(actor, no_restart=True)
@@ -2912,11 +2941,12 @@ class SingleControllerActor:
             metrics["rollout/train_steps"] = float(self._train_steps)
             if self._gen_fleet is not None:
                 metrics.update(self._gen_fleet.as_metrics())
+            if self._engine_supervisor is not None:
+                metrics.update(self._engine_supervisor.as_metrics())
             if self._generation_router is not None:
                 # router/* counters are exactly what you want when a backend starts
-                # failing; computed since P2 landed but never published until now.
-                # Best-effort like the membership push: a router being recreated must
-                # not cost a metrics tick.
+                # failing. Best-effort like the membership push: a router being
+                # recreated must not cost a metrics tick.
                 try:
                     metrics.update(
                         await self._ray_get(self._generation_router.metrics.remote())
@@ -2985,6 +3015,12 @@ class SingleControllerActor:
         while True:
             await asyncio.sleep(interval_s)
             await self._probe_generation_fleet()
+            # Between probing and publishing: a shard condemned by the probe above starts
+            # restarting on this tick rather than the next, and moving to RESTARTING
+            # before the router push keeps a shard that is coming back out of the
+            # serving set.
+            if self._engine_supervisor is not None:
+                self._engine_supervisor.tick()
             # Both of these are best-effort: they talk to a max_restarts=-1 actor that
             # may be mid-recreation, and run() awaits this task and re-raises, so an
             # unguarded RayActorError here would end the training job over a push that
@@ -3026,15 +3062,29 @@ class SingleControllerActor:
             return
 
         fleet_cfg = self._async_cfg.generation_fleet_health
-        worker_group = self._gen.worker_group
 
         async def probe(shard_idx: int) -> None:
-            worker_idx = worker_group.get_dp_leader_worker_idx(shard_idx)
+            # By shard index, not by reaching through to the worker group: which worker
+            # leads a shard depends on the backend's layout, and doing that arithmetic
+            # here put a second copy of it in the control loop -- one that also assumed
+            # every backend has a `worker_group`, the assumption that broke the Dynamo
+            # lane. restart_shard already asks this way.
             try:
                 await asyncio.wait_for(
-                    self._ray_get(worker_group.workers[worker_idx].is_alive.remote()),
+                    self._ray_get(self._gen.shard_liveness_ref(shard_idx)),
                     timeout=fleet_cfg.probe_timeout_s,
                 )
+            except NotImplementedError as error:
+                # A backend that cannot be probed is a misconfiguration, not an unhealthy
+                # shard, and the two must not look alike. Recorded as a probe failure it
+                # condemns every shard within unhealthy_threshold ticks and ends the run
+                # as GenerationFleetExhausted -- a healthy fleet reported as a dead one.
+                raise RuntimeError(
+                    f"generation backend {type(self._gen).__name__} does not implement "
+                    "shard_liveness_ref, so async_rl.generation_fleet_health cannot probe "
+                    "it. Turn fleet health off for this backend, or implement the method "
+                    "over the backend's own worker group."
+                ) from error
             except RayActorError as error:
                 # Conclusive, unlike a timeout: Ray only reports this once the actor
                 # process is actually gone. Counting it as one more ambiguous failure
@@ -3200,7 +3250,7 @@ class SingleControllerActor:
         """Mark the span where the serving set is deliberately empty.
 
         _recover_from_failed_refit marks every serving shard partial, so they all go
-        STALE and serving_shards() is empty until _promote_refit_shards runs -- after a
+        STALE and serving_shards() is empty until _record_refit_landed runs -- after a
         rebuild and a full retry refit, both of which await and yield the event loop.
 
         _stall_watchdog_pump is a task on that same loop and calls raise_if_exhausted()
@@ -3313,25 +3363,76 @@ class SingleControllerActor:
                     "needed to attribute the failure)."
                 ) from failure
 
-    def _promote_refit_shards(self) -> None:
-        """Return shards holding current weights to the serving set.
+    def _refit_participants(self) -> set[int]:
+        """Shards eligible to receive this refit's weights, as of right now.
 
-        The exit from STALE, and the reason marking partial weights is safe rather than
-        terminal. An aborted refit leaves every engine that was receiving with a mix of
-        old and new weights, so they are pulled out of service -- but nothing else moves
-        a shard out of STALE, so without this the recovery would succeed and then leave
-        the fleet empty, which ``raise_if_exhausted`` would end the run over. A worse
+        Captured at the moment membership settles rather than read at promotion time,
+        because a restart finishing mid-transfer turns its shard STALE -- which is not
+        absent -- and the communicator was already built without it.
+
+        Derived from the fleet rather than from the transport's membership so it holds for
+        backends that own no membership at all: a shard that is absent when the transfer
+        starts receives nothing either way.
+        """
+        if self._gen_fleet is None:
+            return set()
+        absent = set(self._gen_fleet.absent_shards())
+        return {
+            health.dp_shard_idx
+            for health in self._gen_fleet.snapshot()
+            if health.dp_shard_idx not in absent
+        }
+
+    def _record_refit_landed(self, participants: set[int]) -> None:
+        """Write down what each shard now holds, and return the STALE ones to service.
+
+        Two things, because they are the same fact seen from two sides: this refit reached
+        these shards. The version is what they hold; promotion is what that entitles them
+        to.
+
+        Promotion is the exit from STALE, and the reason marking partial weights is safe
+        rather than terminal. An aborted refit leaves every engine that was receiving with
+        a mix of old and new weights, so they are pulled out of service -- but nothing else
+        moves a shard out of STALE, so without this the recovery would succeed and then
+        leave the fleet empty, which ``raise_if_exhausted`` would end the run over. A worse
         failure than the one being recovered from, and reached only on the recovery path.
 
-        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but
-        it is failing probes for its own reasons and promoting it here would reset the
-        failure count that is supposed to condemn it.
+        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but it
+        is failing probes for its own reasons and promoting it here would reset the failure
+        count that is supposed to condemn it. It is still stamped: what weights an engine
+        holds is not a verdict on how well it is serving them.
+
+        And only STALE shards that were IN the refit. Asking "is this shard STALE?" alone
+        was correct until restart existed, because nothing could turn a shard STALE while a
+        refit was in flight. A restart can: it takes minutes, nothing blocks it, and
+        mark_loaded moves the shard DEAD -> STALE at whatever moment the reload lands. A
+        shard absent when membership settled received no weights from this transfer, so
+        promoting it would return it to service holding the checkpoint it read off disk --
+        the outcome this module's docstring exists to prevent. It stays STALE, is not
+        absent, and the next refit picks it up.
+
+        The stamp used to live inside ``report_refit`` alone, which meant it was only ever
+        written by a promotion. Nothing turns a shard STALE on a refit that succeeds, so a
+        fleet that has never lost a shard reports version 0 for the life of the run however
+        many refits it received -- and a metric that reads 0 on every healthy shard is one
+        nobody watches, which is the part that matters: this is the reading that would catch
+        the next bug of this shape.
+
+        Args:
+            participants: shards eligible for this refit, from :meth:`_refit_participants`
+                at the point membership settled.
         """
         if self._gen_fleet is None:
             return
         for health in self._gen_fleet.snapshot():
+            if health.dp_shard_idx not in participants:
+                continue
             if health.state is ShardState.STALE:
                 self._gen_fleet.report_refit(
+                    health.dp_shard_idx, weight_version=self._trainer_version
+                )
+            else:
+                self._gen_fleet.record_weight_version(
                     health.dp_shard_idx, weight_version=self._trainer_version
                 )
 
@@ -4062,6 +4163,11 @@ class SingleControllerActor:
         # set comparison in the common case -- it used to be a full rebuild on every call
         # once a shard was gone, because absent_shards() never empties again.
         await self._reconcile_refit_membership()
+        # Read once, here, because the answer changes underneath a refit. A restart takes
+        # minutes and nothing blocks it, so mark_loaded can turn a shard STALE mid-transfer
+        # -- and STALE is not absent, so asking again at promotion time would include a
+        # shard the communicator was deliberately built without.
+        participants = self._refit_participants()
 
         try:
             await self._sync_weights_within(kv_scales, "first")
@@ -4091,19 +4197,24 @@ class SingleControllerActor:
                 raise
             with self._recovery_window():
                 await self._recover_from_failed_refit(failure)
+                # Re-read: the recovery condemns the silent participant and rebuilds over
+                # the survivors, so the retry's membership is not the first attempt's. This
+                # is the likelier of the two windows -- the shard is restarting precisely
+                # because this refit just failed.
+                participants = self._refit_participants()
                 # Once only: a second failure is a real fault, not a membership problem,
                 # and retrying forever would recreate the wedge this exists to remove.
                 await self._sync_weights_within(kv_scales, "retry")
                 # Inside the window: this is what refills the serving set, so releasing
                 # the flag before it runs would reopen the gap it exists to close.
-                self._promote_refit_shards()
+                self._record_refit_landed(participants)
         else:
             # A completed refit is what makes an engine's weights current, so this is
             # where a shard pulled out of service for holding partial ones earns its way
             # back. else, not a trailing statement: the recovery path above already
             # promoted inside its window, and everything below this must still run on
             # both paths.
-            self._promote_refit_shards()
+            self._record_refit_landed(participants)
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would

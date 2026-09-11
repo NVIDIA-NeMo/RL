@@ -296,10 +296,31 @@ class TestFleetHealthValidation:
         with pytest.raises(ValidationError, match="probe_timeout_s"):
             FleetHealthConfig(probe_interval_s=2.0, probe_timeout_s=2.0)
 
-    def test_unimplemented_recovery_modes_are_rejected(self):
-        """They need the communicator rebuild; accepting them would do nothing."""
-        with pytest.raises(ValidationError):
-            FleetHealthConfig(on_dead_shard="degrade_and_restore")
+    def test_restarting_dead_shards_is_off_by_default(self):
+        """Recreating a vLLM worker mid-run is the most invasive thing this does, so it
+        is opt-in rather than implied by enabling fleet health."""
+        assert AsyncRLConfig().generation_fleet_health.restart_dead_shards is False
+
+    def test_restarting_can_be_enabled(self):
+        assert FleetHealthConfig(restart_dead_shards=True).restart_dead_shards is True
+
+    def test_the_restart_budget_defaults_are_armed(self):
+        """Both bounds are what stop a restart failing silently rather than loudly.
+
+        Without restart_timeout_s a bundle that can never be filled leaves the shard in
+        RESTARTING for the rest of the run -- never retried, never retired. Without
+        restart_backoff_s the whole attempt budget can burn inside 25s at the default
+        probe interval, none of the attempts having waited for the cause to clear.
+        """
+        cfg = FleetHealthConfig()
+        assert cfg.restart_timeout_s == 1800.0
+        assert cfg.restart_backoff_s == 60.0
+
+    def test_the_restart_budget_is_not_the_refit_deadline(self):
+        """A refit moves bytes between live processes; a restart reloads a model from
+        disk. Reusing refit_timeout_s here would abort healthy restarts."""
+        cfg = FleetHealthConfig()
+        assert cfg.restart_timeout_s > (cfg.refit_timeout_s or 0)
 
 
 class TestTheRefitDeadlineIsArmedByDefault:
@@ -507,8 +528,7 @@ class TestGenerationRouterPortAndTimeoutValidation:
 class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:
     def test_an_unimplemented_selection_mode_is_rejected(self):
         """Nothing dispatches on this value, so accepting round_robin would silently
-        hand the caller least_outstanding anyway -- the failure mode on_dead_shard's
-        Literal already exists to prevent."""
+        hand the caller least_outstanding anyway."""
         with pytest.raises(ValidationError):
             FleetHealthConfig(selection="round_robin")
 

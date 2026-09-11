@@ -44,7 +44,11 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.membership import RefitMembership, plan_refit_membership
+from nemo_rl.weight_sync.membership import (
+    RefitMembership,
+    desired_membership,
+    should_rebuild,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
 )
@@ -127,18 +131,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         self._inference_cluster = inference_cluster
         self._refit_timeout_s = refit_timeout_s
         self._stale = True
-        # The absent set this synchronizer's current communicator was built with, so a
-        # membership that has not changed can skip the rebuild. None means "never rebuilt",
-        # i.e. still the full-fleet group from setup.
-        #
-        # Without this, reconcile_communicator rebuilt on EVERY call once a shard was gone,
-        # because absent_shards() never empties again -- nothing in production calls
-        # mark_restarting or mark_loaded. _sync_weights reconciles twice per step, so a run
-        # that lost a shard at step 10 and trains to 10,000 paid ~20,000 full rebuilds: a
-        # fresh port, a fresh TCPStore and a fresh NCCL bootstrap across every train and
-        # inference rank each time, plus a plan regeneration on nccl_reshard. The steady
-        # state this feature exists to produce was the expensive one.
-        self._built_with_absent: Optional[frozenset[int]] = None
+        # What the communicators were last built over. None until init_communicator.
+        self._built_membership: Optional[RefitMembership] = None
 
     def _train_parallelism(self) -> dict[str, int]:
         megatron_cfg = self._policy.cfg["megatron_cfg"]
@@ -212,11 +206,10 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     def init_communicator(self) -> None:
         """Build both communicator families and the refit plan, over the whole fleet."""
-        dp_size = self._generation.worker_group.dp_size
         self._build(
-            plan_refit_membership(
-                surviving_shards=list(range(dp_size)),
-                dp_size=dp_size,
+            desired_membership(
+                absent_shards=[],
+                dp_size=self._generation.worker_group.dp_size,
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=self._train_cluster.world_size(),
             )
@@ -340,6 +333,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             nccl_reshard_refit_info
         )
         self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
+        self._built_membership = membership
 
     def _settle_budget_s(self) -> float:
         """How long to let stragglers unwind: their own deadline, plus a little.
@@ -370,34 +364,35 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         communicators without regenerating the plan would corrupt the refit silently,
         which is why the plan is regenerated rather than reused.
         """
-        if not absent_shards:
-            return False
-
-        # Unchanged membership over a live communicator: nothing to do. `force` is how the
-        # recovery path says the communicator is gone rather than merely unchanged -- after
-        # an abort it must be rebuilt even though the absent set is identical, and skipping
-        # it there would fail the recovery with "no shard could be identified as absent".
-        if not force and self._built_with_absent == frozenset(absent_shards):
-            return False
-
-        dp_size = self._generation.worker_group.dp_size
-        surviving = [idx for idx in range(dp_size) if idx not in set(absent_shards)]
-        membership = plan_refit_membership(
-            surviving_shards=surviving,
-            dp_size=dp_size,
+        membership = desired_membership(
+            absent_shards=absent_shards,
+            dp_size=self._generation.worker_group.dp_size,
             total_gen_workers=len(self._generation.worker_group.workers),
             train_world_size=self._train_cluster.world_size(),
         )
+        # An unrecorded membership means the full fleet -- see should_rebuild's docstring,
+        # which owns the rest of this rule for both hardened transports.
+        if self._built_membership is None:
+            self._built_membership = desired_membership(
+                absent_shards=[],
+                dp_size=self._generation.worker_group.dp_size,
+                total_gen_workers=len(self._generation.worker_group.workers),
+                train_world_size=membership.train_world_size,
+            )
+        if not should_rebuild(
+            desired=membership,
+            built=self._built_membership,
+            absent_shards=absent_shards,
+            force=force,
+        ):
+            return False
         print(
-            f"  refit: rebuilding nccl_reshard communicators without shards "
-            f"{sorted(absent_shards)}; gen world "
-            f"{len(surviving) * membership.workers_per_shard}",
+            f"  refit: rebuilding nccl_reshard communicators over shards "
+            f"{membership.surviving_shards}; gen world "
+            f"{membership.world_size - membership.train_world_size}",
             flush=True,
         )
         self._build(membership)
-        # Recorded only after the rebuild has actually happened, so a rebuild that
-        # raises leaves the cache describing the communicator we still have.
-        self._built_with_absent = frozenset(absent_shards)
         return True
 
     def shutdown(self) -> None:
