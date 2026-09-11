@@ -29,6 +29,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.environments.gym_checkpoint import GymCompletionReceipt
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
     _GROUP_STATE_FIELDS,
@@ -83,6 +84,19 @@ def _prompt(idx: int = 7) -> DatumSpec:
         "extra_env_info": None,
         "loss_multiplier": 1.0,
     }
+
+
+def _completion_receipt(
+    rollout_id: str,
+    attempt_index: int = 0,
+) -> GymCompletionReceipt:
+    return GymCompletionReceipt(
+        rollout_id=rollout_id,
+        attempt_index=attempt_index,
+        execution_generation=attempt_index + 1,
+        result_identity=f"result-{rollout_id}-{attempt_index}",
+        result_digest=f"{attempt_index + 1:064x}",
+    )
 
 
 def _single_prompt_batch(batch: list[DatumSpec]) -> DatumSpec:
@@ -207,6 +221,9 @@ def test_ledger_restore_rejects_malformed_completion_acknowledgements(
         "rollout_id": "g7_g0",
         "attempt_index": 0,
         "agent_name": "test-agent",
+        "execution_generation": 1,
+        "result_identity": "result-g7_g0-0",
+        "result_digest": "1" * 64,
     }
     acknowledgement[field] = value
     state["pending_completed_execution_acknowledgements"] = [acknowledgement]
@@ -221,6 +238,9 @@ def test_ledger_restore_rejects_duplicate_completion_acknowledgements() -> None:
         "rollout_id": "g7_g0",
         "attempt_index": 0,
         "agent_name": "test-agent",
+        "execution_generation": 1,
+        "result_identity": "result-g7_g0-0",
+        "result_digest": "1" * 64,
     }
     state["pending_completed_execution_acknowledgements"] = [
         acknowledgement,
@@ -249,6 +269,9 @@ def test_ledger_restore_rejects_unknown_completion_acknowledgement_fields() -> N
             "rollout_id": "g7_g0",
             "attempt_index": 0,
             "agent_name": "test-agent",
+            "execution_generation": 1,
+            "result_identity": "result-g7_g0-0",
+            "result_digest": "1" * 64,
             "unexpected": True,
         }
     ]
@@ -878,6 +901,9 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
                         generation_index=generation_index,
                         gate_rollout_id=gate_ids[generation_index],
                         receipt=receipt,
+                        completion_receipt=_completion_receipt(
+                            f"g7_g{generation_index}"
+                        ),
                         reward=float(generation_index),
                         mask_sample=generation_index == 0,
                         resolved_agent_name="test-agent",
@@ -899,6 +925,9 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
                         generation_index: SiblingSealResult(
                             gate_rollout_id=gate_ids[generation_index],
                             receipt=receipt,
+                            completion_receipt=_completion_receipt(
+                                f"g7_g{generation_index}"
+                            ),
                             reward=float(generation_index),
                             mask_sample=generation_index == 0,
                             resolved_agent_name="test-agent",
@@ -913,8 +942,8 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger.from_state_dict(state)
     assert restored.completed_execution_acknowledgements("g7") == [
-        ("g7_g0", 0, "test-agent"),
-        ("g7_g1", 0, "test-agent"),
+        ("g7_g0", 0, "test-agent", 1, "result-g7_g0-0", "1" * 64),
+        ("g7_g1", 0, "test-agent", 1, "result-g7_g1-0", "1" * 64),
     ]
     physical_ids, _, restored_receipts, rewards, mask_sample = (
         restored.finalization_inputs("g7")
@@ -928,8 +957,8 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
 
     recorded = restored.pending_completed_execution_acknowledgements()
     assert recorded == [
-        ("g7_g0", 0, "test-agent"),
-        ("g7_g1", 0, "test-agent"),
+        ("g7_g0", 0, "test-agent", 1, "result-g7_g0-0", "1" * 64),
+        ("g7_g1", 0, "test-agent", 1, "result-g7_g1-0", "1" * 64),
     ]
     _mutate(lambda cut: restored.discard_group(cut, "g7"))
     restored = RolloutRecoveryLedger.from_state_dict(restored.state_dict())
