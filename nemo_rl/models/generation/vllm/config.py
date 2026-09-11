@@ -45,8 +45,10 @@ class VllmGpuOutputCaptureConfig(BaseModel, extra="allow"):
     """Retain generated CUDA payloads for completion-time GDR token capture.
 
     Used only with Mooncake GDR and Gym token capture. CPU serving and digest
-    mirrors remain available. The budget includes pending requests and IPC
-    leases; exceeding it fails capture instead of silently copying through CPU.
+    mirrors remain available. The budget counts unique retained CUDA backing
+    storages (including unused rows in shared batches) and peak IPC payload
+    assembly. Exceeding it fails capture instead of silently copying through CPU.
+    Router snapshot reuse requires native vLLM async scheduling.
     """
 
     enabled: bool = True

@@ -470,11 +470,16 @@ the CPU PUT path does not create the chunk metadata required by an oversized
 GDR GET.
 
 With Gym token capture on the async vLLM HTTP server, `use_gdr: true` also
-retains original generated token IDs, selected logprobs, and optional routed
-experts on the producing GPU until the existing completion-time PUT. A CUDA
-IPC lease hands those allocations to the serving process. Only a request
-admitted by the capture ledger receives a retention key. PUT timing, staged
-keys, wire fields, and Gym digest versions remain unchanged.
+retains the original generated token IDs and logprobs on the producing GPU.
+Routed-expert capture reuses vLLM's existing GPU snapshot for that forward.
+Capture keeps read-only views instead of making separate per-request copies;
+the snapshot is independent of the router working buffer that the next
+forward reuses. The request and token-position mapping is saved with each
+step so later batch changes cannot change which data belongs to a request.
+At the existing completion-time PUT, the worker assembles the accepted
+payload on GPU and hands it to the serving process through a CUDA IPC lease.
+Only a request admitted by the capture ledger receives a retention key. PUT
+timing, staged keys, wire fields, and Gym digest versions remain unchanged.
 
 CPU copies remain for serving and the existing integrity digests. The sink
 checks device, shape, and alignment without copying the generated payload
@@ -490,26 +495,35 @@ request, no speculative decoding, PP=1, and no context parallelism. The TP
 output owner must be on the frontend host and its physical GPU must be
 mapped to frontend `cuda:0` (the current TQ executor's default device).
 Routed-expert retention additionally requires
-`enable_prefix_caching: false`. Unsupported engine/device configurations fail
-during setup; an individual retention/validation failure produces
-`capture_failed` coordinates instead of silently using a CPU PUT or crashing
-generation.
+`policy.generation.vllm_kwargs.enable_prefix_caching: false` and native
+`policy.generation.vllm_kwargs.async_scheduling: true`. Setting
+`vllm_cfg.async_engine: true` alone does not ensure native async scheduling;
+the synchronous scheduler does not create a GPU router snapshot to reuse.
+Unsupported engine/device configurations fail during setup; an individual
+retention/validation failure produces `capture_failed` coordinates instead of
+silently using a CPU PUT or crashing generation.
 
 Optional controls live under `policy.generation.vllm_cfg`:
 
 ```yaml
 gpu_output_capture:
   enabled: true          # only active with GDR + Gym token capture
-  max_retained_mb: 1024  # logical payload bytes per producing worker
+  max_retained_mb: 1024  # retained backing storage + assembly, in MiB per worker
 ```
 
-The budget covers in-flight fragments and peak assembly of exported leases;
-CUDA allocator padding and Python metadata require additional memory. The
-producer keeps allocations alive until PUT completes, including cancellation
-while staging. Set `enabled: false` to use the previous CPU-produced GDR path
-on configurations outside the supported scope. CPU RDMA and Simple are
-unchanged. Like other PyTorch CUDA IPC users, an unrecoverable receiver or
-RPC failure can leave shared storage retained until the producer exits.
+The budget counts each retained CUDA backing storage once, including unused
+rows and columns kept alive by a view, plus peak assembly of exported leases.
+A batch snapshot stays allocated until its last retained slice is consumed;
+requests that finish at different times can therefore keep completed
+requests' data in memory. CUDA allocator padding, vLLM working memory, TQ's
+separate staging buffer, and Python metadata require additional memory.
+Source views are released after GPU assembly has finished reading them. The
+producer keeps the assembled IPC payload alive until PUT completes,
+including cancellation while staging. Set `enabled: false` to use the
+previous CPU-produced GDR path on configurations outside the supported scope.
+CPU RDMA and Simple are unchanged. Like other PyTorch CUDA IPC users, an
+unrecoverable receiver or RPC failure can leave shared storage retained until
+the producer exits.
 
 Capacity rule of thumb (any backend):
 

@@ -26,7 +26,7 @@ import asyncio
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -42,6 +42,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
+from nemo_rl.models.generation.vllm.gpu_capture_host import GpuCaptureHost  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
@@ -158,6 +159,40 @@ def test_gdr_setup_binds_producer_device_before_attaching_tq(monkeypatch, retain
         ["configure", "cuda_init", "attach"] if retain_gpu else ["attach"]
     )
     assert (worker._gpu_capture_host is not None) is retain_gpu
+
+
+def test_gdr_setup_rejects_native_scheduler_before_attaching_tq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = _fake_worker()
+    worker.cfg = {"vllm_cfg": {"gpu_output_capture": {"enabled": True}}}
+    worker._http_engine_client = object()
+    worker._return_routed_experts_enabled = lambda: True
+    incompatibility = RuntimeError(
+        "GPU routed-expert snapshots require native async_scheduling=True"
+    )
+    configure = AsyncMock(side_effect=incompatibility)
+    attach = MagicMock()
+    monkeypatch.setattr(GpuCaptureHost, "create", configure)
+    monkeypatch.setattr("nemo_rl.data_plane.build_data_plane_client", attach)
+
+    with pytest.raises(RuntimeError, match="async_scheduling") as error:
+        asyncio.run(
+            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                worker,
+                dp_cfg={"backend": "mooncake_cpu", "mooncake_cpu": {"use_gdr": True}},
+                staging_partition="staging",
+            )
+        )
+
+    assert error.value is incompatibility
+    configure.assert_awaited_once_with(
+        worker._http_engine_client,
+        max_retained_bytes=1024 * 1024 * 1024,
+        require_routed_experts=True,
+    )
+    attach.assert_not_called()
+    assert worker._gpu_capture_host is None
 
 
 def test_weight_version_is_stamped_from_worker_state(monkeypatch):
