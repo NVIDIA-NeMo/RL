@@ -2978,15 +2978,6 @@ def _postprocess_single_nemo_gym_group(
             result["full_result"] for result in results
         )
 
-    # Rollouts that returned no assistant turn at all. NemoGym stands these up
-    # as prompt-only samples so one dead rollout cannot fail the step. Carried
-    # unconditionally, unlike mask_sample: the cause is upstream of the policy
-    # -- a generation engine that stopped answering, not a bad trajectory -- so
-    # env.should_mask_flagged_samples has no say over it.
-    final_batch["empty_rollout"] = torch.tensor(
-        [bool(r.get("empty_rollout")) for r in results], dtype=torch.bool
-    )
-
     rollout_metrics.update(_effort_shaping_metrics(shaping))
 
     rollout_metrics.update(
