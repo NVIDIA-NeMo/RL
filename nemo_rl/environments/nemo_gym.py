@@ -1581,8 +1581,9 @@ class NemoGymShardSet:
         robin is deterministic and easy to reason about, which matters more
         than adaptivity here: within a synchronous step there is no completion
         feedback to adapt on, so an even split is the best available policy.
-        Least-in-flight would pay off on the async path, where dispatch is
-        continuous, and can replace this without touching callers.
+        A least-in-flight policy would require callers to release a lease when
+        each dispatch completes. That lifecycle is intentionally outside this
+        round-robin implementation.
         """
         shard_name = self.shard_for_route(route_name)
         replicas = self.handles[shard_name]
@@ -1594,7 +1595,13 @@ class NemoGymShardSet:
         return replicas[index]
 
     def instance_label(self, handle: Any) -> str:
-        """Name one actor instance for error messages and metric keys."""
+        """Name one actor, for error messages and metric keys.
+
+        A shard with one replica is named by the shard alone, so the common
+        case reads as it did before replicas existed; a replicated shard adds
+        the replica index. This is the same rule the per-shard log directories
+        follow, so a metric and its logs carry the same name.
+        """
         for shard_name, replicas in self.handles.items():
             for index, replica in enumerate(replicas):
                 if replica is handle:
@@ -1807,7 +1814,6 @@ def _build_sharded_gym_actors(
             f"{DEFAULT_PLACEMENT_STRATEGY}, so shards may share a node and the "
             f"per-node capacity isolation sharding exists for does not hold."
         )
-
     base_gym_dict = {
         key: value
         for key, value in nemo_gym_dict.items()
