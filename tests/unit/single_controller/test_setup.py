@@ -773,6 +773,10 @@ class TestSetup:
 
     def test_gym_participant_checkpointing_requires_token_capture(self):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
@@ -792,6 +796,10 @@ class TestSetup:
 
     def test_gym_participant_checkpointing_requires_latest_restore_mode(self):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
@@ -830,7 +838,10 @@ class TestSetup:
                 "stop_strings": None,
                 "stop_token_ids": None,
                 "top_k": None,
-                "vllm_cfg": {"async_engine": True},
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "expose_http_server": True,
+                },
             }
         )
         mc.logger["log_dir"] = str(tmp_path / "logs")

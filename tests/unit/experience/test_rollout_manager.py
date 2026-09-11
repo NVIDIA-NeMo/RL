@@ -915,7 +915,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
             del pending, timer_prefix
 
             async def result_ref():
-                return 0, _mask_gate_receipt_result(), None
+                return 0, {"name": "test-agent"}, _mask_gate_receipt_result(), None
 
             async def stream():
                 yield result_ref()
@@ -1714,6 +1714,7 @@ def _receipt_record(
                 "reward": 0.5,
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
+                "_ng_resolved_agent_ref": {"name": "test-agent"},
                 **({"instance_config": cfg} if cfg is not None else {}),
             },
             truncated=False,

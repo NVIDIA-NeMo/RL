@@ -105,9 +105,9 @@ def test_checkpoint_capability_discovery_validates_and_caches_participants() -> 
     assert [
         item["participant"]["server_name"] for item in discovered["participants"]
     ] == [
+        "tools",
         "agent",
         "policy",
-        "tools",
     ]
     assert len(env._gym_checkpoint_participants) == 3
 
@@ -136,6 +136,7 @@ def test_checkpoint_capability_discovery_requires_policy_model() -> None:
 
 def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
     env = _checkpoint_env()
+    deadline_ts = time.time() + 60.0
     capabilities = {
         "policy": _capability(
             "responses_api_models",
@@ -184,13 +185,13 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
         assert json == {
             "schema_version": 1,
             "checkpoint_id": "snapshot-7",
-            "deadline_ts": 123.0,
+            "deadline_ts": deadline_ts,
         }
         return responses[server_name]
 
     env._control = AsyncMock(side_effect=prepare_control)
 
-    result = asyncio.run(env.prepare_checkpoint("snapshot-7", 123.0))
+    result = asyncio.run(env.prepare_checkpoint("snapshot-7", deadline_ts))
 
     assert result["ready"] is True
     assert {item["participant"]["server_name"] for item in result["participants"]} == {
