@@ -611,18 +611,22 @@ def test_merge_takes_max_for_max_fields():
     assert 40.0 <= merged["by_op"]["put"]["max_ms"] < 41.0, "max, not sum"
 
 
-def test_cluster_frac_of_step_is_per_process_and_bounded():
-    """``wall_ms`` sums processes that ran concurrently, so dividing it by one
-    step's wall clock exceeded 1 whenever they overlapped and read as "105% of
-    the step". Divided per process it is the mean share of the step a process
-    spent in the data plane: 10 ranks x 5 calls x 100 ms over a 5 s step is
-    500 ms each, or 10%."""
-    metrics = cluster_step_metrics(
-        merge_snapshots([_rank([100.0] * 5) for _ in range(10)]), {}, 5.0
-    )
+def test_cluster_frac_of_step_is_the_slowest_process():
+    """The ranks meet at the gradient all-reduce, so the step waits on the
+    straggler -- not on their sum, which exceeded the step itself, and not on
+    their mean, which is a cost no rank paid.
 
-    assert "busy_frac_mean" not in metrics
-    assert metrics["step/frac_of_step"] == pytest.approx(0.10, rel=0.1)
+    One rank spends 5 x 100 ms and nine spend 5 x 10 ms, over a 5 s step:
+    max 500 ms = 10%, mean 95 ms = 1.9%, sum 950 ms = 19%. Equal-width ranks
+    cannot tell those apart, which is why this case is lopsided."""
+    straggler = _rank([100.0] * 5)
+    fast = [_rank([10.0] * 5) for _ in range(9)]
+    metrics = cluster_step_metrics(merge_snapshots([straggler, *fast]), {}, 5.0)
+
+    assert metrics["step/frac_of_step"] == pytest.approx(0.10, rel=0.05)
+    assert metrics["step/frac_of_step"] != pytest.approx(0.019, rel=0.05), "mean"
+    assert metrics["step/frac_of_step"] != pytest.approx(0.19, rel=0.05), "sum"
+    assert metrics["step/wall_s"] == pytest.approx(0.5, rel=0.05)
     assert metrics["now/n_processes"] == 10
 
 
