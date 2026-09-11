@@ -252,17 +252,26 @@ class SFTSingleControllerActor:
     def _run_train_step(self) -> dict[str, Any]:
         started = time.monotonic()
         envelopes = self._load_envelopes()
+        loader_wait = time.monotonic() - started
         train_started = time.monotonic()
         step_open = False
         try:
+            phase_started = time.monotonic()
             self._trainer.begin_train_step(self._loss_fn)
+            begin_train_step = time.monotonic() - phase_started
             step_open = True
-            self._trainer.train_placed_microbatches(
+            phase_started = time.monotonic()
+            placed_phases = self._trainer.train_placed_microbatches(
                 [envelope.meta for envelope in envelopes]
             )
+            train_placed_microbatches = time.monotonic() - phase_started
+            phase_started = time.monotonic()
             train_results = self._trainer.finish_train_step()
+            finish_train_step = time.monotonic() - phase_started
             step_open = False
+            phase_started = time.monotonic()
             self._owner_call("commit_sft_batch")
+            commit_sft_batch = time.monotonic() - phase_started
         except Exception:
             if step_open:
                 try:
@@ -289,6 +298,12 @@ class SFTSingleControllerActor:
             "loader_latency_mean": statistics.fmean(loader_seconds),
             "loader_copy_imbalance": loader_latency_max - min(loader_seconds),
             "policy_time": policy_seconds,
+            "begin_train_step": begin_train_step,
+            "train_placed_microbatches": train_placed_microbatches,
+            "finish_train_step": finish_train_step,
+            "commit_sft_batch": commit_sft_batch,
+            "loader_wait": loader_wait,
+            "queue_depth": 1,
             "total_step_time": time.monotonic() - started,
             "valid_tokens": valid_tokens,
             "source_samples": sum(len(envelope.source_ids) for envelope in envelopes),
@@ -298,6 +313,23 @@ class SFTSingleControllerActor:
             "valid_tokens_per_second": valid_tokens
             / max(time.monotonic() - started, 1e-12),
         }
+        if isinstance(placed_phases, dict):
+            for key, value in placed_phases.items():
+                metrics[f"placed_{key}"] = float(value)
+        phase_names = sorted(
+            {
+                phase
+                for envelope in envelopes
+                for phase in envelope.load_phase_seconds
+            }
+        )
+        for phase in phase_names:
+            values = [
+                envelope.load_phase_seconds.get(phase, 0.0) for envelope in envelopes
+            ]
+            metric_phase = phase.replace("-", "_")
+            metrics[f"loader_{metric_phase}_max"] = max(values)
+            metrics[f"loader_{metric_phase}_mean"] = statistics.fmean(values)
         metrics.update(self._policy_metrics(train_results))
         return metrics
 
@@ -315,9 +347,13 @@ class SFTSingleControllerActor:
                 metrics[key] = np.sum(values).item()
         for key, value in train_results.get("moe_metrics", {}).items():
             metrics[f"moe/{key}"] = value
+        for key, value in train_results.get("mtp_metrics", {}).items():
+            metrics[f"mtp/{key}"] = value
         for key in ("total_flops", "num_ranks", "theoretical_tflops"):
             if key in train_results:
                 metrics[key] = train_results[key]
+        for key, value in train_results.get("step_phases", {}).items():
+            metrics[f"worker_{key}"] = float(value)
         return metrics
 
     def _owner_call(self, method_name: str) -> list[Any]:

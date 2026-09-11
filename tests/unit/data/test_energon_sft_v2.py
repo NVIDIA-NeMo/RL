@@ -199,6 +199,11 @@ def test_sft_v2_worker_publishes_sequence_alignment() -> None:
     worker._sft_logical_rank = 0
     worker._sft_logical_world_size = 2
     worker._sft_next_batch_index = 0
+    worker._ld_on = False
+    worker._ld_phase = None
+    worker._ld_t0 = 0.0
+    worker._ld_durations = {}
+    worker._ld_watchdog = None
     worker.tokenizer = MagicMock(pad_token_id=0)
     worker._dp_client = MagicMock()
 
@@ -241,3 +246,20 @@ def test_sft_v2_worker_publishes_sequence_alignment() -> None:
         {"source_id": "source-a"},
         {"source_id": "source-b"},
     ]
+    assert set(envelope.load_phase_seconds) == {
+        "iter",
+        "prepare",
+        "post-prepare",
+        "tensordict",
+        "publish",
+        "publish_setup",
+        "publish_register_partition",
+        "publish_source_tags",
+        "publish_put_samples",
+        "publish_batch_metadata",
+    }
+    assert all(value >= 0.0 for value in envelope.load_phase_seconds.values())
+    assert envelope.load_seconds >= sum(
+        envelope.load_phase_seconds[phase]
+        for phase in ("iter", "prepare", "post-prepare", "tensordict", "publish")
+    )
