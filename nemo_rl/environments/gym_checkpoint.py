@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias, TypeVar, cast
 
@@ -70,6 +72,121 @@ class GymExecutionIdentity(_StrictWireModel):
     def capture_key(self) -> str:
         """Return Gym's attempt-qualified token-capture and routing key."""
         return gym_capture_key(self.rollout_id, self.attempt_index)
+
+
+class GymActorExecutionState(str, Enum):
+    """Publication state of one rollout invocation owned by the Gym actor."""
+
+    RUNNING = "running"
+    TERMINAL = "terminal"
+
+
+@dataclass(frozen=True)
+class GymActorExecution:
+    """One actor-local rollout execution tracked across a checkpoint fence."""
+
+    identity: GymExecutionIdentity
+    state: GymActorExecutionState
+
+
+class GymActorExecutionRegistry:
+    """Fence actor dispatch and retain the exact membership of a checkpoint cut."""
+
+    _MAX_RETIRED_CHECKPOINTS = 256
+
+    def __init__(self) -> None:
+        self._live: dict[tuple[str, int], GymActorExecution] = {}
+        self._frozen_checkpoint_id: str | None = None
+        self._frozen_membership: tuple[GymActorExecution, ...] = ()
+        self._retired_checkpoint_ids: list[str] = []
+
+    @staticmethod
+    def _key(identity: GymExecutionIdentity) -> tuple[str, int]:
+        return identity.rollout_id, identity.attempt_index
+
+    def register(self, identity: GymExecutionIdentity) -> None:
+        """Register one controller-assigned attempt unless checkpointing is active."""
+        if self._frozen_checkpoint_id is not None:
+            raise RuntimeError(
+                "NeMo-Gym dispatch is frozen for checkpoint "
+                f"{self._frozen_checkpoint_id!r}"
+            )
+        key = self._key(identity)
+        if key in self._live:
+            raise ValueError(f"Gym rollout execution {key!r} is already live")
+        self._live[key] = GymActorExecution(
+            identity=identity,
+            state=GymActorExecutionState.RUNNING,
+        )
+
+    def mark_terminal(self, identity: GymExecutionIdentity) -> None:
+        """Retain a completed invocation until it crosses the actor boundary."""
+        key = self._key(identity)
+        execution = self._live.get(key)
+        if execution is None:
+            raise KeyError(f"Gym rollout execution {key!r} is not live")
+        self._live[key] = GymActorExecution(
+            identity=identity,
+            state=GymActorExecutionState.TERMINAL,
+        )
+
+    def release(self, identity: GymExecutionIdentity) -> None:
+        """Release an invocation after its result crosses the actor boundary."""
+        self._live.pop(self._key(identity), None)
+
+    def freeze(self, checkpoint_id: str) -> tuple[GymActorExecution, ...]:
+        """Close actor admission and snapshot the live source-cut membership."""
+        if checkpoint_id in self._retired_checkpoint_ids:
+            raise RuntimeError(f"checkpoint {checkpoint_id!r} is already retired")
+        if self._frozen_checkpoint_id is not None:
+            if self._frozen_checkpoint_id != checkpoint_id:
+                raise RuntimeError(
+                    f"checkpoint {self._frozen_checkpoint_id!r} already owns "
+                    "the Gym actor dispatch fence"
+                )
+            return self._frozen_membership
+        self._frozen_checkpoint_id = checkpoint_id
+        self._frozen_membership = tuple(self._live[key] for key in sorted(self._live))
+        return self._frozen_membership
+
+    def unfreeze(self, checkpoint_id: str) -> None:
+        """Reopen actor admission for the transaction that owns the fence."""
+        if (
+            self._frozen_checkpoint_id is None
+            and checkpoint_id in self._retired_checkpoint_ids
+        ):
+            return
+        if self._frozen_checkpoint_id != checkpoint_id:
+            raise RuntimeError(
+                f"checkpoint {checkpoint_id!r} does not own the Gym actor "
+                f"dispatch fence (owner={self._frozen_checkpoint_id!r})"
+            )
+        self._frozen_checkpoint_id = None
+        self._frozen_membership = ()
+        self._retired_checkpoint_ids.append(checkpoint_id)
+        del self._retired_checkpoint_ids[: -self._MAX_RETIRED_CHECKPOINTS]
+
+    def status(self) -> dict[str, int | str | None]:
+        """Return bounded diagnostics for tests and checkpoint failures."""
+        running = sum(
+            execution.state is GymActorExecutionState.RUNNING
+            for execution in self._live.values()
+        )
+        return {
+            "frozen_checkpoint_id": self._frozen_checkpoint_id,
+            "live": len(self._live),
+            "running": running,
+            "terminal_unreleased": len(self._live) - running,
+            "frozen_membership": len(self._frozen_membership),
+        }
+
+
+class GymCompletionReceipt(GymExecutionIdentity):
+    """Exact Gym-issued proof naming one retained terminal result."""
+
+    execution_generation: PositiveInt
+    result_identity: str = Field(min_length=1, max_length=512)
+    result_digest: Sha256Digest
 
 
 def gym_capture_key(logical_rollout_id: str, attempt_index: int) -> str:
@@ -315,7 +432,7 @@ class GymCheckpointControlRequest(_StrictWireModel):
 class GymCompletedExecution(_StrictWireModel):
     """A completed Gym execution plus the agent participant that owns it."""
 
-    execution: GymExecutionIdentity
+    receipt: GymCompletionReceipt
     agent_name: str = Field(min_length=1)
 
 
@@ -323,13 +440,13 @@ class GymCompletedExecutionAcknowledgementRequest(_StrictWireModel):
     """Idempotent batch release of terminal results owned durably by RL."""
 
     schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
-    executions: list[GymExecutionIdentity] = Field(min_length=1)
+    executions: list[GymCompletionReceipt] = Field(min_length=1)
 
 
 class GymCompletedExecutionAcknowledgementResponse(_StrictWireModel):
     """Every requested identity the agent now considers acknowledged."""
 
-    acknowledged: list[GymExecutionIdentity]
+    acknowledged: list[GymCompletionReceipt]
 
     @model_validator(mode="after")
     def validate_unique_identities(
@@ -453,7 +570,20 @@ class GymAgentExecutionStatus(GymExecutionIdentity):
         | None
     )
     boundary_index: NonNegativeInt | None = None
+    turn_index: NonNegativeInt | None = None
+    boundary_kind: Literal["pending_model", "turn_complete"] | None = None
+    resource_state_revisions: dict[str, NonNegativeInt] = Field(default_factory=dict)
+    completion_receipt: GymCompletionReceipt | None = None
     age_seconds: NonNegativeFloat
+
+
+class GymAgentSelectedBoundary(GymExecutionIdentity):
+    """One agent boundary selected into the current checkpoint cut."""
+
+    boundary_index: NonNegativeInt
+    turn_index: NonNegativeInt
+    boundary_kind: Literal["pending_model", "turn_complete"]
+    resource_state_revisions: dict[str, NonNegativeInt]
 
 
 class GymAgentPrepareResponse(_StrictWireModel):
@@ -464,10 +594,18 @@ class GymAgentPrepareResponse(_StrictWireModel):
     parked_with_boundary: NonNegativeInt
     parked_without_boundary: NonNegativeInt
     completed_unacknowledged: NonNegativeInt
+    acknowledged_completed: NonNegativeInt
     active: NonNegativeInt
     blocking_attempts: list[GymAgentExecutionStatus]
     completed_unacknowledged_attempts: list[GymAgentExecutionStatus]
+    selected_boundaries: list[GymAgentSelectedBoundary]
     executions: list[GymAgentExecutionStatus]
+
+
+class GymAgentStatusResponse(GymAgentPrepareResponse):
+    """Agent prepare state returned by the read-only status route."""
+
+    checkpoint_id: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
 
 
 class GymResourcesPrepareResponse(_StrictWireModel):

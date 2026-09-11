@@ -107,6 +107,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             head_server_config = object()
             _token_capture_enabled = False
             _stable_execution_identity_enabled = True
+            _gym_checkpoint_participants = ()
             _tokenizer = object()
 
             def _require_spinup(self):
@@ -1630,6 +1631,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             head_server_config = object()
             _token_capture_enabled = False
             _stable_execution_identity_enabled = True
+            _gym_checkpoint_participants = ()
 
             def _require_spinup(self):
                 pass
@@ -1750,6 +1752,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             _processor = None
             _token_capture_enabled = False
             _stable_execution_identity_enabled = True
+            _gym_checkpoint_participants = ()
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result

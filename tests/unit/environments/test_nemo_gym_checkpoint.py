@@ -26,6 +26,10 @@ from nemo_rl.environments.nemo_gym import (
     NemoGym,
     _adapt_execution_identity_for_installed_gym,
 )
+from nemo_rl.environments.gym_checkpoint import (
+    GymActorExecutionRegistry,
+    GymExecutionIdentity,
+)
 
 
 def _capability(component: str, name: str, **overrides):
@@ -52,7 +56,22 @@ def _checkpoint_env():
     env.rh = object()
     env._gym_checkpoint_participants = ()
     env._control_timeout_s = 60.0
+    env._active_gym_checkpoint_id = None
+    env._gym_execution_registry = GymActorExecutionRegistry()
     return env
+
+
+def _completion_receipt(
+    rollout_id: str = "group-7_g0",
+    attempt_index: int = 2,
+) -> dict:
+    return {
+        "rollout_id": rollout_id,
+        "attempt_index": attempt_index,
+        "execution_generation": attempt_index + 1,
+        "result_identity": f"result-{rollout_id}-{attempt_index}",
+        "result_digest": f"{attempt_index + 1:064x}",
+    }
 
 
 @pytest.mark.parametrize(
@@ -170,9 +189,11 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
             "parked_with_boundary": 1,
             "parked_without_boundary": 0,
             "completed_unacknowledged": 0,
+            "acknowledged_completed": 0,
             "active": 1,
             "blocking_attempts": [],
             "completed_unacknowledged_attempts": [],
+            "selected_boundaries": [],
             "executions": [],
         },
         "tools": {"sessions": 1, "state": "prepared"},
@@ -250,9 +271,11 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
                 "parked_with_boundary": 0,
                 "parked_without_boundary": 0,
                 "completed_unacknowledged": 0,
+                "acknowledged_completed": 0,
                 "active": 0,
                 "blocking_attempts": [],
                 "completed_unacknowledged_attempts": [],
+                "selected_boundaries": [],
                 "executions": [],
             }
         return {"sessions": 0, "state": "prepared"}
@@ -320,9 +343,11 @@ def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
                 "parked_with_boundary": 0,
                 "parked_without_boundary": 0,
                 "completed_unacknowledged": 0,
+                "acknowledged_completed": 0,
                 "active": 0,
                 "blocking_attempts": [],
                 "completed_unacknowledged_attempts": [],
+                "selected_boundaries": [],
                 "executions": [],
             }
         if path.endswith("/prepare"):
@@ -512,13 +537,15 @@ def test_completed_results_are_acknowledged_by_resolved_agent() -> None:
     env._control = AsyncMock(side_effect=discover_control)
     asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
 
+    receipt = _completion_receipt()
+
     async def acknowledge_control(method, path, *, server_name, json, **_kwargs):
         assert method == "POST"
         assert path.endswith("/acknowledge-completed")
         assert server_name == "agent-route"
         assert json == {
             "schema_version": 1,
-            "executions": [{"rollout_id": "group-7_g0", "attempt_index": 2}],
+            "executions": [receipt],
         }
         return {"acknowledged": json["executions"]}
 
@@ -527,10 +554,7 @@ def test_completed_results_are_acknowledged_by_resolved_agent() -> None:
         env.acknowledge_completed_executions(
             [
                 {
-                    "execution": {
-                        "rollout_id": "group-7_g0",
-                        "attempt_index": 2,
-                    },
+                    "receipt": receipt,
                     "agent_name": "resolved-agent",
                 }
             ]
@@ -539,10 +563,146 @@ def test_completed_results_are_acknowledged_by_resolved_agent() -> None:
 
     assert result["acknowledged"] == [
         {
-            "execution": {"rollout_id": "group-7_g0", "attempt_index": 2},
+            "receipt": receipt,
             "agent_name": "resolved-agent",
         }
     ]
+
+
+def test_completed_result_acknowledgement_rejects_a_different_receipt() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent-route": _capability(
+            "responses_api_agents",
+            "resolved-agent",
+            features=["completed_result_acknowledgement"],
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    receipt = _completion_receipt()
+
+    async def acknowledge_control(_method, _path, **_kwargs):
+        return {
+            "acknowledged": [{**receipt, "result_digest": "f" * 64}],
+        }
+
+    env._control = AsyncMock(side_effect=acknowledge_control)
+    with pytest.raises(RuntimeError, match="did not cover"):
+        asyncio.run(
+            env.acknowledge_completed_executions(
+                [{"receipt": receipt, "agent_name": "resolved-agent"}]
+            )
+        )
+
+
+def test_completion_receipt_is_read_from_the_active_checkpoint_cut() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent-route": _capability(
+            "responses_api_agents",
+            "resolved-agent",
+            features=["completed_result_acknowledgement"],
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    env._active_gym_checkpoint_id = "snapshot-7"
+    receipt = _completion_receipt()
+
+    async def status_control(method, path, *, server_name, params, **_kwargs):
+        assert method == "GET"
+        assert path.endswith("/status")
+        assert server_name == "agent-route"
+        assert params == {"checkpoint_id": "snapshot-7"}
+        execution = {
+            "rollout_id": receipt["rollout_id"],
+            "attempt_index": receipt["attempt_index"],
+            "generation": receipt["execution_generation"],
+            "state": "completed",
+            "parked_boundary_state": None,
+            "boundary_index": None,
+            "turn_index": None,
+            "boundary_kind": None,
+            "resource_state_revisions": {},
+            "completion_receipt": receipt,
+            "age_seconds": 0.1,
+        }
+        return {
+            "checkpoint_id": "snapshot-7",
+            "state": "preparing",
+            "ready_to_commit": False,
+            "running": 0,
+            "parked": 0,
+            "parked_with_boundary": 0,
+            "parked_without_boundary": 0,
+            "completed_unacknowledged": 1,
+            "acknowledged_completed": 0,
+            "active": 1,
+            "blocking_attempts": [],
+            "completed_unacknowledged_attempts": [execution],
+            "selected_boundaries": [],
+            "executions": [execution],
+        }
+
+    env._control = AsyncMock(side_effect=status_control)
+    resolved = asyncio.run(
+        env._completion_receipt_for(
+            GymExecutionIdentity(rollout_id="group-7_g0", attempt_index=2),
+            agent_name="resolved-agent",
+        )
+    )
+
+    assert resolved.model_dump(mode="json") == receipt
+
+
+def test_actor_registry_fences_dispatch_and_tracks_frozen_membership() -> None:
+    registry = GymActorExecutionRegistry()
+    execution = GymExecutionIdentity(rollout_id="rollout-1", attempt_index=1)
+    registry.register(execution)
+    registry.mark_terminal(execution)
+
+    frozen = registry.freeze("snapshot-1")
+
+    assert frozen[0].identity == execution
+    assert registry.status() == {
+        "frozen_checkpoint_id": "snapshot-1",
+        "live": 1,
+        "running": 0,
+        "terminal_unreleased": 1,
+        "frozen_membership": 1,
+    }
+    with pytest.raises(RuntimeError, match="dispatch is frozen"):
+        registry.register(GymExecutionIdentity(rollout_id="rollout-2", attempt_index=0))
+
+    registry.release(execution)
+    registry.unfreeze("snapshot-1")
+    registry.unfreeze("snapshot-1")
+    assert registry.status()["frozen_checkpoint_id"] is None
+    with pytest.raises(RuntimeError, match="already retired"):
+        registry.freeze("snapshot-1")
 
 
 def test_agent_prepare_retries_completed_result_blocker() -> None:
@@ -589,9 +749,11 @@ def test_agent_prepare_retries_completed_result_blocker() -> None:
             "parked_with_boundary": 0,
             "parked_without_boundary": 0,
             "completed_unacknowledged": 0,
+            "acknowledged_completed": 0,
             "active": 0,
             "blocking_attempts": [],
             "completed_unacknowledged_attempts": [],
+            "selected_boundaries": [],
             "executions": [],
         }
 
