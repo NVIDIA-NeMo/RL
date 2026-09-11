@@ -30,12 +30,14 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
+from nemo_rl.experience.reward_penalties import RolloutTextPenaltyEvidence
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
-_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -44,6 +46,7 @@ _SIDECAR_STATE_FIELDS = frozenset(
     {
         *_LEDGER_STATE_FIELDS,
         "batch_shortfall",
+        "finalizer_metrics_by_group",
         "sampler_stamps_target_steps",
     }
 )
@@ -72,6 +75,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "receipt",
         "reward",
         "mask_sample",
+        "text_penalty_evidence",
         "staging_keys",
     }
 )
@@ -177,6 +181,7 @@ class RolloutAttemptRecord:
     receipt: Optional[dict[str, Any]] = None
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
+    text_penalty_evidence: RolloutTextPenaltyEvidence | None = None
     staging_keys: list[str] = field(default_factory=list)
 
     @property
@@ -270,6 +275,7 @@ class ParsedRolloutRecoveryState:
     ledger_state: RolloutRecoveryState
     batch_shortfall: dict[int, int]
     sampler_stamps_target_steps: Optional[bool]
+    finalizer_metrics_by_group: dict[str, dict[str, float]]
 
 
 @dataclass(frozen=True)
@@ -282,6 +288,19 @@ class SiblingSealResult:
     receipt: Optional[dict[str, Any]]
     reward: float
     mask_sample: bool
+    text_penalty_evidence: RolloutTextPenaltyEvidence | None = None
+
+
+def _validate_text_evidence_identity(
+    evidence: RolloutTextPenaltyEvidence | None, rollout_id: str
+) -> None:
+    if evidence is not None:
+        if not isinstance(evidence, RolloutTextPenaltyEvidence):
+            raise TypeError(
+                "text_penalty_evidence must be RolloutTextPenaltyEvidence or None"
+            )
+        if evidence.rollout_id != rollout_id:
+            raise ValueError("text penalty evidence rollout identity mismatch")
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -448,6 +467,8 @@ class RolloutRecoveryLedger:
             attempt.status = RolloutAttemptStatus.ABANDONED
             attempt.receipt = None
             attempt.reward = None
+            attempt.mask_sample = None
+            attempt.text_penalty_evidence = None
             attempt.staging_keys.clear()
         record.status = PromptGroupStatus.GENERATING
 
@@ -578,6 +599,7 @@ class RolloutRecoveryLedger:
         receipt: Optional[dict[str, Any]],
         reward: float,
         mask_sample: bool,
+        text_penalty_evidence: RolloutTextPenaltyEvidence | None = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -588,6 +610,7 @@ class RolloutRecoveryLedger:
         attempt = sibling.current_attempt
         expected_gate_rollout_id = record.gate_rollout_id(generation_index)
         staging_keys = _receipt_staging_keys(receipt)
+        _validate_text_evidence_identity(text_penalty_evidence, gate_rollout_id)
         if not isinstance(mask_sample, bool):
             raise TypeError("mask_sample must be a bool")
         if gate_rollout_id != expected_gate_rollout_id:
@@ -605,6 +628,7 @@ class RolloutRecoveryLedger:
                 attempt.receipt == receipt
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
+                and attempt.text_penalty_evidence == text_penalty_evidence
                 and attempt.staging_keys == staging_keys
             ):
                 return
@@ -622,6 +646,7 @@ class RolloutRecoveryLedger:
         attempt.receipt = copy.deepcopy(receipt)
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
+        attempt.text_penalty_evidence = text_penalty_evidence
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
@@ -681,6 +706,9 @@ class RolloutRecoveryLedger:
                     f"receipt={result.receipt.get('rollout_id')!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
+            _validate_text_evidence_identity(
+                result.text_penalty_evidence, expected_gate_rollout_id
+            )
             if not isinstance(result.mask_sample, bool):
                 raise TypeError("mask_sample must be a bool")
             validated.append((attempt, result, _receipt_staging_keys(result.receipt)))
@@ -691,6 +719,7 @@ class RolloutRecoveryLedger:
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
+            attempt.text_penalty_evidence = result.text_penalty_evidence
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
@@ -734,6 +763,7 @@ class RolloutRecoveryLedger:
         list[Optional[dict[str, Any]]],
         list[float],
         list[bool],
+        list[RolloutTextPenaltyEvidence | None],
     ]:
         """Return sealed finalization inputs in stable sibling order."""
         record = self._require_group(group_id)
@@ -744,6 +774,7 @@ class RolloutRecoveryLedger:
         receipts: list[Optional[dict[str, Any]]] = []
         rewards: list[float] = []
         mask_sample: list[bool] = []
+        evidence: list[RolloutTextPenaltyEvidence | None] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if (
@@ -759,12 +790,14 @@ class RolloutRecoveryLedger:
             receipts.append(copy.deepcopy(attempt.receipt))
             rewards.append(attempt.reward)
             mask_sample.append(attempt.mask_sample)
+            evidence.append(attempt.text_penalty_evidence)
         return (
             record.gate_rollout_ids,
             record.logical_rollout_ids,
             receipts,
             rewards,
             mask_sample,
+            evidence,
         )
 
     def mark_finalization_started(
@@ -866,6 +899,9 @@ class RolloutRecoveryLedger:
                                     "receipt": copy.deepcopy(attempt.receipt),
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
+                                    "text_penalty_evidence": attempt.text_penalty_evidence.state_dict()
+                                    if attempt.text_penalty_evidence is not None
+                                    else None,
                                     "staging_keys": list(attempt.staging_keys),
                                 }
                                 for attempt in sibling.attempts
@@ -897,7 +933,7 @@ class RolloutRecoveryLedger:
         if (
             isinstance(schema_version, bool)
             or not isinstance(schema_version, int)
-            or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+            or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 f"Unsupported rollout-recovery schema version: {schema_version!r}"
@@ -1053,6 +1089,13 @@ class RolloutRecoveryLedger:
                 receipt = attempt_state.get("receipt")
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
+                raw_evidence = attempt_state.get("text_penalty_evidence")
+                evidence = (
+                    RolloutTextPenaltyEvidence.from_state_dict(raw_evidence)
+                    if raw_evidence is not None
+                    else None
+                )
+                _validate_text_evidence_identity(evidence, gate_id)
                 staging_keys = attempt_state.get("staging_keys")
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
@@ -1083,6 +1126,7 @@ class RolloutRecoveryLedger:
                     receipt is not None
                     or reward is not None
                     or mask_sample is not None
+                    or evidence is not None
                     or staging_keys
                 ):
                     raise ValueError("only sealed attempts may retain receipt data")
@@ -1093,6 +1137,7 @@ class RolloutRecoveryLedger:
                         receipt=copy.deepcopy(receipt),
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
+                        text_penalty_evidence=evidence,
                         staging_keys=list(staging_keys),
                     )
                 )
@@ -1218,11 +1263,30 @@ def _validate_batch_shortfall(value: object) -> dict[int, int]:
     return batch_shortfall
 
 
+def _validate_finalizer_metrics(value: object) -> dict[str, dict[str, float]]:
+    """Copy checkpoint-owned statistics; old checkpoints have no pending counts."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("finalizer_metrics_by_group must be a mapping")
+    result: dict[str, dict[str, float]] = {}
+    for group_id, metrics in value.items():
+        if not isinstance(group_id, str) or not isinstance(metrics, dict):
+            raise ValueError("invalid finalizer metrics group")
+        result[group_id] = {}
+        for name, number in metrics.items():
+            if not isinstance(name, str) or type(number) not in (int, float):
+                raise ValueError("invalid finalizer metric name or value")
+            result[group_id][name] = float(number)
+    return result
+
+
 def build_rollout_recovery_state(
     ledger: RolloutRecoveryLedger,
     *,
     batch_shortfall: dict[int, int],
     sampler_stamps_target_steps: bool,
+    finalizer_metrics_by_group: dict[str, dict[str, float]] | None = None,
 ) -> RolloutRecoveryState:
     """Build the complete versioned sidecar from ledger and controller state."""
     if not isinstance(sampler_stamps_target_steps, bool):
@@ -1232,6 +1296,9 @@ def build_rollout_recovery_state(
     state = ledger.state_dict()
     state["batch_shortfall"] = _validate_batch_shortfall(batch_shortfall)
     state["sampler_stamps_target_steps"] = sampler_stamps_target_steps
+    state["finalizer_metrics_by_group"] = _validate_finalizer_metrics(
+        finalizer_metrics_by_group
+    )
     return state
 
 
@@ -1251,12 +1318,12 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+        or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
     ):
         raise ValueError(
             "unsupported rollout recovery schema_version="
             f"{schema_version!r}; supported versions are "
-            f"{sorted(_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
+            f"{sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
         )
     groups = state.get("groups")
     if not isinstance(groups, list):
@@ -1276,4 +1343,7 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
         ledger_state=ledger_state,
         batch_shortfall=_validate_batch_shortfall(state.get("batch_shortfall", {})),
         sampler_stamps_target_steps=raw_sampler_stamps,
+        finalizer_metrics_by_group=_validate_finalizer_metrics(
+            state.get("finalizer_metrics_by_group")
+        ),
     )

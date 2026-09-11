@@ -821,7 +821,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
 
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger.from_state_dict(state)
-    physical_ids, _, restored_receipts, rewards, mask_sample = (
+    physical_ids, _, restored_receipts, rewards, mask_sample, evidence = (
         restored.finalization_inputs("g7")
     )
 
@@ -831,7 +831,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 
@@ -1097,3 +1097,92 @@ def test_restore_rejects_inconsistent_shared_admission_state() -> None:
 
     with pytest.raises(ValueError, match="disagree on phase or target_step"):
         _load(RolloutRecoveryLedger(), state)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_text_penalty_evidence_seals_and_survives_checkpoint(granularity):
+    from nemo_rl.experience.reward_penalties import (
+        CaptureRewardPenaltyConfig,
+        compute_text_penalty_evidence,
+    )
+
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=0,
+        start_weight_version=4,
+        group_id="g7",
+        recovery_granularity=granularity,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    rollout_id = group.gate_rollout_ids[0]
+    evidence = compute_text_penalty_evidence(
+        rollout_id, [], CaptureRewardPenaltyConfig(True, True, ())
+    )
+    result = SiblingSealResult(
+        rollout_id, {"rollout_id": rollout_id, "manifest": []}, -2.0, False, evidence
+    )
+    if granularity == RecoveryGranularity.SIBLING:
+
+        def seal(e):
+            _mutate(
+                lambda cut: ledger.mark_sibling_sealed(
+                    cut,
+                    "g7",
+                    generation_index=0,
+                    gate_rollout_id=rollout_id,
+                    receipt=result.receipt,
+                    reward=result.reward,
+                    mask_sample=False,
+                    text_penalty_evidence=e,
+                )
+            )
+
+        seal(evidence)
+        seal(evidence)
+        with pytest.raises(ValueError, match="conflicting duplicate"):
+            seal(dataclasses.replace(evidence, empty_final_answer=False))
+    else:
+        _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", {0: result}))
+    state = ledger.state_dict()
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    assert restored.finalization_inputs("g7")[3] == [-2.0]
+    assert restored.finalization_inputs("g7")[5] == [evidence]
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    attempt["text_penalty_evidence"]["rollout_id"] = "wrong"
+    with pytest.raises(ValueError, match="evidence rollout identity"):
+        RolloutRecoveryLedger.from_state_dict(state)
+    del attempt["text_penalty_evidence"]
+    state["schema_version"] = 2
+    assert RolloutRecoveryLedger.from_state_dict(state).finalization_inputs("g7")[
+        5
+    ] == [None]
+
+
+def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_groups():
+    metrics = {
+        "canonical_group": {
+            "finalize/reward_count": 2.0,
+            "finalize/penalty_count/empty_final_answer": 1.0,
+        }
+    }
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        sampler_stamps_target_steps=True,
+        finalizer_metrics_by_group=metrics,
+    )
+    parsed = parse_rollout_recovery_state(state)
+    assert parsed.finalizer_metrics_by_group == metrics
+    metrics["canonical_group"]["finalize/reward_count"] = 99.0
+    assert (
+        parsed.finalizer_metrics_by_group["canonical_group"]["finalize/reward_count"]
+        == 2.0
+    )
+    del state["finalizer_metrics_by_group"]
+    assert parse_rollout_recovery_state(state).finalizer_metrics_by_group == {}
