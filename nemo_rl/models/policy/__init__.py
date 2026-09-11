@@ -467,6 +467,20 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing fused linear logprobs.
     # Smaller values reduce peak memory further but may decrease throughput.
     fused_linear_logprobs_chunk_size: NotRequired[int]
+    # Compute the LM output-layer GEMM in fp32 instead of bf16. bf16 rounding of
+    # the logits is the dominant source of generation/training logprob mismatch
+    # (train/token_mult_prob_error). Set the matching generation.vllm_cfg
+    # fp32_lm_head flag for vLLM generation: applying this to only one engine
+    # makes the multiplicative error worse, since both otherwise round to the
+    # same grid.
+    #   False   - bf16 head (default)
+    #   True    - full fp32 head (~2x cost on the logprob pass)
+    #   "tf32"  - fp32 head on TF32 tensor cores; numerically identical here
+    #             because the inputs are already exact bf16 values, at ~baseline
+    #             speed. Prefer this.
+    # No effect when use_fused_linear_logprobs is set, which bypasses the
+    # output layer's standalone forward.
+    fp32_lm_head: NotRequired[bool | Literal["tf32"]]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
