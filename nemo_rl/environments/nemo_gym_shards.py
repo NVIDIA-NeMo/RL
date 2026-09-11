@@ -47,9 +47,16 @@ SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # nemo_gym is installed only in the actor's venv.
 GYM_LOG_DIR_KEY = "nemo_gym_log_dir"
 
+# Gym's server-type keys that make an entry a rollout destination.
+GYM_ROUTABLE_KEYS = frozenset({"responses_api_agents", "resources_servers"})
+
 
 class ShardConfigError(ValueError):
     """Raised for a malformed ``env.nemo_gym.shards`` block."""
+
+
+class ShardSetupError(RuntimeError):
+    """Raised when a sharded stack fails to start or fails its startup checks."""
 
 
 @dataclass(frozen=True)
@@ -408,6 +415,57 @@ def apply_shard_overlay(
         merged["port_range_low"] = shard.port_range_low
         merged["port_range_high"] = shard.port_range_high
     return merged
+
+
+def build_route_shard_map(
+    entries_by_shard: Mapping[str, Mapping[str, list[str]]],
+    allowed_duplicate_entries: frozenset[str] | set[str] = frozenset(),
+) -> dict[str, str]:
+    """Map each routable entry to its shard, rejecting ambiguous routes.
+
+    Takes what each shard reported from ``NemoGym.list_entries()`` and returns
+    ``{route_name: shard_name}``, the lookup the router dispatches on. Current
+    Gym rows route either by ``agent_ref.name`` or by ``task_source``. The
+    latter names the agent or resources-server entry that declared the dataset,
+    so both entry types must be included.
+
+    Two failures are caught here rather than at first dispatch. A routable
+    entry hosted by two shards is always an error: rows naming it could go to
+    either, so routing would be silently nondeterministic. Any other entry in
+    two shards has to be allowlisted, because duplication is usually accidental
+    — a shared YAML dropped into two shards' path lists quietly brings its judge
+    along and doubles that judge's GPU claim.
+
+    Only names are compared. What an entry means is Gym's business.
+    """
+    route_to_shard: dict[str, str] = {}
+    for shard_name, entries in entries_by_shard.items():
+        for entry, types in entries.items():
+            if not GYM_ROUTABLE_KEYS.intersection(types):
+                continue
+            if entry in route_to_shard:
+                raise ShardSetupError(
+                    f"Routable Gym entry '{entry}' is hosted by both shard "
+                    f"'{route_to_shard[entry]}' and shard '{shard_name}'. An "
+                    f"agent or resources server must live in exactly one shard "
+                    f"so rows naming it have one destination."
+                )
+            route_to_shard[entry] = shard_name
+
+    hosting_shard: dict[str, str] = {}
+    for shard_name, entries in entries_by_shard.items():
+        for entry in entries:
+            if entry in hosting_shard and entry not in allowed_duplicate_entries:
+                raise ShardSetupError(
+                    f"Config entry '{entry}' appears in shard "
+                    f"'{hosting_shard[entry]}' and shard '{shard_name}' but is "
+                    f"not listed in allowed_duplicate_entries. If this entry "
+                    f"starts a model engine, duplicating it doubles its GPU "
+                    f"claim; if the duplication is intended, allowlist it."
+                )
+            hosting_shard.setdefault(entry, shard_name)
+
+    return route_to_shard
 
 
 def apply_shard_log_dir(
