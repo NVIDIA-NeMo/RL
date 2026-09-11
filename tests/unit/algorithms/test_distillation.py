@@ -1004,7 +1004,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         def __init__(self, *args, **kwargs):
             pass
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
         def offload_after_refit(self):
@@ -1026,6 +1026,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
 
         def prepare_refit_info(self, *args, **kwargs):
             return None
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
         def init_collective(self, *args, **kwargs):
             self.collective_calls.append((args, kwargs))
@@ -1153,7 +1156,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
         def offload_after_refit(self):
             return None
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     class DummyVllmGeneration:
@@ -1174,6 +1177,9 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
 
         def prepare_refit_info(self, *args, **kwargs):
             self.prepare_refit_info_called = True
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
     nemo_gym_actor = MagicMock()
 
