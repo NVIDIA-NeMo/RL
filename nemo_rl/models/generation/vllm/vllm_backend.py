@@ -1336,7 +1336,10 @@ class VllmInternalWorkerExtension:
         applier = self._get_sparse_delta_applier()
         return applier.update_weights_from_decoded_sparse_payload(*payloads)
 
-    def synchronize_device(self) -> None:
+    def synchronize_sparse_refit_device(self) -> None:
+        # Not named ``synchronize_device``: vLLM 0.29 added that method to
+        # ``WorkerBase`` (vllm-project/vllm#52914) and asserts at init that a
+        # worker extension never shadows a ``Worker`` attribute.
         self._get_sparse_delta_applier().synchronize_device()
 
     def finish_sparse_delta_refit(self) -> dict[str, Any]:
