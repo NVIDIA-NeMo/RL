@@ -184,17 +184,20 @@ def _broadcast_batched_data_dict(
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
                 segments = packed_segments.pop(key)
-                flat_payload = (
-                    torch.cat([segment.contiguous().view(-1) for segment in segments])
+                tensor = (
+                    torch.cat(
+                        [
+                            segment.to(bcast_device).contiguous().view(-1)
+                            for segment in segments
+                        ]
+                    )
                     if segments
                     else torch.empty(
                         0,
                         dtype=getattr(torch, dtype_str.split(".")[-1]),
-                        device=source_device,
+                        device=bcast_device,
                     )
                 )
-                tensor = flat_payload.to(bcast_device)
-                del flat_payload
             else:
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 numel = sum(
