@@ -202,6 +202,7 @@ def evaluation_config(config: dict, checkpoint: Path, output: Path) -> dict:
         mlperf_enabled=False,
         wandb_enabled=False,
         tensorboard_enabled=False,
+        monitor_gpus=False,
         log_dir=str(output / "runtime"),
     )
     raw["grpo"].update(
