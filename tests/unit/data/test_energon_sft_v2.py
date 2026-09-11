@@ -188,6 +188,25 @@ def test_sft_v2_worker_uses_megatron_worker_environment() -> None:
     )
 
 
+def test_sft_v2_worker_defers_processor_construction() -> None:
+    from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker_cls = SFTMegatronPolicyWorker.__ray_metadata__.modified_class
+    with (
+        patch.object(MegatronPolicyWorkerImpl, "__init__", return_value=None),
+        patch("nemo_rl.algorithms.utils.get_tokenizer") as get_tokenizer,
+    ):
+        worker = worker_cls(
+            {"tokenizer": {"use_processor": True}}, tokenizer=MagicMock()
+        )
+
+    get_tokenizer.assert_not_called()
+    assert worker._sft_processor is None
+
+
 def test_sft_v2_worker_publishes_sequence_alignment() -> None:
     from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
 
