@@ -41,7 +41,12 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # also produce very large token_mult_prob_error from a single long outlier, so
 # the multi-step Qwen3 performance tests keep ownership of that metric.
 grep -q "720 TensorQuantizers found in model" "$RUN_LOG"
-grep -q "MegatronQuantPolicyWorker.*723 TensorQuantizers found in model" "$RUN_LOG"
+# The Megatron worker only runs mtq.print_quant_summary ("N TensorQuantizers found in
+# model") when it quantizes from scratch; when the cached quantized checkpoint
+# (<model>_modelopt_<cfg-hash>) exists it restores instead and only ModelOpt's
+# "Inserted N quantizers" line is printed. Accept either so the assertion does not
+# depend on the cluster's cache state.
+grep -qE "MegatronQuantPolicyWorker.*(723 TensorQuantizers found in model|Inserted 723 quantizers)" "$RUN_LOG"
 
 MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' $JSON_METRICS)
 if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then
