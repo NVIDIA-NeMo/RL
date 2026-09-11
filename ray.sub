@@ -496,7 +496,11 @@ ip_head=$head_node_ip:$PORT
 #
 # TOPO_RANK: Topology-aware infrastructure rank.
 #   Fallback chain:
-#   1. SLURM_TOPOLOGY_ADDR (block.node format) -> block_num * 10^10 + node_num
+#   1. SLURM_TOPOLOGY_ADDR (block.node format) ->
+#      (block_digits % 10^4) * 10^6 + (node_digits % 10^6)
+#      Bounded so the quantity stays under Ray's 1e14 custom-resource cap.
+#      The unbounded form block_digits * 10^10 + node_digits overflows when
+#      the block name strips to more than four digits (region/zone/site codes).
 #   2. SLURM_PROCID + 2 on workers, head pinned to 1 (SLURM without topology plugin)
 #   3. Hostname digits (non-SLURM fallback)
 #
@@ -521,7 +525,10 @@ if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "
   if [[ -n "\$_block_digits" && -n "\$_node_digits" ]]; then
     # Force base-10 interpretation; leading-zero digits like "08" would otherwise
     # be parsed as invalid octal by bash arithmetic, silently leaving TOPO_RANK empty.
-    TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
+    # Bound both parts: Ray rejects custom resource quantities above 1e14, and
+    # provider naming can strip to far more digits than the original 10^10
+    # multiplier assumed. Worst case here is 9999*10^6 + 999999, about 1e10.
+    TOPO_RANK=\$(( (10#\$_block_digits % 10000) * 1000000 + (10#\$_node_digits % 1000000) ))
   fi
 elif [[ -n "\${SLURM_PROCID:-}" ]]; then
   # Head srun and worker srun each start their own SLURM_PROCID counter at 0.
