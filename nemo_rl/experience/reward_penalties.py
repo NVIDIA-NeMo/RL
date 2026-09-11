@@ -11,15 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared text detectors and durable token-capture reward penalty evidence."""
+"""Shared reward calculations and the small adapter for verified capture rows."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
-from typing import Any
+import statistics
+from collections.abc import Container, Iterable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
-TEXT_PENALTY_EVIDENCE_SCHEMA_VERSION = 1
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 
 def has_duplicated_reasoning(output_items: list[dict[str, Any]]) -> bool:
@@ -64,151 +68,137 @@ def has_empty_final_answer(output_items: list[dict[str, Any]]) -> bool:
     return final_answer_text is None or final_answer_text == ""
 
 
-@dataclass(frozen=True)
-class CaptureRewardPenaltyConfig:
-    """Resolved internal config shared by receipt producers and finalizers."""
-
-    duplicated_reasoning: bool
-    empty_final_answer: bool
-    unwanted_token_ids: tuple[int, ...]
-
-    @classmethod
-    def from_resolved(cls, config: dict[str, Any] | None) -> CaptureRewardPenaltyConfig:
-        """Consume the existing resolver's output without tokenizer inference."""
-        if config is None:
-            return cls(False, False, ())
-        if config.get("penalize_malformed_think_tag"):
-            raise ValueError(
-                "token capture does not support penalize_malformed_think_tag"
-            )
-        unwanted: tuple[int, ...] = ()
-        if config.get("penalize_unwanted_tokens"):
-            ids = (config.get("token_ids") or {}).get("unwanted")
-            if not ids:
-                raise ValueError("reward_penalties.token_ids.unwanted must be set")
-            unwanted = tuple(ids)
-        return cls(
-            bool(config.get("penalize_duplicated_reasoning")),
-            bool(config.get("penalize_empty_final_answer")),
-            unwanted,
-        )
-
-    @property
-    def semantics_fingerprint(self) -> str:
-        """Version text semantics and effective text flags, independent of tokens."""
-        return f"gym-output-v1:duplicated={int(self.duplicated_reasoning)}:empty={int(self.empty_final_answer)}"
+def effort_shaping_enabled(config: EffortLevelsConfig | None) -> bool:
+    """Return whether the configured low-effort adjustment is active."""
+    return config is not None and config.low_weight > 0 and bool(config.low_string)
 
 
-@dataclass(frozen=True)
-class RolloutTextPenaltyEvidence:
-    """Versioned, token-free evidence bound to one physical rollout attempt."""
-
-    schema_version: int
-    semantics_fingerprint: str
-    rollout_id: str
-    duplicated_reasoning: bool | None
-    empty_final_answer: bool | None
-
-    def __post_init__(self) -> None:
-        if type(self.schema_version) is not int:
-            raise ValueError("text penalty evidence schema_version must be an integer")
-        if not isinstance(self.semantics_fingerprint, str) or not isinstance(
-            self.rollout_id, str
-        ):
-            raise ValueError(
-                "text penalty evidence requires string semantics and identity"
-            )
-        for value in (self.duplicated_reasoning, self.empty_final_answer):
-            if value is not None and type(value) is not bool:
-                raise ValueError("text penalty evidence checks must be bool or None")
-
-    def state_dict(self) -> dict[str, Any]:
-        """Serialize only the explicit evidence schema into checkpoint metadata."""
-        return asdict(self)
-
-    @classmethod
-    def from_state_dict(cls, state: dict[str, Any]) -> RolloutTextPenaltyEvidence:
-        """Preserve unknown semantic versions for finalizer compatibility checks."""
-        expected = {
-            "schema_version",
-            "semantics_fingerprint",
-            "rollout_id",
-            "duplicated_reasoning",
-            "empty_final_answer",
-        }
-        if not isinstance(state, dict) or set(state) != expected:
-            raise ValueError("invalid text penalty evidence fields")
-        return cls(**state)
+def is_low_effort(row: dict[str, Any], config: EffortLevelsConfig) -> bool:
+    """Classify the original rollout input using the standard last-user rule."""
+    prompt = next(
+        (
+            msg["content"]
+            for msg in reversed(row["responses_create_params"]["input"])
+            if msg.get("role") == "user" and "content" in msg
+        ),
+        "",
+    )
+    return config.low_string in prompt
 
 
-def compute_text_penalty_evidence(
-    rollout_id: str,
-    output_items: list[dict[str, Any]],
-    config: CaptureRewardPenaltyConfig,
-) -> RolloutTextPenaltyEvidence:
-    """Evaluate the scored output before it leaves the environment actor."""
-    return RolloutTextPenaltyEvidence(
-        schema_version=TEXT_PENALTY_EVIDENCE_SCHEMA_VERSION,
-        semantics_fingerprint=config.semantics_fingerprint,
-        rollout_id=rollout_id,
-        duplicated_reasoning=has_duplicated_reasoning(output_items)
-        if config.duplicated_reasoning
-        else None,
-        empty_final_answer=has_empty_final_answer(output_items)
-        if config.empty_final_answer
-        else None,
+def shape_effort_reward(
+    reward: float, *, length: int, config: EffortLevelsConfig
+) -> tuple[float, float]:
+    """Return shaped reward and length term, preserving negative reward semantics."""
+    length_reward = min(1.0, config.low_weight * (1.0 - length / config.low_ub))
+    return (
+        reward
+        + reward * max(length_reward, 0.0)
+        + config.low_penalty * min(length_reward, 0.0),
+        length_reward,
     )
 
 
-def finalize_reward_penalties(
-    rollout_id: str,
+def has_unwanted_tokens(
+    generations: Iterable[Container[int]], unwanted_ids: Sequence[int]
+) -> bool:
+    """Check full generated sequences, including their terminal tokens."""
+    return any(
+        token in generation for generation in generations for token in unwanted_ids
+    )
+
+
+@dataclass(frozen=True)
+class RewardChecks:
+    """Scored-text and original-prompt checks saved with a rollout attempt."""
+
+    duplicated_reasoning: bool
+    empty_final_answer: bool
+    low_effort: bool
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not bool
+            for value in (
+                self.duplicated_reasoning,
+                self.empty_final_answer,
+                self.low_effort,
+            )
+        ):
+            raise ValueError("reward checks must be booleans")
+
+
+def compute_reward_checks(
+    result: dict[str, Any],
+    row: dict[str, Any],
+    effort_config: EffortLevelsConfig | None,
+) -> RewardChecks:
+    """Evaluate available checks before sealing, without changing the raw reward."""
+    response = result.get("response")
+    output = response.get("output", []) if isinstance(response, dict) else []
+    return RewardChecks(
+        has_duplicated_reasoning(output),
+        has_empty_final_answer(output),
+        is_low_effort(row, effort_config)
+        if effort_shaping_enabled(effort_config) and effort_config is not None
+        else False,
+    )
+
+
+def finalize_capture_reward(
     reward: float,
-    evidence: RolloutTextPenaltyEvidence | None,
-    config: CaptureRewardPenaltyConfig,
+    *,
+    checks: RewardChecks | None,
+    penalty_config: RewardPenaltyConfig | None,
+    effort_config: EffortLevelsConfig | None,
     token_ids: list[int],
     link_spans: list[tuple[str, int, int]],
-) -> tuple[float, dict[str, int]]:
-    """Apply penalties to a verified selected chain and sealed shaped reward."""
+) -> tuple[float, dict[str, int], dict[str, float]]:
+    """Shape, then penalize. Token IDs and spans must already be verified by Gym."""
     counts = {"duplicated_reasoning": 0, "empty_final_answer": 0, "unwanted_token": 0}
-    if config.duplicated_reasoning or config.empty_final_answer:
-        if evidence is None:
-            raise ValueError("missing_text_evidence")
-        if evidence.rollout_id != rollout_id:
-            raise ValueError("text_evidence_identity_mismatch")
-        if (
-            evidence.schema_version != TEXT_PENALTY_EVIDENCE_SCHEMA_VERSION
-            or evidence.semantics_fingerprint != config.semantics_fingerprint
-        ):
-            raise ValueError("incompatible_text_evidence")
-        for name, enabled, value in (
-            (
-                "duplicated_reasoning",
-                config.duplicated_reasoning,
-                evidence.duplicated_reasoning,
-            ),
-            (
-                "empty_final_answer",
-                config.empty_final_answer,
-                evidence.empty_final_answer,
-            ),
-        ):
-            if enabled:
-                if value is None:
-                    raise ValueError(f"unevaluated_text_evidence:{name}")
-                counts[name] = int(value)
-    if config.unwanted_token_ids:
-        unwanted = set(config.unwanted_token_ids)
-        offset = 0
-        for _, carry_len, generation_len in link_spans:
-            end = offset + carry_len + generation_len
-            if carry_len < 0 or generation_len < 0 or end > len(token_ids):
-                raise ValueError("invalid_penalty_token_span")
-            if unwanted.intersection(token_ids[offset + carry_len : end]):
-                counts["unwanted_token"] = 1
-            offset = end
-        if offset != len(token_ids):
-            raise ValueError("penalty_token_span_coverage")
-    return (0.0 if any(counts.values()) else reward), counts
+    metrics: dict[str, float] = {}
+    shaping = effort_shaping_enabled(effort_config)
+    text_checks = penalty_config is not None and (
+        penalty_config.penalize_duplicated_reasoning
+        or penalty_config.penalize_empty_final_answer
+    )
+    if (shaping or text_checks) and checks is None:
+        raise ValueError("missing_reward_checks")
+    if shaping:
+        assert effort_config is not None and checks is not None
+        length = link_spans[-1][2]
+        bucket = "low" if checks.low_effort else "high"
+        metrics[f"finalize/effort/{bucket}/{length}"] = 1.0
+        if checks.low_effort:
+            reward, length_reward = shape_effort_reward(
+                reward, length=length, config=effort_config
+            )
+            metrics["finalize/effort/length_reward_sum"] = length_reward
+            metrics["finalize/effort/reward_sum"] = reward
+    if penalty_config is not None:
+        if checks is not None:
+            counts["duplicated_reasoning"] = int(
+                penalty_config.penalize_duplicated_reasoning
+                and checks.duplicated_reasoning
+            )
+            counts["empty_final_answer"] = int(
+                penalty_config.penalize_empty_final_answer and checks.empty_final_answer
+            )
+        if penalty_config.penalize_unwanted_tokens:
+            assert penalty_config.token_ids is not None
+            unwanted_ids = penalty_config.token_ids.unwanted
+            assert unwanted_ids is not None
+            offset = 0
+            for _, carry, generated in link_spans:
+                end = offset + carry + generated
+                if has_unwanted_tokens(
+                    (token_ids[offset + carry : end],),
+                    unwanted_ids,
+                ):
+                    counts["unwanted_token"] = 1
+                    break
+                offset = end
+    return (0.0 if any(counts.values()) else reward), counts, metrics
 
 
 CAPTURE_PENALTY_METRICS = {
@@ -243,4 +233,21 @@ def aggregate_capture_reward_metrics(
             "total_reward/max": max(metrics["finalize/reward_max"]),
         }
     )
+    for bucket in ("low", "high"):
+        lengths = [
+            int(name.rsplit("/", 1)[1])
+            for name, values in metrics.items()
+            if name.startswith(f"finalize/effort/{bucket}/")
+            for _ in range(int(sum(values)))
+        ]
+        if lengths:
+            result[f"mean_length_{bucket}"] = statistics.fmean(lengths)
+            result[f"median_length_{bucket}"] = float(statistics.median(lengths))
+            if bucket == "low":
+                result["mean_length_reward_low"] = sum(
+                    metrics["finalize/effort/length_reward_sum"]
+                ) / len(lengths)
+                result["mean_reward_low"] = sum(
+                    metrics["finalize/effort/reward_sum"]
+                ) / len(lengths)
     return result

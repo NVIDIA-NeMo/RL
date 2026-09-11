@@ -55,10 +55,6 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
-from nemo_rl.experience.reward_penalties import (
-    CaptureRewardPenaltyConfig,
-    compute_text_penalty_evidence,
-)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -290,7 +286,6 @@ class NemoGymConfig(TypedDict):
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
-    capture_reward_penalties: NotRequired[CaptureRewardPenaltyConfig | None]
     token_capture: NotRequired[Dict[str, Any] | None]
 
 
@@ -854,22 +849,12 @@ Depending on your data shape, you may want to change these values."""
         except (RuntimeError, OSError) as error:
             # An unfetchable manifest finalizes as a placeholder row.
             print(f"manifest({rollout_id}) fetch failed: {error}", flush=True)
-        penalty_config = self.cfg.get("capture_reward_penalties")
         return {
             "message_log": [],
             "input_message_log": [],
             "full_result": nemo_gym_result,
             "rollout_id": rollout_id,
             "receipt": receipt,
-            "text_penalty_evidence": (
-                compute_text_penalty_evidence(
-                    rollout_id,
-                    (scored_response or {}).get("output", []),
-                    penalty_config,
-                )
-                if penalty_config is not None
-                else None
-            ),
         }
 
     @staticmethod
@@ -1400,7 +1385,6 @@ def build_nemo_gym_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
-    capture_reward_penalties: CaptureRewardPenaltyConfig | None = None,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a NeMo-Gym actor.
 
@@ -1490,7 +1474,6 @@ def build_nemo_gym_config(
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
         **port_range,
-        capture_reward_penalties=capture_reward_penalties,
         **multimodal_flags,
     )
 
@@ -1504,7 +1487,6 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
-    capture_reward_penalties: CaptureRewardPenaltyConfig | None = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -1531,7 +1513,6 @@ def spinup_nemo_gym_actor(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
-        capture_reward_penalties=capture_reward_penalties,
     )
 
     nemo_gym_opts: dict[str, Any] = {

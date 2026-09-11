@@ -376,21 +376,28 @@ def test_run_rollouts_shapes_completion_reward_and_emits_low_metrics():
 @pytest.mark.parametrize(
     "usage", [None, {"output_tokens": 1000}, {"completion_tokens": 99000}]
 )
-def test_streamed_capture_seals_raw_reward_and_original_effort_context(usage) -> None:
+def test_streamed_capture_seals_raw_reward_and_original_reward_checks(usage) -> None:
     """Capture defers shaping until verified terminal length is available."""
     observed_rewards: list[float] = []
-    observed_contexts = []
+    observed_checks = []
 
     async def record_completion(_rowidx: int, completion: Completion) -> None:
         observed_rewards.append(completion.reward)
-        observed_contexts.append(completion.env_extras["ng_effort_context"])
+        observed_checks.append(completion.env_extras["ng_reward_checks"])
 
     result = {
         "input_message_log": [{"role": "user", "token_ids": [1, 2]}],
         "message_log": [],
         "full_result": {
             "reward": 1.0,
-            "response": {"usage": usage},
+            "response": {
+                "usage": usage,
+                "output": [
+                    {"type": "reasoning", "summary": [{"text": "same"}]},
+                    {"content": "same"},
+                    {"content": " "},
+                ],
+            },
         },
         "receipt": {"rollout_id": "rollout-0", "manifest": []},
         "rollout_id": "rollout-0",
@@ -405,8 +412,9 @@ def test_streamed_capture_seals_raw_reward_and_original_effort_context(usage) ->
 
     assert not any(key in metrics for key in _SHAPING_METRIC_KEYS)
     assert observed_rewards == [1.0]
-    assert observed_contexts[0].rollout_id == "rollout-0"
-    assert observed_contexts[0].is_low_effort is True
+    assert observed_checks[0].low_effort is True
+    assert observed_checks[0].duplicated_reasoning is True
+    assert observed_checks[0].empty_final_answer is True
 
 
 def test_run_rollouts_leaves_high_effort_prompt_reward_untouched():
