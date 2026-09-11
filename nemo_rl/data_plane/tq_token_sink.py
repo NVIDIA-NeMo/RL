@@ -128,6 +128,7 @@ class FetchedStagedCall:
     snapshot: StagedCallBaseSnapshot
     routed_len: int
     fragment: RouteFragment | None = None
+    extras_metadata_json: bytes = b"null"
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -449,6 +450,9 @@ class TQTokenSource:
                     fragment=(
                         _row_to_route_fragment(row) if include_route_fragments else None
                     ),
+                    extras_metadata_json=_row_text(
+                        row, ROUTED_EXTRAS_METADATA_FIELD
+                    ).encode("utf-8"),
                 )
             )
         return fetched

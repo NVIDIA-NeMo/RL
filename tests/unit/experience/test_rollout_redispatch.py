@@ -104,6 +104,7 @@ class _ScriptedImpl:
 
 def _make_manager(buffer, impl, policy) -> RolloutManager:
     manager = object.__new__(RolloutManager)
+    manager._context_compaction = False
     manager._impl = impl
     manager._tokenizer = None
     manager._num_generations_per_prompt = 1

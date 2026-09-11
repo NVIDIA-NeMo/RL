@@ -35,7 +35,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     GenerationRouterConfig,
     MasterConfig,
     RolloutFailureConfig,
+    TokenCaptureConfig,
     WatchdogConfig,
+    cc_execution_row_multiple,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
@@ -83,6 +85,146 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
 
 
 class TestDefaultsAreInert:
+    @pytest.mark.parametrize(
+        "bad,reason",
+        [
+            (None, None),
+            ("lookahead", "zero lookahead"),
+            ("sampler", "zero lookahead"),
+            ("gbs", "must equal policy.train_global_batch_size"),
+            ("checkpoint", "checkpoint/resume"),
+            ("rollout_checkpoint", "CC rollout checkpoint/resume"),
+            ("dynamic", "use_dynamic_sampling not supported"),
+            ("sequence_loss", "token-level GRPO"),
+            ("packing", "fixed-batch"),
+        ],
+    )
+    def test_cc_startup_contract(self, bad, reason):
+        config = _master_config(
+            sampler={"name": "in_order", "max_lookahead_versions": 0}
+        )
+        config.token_capture = TokenCaptureConfig(enabled=True, context_compaction=True)
+        config.async_rl.rollout_failure.min_step_batch_fraction = 1
+        config.policy.update(
+            megatron_cfg={"enabled": True},
+            sequence_packing={"enabled": False},
+            dynamic_batching={"enabled": False},
+            train_micro_batch_size=1,
+            logprob_batch_size=1,
+            generation={
+                "backend": "vllm",
+                "colocated": {"enabled": False},
+                "vllm_cfg": {"async_engine": True, "expose_http_server": True},
+            },
+        )
+        if bad == "lookahead":
+            config.async_rl.sampler.max_lookahead_versions = 1
+        elif bad == "sampler":
+            config.async_rl.sampler = AsyncRLConfig(
+                sampler={"name": "weight_fifo"}
+            ).sampler
+        elif bad == "gbs":
+            config.policy["train_global_batch_size"] -= 1
+        elif bad == "checkpoint":
+            config.checkpointing["enabled"] = True
+        elif bad == "rollout_checkpoint":
+            config.rollout_checkpointing.snapshot_attempt_interval_s = 60
+        elif bad == "dynamic":
+            config.grpo.use_dynamic_sampling = True
+        elif bad == "sequence_loss":
+            config.loss_fn.token_level_loss = False
+        elif bad == "packing":
+            config.policy["sequence_packing"]["enabled"] = True
+        if reason is None:
+            validate_single_controller_config(config)
+        else:
+            with pytest.raises((ValueError, NotImplementedError), match=reason):
+                validate_single_controller_config(config)
+
+    @pytest.mark.parametrize("logprobs,expected", [(False, 6), (True, 12)])
+    def test_cc_padding_covers_both_consumer_microbatch_sizes(self, logprobs, expected):
+        policy = {
+            "megatron_cfg": {"enabled": True},
+            "sequence_packing": {"enabled": False},
+            "dynamic_batching": {"enabled": False},
+            "train_micro_batch_size": 3,
+            "logprob_batch_size": 2,
+        }
+        assert (
+            cc_execution_row_multiple(policy, dp_size=2, logprobs_required=logprobs)
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        "bad", ["packing", "dynamic", "vpp", "vpp_one", "backend", "zero", "bool"]
+    )
+    def test_cc_padding_rejects_unqualified_layouts(self, bad):
+        policy = {
+            "megatron_cfg": {"enabled": True},
+            "sequence_packing": {"enabled": bad == "packing"},
+            "dynamic_batching": {"enabled": bad == "dynamic"},
+            "train_micro_batch_size": 1,
+            "logprob_batch_size": 1,
+        }
+        if bad in ("vpp", "vpp_one"):
+            policy["megatron_cfg"]["virtual_pipeline_model_parallel_size"] = (
+                1 if bad == "vpp_one" else 2
+            )
+        if bad == "backend":
+            policy["megatron_cfg"]["enabled"] = False
+        with pytest.raises(ValueError, match="CC"):
+            cc_execution_row_multiple(
+                policy,
+                dp_size=0 if bad == "zero" else True if bad == "bool" else 1,
+                logprobs_required=True,
+            )
+
+    @pytest.mark.parametrize("context_compaction", [False, True])
+    @pytest.mark.parametrize(
+        "penalty", ["invalid_tool_call_advantage", "malformed_thinking_advantage"]
+    )
+    def test_capture_rejects_output_penalty_overrides(
+        self, context_compaction, penalty
+    ):
+        config = _master_config()
+        config.token_capture = TokenCaptureConfig(
+            enabled=True, context_compaction=context_compaction
+        )
+        config.async_rl.rollout_failure.min_step_batch_fraction = 1
+        setattr(config.grpo, penalty, -5.0)
+        if context_compaction:
+            with pytest.raises(ValueError, match="message-level advantage overrides"):
+                validate_single_controller_config(config)
+        else:
+            with pytest.raises(
+                NotImplementedError, match="token-capture finalizer does not emit"
+            ):
+                validate_single_controller_config(config)
+
+    def test_context_compaction_is_explicitly_opt_in(self):
+        assert TokenCaptureConfig().context_compaction is False
+
+    @pytest.mark.parametrize(
+        "enabled,deferred,fraction,expected",
+        [
+            (False, False, 1, "enabled=true"),
+            (True, True, 1, "direct"),
+            (True, False, 0.9, "min_step_batch_fraction"),
+        ],
+    )
+    def test_cc_rejects_unsafe_capture_dispatch_config(
+        self, enabled, deferred, fraction, expected
+    ):
+        config = _master_config()
+        config.token_capture = TokenCaptureConfig(
+            enabled=enabled,
+            context_compaction=True,
+            defer_routed_experts_to_policy=deferred,
+        )
+        config.async_rl.rollout_failure.min_step_batch_fraction = fraction
+        with pytest.raises(ValueError, match=expected):
+            validate_single_controller_config(config)
+
     def test_timeouts_default_to_disabled(self):
         cfg = AsyncRLConfig()
         assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None

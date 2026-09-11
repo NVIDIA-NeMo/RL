@@ -6,6 +6,8 @@ grpo:
   max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
+  # SingleController baseline/std: valid_owners (default) or all_owners (legacy masked rewards).
+  baseline_population: valid_owners
   use_leave_one_out_baseline: true
   val_period: 10
   val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay

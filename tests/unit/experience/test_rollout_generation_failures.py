@@ -170,6 +170,7 @@ def _sample(idx=7):
 def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
     """Build a RolloutManager without firing the real __init__."""
     manager = object.__new__(RolloutManager)
+    manager._context_compaction = False
     manager._impl = impl
     manager._tokenizer = None
     manager._num_generations_per_prompt = 1
@@ -536,6 +537,7 @@ def _make_gym_impl(
     from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 
     impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._context_compaction = False
     impl._tokenizer = _FakeTokenizer()
     impl._task_to_env = {"nemo_gym": type("Env", (), {"run_rollouts": gym_method})()}
     impl._num_generations_per_prompt = num_generations

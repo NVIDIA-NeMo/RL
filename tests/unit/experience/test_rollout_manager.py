@@ -242,6 +242,7 @@ def _make_manager(
     these tests keep exercising the no-retry path unless they ask for otherwise.
     """
     mgr = object.__new__(RolloutManager)
+    mgr._context_compaction = False
     mgr._impl = impl
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = 1
@@ -1708,8 +1709,12 @@ def _make_capture_manager(
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
     recovery_config: RolloutRecoveryConfig | None = None,
+    context_compaction=False,
+    execution_row_multiple=1,
 ):
     mgr = object.__new__(RolloutManager)
+    mgr._context_compaction = context_compaction
+    mgr._execution_row_multiple = execution_row_multiple
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._rollout_recovery_config = recovery_config or RolloutRecoveryConfig()
