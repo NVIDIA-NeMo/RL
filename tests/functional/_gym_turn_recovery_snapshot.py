@@ -24,7 +24,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-import torch
+
+_PROFILES = ("counter", "workplace")
+_WORKPLACE_EVENT = {
+    "event_name": "NeMo RL checkpoint recovery sentinel",
+    "participant_email": "checkpoint-recovery@example.com",
+    "event_start": "2025-01-15 10:00:00",
+    "duration": "30",
+}
 
 
 def _digest(path: Path) -> str:
@@ -101,8 +108,12 @@ def _matching_recovery_attempt(
 def inspect_snapshot(
     snapshot: Path,
     dataset_rows: list[dict[str, Any]],
+    *,
+    profile: str = "counter",
 ) -> dict[str, Any]:
     """Validate one published cross-system snapshot and select a continuation."""
+    import torch
+
     manifest = _read_json(snapshot / "manifest.json")
     if manifest.get("base_train_step") != 0:
         raise AssertionError("the fault-injection cut must use the bootstrap anchor")
@@ -181,10 +192,13 @@ def inspect_snapshot(
         if _digest(record_path) != expected_digest:
             raise AssertionError(f"agent boundary digest mismatch for {record_path}")
         record = _read_json(record_path)
+        pending_model = record.get("pending_model")
         if (
             record.get("boundary_index", 0) < 1
             or not record.get("last_committed_model_call_id")
             or not record.get("resource_state_revisions")
+            or not isinstance(pending_model, dict)
+            or pending_model.get("pending_action_cursor", 0) < 1
         ):
             continue
         group, attempt = _matching_recovery_attempt(recovery, record["rollout_id"])
@@ -200,7 +214,8 @@ def inspect_snapshot(
 
     if not candidates:
         raise AssertionError(
-            "snapshot has no Gym turn boundary tied to an unfinished RL sibling"
+            "snapshot has no post-mutation Gym turn boundary tied to an unfinished "
+            "RL sibling"
         )
     boundary, group = sorted(
         candidates,
@@ -213,18 +228,19 @@ def inspect_snapshot(
     except (IndexError, KeyError, TypeError, ValueError) as error:
         raise AssertionError(
             "selected recovery group does not resolve to its deterministic "
-            "counter dataset row"
+            f"{profile} dataset row"
         ) from error
-    initial_count = dataset_row.get("initial_count")
-    expected_count = dataset_row.get("expected_count")
-    if (
-        isinstance(initial_count, bool)
-        or not isinstance(initial_count, int)
-        or isinstance(expected_count, bool)
-        or not isinstance(expected_count, int)
-        or expected_count <= initial_count
-    ):
-        raise AssertionError("counter test row has invalid initial/expected values")
+    if profile == "counter":
+        initial_count = dataset_row.get("initial_count")
+        expected_count = dataset_row.get("expected_count")
+        if (
+            isinstance(initial_count, bool)
+            or not isinstance(initial_count, int)
+            or isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count <= initial_count
+        ):
+            raise AssertionError("counter test row has invalid initial/expected values")
 
     resources_manifest = _read_json(resources_manifest_path)
     resource_snapshots: list[dict[str, Any]] = []
@@ -249,20 +265,13 @@ def inspect_snapshot(
         raise AssertionError(
             "agent boundary and resources snapshot disagree about state revision"
         )
-    checkpoint_counter = (resource_snapshot.get("state") or {}).get("counter")
-    if (
-        isinstance(checkpoint_counter, bool)
-        or not isinstance(checkpoint_counter, int)
-        or not initial_count < checkpoint_counter <= expected_count
-    ):
-        raise AssertionError(
-            "checkpoint must contain a counter mutation strictly after the initial "
-            "state and no later than the expected terminal state"
-        )
+    if not isinstance(expected_revision, int) or expected_revision < 2:
+        raise AssertionError("checkpointed resource state has no committed mutation")
 
-    return {
+    selected = {
         "snapshot_path": str(snapshot.resolve()),
         "checkpoint_id": gym_checkpoint["checkpoint_id"],
+        "profile": profile,
         "rollout_id": boundary["rollout_id"],
         "source_attempt_index": boundary["attempt_index"],
         "restored_attempt_index": boundary["attempt_index"] + 1,
@@ -271,11 +280,53 @@ def inspect_snapshot(
         "resource_state_revisions": boundary["resource_state_revisions"],
         "group_id": group["group_id"],
         "prompt_index": prompt_index,
-        "initial_count": initial_count,
-        "checkpoint_counter": checkpoint_counter,
-        "expected_count": expected_count,
         "completed_group_ids": sorted(item["group_id"] for item in replay["groups"]),
     }
+    state = resource_snapshot.get("state") or {}
+    if profile == "counter":
+        checkpoint_counter = state.get("counter")
+        if (
+            isinstance(checkpoint_counter, bool)
+            or not isinstance(checkpoint_counter, int)
+            or not initial_count < checkpoint_counter <= expected_count
+        ):
+            raise AssertionError(
+                "checkpoint must contain a counter mutation strictly after the "
+                "initial state and no later than the expected terminal state"
+            )
+        selected.update(
+            initial_count=initial_count,
+            checkpoint_counter=checkpoint_counter,
+            expected_count=expected_count,
+        )
+    else:
+        sentinel_count = _workplace_sentinel_count(state)
+        if sentinel_count != 1:
+            raise AssertionError(
+                "Workplace checkpoint must contain exactly one sentinel calendar "
+                f"event, got {sentinel_count}"
+            )
+        selected["checkpoint_sentinel_count"] = sentinel_count
+    return selected
+
+
+def _workplace_sentinel_count(state: dict[str, Any]) -> int:
+    try:
+        payload = state["containers"]["calendar"]["_calendar_events"]
+        frame = json.loads(payload)
+        columns = frame["columns"]
+        rows = frame["data"]
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise AssertionError(
+            "Workplace checkpoint has no serialized calendar state"
+        ) from error
+    return sum(
+        all(
+            str(row[columns.index(field)]) == value
+            for field, value in _WORKPLACE_EVENT.items()
+        )
+        for row in rows
+    )
 
 
 def _published_bootstrap_snapshots(checkpoint_dir: Path) -> list[Path]:
@@ -298,7 +349,11 @@ def select_snapshot(args: argparse.Namespace) -> None:
     while time.monotonic() < deadline:
         for snapshot in _published_bootstrap_snapshots(args.checkpoint_dir):
             try:
-                selected = inspect_snapshot(snapshot, dataset_rows)
+                selected = inspect_snapshot(
+                    snapshot,
+                    dataset_rows,
+                    profile=args.profile,
+                )
             except (
                 AssertionError,
                 FileNotFoundError,
@@ -395,6 +450,53 @@ def verify_restore(args: argparse.Namespace) -> None:
             "a completed, checkpointed group was regenerated after restore: "
             f"events={regenerated_completed_groups!r}"
         )
+    if args.profile == "workplace":
+        _verify_workplace_audit(selected, args.audit_events)
+
+
+def _verify_workplace_audit(
+    selected: dict[str, Any],
+    audit_path: Path | None,
+) -> None:
+    if audit_path is None or not audit_path.is_file():
+        raise AssertionError("Workplace recovery produced no durable audit events")
+    events = [
+        json.loads(line) for line in audit_path.read_text().splitlines() if line.strip()
+    ]
+    rollout_id = selected["rollout_id"]
+    source_attempt = selected["source_attempt_index"]
+    restored_attempt = selected["restored_attempt_index"]
+    mutations = [
+        event
+        for event in events
+        if event.get("event") == "mutation_applied"
+        and event.get("rollout_id") == rollout_id
+    ]
+    expected_mutation = [
+        event
+        for event in mutations
+        if event.get("attempt_index") == source_attempt
+        and event.get("sentinel_count") == 1
+    ]
+    if len(expected_mutation) != 1 or len(mutations) != 1:
+        raise AssertionError(
+            "Workplace sentinel mutation did not execute exactly once before the "
+            f"crash: events={mutations!r}"
+        )
+    for event_name in ("state_restored", "state_verified"):
+        matches = [
+            event
+            for event in events
+            if event.get("event") == event_name
+            and event.get("rollout_id") == rollout_id
+            and event.get("attempt_index") == restored_attempt
+            and event.get("sentinel_count") == 1
+        ]
+        if len(matches) != 1:
+            raise AssertionError(
+                f"Workplace restored state was not observed exactly once at "
+                f"{event_name}: events={matches!r}"
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -408,10 +510,13 @@ def parse_args() -> argparse.Namespace:
     select.add_argument("run_log", type=Path)
     select.add_argument("dataset", type=Path)
     select.add_argument("timeout_s", type=float)
+    select.add_argument("--profile", choices=_PROFILES, default="counter")
 
     verify = subparsers.add_parser("verify-restore")
     verify.add_argument("selection", type=Path)
     verify.add_argument("events", type=Path)
+    verify.add_argument("--profile", choices=_PROFILES, default="counter")
+    verify.add_argument("--audit-events", type=Path)
     return parser.parse_args()
 
 
