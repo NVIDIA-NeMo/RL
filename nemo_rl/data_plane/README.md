@@ -612,6 +612,13 @@ processes, against a 6x wider view of the traffic. The fan-out is
 best-effort — a rank that cannot answer is dropped rather than failing the
 step.
 
+**`step/self/frac` is a share of process-time, not of `wall_s`.** Both its
+terms are summed across processes, so it answers "what fraction of the data
+plane's process-time was the wrapper". It deliberately does **not** divide by
+`step/wall_s`, which is a max: a sum over a max is a ratio of nothing. So
+`self/frac` will not equal `self/overhead_ms / (step/wall_s * 1000)`, and the
+difference is the DP degree, not an error.
+
 `step/self/overhead_ms` reports what the measurement itself cost — the
 whole bill, both halves:
 
