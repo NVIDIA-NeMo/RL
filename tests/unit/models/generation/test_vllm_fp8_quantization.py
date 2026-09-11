@@ -1382,7 +1382,10 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
         moe_kernel=None,
         mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
         experts_cls=types.SimpleNamespace(is_monolithic=lambda: True),
-        get_fused_moe_quant_config=lambda _layer: object(),
+        get_fused_moe_quant_config=lambda realized_layer: types.SimpleNamespace(
+            w1_scale=realized_layer.w13_weight_scale,
+            w2_scale=realized_layer.w2_weight_scale,
+        ),
     )
 
     def make_kernel(**kwargs):
