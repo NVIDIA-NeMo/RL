@@ -865,23 +865,11 @@ class BaseVllmGenerationWorker:
 
         RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure
 
-        # vLLM v2 Ray executor (default for vLLM >= 0.25). It has no
-        # _configure_ray_workers_use_nsight; the nsight config is built in
-        # _build_runtime_env. Wrap it so the same deferred-capture config applies.
-        try:
-            from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
-
-            _orig_build_runtime_env = RayExecutorV2._build_runtime_env
-
-            def _patched_build_runtime_env(self):
-                runtime_env = _orig_build_runtime_env(self)
-                if self.parallel_config.ray_workers_use_nsight:
-                    runtime_env["nsight"] = nsight_config
-                return runtime_env
-
-            RayExecutorV2._build_runtime_env = _patched_build_runtime_env
-        except ImportError:
-            pass
+        # vLLM v2 Ray executor (default for vLLM >= 0.25) is built inside the vLLM
+        # EngineCore subprocess (spawn -> pristine vLLM import), so an in-process
+        # monkey-patch here cannot reach it. Its inner-worker nsight config is instead
+        # installed by the `vllm.general_plugins` entry point in
+        # nemo_rl.utils.vllm_nsight_plugin, which vLLM loads inside that subprocess.
 
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get speculative decoding metrics from the vLLM engine.
