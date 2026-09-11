@@ -722,26 +722,27 @@ per-row paths produce identical values, and the `_WriteScheme` bookkeeping
 that used to record which granularity a put had used, so a get could replay
 it, is gone with them.
 
-Measured cost, from a 15-step A/B on one recipe (Llama-3.2-1B, 1 node x 4
-GB300, TQ `simple`, 24 MB/step) differing only in `verify_tensor_hash`:
+Measured cost, from a same-node interleaved A/B (`off/on/off/on`, 20 steps
+each, Llama-3.2-1B, 1 node x 4 GB300, TQ `simple`, 24 MB/step), differing only
+in `verify_tensor_hash`:
 
-| | guard on | guard off |
+| | guard off | guard on |
 |---|---|---|
-| `step/self/overhead_ms` | ~123 ms | ~4.4 ms |
-| `step/wall_s` | ~1.35 s | ~1.05 s |
-| `total_step_time` (mean, steps 8-15) | 16.8 s | 15.1 s (see below) |
-| `step/hash/rows_checked` | 2560 | — |
+| `step/wall_s` | 0.18 s | 0.25 s |
+| `step/self/overhead_ms` | 3.3 ms | 116 ms |
+| **accounted** (the two are disjoint: `wall` is the RPC, `self` is the wrapper) | **183 ms** | **363 ms** |
+| `step/hash/rows_checked` | — | 2560 |
+| `total_step_time` | 13.9 s | 13.8 s |
 
-The wrapper's own accounting is ~4 ms; the guard is essentially all of the
-~119 ms difference, and the data plane's own wall time rose 297 ms.
+**The guard costs ~180 ms/step by the counters, and its effect on step time is
+not measurable.** Step time has a standard deviation of 3-4 s and a run-to-run
+floor of 0.6-0.9 s on identical config; across the two pairs the guard-on runs
+were 0.15 s *faster*. Any end-to-end figure quoted from a single pair -- and
+especially from two different nodes -- is reading noise.
 
-The end-to-end step moved 1.67 s, which those two do **not** explain, and it
-should not be read as the guard's cost. `comm_volume_mb` was unchanged
-(24.42 vs 24.58 MB), step time varied 14.3-20.3 s *within* each run, and at
-step 10 the guard-off run was the slower of the two. The two runs were also on
-different nodes. Against that spread a 1.67 s mean difference is not
-attributable; a same-node A/B is needed before any end-to-end figure is
-quoted.
+That the accounted 180 ms sits inside that floor is also the check that the
+counters are not under-reporting: there is no cost appearing in the step that
+the instrument fails to bill.
 
 **The accepted limit: a within-row permutation is not detected.** XOR cannot
 see its own operands reordered, and no seed fixes it — the seed covers dtype
