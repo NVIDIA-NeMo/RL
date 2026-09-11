@@ -757,7 +757,8 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         # training storage, then writes BF16 or performs on-receive MXFP8
         # quantization at the destination.
         #   BF16 train  ↔ BF16 gen   (default, tested)
-        #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
+        #   Blockwise FP8 train ↔ blockwise FP8 gen
+        #   Native MXFP8 train ↔ MXFP8 gen
         #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
         # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}

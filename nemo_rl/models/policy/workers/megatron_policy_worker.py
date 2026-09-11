@@ -935,6 +935,59 @@ class MegatronPolicyWorkerImpl(
             if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
                 optim_instance._copy_main_params_to_param_buffer()
 
+    def _stage_optimizer_params_for_read(self, optimizer: Any) -> None:
+        if getattr(optimizer, "is_stub_optimizer", False):
+            return
+
+        child_optimizers = getattr(optimizer, "chained_optimizers", None)
+        if child_optimizers is not None:
+            for child_optimizer in child_optimizers:
+                self._stage_optimizer_params_for_read(child_optimizer)
+            return
+
+        stage = getattr(optimizer, "_copy_main_params_to_param_buffer", None)
+        if not callable(stage):
+            raise RuntimeError(
+                "cannot materialize optimizer-owned MXFP8 parameters: "
+                f"{type(optimizer).__name__} does not provide param-buffer staging"
+            )
+        stage()
+
+    def _optimizer_model_chunks(self) -> list[Any]:
+        chunks: list[Any] = []
+
+        def collect(optimizer: Any) -> None:
+            chunks.extend(getattr(optimizer, "model_chunks", []) or [])
+            for child_optimizer in getattr(optimizer, "chained_optimizers", None) or []:
+                collect(child_optimizer)
+
+        collect(self.optimizer)
+        if not chunks and hasattr(self.model, "start_param_sync"):
+            chunks.append(self.model)
+
+        unique_chunks: list[Any] = []
+        seen: set[int] = set()
+        for chunk in chunks:
+            if id(chunk) in seen:
+                continue
+            seen.add(id(chunk))
+            unique_chunks.append(chunk)
+        return unique_chunks
+
+    def _materialize_model_params_for_read(self) -> None:
+        """Refresh optimizer-owned model params without resetting DDP grad state."""
+        if getattr(self, "_train_step_state", None) is not None:
+            raise RuntimeError(
+                "cannot materialize model parameters while a train step is open"
+            )
+
+        self._stage_optimizer_params_for_read(self.optimizer)
+        model_chunks = self._optimizer_model_chunks()
+        if not model_chunks:
+            raise RuntimeError("cannot materialize model parameters: no model chunks")
+        for model_chunk in model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
+
     def _uses_mxfp8_overlap_shared_param_buffer(self) -> bool:
         return getattr(
             self.megatron_cfg.optimizer, "reuse_grad_buf_for_mxfp8_param_ag", False
@@ -947,8 +1000,7 @@ class MegatronPolicyWorkerImpl(
         ):
             return
 
-        self.optimizer.prepare_model_params_for_param_sync()
-        self.model.start_param_sync(force_sync=True)
+        self._materialize_model_params_for_read()
 
     def _get_model_extra_state_dict(self) -> dict[str, Any]:
         fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
@@ -2541,7 +2593,13 @@ class MegatronPolicyWorkerImpl(
         """
         ## disable overlap param gather when swapping weights
         if self.should_disable_forward_pre_hook:
-            self.disable_forward_pre_hook()
+            uses_mxfp8_shared_buffer = self._uses_mxfp8_overlap_shared_param_buffer()
+            if (
+                uses_mxfp8_shared_buffer
+                and getattr(self, "_train_step_state", None) is None
+            ):
+                self._materialize_model_params_for_read()
+            self.disable_forward_pre_hook(param_sync=not uses_mxfp8_shared_buffer)
 
         with torch.no_grad():
             # Save original references
@@ -3309,6 +3367,52 @@ class MegatronPolicyWorkerImpl(
             f"with mapping {type(mapping).__name__}"
         )
 
+    def _grouped_source_uses_native_mxfp8(self, task: Any) -> bool:
+        """Return whether a grouped expert weight really stores MXFP8 members.
+
+        Bridge owns task construction now, and it names a grouped expert weight
+        the same way whatever that weight stores, so this is the only place a
+        BF16 boundary layer can still be told apart from a quantized one. A
+        negative answer means "send it down the misc path", exactly as the
+        ungrouped branch concludes from an absent ``get_metadata``; it is not an
+        error. Asking ``get_grouped_quantized_members`` first instead would turn
+        the supported first-N/last-M-BF16 config into a planning-time
+        ``ValueError``, since a BF16 ``GroupedTensor`` has no quantized storage
+        to enumerate.
+
+        The remaining raises stay: once the weight *is* MXFP8, a missing or empty
+        member list is a real defect and must not be demoted to BF16 transport.
+        """
+        from megatron.core.fp8_utils import (
+            get_grouped_quantized_members,
+            is_grouped_mxfp8tensor,
+        )
+
+        if not is_grouped_mxfp8tensor(task.param_weight):
+            return False
+
+        try:
+            members = get_grouped_quantized_members(
+                task.param_weight, create_if_missing=False
+            )
+        except RuntimeError:
+            members = get_grouped_quantized_members(
+                task.param_weight, create_if_missing=True
+            )
+        except ValueError as error:
+            logical_name = self._native_task_projections(task, grouped=True)[0][0]
+            raise ValueError(
+                f"Invalid grouped MXFP8 source {logical_name!r} role 'weight': {error}"
+            ) from error
+        if not members:
+            logical_name = self._native_task_projections(task, grouped=True)[0][0]
+            raise ValueError(
+                f"Grouped MXFP8 source {logical_name!r} role 'weight' has no members"
+            )
+        for member in members:
+            extract_native_mxfp8_components(member)
+        return True
+
     def _task_uses_native_mxfp8_storage(self, task: Any, *, grouped: bool) -> bool:
         """Return whether every local source component uses native MXFP8 storage."""
         if not self._native_task_projections(task, grouped=grouped):
@@ -3317,35 +3421,7 @@ class MegatronPolicyWorkerImpl(
         local_uses_native: bool | None = None
         if task.param_weight is not None:
             if grouped:
-                from megatron.core.fp8_utils import get_grouped_quantized_members
-
-                try:
-                    members = get_grouped_quantized_members(
-                        task.param_weight, create_if_missing=False
-                    )
-                except RuntimeError:
-                    members = get_grouped_quantized_members(
-                        task.param_weight, create_if_missing=True
-                    )
-                except ValueError as error:
-                    logical_name = self._native_task_projections(task, grouped=True)[0][
-                        0
-                    ]
-                    raise ValueError(
-                        f"Invalid grouped MXFP8 source {logical_name!r} role "
-                        f"'weight': {error}"
-                    ) from error
-                if not members:
-                    logical_name = self._native_task_projections(task, grouped=True)[0][
-                        0
-                    ]
-                    raise ValueError(
-                        f"Grouped MXFP8 source {logical_name!r} role 'weight' "
-                        "has no members"
-                    )
-                for member in members:
-                    extract_native_mxfp8_components(member)
-                local_uses_native = True
+                local_uses_native = self._grouped_source_uses_native_mxfp8(task)
             else:
                 metadata_getter = getattr(task.param_weight, "get_metadata", None)
                 if callable(metadata_getter):
