@@ -128,6 +128,7 @@ from nemo_rl.data_plane.schema import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience.effort_shaping import aggregate_capture_effort_metrics
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import aggregate_capture_reward_metrics
@@ -2662,7 +2663,11 @@ class SingleControllerActor:
                         for name, values in step_finalizer_metrics.items()
                         if values
                         and not name.startswith(
-                            ("finalize/reward_", "finalize/penalty_count/")
+                            (
+                                "finalize/reward_",
+                                "finalize/penalty_count/",
+                                "finalize/effort/",
+                            )
                         )
                     }
                 )
@@ -2680,6 +2685,9 @@ class SingleControllerActor:
                 )
                 step_metrics.update(
                     aggregate_capture_reward_metrics(step_finalizer_metrics)
+                )
+                step_metrics.update(
+                    aggregate_capture_effort_metrics(step_finalizer_metrics)
                 )
                 try:
                     step_metrics.update(

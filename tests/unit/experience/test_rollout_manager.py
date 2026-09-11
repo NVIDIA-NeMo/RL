@@ -2091,17 +2091,31 @@ def test_capture_completion_preserves_evidence_and_shaped_reward_until_finalizat
 def test_capture_manager_seals_evidence_and_forwards_it_to_reassembly(
     monkeypatch, granularity
 ):
+    from nemo_rl.experience.effort_shaping import (
+        EffortLevelsConfig,
+        compute_effort_context,
+    )
     from nemo_rl.experience.reward_penalties import (
         CaptureRewardPenaltyConfig,
         compute_text_penalty_evidence,
     )
 
+    effort = EffortLevelsConfig(low_weight=1, low_string="budget")
     original = _receipt_record
 
     def with_evidence(*args, **kwargs):
         record = original(*args, **kwargs)
         for completion in record.completions:
             extras = completion.env_extras
+            extras["ng_effort_context"] = compute_effort_context(
+                extras["ng_rollout_id"],
+                {
+                    "responses_create_params": {
+                        "input": [{"role": "user", "content": "budget"}]
+                    }
+                },
+                effort,
+            )
             extras["ng_text_penalty_evidence"] = compute_text_penalty_evidence(
                 extras["ng_rollout_id"], [], CaptureRewardPenaltyConfig(True, True, ())
             )
@@ -2122,4 +2136,13 @@ def test_capture_manager_seals_evidence_and_forwards_it_to_reassembly(
     assert (
         tuple(restored.finalization_inputs(request.group_id)[5])
         == request.text_penalty_evidence
+    )
+
+    assert len(request.effort_contexts) == 2
+    for rid, context in zip(request.rollout_ids, request.effort_contexts):
+        assert context.rollout_id == rid
+        assert context.is_low_effort is True
+    assert (
+        tuple(restored.finalization_inputs(request.group_id)[6])
+        == request.effort_contexts
     )

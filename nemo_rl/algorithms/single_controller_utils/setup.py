@@ -1739,6 +1739,7 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
                 reward_penalty_config=CaptureRewardPenaltyConfig.from_resolved(
                     resolved_reward_penalty_config
                 ),

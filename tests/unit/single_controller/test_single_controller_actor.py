@@ -2361,7 +2361,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     assert "advantages" in (result_meta.fields or [])
 
 
-def test_train_pump_consumes_recovered_penalty_counts_once(monkeypatch):
+def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(monkeypatch):
     from nemo_rl.experience.rollout_recovery import (
         RolloutRecoveryLedger,
         build_rollout_recovery_state,
@@ -2391,6 +2391,9 @@ def test_train_pump_consumes_recovered_penalty_counts_once(monkeypatch):
             "finalize/reward_min": 0.0,
             "finalize/reward_max": 0.0,
             "finalize/penalty_count/empty_final_answer": 1.0,
+            "finalize/effort/low/100": 1.0,
+            "finalize/effort/length_reward_sum": 0.9,
+            "finalize/effort/reward_sum": 1.9,
         },
         "group-1": {
             "finalize/reward_count": 3.0,
@@ -2399,6 +2402,11 @@ def test_train_pump_consumes_recovered_penalty_counts_once(monkeypatch):
             "finalize/reward_min": 2.0,
             "finalize/reward_max": 2.0,
             "finalize/penalty_count/empty_final_answer": 0.0,
+            "finalize/effort/low/900": 1.0,
+            "finalize/effort/low/1000": 1.0,
+            "finalize/effort/low/1200": 1.0,
+            "finalize/effort/length_reward_sum": -0.1,
+            "finalize/effort/reward_sum": 2.9,
         },
     }
     state = build_rollout_recovery_state(
@@ -2416,4 +2424,9 @@ def test_train_pump_consumes_recovered_penalty_counts_once(monkeypatch):
     assert metrics["finalize/reward_count"] == 4.0
     assert metrics["finalize/penalty_count/empty_final_answer"] == 1.0
     assert metrics["total_reward/mean"] == 1.5
+    assert metrics["mean_reward_low"] == pytest.approx(1.2)
+    assert metrics["mean_length_low"] == 800
+    assert metrics["median_length_low"] == 950
+    assert metrics["mean_length_reward_low"] == pytest.approx(0.2)
+    assert not any(name.startswith("finalize/effort/") for name in metrics)
     assert ctrl._finalizer_metrics_by_group == {}

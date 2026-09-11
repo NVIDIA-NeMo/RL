@@ -18,7 +18,6 @@
 import asyncio
 import copy
 import json
-import statistics
 import uuid
 import warnings
 from collections import defaultdict
@@ -60,6 +59,20 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
+)
+from nemo_rl.experience.effort_shaping import (
+    EffortLevelsConfig as EffortLevelsConfig,
+)
+from nemo_rl.experience.effort_shaping import (
+    EffortShapingMetrics as _EffortShapingMetrics,
+)
+from nemo_rl.experience.effort_shaping import (
+    effort_shaping_enabled,
+    is_low_effort,
+    shape_effort_reward,
+)
+from nemo_rl.experience.effort_shaping import (
+    effort_shaping_metrics as _effort_shaping_metrics,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -404,79 +417,12 @@ def backfill_missing_routed_experts(
     return backfilled_counts
 
 
-class EffortLevelsConfig(BaseModel, extra="allow"):
-    """Controls length-based reward shaping for low-effort prompts.
-
-    When a prompt contains ``low_string``, the final reward is adjusted by a
-    length-reward term that penalises overly long responses.  The reward formula
-    is::
-
-        length_reward = min(1, low_weight * (1 - response_len / low_ub))
-        new_reward    = orig_reward
-                      + orig_reward * max(length_reward, 0)
-                      + low_penalty * min(length_reward, 0)
-
-    Setting ``low_weight = 0`` or leaving ``low_string`` empty disables the
-    shaping entirely.
-    """
-
-    low_weight: float = 0.0
-    """Weight applied to the length-reward term.  Set to 0 to disable."""
-    low_penalty: float = 1.0
-    """Coefficient for the negative length-reward penalty."""
-    low_ub: int = 64000
-    """Response-length upper bound (in tokens) used to normalise the term."""
-    low_string: str = ""
-    """Substring that must appear in the user prompt to trigger shaping."""
-
-
-@dataclass
-class _EffortShapingMetrics:
-    length_rewards_low: list[float]
-    rewards_low: list[float]
-    low_lengths: list[int]
-    high_lengths: list[int]
-
-
 def _terminal_completion_length(result: dict) -> Optional[int]:
-    """Terminal assistant completion length for effort shaping, or None.
-
-    Legacy rollouts carry tokens inline: the last ``message_log`` entry is the
-    terminal turn, and its ``token_ids`` length is the completion length (0 if
-    that turn is not an assistant turn, matching the pre-receipt behavior).
-
-    Token-capture receipt rollouts carry ``message_log: []`` by design — the
-    tokens live in the capture ledger. The manifest's ``delta_len`` is NOT the
-    same quantity (a root call's delta stages prompt + generation, per the
-    ledger invariant ``parentless rows have prev_len == 0``), so the length
-    comes from the scored response's usage block instead: ``output_tokens``
-    is the terminal call's generation length, matching the legacy semantics.
-    A receipt row with no usable usage returns None so the caller skips
-    shaping rather than inventing a length.
-    """
+    """Return inline terminal assistant length; capture is shaped after verification."""
     message_log = result.get("message_log") or []
     if message_log:
         last = message_log[-1]
         return len(last["token_ids"]) if last["role"] == "assistant" else 0
-    # TODO(token-capture): the agent ACCUMULATES usage across model calls onto
-    # the scored response (simple_agent accumulate_response_usage), so
-    # output_tokens equals the terminal generation only for single-call
-    # rollouts; on multi-call rollouts this shapes on the accumulated total
-    # while the legacy path uses the final assistant turn only. All observed
-    # capture runs are single-call (finalize/calls_per_rollout == 1.0). The
-    # durable fix is upstream: per-call generation counts on the receipt
-    # (Gym preserving per-call usage, or CallRecord recording generation
-    # length distinct from staged delta_len).
-    full_result = result.get("full_result")
-    if isinstance(full_result, dict):
-        response = full_result.get("response")
-        if isinstance(response, dict):
-            usage = response.get("usage")
-            if isinstance(usage, dict):
-                for key in ("output_tokens", "completion_tokens"):
-                    tokens = usage.get(key)
-                    if isinstance(tokens, (int, float)):
-                        return int(tokens)
     return None
 
 
@@ -499,15 +445,12 @@ def _apply_effort_shaping(
     low_lengths: list[int] = []
     high_lengths: list[int] = []
 
-    if (
-        effort_config is None
-        or effort_config.low_weight <= 0
-        or not effort_config.low_string
-    ):
+    if not effort_shaping_enabled(effort_config):
         return _EffortShapingMetrics(
             length_rewards_low, rewards_low, low_lengths, high_lengths
         )
 
+    assert effort_config is not None
     lengths = [_terminal_completion_length(r) for r in results]
     orig_rewards = [r["full_result"]["reward"] for r in results]
     for i, result in enumerate(results):
@@ -517,25 +460,9 @@ def _apply_effort_shaping(
         length = lengths[i]
         if length is None:
             continue
-        prompt = next(
-            (
-                msg["content"]
-                for msg in reversed(
-                    nemo_gym_rows[i]["responses_create_params"]["input"]
-                )
-                if msg.get("role") == "user" and "content" in msg
-            ),
-            "",
-        )
-        if effort_config.low_string in prompt:
-            length_reward = min(
-                1.0,
-                effort_config.low_weight * (1.0 - length / effort_config.low_ub),
-            )
-            new_reward = (
-                orig_rewards[i]
-                + orig_rewards[i] * max(length_reward, 0.0)
-                + effort_config.low_penalty * min(length_reward, 0.0)
+        if is_low_effort(nemo_gym_rows[i], effort_config):
+            new_reward, length_reward = shape_effort_reward(
+                orig_rewards[i], length=length, config=effort_config
             )
             result["full_result"]["reward"] = new_reward
             length_rewards_low.append(length_reward)
@@ -547,38 +474,6 @@ def _apply_effort_shaping(
     return _EffortShapingMetrics(
         length_rewards_low, rewards_low, low_lengths, high_lengths
     )
-
-
-def _effort_shaping_metrics(shaping: _EffortShapingMetrics) -> dict[str, float]:
-    """Build the rollout-metric entries for one group's effort-shaping lists.
-
-    Shared by the batched v1 path and the SingleController rollout manager so the
-    two cannot drift apart.
-
-    Args:
-        shaping: Per-sample tracking lists returned by ``_apply_effort_shaping``.
-
-    Returns:
-        Metric name to value. Empty only when shaping was disabled; callers
-        ``update`` an existing dict, so an absent key leaves the metric unreported
-        rather than reporting a zero.
-    """
-    metrics: dict[str, float] = {}
-    if shaping.length_rewards_low:
-        metrics["mean_length_reward_low"] = sum(shaping.length_rewards_low) / len(
-            shaping.length_rewards_low
-        )
-    if shaping.rewards_low:
-        metrics["mean_reward_low"] = sum(shaping.rewards_low) / len(shaping.rewards_low)
-    if shaping.low_lengths:
-        metrics["mean_length_low"] = sum(shaping.low_lengths) / len(shaping.low_lengths)
-        metrics["median_length_low"] = float(statistics.median(shaping.low_lengths))
-    if shaping.high_lengths:
-        metrics["mean_length_high"] = sum(shaping.high_lengths) / len(
-            shaping.high_lengths
-        )
-        metrics["median_length_high"] = float(statistics.median(shaping.high_lengths))
-    return metrics
 
 
 def generate_responses(

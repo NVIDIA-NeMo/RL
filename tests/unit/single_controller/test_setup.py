@@ -1592,7 +1592,10 @@ class TestSetup:
         ]
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
-    def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
+    @pytest.mark.parametrize("shaping_enabled", [False, True])
+    def test_token_capture_always_creates_finalizer_actor_pool(
+        self, patched_factories, shaping_enabled
+    ):
         mc = _make_master_config(backend="vllm")
         mc.policy["generation"].update(
             {
@@ -1607,6 +1610,18 @@ class TestSetup:
         # wandb keys that _make_master_config populates.
         mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
         mc.token_capture.enabled = True
+        effort = (
+            EffortLevelsConfig(
+                low_weight=1, low_penalty=2, low_ub=500, low_string="budget"
+            )
+            if shaping_enabled
+            else None
+        )
+        mc.env = {
+            "nemo_gym": {
+                "effort_levels": effort.model_dump() if effort is not None else None
+            }
+        }
         mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
@@ -1636,6 +1651,7 @@ class TestSetup:
         assert actor_config.partition_id == "rollout_data"
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
+        assert actor_config.effort_config == effort
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")

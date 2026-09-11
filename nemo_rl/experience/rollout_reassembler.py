@@ -44,6 +44,13 @@ import torch
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.experience.effort_shaping import (
+    EffortLevelsConfig,
+    EffortShapingMetrics,
+    RolloutEffortContext,
+    capture_effort_statistics,
+    finalize_effort_reward,
+)
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.reward_penalties import (
     CaptureRewardPenaltyConfig,
@@ -85,6 +92,7 @@ class FinalizedRollout:
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
     penalty_counts: dict[str, int] = field(default_factory=dict)
+    effort_metrics: EffortShapingMetrics | None = None
 
 
 @dataclass
@@ -122,10 +130,12 @@ class RolloutReassembler:
         pad_token_id: int,
         max_seq_len: int,
         reward_penalty_config: CaptureRewardPenaltyConfig | None = None,
+        effort_config: EffortLevelsConfig | None = None,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
+        self._effort_config = effort_config
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
@@ -155,6 +165,7 @@ class RolloutReassembler:
         *,
         reward: float,
         text_penalty_evidence: RolloutTextPenaltyEvidence | None = None,
+        effort_context: RolloutEffortContext | None = None,
     ) -> FinalizedRollout:
         """Verify one receipt against its staged rows and linearize the main chain.
 
@@ -245,6 +256,18 @@ class RolloutReassembler:
             NotImplementedError,
         ) as error:
             return rejected(f"rebuild_failed:{error}", staging_keys)
+        if not row.link_spans or row.link_spans[-1][0] != parsed.terminal_model_call_id:
+            return rejected("effort_shaping:terminal_span_identity", staging_keys)
+        try:
+            reward, effort_metrics = finalize_effort_reward(
+                rollout_id,
+                reward,
+                terminal_length=row.link_spans[-1][2],
+                context=effort_context,
+                config=self._effort_config,
+            )
+        except ValueError as error:
+            return rejected(f"effort_shaping:{error}", staging_keys)
         penalty_counts: dict[str, int] = {}
         if self._reward_penalty_config is not None:
             try:
@@ -342,6 +365,7 @@ class RolloutReassembler:
             routed_experts=routed_experts,
             route_plan=route_plan,
             penalty_counts=penalty_counts,
+            effort_metrics=effort_metrics,
         )
 
     def _execute_direct_plan(
@@ -394,6 +418,7 @@ class RolloutReassembler:
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
         text_penalty_evidence: Optional[list[RolloutTextPenaltyEvidence | None]] = None,
+        effort_contexts: list[RolloutEffortContext | None] | None = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -426,13 +451,24 @@ class RolloutReassembler:
         )
         if len(evidence_by_rollout) != len(rollout_ids):
             raise ValueError("text_penalty_evidence must be one per rollout")
+        contexts: tuple[RolloutEffortContext | None, ...] = (
+            tuple(effort_contexts)
+            if effort_contexts is not None
+            else (None,) * len(rollout_ids)
+        )
+        if len(contexts) != len(rollout_ids):
+            raise ValueError("effort_contexts must be one per rollout")
         _group_t0 = time.perf_counter()
         rows = [
             self.finalize_rollout(
-                rollout_id, receipt, reward=reward, text_penalty_evidence=evidence
+                rollout_id,
+                receipt,
+                reward=reward,
+                text_penalty_evidence=evidence,
+                effort_context=context,
             )
-            for rollout_id, receipt, reward, evidence in zip(
-                rollout_ids, receipts, rewards, evidence_by_rollout
+            for rollout_id, receipt, reward, evidence, context in zip(
+                rollout_ids, receipts, rewards, evidence_by_rollout, contexts
             )
         ]
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
@@ -459,6 +495,12 @@ class RolloutReassembler:
                     "finalize/reward_max": max(final_rewards),
                 }
             )
+        for valid_row in valid_rows:
+            if valid_row.effort_metrics is not None:
+                for name, value in capture_effort_statistics(
+                    valid_row.effort_metrics
+                ).items():
+                    metrics[name] = metrics.get(name, 0.0) + value
         config = self._reward_penalty_config
         if config is not None:
             for category, enabled in (

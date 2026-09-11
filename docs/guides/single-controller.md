@@ -108,36 +108,71 @@ reward_penalties:
 
 The environment checks the ordered scored `response.output` for duplicated
 reasoning and empty final answers, preserving the final-function-call exception.
-It seals versioned Boolean evidence alongside the reward after effort shaping.
-The finalizer verifies the selected token chain, checks its generated tokens for
-unwanted IDs (including terminal tokens), and applies all enabled penalties
-before publishing `total_reward` for advantage estimation. Prompt tokens, tool
-responses, and abandoned branches do not trigger the token penalty. Capture token
+It produces versioned Boolean evidence bound to the physical rollout. The rollout
+manager seals this evidence alongside the raw Gym reward and, when effort shaping
+is active, the original prompt's low/high-effort classification.
+
+The finalizer verifies the selected token chain, applies effort shaping using the
+terminal call's generated length, and then applies all three enabled penalties
+before publishing `total_reward` for advantage estimation. Any violation sets the
+reward to exactly zero, including when the shaped reward was negative. Unwanted
+IDs are checked across generated spans, including terminal tokens; prompt tokens,
+tool responses, and abandoned branches do not trigger this penalty. Capture token
 IDs, logprobs, and training masks retain their existing behavior.
 
-Recovery retains the evidence and the reward before penalties, so finalization
-retries do not repeat effort shaping. Recovery schema 3 reads schema 2
-checkpoints; old sealed rollouts without evidence can still finalize with text
-checks disabled, including unwanted-token checks. Enabled text checks reject
-missing or incompatible evidence through capture's existing masked-placeholder
-path; regenerate such rollouts to use the checks. Existing configuration
-fingerprint compatibility checks still apply. As with non-capture replay,
-already-finalized canonical rows retain their saved rewards; changing the penalty
-configuration does not retroactively rescore them.
+Effort shaping uses the existing `env.nemo_gym.effort_levels` configuration:
+
+```yaml
+env:
+  nemo_gym:
+    effort_levels:
+      low_weight: 1.0
+      low_penalty: 1.0
+      low_ub: 1000
+      low_string: "<budget>"
+```
+
+These are example overrides; defaults remain unchanged. Setting `low_weight <= 0`
+or leaving `low_string` empty disables shaping. An active configuration requires
+`low_ub > 0`. Both paths use the same last-user-message classification and formula:
+
+```text
+length_reward = min(1, low_weight * (1 - terminal_generation_length / low_ub))
+reward = raw_reward + raw_reward * max(length_reward, 0)
+                    + low_penalty * min(length_reward, 0)
+```
+
+Capture reads the verified terminal generation span, excluding carry tokens and
+previous calls. It does not use accumulated response usage. Thus a 900-token call
+followed by a 100-token final call is shaped using 100 tokens in both paths.
+The full generated call counts, including reasoning and terminal tokens.
+High-effort prompts retain their raw rewards.
+
+Recovery schema 4 saves raw rewards, text evidence, and effort context for
+unfinished rollouts in both sibling and prompt-group recovery modes. The context
+includes a configuration/semantics fingerprint and rollout identity. Finalization
+uses these saved inputs without reclassifying a rehydrated prompt. Missing or
+incompatible required context rejects a row through the existing masked-placeholder
+path. Already-finalized canonical rows retain their saved rewards, so recovery
+does not shape them again. Migration of checkpoints predating this effort-shaping
+change is outside scope.
 
 `reasoning_equal_to_final_answer_rate`, `empty_final_answer_rate`, and
 `unwanted_token_rate` count each enabled category once per valid finalized
 rollout. Counts and valid-row denominators are pooled across groups. Final reward
 mean, minimum, maximum, and sample standard deviation use the same population;
-infrastructure rejections are reported separately. Pending group statistics
-survive checkpoints and are consumed once when training commits. Capture does
-not emit rollout-stage penalty rates or pre-penalty reward summaries.
+infrastructure rejections are reported separately.
+
+Capture retains `mean_length_reward_low`, `mean_reward_low`, and the low/high
+length means and medians. `mean_reward_low` measures the effort-shaped reward
+before reward zeroing. Exact length frequencies preserve medians across unequal
+groups. Pending group statistics survive checkpoints and are consumed once when
+training commits; capture suppresses rollout-stage duplicates.
 
 Malformed-thinking reward penalties and both message-level advantage overrides
-remain unsupported with capture and fail at setup. Effort shaping is unchanged:
-its existing multi-turn length accounting differs between capture and standard
-rollouts. Penalty parity therefore assumes equal incoming rewards, or disabled
-effort shaping.
+remain unsupported with capture and fail at setup. Reward parity applies to
+matching scored output and valid selected trajectories with the same raw reward
+and configuration, including when effort shaping is enabled.
 
 ## Checkpointing and Replay Recovery
 

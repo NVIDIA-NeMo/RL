@@ -40,6 +40,7 @@ from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.effort_shaping import compute_effort_context
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -1147,16 +1148,16 @@ class AsyncNemoGymRolloutImpl:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
-            # A streamed completion may become durable recovery ownership before
-            # the rest of its prompt group finishes. Shape its reward first so a
-            # checkpoint never preserves a raw reward that finalization will later
-            # train on. The shaping rule is row-local; aggregation below is metrics
-            # only.
-            shaping_by_rowidx[rowidx] = _apply_effort_shaping(
-                [result],
-                [inputs_by_rowidx[rowidx]],
-                self._effort_config,
-            )
+            if "receipt" in result:
+                # Seal raw capture rewards and original prompt classification.
+                # The finalizer shapes once, using verified terminal length.
+                result["effort_context"] = compute_effort_context(
+                    result["rollout_id"], inputs_by_rowidx[rowidx], self._effort_config
+                )
+            else:
+                shaping_by_rowidx[rowidx] = _apply_effort_shaping(
+                    [result], [inputs_by_rowidx[rowidx]], self._effort_config
+                )
             results[rowidx] = result
             if on_completion is not None:
                 # Use the same conversion path as completed groups so streamed
@@ -1376,6 +1377,7 @@ class AsyncNemoGymRolloutImpl:
                 env_extras = dict(result["full_result"])
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
+                env_extras["ng_effort_context"] = result.get("effort_context")
                 env_extras["ng_text_penalty_evidence"] = result.get(
                     "text_penalty_evidence"
                 )
@@ -1512,7 +1514,8 @@ class AsyncNemoGymRolloutImpl:
             {
                 k: v
                 for k, v in (c.env_extras or {}).items()
-                if k not in ("ng_receipt", "ng_text_penalty_evidence")
+                if k
+                not in ("ng_receipt", "ng_text_penalty_evidence", "ng_effort_context")
                 and not (receipt_mode and k == "reward")
             }
             for c in completions
@@ -2224,6 +2227,7 @@ class RolloutManager:
                     reward=completion.reward,
                     mask_sample=mask_sample,
                     text_penalty_evidence=env_extras.get("ng_text_penalty_evidence"),
+                    effort_context=env_extras.get("ng_effort_context"),
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2254,6 +2258,7 @@ class RolloutManager:
                     reward=completion.reward,
                     mask_sample=mask_sample,
                     text_penalty_evidence=env_extras.get("ng_text_penalty_evidence"),
+                    effort_context=env_extras.get("ng_effort_context"),
                 )
 
         try:
@@ -2286,6 +2291,7 @@ class RolloutManager:
                 rewards,
                 mask_sample,
                 text_penalty_evidence,
+                effort_contexts,
             ) = self._recovery_ledger.finalization_inputs(group_id)
             request = ReassemblyRequest(
                 group_id=group_id,
@@ -2293,6 +2299,7 @@ class RolloutManager:
                 canonical_sample_ids=tuple(canonical_sample_ids),
                 receipts=tuple(receipts),
                 text_penalty_evidence=tuple(text_penalty_evidence),
+                effort_contexts=tuple(effort_contexts),
                 rewards=tuple(rewards),
                 fallback_weight_version=start_version,
                 prompt_idx=int(recovery_group.prompt_id),

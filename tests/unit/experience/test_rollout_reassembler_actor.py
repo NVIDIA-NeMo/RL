@@ -101,6 +101,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
         text_penalty_evidence=None,
+        effort_contexts=None,
     )
 
 
@@ -136,6 +137,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "mask_sample",
         "loss_multiplier",
         "text_penalty_evidence",
+        "effort_contexts",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
@@ -177,3 +179,27 @@ def test_text_evidence_remains_metadata_only_and_reaches_finalizer():
     assert actor._finalizer.finalize_group.call_args.kwargs[
         "text_penalty_evidence"
     ] == [evidence]
+
+
+def test_effort_context_remains_metadata_only_and_reaches_finalizer():
+    from nemo_rl.experience.effort_shaping import (
+        EffortLevelsConfig,
+        compute_effort_context,
+    )
+
+    context = compute_effort_context(
+        "group_g0",
+        {"responses_create_params": {"input": [{"role": "user", "content": "budget"}]}},
+        EffortLevelsConfig(low_weight=1, low_string="budget"),
+    )
+    request = replace(_request(), effort_contexts=(context,))
+    assert_metadata_only(request)
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        None, 4, 4, [], dropped=True
+    )
+    actor.finalize(request)
+    assert actor._finalizer.finalize_group.call_args.kwargs["effort_contexts"] == [
+        context
+    ]
