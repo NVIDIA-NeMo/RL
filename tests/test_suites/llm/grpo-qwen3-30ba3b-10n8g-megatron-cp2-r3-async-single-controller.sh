@@ -41,6 +41,7 @@ uv run examples/run_grpo_single_controller.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=False \
     checkpointing.checkpoint_dir=$CKPT_DIR \
+    data_plane.observability.verify_tensor_hash=True \
     $@ \
     2>&1 | tee $RUN_LOG
 
