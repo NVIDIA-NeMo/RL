@@ -1270,6 +1270,7 @@ class _ModelWithNonSerializableExtraState(torch.nn.Module):
         (True, True, "mxfp8", "fp8", None, False),
     ],
 )
+@pytest.mark.parametrize("refit_payload_mode", ["hf_export", "logical_weights"])
 def test_native_mxfp8_export_selection(
     enabled: bool,
     fp8_param: bool,
@@ -1277,6 +1278,7 @@ def test_native_mxfp8_export_selection(
     precision: str,
     is_mx: Optional[bool],
     expected: bool,
+    refit_payload_mode: str,
 ) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
@@ -1297,7 +1299,10 @@ def test_native_mxfp8_export_selection(
         }
     }
 
-    assert worker._is_native_mxfp8_export() is expected
+    worker.refit_payload_mode = refit_payload_mode
+    assert worker._is_native_mxfp8_export() is (
+        expected and refit_payload_mode == "hf_export"
+    )
 
 
 def test_native_mxfp8_refit_syncs_shared_storage_before_reading_components() -> None:
