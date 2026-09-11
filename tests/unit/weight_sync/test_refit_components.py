@@ -227,10 +227,89 @@ def test_native_mxfp8_param_names_requires_canonical_dtype_pair() -> None:
         "model.layers.0.mlp.down_proj.weight"
     }
 
-    refit_info["per_layer_params"]["model.layers.0"][0]["components"][1]["dtype"] = (
-        "torch.float32"
-    )
-    assert native_mxfp8_param_names(refit_info) == set()
+
+@pytest.mark.parametrize(
+    ("param_info", "match"),
+    [
+        pytest.param(None, "must be a mapping", id="non-mapping-param-info"),
+        pytest.param({}, "must contain a name", id="missing-name"),
+        pytest.param({"name": 7}, "must contain a name", id="non-string-name"),
+        pytest.param(
+            {
+                "name": "model.layers.0.mlp.down_proj.weight",
+                "global_shape": [64, 256],
+                "dtype": "torch.float8_e4m3fn",
+                "components": {},
+            },
+            "components must be a sequence",
+            id="mapping-components-container",
+        ),
+        pytest.param(
+            {
+                "name": "model.layers.0.mlp.down_proj.weight",
+                "global_shape": [64, 256],
+                "dtype": "torch.float8_e4m3fn",
+                "components": "weight",
+            },
+            "components must be a sequence",
+            id="string-components-container",
+        ),
+        pytest.param(
+            {
+                "name": "model.layers.0.mlp.down_proj.weight",
+                "global_shape": [64, 256],
+                "dtype": "torch.float8_e4m3fn",
+                "components": [None],
+            },
+            "component metadata must be mappings",
+            id="non-mapping-component",
+        ),
+    ],
+)
+def test_native_mxfp8_param_names_handles_malformed_metadata(
+    param_info: object, match: str
+) -> None:
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {"model.layers.0": [param_info]},
+    }
+
+    assert native_mxfp8_param_names(refit_info, strict=False) == set()
+    with pytest.raises(ValueError, match=match):
+        native_mxfp8_param_names(refit_info, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("component_index", "dtype", "match"),
+    [
+        pytest.param(
+            0,
+            "torch.bfloat16",
+            "native weight dtype must be torch.float8_e4m3fn",
+            id="weight",
+        ),
+        pytest.param(
+            1,
+            "torch.float32",
+            "weight_scale dtype must be torch.uint8",
+            id="weight-scale",
+        ),
+    ],
+)
+@pytest.mark.parametrize("strict", [False, True], ids=["permissive", "strict"])
+def test_native_mxfp8_param_names_rejects_wrong_component_dtype(
+    component_index: int, dtype: str, match: str, strict: bool
+) -> None:
+    refit_info = _native_refit_info()
+    refit_info["per_layer_params"]["model.layers.0"][0]["components"][component_index][
+        "dtype"
+    ] = dtype
+
+    if strict:
+        with pytest.raises(ValueError, match=match):
+            native_mxfp8_param_names(refit_info, strict=True)
+    else:
+        assert native_mxfp8_param_names(refit_info, strict=False) == set()
 
 
 def test_native_mxfp8_param_names_rejects_invalid_scale_shape() -> None:

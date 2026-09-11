@@ -592,7 +592,9 @@ def setup(
         )
         student_generation.weight_synchronizer.init_communicator()
     elif student_generation is not None:
-        state_dict_info = student_policy.prepare_refit_info()
+        state_dict_info = student_policy.prepare_refit_info(
+            refit_payload_mode=student_generation.get_refit_payload_mode()
+        )
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights
